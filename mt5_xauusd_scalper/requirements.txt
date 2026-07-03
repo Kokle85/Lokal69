@@ -1,0 +1,11 @@
+# MT5 XAUUSD Scalper MVP - Python 3.11
+# MetaTrader5 only installs on Windows; the terminal + package are required for live/demo runs.
+MetaTrader5>=5.0.45; sys_platform == "win32"
+pandas>=2.1
+numpy>=1.26
+pydantic>=2.5
+PyYAML>=6.0
+python-dotenv>=1.0
+python-telegram-bot>=21.0
+loguru>=0.7
+pytest>=8.0

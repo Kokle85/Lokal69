@@ -1,0 +1,103 @@
+# MT5 XAUUSD Scalper MVP configuration.
+# Default mode is SIGNAL_ONLY: the bot only scans and notifies, it never trades.
+# LIVE_AUTO is disabled by default and additionally requires trading.allow_live_auto: true.
+
+mode: SIGNAL_ONLY
+
+account:
+  size_usd: 25000
+
+mt5:
+  login:
+  password:
+  server:
+  path:
+
+trading:
+  symbol: XAUUSD
+  allowed_symbol_aliases:
+    - XAUUSD
+    - GOLD
+    - XAUUSDm
+  magic_number: 26070301
+  max_spread_points: 25
+  max_entry_slippage_points: 20
+  deviation_points: 20
+  max_positions: 1
+  require_stop_loss: true
+  allow_trade_without_sl: false
+  allow_live_auto: false
+  allow_kill_close_position: false
+
+daily_goals:
+  daily_profit_target_usd: 200
+  daily_profit_lock_usd: 150
+  max_daily_loss_usd: 250
+  max_open_loss_usd: 150
+  default_risk_per_trade_usd: 75
+  risk_after_win_usd: 100
+  risk_after_loss_usd: 50
+  max_trades_per_day: 4
+  max_consecutive_losses: 2
+
+strategies:
+  high_precision_scalp:
+    enabled: true
+    rr: 1.0
+    min_precision_score: 8
+    max_trades_per_day: 3
+  momentum_scalp:
+    enabled: true
+    rr: 1.6
+    min_quality_score: 8
+    max_trades_per_day: 1
+
+strategy:
+  main_timeframe: M15
+  confirmation_timeframe: M5
+  entry_timeframe: M1
+  ema_fast: 20
+  ema_slow: 50
+  rsi_period: 14
+  atr_period: 14
+  use_vwap: true
+  pullback_ema_tolerance_atr: 0.35
+  max_distance_from_ema_atr: 0.75
+  rejection_wick_body_ratio: 1.5
+  choppy_wick_body_ratio: 1.8
+  spike_atr_multiplier: 2.5
+  min_sl_atr: 0.8
+  max_sl_atr: 2.2
+  m5_structure_lookback: 20
+  retest_tolerance_atr: 0.30
+
+position_management:
+  move_to_breakeven_at_r: 0.7
+  partial_close_enabled: true
+  partial_close_at_r: 1.0
+  partial_close_percent: 50
+  time_exit_minutes: 8
+  max_trade_duration_minutes: 12
+
+regime:
+  enabled: true
+  block_choppy: true
+  block_spike: true
+  block_dead_market: true
+  spike_atr_multiplier: 2.5
+  choppy_wick_body_ratio: 1.8
+  min_atr_points: 15
+  max_atr_points: 350
+
+sessions:
+  timezone: Europe/Skopje
+  enabled: true
+  windows:
+    - start: "09:00"
+      end: "12:00"
+    - start: "15:00"
+      end: "18:00"
+  block_friday_after: "20:00"
+
+telegram:
+  enabled: true

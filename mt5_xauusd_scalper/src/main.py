@@ -1,0 +1,529 @@
+"""MT5 XAUUSD Scalper MVP - main entry point and scan loop."""
+from __future__ import annotations
+
+import asyncio
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from loguru import logger
+
+# Allow `python src/main.py` from the project root.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config import BotConfig, ConfigError, load_config
+from daily_risk_governor import DailyRiskGovernor
+from execution import ExecutionEngine
+from journal import Journal
+from market_data import MarketData
+from models import (
+    BotMode,
+    CloseReason,
+    Direction,
+    ManagedPosition,
+    PositionActionType,
+    Signal,
+    SignalStatus,
+)
+from mt5_connector import MT5Connector, MT5Error
+from position_manager import apply_action_to_state, evaluate_position
+from regime_detector import RegimeDetector, build_snapshot
+from risk_manager import RiskManager
+from strategy_high_precision import HighPrecisionStrategy
+from strategy_momentum import MomentumStrategy
+from strategy_selector import StrategySelector
+from telegram_bot import TelegramService
+from utils import fmt_usd, in_session, now_in_tz
+
+SCAN_INTERVAL_SECONDS = 5
+
+
+def setup_logging() -> None:
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+    Path("logs").mkdir(exist_ok=True)
+    logger.add("logs/bot.log", level="DEBUG", rotation="10 MB", retention="14 days")
+
+
+class ScalperBot:
+    def __init__(self, cfg: BotConfig) -> None:
+        self.cfg = cfg
+        self.journal = Journal()
+        self.connector = MT5Connector(cfg.mt5, cfg.trading)
+        self.market_data = MarketData(self.connector)
+        self.regime_detector = RegimeDetector(cfg.regime, cfg.trading.max_spread_points)
+        self.risk_manager = RiskManager(cfg.trading, cfg.strategy)
+        self.selector = StrategySelector(
+            HighPrecisionStrategy(
+                cfg.strategies.high_precision_scalp, cfg.strategy,
+                cfg.trading.max_spread_points, cfg.regime.min_atr_points, cfg.regime.max_atr_points,
+            ),
+            MomentumStrategy(
+                cfg.strategies.momentum_scalp, cfg.strategy,
+                cfg.trading.max_spread_points, cfg.regime.min_atr_points, cfg.regime.max_atr_points,
+            ),
+        )
+        self.telegram = TelegramService(cfg.telegram, self)
+        self.execution = ExecutionEngine(
+            self.connector, cfg.trading, notify=self.telegram.send_nowait
+        )
+        today = now_in_tz(cfg.sessions.timezone).date()
+        self.governor = DailyRiskGovernor(cfg.daily_goals, today)
+
+        self.paused = False
+        self.position: Optional[ManagedPosition] = None
+        self.pending_signals: dict[int, Signal] = {}
+        self.current_regime = "UNKNOWN"
+        self.active_strategy = "-"
+        self.auto_trading_allowed = False
+
+    # ================================================================ startup
+
+    def startup(self) -> None:
+        self.connector.connect()
+        self.connector.resolve_symbol()
+        spec = self.connector.symbol_spec()
+        if not spec.trade_allowed:
+            raise MT5Error(f"Symbol {spec.name} is not tradeable on this account.")
+
+        account = self.connector.account_info()
+        is_demo = self.connector.is_demo_account()
+        mode = self.cfg.mode
+
+        if mode is BotMode.DEMO_AUTO:
+            if not is_demo:
+                raise MT5Error(
+                    "Mode is DEMO_AUTO but the connected MT5 account is LIVE. "
+                    "Auto trading is blocked. Use a demo account or SIGNAL_ONLY."
+                )
+            self.auto_trading_allowed = True
+        elif mode is BotMode.LIVE_AUTO:
+            # config.py already refuses LIVE_AUTO without allow_live_auto: true
+            self.auto_trading_allowed = True
+            logger.warning("LIVE_AUTO enabled by explicit config confirmation. Trade carefully.")
+        elif mode is BotMode.SEMI_AUTO:
+            if not is_demo and not self.cfg.trading.allow_live_auto:
+                raise MT5Error(
+                    "SEMI_AUTO on a LIVE account requires trading.allow_live_auto: true. "
+                    "Execution is blocked for safety."
+                )
+            self.auto_trading_allowed = True  # only after manual approval
+
+        self.governor.reset_for_day(
+            now_in_tz(self.cfg.sessions.timezone).date(), float(account.equity)
+        )
+        self.journal.log_event(
+            "INFO", "startup",
+            f"Bot started in {mode.value} mode on {spec.name}",
+            {"balance": account.balance, "equity": account.equity, "demo": is_demo},
+        )
+        logger.info("Startup complete | mode={} | symbol={} | demo={}", mode.value, spec.name, is_demo)
+
+    # ================================================================ main loop
+
+    async def run(self) -> None:
+        self.startup()
+        await self.telegram.start()
+        await self.telegram.send(
+            f"🤖 XAUUSD Scalper started\nMode: {self.cfg.mode.value}\nSymbol: {self.connector.symbol}"
+        )
+        try:
+            while True:
+                try:
+                    await self.tick()
+                except MT5Error as exc:
+                    logger.error("MT5 error in loop: {}", exc)
+                    if not self.connector.reconnect():
+                        logger.error("Reconnect failed; retrying next cycle")
+                except Exception as exc:  # noqa: BLE001 - loop must survive
+                    logger.exception("Unexpected error in scan loop: {}", exc)
+                    self.journal.log_event("ERROR", "loop_error", str(exc))
+                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        finally:
+            await self.telegram.stop()
+            self.journal.close()
+            self.connector.shutdown()
+
+    async def tick(self) -> None:
+        if not self.connector.is_alive():
+            raise MT5Error("MT5 terminal connection lost")
+
+        self._rollover_day_if_needed()
+        await self._expire_pending_approvals()
+        await self._manage_open_position()
+        self._sync_closed_position()
+        self._persist_daily_stats()
+
+        if self.paused:
+            return
+
+        # Governor runs before every scan.
+        account = self.connector.account_info()
+        self.governor.check_equity_drawdown(float(account.equity))
+        self.governor.check_locks()
+        await self._flush_lock_events()
+        if self.governor.state.locked:
+            return
+
+        allowed, session_reason = in_session(self.cfg.sessions)
+        if not allowed:
+            logger.debug("Skipping scan: {}", session_reason)
+            return
+
+        m1 = self.market_data.fetch_closed("M1")
+        if not self.market_data.new_m1_candle(m1):
+            return  # evaluate entries only on a new closed M1 candle
+
+        await self._scan(m1)
+
+    # ================================================================ scanning
+
+    async def _scan(self, m1) -> None:
+        m5 = self.market_data.fetch_closed("M5")
+        m15 = self.market_data.fetch_closed("M15")
+        spec = self.connector.symbol_spec()
+        spread = self.connector.spread_points()
+
+        snap = build_snapshot(
+            m15, m5, m1, self.cfg.strategy, spread, spec.point, self.cfg.sessions.timezone
+        )
+        regime_result = self.regime_detector.detect(snap)
+        self.current_regime = regime_result.regime.value
+        logger.info("Regime: {} ({})", self.current_regime, "; ".join(regime_result.reasons))
+
+        selection = self.selector.select(snap, regime_result.regime)
+        if selection.signal is None:
+            if selection.rejections:
+                logger.info("No signal: {}", selection.reason)
+                for reason in selection.rejections[:6]:
+                    logger.debug("  rejected: {}", reason)
+            return
+
+        signal = selection.signal
+        signal.symbol = self.connector.symbol
+        signal.mode = self.cfg.mode
+        self.active_strategy = signal.strategy.value
+
+        # Governor runs before every signal.
+        open_loss = self._open_loss_usd()
+        decision = self.governor.evaluate_new_trade(signal.score, open_loss)
+        await self._flush_lock_events()
+        if not decision.allowed:
+            logger.warning("Signal blocked by governor: {}", decision.reason)
+            self.journal.log_event("WARNING", "risk_block", decision.reason)
+            return
+        signal.risk_usd = decision.risk_usd
+
+        check = self.risk_manager.validate_signal(
+            signal,
+            atr_value=snap.atr_now,
+            spread_points=spread,
+            open_positions=len(self.connector.open_positions()),
+            symbol_tradeable=spec.trade_allowed,
+        )
+        if not check.ok:
+            logger.warning("Signal rejected by risk manager: {}", check.reason)
+            self.journal.log_event("WARNING", "risk_block", check.reason)
+            return
+
+        lot_result = self.risk_manager.size_position(signal, spec)
+        if not lot_result.ok:
+            self.journal.log_event("WARNING", "lot_skip", lot_result.reason)
+            return
+        signal.lot = lot_result.lot
+
+        signal.signal_id = self.journal.record_signal(signal, SignalStatus.SENT)
+        logger.info(
+            "SIGNAL {} {} entry {:.2f} SL {:.2f} TP {:.2f} lot {} score {}/{}",
+            signal.strategy.value, signal.direction.value, signal.entry,
+            signal.sl, signal.tp, signal.lot, signal.score, signal.max_score,
+        )
+        await self.telegram.send_signal(signal, self.governor.state.realized_pnl, self.cfg.mode)
+        if self.cfg.mode is BotMode.SEMI_AUTO:
+            self.pending_signals[signal.signal_id] = signal
+
+        if self.cfg.mode in (BotMode.DEMO_AUTO, BotMode.LIVE_AUTO):
+            await self._execute_signal(signal)
+        # SEMI_AUTO waits for the Telegram approval callback; SIGNAL_ONLY stops here.
+
+    # ================================================================ execution
+
+    async def _execute_signal(self, signal: Signal) -> None:
+        if not self.auto_trading_allowed and self.cfg.mode is not BotMode.SEMI_AUTO:
+            logger.warning("Auto trading not allowed - signal not executed")
+            return
+
+        spec = self.connector.symbol_spec()
+
+        # Governor runs before every order.
+        decision = self.governor.evaluate_new_trade(signal.score, self._open_loss_usd())
+        if not decision.allowed:
+            logger.warning("Order blocked by governor: {}", decision.reason)
+            self.journal.update_signal_status(signal.signal_id, SignalStatus.CANCELLED)
+            return
+
+        result = self.execution.place_market_order(signal, spec, signal.lot)
+        if not result.ok:
+            self.journal.update_signal_status(signal.signal_id, SignalStatus.CANCELLED)
+            self.journal.log_event("ERROR", "order_failed", result.comment)
+            return
+
+        trade_id = self.journal.record_trade(signal, result.ticket, result.price, result.volume)
+        self.journal.update_signal_status(signal.signal_id, SignalStatus.EXECUTED)
+        self.position = ManagedPosition(
+            ticket=result.ticket,
+            symbol=signal.symbol,
+            direction=signal.direction,
+            entry=result.price,
+            sl=signal.sl,
+            tp=signal.tp,
+            lot=result.volume,
+            initial_lot=result.volume,
+            initial_sl=signal.sl,
+            risk_usd=signal.risk_usd,
+            opened_at=datetime.now(timezone.utc),
+            strategy=signal.strategy,
+            trade_id=trade_id,
+        )
+        await self.telegram.send(
+            f"📈 Trade opened: {signal.direction.value} {result.volume} lot @ {result.price:.2f}\n"
+            f"SL {signal.sl:.2f} | TP {signal.tp:.2f} | Risk ${signal.risk_usd:.0f}"
+        )
+
+    # ================================================================ position mgmt
+
+    async def _manage_open_position(self) -> None:
+        if self.position is None:
+            return
+        pos = self.position
+        broker_positions = {p.ticket: p for p in self.connector.open_positions()}
+        if pos.ticket not in broker_positions:
+            return  # closed - handled by _sync_closed_position
+
+        tick = self.connector.tick()
+        current = tick.bid if pos.direction is Direction.BUY else tick.ask
+        spec = self.connector.symbol_spec()
+
+        for action in evaluate_position(pos, current, datetime.now(timezone.utc), self.cfg.position_management):
+            if action.action is PositionActionType.MOVE_BREAKEVEN:
+                result = self.execution.modify_sl(pos.ticket, action.new_sl, pos.tp, spec)
+                if result.ok:
+                    apply_action_to_state(pos, action)
+                    self.journal.update_trade_sl(pos.trade_id, action.new_sl)
+                    await self.telegram.send(f"🔒 SL moved to breakeven ({action.reason})")
+            elif action.action is PositionActionType.PARTIAL_CLOSE:
+                close_lot = self._round_lot(pos.lot * action.close_fraction, spec)
+                if close_lot >= spec.volume_min and (pos.lot - close_lot) >= spec.volume_min:
+                    result = self.execution.close_position(
+                        pos.ticket, pos.direction, close_lot, spec, "partial"
+                    )
+                    if result.ok:
+                        apply_action_to_state(pos, action)
+                        self.journal.update_trade_lot(pos.trade_id, pos.lot)
+                        await self.telegram.send(f"✂️ Partial close {close_lot} lot ({action.reason})")
+                else:
+                    logger.info("Partial close skipped: lot too small to split")
+                    pos.partial_done = True
+            elif action.action in (PositionActionType.TIME_EXIT, PositionActionType.MAX_DURATION_EXIT):
+                result = self.execution.close_position(
+                    pos.ticket, pos.direction, pos.lot, spec, action.action.value.lower()
+                )
+                if result.ok:
+                    await self.telegram.send(f"⏱ Position closed: {action.reason}")
+                break
+
+    def _sync_closed_position(self) -> None:
+        if self.position is None:
+            return
+        pos = self.position
+        if any(p.ticket == pos.ticket for p in self.connector.open_positions()):
+            return
+
+        day_start = now_in_tz(self.cfg.sessions.timezone).replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = self.connector.today_deals(day_start.astimezone(timezone.utc).replace(tzinfo=None))
+        profit = sum(
+            d.profit + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0)
+            for d in deals
+            if getattr(d, "position_id", None) == pos.ticket and d.entry != 0
+        )
+        close_price = 0.0
+        for d in reversed(deals):
+            if getattr(d, "position_id", None) == pos.ticket and d.entry != 0:
+                close_price = d.price
+                break
+
+        duration = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60.0
+        reason = CloseReason.UNKNOWN.value
+        self.journal.close_trade(pos.trade_id, close_price, profit, reason, duration)
+        events = self.governor.on_trade_closed(profit)
+        self.position = None
+        self.telegram.send_nowait(
+            f"🏁 Trade closed {fmt_usd(profit)} | Daily P/L: {fmt_usd(self.governor.state.realized_pnl)}"
+        )
+        for event in events:
+            self.telegram.send_nowait(event.message)
+            self.journal.log_event("WARNING", "daily_lock", event.message, {"reason": event.reason})
+
+    # ================================================================ helpers
+
+    def _open_loss_usd(self) -> float:
+        loss = 0.0
+        for p in self.connector.open_positions():
+            if p.profit < 0:
+                loss += -p.profit
+        return loss
+
+    @staticmethod
+    def _round_lot(lot: float, spec) -> float:
+        step = spec.volume_step or 0.01
+        return round(int(lot / step + 1e-9) * step, 8)
+
+    def _rollover_day_if_needed(self) -> None:
+        today = now_in_tz(self.cfg.sessions.timezone).date()
+        if today != self.governor.state.day:
+            account = self.connector.account_info()
+            self.governor.reset_for_day(today, float(account.equity))
+
+    def _persist_daily_stats(self) -> None:
+        s = self.governor.state
+        try:
+            equity = float(self.connector.account_info().equity)
+        except MT5Error:
+            equity = 0.0
+        self.journal.upsert_daily_stats(
+            s.day, s.starting_equity, equity, s.realized_pnl, s.trades_today,
+            s.wins, s.losses, s.consecutive_losses, s.locked,
+            s.daily_target_hit, s.daily_max_loss_hit,
+        )
+
+    async def _flush_lock_events(self) -> None:
+        s = self.governor.state
+        for event in s.lock_events:
+            if not getattr(event, "_notified", False):
+                await self.telegram.send(event.message)
+                self.journal.log_event("WARNING", "daily_lock", event.message, {"reason": event.reason})
+                event._notified = True  # type: ignore[attr-defined]
+
+    async def _expire_pending_approvals(self) -> None:
+        for pending in self.telegram.pop_expired():
+            sid = pending.signal.signal_id
+            if sid is not None:
+                self.pending_signals.pop(sid, None)
+                self.journal.update_signal_status(sid, SignalStatus.EXPIRED)
+                logger.info("Signal {} expired without approval", sid)
+                await self.telegram.send(f"⏱ Signal #{sid} expired (no approval within 60s).")
+
+    # ================================================================ BotControl (Telegram)
+
+    def status_text(self) -> str:
+        s = self.governor.state
+        try:
+            account = self.connector.account_info()
+            balance, equity = account.balance, account.equity
+        except (MT5Error, Exception):
+            balance = equity = 0.0
+        pos_text = "none"
+        if self.position:
+            pos_text = (
+                f"{self.position.direction.value} {self.position.lot} lot "
+                f"@ {self.position.entry:.2f} (ticket {self.position.ticket})"
+            )
+        next_risk = self.governor.evaluate_new_trade(signal_score=11).risk_usd
+        return (
+            f"Account size: {fmt_usd(self.cfg.account.size_usd)}\n"
+            f"Balance: {fmt_usd(balance)}\n"
+            f"Equity: {fmt_usd(equity)}\n"
+            f"Daily realized P/L: {fmt_usd(s.realized_pnl)}\n"
+            f"Daily target: {fmt_usd(self.cfg.daily_goals.daily_profit_target_usd)}\n"
+            f"Daily lock: {'YES - ' + s.lock_reason if s.locked else 'no'}\n"
+            f"Trades today: {s.trades_today}\n"
+            f"Consecutive losses: {s.consecutive_losses}\n"
+            f"Regime: {self.current_regime}\n"
+            f"Active strategy: {self.active_strategy}\n"
+            f"Open position: {pos_text}\n"
+            f"Risk for next trade: {fmt_usd(next_risk)}\n"
+            f"Mode: {self.cfg.mode.value}\n"
+            f"Paused: {'yes' if self.paused else 'no'}"
+        )
+
+    def summary_text(self) -> str:
+        s = self.governor.state
+        return (
+            f"Summary {s.day}\n"
+            f"Realized P/L: {fmt_usd(s.realized_pnl)}\n"
+            f"Trades: {s.trades_today} (W {s.wins} / L {s.losses})\n"
+            f"Consecutive losses: {s.consecutive_losses}\n"
+            f"Target hit: {'yes' if s.daily_target_hit else 'no'}\n"
+            f"Max loss hit: {'yes' if s.daily_max_loss_hit else 'no'}\n"
+            f"Locked: {'yes - ' + s.lock_reason if s.locked else 'no'}"
+        )
+
+    def mode_text(self) -> str:
+        return f"Mode: {self.cfg.mode.value}"
+
+    def pause(self) -> str:
+        self.paused = True
+        self.journal.log_event("INFO", "pause", "Bot paused via Telegram")
+        return "⏸ Bot paused. Scanning and trading stopped."
+
+    def resume(self) -> str:
+        self.paused = False
+        self.journal.log_event("INFO", "resume", "Bot resumed via Telegram")
+        return "▶️ Bot resumed."
+
+    async def kill(self) -> str:
+        self.paused = True
+        self.journal.log_event("WARNING", "kill", "Emergency stop via Telegram")
+        if self.cfg.trading.allow_kill_close_position and self.position:
+            spec = self.connector.symbol_spec()
+            result = self.execution.close_position(
+                self.position.ticket, self.position.direction, self.position.lot, spec, "kill"
+            )
+            return f"🛑 KILLED. Position close: {'ok' if result.ok else result.comment}"
+        return "🛑 KILLED. Bot paused. (allow_kill_close_position is false - position untouched)"
+
+    async def on_signal_approved(self, signal_id: int) -> str:
+        signal = self.pending_signals.pop(signal_id, None)
+        if signal is None:
+            return "Signal not found or already handled."
+        # Recheck governor and risk limits before executing an approved signal;
+        # the execution engine rechecks spread/price drift/positions itself.
+        decision = self.governor.evaluate_new_trade(signal.score, self._open_loss_usd())
+        if not decision.allowed:
+            self.journal.update_signal_status(signal_id, SignalStatus.CANCELLED)
+            return f"Cancelled: {decision.reason}"
+        signal.risk_usd = decision.risk_usd
+        self.journal.update_signal_status(signal_id, SignalStatus.APPROVED)
+        await self._execute_signal(signal)
+        return "Execution attempted - check trade notifications."
+
+    def on_signal_rejected(self, signal_id: int) -> str:
+        self.pending_signals.pop(signal_id, None)
+        self.telegram.cancel_pending(signal_id)
+        self.journal.update_signal_status(signal_id, SignalStatus.REJECTED)
+        return "Signal rejected."
+
+
+def main() -> int:
+    setup_logging()
+    try:
+        cfg = load_config("config.yaml")
+    except ConfigError as exc:
+        logger.error("{}", exc)
+        return 2
+
+    bot = ScalperBot(cfg)
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user (Ctrl+C)")
+        return 0
+    except MT5Error as exc:
+        logger.error("MT5 error: {}", exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
