@@ -56,6 +56,54 @@ zone), only one more trade is allowed, at **half risk** and only for a setup sco
 ≥ 9/11. Protecting capital and banked profit always outranks reaching the target.
 On many days the bot will simply not trade at all; that is correct behavior.
 
+## Validation & honest profitability assessment
+
+A backtest that shows profit means nothing until it survives realistic costs and
+out-of-sample testing. This project ships the machinery to find the truth:
+
+**Realistic costs (backtest.py + cost_model.py).** Every simulated fill pays a
+variable spread, per-side commission, adverse slippage, and occasional requotes;
+bars that span both stop and target resolve stop-first by default. The report
+now includes `total_commission`, `cost_drag_pct`, and per-trade Sharpe/Sortino.
+Backtest position management runs through the **same** `decide_actions()` the live
+bot uses, so the two cannot silently diverge.
+
+```bat
+python src/backtest.py --days 90 --export-trades data\trades.csv
+```
+
+**Validation suite (validation.py).**
+
+```bat
+python src/validation.py --days 180 --all
+```
+
+- **Walk-forward** — optimizes on each train block, scores the *next* unseen
+  block, and stitches the test blocks into one out-of-sample equity curve.
+  In-sample profit is not evidence; only the OOS number counts.
+- **Monte Carlo** — bootstrap-resamples the trade sequence to give confidence
+  intervals for net PnL and drawdown, the probability of a losing run, and the
+  probability of breaching a daily-loss-sized drawdown. Exposes results that
+  only looked good because winners happened to cluster.
+- **Spread sensitivity** — re-runs across a range of spreads and reports the
+  break-even spread. Critical for gold, where spread alone can kill the edge.
+
+**Go/No-Go gate (go_no_go.py).**
+
+```bat
+python src/go_no_go.py --days 180
+```
+
+Applies strict, non-negotiable criteria (≥100 out-of-sample trades, OOS profit
+factor ≥ 1.2 after costs, Monte-Carlo probability of loss ≤ 30%, drawdown-breach
+probability ≤ 20%, break-even spread ≥ 22 points). A single failure is a
+**NO-GO** — and that is the system working: it means the data does not show a
+durable, cost-adjusted edge, so you should not risk money. The command exits
+non-zero on NO-GO so it can gate automation.
+
+> No technical-analysis strategy guarantees profit. These tools give the strategy
+> its best honest shot and tell you the truth — they do not manufacture an edge.
+
 ## SNIPER_MODE (enabled by default)
 
 Sniper mode caps the day at **2 trades** while keeping only one position open at a
@@ -222,9 +270,12 @@ considering it. Capital protection beats convenience.
 python -m pytest tests -q
 ```
 
-78 tests cover indicators, VWAP (incl. daily/timezone reset), regime detection,
+138 tests cover indicators, VWAP (incl. daily/timezone reset), regime detection,
 both strategies, the selector, risk manager, lot sizing, the daily risk governor
-(including the scenario behaviors from the spec) and position management.
+(including the scenario behaviors from the spec), position management, SNIPER_MODE,
+the realistic cost model, the shared decision core, the validation tooling
+(Monte Carlo, spread sensitivity), the Go/No-Go gate, and a full end-to-end
+integration suite that drives the order lifecycle through a fake MT5 terminal.
 
 ## Project structure
 
