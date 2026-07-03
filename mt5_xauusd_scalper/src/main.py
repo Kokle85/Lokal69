@@ -30,6 +30,7 @@ from mt5_connector import MT5Connector, MT5Error
 from position_manager import apply_action_to_state, evaluate_position
 from regime_detector import RegimeDetector, build_snapshot
 from risk_manager import RiskManager
+from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
 from strategy_high_precision import HighPrecisionStrategy
 from strategy_momentum import MomentumStrategy
 from strategy_selector import StrategySelector
@@ -48,7 +49,10 @@ def setup_logging() -> None:
 
 class ScalperBot:
     def __init__(self, cfg: BotConfig) -> None:
+        if cfg.sniper_mode.enabled:
+            cfg = apply_sniper_overrides(cfg)
         self.cfg = cfg
+        self.sniper = cfg.sniper_mode if cfg.sniper_mode.enabled else None
         self.journal = Journal()
         self.connector = MT5Connector(cfg.mt5, cfg.trading)
         self.market_data = MarketData(self.connector)
@@ -69,7 +73,10 @@ class ScalperBot:
             self.connector, cfg.trading, notify=self.telegram.send_nowait
         )
         today = now_in_tz(cfg.sessions.timezone).date()
-        self.governor = DailyRiskGovernor(cfg.daily_goals, today)
+        if self.sniper:
+            self.governor: DailyRiskGovernor = SniperGovernor(cfg.risk, self.sniper, today)
+        else:
+            self.governor = DailyRiskGovernor(cfg.daily_goals, today)
 
         self.paused = False
         self.position: Optional[ManagedPosition] = None
@@ -205,33 +212,58 @@ class ScalperBot:
         signal.mode = self.cfg.mode
         self.active_strategy = signal.strategy.value
 
+        signal_only_info = False
+        if self.sniper:
+            sniper_adjust_signal(signal, snap, self.sniper)
+            signal.trade_number = self.governor.state.trades_today + 1
+            signal.max_trades_today = self.sniper.max_trades_per_day
+            if signal.score < self.sniper.min_sniper_score:
+                reason = (
+                    f"sniper score {signal.score}/{signal.max_score} below minimum "
+                    f"{self.sniper.min_sniper_score}"
+                )
+                logger.info("Signal rejected: {}", reason)
+                self.journal.log_event("INFO", "sniper_reject", reason)
+                return
+
         # Governor runs before every signal.
         open_loss = self._open_loss_usd()
         decision = self.governor.evaluate_new_trade(signal.score, open_loss)
         await self._flush_lock_events()
         if not decision.allowed:
-            logger.warning("Signal blocked by governor: {}", decision.reason)
-            self.journal.log_event("WARNING", "risk_block", decision.reason)
-            return
+            # Sniper scores in [min_sniper_score, min_execution_score) are worth
+            # seeing but never trading: pass them through as signal-only info.
+            if (
+                self.sniper
+                and self.cfg.mode is BotMode.SIGNAL_ONLY
+                and "score" in decision.reason
+            ):
+                signal_only_info = True
+                signal.note = f"not tradeable: {decision.reason}"
+            else:
+                logger.warning("Signal blocked by governor: {}", decision.reason)
+                self.journal.log_event("WARNING", "risk_block", decision.reason)
+                return
         signal.risk_usd = decision.risk_usd
 
-        check = self.risk_manager.validate_signal(
-            signal,
-            atr_value=snap.atr_now,
-            spread_points=spread,
-            open_positions=len(self.connector.open_positions()),
-            symbol_tradeable=spec.trade_allowed,
-        )
-        if not check.ok:
-            logger.warning("Signal rejected by risk manager: {}", check.reason)
-            self.journal.log_event("WARNING", "risk_block", check.reason)
-            return
+        if not signal_only_info:
+            check = self.risk_manager.validate_signal(
+                signal,
+                atr_value=snap.atr_now,
+                spread_points=spread,
+                open_positions=len(self.connector.open_positions()),
+                symbol_tradeable=spec.trade_allowed,
+            )
+            if not check.ok:
+                logger.warning("Signal rejected by risk manager: {}", check.reason)
+                self.journal.log_event("WARNING", "risk_block", check.reason)
+                return
 
-        lot_result = self.risk_manager.size_position(signal, spec)
-        if not lot_result.ok:
-            self.journal.log_event("WARNING", "lot_skip", lot_result.reason)
-            return
-        signal.lot = lot_result.lot
+            lot_result = self.risk_manager.size_position(signal, spec)
+            if not lot_result.ok:
+                self.journal.log_event("WARNING", "lot_skip", lot_result.reason)
+                return
+            signal.lot = lot_result.lot
 
         signal.signal_id = self.journal.record_signal(signal, SignalStatus.SENT)
         logger.info(
@@ -240,6 +272,8 @@ class ScalperBot:
             signal.sl, signal.tp, signal.lot, signal.score, signal.max_score,
         )
         await self.telegram.send_signal(signal, self.governor.state.realized_pnl, self.cfg.mode)
+        if signal_only_info:
+            return
         if self.cfg.mode is BotMode.SEMI_AUTO:
             self.pending_signals[signal.signal_id] = signal
 
@@ -429,15 +463,35 @@ class ScalperBot:
                 f"{self.position.direction.value} {self.position.lot} lot "
                 f"@ {self.position.entry:.2f} (ticket {self.position.ticket})"
             )
-        next_risk = self.governor.evaluate_new_trade(signal_score=11).risk_usd
+        perfect_score = 13 if self.sniper else 11
+        next_risk = self.governor.evaluate_new_trade(signal_score=perfect_score).risk_usd
+        target = (
+            self.cfg.risk.daily_profit_target_usd
+            if self.sniper
+            else self.cfg.daily_goals.daily_profit_target_usd
+        )
+        sniper_lines = ""
+        if self.sniper and isinstance(self.governor, SniperGovernor):
+            allowed, reason = self.governor.second_trade_status()
+            sniper_lines = (
+                f"First trade result: {self.governor.first_trade_result()}\n"
+                f"Second trade allowed: {'yes' if allowed else 'NO'}\n"
+                f"Second trade condition: {reason}\n"
+            )
+        trades_line = (
+            f"Trades today: {s.trades_today}/{self.sniper.max_trades_per_day}\n"
+            if self.sniper
+            else f"Trades today: {s.trades_today}\n"
+        )
         return (
             f"Account size: {fmt_usd(self.cfg.account.size_usd)}\n"
             f"Balance: {fmt_usd(balance)}\n"
             f"Equity: {fmt_usd(equity)}\n"
             f"Daily realized P/L: {fmt_usd(s.realized_pnl)}\n"
-            f"Daily target: {fmt_usd(self.cfg.daily_goals.daily_profit_target_usd)}\n"
+            f"Daily target: {fmt_usd(target)}\n"
             f"Daily lock: {'YES - ' + s.lock_reason if s.locked else 'no'}\n"
-            f"Trades today: {s.trades_today}\n"
+            f"{trades_line}"
+            f"{sniper_lines}"
             f"Consecutive losses: {s.consecutive_losses}\n"
             f"Regime: {self.current_regime}\n"
             f"Active strategy: {self.active_strategy}\n"

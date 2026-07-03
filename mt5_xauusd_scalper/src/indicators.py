@@ -197,6 +197,41 @@ def has_lower_highs_lower_lows(df: pd.DataFrame, window: int = 2, lookback: int 
     return highs[-1] < highs[-2] and lows[-1] < lows[-2]
 
 
+# ------------------------------------------------------------- liquidity sweep
+
+def detect_liquidity_sweep(
+    df: pd.DataFrame,
+    bullish: bool,
+    atr_now: float,
+    lookback: int = 20,
+    max_sweep_atr: float = 1.2,
+    recent: int = 5,
+) -> bool:
+    """True when price recently swept liquidity beyond the prior range and reclaimed it.
+
+    Bullish: one of the last `recent` bars dipped below the low of the preceding
+    `lookback` bars (stop hunt) by at most max_sweep_atr * ATR, and the latest
+    close is back above that level. Bearish is the mirror image.
+    """
+    if atr_now <= 0 or len(df) < lookback + recent:
+        return False
+    window = df.iloc[-(lookback + recent) : -recent]
+    tail = df.iloc[-recent:]
+    if bullish:
+        ref = float(window["low"].min())
+        extreme = float(tail["low"].min())
+        swept = extreme < ref
+        depth_ok = (ref - extreme) <= max_sweep_atr * atr_now
+        reclaimed = float(tail["close"].iloc[-1]) > ref
+    else:
+        ref = float(window["high"].max())
+        extreme = float(tail["high"].max())
+        swept = extreme > ref
+        depth_ok = (extreme - ref) <= max_sweep_atr * atr_now
+        reclaimed = float(tail["close"].iloc[-1]) < ref
+    return swept and depth_ok and reclaimed
+
+
 # --------------------------------------------------------------- filters
 
 def is_choppy_market(

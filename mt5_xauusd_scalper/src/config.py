@@ -165,6 +165,71 @@ class SessionsConfig(BaseModel):
     block_friday_after: str = "20:00"
 
 
+class SniperModeConfig(BaseModel):
+    """Highly selective 2-trades-per-day profile. When enabled it overrides
+    strategy RR, SL bounds, position management and the daily risk governor."""
+
+    enabled: bool = True
+    max_trades_per_day: int = 2
+    min_sniper_score: int = 10        # minimum 13-scale score to emit a signal at all
+    min_execution_score: int = 11     # minimum 13-scale score to execute the first trade
+    allow_no_trade_days: bool = True
+    allow_second_trade_after_loss: bool = False
+    second_trade_min_score: int = 11
+    second_trade_after_loss_min_score: int = 12
+    tp_r: float = 0.5
+    min_tp_r: float = 0.35
+    max_tp_r: float = 0.6
+    move_to_breakeven_at_r: float = 0.25
+    partial_close_enabled: bool = True
+    partial_close_at_r: float = 0.35
+    partial_close_percent: float = 50
+    time_exit_minutes: int = 5
+    max_trade_duration_minutes: int = 8
+    sweep_lookback_candles: int = 20
+    max_sweep_atr: float = 1.2
+    min_sl_atr: float = 0.7
+    max_sl_atr: float = 1.8
+
+    @model_validator(mode="after")
+    def _sanity(self) -> "SniperModeConfig":
+        if not self.min_tp_r <= self.tp_r <= self.max_tp_r:
+            raise ValueError("sniper_mode.tp_r must lie between min_tp_r and max_tp_r.")
+        if self.max_trades_per_day > 2:
+            raise ValueError("sniper_mode.max_trades_per_day cannot exceed 2.")
+        if self.second_trade_after_loss_min_score < self.second_trade_min_score:
+            raise ValueError(
+                "second_trade_after_loss_min_score must be >= second_trade_min_score "
+                "(a trade after a loss must be stricter, never looser)."
+            )
+        return self
+
+
+class RiskConfig(BaseModel):
+    """Risk settings used when sniper mode is enabled."""
+
+    account_size_usd: float = 25000
+    default_risk_per_trade_usd: float = 100
+    max_risk_per_trade_usd: float = 150
+    risk_after_win_usd: float = 100
+    risk_after_loss_usd: float = 50
+    max_daily_loss_usd: float = 150
+    max_open_loss_usd: float = 150
+    max_consecutive_losses: int = 1
+    stop_after_first_loss: bool = True
+    stop_after_second_trade: bool = True
+    daily_profit_target_usd: float = 200
+    daily_profit_lock_usd: float = 100
+
+    @model_validator(mode="after")
+    def _sanity(self) -> "RiskConfig":
+        if self.risk_after_loss_usd > self.default_risk_per_trade_usd:
+            raise ValueError("risk_after_loss_usd must not exceed the default risk.")
+        if self.default_risk_per_trade_usd > self.max_risk_per_trade_usd:
+            raise ValueError("default_risk_per_trade_usd must not exceed max_risk_per_trade_usd.")
+        return self
+
+
 class TelegramConfig(BaseModel):
     enabled: bool = True
     bot_token: str = ""
@@ -190,6 +255,8 @@ class BotConfig(BaseModel):
     regime: RegimeConfig = RegimeConfig()
     sessions: SessionsConfig = SessionsConfig()
     telegram: TelegramConfig = TelegramConfig()
+    sniper_mode: SniperModeConfig = SniperModeConfig()
+    risk: RiskConfig = RiskConfig()
 
     @model_validator(mode="after")
     def _live_auto_guard(self) -> "BotConfig":

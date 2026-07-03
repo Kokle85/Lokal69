@@ -111,6 +111,9 @@ class Signal:
     mode: BotMode = BotMode.SIGNAL_ONLY
     signal_id: Optional[int] = None
     candle_time: Optional[datetime] = None
+    trade_number: Optional[int] = None  # 1-based number of this trade today (sniper mode)
+    max_trades_today: int = 0
+    note: str = ""
 
     @property
     def sl_distance(self) -> float:

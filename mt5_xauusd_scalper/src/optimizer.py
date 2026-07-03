@@ -94,6 +94,67 @@ def evaluate_result(metrics: dict, total_days: int) -> tuple[bool, str, float]:
     return True, "", round(score, 4)
 
 
+def compare_trade_counts(base_cfg: BotConfig, m1: pd.DataFrame, spread_points: float) -> None:
+    """Compare sniper max_trades_per_day = 1 vs 2 and reject 2 if the second
+    trade does not earn its place."""
+    results = {}
+    for max_trades in (1, 2):
+        cfg = copy.deepcopy(base_cfg)
+        cfg.sniper_mode.enabled = True
+        cfg.sniper_mode.max_trades_per_day = max_trades
+        report = Backtester(cfg, m1, spread_points=spread_points).run()
+        results[max_trades] = report.metrics
+        logger.info(
+            "max_trades={}: trades={} net={} pf={} dd={}",
+            max_trades,
+            report.metrics.get("total_trades", 0),
+            report.metrics.get("net_pnl", 0),
+            report.metrics.get("profit_factor", 0),
+            report.metrics.get("max_drawdown", 0),
+        )
+
+    one, two = results[1], results[2]
+    reasons: list[str] = []
+
+    pf1 = float(two.get("profit_factor_trade1", 0) or 0)
+    pf2 = float(two.get("profit_factor_trade2", 0) or 0)
+    n2 = int(two.get("trades_as_no2", 0))
+    if n2 == 0:
+        reasons.append("no second trades were ever taken (nothing to justify max_trades=2)")
+    else:
+        if pf2 < pf1:
+            reasons.append(f"second trade profit factor {pf2} < first trade {pf1}")
+        dd1 = float(one.get("max_drawdown", 0) or 0)
+        dd2 = float(two.get("max_drawdown", 0) or 0)
+        if dd1 > 0 and dd2 > dd1 * 1.25:
+            reasons.append(f"second trade increases drawdown too much ({dd1} -> {dd2})")
+        if int(two.get("days_hitting_max_loss", 0)) > int(one.get("days_hitting_max_loss", 0)):
+            reasons.append("second trade causes more daily max-loss hits")
+        if float(two.get("expectancy", 0) or 0) < float(one.get("expectancy", 0) or 0):
+            reasons.append("second trade reduces per-trade expectancy")
+        # Proxy for "appears after bad market conditions": setup quality decay.
+        e1 = float(two.get("expectancy_trade1", 0) or 0)
+        e2 = float(two.get("expectancy_trade2", 0) or 0)
+        if e2 < 0 <= e1:
+            reasons.append("second trades lose on average while first trades win")
+
+    print("\n===== TRADE COUNT COMPARISON (sniper mode) =====")
+    for k in ("total_trades", "net_pnl", "profit_factor", "expectancy",
+              "max_drawdown", "days_hitting_max_loss", "positive_days_pct"):
+        print(f"{k:26s} 1-trade: {one.get(k, '-'):<12} 2-trade: {two.get(k, '-')}")
+    for k in ("trades_as_no2", "win_rate_trade1_pct", "win_rate_trade2_pct",
+              "profit_factor_trade1", "profit_factor_trade2",
+              "days_second_trade_improved", "days_second_trade_reduced"):
+        print(f"{k:26s} {two.get(k, '-')}")
+    if reasons:
+        print("\nVERDICT: keep max_trades_per_day = 1. The second trade is rejected:")
+        for reason in reasons:
+            print(f"  - {reason}")
+    else:
+        print("\nVERDICT: max_trades_per_day = 2 is acceptable on this sample.")
+    print("================================================\n")
+
+
 def main() -> int:
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -106,11 +167,27 @@ def main() -> int:
                         help="random sample size from the full grid (full grid = 59049 combos)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", default="data/optimizer_results.csv")
+    parser.add_argument(
+        "--compare-trade-counts", action="store_true",
+        help="compare sniper max_trades_per_day 1 vs 2 instead of the parameter grid",
+    )
     args = parser.parse_args()
 
     base_cfg = load_config(args.config)
     m1 = load_m1_from_csv(args.csv) if args.csv else load_m1_from_mt5(base_cfg, args.days)
     logger.info("Optimizing over {} M1 bars", len(m1))
+
+    if args.compare_trade_counts:
+        compare_trade_counts(base_cfg, m1, args.spread_points)
+        return 0
+
+    if base_cfg.sniper_mode.enabled:
+        # The grid explores base strategy parameters (RR 0.9-1.8 etc.), which
+        # sniper overrides would clobber. Sniper behavior is evaluated separately
+        # via --compare-trade-counts.
+        logger.info("Grid search runs with sniper_mode disabled")
+        base_cfg = copy.deepcopy(base_cfg)
+        base_cfg.sniper_mode.enabled = False
 
     keys = list(PARAMETER_GRID)
     combos = [dict(zip(keys, values)) for values in itertools.product(*PARAMETER_GRID.values())]

@@ -24,6 +24,7 @@ class DailyState:
     losses: int = 0
     consecutive_losses: int = 0
     last_trade_was_win: bool | None = None
+    trade_results: list[float] = field(default_factory=list)
     locked: bool = False
     lock_reason: str = ""
     daily_target_hit: bool = False
@@ -145,6 +146,7 @@ class DailyRiskGovernor:
         s = self.state
         s.realized_pnl += profit_usd
         s.trades_today += 1
+        s.trade_results.append(profit_usd)
         if profit_usd >= 0:
             s.wins += 1
             s.consecutive_losses = 0

@@ -56,6 +56,43 @@ zone), only one more trade is allowed, at **half risk** and only for a setup sco
 ≥ 9/11. Protecting capital and banked profit always outranks reaching the target.
 On many days the bot will simply not trade at all; that is correct behavior.
 
+## SNIPER_MODE (enabled by default)
+
+Sniper mode caps the day at **2 trades** while keeping only one position open at a
+time — and it never forces the second trade. Setups are re-scored on a **13-point
+scale**: the 11-point base setup score plus a 2-point bonus when a liquidity sweep
+of the prior range (max depth `max_sweep_atr` × ATR, within `sweep_lookback_candles`
+candles) was reclaimed.
+
+| Rule | Value |
+|---|---|
+| Signal threshold | score ≥ 10/13 (below 11 = information only, never traded) |
+| First trade executes at | score ≥ 11/13, risk $100 |
+| Second trade after a **win** | score ≥ 11/13, risk $100, target/lock/session/regime/spread re-checked |
+| Second trade after a **loss** | **blocked by default** (day locks). With `allow_second_trade_after_loss: true`: score ≥ 12/13 and risk $50 |
+| Daily locks | +$200 target, −$150 daily loss, 2 trades taken, open loss > $150 |
+| Green-day protection | once realized ≥ $100, the next trade's risk never exceeds banked profit |
+| Trade management | TP 0.5R (0.35–0.6 bounds), breakeven at 0.25R, 50% partial at 0.35R, time exit 5 min, hard exit 8 min, SL 0.7–1.8 ATR |
+
+Every Telegram signal shows `Trade number today: 1/2` (or `2/2`), and `/status`
+shows trades today as `X/2`, the first trade's result, whether a second trade is
+allowed and why not if blocked.
+
+The backtest reports first-vs-second trade win rate, profit factor, expectancy,
+days with 0/1/2 trades and how often the second trade improved or reduced the
+daily result. To decide whether the second trade earns its place at all:
+
+```bat
+python src/optimizer.py --days 10 --compare-trade-counts
+```
+
+This compares `max_trades_per_day` 1 vs 2 and **rejects the 2-trade setting** if
+the second trade has a lower profit factor than the first, inflates drawdown,
+causes more max-loss days, or drags expectancy down.
+
+Set `sniper_mode.enabled: false` in `config.yaml` to fall back to the standard
+`daily_goals` profile (4 trades/day, 2-loss lock).
+
 ## 5. Setup
 
 ### Requirements

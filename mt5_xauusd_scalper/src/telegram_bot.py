@@ -58,6 +58,12 @@ def format_signal_message(signal: Signal, daily_pnl: float, mode: BotMode) -> st
     strategy_label = (
         "High Precision Scalp" if signal.strategy.value == "HIGH_PRECISION_SCALP" else "Momentum Scalp"
     )
+    trade_no_line = (
+        f"Trade number today: {signal.trade_number}/{signal.max_trades_today}\n"
+        if signal.trade_number
+        else ""
+    )
+    note_line = f"Note: {signal.note}\n" if signal.note else ""
     return (
         f"XAUUSD {scalp}\n"
         f"\n"
@@ -72,6 +78,8 @@ def format_signal_message(signal: Signal, daily_pnl: float, mode: BotMode) -> st
         f"Score: {signal.score}/{signal.max_score}\n"
         f"Setup: {signal.setup_reason}\n"
         f"Spread: OK\n"
+        f"{trade_no_line}"
+        f"{note_line}"
         f"Daily P/L: {fmt_usd(daily_pnl)}\n"
         f"Mode: {mode.value}"
     )

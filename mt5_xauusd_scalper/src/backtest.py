@@ -27,6 +27,7 @@ from daily_risk_governor import DailyRiskGovernor
 from models import Direction, Regime, StrategyName, SymbolSpec
 from regime_detector import RegimeDetector, build_snapshot
 from risk_manager import calculate_lot, validate_sl_distance
+from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
 from strategy_high_precision import HighPrecisionStrategy
 from strategy_momentum import MomentumStrategy
 from strategy_selector import StrategySelector
@@ -58,6 +59,8 @@ class SimTrade:
     open_time: pd.Timestamp
     open_idx: int
     session_hour: int
+    trade_no: int = 1  # 1st or 2nd trade of its day
+    score: int = 0
     realized: float = 0.0
     partial_done: bool = False
     breakeven_done: bool = False
@@ -98,7 +101,10 @@ class Backtester:
         spec: SymbolSpec = DEFAULT_SPEC,
         spread_points: float = 18.0,
     ) -> None:
+        if cfg.sniper_mode.enabled:
+            cfg = apply_sniper_overrides(cfg)
         self.cfg = cfg
+        self.sniper = cfg.sniper_mode if cfg.sniper_mode.enabled else None
         self.m1 = m1.reset_index(drop=True)
         self.spec = spec
         self.spread_points = spread_points
@@ -137,7 +143,7 @@ class Backtester:
             if day != current_day:
                 if governor is not None:
                     report.daily_pnl[str(current_day)] = governor.state.realized_pnl
-                governor = DailyRiskGovernor(self.cfg.daily_goals, day)
+                governor = self._new_governor(day)
                 current_day = day
 
             # ---- manage the open trade first
@@ -170,6 +176,11 @@ class Backtester:
         report.metrics = self._compute_metrics(report)
         return report
 
+    def _new_governor(self, day) -> DailyRiskGovernor:
+        if self.sniper:
+            return SniperGovernor(self.cfg.risk, self.sniper, day)
+        return DailyRiskGovernor(self.cfg.daily_goals, day)
+
     # ------------------------------------------------------------- entries
 
     def _try_open(
@@ -199,6 +210,10 @@ class Backtester:
         if selection.signal is None:
             return None
         signal = selection.signal
+        if self.sniper:
+            sniper_adjust_signal(signal, snap, self.sniper)
+            if signal.score < self.sniper.min_sniper_score:
+                return None
 
         decision = governor.evaluate_new_trade(signal.score)
         if not decision.allowed:
@@ -230,6 +245,8 @@ class Backtester:
             session_hour=bar_time.tz_convert(self.cfg.sessions.timezone).hour
             if bar_time.tzinfo
             else bar_time.hour,
+            trade_no=governor.state.trades_today + 1,
+            score=signal.score,
         )
 
     # ------------------------------------------------------------- trade sim
@@ -351,6 +368,43 @@ class Backtester:
         )
         m["best_day"] = round(max(vals), 2) if vals else 0.0
         m["worst_day"] = round(min(vals), 2) if vals else 0.0
+
+        # --- first vs second trade of the day (sniper-mode reporting)
+        for trade_no in (1, 2):
+            subset = [t.realized for t in trades if t.trade_no == trade_no]
+            m[f"trades_as_no{trade_no}"] = len(subset)
+            if subset:
+                arr = np.array(subset)
+                sub_wins = arr[arr > 0]
+                sub_losses = arr[arr <= 0]
+                m[f"win_rate_trade{trade_no}_pct"] = round(100.0 * len(sub_wins) / len(arr), 2)
+                gw = float(sub_wins.sum()) if len(sub_wins) else 0.0
+                gl = float(-sub_losses.sum()) if len(sub_losses) else 0.0
+                m[f"profit_factor_trade{trade_no}"] = (
+                    round(gw / gl, 3) if gl > 0 else float("inf")
+                )
+                m[f"net_pnl_trade{trade_no}"] = round(float(arr.sum()), 2)
+                m[f"expectancy_trade{trade_no}"] = round(float(arr.mean()), 2)
+
+        trades_by_day: dict[str, list[SimTrade]] = _group(
+            trades, key=lambda t: str(t.open_time.date())
+        )
+        counts = {d: len(g) for d, g in trades_by_day.items()}
+        total_days = max(1, len(report.daily_pnl))
+        m["days_with_0_trades"] = total_days - len(counts)
+        m["days_with_1_trade"] = sum(1 for c in counts.values() if c == 1)
+        m["days_with_2_trades"] = sum(1 for c in counts.values() if c >= 2)
+        improved = reduced = 0
+        for day_trades in trades_by_day.values():
+            second = [t for t in day_trades if t.trade_no == 2]
+            if second:
+                pnl2 = sum(t.realized for t in second)
+                if pnl2 > 0:
+                    improved += 1
+                elif pnl2 < 0:
+                    reduced += 1
+        m["days_second_trade_improved"] = improved
+        m["days_second_trade_reduced"] = reduced
 
         for name, group in _group(trades, key=lambda t: t.strategy.value).items():
             m[f"pnl_by_strategy[{name}]"] = round(sum(t.realized for t in group), 2)

@@ -101,3 +101,43 @@ sessions:
 
 telegram:
   enabled: true
+
+# SNIPER_MODE: maximum 2 trades per day, both must be A++ setups (13-point scale).
+# The second trade is never forced; by default a losing first trade locks the day.
+sniper_mode:
+  enabled: true
+  max_trades_per_day: 2
+  min_sniper_score: 10
+  min_execution_score: 11
+  allow_no_trade_days: true
+  allow_second_trade_after_loss: false
+  second_trade_min_score: 11
+  second_trade_after_loss_min_score: 12
+  tp_r: 0.5
+  min_tp_r: 0.35
+  max_tp_r: 0.6
+  move_to_breakeven_at_r: 0.25
+  partial_close_enabled: true
+  partial_close_at_r: 0.35
+  partial_close_percent: 50
+  time_exit_minutes: 5
+  max_trade_duration_minutes: 8
+  sweep_lookback_candles: 20
+  max_sweep_atr: 1.2
+  min_sl_atr: 0.7
+  max_sl_atr: 1.8
+
+# Risk settings used while sniper_mode is enabled (daily_goals applies otherwise).
+risk:
+  account_size_usd: 25000
+  default_risk_per_trade_usd: 100
+  max_risk_per_trade_usd: 150
+  risk_after_win_usd: 100
+  risk_after_loss_usd: 50
+  max_daily_loss_usd: 150
+  max_open_loss_usd: 150
+  max_consecutive_losses: 1
+  stop_after_first_loss: true
+  stop_after_second_trade: true
+  daily_profit_target_usd: 200
+  daily_profit_lock_usd: 100
