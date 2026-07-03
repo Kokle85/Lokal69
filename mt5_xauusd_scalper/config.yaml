@@ -102,6 +102,21 @@ sessions:
 telegram:
   enabled: true
 
+# Realistic simulation costs for backtest.py / optimizer.py (not used live).
+# Conservative XAUUSD defaults: variable spread, per-side commission, adverse
+# slippage on every fill, and stop-before-target on bars that span both.
+backtest:
+  base_spread_points: 18.0
+  spread_std_points: 6.0
+  max_spread_points: 60.0
+  commission_per_lot_per_side_usd: 3.5
+  entry_slippage_points: 3.0
+  exit_slippage_points: 3.0
+  requote_probability: 0.05
+  requote_extra_points: 5.0
+  intrabar_fill: conservative   # conservative | optimistic | random
+  seed: 12345
+
 # SNIPER_MODE: maximum 2 trades per day, both must be A++ setups (13-point scale).
 # The second trade is never forced; by default a losing first trade locks the day.
 sniper_mode:

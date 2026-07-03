@@ -388,7 +388,11 @@ class ScalperBot:
                 break
 
         duration = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60.0
-        reason = CloseReason.UNKNOWN.value
+        reason = self._infer_close_reason(pos, close_price, duration)
+        logger.info(
+            "Position {} closed: {} @ {} for {} (held {:.1f} min)",
+            pos.ticket, reason, close_price, fmt_usd(profit), duration,
+        )
         self.journal.close_trade(pos.trade_id, close_price, profit, reason, duration)
         events = self.governor.on_trade_closed(profit)
         self.position = None
@@ -398,6 +402,32 @@ class ScalperBot:
         for event in events:
             self.telegram.send_nowait(event.message)
             self.journal.log_event("WARNING", "daily_lock", event.message, {"reason": event.reason})
+
+    def _infer_close_reason(self, pos: ManagedPosition, close_price: float, duration: float) -> str:
+        """Classify how a position closed by comparing the fill to its SL/TP.
+
+        The broker doesn't hand us a labelled reason, so we reconcile the close
+        price against the trade's levels (tolerance = a few points) and fall back
+        to the time-based exits the bot itself would have issued.
+        """
+        if close_price <= 0:
+            return CloseReason.UNKNOWN.value
+        spec_point = 0.01
+        try:
+            spec_point = self.connector.symbol_spec().point
+        except MT5Error:
+            pass
+        tol = 25 * spec_point  # within ~25 points of a level counts as that level
+        if abs(close_price - pos.tp) <= tol:
+            return CloseReason.TAKE_PROFIT.value
+        if abs(close_price - pos.sl) <= tol:
+            # SL at/beyond breakeven that got hit still reports as STOP_LOSS.
+            return CloseReason.STOP_LOSS.value
+        if duration >= self.cfg.position_management.max_trade_duration_minutes:
+            return CloseReason.MAX_DURATION.value
+        if duration >= self.cfg.position_management.time_exit_minutes:
+            return CloseReason.TIME_EXIT.value
+        return CloseReason.MANUAL.value
 
     # ================================================================ helpers
 

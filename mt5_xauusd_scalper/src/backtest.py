@@ -1,16 +1,21 @@
 """Backtester: replays M1 history through the live strategy/risk stack.
 
 M5/M15 candles are resampled from M1 so all timeframes stay aligned.
-Spread is charged as a fixed cost per trade (points -> USD) which is the
-conservative, transparent choice for bar-based simulation.
+Costs are modelled realistically (cost_model.py): variable spread, per-side
+commission, adverse slippage on every fill, occasional requotes, and a
+configurable intrabar rule for bars that span both stop and target.
+Position management goes through the SAME decide_actions() the live bot uses,
+so backtest behaviour cannot silently drift from live behaviour.
 
 Usage:
-    python src/backtest.py --days 30              # pull M1 history from MT5
-    python src/backtest.py --csv data/m1.csv      # or use a CSV export
+    python src/backtest.py --days 30                     # pull M1 history from MT5
+    python src/backtest.py --csv data/m1.csv             # or use a CSV export
+    python src/backtest.py --csv data/m1.csv --export-trades data/trades.csv
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,8 +28,10 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import BotConfig, load_config
+from cost_model import CostModel
 from daily_risk_governor import DailyRiskGovernor
-from models import Direction, Regime, StrategyName, SymbolSpec
+from models import Direction, PositionActionType, Regime, StrategyName, SymbolSpec
+from position_manager import decide_actions
 from regime_detector import RegimeDetector, build_snapshot
 from risk_manager import calculate_lot, validate_sl_distance
 from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
@@ -49,7 +56,8 @@ class SimTrade:
     direction: Direction
     strategy: StrategyName
     regime: Regime
-    entry: float
+    entry: float            # actual fill price (adverse-adjusted, drives PnL)
+    intended_entry: float   # signal entry (drives R geometry: TP/SL/partials)
     sl: float
     tp: float
     initial_sl: float
@@ -59,9 +67,11 @@ class SimTrade:
     open_time: pd.Timestamp
     open_idx: int
     session_hour: int
-    trade_no: int = 1  # 1st or 2nd trade of its day
+    trade_index: int = 0    # global trade counter (seeds the cost model)
+    trade_no: int = 1       # 1st or 2nd trade of its day
     score: int = 0
-    realized: float = 0.0
+    realized: float = 0.0   # net of commission and slippage
+    commission_usd: float = 0.0
     partial_done: bool = False
     breakeven_done: bool = False
     close_time: Optional[pd.Timestamp] = None
@@ -69,7 +79,7 @@ class SimTrade:
 
     @property
     def risk_distance(self) -> float:
-        return abs(self.entry - self.initial_sl)
+        return abs(self.intended_entry - self.initial_sl)
 
 
 @dataclass
@@ -99,15 +109,20 @@ class Backtester:
         cfg: BotConfig,
         m1: pd.DataFrame,
         spec: SymbolSpec = DEFAULT_SPEC,
-        spread_points: float = 18.0,
+        spread_points: Optional[float] = None,
     ) -> None:
-        if cfg.sniper_mode.enabled:
-            cfg = apply_sniper_overrides(cfg)
+        cfg = apply_sniper_overrides(cfg) if cfg.sniper_mode.enabled else copy.deepcopy(cfg)
+        if spread_points is not None:  # CLI/optimizer override of the base spread
+            cfg.backtest.base_spread_points = spread_points
         self.cfg = cfg
         self.sniper = cfg.sniper_mode if cfg.sniper_mode.enabled else None
         self.m1 = m1.reset_index(drop=True)
         self.spec = spec
-        self.spread_points = spread_points
+        # The signal/regime layer sees the model's base spread so its spread
+        # filters behave as they would live; per-fill cost uses the full model.
+        self.spread_points = cfg.backtest.base_spread_points
+        self.cost = CostModel(cfg.backtest, spec)
+        self._trade_counter = 0
         self.m5 = resample_m1(m1, 5)
         self.m15 = resample_m1(m1, 15)
         self.detector = RegimeDetector(cfg.regime, cfg.trading.max_spread_points)
@@ -167,7 +182,7 @@ class Backtester:
         # flush the last day / force-close a dangling trade at the last close
         if open_trade is not None:
             last = self.m1.iloc[-1]
-            self._close_trade(open_trade, float(last["close"]), open_trade.lot, last["time"], "END_OF_DATA")
+            self._exit(open_trade, float(last["close"]), open_trade.lot, last["time"], "END_OF_DATA")
             governor.on_trade_closed(open_trade.realized)
             report.trades.append(open_trade)
         if governor is not None:
@@ -227,13 +242,16 @@ class Backtester:
         if not lot_result.ok:
             return None
 
-        spread_price = self.spread_points * self.spec.point
-        entry = signal.entry + spread_price if signal.direction is Direction.BUY else signal.entry
+        self._trade_counter += 1
+        idx = self._trade_counter
+        fill = self.cost.entry_fill(signal.entry, signal.direction, idx)
+        entry_commission = self.cost.commission(lot_result.lot)
         return SimTrade(
             direction=signal.direction,
             strategy=signal.strategy,
             regime=signal.regime,
-            entry=entry,
+            entry=fill.price,
+            intended_entry=signal.entry,
             sl=signal.sl,
             tp=signal.tp,
             initial_sl=signal.sl,
@@ -245,8 +263,11 @@ class Backtester:
             session_hour=bar_time.tz_convert(self.cfg.sessions.timezone).hour
             if bar_time.tzinfo
             else bar_time.hour,
+            trade_index=idx,
             trade_no=governor.state.trades_today + 1,
             score=signal.score,
+            realized=-entry_commission,
+            commission_usd=entry_commission,
         )
 
     # ------------------------------------------------------------- trade sim
@@ -255,10 +276,21 @@ class Backtester:
         diff = exit_price - trade.entry if trade.direction is Direction.BUY else trade.entry - exit_price
         return diff * self._usd_per_unit * lot
 
-    def _close_trade(
-        self, trade: SimTrade, price: float, lot: float, when: pd.Timestamp, reason: str
+    def _exit(
+        self,
+        trade: SimTrade,
+        level_price: float,
+        lot: float,
+        when: pd.Timestamp,
+        reason: str,
+        apply_costs: bool = True,
     ) -> None:
-        trade.realized += self._pnl(trade, price, lot)
+        """Close `lot` of the trade at `level_price`, applying exit slippage/spread
+        and per-lot commission. Fully closes the trade when no volume remains."""
+        fill = self.cost.exit_fill(level_price, trade.direction, trade.trade_index) if apply_costs else level_price
+        commission = self.cost.commission(lot)
+        trade.realized += self._pnl(trade, fill, lot) - commission
+        trade.commission_usd += commission
         trade.lot = round(trade.lot - lot, 8)
         if trade.lot <= 1e-9:
             trade.close_time = when
@@ -266,7 +298,11 @@ class Backtester:
 
     def _process_bar(self, trade: SimTrade, bar: pd.Series, i: int, pm) -> bool:
         """Advance the open trade one M1 bar. Returns True when fully closed.
-        Conservative intra-bar ordering: stop loss is always assumed to hit first."""
+
+        Management decisions go through the shared decide_actions() so the
+        backtest applies the SAME breakeven/partial/time rules as the live bot.
+        Fills (SL/TP/market) are simulated here with the realistic cost model.
+        """
         high, low, close = float(bar["high"]), float(bar["low"]), float(bar["close"])
         when = bar["time"]
         buying = trade.direction is Direction.BUY
@@ -274,41 +310,55 @@ class Backtester:
         minutes_open = i - trade.open_idx
 
         sl_hit = low <= trade.sl if buying else high >= trade.sl
-        if sl_hit:
-            self._close_trade(trade, trade.sl, trade.lot, when, "STOP_LOSS")
-            return True
-
         tp_hit = high >= trade.tp if buying else low <= trade.tp
+        if sl_hit and tp_hit:
+            # One bar spans both: intrabar rule decides which fills first.
+            if self.cost.stop_hit_first(trade.trade_index):
+                self._exit(trade, trade.sl, trade.lot, when, "STOP_LOSS")
+            else:
+                self._exit(trade, trade.tp, trade.lot, when, "TAKE_PROFIT")
+            return True
+        if sl_hit:
+            self._exit(trade, trade.sl, trade.lot, when, "STOP_LOSS")
+            return True
         if tp_hit:
-            self._close_trade(trade, trade.tp, trade.lot, when, "TAKE_PROFIT")
+            self._exit(trade, trade.tp, trade.lot, when, "TAKE_PROFIT")
             return True
 
+        ref = trade.intended_entry
         best = high if buying else low
-        best_r = ((best - trade.entry) if buying else (trade.entry - best)) / risk if risk > 0 else 0.0
+        favorable_r = ((best - ref) if buying else (ref - best)) / risk if risk > 0 else 0.0
+        close_r = ((close - ref) if buying else (ref - close)) / risk if risk > 0 else 0.0
 
-        if not trade.breakeven_done and best_r >= pm.move_to_breakeven_at_r:
-            trade.sl = trade.entry
-            trade.breakeven_done = True
-
-        if pm.partial_close_enabled and not trade.partial_done and best_r >= pm.partial_close_at_r:
-            partial_price = (
-                trade.entry + pm.partial_close_at_r * risk
-                if buying
-                else trade.entry - pm.partial_close_at_r * risk
-            )
-            close_lot = round(trade.initial_lot * pm.partial_close_percent / 100.0, 8)
-            close_lot = min(close_lot, trade.lot)
-            if close_lot > 0 and trade.lot - close_lot > 1e-9:
-                self._close_trade(trade, partial_price, close_lot, when, "PARTIAL")
-                trade.partial_done = True
-
-        close_r = ((close - trade.entry) if buying else (trade.entry - close)) / risk if risk > 0 else 0.0
-        if minutes_open >= pm.max_trade_duration_minutes:
-            self._close_trade(trade, close, trade.lot, when, "MAX_DURATION")
-            return True
-        if minutes_open >= pm.time_exit_minutes and close_r < pm.time_exit_min_r:
-            self._close_trade(trade, close, trade.lot, when, "TIME_EXIT")
-            return True
+        for action in decide_actions(
+            favorable_r=favorable_r,
+            current_r=close_r,
+            minutes_open=minutes_open,
+            breakeven_done=trade.breakeven_done,
+            partial_done=trade.partial_done,
+            entry_price=trade.entry,
+            cfg=pm,
+        ):
+            if action.action is PositionActionType.MOVE_BREAKEVEN:
+                trade.sl = trade.entry  # risk-free at the actual entry fill
+                trade.breakeven_done = True
+            elif action.action is PositionActionType.PARTIAL_CLOSE:
+                partial_level = (
+                    ref + pm.partial_close_at_r * risk
+                    if buying
+                    else ref - pm.partial_close_at_r * risk
+                )
+                close_lot = round(trade.initial_lot * pm.partial_close_percent / 100.0, 8)
+                close_lot = min(close_lot, trade.lot)
+                if close_lot > 0 and trade.lot - close_lot > 1e-9:
+                    self._exit(trade, partial_level, close_lot, when, "PARTIAL")
+                    trade.partial_done = True
+            elif action.action in (
+                PositionActionType.TIME_EXIT,
+                PositionActionType.MAX_DURATION_EXIT,
+            ):
+                self._exit(trade, close, trade.lot, when, action.action.value)
+                return True
         return False
 
     # ------------------------------------------------------------- metrics
@@ -332,10 +382,24 @@ class Backtester:
         m["average_loss"] = round(float(losses.mean()), 2) if len(losses) else 0.0
         m["expectancy"] = round(float(pnls.mean()), 2)
         m["net_pnl"] = round(float(pnls.sum()), 2)
+        m["total_commission"] = round(sum(t.commission_usd for t in trades), 2)
+        gross_before_costs = m["net_pnl"] + m["total_commission"]
+        m["cost_drag_pct"] = (
+            round(100.0 * m["total_commission"] / abs(gross_before_costs), 2)
+            if gross_before_costs
+            else 0.0
+        )
 
         equity = np.cumsum(pnls)
         peak = np.maximum.accumulate(equity)
         m["max_drawdown"] = round(float((peak - equity).max()), 2)
+
+        # Risk-adjusted return per trade (Sharpe/Sortino on the trade series).
+        std = float(pnls.std(ddof=1)) if len(pnls) > 1 else 0.0
+        m["sharpe_per_trade"] = round(float(pnls.mean()) / std, 3) if std > 0 else 0.0
+        downside = pnls[pnls < 0]
+        dstd = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+        m["sortino_per_trade"] = round(float(pnls.mean()) / dstd, 3) if dstd > 0 else 0.0
 
         streak = worst = 0
         for p in pnls:
@@ -354,12 +418,16 @@ class Backtester:
         trade_days = [d for d, v in daily.items() if v != 0.0] or list(daily)
         m["trades_per_day"] = round(len(trades) / max(1, len(daily)), 2)
         m["no_trade_days"] = sum(1 for v in daily.values() if v == 0.0)
-        m["days_hitting_target"] = sum(
-            1 for v in daily.values() if v >= self.cfg.daily_goals.daily_profit_target_usd
+        target = (
+            self.cfg.risk.daily_profit_target_usd if self.sniper
+            else self.cfg.daily_goals.daily_profit_target_usd
         )
-        m["days_hitting_max_loss"] = sum(
-            1 for v in daily.values() if v <= -self.cfg.daily_goals.max_daily_loss_usd
+        max_loss = (
+            self.cfg.risk.max_daily_loss_usd if self.sniper
+            else self.cfg.daily_goals.max_daily_loss_usd
         )
+        m["days_hitting_target"] = sum(1 for v in daily.values() if v >= target)
+        m["days_hitting_max_loss"] = sum(1 for v in daily.values() if v <= -max_loss)
         vals = list(daily.values())
         m["avg_daily_pnl"] = round(float(np.mean(vals)), 2) if vals else 0.0
         m["median_daily_pnl"] = round(float(np.median(vals)), 2) if vals else 0.0
@@ -460,6 +528,31 @@ def print_report(report: BacktestReport) -> None:
     print("===========================\n")
 
 
+def export_trades_csv(report: BacktestReport, path: str) -> None:
+    """Write the per-trade ledger (with running equity) for external analysis."""
+    import csv
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    equity = 0.0
+    with out.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            ["trade_index", "open_time", "close_time", "direction", "strategy", "regime",
+             "trade_no", "score", "entry", "sl", "tp", "lot", "close_reason",
+             "commission_usd", "pnl", "equity"]
+        )
+        for t in report.trades:
+            equity += t.realized
+            writer.writerow(
+                [t.trade_index, t.open_time, t.close_time, t.direction.value, t.strategy.value,
+                 t.regime.value, t.trade_no, t.score, round(t.entry, 2), round(t.sl, 2),
+                 round(t.tp, 2), t.initial_lot, t.close_reason, round(t.commission_usd, 2),
+                 round(t.realized, 2), round(equity, 2)]
+            )
+    logger.info("Trade ledger written to {}", out)
+
+
 def main() -> int:
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -467,7 +560,9 @@ def main() -> int:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--days", type=int, default=30, help="days of M1 history from MT5")
     parser.add_argument("--csv", default=None, help="CSV with M1 candles instead of MT5")
-    parser.add_argument("--spread-points", type=float, default=18.0)
+    parser.add_argument("--spread-points", type=float, default=None,
+                        help="override backtest.base_spread_points")
+    parser.add_argument("--export-trades", default=None, help="write per-trade ledger CSV")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -479,6 +574,8 @@ def main() -> int:
 
     report = Backtester(cfg, m1, spread_points=args.spread_points).run()
     print_report(report)
+    if args.export_trades:
+        export_trades_csv(report, args.export_trades)
     return 0
 
 

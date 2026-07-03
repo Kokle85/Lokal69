@@ -243,6 +243,34 @@ class TelegramConfig(BaseModel):
         return self
 
 
+class BacktestConfig(BaseModel):
+    """Realistic simulation costs and fill assumptions for backtest/optimizer.
+
+    Defaults are deliberately conservative for XAUUSD on a retail/ECN account:
+    a ~18-point base spread, per-side commission, adverse slippage on every
+    fill, and an intrabar rule that assumes the stop is hit before the target
+    when a single bar spans both.
+    """
+
+    base_spread_points: float = 18.0
+    spread_std_points: float = 6.0          # random spread variation (seeded per trade)
+    max_spread_points: float = 60.0         # spread never modelled above this
+    commission_per_lot_per_side_usd: float = 3.5
+    entry_slippage_points: float = 3.0      # adverse slippage crossing in
+    exit_slippage_points: float = 3.0       # adverse slippage crossing out (market exits)
+    requote_probability: float = 0.05       # fraction of entries that slip an extra tick
+    requote_extra_points: float = 5.0
+    intrabar_fill: str = "conservative"     # conservative | optimistic | random
+    seed: int = 12345
+
+    @field_validator("intrabar_fill")
+    @classmethod
+    def _valid_fill(cls, v: str) -> str:
+        if v not in {"conservative", "optimistic", "random"}:
+            raise ValueError("backtest.intrabar_fill must be conservative, optimistic or random.")
+        return v
+
+
 class BotConfig(BaseModel):
     mode: BotMode = BotMode.SIGNAL_ONLY
     account: AccountConfig = AccountConfig()
@@ -257,6 +285,7 @@ class BotConfig(BaseModel):
     telegram: TelegramConfig = TelegramConfig()
     sniper_mode: SniperModeConfig = SniperModeConfig()
     risk: RiskConfig = RiskConfig()
+    backtest: BacktestConfig = BacktestConfig()
 
     @model_validator(mode="after")
     def _live_auto_guard(self) -> "BotConfig":
