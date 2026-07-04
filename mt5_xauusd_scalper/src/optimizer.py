@@ -37,6 +37,19 @@ PARAMETER_GRID: dict[str, list] = {
     "time_exit_minutes": [6, 8, 10],
 }
 
+# Grid for SNIPER_MODE geometry (used with --sniper-grid): tests the levers
+# that control cost efficiency and winner-scratching, not the entry signal.
+SNIPER_GRID: dict[str, list] = {
+    "tp_r": [1.2, 1.4, 1.6],
+    "min_sl_atr": [0.7, 0.8, 1.0],
+    "max_sl_atr": [1.8, 2.0, 2.2],
+    "move_to_breakeven_at_r": [0.5, 0.6, 0.7],
+    "partial_close_at_r": [0.9, 1.0, 1.2],
+    "time_exit_minutes": [12, 15, 20],
+    "min_execution_score": [11, 12],
+    "max_cost_to_tp_pct": [20, 25, 30],
+}
+
 # Hard rejection thresholds - results failing any of these are discarded.
 MIN_PROFIT_FACTOR = 1.2
 MIN_TRADES = 100
@@ -57,6 +70,23 @@ def apply_params(base: BotConfig, params: dict) -> BotConfig:
     cfg.position_management.move_to_breakeven_at_r = params["move_to_breakeven_at_r"]
     cfg.position_management.partial_close_at_r = params["partial_close_at_r"]
     cfg.position_management.time_exit_minutes = params["time_exit_minutes"]
+    return cfg
+
+
+def apply_sniper_params(base: BotConfig, params: dict) -> BotConfig:
+    cfg = copy.deepcopy(base)
+    cfg.sniper_mode.enabled = True
+    s = cfg.sniper_mode
+    s.tp_r = params["tp_r"]
+    s.min_tp_r = min(s.min_tp_r, s.tp_r)
+    s.max_tp_r = max(s.max_tp_r, s.tp_r)
+    s.min_sl_atr = params["min_sl_atr"]
+    s.max_sl_atr = params["max_sl_atr"]
+    s.move_to_breakeven_at_r = params["move_to_breakeven_at_r"]
+    s.partial_close_at_r = params["partial_close_at_r"]
+    s.time_exit_minutes = params["time_exit_minutes"]
+    s.min_execution_score = params["min_execution_score"]
+    cfg.trading.max_cost_to_tp_pct = params["max_cost_to_tp_pct"]
     return cfg
 
 
@@ -171,6 +201,11 @@ def main() -> int:
         "--compare-trade-counts", action="store_true",
         help="compare sniper max_trades_per_day 1 vs 2 instead of the parameter grid",
     )
+    parser.add_argument(
+        "--sniper-grid", action="store_true",
+        help="optimize SNIPER_MODE geometry (tp_r, SL bounds, BE/partial, cost gate) "
+             "instead of the base-strategy grid",
+    )
     args = parser.parse_args()
 
     base_cfg = load_config(args.config)
@@ -181,16 +216,20 @@ def main() -> int:
         compare_trade_counts(base_cfg, m1, args.spread_points)
         return 0
 
-    if base_cfg.sniper_mode.enabled:
-        # The grid explores base strategy parameters (RR 0.9-1.8 etc.), which
-        # sniper overrides would clobber. Sniper behavior is evaluated separately
-        # via --compare-trade-counts.
-        logger.info("Grid search runs with sniper_mode disabled")
-        base_cfg = copy.deepcopy(base_cfg)
-        base_cfg.sniper_mode.enabled = False
+    if args.sniper_grid:
+        grid, apply_fn = SNIPER_GRID, apply_sniper_params
+        logger.info("Optimizing SNIPER_MODE geometry ({} parameters)", len(grid))
+    else:
+        grid, apply_fn = PARAMETER_GRID, apply_params
+        if base_cfg.sniper_mode.enabled:
+            # The base grid explores strategy parameters (RR 0.9-1.8 etc.), which
+            # sniper overrides would clobber. Use --sniper-grid for sniper tuning.
+            logger.info("Grid search runs with sniper_mode disabled (use --sniper-grid for sniper)")
+            base_cfg = copy.deepcopy(base_cfg)
+            base_cfg.sniper_mode.enabled = False
 
-    keys = list(PARAMETER_GRID)
-    combos = [dict(zip(keys, values)) for values in itertools.product(*PARAMETER_GRID.values())]
+    keys = list(grid)
+    combos = [dict(zip(keys, values)) for values in itertools.product(*grid.values())]
     if args.sample and args.sample < len(combos):
         random.Random(args.seed).shuffle(combos)
         combos = combos[: args.sample]
@@ -198,7 +237,7 @@ def main() -> int:
 
     rows: list[dict] = []
     for idx, params in enumerate(combos, 1):
-        cfg = apply_params(base_cfg, params)
+        cfg = apply_fn(base_cfg, params)
         report = Backtester(cfg, m1, spread_points=args.spread_points).run()
         total_days = len(report.daily_pnl)
         accepted, reason, score = evaluate_result(report.metrics, total_days)

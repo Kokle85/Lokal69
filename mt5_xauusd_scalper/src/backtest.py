@@ -32,8 +32,8 @@ from cost_model import CostModel
 from daily_risk_governor import DailyRiskGovernor
 from models import Direction, PositionActionType, Regime, StrategyName, SymbolSpec
 from position_manager import decide_actions
-from regime_detector import RegimeDetector, build_snapshot
-from risk_manager import calculate_lot, validate_sl_distance
+from regime_detector import RegimeDetector, build_snapshot, geometry_atr
+from risk_manager import calculate_lot, check_cost_to_tp, validate_sl_distance
 from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
 from strategy_high_precision import HighPrecisionStrategy
 from strategy_momentum import MomentumStrategy
@@ -235,8 +235,15 @@ class Backtester:
             return None
         signal.risk_usd = decision.risk_usd
 
-        sl_check = validate_sl_distance(signal.entry, signal.sl, snap.atr_now, self.cfg.strategy)
+        sl_check = validate_sl_distance(
+            signal.entry, signal.sl, geometry_atr(snap, self.cfg.strategy), self.cfg.strategy
+        )
         if not sl_check.ok:
+            return None
+        cost_check = check_cost_to_tp(
+            signal.entry, signal.tp, self.spread_points, self.spec.point, self.cfg.trading
+        )
+        if not cost_check.ok:
             return None
         lot_result = calculate_lot(signal.risk_usd, signal.entry, signal.sl, self.spec)
         if not lot_result.ok:

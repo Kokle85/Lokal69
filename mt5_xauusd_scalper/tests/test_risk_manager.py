@@ -13,7 +13,7 @@ def risk_manager(tuning) -> RiskManager:
     return RiskManager(TradingConfig(), tuning)
 
 
-def make_signal(entry=2000.0, sl=1999.6, tp=2000.4) -> Signal:
+def make_signal(entry=2000.0, sl=1999.0, tp=2001.5) -> Signal:
     return Signal(
         symbol="XAUUSD",
         direction=Direction.BUY,
@@ -32,7 +32,7 @@ def make_signal(entry=2000.0, sl=1999.6, tp=2000.4) -> Signal:
     )
 
 
-ATR = 0.35
+ATR = 0.8  # geometry ATR; default signal SL distance 1.0 -> 1.25 ATR (in bounds)
 
 
 def test_valid_signal_passes(risk_manager):
@@ -90,6 +90,26 @@ def test_sl_too_large_rejected(tuning):
 
 def test_sl_within_bounds_accepted(tuning):
     check = validate_sl_distance(2000.0, 2000.0 - 1.2 * ATR, ATR, tuning)
+    assert check.ok
+
+
+def test_cost_gate_blocks_thin_tp(risk_manager):
+    # TP only 30pt away: spread 10 + buffer 12 = 22pt cost = 73% of target -> block
+    signal = make_signal(tp=2000.30)
+    check = risk_manager.validate_signal(
+        signal, atr_value=ATR, spread_points=10, open_positions=0,
+        symbol_tradeable=True, point=0.01,
+    )
+    assert not check.ok
+    assert "cost" in check.reason
+
+
+def test_cost_gate_passes_wide_tp(risk_manager):
+    # TP 150pt away: 22pt cost = ~15% of target -> fine
+    check = risk_manager.validate_signal(
+        make_signal(), atr_value=ATR, spread_points=10, open_positions=0,
+        symbol_tradeable=True, point=0.01,
+    )
     assert check.ok
 
 

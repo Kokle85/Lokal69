@@ -65,6 +65,36 @@ def calculate_lot(
     return LotResult(True, lot, "ok", actual_loss)
 
 
+def check_cost_to_tp(
+    entry: float,
+    tp: float,
+    spread_points: float,
+    point: float,
+    trading: TradingConfig,
+) -> RiskCheck:
+    """Reject trades whose fixed costs eat too much of the profit target.
+
+    Estimated round-trip cost = current spread + cost_buffer_points (slippage
+    in/out + commission expressed in points). If that exceeds
+    max_cost_to_tp_pct of the TP distance, the trade is structurally
+    unprofitable regardless of signal quality.
+    """
+    if point <= 0:
+        return RiskCheck(False, "invalid symbol point size")
+    tp_points = abs(tp - entry) / point
+    if tp_points <= 0:
+        return RiskCheck(False, "TP distance is zero")
+    cost_points = spread_points + trading.cost_buffer_points
+    cost_pct = 100.0 * cost_points / tp_points
+    if cost_pct > trading.max_cost_to_tp_pct:
+        return RiskCheck(
+            False,
+            f"round-trip cost ~{cost_points:.0f}pt is {cost_pct:.0f}% of TP distance "
+            f"{tp_points:.0f}pt (limit {trading.max_cost_to_tp_pct:.0f}%)",
+        )
+    return RiskCheck(True, "ok")
+
+
 def validate_sl_distance(
     entry: float, sl: float, atr_value: float, tuning: StrategyTuningConfig
 ) -> RiskCheck:
@@ -95,6 +125,7 @@ class RiskManager:
         spread_points: float,
         open_positions: int,
         symbol_tradeable: bool,
+        point: float = 0.01,
     ) -> RiskCheck:
         if signal.sl <= 0 or signal.sl_distance <= 0:
             return RiskCheck(False, "signal has no stop loss")
@@ -110,6 +141,9 @@ class RiskManager:
         sl_check = validate_sl_distance(signal.entry, signal.sl, atr_value, self.tuning)
         if not sl_check.ok:
             return sl_check
+        cost_check = check_cost_to_tp(signal.entry, signal.tp, spread_points, point, self.trading)
+        if not cost_check.ok:
+            return cost_check
         return RiskCheck(True, "ok")
 
     def size_position(self, signal: Signal, spec: SymbolSpec) -> LotResult:

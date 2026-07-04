@@ -28,7 +28,7 @@ from models import (
 )
 from mt5_connector import MT5Connector, MT5Error
 from position_manager import apply_action_to_state, evaluate_position
-from regime_detector import RegimeDetector, build_snapshot
+from regime_detector import RegimeDetector, build_snapshot, geometry_atr
 from risk_manager import RiskManager
 from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
 from strategy_high_precision import HighPrecisionStrategy
@@ -249,10 +249,11 @@ class ScalperBot:
         if not signal_only_info:
             check = self.risk_manager.validate_signal(
                 signal,
-                atr_value=snap.atr_now,
+                atr_value=geometry_atr(snap, self.cfg.strategy),
                 spread_points=spread,
                 open_positions=len(self.connector.open_positions()),
                 symbol_tradeable=spec.trade_allowed,
+                point=spec.point,
             )
             if not check.ok:
                 logger.warning("Signal rejected by risk manager: {}", check.reason)

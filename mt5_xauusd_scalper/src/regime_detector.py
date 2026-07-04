@@ -75,6 +75,14 @@ def build_snapshot(
     )
 
 
+def geometry_atr(snap: MarketSnapshot, tuning: StrategyTuningConfig) -> float:
+    """ATR that defines stop geometry: M5 by default (wider stops so fixed
+    costs stay a small fraction of the target), M1 if configured."""
+    if tuning.sl_timeframe == "M5":
+        return float(snap.m5_atr.iloc[-1])
+    return snap.atr_now
+
+
 class RegimeDetector:
     def __init__(self, cfg: RegimeConfig, max_spread_points: float) -> None:
         self.cfg = cfg

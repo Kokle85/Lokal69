@@ -25,6 +25,11 @@ def in_session(cfg: SessionsConfig, now: datetime | None = None) -> tuple[bool, 
     if local.weekday() >= 5:
         return False, "weekend"
 
+    # Data-driven hour filter (from backtest pnl_by_hour); applies even when
+    # the window filter is disabled.
+    if cfg.allowed_hours and local.hour not in cfg.allowed_hours:
+        return False, f"hour {local.hour:02d} not in allowed_hours {sorted(cfg.allowed_hours)}"
+
     if not cfg.enabled:
         return True, "session filter disabled"
 

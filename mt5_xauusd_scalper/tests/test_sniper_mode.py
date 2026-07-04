@@ -42,14 +42,16 @@ def test_sniper_config_rejects_looser_after_loss_score():
 
 def test_apply_sniper_overrides():
     cfg = apply_sniper_overrides(BotConfig())
-    assert cfg.strategies.high_precision_scalp.rr == 0.5
-    assert cfg.strategies.momentum_scalp.rr == 0.5
-    assert cfg.position_management.move_to_breakeven_at_r == 0.25
-    assert cfg.position_management.partial_close_at_r == 0.35
-    assert cfg.position_management.time_exit_minutes == 5
-    assert cfg.position_management.max_trade_duration_minutes == 8
-    assert cfg.strategy.min_sl_atr == 0.7
-    assert cfg.strategy.max_sl_atr == 1.8
+    # Geometry sized for M5 stops so costs stay a small fraction of the target.
+    assert cfg.strategies.high_precision_scalp.rr == 1.5
+    assert cfg.strategies.momentum_scalp.rr == 1.5
+    assert cfg.position_management.move_to_breakeven_at_r == 0.55
+    assert cfg.position_management.partial_close_at_r == 1.0
+    assert cfg.position_management.time_exit_minutes == 15
+    assert cfg.position_management.max_trade_duration_minutes == 25
+    assert cfg.strategy.min_sl_atr == 0.8
+    assert cfg.strategy.max_sl_atr == 2.0
+    assert cfg.strategy.sl_timeframe == "M5"
 
 
 # ------------------------------------------------------------------ sweep

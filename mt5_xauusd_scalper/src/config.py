@@ -42,6 +42,11 @@ class TradingConfig(BaseModel):
     max_entry_slippage_points: float = 20
     deviation_points: int = 20
     max_positions: int = 1
+    # Cost gate: skip any trade whose estimated round-trip cost (spread +
+    # cost_buffer_points for slippage/commission) exceeds this % of the TP
+    # distance. Prevents structurally unprofitable trade geometry.
+    max_cost_to_tp_pct: float = 25.0
+    cost_buffer_points: float = 12.0
     require_stop_loss: bool = True
     allow_trade_without_sl: bool = False
     allow_live_auto: bool = False
@@ -125,6 +130,17 @@ class StrategyTuningConfig(BaseModel):
     max_sl_atr: float = 2.2
     m5_structure_lookback: int = 20
     retest_tolerance_atr: float = 0.30
+    # Timeframe whose ATR/swings define the stop geometry. M5 keeps M1 entry
+    # timing but widens SL/TP so fixed costs (spread/slippage/commission)
+    # become a small fraction of the target instead of dominating it.
+    sl_timeframe: str = "M5"
+
+    @field_validator("sl_timeframe")
+    @classmethod
+    def _valid_sl_tf(cls, v: str) -> str:
+        if v not in {"M1", "M5"}:
+            raise ValueError("strategy.sl_timeframe must be M1 or M5.")
+        return v
 
 
 class PositionManagementConfig(BaseModel):
@@ -163,6 +179,10 @@ class SessionsConfig(BaseModel):
         ]
     )
     block_friday_after: str = "20:00"
+    # Optional data-driven filter: if non-empty, trade ONLY in these local
+    # hours (fill from the backtest's pnl_by_hour breakdown). Applies on top
+    # of the session windows.
+    allowed_hours: list[int] = Field(default_factory=list)
 
 
 class SniperModeConfig(BaseModel):
@@ -177,19 +197,22 @@ class SniperModeConfig(BaseModel):
     allow_second_trade_after_loss: bool = False
     second_trade_min_score: int = 11
     second_trade_after_loss_min_score: int = 12
-    tp_r: float = 0.5
-    min_tp_r: float = 0.35
-    max_tp_r: float = 0.6
-    move_to_breakeven_at_r: float = 0.25
+    # Trade geometry sized for M5 stops: at XAUUSD round-trip costs of ~30
+    # points, a 0.5R target on M1 stops was mathematically unprofitable.
+    # 1.5R on M5-sized stops keeps costs to ~15-20% of the target.
+    tp_r: float = 1.5
+    min_tp_r: float = 1.2
+    max_tp_r: float = 1.8
+    move_to_breakeven_at_r: float = 0.55
     partial_close_enabled: bool = True
-    partial_close_at_r: float = 0.35
+    partial_close_at_r: float = 1.0
     partial_close_percent: float = 50
-    time_exit_minutes: int = 5
-    max_trade_duration_minutes: int = 8
+    time_exit_minutes: int = 15
+    max_trade_duration_minutes: int = 25
     sweep_lookback_candles: int = 20
     max_sweep_atr: float = 1.2
-    min_sl_atr: float = 0.7
-    max_sl_atr: float = 1.8
+    min_sl_atr: float = 0.8
+    max_sl_atr: float = 2.0
 
     @model_validator(mode="after")
     def _sanity(self) -> "SniperModeConfig":

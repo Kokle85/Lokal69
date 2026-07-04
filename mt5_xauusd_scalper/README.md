@@ -56,6 +56,31 @@ zone), only one more trade is allowed, at **half risk** and only for a setup sco
 ≥ 9/11. Protecting capital and banked profit always outranks reaching the target.
 On many days the bot will simply not trade at all; that is correct behavior.
 
+## Trade geometry & cost efficiency (why the defaults look like they do)
+
+At realistic XAUUSD costs (~30 points round trip: spread + slippage + commission),
+tight M1-scalp targets are structurally unprofitable — a 20-point TP pays 30 points
+of cost on every "winner". The defaults therefore enforce cost-efficient geometry:
+
+- **M5 stop geometry** (`strategy.sl_timeframe: M5`): entries still time on M1,
+  but SL/TP are sized from M5 ATR and M5 swings, so fixed costs drop to ~15-20%
+  of the target instead of exceeding it.
+- **Sniper targets at 1.5R** (`tp_r: 1.5`, bounds 1.2-1.8): break-even win rate
+  ~48-55% after costs, versus mathematically impossible at the old 0.5R/M1 combo.
+- **Cost gate** (`trading.max_cost_to_tp_pct: 25`): any trade whose estimated
+  round-trip cost exceeds 25% of its TP distance is skipped and journaled —
+  structurally losing trades never execute, regardless of signal quality.
+- **No winner-scratching**: breakeven at 0.55R and partial at 1.0R (was 0.25R /
+  0.35R) so normal gold noise doesn't convert would-be winners into scratches;
+  time exits stretched to 15/25 minutes to fit the M5 pace.
+- **Data-driven hours** (`sessions.allowed_hours`): after a real backtest, copy
+  the historically positive hours from the `pnl_by_hour` breakdown into this list
+  and the bot trades only those hours.
+- **Sniper geometry optimizer**: `python src/optimizer.py --days 30 --sniper-grid`
+  grids over tp_r / SL bounds / breakeven / partial / time exits / cost gate —
+  the levers that control net expectancy. Walk-forward validation automatically
+  tunes this same grid when sniper mode is enabled.
+
 ## Validation & honest profitability assessment
 
 A backtest that shows profit means nothing until it survives realistic costs and

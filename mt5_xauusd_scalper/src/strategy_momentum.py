@@ -120,22 +120,33 @@ class MomentumStrategy:
         if not atr_ok:
             rejections.append(f"ATR {snap.atr_points:.0f}pt outside allowed range")
 
-        # --- stop loss around the retest extreme
-        if buying:
+        # --- stop loss: M5 swing in M5 geometry mode (wider, cost-efficient),
+        # otherwise the M1 retest extreme
+        atr_geo = m5_atr_now if t.sl_timeframe == "M5" else atr_now
+        if t.sl_timeframe == "M5":
+            if buying:
+                swing = ind.recent_swing_low(snap.m5, lookback=t.m5_structure_lookback)
+                sl = swing if swing is not None and swing < price else None
+            else:
+                swing = ind.recent_swing_high(snap.m5, lookback=t.m5_structure_lookback)
+                sl = swing if swing is not None and swing > price else None
+        elif buying:
             retest_low = float(m1_recent["low"].min())
             sl = retest_low if retest_low < price else None
         else:
             retest_high = float(m1_recent["high"].max())
             sl = retest_high if retest_high > price else None
         if sl is None:
-            rejections.append("no valid retest extreme for stop loss")
+            rejections.append(f"no valid {t.sl_timeframe} extreme for stop loss")
             return EvaluationResult(None, rejections)
 
         sl_distance = abs(price - sl)
-        if sl_distance < t.min_sl_atr * atr_now:
-            rejections.append(f"SL distance {sl_distance / atr_now:.2f} ATR too small")
-        if sl_distance > t.max_sl_atr * atr_now:
-            rejections.append(f"SL distance {sl_distance / atr_now:.2f} ATR too large")
+        if atr_geo <= 0:
+            rejections.append("geometry ATR not available")
+        elif sl_distance < t.min_sl_atr * atr_geo:
+            rejections.append(f"SL distance {sl_distance / atr_geo:.2f} ATR too small")
+        elif sl_distance > t.max_sl_atr * atr_geo:
+            rejections.append(f"SL distance {sl_distance / atr_geo:.2f} ATR too large")
 
         # --- quality score
         score = 0

@@ -110,7 +110,10 @@ def downtrend_m5(n: int = 150, start_price: float = 2040.0) -> pd.DataFrame:
 
 @pytest.fixture
 def tuning() -> StrategyTuningConfig:
-    return StrategyTuningConfig()
+    # Strategy entry-logic tests use hand-crafted M1 candle sequences whose SL
+    # swings are sized for M1 ATR; pin M1 geometry here. M5 geometry (the
+    # production default) is covered in test_cost_and_hours.py.
+    return StrategyTuningConfig(sl_timeframe="M1")
 
 
 @pytest.fixture

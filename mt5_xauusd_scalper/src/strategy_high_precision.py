@@ -123,22 +123,27 @@ class HighPrecisionStrategy:
         if not atr_ok:
             rejections.append(f"ATR {snap.atr_points:.0f}pt outside allowed range")
 
-        # --- stop loss from M1 swing
+        # --- stop loss from the geometry timeframe's swing (M5 by default:
+        # wider stops keep fixed costs small relative to the target)
+        atr_geo = float(snap.m5_atr.iloc[-1]) if t.sl_timeframe == "M5" else atr_now
+        sl_df = snap.m5 if t.sl_timeframe == "M5" else snap.m1
         if buying:
-            swing = ind.recent_swing_low(snap.m1)
+            swing = ind.recent_swing_low(sl_df)
             sl = swing if swing is not None and swing < price else None
         else:
-            swing = ind.recent_swing_high(snap.m1)
+            swing = ind.recent_swing_high(sl_df)
             sl = swing if swing is not None and swing > price else None
         if sl is None:
-            rejections.append("no valid M1 swing for stop loss")
+            rejections.append(f"no valid {t.sl_timeframe} swing for stop loss")
             return EvaluationResult(None, rejections)
 
         sl_distance = abs(price - sl)
-        if sl_distance < t.min_sl_atr * atr_now:
-            rejections.append(f"SL distance {sl_distance / atr_now:.2f} ATR too small")
-        if sl_distance > t.max_sl_atr * atr_now:
-            rejections.append(f"SL distance {sl_distance / atr_now:.2f} ATR too large")
+        if atr_geo <= 0:
+            rejections.append("geometry ATR not available")
+        elif sl_distance < t.min_sl_atr * atr_geo:
+            rejections.append(f"SL distance {sl_distance / atr_geo:.2f} ATR too small")
+        elif sl_distance > t.max_sl_atr * atr_geo:
+            rejections.append(f"SL distance {sl_distance / atr_geo:.2f} ATR too large")
 
         # --- precision score
         score = 0

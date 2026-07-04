@@ -31,7 +31,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from backtest import Backtester, load_m1_from_csv, load_m1_from_mt5
 from config import BotConfig, load_config
-from optimizer import PARAMETER_GRID, apply_params, evaluate_result
+from optimizer import (
+    PARAMETER_GRID,
+    SNIPER_GRID,
+    apply_params,
+    apply_sniper_params,
+    evaluate_result,
+)
 
 
 # ============================================================ Monte Carlo
@@ -161,11 +167,17 @@ def walk_forward(
     if block < 2000:
         logger.warning("Walk-forward: only {} bars/block - results may be thin", block)
 
-    keys = list(PARAMETER_GRID)
+    # Tune the knobs that actually apply: sniper geometry when sniper mode is
+    # on (its overrides would clobber the base-strategy grid), else the base grid.
+    if cfg.sniper_mode.enabled:
+        grid, apply_fn = SNIPER_GRID, apply_sniper_params
+    else:
+        grid, apply_fn = PARAMETER_GRID, apply_params
+    keys = list(grid)
     import itertools
     import random
 
-    combos = [dict(zip(keys, v)) for v in itertools.product(*PARAMETER_GRID.values())]
+    combos = [dict(zip(keys, v)) for v in itertools.product(*grid.values())]
     random.Random(seed).shuffle(combos)
     combos = combos[: max(1, sample)]
 
@@ -180,13 +192,13 @@ def walk_forward(
 
         best_params, best_score = None, -1e18
         for params in combos:
-            trial = apply_params(cfg, params)
+            trial = apply_fn(cfg, params)
             rep = Backtester(trial, train.copy()).run()
             accepted, _, score = evaluate_result(rep.metrics, len(rep.daily_pnl))
             if score > best_score:
                 best_score, best_params = score, params
 
-        tuned = apply_params(cfg, best_params) if best_params else copy.deepcopy(cfg)
+        tuned = apply_fn(cfg, best_params) if best_params else copy.deepcopy(cfg)
         test_rep = Backtester(tuned, test.copy()).run()
         fold_pnls = [t.realized for t in test_rep.trades]
         oos_pnls.extend(fold_pnls)

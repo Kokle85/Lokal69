@@ -28,6 +28,10 @@ trading:
   allow_trade_without_sl: false
   allow_live_auto: false
   allow_kill_close_position: false
+  # Cost gate: skip trades where spread + cost_buffer (slippage+commission in
+  # points) exceeds this % of the TP distance - they lose money by construction.
+  max_cost_to_tp_pct: 25
+  cost_buffer_points: 12
 
 daily_goals:
   daily_profit_target_usd: 200
@@ -70,6 +74,9 @@ strategy:
   max_sl_atr: 2.2
   m5_structure_lookback: 20
   retest_tolerance_atr: 0.30
+  # Stop geometry timeframe: M5 keeps M1 entry timing but sizes SL/TP from M5
+  # ATR/swings, so fixed costs stay a small fraction of the target.
+  sl_timeframe: M5
 
 position_management:
   move_to_breakeven_at_r: 0.7
@@ -98,6 +105,9 @@ sessions:
     - start: "15:00"
       end: "18:00"
   block_friday_after: "20:00"
+  # Data-driven hour filter: after a real backtest, copy the historically
+  # positive hours from pnl_by_hour here (e.g. [15, 16, 17]). Empty = off.
+  allowed_hours: []
 
 telegram:
   enabled: true
@@ -128,19 +138,21 @@ sniper_mode:
   allow_second_trade_after_loss: false
   second_trade_min_score: 11
   second_trade_after_loss_min_score: 12
-  tp_r: 0.5
-  min_tp_r: 0.35
-  max_tp_r: 0.6
-  move_to_breakeven_at_r: 0.25
+  # Geometry sized for M5 stops: 0.5R targets on M1 stops were mathematically
+  # unprofitable at real XAUUSD costs (~30pt round trip vs 12-31pt targets).
+  tp_r: 1.5
+  min_tp_r: 1.2
+  max_tp_r: 1.8
+  move_to_breakeven_at_r: 0.55
   partial_close_enabled: true
-  partial_close_at_r: 0.35
+  partial_close_at_r: 1.0
   partial_close_percent: 50
-  time_exit_minutes: 5
-  max_trade_duration_minutes: 8
+  time_exit_minutes: 15
+  max_trade_duration_minutes: 25
   sweep_lookback_candles: 20
   max_sweep_atr: 1.2
-  min_sl_atr: 0.7
-  max_sl_atr: 1.8
+  min_sl_atr: 0.8
+  max_sl_atr: 2.0
 
 # Risk settings used while sniper_mode is enabled (daily_goals applies otherwise).
 risk:
