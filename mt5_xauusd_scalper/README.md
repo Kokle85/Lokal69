@@ -56,6 +56,31 @@ zone), only one more trade is allowed, at **half risk** and only for a setup sco
 ≥ 9/11. Protecting capital and banked profit always outranks reaching the target.
 On many days the bot will simply not trade at all; that is correct behavior.
 
+## Analytics dashboard
+
+A local web dashboard for visual analysis of the bot's work — no new
+dependencies (stdlib HTTP server; charts via Chart.js CDN in the browser):
+
+```bat
+run_dashboard.bat
+```
+
+or `python src/dashboard.py`, then open **http://127.0.0.1:8765**. It reads the
+live journal (`data/trading_bot.db`) read-only, so it can run alongside the bot,
+and auto-refreshes every 10 seconds. To inspect a backtest instead:
+
+```bat
+python src\backtest.py --days 90 --export-trades data\trades.csv
+python src\dashboard.py --csv data\trades.csv
+```
+
+What it shows: KPI tiles (net P/L, today's P/L, win rate, profit factor,
+expectancy, day-lock badge), equity curve, daily P/L bars, wins-vs-losses,
+net P/L by hour of day (feed `sessions.allowed_hours` from this), by strategy,
+by regime, by signal score, trade-1-vs-trade-2 comparison, the signals funnel
+(sent → approved → executed / rejected / expired), plus recent-trades and
+bot-events tables. Light and dark theme follow your OS setting.
+
 ## Trade geometry & cost efficiency (why the defaults look like they do)
 
 At realistic XAUUSD costs (~30 points round trip: spread + slippage + commission),
