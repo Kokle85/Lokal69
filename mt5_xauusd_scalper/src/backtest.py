@@ -96,6 +96,17 @@ class BacktestReport:
     metrics: dict[str, float | int | str] = field(default_factory=dict)
 
 
+def _ns(time_series: pd.Series) -> np.ndarray:
+    """Int64 nanoseconds-since-epoch (UTC), resolution-proof.
+
+    A plain .astype('int64') returns the column's NATIVE unit, which pandas 2.x
+    makes microseconds after resample - while Timestamp.value is always
+    nanoseconds. Mixing them (a 1000x error) froze the higher-timeframe windows
+    and caused a lookahead bug. Forcing datetime64[ns] on every side fixes it.
+    """
+    return time_series.to_numpy(dtype="datetime64[ns]").astype("int64")
+
+
 def resample_m1(m1: pd.DataFrame, minutes: int) -> pd.DataFrame:
     df = m1.set_index("time")
     out = pd.DataFrame(
@@ -154,8 +165,9 @@ class Backtester:
         current_day = None
         open_trade: Optional[SimTrade] = None
 
-        m5_times = self.m5["time"].astype("int64").to_numpy()
-        m15_times = self.m15["time"].astype("int64").to_numpy()
+        m5_times = _ns(self.m5["time"])
+        m15_times = _ns(self.m15["time"])
+        m1_ns = _ns(self.m1["time"])
 
         for i in range(M1_WINDOW, len(self.m1)):
             bar = self.m1.iloc[i]
@@ -184,7 +196,7 @@ class Backtester:
             if governor.state.locked:
                 continue
 
-            open_trade = self._try_open(i, bar_time, m5_times, m15_times, governor)
+            open_trade = self._try_open(i, m1_ns[i], m5_times, m15_times, governor)
 
         # flush the last day / force-close a dangling trade at the last close
         if open_trade is not None:
@@ -214,8 +226,9 @@ class Backtester:
         tally: Counter[str] = Counter()
         st = {"n": 0, "m15_up": 0, "m5_up": 0, "agree": 0, "vwap_above": 0,
               "sep15_pts": 0.0, "sep5_pts": 0.0}
-        m5_times = self.m5["time"].astype("int64").to_numpy()
-        m15_times = self.m15["time"].astype("int64").to_numpy()
+        m5_times = _ns(self.m5["time"])
+        m15_times = _ns(self.m15["time"])
+        m1_ns = _ns(self.m1["time"])
 
         for i in range(M1_WINDOW, len(self.m1)):
             tally["bars_scanned"] += 1
@@ -225,9 +238,8 @@ class Backtester:
                 tally["1_outside_session"] += 1
                 continue
 
-            bar_ns = bar_time.value
-            n5 = int(np.searchsorted(m5_times, bar_ns, side="right")) - 1
-            n15 = int(np.searchsorted(m15_times, bar_ns, side="right")) - 1
+            n5 = int(np.searchsorted(m5_times, m1_ns[i], side="right")) - 1
+            n15 = int(np.searchsorted(m15_times, m1_ns[i], side="right")) - 1
             if n5 < M5_WINDOW // 2 or n15 < M15_WINDOW // 2:
                 tally["2_warming_up"] += 1
                 continue
@@ -313,10 +325,10 @@ class Backtester:
     # ------------------------------------------------------------- entries
 
     def _try_open(
-        self, i: int, bar_time: pd.Timestamp, m5_times, m15_times, governor: DailyRiskGovernor
+        self, i: int, bar_ns: int, m5_times, m15_times, governor: DailyRiskGovernor
     ) -> Optional[SimTrade]:
         m1_win = self.m1.iloc[i - M1_WINDOW + 1 : i + 1]
-        bar_ns = bar_time.value
+        bar_time: pd.Timestamp = self.m1.iloc[i]["time"]
         n5 = int(np.searchsorted(m5_times, bar_ns, side="right")) - 1
         n15 = int(np.searchsorted(m15_times, bar_ns, side="right")) - 1
         if n5 < M5_WINDOW // 2 or n15 < M15_WINDOW // 2:
