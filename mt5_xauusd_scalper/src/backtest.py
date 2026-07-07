@@ -812,15 +812,63 @@ def _group(items, key):
 # ---------------------------------------------------------------- data loading
 
 def load_m1_from_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    required = {"time", "open", "high", "low", "close"}
-    missing = required - set(df.columns)
-    if missing:
-        raise SystemExit(f"CSV is missing columns: {missing}")
+    """Load M1 candles from a CSV. Accepts the native format
+    (time,open,high,low,close[,tick_volume]) and the two common free gold M1
+    exports without any pre-conversion:
+
+    - HistData.com  : no header, semicolon, "YYYYMMDD HHMMSS;O;H;L;C;V"
+    - Dukascopy     : header "Gmt time,Open,High,Low,Close,Volume",
+                      time "DD.MM.YYYY HH:MM:SS.000"
+    """
+    if not Path(path).exists():
+        raise SystemExit(
+            f"CSV not found: {path}\n"
+            "That filename was only an example - download the data first. Free "
+            "XAUUSD M1 history: HistData.com (Metatrader M1 export) or Dukascopy. "
+            "Then point --csv at the file you actually downloaded."
+        )
+
+    # Sniff header + separator from the first line.
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+        first = fh.readline()
+    sep = ";" if first.count(";") > first.count(",") else ","
+    has_header = any(c.isalpha() for c in first.split(sep)[0])
+
+    if not has_header:
+        # HistData M1: DATE(YYYYMMDD) TIME(HHMMSS);open;high;low;close;volume
+        df = pd.read_csv(path, sep=sep, header=None,
+                         names=["time", "open", "high", "low", "close", "tick_volume"])
+        df["time"] = pd.to_datetime(df["time"], format="%Y%m%d %H%M%S", utc=True)
+    else:
+        df = pd.read_csv(path, sep=sep)
+        df.columns = [c.strip().lower() for c in df.columns]
+        rename = {"gmt time": "time", "date": "time", "timestamp": "time",
+                  "datetime": "time", "vol": "tick_volume", "volume": "tick_volume"}
+        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+        required = {"time", "open", "high", "low", "close"}
+        missing = required - set(df.columns)
+        if missing:
+            raise SystemExit(
+                f"CSV is missing columns: {missing}. Found: {list(df.columns)}. "
+                "Expected time,open,high,low,close (Dukascopy/HistData are handled)."
+            )
+        # Dukascopy uses DD.MM.YYYY HH:MM:SS.000; fall back to generic parsing.
+        df["time"] = pd.to_datetime(df["time"], utc=True,
+                                    dayfirst=("." in str(df["time"].iloc[0])),
+                                    errors="coerce")
+
     if "tick_volume" not in df.columns:
         df["tick_volume"] = 1.0
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    return df.sort_values("time").reset_index(drop=True)
+    df = df.dropna(subset=["time", "open", "high", "low", "close"])
+    df = df[df["high"] >= df["low"]]  # drop malformed rows
+    if df.empty:
+        raise SystemExit(f"No valid M1 rows parsed from {path} - check the format.")
+    for col in ("open", "high", "low", "close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    logger.info("Loaded {} M1 rows from {} ({} -> {})",
+                len(df), path, df["time"].min(), df["time"].max())
+    return df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
 
 def load_m1_from_mt5(cfg: BotConfig, days: int) -> pd.DataFrame:
