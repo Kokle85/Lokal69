@@ -282,12 +282,23 @@ class SessionOpensConfig(BaseModel):
 
 
 class InstrumentConfig(BaseModel):
-    """One tradeable instrument and which session opens it trades."""
+    """One tradeable instrument, which session opens it trades, and optional
+    per-instrument ORB overrides (None = inherit the global orb value).
+
+    Example: index CFDs use tp_r 3.0 (strong NY-open trends run further), while
+    gold uses the validated tp_r 1.3.
+    """
 
     symbol: str
     aliases: list[str] = Field(default_factory=list)
     opens: list[str] = Field(default_factory=lambda: ["london", "newyork"])
     enabled: bool = True
+    # optional ORB overrides
+    tp_r: Optional[float] = None
+    max_trades_per_day: Optional[int] = None
+    min_range_atr: Optional[float] = None
+    move_to_breakeven_at_r: Optional[float] = None
+    trend_filter: Optional[str] = None
 
     @field_validator("symbol")
     @classmethod
@@ -367,12 +378,14 @@ class BacktestConfig(BaseModel):
 
 def _default_instruments() -> list["InstrumentConfig"]:
     return [
+        # Gold: validated config (tp_r 1.3, 1 trade/day), London + NY.
         InstrumentConfig(symbol="XAUUSD", aliases=["XAUUSD", "GOLD", "XAUUSDm"],
                          opens=["london", "newyork"]),
+        # Index CFDs: New York open only, RR 3:1 (strong NY-open trends run far).
         InstrumentConfig(symbol="US100", aliases=["US100", "NAS100", "USTEC", "NDX100"],
-                         opens=["newyork"]),
+                         opens=["newyork"], tp_r=3.0),
         InstrumentConfig(symbol="US500", aliases=["US500", "SPX500", "SP500"],
-                         opens=["newyork"]),
+                         opens=["newyork"], tp_r=3.0),
     ]
 
 
@@ -420,6 +433,20 @@ class BotConfig(BaseModel):
             if up in names:
                 return inst
         return None
+
+    def effective_orb(self, symbol: str) -> "ORBConfig":
+        """Global ORB config with this instrument's per-instrument overrides
+        applied (None overrides inherit the global value)."""
+        inst = self.instrument_for(symbol)
+        orb = self.orb.model_copy(deep=True)
+        if inst is None:
+            return orb
+        for field in ("tp_r", "max_trades_per_day", "min_range_atr",
+                      "move_to_breakeven_at_r", "trend_filter"):
+            val = getattr(inst, field)
+            if val is not None:
+                setattr(orb, field, val)
+        return orb
 
 
 class ConfigError(Exception):

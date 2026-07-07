@@ -163,3 +163,14 @@ def test_trend_filter_none_takes_both():
         df, now.to_pydatetime(), "XAUUSD", ["newyork"],
         m5_atr=3.0, point=0.01, spread_points=18, trend_up=False)
     assert ev.signal is not None  # filter off -> counter-trend allowed
+
+
+def test_effective_orb_per_instrument_overrides():
+    from config import BotConfig
+    cfg = BotConfig()  # default instruments: gold + US100/US500 with tp_r 3.0
+    assert cfg.effective_orb("XAUUSD").tp_r == cfg.orb.tp_r      # gold inherits global
+    assert cfg.effective_orb("US100").tp_r == 3.0               # index override
+    assert cfg.effective_orb("NAS100").tp_r == 3.0              # via alias
+    assert cfg.effective_orb("US500").tp_r == 3.0
+    # unknown symbol inherits the global config
+    assert cfg.effective_orb("EURUSD").tp_r == cfg.orb.tp_r

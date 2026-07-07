@@ -155,11 +155,16 @@ def walk_forward(
     folds: int = 4,
     sample: int = 20,
     seed: int = 7,
+    symbol: str = "XAUUSD",
 ) -> WalkForwardResult:
-    """Rolling train/test: optimize on each train block, score the next block.
+    """Out-of-sample test across rolling folds.
 
-    The test blocks are stitched into a single out-of-sample equity curve — that
-    aggregate is the number that matters. In-sample profit is not evidence.
+    For ORB the config is already a chosen, pre-tuned set, so each fold's test
+    block is scored with that FIXED config - a clean OOS test with no per-fold
+    re-optimization (which on tiny blocks would just curve-fit). For scalp/sniper
+    it optimizes the relevant grid on each train block, then scores the next.
+    The test blocks stitch into one OOS equity curve; that aggregate is what
+    matters. In-sample profit is not evidence.
     """
     m1 = m1.reset_index(drop=True)
     n = len(m1)
@@ -167,19 +172,19 @@ def walk_forward(
     if block < 2000:
         logger.warning("Walk-forward: only {} bars/block - results may be thin", block)
 
-    # Tune the knobs that actually apply: sniper geometry when sniper mode is
-    # on (its overrides would clobber the base-strategy grid), else the base grid.
-    if cfg.sniper_mode.enabled:
-        grid, apply_fn = SNIPER_GRID, apply_sniper_params
-    else:
-        grid, apply_fn = PARAMETER_GRID, apply_params
-    keys = list(grid)
-    import itertools
-    import random
+    orb = cfg.trading_style == "orb"
+    if not orb:
+        if cfg.sniper_mode.enabled:
+            grid, apply_fn = SNIPER_GRID, apply_sniper_params
+        else:
+            grid, apply_fn = PARAMETER_GRID, apply_params
+        keys = list(grid)
+        import itertools
+        import random
 
-    combos = [dict(zip(keys, v)) for v in itertools.product(*grid.values())]
-    random.Random(seed).shuffle(combos)
-    combos = combos[: max(1, sample)]
+        combos = [dict(zip(keys, v)) for v in itertools.product(*grid.values())]
+        random.Random(seed).shuffle(combos)
+        combos = combos[: max(1, sample)]
 
     oos_pnls: list[float] = []
     per_fold: list[dict] = []
@@ -190,16 +195,20 @@ def walk_forward(
         if len(test) < 500:
             break
 
-        best_params, best_score = None, -1e18
-        for params in combos:
-            trial = apply_fn(cfg, params)
-            rep = Backtester(trial, train.copy()).run()
-            accepted, _, score = evaluate_result(rep.metrics, len(rep.daily_pnl))
-            if score > best_score:
-                best_score, best_params = score, params
+        best_params = None
+        if orb:
+            tuned = cfg  # fixed pre-chosen ORB config, tested OOS
+        else:
+            best_score = -1e18
+            for params in combos:
+                trial = apply_fn(cfg, params)
+                rep = Backtester(trial, train.copy(), symbol=symbol).run()
+                _, _, score = evaluate_result(rep.metrics, len(rep.daily_pnl))
+                if score > best_score:
+                    best_score, best_params = score, params
+            tuned = apply_fn(cfg, best_params) if best_params else copy.deepcopy(cfg)
 
-        tuned = apply_fn(cfg, best_params) if best_params else copy.deepcopy(cfg)
-        test_rep = Backtester(tuned, test.copy()).run()
+        test_rep = Backtester(tuned, test.copy(), symbol=symbol).run()
         fold_pnls = [t.realized for t in test_rep.trades]
         oos_pnls.extend(fold_pnls)
         per_fold.append(
@@ -239,11 +248,17 @@ def main() -> int:
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=5000)
+    parser.add_argument("--symbol", default=None, help="instrument symbol for data + labeling")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    symbol = args.symbol or cfg.trading.symbol
+    if args.symbol:
+        cfg.trading.symbol = args.symbol
+        inst = cfg.instrument_for(args.symbol)
+        cfg.trading.allowed_symbol_aliases = inst.aliases if inst else [args.symbol]
     m1 = load_m1_from_csv(args.csv) if args.csv else load_m1_from_mt5(cfg, args.days)
-    logger.info("Validation over {} M1 bars", len(m1))
+    logger.info("Validation of {} over {} M1 bars", symbol, len(m1))
 
     run_mc = args.monte_carlo or args.all
     run_ss = args.spread_sensitivity or args.all

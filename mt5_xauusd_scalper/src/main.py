@@ -41,9 +41,9 @@ from utils import fmt_usd, in_session, now_in_tz
 SCAN_INTERVAL_SECONDS = 5
 
 
-def _orb_goals(cfg: BotConfig) -> DailyGoalsConfig:
-    """Daily risk limits for ORB mode (from the risk + orb config sections)."""
-    r, o = cfg.risk, cfg.orb
+def _orb_goals(cfg: BotConfig, o) -> DailyGoalsConfig:
+    """Daily risk limits for ORB mode (risk section + the effective ORB config)."""
+    r = cfg.risk
     return DailyGoalsConfig(
         daily_profit_target_usd=r.daily_profit_target_usd,
         daily_profit_lock_usd=r.daily_profit_target_usd,
@@ -99,8 +99,9 @@ class ScalperBot:
         )
         today = now_in_tz(cfg.sessions.timezone).date()
         if self.orb_mode:
-            self.orb_strategy = ORBStrategy(cfg.orb, cfg.session_opens)
-            self.governor: DailyRiskGovernor = DailyRiskGovernor(_orb_goals(cfg), today)
+            self.orb = cfg.effective_orb(cfg.trading.symbol)  # per-instrument tp_r etc.
+            self.orb_strategy = ORBStrategy(self.orb, cfg.session_opens)
+            self.governor: DailyRiskGovernor = DailyRiskGovernor(_orb_goals(cfg, self.orb), today)
         elif self.sniper:
             self.governor = SniperGovernor(cfg.risk, self.sniper, today)
         else:
@@ -231,7 +232,7 @@ class ScalperBot:
         if m5_atr <= 0:
             return
         trend_up = None
-        period = self.cfg.orb.trend_ema_period
+        period = self.orb.trend_ema_period
         if len(m5) > period:
             ema = _ind.ema(m5["close"], period)
             trend_up = float(m5["close"].iloc[-1]) > float(ema.iloc[-1])
@@ -255,7 +256,7 @@ class ScalperBot:
         signal = ev.signal
         signal.mode = self.cfg.mode
         signal.trade_number = self.governor.state.trades_today + 1
-        signal.max_trades_today = self.cfg.orb.max_trades_per_day
+        signal.max_trades_today = self.orb.max_trades_per_day
         self.current_regime = f"ORB/{ev.session_name}"
         self.active_strategy = signal.strategy.value
 
@@ -265,7 +266,7 @@ class ScalperBot:
             logger.warning("ORB signal blocked by governor: {}", decision.reason)
             self.journal.log_event("WARNING", "risk_block", decision.reason)
             return
-        signal.risk_usd = self.cfg.orb.risk_per_trade_usd
+        signal.risk_usd = self.orb.risk_per_trade_usd
 
         check = self.risk_manager.validate_signal(
             signal, atr_value=abs(signal.entry - signal.sl), spread_points=spread,

@@ -146,8 +146,9 @@ class Backtester:
         self.symbol = symbol
         inst = cfg.instrument_for(symbol)
         self.instrument_opens = inst.opens if inst else ["london", "newyork"]
-        self.orb = cfg.orb if self.orb_mode else None
-        self.orb_strategy = ORBStrategy(cfg.orb, cfg.session_opens)
+        # Per-instrument ORB config (indices override tp_r to 3:1, etc.).
+        self.orb = cfg.effective_orb(symbol) if self.orb_mode else None
+        self.orb_strategy = ORBStrategy(self.orb or cfg.orb, cfg.session_opens)
         self._traded_sessions: set = set()
         self.m1 = m1.reset_index(drop=True)
         self.spec = spec
@@ -248,7 +249,7 @@ class Backtester:
         return DailyRiskGovernor(self.cfg.daily_goals, day)
 
     def _orb_goals(self) -> DailyGoalsConfig:
-        r, o = self.cfg.risk, self.cfg.orb
+        r, o = self.cfg.risk, self.orb
         return DailyGoalsConfig(
             daily_profit_target_usd=r.daily_profit_target_usd,
             daily_profit_lock_usd=r.daily_profit_target_usd,  # no half-risk zone for ORB
@@ -262,7 +263,7 @@ class Backtester:
         )
 
     def _orb_pm(self) -> PositionManagementConfig:
-        o = self.cfg.orb
+        o = self.orb
         return PositionManagementConfig(
             move_to_breakeven_at_r=o.move_to_breakeven_at_r,
             partial_close_enabled=o.partial_close_enabled,
@@ -284,7 +285,7 @@ class Backtester:
         if atr <= 0 or atr != atr:  # nan guard
             return 0.0, None
         trend_up: Optional[bool] = None
-        if idx >= self.cfg.orb.trend_ema_period:
+        if idx >= self.orb.trend_ema_period:
             trend_up = float(self._m5_close[idx]) > float(self._m5_ema_full[idx])
         return atr, trend_up
 
@@ -295,7 +296,7 @@ class Backtester:
         # of bars outside any tradeable session-open window.
         if active_session_open(
             self.cfg.session_opens, self.instrument_opens, now,
-            self.cfg.orb.opening_range_minutes, self.cfg.orb.entry_window_minutes,
+            self.orb.opening_range_minutes, self.orb.entry_window_minutes,
         ) is None:
             return None
         m5_atr, trend_up = self._m5_context_at(bar_ns)
@@ -316,7 +317,7 @@ class Backtester:
         decision = governor.evaluate_new_trade(signal.score)
         if not decision.allowed:
             return None
-        signal.risk_usd = self.cfg.orb.risk_per_trade_usd
+        signal.risk_usd = self.orb.risk_per_trade_usd
 
         # Keep the cost gate (ORB SL is range-defined, so skip the ATR-SL bounds).
         cost = check_cost_to_tp(
