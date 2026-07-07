@@ -155,17 +155,19 @@ orb:
   enabled: true
   opening_range_minutes: 15
   entry_window_minutes: 90
-  # Data-driven defaults from the 2nd optimizer sweep on 64 days of XAUUSD.
-  # Best risk-adjusted config: tp_r 1.3 (WR jumps to 46% vs 27% at 2R -> above
-  # the 43% breakeven), 1 trade/day (only the first/London breakout; the 2nd/NY
-  # trade bled), trend_filter none, breakeven 0.8R. PF ~1.22, net +483/64d.
-  tp_r: 1.3
+  # 3:1 system, validated on FULL-YEAR 2025 XAUUSD M1 (258 trades, real costs):
+  # WR 31.9% vs 25% breakeven, PF 1.14, net +7715, cost drag 11% (vs 55% at low
+  # RR). Walk-forward OOS (6 folds): PF 1.203, +9189, WR 33% - 5/6 folds green.
+  # Breakeven-stop and partial close HURT at 3R (they kill the runners that pay
+  # for the losses); retest entry loses on gold (works only on index CFDs).
+  # Expect losing streaks of 10-16 trades - that is the nature of 3:1.
+  tp_r: 3.0
   entry_mode: breakout       # gold: validated momentum entry (indices use "retest")
   retest_entry_pct: 0.40
   entry_on_close: true
   breakout_buffer_atr: 0.05
   sl_buffer_atr: 0.05
-  min_range_atr: 0.3
+  min_range_atr: 1.0         # only strong opening ranges (trend days)
   max_range_atr: 4.0
   max_breakout_extension_atr: 1.0
   max_trades_per_day: 1
@@ -180,11 +182,13 @@ orb:
   risk_per_trade_usd: 75      # only used when risk_mode is "fixed"
   trend_filter: none         # "none" beat "ema" on gold; re-test per instrument
   trend_ema_period: 50
-  move_to_breakeven_at_r: 0.8
+  # 99.0 = breakeven stop OFF. At 3R the BE stop scratched the winners that pay
+  # for everything (WR 34.6 -> 23.4, net collapsed). Do not lower this blindly.
+  move_to_breakeven_at_r: 99.0
   partial_close_enabled: false
   partial_close_at_r: 1.0
   partial_close_percent: 50
-  max_trade_minutes: 150
+  max_trade_minutes: 360     # a 3R runner needs hours, not 150 min
   min_score: 0
 
 # Realistic simulation costs for backtest.py / optimizer.py (not used live).
