@@ -143,19 +143,22 @@ orb:
   enabled: true
   opening_range_minutes: 15
   entry_window_minutes: 90
-  tp_r: 2.0
+  # Data-driven defaults from the first optimizer sweep on 64 days of XAUUSD:
+  # tp_r 1.5 (2.0/2.5 needed a hit rate gold doesn't reach), trend_filter none
+  # (the EMA filter hurt on gold), breakeven at 0.8R (protects reached winners).
+  tp_r: 1.5
   entry_on_close: true
   breakout_buffer_atr: 0.05
   sl_buffer_atr: 0.05
-  min_range_atr: 0.5
+  min_range_atr: 0.4
   max_range_atr: 4.0
   max_breakout_extension_atr: 1.0
-  max_trades_per_day: 3
+  max_trades_per_day: 2
   max_trades_per_session: 1
   risk_per_trade_usd: 75
-  trend_filter: ema          # "ema" = only trade breakouts with the M5 trend; "none" = both ways
+  trend_filter: none         # "none" beat "ema" on gold; re-test per instrument
   trend_ema_period: 50
-  move_to_breakeven_at_r: 1.0
+  move_to_breakeven_at_r: 0.8
   partial_close_enabled: false
   partial_close_at_r: 1.0
   partial_close_percent: 50

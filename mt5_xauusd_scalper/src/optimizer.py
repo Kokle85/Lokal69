@@ -50,15 +50,17 @@ SNIPER_GRID: dict[str, list] = {
     "max_cost_to_tp_pct": [20, 25, 30],
 }
 
-# Grid for ORB mode (--orb-grid): the levers that control ORB net expectancy.
+# Grid for ORB mode (--orb-grid). Focused on the region the first sweep found
+# profitable (tp_r 1.5, trend none, 15-min range, breakeven ~0.8) plus the
+# money-management levers that shape the daily P/L distribution: max trades per
+# day and the daily profit target ("stop while ahead").
 ORB_GRID: dict[str, list] = {
-    "opening_range_minutes": [15, 30],
-    "tp_r": [1.5, 2.0, 2.5],
-    "trend_filter": ["none", "ema"],
-    "min_range_atr": [0.4, 0.6, 0.8],
-    "max_breakout_extension_atr": [0.5, 1.0],
-    "entry_window_minutes": [60, 90, 120],
-    "move_to_breakeven_at_r": [0.8, 1.0, 1.5],
+    "tp_r": [1.3, 1.5, 1.7],
+    "min_range_atr": [0.3, 0.4, 0.6],
+    "move_to_breakeven_at_r": [0.6, 0.8, 1.0],
+    "max_trades_per_day": [1, 2, 3],
+    "daily_profit_target_usd": [80, 120, 200],
+    "trend_filter": ["none"],
 }
 
 
@@ -66,13 +68,17 @@ def apply_orb_params(base: BotConfig, params: dict) -> BotConfig:
     cfg = copy.deepcopy(base)
     cfg.trading_style = "orb"
     o = cfg.orb
-    o.opening_range_minutes = params["opening_range_minutes"]
-    o.tp_r = params["tp_r"]
-    o.trend_filter = params["trend_filter"]
-    o.min_range_atr = params["min_range_atr"]
-    o.max_breakout_extension_atr = params["max_breakout_extension_atr"]
-    o.entry_window_minutes = params["entry_window_minutes"]
-    o.move_to_breakeven_at_r = params["move_to_breakeven_at_r"]
+    o.tp_r = params.get("tp_r", o.tp_r)
+    o.min_range_atr = params.get("min_range_atr", o.min_range_atr)
+    o.move_to_breakeven_at_r = params.get("move_to_breakeven_at_r", o.move_to_breakeven_at_r)
+    o.max_trades_per_day = params.get("max_trades_per_day", o.max_trades_per_day)
+    o.trend_filter = params.get("trend_filter", o.trend_filter)
+    o.opening_range_minutes = params.get("opening_range_minutes", o.opening_range_minutes)
+    o.max_breakout_extension_atr = params.get("max_breakout_extension_atr", o.max_breakout_extension_atr)
+    o.entry_window_minutes = params.get("entry_window_minutes", o.entry_window_minutes)
+    # money management (governor reads the daily target from cfg.risk)
+    if "daily_profit_target_usd" in params:
+        cfg.risk.daily_profit_target_usd = params["daily_profit_target_usd"]
     return cfg
 
 
