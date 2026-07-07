@@ -90,32 +90,19 @@ class ORBStrategy:
         close = float(last["close"])
         high = float(last["high"])
         low = float(last["low"])
+        range_dist = hi - lo
         buffer = c.breakout_buffer_atr * m5_atr
         sl_buffer = c.sl_buffer_atr * m5_atr
 
-        long_level = hi + buffer
-        short_level = lo - buffer
-        if c.entry_on_close:
-            broke_long = close > long_level
-            broke_short = close < short_level
+        if c.entry_mode == "retest":
+            result = self._retest_entry(m1, range_end, hi, lo, range_dist, buffer,
+                                        sl_buffer, high, low, close, name)
         else:
-            broke_long = high > long_level
-            broke_short = low < short_level
-
-        if broke_long:
-            direction = Direction.BUY
-            entry = close if c.entry_on_close else long_level
-            extension = (entry - long_level) / m5_atr
-            sl = lo - sl_buffer
-            tp = entry + c.tp_r * (entry - sl)
-        elif broke_short:
-            direction = Direction.SELL
-            entry = close if c.entry_on_close else short_level
-            extension = (short_level - entry) / m5_atr
-            sl = hi + sl_buffer
-            tp = entry - c.tp_r * (sl - entry)
-        else:
-            return ORBEvaluation(None, [f"{name}: no breakout beyond the opening range"], name)
+            result = self._breakout_entry(c, hi, lo, buffer, sl_buffer,
+                                          high, low, close, m5_atr, name)
+        if isinstance(result, ORBEvaluation):
+            return result  # rejection carrying the reason
+        direction, entry, sl, tp, extension = result
 
         # Directional filter: only trade with the higher-timeframe trend.
         if c.trend_filter == "ema" and trend_up is not None:
@@ -137,10 +124,11 @@ class ORBStrategy:
         if score < c.min_score:
             return ORBEvaluation(None, [f"{name}: ORB score {score}/{MAX_SCORE} < {c.min_score}"], name)
 
+        entry_desc = "retest" if c.entry_mode == "retest" else "breakout"
         setup = (
-            f"{name.upper()} open ORB: {c.opening_range_minutes}m range "
-            f"[{lo:.2f}-{hi:.2f}] {range_atr:.1f}xATR, breakout "
-            f"{'above' if direction is Direction.BUY else 'below'}, TP {c.tp_r:.1f}R"
+            f"{name.upper()} open ORB {entry_desc}: {c.opening_range_minutes}m range "
+            f"[{lo:.2f}-{hi:.2f}] {range_atr:.1f}xATR, "
+            f"{'long' if direction is Direction.BUY else 'short'}, TP {c.tp_r:.1f}R"
         )
         signal = Signal(
             symbol=symbol,
@@ -158,6 +146,59 @@ class ORBStrategy:
             created_at=datetime.now(timezone.utc),
         )
         return ORBEvaluation(signal, [], name)
+
+    def _breakout_entry(self, c, hi, lo, buffer, sl_buffer, high, low, close, m5_atr, name):
+        """Immediate momentum entry on the break. Returns a tuple or a rejection."""
+        long_level = hi + buffer
+        short_level = lo - buffer
+        if c.entry_on_close:
+            broke_long, broke_short = close > long_level, close < short_level
+        else:
+            broke_long, broke_short = high > long_level, low < short_level
+        if broke_long:
+            entry = close if c.entry_on_close else long_level
+            sl = lo - sl_buffer
+            return (Direction.BUY, entry, sl, entry + c.tp_r * (entry - sl),
+                    (entry - long_level) / m5_atr)
+        if broke_short:
+            entry = close if c.entry_on_close else short_level
+            sl = hi + sl_buffer
+            return (Direction.SELL, entry, sl, entry - c.tp_r * (sl - entry),
+                    (short_level - entry) / m5_atr)
+        return ORBEvaluation(None, [f"{name}: no breakout beyond the opening range"], name)
+
+    def _retest_entry(self, m1, range_end, hi, lo, range_dist, buffer, sl_buffer,
+                      high, low, close, name):
+        """Wait for a breakout, then for price to pull back into the range to
+        retest_entry_pct depth; enter there (limit), stop at the range extreme."""
+        c = self.cfg
+        times = pd.to_datetime(m1["time"])
+        if times.dt.tz is None:
+            times = times.dt.tz_localize("UTC")
+        range_end_utc = pd.Timestamp(range_end).tz_convert("UTC")
+        post = m1[(times >= range_end_utc).to_numpy()]
+        if post.empty:
+            return ORBEvaluation(None, [f"{name}: opening range still forming"], name)
+
+        up_broke = float(post["high"].max()) > hi + buffer
+        down_broke = float(post["low"].min()) < lo - buffer
+        if up_broke and not down_broke:
+            entry = hi - c.retest_entry_pct * range_dist   # pull back into the range
+            sl = lo - sl_buffer
+            if low > entry:
+                return ORBEvaluation(None, [f"{name}: broke up, waiting for pullback to entry"], name)
+            if close < sl:
+                return ORBEvaluation(None, [f"{name}: pullback broke the stop (failed)"], name)
+            return (Direction.BUY, entry, sl, entry + c.tp_r * (entry - sl), 0.0)
+        if down_broke and not up_broke:
+            entry = lo + c.retest_entry_pct * range_dist
+            sl = hi + sl_buffer
+            if high < entry:
+                return ORBEvaluation(None, [f"{name}: broke down, waiting for pullback to entry"], name)
+            if close > sl:
+                return ORBEvaluation(None, [f"{name}: pullback broke the stop (failed)"], name)
+            return (Direction.SELL, entry, sl, entry - c.tp_r * (sl - entry), 0.0)
+        return ORBEvaluation(None, [f"{name}: no clean single-side breakout yet"], name)
 
     def _score(
         self, range_atr: float, extension: float, candle: pd.Series,

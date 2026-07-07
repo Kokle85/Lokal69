@@ -299,6 +299,8 @@ class InstrumentConfig(BaseModel):
     min_range_atr: Optional[float] = None
     move_to_breakeven_at_r: Optional[float] = None
     trend_filter: Optional[str] = None
+    entry_mode: Optional[str] = None
+    retest_entry_pct: Optional[float] = None
 
     @field_validator("symbol")
     @classmethod
@@ -316,6 +318,11 @@ class ORBConfig(BaseModel):
     opening_range_minutes: int = 15
     entry_window_minutes: int = 90       # only take a breakout within this window after the range
     tp_r: float = 2.0                    # target = tp_r x risk (risk = range + buffers)
+    # Entry model: "breakout" enters immediately on the break; "retest" waits for
+    # the break, then for price to pull back into the range to retest_entry_pct
+    # of the range depth, and enters there with the stop at the range extreme.
+    entry_mode: str = "breakout"         # "breakout" | "retest"
+    retest_entry_pct: float = 0.40       # pullback depth into the range (retest mode)
     entry_on_close: bool = True          # require an M1 close beyond the level (vs intrabar touch)
     breakout_buffer_atr: float = 0.05    # price must clear the level by this x M5 ATR
     sl_buffer_atr: float = 0.05          # stop sits this x M5 ATR beyond the opposite side
@@ -345,6 +352,10 @@ class ORBConfig(BaseModel):
             raise ValueError("orb.tp_r must be positive.")
         if self.trend_filter not in {"none", "ema"}:
             raise ValueError("orb.trend_filter must be 'none' or 'ema'.")
+        if self.entry_mode not in {"breakout", "retest"}:
+            raise ValueError("orb.entry_mode must be 'breakout' or 'retest'.")
+        if not 0.0 < self.retest_entry_pct < 1.0:
+            raise ValueError("orb.retest_entry_pct must be between 0 and 1.")
         return self
 
 
@@ -442,7 +453,8 @@ class BotConfig(BaseModel):
         if inst is None:
             return orb
         for field in ("tp_r", "max_trades_per_day", "min_range_atr",
-                      "move_to_breakeven_at_r", "trend_filter"):
+                      "move_to_breakeven_at_r", "trend_filter",
+                      "entry_mode", "retest_entry_pct"):
             val = getattr(inst, field)
             if val is not None:
                 setattr(orb, field, val)

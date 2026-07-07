@@ -137,10 +137,14 @@ instruments:
     aliases: [US100, NAS100, USTEC, NDX100]
     opens: [newyork]
     tp_r: 3.0
+    entry_mode: retest       # break the range, then enter the 40% pullback, RR 3:1
+    retest_entry_pct: 0.40
   - symbol: US500
     aliases: [US500, SPX500, SP500]
     opens: [newyork]
     tp_r: 3.0
+    entry_mode: retest
+    retest_entry_pct: 0.40
 
 # Opening Range Breakout. Filters are ATR-relative so one config fits gold and
 # index CFDs. SL = opposite side of the range; TP = tp_r x risk.
@@ -153,6 +157,8 @@ orb:
   # the 43% breakeven), 1 trade/day (only the first/London breakout; the 2nd/NY
   # trade bled), trend_filter none, breakeven 0.8R. PF ~1.22, net +483/64d.
   tp_r: 1.3
+  entry_mode: breakout       # gold: validated momentum entry (indices use "retest")
+  retest_entry_pct: 0.40
   entry_on_close: true
   breakout_buffer_atr: 0.05
   sl_buffer_atr: 0.05

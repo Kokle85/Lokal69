@@ -174,3 +174,59 @@ def test_effective_orb_per_instrument_overrides():
     assert cfg.effective_orb("US500").tp_r == 3.0
     # unknown symbol inherits the global config
     assert cfg.effective_orb("EURUSD").tp_r == cfg.orb.tp_r
+
+
+def _retest_frame(range_high, range_low, breakout_peak, pullback_low, *, day="2026-06-01"):
+    """Range, then a breakout above range_high up to breakout_peak, then a
+    pullback whose last bar low reaches pullback_low."""
+    rows = []
+    start = pd.Timestamp(f"{day} 13:00", tz="UTC")
+    t = start
+    mid = (range_high + range_low) / 2
+    for _ in range(60):
+        rows.append((t, mid, mid + 0.2, mid - 0.2, mid)); t += pd.Timedelta(minutes=1)
+    t = pd.Timestamp(f"{day} 13:30", tz="UTC")
+    for k in range(15):
+        hi = range_high if k == 3 else range_high - 0.3
+        lo = range_low if k == 7 else range_low + 0.3
+        rows.append((t, mid, hi, lo, mid)); t += pd.Timedelta(minutes=1)
+    # up to the peak, then pull back down to pullback_low on the final bar
+    for c in [breakout_peak, breakout_peak - 0.5, pullback_low + 0.5, pullback_low]:
+        rows.append((t, c + 0.1, c + 0.3, min(c, pullback_low) - 0.1, c))
+        t += pd.Timedelta(minutes=1)
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close"])
+    df["tick_volume"] = 100.0
+    return df, t
+
+
+def test_retest_entry_long():
+    df, now = _retest_frame(105.0, 100.0, breakout_peak=107.0, pullback_low=103.0)
+    strat = make_strategy(entry_mode="retest", retest_entry_pct=0.40, tp_r=3.0, min_range_atr=0.5)
+    ev = strat.evaluate(df, now.to_pydatetime(), "US100", ["newyork"],
+                        m5_atr=3.0, point=1.0, spread_points=5)
+    assert ev.signal is not None, ev.rejections
+    s = ev.signal
+    assert s.direction is Direction.BUY
+    assert s.entry == pytest.approx(103.0)          # 105 - 0.40*5
+    assert s.sl < s.entry < s.tp
+    assert (s.tp - s.entry) == pytest.approx(3.0 * (s.entry - s.sl))  # RR 3:1
+
+
+def test_retest_waits_for_pullback():
+    # breakout up to 107 but the last bar hasn't pulled back to the 103 entry
+    df, now = _retest_frame(105.0, 100.0, breakout_peak=107.0, pullback_low=106.0)
+    strat = make_strategy(entry_mode="retest", retest_entry_pct=0.40, tp_r=3.0, min_range_atr=0.5)
+    ev = strat.evaluate(df, now.to_pydatetime(), "US100", ["newyork"],
+                        m5_atr=3.0, point=1.0, spread_points=5)
+    assert ev.signal is None
+    assert any("waiting for pullback" in r for r in ev.rejections)
+
+
+def test_retest_no_breakout_yet():
+    # price never left the range -> no retest setup
+    df, now = _retest_frame(105.0, 100.0, breakout_peak=104.0, pullback_low=102.0)
+    strat = make_strategy(entry_mode="retest", retest_entry_pct=0.40, min_range_atr=0.5)
+    ev = strat.evaluate(df, now.to_pydatetime(), "US100", ["newyork"],
+                        m5_atr=3.0, point=1.0, spread_points=5)
+    assert ev.signal is None
+    assert any("no clean single-side breakout" in r for r in ev.rejections)
