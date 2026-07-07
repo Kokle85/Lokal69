@@ -29,7 +29,7 @@ from models import (
 from mt5_connector import MT5Connector, MT5Error
 from position_manager import apply_action_to_state, evaluate_position
 from regime_detector import RegimeDetector, build_snapshot, geometry_atr
-from risk_manager import RiskManager
+from risk_manager import RiskManager, orb_position_risk
 from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
 from strategy_orb import ORBStrategy
 from strategy_high_precision import HighPrecisionStrategy
@@ -44,14 +44,16 @@ SCAN_INTERVAL_SECONDS = 5
 def _orb_goals(cfg: BotConfig, o) -> DailyGoalsConfig:
     """Daily risk limits for ORB mode (risk section + the effective ORB config)."""
     r = cfg.risk
+    max_loss = o.daily_risk_budget_usd if o.risk_mode == "daily_budget" else r.max_daily_loss_usd
+    base_risk = o.daily_risk_budget_usd if o.risk_mode == "daily_budget" else o.risk_per_trade_usd
     return DailyGoalsConfig(
         daily_profit_target_usd=r.daily_profit_target_usd,
         daily_profit_lock_usd=r.daily_profit_target_usd,
-        max_daily_loss_usd=r.max_daily_loss_usd,
-        max_open_loss_usd=r.max_open_loss_usd,
-        default_risk_per_trade_usd=o.risk_per_trade_usd,
-        risk_after_win_usd=o.risk_per_trade_usd,
-        risk_after_loss_usd=o.risk_per_trade_usd,
+        max_daily_loss_usd=max_loss,
+        max_open_loss_usd=max(max_loss, r.max_open_loss_usd),
+        default_risk_per_trade_usd=base_risk,
+        risk_after_win_usd=base_risk,
+        risk_after_loss_usd=base_risk,
         max_trades_per_day=o.max_trades_per_day,
         max_consecutive_losses=max(o.max_trades_per_day, 2),
     )
@@ -266,7 +268,9 @@ class ScalperBot:
             logger.warning("ORB signal blocked by governor: {}", decision.reason)
             self.journal.log_event("WARNING", "risk_block", decision.reason)
             return
-        signal.risk_usd = self.orb.risk_per_trade_usd
+        signal.risk_usd = orb_position_risk(
+            self.orb, self.governor.state.trades_today, self.governor.state.realized_pnl
+        )
 
         check = self.risk_manager.validate_signal(
             signal, atr_value=abs(signal.entry - signal.sl), spread_points=spread,

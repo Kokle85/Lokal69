@@ -163,3 +163,50 @@ def test_diagnose_funnel_accounts_for_every_bar():
     # trend-alignment stats are percentages in range
     for key in ("m15_uptrend_pct", "m5_uptrend_pct", "m15_m5_agree_pct"):
         assert 0.0 <= stats[key] <= 100.0
+
+
+# ------------------------------------------------------------------ adaptive risk
+
+def test_daily_budget_single_trade_risks_whole_budget():
+    from config import ORBConfig
+    from risk_manager import orb_position_risk
+    o = ORBConfig(risk_mode="daily_budget", daily_risk_budget_usd=300,
+                  max_trades_per_day=1, max_risk_per_trade_usd=300)
+    assert orb_position_risk(o, 0, 0.0) == 300.0
+
+
+def test_daily_budget_splits_and_consumes():
+    from config import ORBConfig
+    from risk_manager import orb_position_risk
+    o = ORBConfig(risk_mode="daily_budget", daily_risk_budget_usd=300,
+                  max_trades_per_day=2, max_risk_per_trade_usd=300)
+    assert orb_position_risk(o, 0, 0.0) == 150.0          # 300 / 2
+    assert orb_position_risk(o, 1, -150.0) == 150.0       # (300-150) / 1 left
+    assert orb_position_risk(o, 1, -300.0) == 0.0         # budget spent
+
+
+def test_daily_budget_profit_extends_but_capped():
+    from config import ORBConfig
+    from risk_manager import orb_position_risk
+    o = ORBConfig(risk_mode="daily_budget", daily_risk_budget_usd=300,
+                  max_trades_per_day=2, profit_extends_budget=True, max_risk_per_trade_usd=300)
+    # (300 + 200 banked) / 1 = 500, capped at 300
+    assert orb_position_risk(o, 1, 200.0) == 300.0
+
+
+def test_fixed_mode_returns_fixed_risk():
+    from config import ORBConfig
+    from risk_manager import orb_position_risk
+    o = ORBConfig(risk_mode="fixed", risk_per_trade_usd=75, max_risk_per_trade_usd=300)
+    assert orb_position_risk(o, 0, 0.0) == 75.0
+
+
+def test_lot_adapts_to_sl_at_same_risk():
+    from models import SymbolSpec
+    from risk_manager import calculate_lot
+    spec = SymbolSpec(name="XAUUSD", point=0.01, tick_size=0.01, tick_value=1.0,
+                      volume_min=0.01, volume_max=100, volume_step=0.01, digits=2)
+    wide = calculate_lot(300, 4700, 4695, spec)   # 5.0 SL
+    tight = calculate_lot(300, 4700, 4697, spec)  # 3.0 SL
+    assert wide.ok and tight.ok
+    assert tight.lot > wide.lot                   # tighter stop -> bigger lot, same $ risk

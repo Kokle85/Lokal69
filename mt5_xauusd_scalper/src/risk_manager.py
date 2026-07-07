@@ -65,6 +65,25 @@ def calculate_lot(
     return LotResult(True, lot, "ok", actual_loss)
 
 
+def orb_position_risk(orb, trades_today: int, realized_pnl: float) -> float:
+    """Per-trade risk (USD) for an ORB trade.
+
+    In "daily_budget" mode the day has a total risk budget; each trade risks the
+    remaining budget spread over the remaining trades, so the lot adapts to the
+    SL distance and the day cannot lose more than the budget. Banked profit
+    extends the budget (trading with house money). "fixed" mode just returns
+    risk_per_trade_usd. Always capped by max_risk_per_trade_usd.
+    """
+    if orb.risk_mode == "fixed":
+        return min(orb.risk_per_trade_usd, orb.max_risk_per_trade_usd)
+    budget = orb.daily_risk_budget_usd
+    if orb.profit_extends_budget and realized_pnl > 0:
+        budget += realized_pnl
+    remaining_budget = max(0.0, budget - max(0.0, -realized_pnl))
+    remaining_trades = max(1, orb.max_trades_per_day - trades_today)
+    return min(remaining_budget / remaining_trades, orb.max_risk_per_trade_usd)
+
+
 def check_cost_to_tp(
     entry: float,
     tp: float,

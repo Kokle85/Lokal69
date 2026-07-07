@@ -170,7 +170,14 @@ orb:
   max_breakout_extension_atr: 1.0
   max_trades_per_day: 1
   max_trades_per_session: 1
-  risk_per_trade_usd: 75
+  # Adaptive position sizing: the day has a $300 risk budget split across
+  # trades; each trade's lot is sized from the SL distance to risk its share,
+  # so the day can't lose more than the budget. Banked profit extends it.
+  risk_mode: daily_budget
+  daily_risk_budget_usd: 300
+  profit_extends_budget: true
+  max_risk_per_trade_usd: 300
+  risk_per_trade_usd: 75      # only used when risk_mode is "fixed"
   trend_filter: none         # "none" beat "ema" on gold; re-test per instrument
   trend_ema_period: 50
   move_to_breakeven_at_r: 0.8

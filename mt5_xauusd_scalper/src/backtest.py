@@ -43,7 +43,7 @@ from models import (
 )
 from position_manager import decide_actions
 from regime_detector import RegimeDetector, build_snapshot, geometry_atr
-from risk_manager import calculate_lot, check_cost_to_tp, validate_sl_distance
+from risk_manager import calculate_lot, check_cost_to_tp, orb_position_risk, validate_sl_distance
 from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
 from strategy_high_precision import HighPrecisionStrategy
 from strategy_momentum import MomentumStrategy
@@ -250,14 +250,17 @@ class Backtester:
 
     def _orb_goals(self) -> DailyGoalsConfig:
         r, o = self.cfg.risk, self.orb
+        # In daily-budget mode the day's max loss IS the risk budget.
+        max_loss = o.daily_risk_budget_usd if o.risk_mode == "daily_budget" else r.max_daily_loss_usd
+        base_risk = o.daily_risk_budget_usd if o.risk_mode == "daily_budget" else o.risk_per_trade_usd
         return DailyGoalsConfig(
             daily_profit_target_usd=r.daily_profit_target_usd,
             daily_profit_lock_usd=r.daily_profit_target_usd,  # no half-risk zone for ORB
-            max_daily_loss_usd=r.max_daily_loss_usd,
-            max_open_loss_usd=r.max_open_loss_usd,
-            default_risk_per_trade_usd=o.risk_per_trade_usd,
-            risk_after_win_usd=o.risk_per_trade_usd,
-            risk_after_loss_usd=o.risk_per_trade_usd,
+            max_daily_loss_usd=max_loss,
+            max_open_loss_usd=max(max_loss, r.max_open_loss_usd),
+            default_risk_per_trade_usd=base_risk,
+            risk_after_win_usd=base_risk,
+            risk_after_loss_usd=base_risk,
             max_trades_per_day=o.max_trades_per_day,
             max_consecutive_losses=max(o.max_trades_per_day, 2),  # daily loss cap governs, not streak
         )
@@ -317,7 +320,9 @@ class Backtester:
         decision = governor.evaluate_new_trade(signal.score)
         if not decision.allowed:
             return None
-        signal.risk_usd = self.orb.risk_per_trade_usd
+        signal.risk_usd = orb_position_risk(
+            self.orb, governor.state.trades_today, governor.state.realized_pnl
+        )
 
         # Keep the cost gate (ORB SL is range-defined, so skip the ATR-SL bounds).
         cost = check_cost_to_tp(

@@ -301,6 +301,9 @@ class InstrumentConfig(BaseModel):
     trend_filter: Optional[str] = None
     entry_mode: Optional[str] = None
     retest_entry_pct: Optional[float] = None
+    risk_mode: Optional[str] = None
+    daily_risk_budget_usd: Optional[float] = None
+    risk_per_trade_usd: Optional[float] = None
 
     @field_validator("symbol")
     @classmethod
@@ -331,7 +334,17 @@ class ORBConfig(BaseModel):
     max_breakout_extension_atr: float = 1.0  # skip if entry is this far x M5 ATR beyond the level (chasing)
     max_trades_per_day: int = 3
     max_trades_per_session: int = 1
+    # Position sizing:
+    #   "fixed"        -> every trade risks risk_per_trade_usd
+    #   "daily_budget" -> the day has a total risk budget; each trade risks
+    #                     (remaining budget / remaining trades), so the lot adapts
+    #                     to the SL distance and the day can't lose more than the
+    #                     budget. Banked profit extends the budget (house money).
+    risk_mode: str = "daily_budget"
     risk_per_trade_usd: float = 75.0
+    daily_risk_budget_usd: float = 300.0
+    profit_extends_budget: bool = True
+    max_risk_per_trade_usd: float = 300.0
     # Directional filter: only take breakouts aligned with the higher-timeframe
     # trend (M5 EMA). "none" trades both ways (chops in ranges); "ema" only
     # longs above the EMA / shorts below - the main ORB win-rate lever.
@@ -356,6 +369,8 @@ class ORBConfig(BaseModel):
             raise ValueError("orb.entry_mode must be 'breakout' or 'retest'.")
         if not 0.0 < self.retest_entry_pct < 1.0:
             raise ValueError("orb.retest_entry_pct must be between 0 and 1.")
+        if self.risk_mode not in {"fixed", "daily_budget"}:
+            raise ValueError("orb.risk_mode must be 'fixed' or 'daily_budget'.")
         return self
 
 
@@ -454,7 +469,8 @@ class BotConfig(BaseModel):
             return orb
         for field in ("tp_r", "max_trades_per_day", "min_range_atr",
                       "move_to_breakeven_at_r", "trend_filter",
-                      "entry_mode", "retest_entry_pct"):
+                      "entry_mode", "retest_entry_pct", "risk_mode",
+                      "daily_risk_budget_usd", "risk_per_trade_usd"):
             val = getattr(inst, field)
             if val is not None:
                 setattr(orb, field, val)
