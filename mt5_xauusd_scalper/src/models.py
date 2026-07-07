@@ -34,6 +34,7 @@ class Direction(str, Enum):
 class StrategyName(str, Enum):
     HIGH_PRECISION = "HIGH_PRECISION_SCALP"
     MOMENTUM = "MOMENTUM_SCALP"
+    ORB = "OPENING_RANGE_BREAKOUT"
 
 
 class SignalStatus(str, Enum):

@@ -56,6 +56,44 @@ zone), only one more trade is allowed, at **half risk** and only for a setup sco
 ≥ 9/11. Protecting capital and banked profit always outranks reaching the target.
 On many days the bot will simply not trade at all; that is correct behavior.
 
+## ORB mode (Opening Range Breakout) — multi-instrument
+
+Set `trading_style: orb` (the default in the shipped config) to trade opening-range
+breakouts across **XAUUSD, US100 (NASDAQ) and US500 (S&P 500)** at the London and
+New York session opens, instead of the gold-only regime scalper (`trading_style: scalp`).
+
+How it works: at each configured session open, the first `opening_range_minutes`
+(15) define a high/low range. A close beyond the high goes long, beyond the low
+goes short; the stop sits on the opposite side of the range, the target at
+`tp_r` × risk (2R). All distance filters are **ATR-relative** (`min_range_atr`,
+`breakout_buffer_atr`, `max_breakout_extension_atr`, …) so one config works across
+gold and index CFDs without per-point tuning. One trade per session, up to
+`max_trades_per_day` (3), with the same realistic cost model, cost gate, lot
+sizing and daily risk governor as scalp mode.
+
+**Configure your instruments** — index CFD symbol names vary by broker. Open MT5
+Market Watch, find the exact names for NASDAQ and S&P (e.g. `NAS100`/`US100`/`USTEC`,
+`SPX500`/`US500`), and set them in `config.yaml` under `instruments:` and their
+`aliases:`. Verify the New York open time matches your broker's server time
+(`session_opens.newyork`, default 15:30 Europe/Skopje ≈ 09:30 ET).
+
+**Backtest each instrument** (pulls that symbol's M1 history from MT5):
+
+```bat
+python src\backtest.py --days 60 --symbol XAUUSD --diagnose
+python src\backtest.py --days 60 --symbol XAUUSD --export-trades data\xau.csv
+python src\backtest.py --days 60 --symbol US100  --export-trades data\nas.csv
+python src\backtest.py --days 60 --symbol US500  --export-trades data\spx.csv
+```
+
+`--diagnose` in ORB mode prints an ORB funnel (range-forming, no-breakout,
+range-too-small/large, chasing, session-already-traded, cost gate, and realized
+`BREAKOUT_TRADE`s). Visualize any ledger with `python src\dashboard.py --csv data\xau.csv`.
+
+> Live ORB currently scans the single symbol in `trading.symbol`. Scanning all
+> three instruments simultaneously in one live session (multi-symbol positions)
+> is the next step; for now backtest all three, then run whichever you choose live.
+
 ## Analytics dashboard
 
 A local web dashboard for visual analysis of the bot's work — no new

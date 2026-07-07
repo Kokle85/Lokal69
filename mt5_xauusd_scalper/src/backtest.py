@@ -27,9 +27,11 @@ from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import BotConfig, load_config
+import indicators as ind
+from config import BotConfig, DailyGoalsConfig, PositionManagementConfig, load_config
 from cost_model import CostModel
 from daily_risk_governor import DailyRiskGovernor
+from strategy_orb import ORBStrategy
 from models import (
     NO_TRADE_REGIMES,
     Direction,
@@ -128,12 +130,24 @@ class Backtester:
         m1: pd.DataFrame,
         spec: SymbolSpec = DEFAULT_SPEC,
         spread_points: Optional[float] = None,
+        symbol: str = "XAUUSD",
     ) -> None:
-        cfg = apply_sniper_overrides(cfg) if cfg.sniper_mode.enabled else copy.deepcopy(cfg)
+        self.orb_mode = cfg.trading_style == "orb"
+        # Sniper geometry overrides apply only to the scalp style.
+        if cfg.sniper_mode.enabled and not self.orb_mode:
+            cfg = apply_sniper_overrides(cfg)
+        else:
+            cfg = copy.deepcopy(cfg)
         if spread_points is not None:  # CLI/optimizer override of the base spread
             cfg.backtest.base_spread_points = spread_points
         self.cfg = cfg
-        self.sniper = cfg.sniper_mode if cfg.sniper_mode.enabled else None
+        self.sniper = cfg.sniper_mode if (cfg.sniper_mode.enabled and not self.orb_mode) else None
+        self.symbol = symbol
+        inst = cfg.instrument_for(symbol)
+        self.instrument_opens = inst.opens if inst else ["london", "newyork"]
+        self.orb = cfg.orb if self.orb_mode else None
+        self.orb_strategy = ORBStrategy(cfg.orb, cfg.session_opens)
+        self._traded_sessions: set = set()
         self.m1 = m1.reset_index(drop=True)
         self.spec = spec
         # The signal/regime layer sees the model's base spread so its spread
@@ -160,13 +174,13 @@ class Backtester:
 
     def run(self) -> BacktestReport:
         report = BacktestReport()
-        pm = self.cfg.position_management
+        pm = self._orb_pm() if self.orb_mode else self.cfg.position_management
         governor: Optional[DailyRiskGovernor] = None
         current_day = None
         open_trade: Optional[SimTrade] = None
 
-        m5_times = _ns(self.m5["time"])
-        m15_times = _ns(self.m15["time"])
+        self._m5_times = _ns(self.m5["time"])
+        self._m15_times = _ns(self.m15["time"])
         m1_ns = _ns(self.m1["time"])
 
         for i in range(M1_WINDOW, len(self.m1)):
@@ -188,15 +202,19 @@ class Backtester:
                     report.trades.append(open_trade)
                     open_trade = None
 
-            # ---- new entries only on closed M1 candles inside sessions
-            allowed, _ = in_session(self.cfg.sessions, bar_time.to_pydatetime())
-            if open_trade is not None or not allowed:
+            if open_trade is not None:
                 continue
             governor.check_locks()
             if governor.state.locked:
                 continue
 
-            open_trade = self._try_open(i, m1_ns[i], m5_times, m15_times, governor)
+            if self.orb_mode:
+                open_trade = self._try_open_orb(i, m1_ns[i], governor)
+            else:
+                # scalp entries only inside the scalp session windows
+                allowed, _ = in_session(self.cfg.sessions, bar_time.to_pydatetime())
+                if allowed:
+                    open_trade = self._try_open(i, m1_ns[i], self._m5_times, self._m15_times, governor)
 
         # flush the last day / force-close a dangling trade at the last close
         if open_trade is not None:
@@ -211,9 +229,97 @@ class Backtester:
         return report
 
     def _new_governor(self, day) -> DailyRiskGovernor:
+        if self.orb_mode:
+            return DailyRiskGovernor(self._orb_goals(), day)
         if self.sniper:
             return SniperGovernor(self.cfg.risk, self.sniper, day)
         return DailyRiskGovernor(self.cfg.daily_goals, day)
+
+    def _orb_goals(self) -> DailyGoalsConfig:
+        r, o = self.cfg.risk, self.cfg.orb
+        return DailyGoalsConfig(
+            daily_profit_target_usd=r.daily_profit_target_usd,
+            daily_profit_lock_usd=r.daily_profit_target_usd,  # no half-risk zone for ORB
+            max_daily_loss_usd=r.max_daily_loss_usd,
+            max_open_loss_usd=r.max_open_loss_usd,
+            default_risk_per_trade_usd=o.risk_per_trade_usd,
+            risk_after_win_usd=o.risk_per_trade_usd,
+            risk_after_loss_usd=o.risk_per_trade_usd,
+            max_trades_per_day=o.max_trades_per_day,
+            max_consecutive_losses=max(o.max_trades_per_day, 2),  # daily loss cap governs, not streak
+        )
+
+    def _orb_pm(self) -> PositionManagementConfig:
+        o = self.cfg.orb
+        return PositionManagementConfig(
+            move_to_breakeven_at_r=o.move_to_breakeven_at_r,
+            partial_close_enabled=o.partial_close_enabled,
+            partial_close_at_r=o.partial_close_at_r,
+            partial_close_percent=o.partial_close_percent,
+            time_exit_minutes=10**9,           # ORB holds to TP/SL, no stale-time exit
+            max_trade_duration_minutes=o.max_trade_minutes,
+            time_exit_min_r=-10**9,
+        )
+
+    def _m5_atr_at(self, bar_ns: int) -> float:
+        n5 = int(np.searchsorted(self._m5_times, bar_ns, side="right")) - 1
+        if n5 < 20:
+            return 0.0
+        m5_win = self.m5.iloc[max(0, n5 - 60): n5]
+        if len(m5_win) < 16:
+            return 0.0
+        return float(ind.atr(m5_win, 14).iloc[-1])
+
+    def _try_open_orb(self, i: int, bar_ns: int, governor: DailyRiskGovernor) -> Optional["SimTrade"]:
+        bar_time: pd.Timestamp = self.m1.iloc[i]["time"]
+        m5_atr = self._m5_atr_at(bar_ns)
+        if m5_atr <= 0:
+            return None
+        m1_win = self.m1.iloc[i - M1_WINDOW + 1: i + 1].reset_index(drop=True)
+        ev = self.orb_strategy.evaluate(
+            m1_win, bar_time.to_pydatetime(), self.symbol, self.instrument_opens,
+            m5_atr, self.spec.point, self.spread_points,
+        )
+        if ev.signal is None:
+            return None
+        sess_key = (bar_time.date(), ev.session_name)
+        if sess_key in self._traded_sessions:
+            return None
+
+        signal = ev.signal
+        decision = governor.evaluate_new_trade(signal.score)
+        if not decision.allowed:
+            return None
+        signal.risk_usd = self.cfg.orb.risk_per_trade_usd
+
+        # Keep the cost gate (ORB SL is range-defined, so skip the ATR-SL bounds).
+        cost = check_cost_to_tp(
+            signal.entry, signal.tp, self.spread_points, self.spec.point, self.cfg.trading
+        )
+        if not cost.ok:
+            return None
+        lot_result = calculate_lot(signal.risk_usd, signal.entry, signal.sl, self.spec)
+        if not lot_result.ok:
+            return None
+
+        self._traded_sessions.add(sess_key)
+        self._trade_counter += 1
+        idx = self._trade_counter
+        fill = self.cost.entry_fill(signal.entry, signal.direction, idx)
+        entry_commission = self.cost.commission(lot_result.lot)
+        session_hour = (
+            bar_time.tz_convert(self.cfg.session_opens.timezone).hour
+            if bar_time.tzinfo else bar_time.hour
+        )
+        return SimTrade(
+            direction=signal.direction, strategy=signal.strategy, regime=signal.regime,
+            entry=fill.price, intended_entry=signal.entry, sl=signal.sl, tp=signal.tp,
+            initial_sl=signal.sl, lot=lot_result.lot, initial_lot=lot_result.lot,
+            risk_usd=signal.risk_usd, open_time=bar_time, open_idx=i,
+            session_hour=session_hour, trade_index=idx,
+            trade_no=governor.state.trades_today + 1, score=signal.score,
+            realized=-entry_commission, commission_usd=entry_commission,
+        )
 
     # ------------------------------------------------------------- diagnostics
 
@@ -321,6 +427,50 @@ class Backtester:
             "avg_m5_ema_gap_pts": round(st["sep5_pts"] / n, 1),
         }
         return dict(sorted(tally.items())), stats
+
+    def diagnose_orb(self) -> dict[str, int]:
+        """Rejection funnel for ORB mode: why each bar did/didn't break out."""
+        from collections import Counter
+
+        tally: Counter[str] = Counter()
+        self._m5_times = _ns(self.m5["time"])
+        m1_ns = _ns(self.m1["time"])
+        traded: set = set()
+        for i in range(M1_WINDOW, len(self.m1)):
+            tally["bars_scanned"] += 1
+            bar_time = self.m1.iloc[i]["time"]
+            m5_atr = self._m5_atr_at(m1_ns[i])
+            if m5_atr <= 0:
+                tally["1_warming_up"] += 1
+                continue
+            ev = self.orb_strategy.evaluate(
+                self.m1.iloc[i - M1_WINDOW + 1: i + 1].reset_index(drop=True),
+                bar_time.to_pydatetime(), self.symbol, self.instrument_opens,
+                m5_atr, self.spec.point, self.spread_points,
+            )
+            if ev.signal is None:
+                import re
+
+                reason = ev.rejections[0] if ev.rejections else "no signal"
+                reason = reason.split(":", 1)[-1].strip()
+                reason = re.sub(r"\[[^\]]*\]", "", reason)
+                reason = re.sub(r"[-+]?\d[\d.]*", "", reason)
+                reason = re.sub(r"\s+", " ", reason).strip()[:45]
+                tally[f"2_{reason}"] += 1
+                continue
+            sess_key = (bar_time.date(), ev.session_name)
+            if sess_key in traded:
+                tally["3_session_already_traded"] += 1
+                continue
+            cost = check_cost_to_tp(
+                ev.signal.entry, ev.signal.tp, self.spread_points, self.spec.point, self.cfg.trading
+            )
+            if not cost.ok:
+                tally["4_cost_gate"] += 1
+                continue
+            traded.add(sess_key)
+            tally["5_BREAKOUT_TRADE"] += 1
+        return dict(sorted(tally.items()))
 
     # ------------------------------------------------------------- entries
 
@@ -721,20 +871,37 @@ def main() -> int:
     parser.add_argument("--spread-points", type=float, default=None,
                         help="override backtest.base_spread_points")
     parser.add_argument("--export-trades", default=None, help="write per-trade ledger CSV")
+    parser.add_argument("--symbol", default=None,
+                        help="instrument symbol to pull/label (e.g. XAUUSD, US100, US500)")
     parser.add_argument("--diagnose", action="store_true",
                         help="print a rejection funnel (why bars did/didn't produce trades) "
                              "instead of running the trade simulation")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    symbol = args.symbol or cfg.trading.symbol
+    if args.symbol:
+        cfg.trading.symbol = args.symbol  # so MT5 pulls the right instrument's history
     if args.csv:
         m1 = load_m1_from_csv(args.csv)
     else:
         m1 = load_m1_from_mt5(cfg, args.days)
-    logger.info("Backtesting {} M1 bars ({} -> {})", len(m1), m1['time'].iloc[0], m1['time'].iloc[-1])
+    logger.info("Backtesting {} ({} M1 bars, {} -> {})", symbol, len(m1),
+                m1['time'].iloc[0], m1['time'].iloc[-1])
 
-    bt = Backtester(cfg, m1, spread_points=args.spread_points)
+    bt = Backtester(cfg, m1, spread_points=args.spread_points, symbol=symbol)
     if args.diagnose:
+        if bt.orb_mode:
+            funnel = bt.diagnose_orb()
+            scanned = funnel.pop("bars_scanned", 0)
+            print(f"\n===== ORB FUNNEL ({symbol}) =====")
+            print(f"{'bars_scanned':44s} {scanned}")
+            for stage, count in funnel.items():
+                pct = 100.0 * count / scanned if scanned else 0.0
+                print(f"{stage:44s} {count:6d}  ({pct:4.1f}%)")
+            print("Stage 2 holds most bars (outside session-open windows). "
+                  "5_BREAKOUT_TRADE is your realized ORB entries.\n")
+            return 0
         funnel, stats = bt.diagnose()
         scanned = funnel.pop("bars_scanned", 0)
         print("\n===== REJECTION FUNNEL =====")
@@ -745,11 +912,7 @@ def main() -> int:
         print("\n----- TREND ALIGNMENT (in-session bars) -----")
         for k, v in stats.items():
             print(f"{k:40s} {v}")
-        print("============================")
-        print("Stages 1-2 hold most bars (outside sessions / warm-up).")
-        print("If m15_m5_agree_pct is very low, the timeframes rarely align -> "
-              "conflict=CHOPPY dominates. m15/m5_uptrend_pct near 0 or 100 with "
-              "the other mid-range points to one timeframe leading the other.\n")
+        print("============================\n")
         return 0
 
     report = bt.run()

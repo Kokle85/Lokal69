@@ -54,13 +54,11 @@ class TradingConfig(BaseModel):
 
     @field_validator("symbol")
     @classmethod
-    def _gold_only(cls, v: str) -> str:
-        allowed = {"XAUUSD", "GOLD", "XAUUSDM"}
-        if v.upper() not in allowed:
-            raise ValueError(
-                f"symbol '{v}' is not allowed. This bot trades Gold only "
-                f"(XAUUSD / GOLD / XAUUSDm)."
-            )
+    def _valid_symbol(cls, v: str) -> str:
+        # Multi-instrument: accept any plausible broker symbol (gold + index CFDs
+        # like US100/NAS100/US500/SPX500). MT5 validates existence at runtime.
+        if not v or not v.replace(".", "").replace("_", "").isalnum():
+            raise ValueError(f"symbol '{v}' is not a valid instrument symbol.")
         return v
 
     @model_validator(mode="after")
@@ -266,6 +264,72 @@ class TelegramConfig(BaseModel):
         return self
 
 
+class SessionOpensConfig(BaseModel):
+    """Named session opens (local time) at which an ORB range forms.
+
+    London ~= London cash open, New York ~= US equity open. Times are in the
+    `timezone`. For XAUUSD both apply; for US index CFDs use `newyork`.
+    """
+
+    timezone: str = "Europe/Skopje"
+    london: str = "09:00"
+    newyork: str = "15:30"
+    enabled: list[str] = Field(default_factory=lambda: ["london", "newyork"])
+    block_friday_after: str = "22:00"
+
+    def open_time(self, name: str) -> str:
+        return {"london": self.london, "newyork": self.newyork}[name]
+
+
+class InstrumentConfig(BaseModel):
+    """One tradeable instrument and which session opens it trades."""
+
+    symbol: str
+    aliases: list[str] = Field(default_factory=list)
+    opens: list[str] = Field(default_factory=lambda: ["london", "newyork"])
+    enabled: bool = True
+
+    @field_validator("symbol")
+    @classmethod
+    def _valid(cls, v: str) -> str:
+        if not v or not v.replace(".", "").replace("_", "").isalnum():
+            raise ValueError(f"instrument symbol '{v}' is invalid.")
+        return v
+
+
+class ORBConfig(BaseModel):
+    """Opening Range Breakout. Filters are ATR-relative so the same settings
+    work across gold and index CFDs without per-point tuning."""
+
+    enabled: bool = True
+    opening_range_minutes: int = 15
+    entry_window_minutes: int = 90       # only take a breakout within this window after the range
+    tp_r: float = 2.0                    # target = tp_r x risk (risk = range + buffers)
+    entry_on_close: bool = True          # require an M1 close beyond the level (vs intrabar touch)
+    breakout_buffer_atr: float = 0.05    # price must clear the level by this x M5 ATR
+    sl_buffer_atr: float = 0.05          # stop sits this x M5 ATR beyond the opposite side
+    min_range_atr: float = 0.5           # skip if opening range < this x M5 ATR (no volatility)
+    max_range_atr: float = 4.0           # skip if opening range > this x M5 ATR (already exploded)
+    max_breakout_extension_atr: float = 1.0  # skip if entry is this far x M5 ATR beyond the level (chasing)
+    max_trades_per_day: int = 3
+    max_trades_per_session: int = 1
+    risk_per_trade_usd: float = 75.0
+    move_to_breakeven_at_r: float = 1.0
+    partial_close_enabled: bool = False
+    partial_close_at_r: float = 1.0
+    partial_close_percent: float = 50.0
+    max_trade_minutes: int = 150         # hard time cap (roughly a session)
+    min_score: int = 0                   # optional quality gate (0 = off); ORB score is 0-10
+
+    @model_validator(mode="after")
+    def _sanity(self) -> "ORBConfig":
+        if self.min_range_atr >= self.max_range_atr:
+            raise ValueError("orb.min_range_atr must be < max_range_atr.")
+        if self.tp_r <= 0:
+            raise ValueError("orb.tp_r must be positive.")
+        return self
+
+
 class BacktestConfig(BaseModel):
     """Realistic simulation costs and fill assumptions for backtest/optimizer.
 
@@ -294,8 +358,20 @@ class BacktestConfig(BaseModel):
         return v
 
 
+def _default_instruments() -> list["InstrumentConfig"]:
+    return [
+        InstrumentConfig(symbol="XAUUSD", aliases=["XAUUSD", "GOLD", "XAUUSDm"],
+                         opens=["london", "newyork"]),
+        InstrumentConfig(symbol="US100", aliases=["US100", "NAS100", "USTEC", "NDX100"],
+                         opens=["newyork"]),
+        InstrumentConfig(symbol="US500", aliases=["US500", "SPX500", "SP500"],
+                         opens=["newyork"]),
+    ]
+
+
 class BotConfig(BaseModel):
     mode: BotMode = BotMode.SIGNAL_ONLY
+    trading_style: str = "scalp"  # "scalp" (regime+pullback) or "orb"
     account: AccountConfig = AccountConfig()
     mt5: MT5Config = MT5Config()
     trading: TradingConfig = TradingConfig()
@@ -305,10 +381,20 @@ class BotConfig(BaseModel):
     position_management: PositionManagementConfig = PositionManagementConfig()
     regime: RegimeConfig = RegimeConfig()
     sessions: SessionsConfig = SessionsConfig()
+    session_opens: SessionOpensConfig = SessionOpensConfig()
+    instruments: list[InstrumentConfig] = Field(default_factory=_default_instruments)
+    orb: ORBConfig = ORBConfig()
     telegram: TelegramConfig = TelegramConfig()
     sniper_mode: SniperModeConfig = SniperModeConfig()
     risk: RiskConfig = RiskConfig()
     backtest: BacktestConfig = BacktestConfig()
+
+    @field_validator("trading_style")
+    @classmethod
+    def _valid_style(cls, v: str) -> str:
+        if v not in {"scalp", "orb"}:
+            raise ValueError("trading_style must be 'scalp' or 'orb'.")
+        return v
 
     @model_validator(mode="after")
     def _live_auto_guard(self) -> "BotConfig":
@@ -319,6 +405,14 @@ class BotConfig(BaseModel):
                 "Use demo mode first."
             )
         return self
+
+    def instrument_for(self, symbol: str) -> Optional["InstrumentConfig"]:
+        up = symbol.upper()
+        for inst in self.instruments:
+            names = [inst.symbol.upper()] + [a.upper() for a in inst.aliases]
+            if up in names:
+                return inst
+        return None
 
 
 class ConfigError(Exception):

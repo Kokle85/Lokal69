@@ -4,6 +4,10 @@
 
 mode: SIGNAL_ONLY
 
+# Trading style: "orb" = Opening Range Breakout (multi-instrument, London/NY opens),
+# "scalp" = the original regime+pullback gold scalper.
+trading_style: orb
+
 account:
   size_usd: 25000
 
@@ -111,6 +115,50 @@ sessions:
 
 telegram:
   enabled: true
+
+# Named session opens for ORB (local time). ORB forms a range at each.
+session_opens:
+  timezone: Europe/Skopje
+  london: "09:00"      # ~London cash open
+  newyork: "15:30"     # ~US equity open (09:30 ET)
+  enabled: [london, newyork]
+  block_friday_after: "22:00"
+
+# Instruments to trade. VERIFY the symbol names against your broker's Market
+# Watch (index CFD names vary: NAS100/US100/USTEC, US500/SPX500/SP500).
+instruments:
+  - symbol: XAUUSD
+    aliases: [XAUUSD, GOLD, XAUUSDm]
+    opens: [london, newyork]
+  - symbol: US100
+    aliases: [US100, NAS100, USTEC, NDX100]
+    opens: [newyork]
+  - symbol: US500
+    aliases: [US500, SPX500, SP500]
+    opens: [newyork]
+
+# Opening Range Breakout. Filters are ATR-relative so one config fits gold and
+# index CFDs. SL = opposite side of the range; TP = tp_r x risk.
+orb:
+  enabled: true
+  opening_range_minutes: 15
+  entry_window_minutes: 90
+  tp_r: 2.0
+  entry_on_close: true
+  breakout_buffer_atr: 0.05
+  sl_buffer_atr: 0.05
+  min_range_atr: 0.5
+  max_range_atr: 4.0
+  max_breakout_extension_atr: 1.0
+  max_trades_per_day: 3
+  max_trades_per_session: 1
+  risk_per_trade_usd: 75
+  move_to_breakeven_at_r: 1.0
+  partial_close_enabled: false
+  partial_close_at_r: 1.0
+  partial_close_percent: 50
+  max_trade_minutes: 150
+  min_score: 0
 
 # Realistic simulation costs for backtest.py / optimizer.py (not used live).
 # Conservative XAUUSD defaults: variable spread, per-side commission, adverse

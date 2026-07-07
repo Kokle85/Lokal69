@@ -4,7 +4,10 @@ from __future__ import annotations
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-from config import SessionsConfig
+from datetime import timedelta
+from typing import Optional
+
+from config import SessionOpensConfig, SessionsConfig
 
 
 def now_in_tz(tz_name: str) -> datetime:
@@ -37,6 +40,37 @@ def in_session(cfg: SessionsConfig, now: datetime | None = None) -> tuple[bool, 
         if parse_hhmm(window.start) <= local.time() < parse_hhmm(window.end):
             return True, f"inside session {window.start}-{window.end}"
     return False, "outside allowed trading sessions"
+
+
+def active_session_open(
+    cfg: SessionOpensConfig,
+    opens: list[str],
+    now: datetime,
+    range_minutes: int,
+    entry_window_minutes: int,
+) -> Optional[tuple[str, datetime, datetime, datetime]]:
+    """Which enabled session open is 'now' inside the tradeable window of?
+
+    Returns (name, open_dt, range_end_dt, entry_deadline_dt) in the config's
+    timezone, or None. The tradeable window runs from the session open through
+    range + entry window. Weekends and the Friday cutoff are excluded.
+    """
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    if local.weekday() >= 5:
+        return None
+    if local.weekday() == 4 and local.time() >= parse_hhmm(cfg.block_friday_after):
+        return None
+
+    for name in opens:
+        if name not in cfg.enabled:
+            continue
+        open_t = parse_hhmm(cfg.open_time(name))
+        open_dt = local.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0)
+        range_end = open_dt + timedelta(minutes=range_minutes)
+        deadline = range_end + timedelta(minutes=entry_window_minutes)
+        if open_dt <= local < deadline:
+            return name, open_dt, range_end, deadline
+    return None
 
 
 def price_to_points(distance: float, point: float) -> float:

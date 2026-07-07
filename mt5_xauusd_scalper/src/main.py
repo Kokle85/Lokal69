@@ -12,7 +12,7 @@ from loguru import logger
 # Allow `python src/main.py` from the project root.
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import BotConfig, ConfigError, load_config
+from config import BotConfig, ConfigError, DailyGoalsConfig, load_config
 from daily_risk_governor import DailyRiskGovernor
 from execution import ExecutionEngine
 from journal import Journal
@@ -31,6 +31,7 @@ from position_manager import apply_action_to_state, evaluate_position
 from regime_detector import RegimeDetector, build_snapshot, geometry_atr
 from risk_manager import RiskManager
 from sniper_mode import SniperGovernor, apply_sniper_overrides, sniper_adjust_signal
+from strategy_orb import ORBStrategy
 from strategy_high_precision import HighPrecisionStrategy
 from strategy_momentum import MomentumStrategy
 from strategy_selector import StrategySelector
@@ -38,6 +39,22 @@ from telegram_bot import TelegramService
 from utils import fmt_usd, in_session, now_in_tz
 
 SCAN_INTERVAL_SECONDS = 5
+
+
+def _orb_goals(cfg: BotConfig) -> DailyGoalsConfig:
+    """Daily risk limits for ORB mode (from the risk + orb config sections)."""
+    r, o = cfg.risk, cfg.orb
+    return DailyGoalsConfig(
+        daily_profit_target_usd=r.daily_profit_target_usd,
+        daily_profit_lock_usd=r.daily_profit_target_usd,
+        max_daily_loss_usd=r.max_daily_loss_usd,
+        max_open_loss_usd=r.max_open_loss_usd,
+        default_risk_per_trade_usd=o.risk_per_trade_usd,
+        risk_after_win_usd=o.risk_per_trade_usd,
+        risk_after_loss_usd=o.risk_per_trade_usd,
+        max_trades_per_day=o.max_trades_per_day,
+        max_consecutive_losses=max(o.max_trades_per_day, 2),
+    )
 
 
 def setup_logging() -> None:
@@ -56,10 +73,11 @@ def setup_logging() -> None:
 
 class ScalperBot:
     def __init__(self, cfg: BotConfig) -> None:
-        if cfg.sniper_mode.enabled:
+        self.orb_mode = cfg.trading_style == "orb"
+        if cfg.sniper_mode.enabled and not self.orb_mode:
             cfg = apply_sniper_overrides(cfg)
         self.cfg = cfg
-        self.sniper = cfg.sniper_mode if cfg.sniper_mode.enabled else None
+        self.sniper = cfg.sniper_mode if (cfg.sniper_mode.enabled and not self.orb_mode) else None
         self.journal = Journal()
         self.connector = MT5Connector(cfg.mt5, cfg.trading)
         self.market_data = MarketData(self.connector)
@@ -80,10 +98,14 @@ class ScalperBot:
             self.connector, cfg.trading, notify=self.telegram.send_nowait
         )
         today = now_in_tz(cfg.sessions.timezone).date()
-        if self.sniper:
-            self.governor: DailyRiskGovernor = SniperGovernor(cfg.risk, self.sniper, today)
+        if self.orb_mode:
+            self.orb_strategy = ORBStrategy(cfg.orb, cfg.session_opens)
+            self.governor: DailyRiskGovernor = DailyRiskGovernor(_orb_goals(cfg), today)
+        elif self.sniper:
+            self.governor = SniperGovernor(cfg.risk, self.sniper, today)
         else:
             self.governor = DailyRiskGovernor(cfg.daily_goals, today)
+        self._traded_sessions: set = set()
 
         self.paused = False
         self.position: Optional[ManagedPosition] = None
@@ -180,18 +202,94 @@ class ScalperBot:
         if self.governor.state.locked:
             return
 
-        allowed, session_reason = in_session(self.cfg.sessions)
-        if not allowed:
-            logger.debug("Skipping scan: {}", session_reason)
-            return
+        if not self.orb_mode:
+            allowed, session_reason = in_session(self.cfg.sessions)
+            if not allowed:
+                logger.debug("Skipping scan: {}", session_reason)
+                return
 
         m1 = self.market_data.fetch_closed("M1")
         if not self.market_data.new_m1_candle(m1):
             return  # evaluate entries only on a new closed M1 candle
 
-        await self._scan(m1)
+        if self.orb_mode:
+            await self._scan_orb(m1)
+        else:
+            await self._scan(m1)
 
     # ================================================================ scanning
+
+    async def _scan_orb(self, m1) -> None:
+        from datetime import timezone as _tz
+
+        import indicators as _ind
+
+        spec = self.connector.symbol_spec()
+        spread = self.connector.spread_points()
+        m5 = self.market_data.fetch_closed("M5")
+        m5_atr = float(_ind.atr(m5, self.cfg.strategy.atr_period).iloc[-1]) if len(m5) > 20 else 0.0
+        if m5_atr <= 0:
+            return
+
+        inst = self.cfg.instrument_for(self.connector.symbol)
+        opens = inst.opens if inst else ["london", "newyork"]
+        now = datetime.now(_tz.utc)
+        ev = self.orb_strategy.evaluate(
+            m1, now, self.connector.symbol, opens, m5_atr, spec.point, spread
+        )
+        if ev.signal is None:
+            if ev.rejections:
+                logger.debug("ORB no signal: {}", ev.rejections[0])
+            return
+
+        sess_key = (now_in_tz(self.cfg.session_opens.timezone).date(), ev.session_name)
+        if sess_key in self._traded_sessions:
+            logger.debug("ORB: {} session already traded today", ev.session_name)
+            return
+
+        signal = ev.signal
+        signal.mode = self.cfg.mode
+        signal.trade_number = self.governor.state.trades_today + 1
+        signal.max_trades_today = self.cfg.orb.max_trades_per_day
+        self.current_regime = f"ORB/{ev.session_name}"
+        self.active_strategy = signal.strategy.value
+
+        decision = self.governor.evaluate_new_trade(signal.score)
+        await self._flush_lock_events()
+        if not decision.allowed:
+            logger.warning("ORB signal blocked by governor: {}", decision.reason)
+            self.journal.log_event("WARNING", "risk_block", decision.reason)
+            return
+        signal.risk_usd = self.cfg.orb.risk_per_trade_usd
+
+        check = self.risk_manager.validate_signal(
+            signal, atr_value=abs(signal.entry - signal.sl), spread_points=spread,
+            open_positions=len(self.connector.open_positions()),
+            symbol_tradeable=spec.trade_allowed, point=spec.point,
+        )
+        if not check.ok:
+            logger.warning("ORB signal rejected by risk manager: {}", check.reason)
+            self.journal.log_event("WARNING", "risk_block", check.reason)
+            return
+
+        lot_result = self.risk_manager.size_position(signal, spec)
+        if not lot_result.ok:
+            self.journal.log_event("WARNING", "lot_skip", lot_result.reason)
+            return
+        signal.lot = lot_result.lot
+
+        signal.signal_id = self.journal.record_signal(signal, SignalStatus.SENT)
+        logger.info(
+            "ORB SIGNAL {} {} entry {:.2f} SL {:.2f} TP {:.2f} lot {} ({})",
+            signal.direction.value, signal.symbol, signal.entry, signal.sl, signal.tp,
+            signal.lot, signal.setup_reason,
+        )
+        await self.telegram.send_signal(signal, self.governor.state.realized_pnl, self.cfg.mode)
+        if self.cfg.mode is BotMode.SEMI_AUTO:
+            self.pending_signals[signal.signal_id] = signal
+        if self.cfg.mode in (BotMode.DEMO_AUTO, BotMode.LIVE_AUTO):
+            self._traded_sessions.add(sess_key)
+            await self._execute_signal(signal)
 
     async def _scan(self, m1) -> None:
         m5 = self.market_data.fetch_closed("M5")
