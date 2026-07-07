@@ -167,6 +167,29 @@ class MT5Connector:
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
         return df
 
+    def rates_range(self, timeframe: str, days: int) -> pd.DataFrame:
+        """Pull history by DATE RANGE (copy_rates_range) - the reliable way to
+        fetch long spans. Unlike copy_rates_from_pos it is not bound by a bar
+        count, so 360+ days come back in one call if the terminal has cached the
+        history (scroll the M1 chart back / raise 'Max bars in chart')."""
+        from datetime import datetime, timedelta, timezone
+
+        tf_map = {
+            "M1": mt5.TIMEFRAME_M1,
+            "M5": mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15,
+        }
+        if timeframe not in tf_map:
+            raise MT5Error(f"Unsupported timeframe {timeframe}")
+        utc_to = datetime.now(timezone.utc) + timedelta(days=1)  # pad so the last bar is included
+        utc_from = utc_to - timedelta(days=days + 1)
+        raw = mt5.copy_rates_range(self.symbol, tf_map[timeframe], utc_from, utc_to)
+        if raw is None or len(raw) == 0:
+            raise MT5Error(f"copy_rates_range returned no data for {self.symbol} {timeframe}")
+        df = pd.DataFrame(raw)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df
+
     # ------------------------------------------------------------ trading state
 
     def open_positions(self) -> list[Any]:

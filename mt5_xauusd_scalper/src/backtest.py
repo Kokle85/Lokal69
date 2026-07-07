@@ -830,13 +830,27 @@ def load_m1_from_mt5(cfg: BotConfig, days: int) -> pd.DataFrame:
     connector.connect()
     try:
         connector.resolve_symbol()
-        requested = min(days * 1440, 200_000)
-        # The terminal only caches history it has downloaded. If it has fewer M1
-        # bars than requested, copy_rates_from_pos can return nothing rather than
-        # a partial set - so step the request down until the terminal answers.
-        for count in (requested, 50_000, 20_000, 5_000, 1_000):
-            if count > requested:
-                continue
+        requested = days * 1440
+        # Preferred path for long spans: pull by DATE RANGE. copy_rates_from_pos
+        # is bounded by a bar count (and previously hard-capped at 200k here), so
+        # it silently truncated long requests; copy_rates_range returns whatever
+        # the terminal has cached in the window, so --days 360 comes back in full.
+        try:
+            df = connector.rates_range("M1", days)
+            got_days = len(df) / 1440.0
+            if got_days < days * 0.6:
+                logger.warning(
+                    "Terminal returned {} M1 bars (~{:.0f} of {} days requested). "
+                    "Open the XAUUSD M1 chart, press Home / scroll left to download "
+                    "more history, and raise 'Max bars in chart' "
+                    "(Tools > Options > Charts), then retry.",
+                    len(df), got_days, days,
+                )
+            return df
+        except MT5Error:
+            logger.warning("Date-range pull returned nothing, falling back to bar-count pull...")
+        # Fallback: step the bar-count request down until the terminal answers.
+        for count in (min(requested, 200_000), 50_000, 20_000, 5_000, 1_000):
             try:
                 df = connector.rates("M1", count)
             except MT5Error:
