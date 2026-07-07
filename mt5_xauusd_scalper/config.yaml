@@ -178,13 +178,18 @@ orb:
   # Adaptive position sizing: the day has a risk budget split across trades;
   # each trade's lot is sized from the SL distance to risk its share, so the
   # day can't lose more than the budget. Banked profit extends it.
-  # Monte Carlo (10k resamples of full-2025): at $300/day the p95 max drawdown
-  # is $12,469 (~50% of a $25k account, P(DD>$5k)=75%) - oversized. At $150/day:
-  # p95 DD $6,235 (~25%), median year +$3,837. On a prop account with a 10%
-  # max-drawdown rule use ~$60-75/day instead. Raising this back to 300 doubles
-  # both the profit AND the drawdown - the edge itself does not change.
+  # PROP ACCOUNT SIZING (FundingPips-style: +8% target, -10% static max loss,
+  # -5% daily). 20k-run Monte Carlo race of target-vs-bust on the full-2025
+  # trade set, by daily budget:
+  #   $300: 67% pass / 33% bust, ~16 trading days to pass
+  #   $150: 79% / 21%, ~55 days
+  #   $100: 87% / 13%, ~107 days   <-- current setting (balanced)
+  #   $ 75: 92% /  8%, ~169 days
+  #   $ 60: 95.5% / 4.5%, ~232 days
+  # Bigger budget = faster but busts more often; the edge itself is unchanged.
+  # If the prop max loss is TRAILING (not static), bust odds are worse - size down.
   risk_mode: daily_budget
-  daily_risk_budget_usd: 150
+  daily_risk_budget_usd: 100
   profit_extends_budget: true
   max_risk_per_trade_usd: 300
   risk_per_trade_usd: 75      # only used when risk_mode is "fixed"
