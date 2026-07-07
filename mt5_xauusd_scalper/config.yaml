@@ -143,17 +143,18 @@ orb:
   enabled: true
   opening_range_minutes: 15
   entry_window_minutes: 90
-  # Data-driven defaults from the first optimizer sweep on 64 days of XAUUSD:
-  # tp_r 1.5 (2.0/2.5 needed a hit rate gold doesn't reach), trend_filter none
-  # (the EMA filter hurt on gold), breakeven at 0.8R (protects reached winners).
-  tp_r: 1.5
+  # Data-driven defaults from the 2nd optimizer sweep on 64 days of XAUUSD.
+  # Best risk-adjusted config: tp_r 1.3 (WR jumps to 46% vs 27% at 2R -> above
+  # the 43% breakeven), 1 trade/day (only the first/London breakout; the 2nd/NY
+  # trade bled), trend_filter none, breakeven 0.8R. PF ~1.22, net +483/64d.
+  tp_r: 1.3
   entry_on_close: true
   breakout_buffer_atr: 0.05
   sl_buffer_atr: 0.05
-  min_range_atr: 0.4
+  min_range_atr: 0.3
   max_range_atr: 4.0
   max_breakout_extension_atr: 1.0
-  max_trades_per_day: 2
+  max_trades_per_day: 1
   max_trades_per_session: 1
   risk_per_trade_usd: 75
   trend_filter: none         # "none" beat "ema" on gold; re-test per instrument

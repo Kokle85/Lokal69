@@ -122,7 +122,10 @@ def apply_sniper_params(base: BotConfig, params: dict) -> BotConfig:
     return cfg
 
 
-def evaluate_result(metrics: dict, total_days: int, min_trades: int = MIN_TRADES) -> tuple[bool, str, float]:
+def evaluate_result(
+    metrics: dict, total_days: int, min_trades: int = MIN_TRADES,
+    max_consec: int = MAX_CONSECUTIVE_LOSSES,
+) -> tuple[bool, str, float]:
     """Return (accepted, rejection_reason, rank_score)."""
     trades = int(metrics.get("total_trades", 0))
     if trades < min_trades:
@@ -130,8 +133,8 @@ def evaluate_result(metrics: dict, total_days: int, min_trades: int = MIN_TRADES
     pf = float(metrics.get("profit_factor", 0.0))
     if pf < MIN_PROFIT_FACTOR:
         return False, f"profit_factor {pf} < {MIN_PROFIT_FACTOR}", 0.0
-    if int(metrics.get("max_consecutive_losses", 99)) > MAX_CONSECUTIVE_LOSSES:
-        return False, "max_consecutive_losses > 4", 0.0
+    if int(metrics.get("max_consecutive_losses", 99)) > max_consec:
+        return False, f"max_consecutive_losses > {max_consec}", 0.0
     loss_days = int(metrics.get("days_hitting_max_loss", 0))
     if total_days > 0 and loss_days / total_days > MAX_LOSS_DAY_RATIO:
         return False, "daily max loss hit too often", 0.0
@@ -283,13 +286,18 @@ def main() -> int:
     )
 
     symbol = args.symbol or base_cfg.trading.symbol
-    min_trades = 40 if args.orb_grid else MIN_TRADES  # ORB takes fewer, higher-quality trades
+    # ORB takes fewer, higher-quality trades; a 1-trade/day system naturally has
+    # longer losing streaks, so relax both the trade-count and consec-loss gates.
+    min_trades = 40 if args.orb_grid else MIN_TRADES
+    max_consec = 6 if args.orb_grid else MAX_CONSECUTIVE_LOSSES
     rows: list[dict] = []
     for idx, params in enumerate(combos, 1):
         cfg = apply_fn(base_cfg, params)
         report = Backtester(cfg, m1, spread_points=args.spread_points, symbol=symbol).run()
         total_days = len(report.daily_pnl)
-        accepted, reason, score = evaluate_result(report.metrics, total_days, min_trades=min_trades)
+        accepted, reason, score = evaluate_result(
+            report.metrics, total_days, min_trades=min_trades, max_consec=max_consec
+        )
         row = {
             **params,
             "accepted": accepted,
