@@ -24,7 +24,10 @@ trading:
     - GOLD
     - XAUUSDm
   magic_number: 26070301
-  max_spread_points: 25
+  # Spread-sensitivity on full-2025: the 3R system keeps PF 1.11 at 30pt and
+  # 1.08 at 40pt (break-even ~70pt+), so 35 is safely inside the edge and stops
+  # us skipping valid entries on mildly elevated spread.
+  max_spread_points: 35
   max_entry_slippage_points: 20
   deviation_points: 20
   max_positions: 1
@@ -172,11 +175,16 @@ orb:
   max_breakout_extension_atr: 1.0
   max_trades_per_day: 1
   max_trades_per_session: 1
-  # Adaptive position sizing: the day has a $300 risk budget split across
-  # trades; each trade's lot is sized from the SL distance to risk its share,
-  # so the day can't lose more than the budget. Banked profit extends it.
+  # Adaptive position sizing: the day has a risk budget split across trades;
+  # each trade's lot is sized from the SL distance to risk its share, so the
+  # day can't lose more than the budget. Banked profit extends it.
+  # Monte Carlo (10k resamples of full-2025): at $300/day the p95 max drawdown
+  # is $12,469 (~50% of a $25k account, P(DD>$5k)=75%) - oversized. At $150/day:
+  # p95 DD $6,235 (~25%), median year +$3,837. On a prop account with a 10%
+  # max-drawdown rule use ~$60-75/day instead. Raising this back to 300 doubles
+  # both the profit AND the drawdown - the edge itself does not change.
   risk_mode: daily_budget
-  daily_risk_budget_usd: 300
+  daily_risk_budget_usd: 150
   profit_extends_budget: true
   max_risk_per_trade_usd: 300
   risk_per_trade_usd: 75      # only used when risk_mode is "fixed"
