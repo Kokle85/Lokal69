@@ -155,8 +155,11 @@ def test_diagnose_funnel_accounts_for_every_bar():
                        "low": np.minimum(openp, close) - pad,
                        "close": close, "tick_volume": rng.integers(50, 300, n)})
     bt = Backtester(BotConfig(), m1)
-    funnel = bt.diagnose()
+    funnel, stats = bt.diagnose()
     scanned = funnel.pop("bars_scanned")
     assert scanned == len(m1) - M1_WINDOW
     # every scanned bar lands in exactly one terminal bucket
     assert sum(funnel.values()) == scanned
+    # trend-alignment stats are percentages in range
+    for key in ("m15_uptrend_pct", "m5_uptrend_pct", "m15_m5_agree_pct"):
+        assert 0.0 <= stats[key] <= 100.0

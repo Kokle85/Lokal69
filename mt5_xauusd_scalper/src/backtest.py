@@ -205,12 +205,15 @@ class Backtester:
 
     # ------------------------------------------------------------- diagnostics
 
-    def diagnose(self) -> dict[str, int]:
+    def diagnose(self) -> tuple[dict[str, int], dict[str, float]]:
         """Replay every in-window bar and tally WHY it did or didn't produce a
-        tradeable signal. Turns '0 trades' into an actionable funnel."""
+        tradeable signal. Returns (funnel, regime_stats). Turns '0 trades' into
+        an actionable funnel plus aggregate trend-alignment stats."""
         from collections import Counter
 
         tally: Counter[str] = Counter()
+        st = {"n": 0, "m15_up": 0, "m5_up": 0, "agree": 0, "vwap_above": 0,
+              "sep15_pts": 0.0, "sep5_pts": 0.0}
         m5_times = self.m5["time"].astype("int64").to_numpy()
         m15_times = self.m15["time"].astype("int64").to_numpy()
 
@@ -236,6 +239,17 @@ class Backtester:
                 self.cfg.strategy, self.spread_points, self.spec.point,
                 self.cfg.sessions.timezone,
             )
+            # aggregate trend-alignment stats (in-session, warmed-up bars)
+            m15_up = float(snap.m15_ema_fast.iloc[-1]) > float(snap.m15_ema_slow.iloc[-1])
+            m5_up = float(snap.m5_ema_fast.iloc[-1]) > float(snap.m5_ema_slow.iloc[-1])
+            st["n"] += 1
+            st["m15_up"] += int(m15_up)
+            st["m5_up"] += int(m5_up)
+            st["agree"] += int(m15_up == m5_up)
+            st["vwap_above"] += int(snap.price > snap.vwap_now)
+            st["sep15_pts"] += abs(float(snap.m15_ema_fast.iloc[-1]) - float(snap.m15_ema_slow.iloc[-1])) / self.spec.point
+            st["sep5_pts"] += abs(float(snap.m5_ema_fast.iloc[-1]) - float(snap.m5_ema_slow.iloc[-1])) / self.spec.point
+
             regime = self.detector.detect(snap)
             if regime.regime in NO_TRADE_REGIMES or regime.regime is Regime.RANGE:
                 reason = regime.reasons[0] if regime.reasons else ""
@@ -284,7 +298,17 @@ class Backtester:
                 continue
             tally["9_PASSES_ALL_FILTERS"] += 1
 
-        return dict(sorted(tally.items()))
+        n = max(1, st["n"])
+        stats = {
+            "in_session_bars": float(st["n"]),
+            "m15_uptrend_pct": round(100.0 * st["m15_up"] / n, 1),
+            "m5_uptrend_pct": round(100.0 * st["m5_up"] / n, 1),
+            "m15_m5_agree_pct": round(100.0 * st["agree"] / n, 1),
+            "price_above_vwap_pct": round(100.0 * st["vwap_above"] / n, 1),
+            "avg_m15_ema_gap_pts": round(st["sep15_pts"] / n, 1),
+            "avg_m5_ema_gap_pts": round(st["sep5_pts"] / n, 1),
+        }
+        return dict(sorted(tally.items())), stats
 
     # ------------------------------------------------------------- entries
 
@@ -699,16 +723,21 @@ def main() -> int:
 
     bt = Backtester(cfg, m1, spread_points=args.spread_points)
     if args.diagnose:
-        funnel = bt.diagnose()
+        funnel, stats = bt.diagnose()
         scanned = funnel.pop("bars_scanned", 0)
         print("\n===== REJECTION FUNNEL =====")
         print(f"{'bars_scanned':40s} {scanned}")
         for stage, count in funnel.items():
             pct = 100.0 * count / scanned if scanned else 0.0
-            print(f"{stage:40s} {count:6d}  ({pct:4.1f}%)")
+            print(f"{stage:44s} {count:6d}  ({pct:4.1f}%)")
+        print("\n----- TREND ALIGNMENT (in-session bars) -----")
+        for k, v in stats.items():
+            print(f"{k:40s} {v}")
         print("============================")
-        print("Stages 1-2 are expected to hold most bars (outside sessions / warm-up).")
-        print("Look at stages 3-8: the biggest one is your tightest filter.\n")
+        print("Stages 1-2 hold most bars (outside sessions / warm-up).")
+        print("If m15_m5_agree_pct is very low, the timeframes rarely align -> "
+              "conflict=CHOPPY dominates. m15/m5_uptrend_pct near 0 or 100 with "
+              "the other mid-range points to one timeframe leading the other.\n")
         return 0
 
     report = bt.run()
