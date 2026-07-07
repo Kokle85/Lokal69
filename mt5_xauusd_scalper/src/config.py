@@ -314,6 +314,11 @@ class ORBConfig(BaseModel):
     max_trades_per_day: int = 3
     max_trades_per_session: int = 1
     risk_per_trade_usd: float = 75.0
+    # Directional filter: only take breakouts aligned with the higher-timeframe
+    # trend (M5 EMA). "none" trades both ways (chops in ranges); "ema" only
+    # longs above the EMA / shorts below - the main ORB win-rate lever.
+    trend_filter: str = "ema"            # "none" | "ema"
+    trend_ema_period: int = 50
     move_to_breakeven_at_r: float = 1.0
     partial_close_enabled: bool = False
     partial_close_at_r: float = 1.0
@@ -327,6 +332,8 @@ class ORBConfig(BaseModel):
             raise ValueError("orb.min_range_atr must be < max_range_atr.")
         if self.tp_r <= 0:
             raise ValueError("orb.tp_r must be positive.")
+        if self.trend_filter not in {"none", "ema"}:
+            raise ValueError("orb.trend_filter must be 'none' or 'ema'.")
         return self
 
 

@@ -100,7 +100,12 @@ class MT5Connector:
     # ------------------------------------------------------------ symbol
 
     def resolve_symbol(self) -> str:
-        """Find the broker's gold symbol among the allowed aliases. Reject anything else."""
+        """Find the broker's name for the configured instrument among its aliases.
+
+        Only the instrument's own symbol + aliases are tried — never an unrelated
+        fallback — so a missing index CFD fails loudly instead of silently
+        trading gold.
+        """
         aliases = list(dict.fromkeys([self.trading.symbol, *self.trading.allowed_symbol_aliases]))
         for candidate in aliases:
             info = mt5.symbol_info(candidate)
@@ -113,8 +118,9 @@ class MT5Connector:
             logger.info("Symbol validated: {} (spread {} pt)", candidate, info.spread)
             return candidate
         raise MT5Error(
-            f"No allowed gold symbol found in MT5. Tried: {aliases}. "
-            "Check your broker's symbol name and allowed_symbol_aliases in config.yaml."
+            f"Instrument '{self.trading.symbol}' not found in MT5. Tried: {aliases}. "
+            "Open the symbol in Market Watch and set the exact broker name in "
+            "config.yaml (instruments[].symbol / aliases)."
         )
 
     def symbol_spec(self) -> SymbolSpec:

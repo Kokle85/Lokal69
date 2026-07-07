@@ -230,12 +230,17 @@ class ScalperBot:
         m5_atr = float(_ind.atr(m5, self.cfg.strategy.atr_period).iloc[-1]) if len(m5) > 20 else 0.0
         if m5_atr <= 0:
             return
+        trend_up = None
+        period = self.cfg.orb.trend_ema_period
+        if len(m5) > period:
+            ema = _ind.ema(m5["close"], period)
+            trend_up = float(m5["close"].iloc[-1]) > float(ema.iloc[-1])
 
         inst = self.cfg.instrument_for(self.connector.symbol)
         opens = inst.opens if inst else ["london", "newyork"]
         now = datetime.now(_tz.utc)
         ev = self.orb_strategy.evaluate(
-            m1, now, self.connector.symbol, opens, m5_atr, spec.point, spread
+            m1, now, self.connector.symbol, opens, m5_atr, spec.point, spread, trend_up=trend_up
         )
         if ev.signal is None:
             if ev.rejections:

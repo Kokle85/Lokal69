@@ -137,3 +137,29 @@ def test_active_session_open_skips_weekend():
     opens = SessionOpensConfig(timezone=TZ, newyork="15:30")
     sat = datetime(2026, 6, 6, 16, 0, tzinfo=ZoneInfo(TZ))  # Saturday
     assert active_session_open(opens, ["newyork"], sat, 15, 90) is None
+
+
+def test_trend_filter_blocks_countertrend_long():
+    df, now = m1_session(2005.0, 2000.0, 2006.5)  # long breakout
+    strat = make_strategy(trend_filter="ema")
+    # trend_up=False -> long breakout is counter-trend -> blocked
+    ev = strat.evaluate(df, now.to_pydatetime(), "XAUUSD", ["newyork"],
+                        m5_atr=3.0, point=0.01, spread_points=18, trend_up=False)
+    assert ev.signal is None
+    assert any("against down-trend" in r for r in ev.rejections)
+
+
+def test_trend_filter_allows_aligned_long():
+    df, now = m1_session(2005.0, 2000.0, 2006.5)
+    ev = make_strategy(trend_filter="ema").evaluate(
+        df, now.to_pydatetime(), "XAUUSD", ["newyork"],
+        m5_atr=3.0, point=0.01, spread_points=18, trend_up=True)
+    assert ev.signal is not None
+
+
+def test_trend_filter_none_takes_both():
+    df, now = m1_session(2005.0, 2000.0, 2006.5)
+    ev = make_strategy(trend_filter="none").evaluate(
+        df, now.to_pydatetime(), "XAUUSD", ["newyork"],
+        m5_atr=3.0, point=0.01, spread_points=18, trend_up=False)
+    assert ev.signal is not None  # filter off -> counter-trend allowed

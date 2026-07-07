@@ -261,24 +261,31 @@ class Backtester:
             time_exit_min_r=-10**9,
         )
 
-    def _m5_atr_at(self, bar_ns: int) -> float:
+    def _m5_context_at(self, bar_ns: int) -> tuple[float, Optional[bool]]:
+        """(M5 ATR, trend_up) at the given time from the closed M5 window."""
         n5 = int(np.searchsorted(self._m5_times, bar_ns, side="right")) - 1
         if n5 < 20:
-            return 0.0
-        m5_win = self.m5.iloc[max(0, n5 - 60): n5]
+            return 0.0, None
+        period = self.cfg.orb.trend_ema_period
+        m5_win = self.m5.iloc[max(0, n5 - max(60, period + 10)): n5]
         if len(m5_win) < 16:
-            return 0.0
-        return float(ind.atr(m5_win, 14).iloc[-1])
+            return 0.0, None
+        atr = float(ind.atr(m5_win, 14).iloc[-1])
+        trend_up: Optional[bool] = None
+        if len(m5_win) > period:
+            ema = ind.ema(m5_win["close"], period)
+            trend_up = float(m5_win["close"].iloc[-1]) > float(ema.iloc[-1])
+        return atr, trend_up
 
     def _try_open_orb(self, i: int, bar_ns: int, governor: DailyRiskGovernor) -> Optional["SimTrade"]:
         bar_time: pd.Timestamp = self.m1.iloc[i]["time"]
-        m5_atr = self._m5_atr_at(bar_ns)
+        m5_atr, trend_up = self._m5_context_at(bar_ns)
         if m5_atr <= 0:
             return None
         m1_win = self.m1.iloc[i - M1_WINDOW + 1: i + 1].reset_index(drop=True)
         ev = self.orb_strategy.evaluate(
             m1_win, bar_time.to_pydatetime(), self.symbol, self.instrument_opens,
-            m5_atr, self.spec.point, self.spread_points,
+            m5_atr, self.spec.point, self.spread_points, trend_up=trend_up,
         )
         if ev.signal is None:
             return None
@@ -439,14 +446,14 @@ class Backtester:
         for i in range(M1_WINDOW, len(self.m1)):
             tally["bars_scanned"] += 1
             bar_time = self.m1.iloc[i]["time"]
-            m5_atr = self._m5_atr_at(m1_ns[i])
+            m5_atr, trend_up = self._m5_context_at(m1_ns[i])
             if m5_atr <= 0:
                 tally["1_warming_up"] += 1
                 continue
             ev = self.orb_strategy.evaluate(
                 self.m1.iloc[i - M1_WINDOW + 1: i + 1].reset_index(drop=True),
                 bar_time.to_pydatetime(), self.symbol, self.instrument_opens,
-                m5_atr, self.spec.point, self.spread_points,
+                m5_atr, self.spec.point, self.spread_points, trend_up=trend_up,
             )
             if ev.signal is None:
                 import re
@@ -881,7 +888,10 @@ def main() -> int:
     cfg = load_config(args.config)
     symbol = args.symbol or cfg.trading.symbol
     if args.symbol:
-        cfg.trading.symbol = args.symbol  # so MT5 pulls the right instrument's history
+        # Resolve the RIGHT instrument: use its own aliases, never gold fallback.
+        cfg.trading.symbol = args.symbol
+        inst = cfg.instrument_for(args.symbol)
+        cfg.trading.allowed_symbol_aliases = inst.aliases if inst else [args.symbol]
     if args.csv:
         m1 = load_m1_from_csv(args.csv)
     else:

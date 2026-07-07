@@ -50,6 +50,32 @@ SNIPER_GRID: dict[str, list] = {
     "max_cost_to_tp_pct": [20, 25, 30],
 }
 
+# Grid for ORB mode (--orb-grid): the levers that control ORB net expectancy.
+ORB_GRID: dict[str, list] = {
+    "opening_range_minutes": [15, 30],
+    "tp_r": [1.5, 2.0, 2.5],
+    "trend_filter": ["none", "ema"],
+    "min_range_atr": [0.4, 0.6, 0.8],
+    "max_breakout_extension_atr": [0.5, 1.0],
+    "entry_window_minutes": [60, 90, 120],
+    "move_to_breakeven_at_r": [0.8, 1.0, 1.5],
+}
+
+
+def apply_orb_params(base: BotConfig, params: dict) -> BotConfig:
+    cfg = copy.deepcopy(base)
+    cfg.trading_style = "orb"
+    o = cfg.orb
+    o.opening_range_minutes = params["opening_range_minutes"]
+    o.tp_r = params["tp_r"]
+    o.trend_filter = params["trend_filter"]
+    o.min_range_atr = params["min_range_atr"]
+    o.max_breakout_extension_atr = params["max_breakout_extension_atr"]
+    o.entry_window_minutes = params["entry_window_minutes"]
+    o.move_to_breakeven_at_r = params["move_to_breakeven_at_r"]
+    return cfg
+
+
 # Hard rejection thresholds - results failing any of these are discarded.
 MIN_PROFIT_FACTOR = 1.2
 MIN_TRADES = 100
@@ -90,11 +116,11 @@ def apply_sniper_params(base: BotConfig, params: dict) -> BotConfig:
     return cfg
 
 
-def evaluate_result(metrics: dict, total_days: int) -> tuple[bool, str, float]:
+def evaluate_result(metrics: dict, total_days: int, min_trades: int = MIN_TRADES) -> tuple[bool, str, float]:
     """Return (accepted, rejection_reason, rank_score)."""
     trades = int(metrics.get("total_trades", 0))
-    if trades < MIN_TRADES:
-        return False, f"trades {trades} < {MIN_TRADES}", 0.0
+    if trades < min_trades:
+        return False, f"trades {trades} < {min_trades}", 0.0
     pf = float(metrics.get("profit_factor", 0.0))
     if pf < MIN_PROFIT_FACTOR:
         return False, f"profit_factor {pf} < {MIN_PROFIT_FACTOR}", 0.0
@@ -206,9 +232,18 @@ def main() -> int:
         help="optimize SNIPER_MODE geometry (tp_r, SL bounds, BE/partial, cost gate) "
              "instead of the base-strategy grid",
     )
+    parser.add_argument(
+        "--orb-grid", action="store_true",
+        help="optimize ORB parameters (range length, tp_r, trend filter, range/entry filters)",
+    )
+    parser.add_argument("--symbol", default=None, help="instrument symbol for data + labeling")
     args = parser.parse_args()
 
     base_cfg = load_config(args.config)
+    if args.symbol:
+        base_cfg.trading.symbol = args.symbol
+        inst = base_cfg.instrument_for(args.symbol)
+        base_cfg.trading.allowed_symbol_aliases = inst.aliases if inst else [args.symbol]
     m1 = load_m1_from_csv(args.csv) if args.csv else load_m1_from_mt5(base_cfg, args.days)
     logger.info("Optimizing over {} M1 bars", len(m1))
 
@@ -216,7 +251,10 @@ def main() -> int:
         compare_trade_counts(base_cfg, m1, args.spread_points)
         return 0
 
-    if args.sniper_grid:
+    if args.orb_grid:
+        grid, apply_fn = ORB_GRID, apply_orb_params
+        logger.info("Optimizing ORB parameters ({} levers)", len(grid))
+    elif args.sniper_grid:
         grid, apply_fn = SNIPER_GRID, apply_sniper_params
         logger.info("Optimizing SNIPER_MODE geometry ({} parameters)", len(grid))
     else:
@@ -235,12 +273,14 @@ def main() -> int:
         combos = combos[: args.sample]
     logger.info("Testing {} parameter combinations", len(combos))
 
+    symbol = args.symbol or base_cfg.trading.symbol
+    min_trades = 40 if args.orb_grid else MIN_TRADES  # ORB takes fewer, higher-quality trades
     rows: list[dict] = []
     for idx, params in enumerate(combos, 1):
         cfg = apply_fn(base_cfg, params)
-        report = Backtester(cfg, m1, spread_points=args.spread_points).run()
+        report = Backtester(cfg, m1, spread_points=args.spread_points, symbol=symbol).run()
         total_days = len(report.daily_pnl)
-        accepted, reason, score = evaluate_result(report.metrics, total_days)
+        accepted, reason, score = evaluate_result(report.metrics, total_days, min_trades=min_trades)
         row = {
             **params,
             "accepted": accepted,

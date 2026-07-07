@@ -59,6 +59,7 @@ class ORBStrategy:
         m5_atr: float,
         point: float,
         spread_points: float,
+        trend_up: bool | None = None,
     ) -> ORBEvaluation:
         c = self.cfg
         if m5_atr <= 0 or point <= 0:
@@ -115,6 +116,13 @@ class ORBStrategy:
             tp = entry - c.tp_r * (sl - entry)
         else:
             return ORBEvaluation(None, [f"{name}: no breakout beyond the opening range"], name)
+
+        # Directional filter: only trade with the higher-timeframe trend.
+        if c.trend_filter == "ema" and trend_up is not None:
+            if direction is Direction.BUY and not trend_up:
+                return ORBEvaluation(None, [f"{name}: long breakout against down-trend (EMA filter)"], name)
+            if direction is Direction.SELL and trend_up:
+                return ORBEvaluation(None, [f"{name}: short breakout against up-trend (EMA filter)"], name)
 
         if extension > c.max_breakout_extension_atr:
             return ORBEvaluation(
