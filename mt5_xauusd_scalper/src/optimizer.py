@@ -271,7 +271,10 @@ def main() -> int:
     if args.sample and args.sample < len(combos):
         random.Random(args.seed).shuffle(combos)
         combos = combos[: args.sample]
-    logger.info("Testing {} parameter combinations", len(combos))
+    logger.info(
+        "Testing {} parameter combinations (~{}s each over {} bars) - progress logged per combo",
+        len(combos), "10-60", len(m1),
+    )
 
     symbol = args.symbol or base_cfg.trading.symbol
     min_trades = 40 if args.orb_grid else MIN_TRADES  # ORB takes fewer, higher-quality trades

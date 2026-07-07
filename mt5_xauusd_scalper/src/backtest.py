@@ -32,6 +32,7 @@ from config import BotConfig, DailyGoalsConfig, PositionManagementConfig, load_c
 from cost_model import CostModel
 from daily_risk_governor import DailyRiskGovernor
 from strategy_orb import ORBStrategy
+from utils import active_session_open
 from models import (
     NO_TRADE_REGIMES,
     Direction,
@@ -170,6 +171,17 @@ class Backtester:
         )
         self._usd_per_unit = spec.tick_value / spec.tick_size  # USD per 1.0 price move per lot
 
+        # Precompute M5 ATR/EMA once over the whole series (indexed per bar) so
+        # the ORB path is O(1) per bar instead of recomputing on a rolling
+        # window every candle - the difference between a ~75s and a ~7s run.
+        self._m5_times = _ns(self.m5["time"])
+        if self.orb_mode:
+            self._m5_atr_full = ind.atr(self.m5, 14).to_numpy()
+            self._m5_ema_full = ind.ema(
+                self.m5["close"], cfg.orb.trend_ema_period
+            ).to_numpy()
+            self._m5_close = self.m5["close"].to_numpy()
+
     # ------------------------------------------------------------------ run
 
     def run(self) -> BacktestReport:
@@ -262,29 +274,36 @@ class Backtester:
         )
 
     def _m5_context_at(self, bar_ns: int) -> tuple[float, Optional[bool]]:
-        """(M5 ATR, trend_up) at the given time from the closed M5 window."""
+        """(M5 ATR, trend_up) at the given time, read from the precomputed
+        per-bar M5 series. `idx` is the last CLOSED M5 candle before `bar_ns`."""
         n5 = int(np.searchsorted(self._m5_times, bar_ns, side="right")) - 1
-        if n5 < 20:
+        idx = n5 - 1  # exclude the still-forming M5 candle
+        if idx < 20:
             return 0.0, None
-        period = self.cfg.orb.trend_ema_period
-        m5_win = self.m5.iloc[max(0, n5 - max(60, period + 10)): n5]
-        if len(m5_win) < 16:
+        atr = float(self._m5_atr_full[idx])
+        if atr <= 0 or atr != atr:  # nan guard
             return 0.0, None
-        atr = float(ind.atr(m5_win, 14).iloc[-1])
         trend_up: Optional[bool] = None
-        if len(m5_win) > period:
-            ema = ind.ema(m5_win["close"], period)
-            trend_up = float(m5_win["close"].iloc[-1]) > float(ema.iloc[-1])
+        if idx >= self.cfg.orb.trend_ema_period:
+            trend_up = float(self._m5_close[idx]) > float(self._m5_ema_full[idx])
         return atr, trend_up
 
     def _try_open_orb(self, i: int, bar_ns: int, governor: DailyRiskGovernor) -> Optional["SimTrade"]:
         bar_time: pd.Timestamp = self.m1.iloc[i]["time"]
+        now = bar_time.to_pydatetime()
+        # Cheap session pre-check: skip the 400-bar window build for the ~85%
+        # of bars outside any tradeable session-open window.
+        if active_session_open(
+            self.cfg.session_opens, self.instrument_opens, now,
+            self.cfg.orb.opening_range_minutes, self.cfg.orb.entry_window_minutes,
+        ) is None:
+            return None
         m5_atr, trend_up = self._m5_context_at(bar_ns)
         if m5_atr <= 0:
             return None
         m1_win = self.m1.iloc[i - M1_WINDOW + 1: i + 1].reset_index(drop=True)
         ev = self.orb_strategy.evaluate(
-            m1_win, bar_time.to_pydatetime(), self.symbol, self.instrument_opens,
+            m1_win, now, self.symbol, self.instrument_opens,
             m5_atr, self.spec.point, self.spread_points, trend_up=trend_up,
         )
         if ev.signal is None:
