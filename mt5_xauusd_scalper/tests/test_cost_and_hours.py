@@ -133,3 +133,30 @@ def test_apply_sniper_params():
     assert cfg.trading.max_cost_to_tp_pct == params["max_cost_to_tp_pct"]
     # base config untouched (deep copy)
     assert BotConfig().sniper_mode.tp_r == 1.5
+
+
+# ------------------------------------------------------------------ diagnose funnel
+
+def test_diagnose_funnel_accounts_for_every_bar():
+    """The rejection funnel must classify every scanned bar exactly once."""
+    import numpy as np
+    import pandas as pd
+    from backtest import Backtester, M1_WINDOW
+    from config import BotConfig
+
+    rng = np.random.default_rng(5)
+    n = 3 * 1440
+    times = pd.date_range(pd.Timestamp("2026-03-02 00:00", tz="UTC"), periods=n, freq="1min")
+    close = 2350 + np.cumsum(rng.normal(0, 0.12, n))
+    openp = np.concatenate([[close[0]], close[:-1]])
+    pad = np.abs(rng.normal(0.06, 0.03, n))
+    m1 = pd.DataFrame({"time": times, "open": openp,
+                       "high": np.maximum(openp, close) + pad,
+                       "low": np.minimum(openp, close) - pad,
+                       "close": close, "tick_volume": rng.integers(50, 300, n)})
+    bt = Backtester(BotConfig(), m1)
+    funnel = bt.diagnose()
+    scanned = funnel.pop("bars_scanned")
+    assert scanned == len(m1) - M1_WINDOW
+    # every scanned bar lands in exactly one terminal bucket
+    assert sum(funnel.values()) == scanned

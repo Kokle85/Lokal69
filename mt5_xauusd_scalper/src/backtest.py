@@ -30,7 +30,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import BotConfig, load_config
 from cost_model import CostModel
 from daily_risk_governor import DailyRiskGovernor
-from models import Direction, PositionActionType, Regime, StrategyName, SymbolSpec
+from models import (
+    NO_TRADE_REGIMES,
+    Direction,
+    PositionActionType,
+    Regime,
+    StrategyName,
+    SymbolSpec,
+)
 from position_manager import decide_actions
 from regime_detector import RegimeDetector, build_snapshot, geometry_atr
 from risk_manager import calculate_lot, check_cost_to_tp, validate_sl_distance
@@ -195,6 +202,84 @@ class Backtester:
         if self.sniper:
             return SniperGovernor(self.cfg.risk, self.sniper, day)
         return DailyRiskGovernor(self.cfg.daily_goals, day)
+
+    # ------------------------------------------------------------- diagnostics
+
+    def diagnose(self) -> dict[str, int]:
+        """Replay every in-window bar and tally WHY it did or didn't produce a
+        tradeable signal. Turns '0 trades' into an actionable funnel."""
+        from collections import Counter
+
+        tally: Counter[str] = Counter()
+        m5_times = self.m5["time"].astype("int64").to_numpy()
+        m15_times = self.m15["time"].astype("int64").to_numpy()
+
+        for i in range(M1_WINDOW, len(self.m1)):
+            tally["bars_scanned"] += 1
+            bar_time = self.m1.iloc[i]["time"]
+            allowed, _ = in_session(self.cfg.sessions, bar_time.to_pydatetime())
+            if not allowed:
+                tally["1_outside_session"] += 1
+                continue
+
+            bar_ns = bar_time.value
+            n5 = int(np.searchsorted(m5_times, bar_ns, side="right")) - 1
+            n15 = int(np.searchsorted(m15_times, bar_ns, side="right")) - 1
+            if n5 < M5_WINDOW // 2 or n15 < M15_WINDOW // 2:
+                tally["2_warming_up"] += 1
+                continue
+
+            snap = build_snapshot(
+                self.m15.iloc[max(0, n15 - M15_WINDOW): n15].reset_index(drop=True),
+                self.m5.iloc[max(0, n5 - M5_WINDOW): n5].reset_index(drop=True),
+                self.m1.iloc[i - M1_WINDOW + 1: i + 1].reset_index(drop=True),
+                self.cfg.strategy, self.spread_points, self.spec.point,
+                self.cfg.sessions.timezone,
+            )
+            regime = self.detector.detect(snap)
+            if regime.regime in NO_TRADE_REGIMES or regime.regime is Regime.RANGE:
+                tally[f"3_regime_{regime.regime.value}"] += 1
+                continue
+
+            selection = self.selector.select(snap, regime.regime)
+            if selection.signal is None:
+                reason = selection.rejections[0] if selection.rejections else "no signal"
+                # keep the human reason after the strategy prefix, and strip
+                # variable numbers/parentheticals so similar reasons group into one
+                import re
+
+                short = reason.split(":", 1)[-1].strip()
+                short = re.sub(r"\([^)]*\)", "", short)
+                short = re.sub(r"[-+]?\d[\d.]*", "", short)
+                short = re.sub(r"\s+", " ", short).strip()[:45]
+                tally[f"4_strat: {short}"] += 1
+                continue
+
+            signal = selection.signal
+            if self.sniper:
+                sniper_adjust_signal(signal, snap, self.sniper)
+                if signal.score < self.sniper.min_sniper_score:
+                    tally[f"5_score_below_min_sniper ({self.sniper.min_sniper_score})"] += 1
+                    continue
+                if signal.score < self.sniper.min_execution_score:
+                    tally[f"6_score_signal_only ({signal.score}<{self.sniper.min_execution_score})"] += 1
+                    continue
+
+            sl_check = validate_sl_distance(
+                signal.entry, signal.sl, geometry_atr(snap, self.cfg.strategy), self.cfg.strategy
+            )
+            if not sl_check.ok:
+                tally["7_sl_bounds"] += 1
+                continue
+            cost_check = check_cost_to_tp(
+                signal.entry, signal.tp, self.spread_points, self.spec.point, self.cfg.trading
+            )
+            if not cost_check.ok:
+                tally["8_cost_gate"] += 1
+                continue
+            tally["9_PASSES_ALL_FILTERS"] += 1
+
+        return dict(sorted(tally.items()))
 
     # ------------------------------------------------------------- entries
 
@@ -595,6 +680,9 @@ def main() -> int:
     parser.add_argument("--spread-points", type=float, default=None,
                         help="override backtest.base_spread_points")
     parser.add_argument("--export-trades", default=None, help="write per-trade ledger CSV")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="print a rejection funnel (why bars did/didn't produce trades) "
+                             "instead of running the trade simulation")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -604,7 +692,21 @@ def main() -> int:
         m1 = load_m1_from_mt5(cfg, args.days)
     logger.info("Backtesting {} M1 bars ({} -> {})", len(m1), m1['time'].iloc[0], m1['time'].iloc[-1])
 
-    report = Backtester(cfg, m1, spread_points=args.spread_points).run()
+    bt = Backtester(cfg, m1, spread_points=args.spread_points)
+    if args.diagnose:
+        funnel = bt.diagnose()
+        scanned = funnel.pop("bars_scanned", 0)
+        print("\n===== REJECTION FUNNEL =====")
+        print(f"{'bars_scanned':40s} {scanned}")
+        for stage, count in funnel.items():
+            pct = 100.0 * count / scanned if scanned else 0.0
+            print(f"{stage:40s} {count:6d}  ({pct:4.1f}%)")
+        print("============================")
+        print("Stages 1-2 are expected to hold most bars (outside sessions / warm-up).")
+        print("Look at stages 3-8: the biggest one is your tightest filter.\n")
+        return 0
+
+    report = bt.run()
     print_report(report)
     if args.export_trades:
         export_trades_csv(report, args.export_trades)
