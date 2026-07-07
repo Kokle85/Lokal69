@@ -813,12 +813,14 @@ def _group(items, key):
 
 def load_m1_from_csv(path: str) -> pd.DataFrame:
     """Load M1 candles from a CSV. Accepts the native format
-    (time,open,high,low,close[,tick_volume]) and the two common free gold M1
+    (time,open,high,low,close[,tick_volume]) and the common free gold M1
     exports without any pre-conversion:
 
-    - HistData.com  : no header, semicolon, "YYYYMMDD HHMMSS;O;H;L;C;V"
-    - Dukascopy     : header "Gmt time,Open,High,Low,Close,Volume",
-                      time "DD.MM.YYYY HH:MM:SS.000"
+    - HistData MT    : no header, comma, "YYYY.MM.DD,HH:MM,O,H,L,C,V"
+                       (date and time in SEPARATE columns)
+    - HistData ASCII : no header, semicolon, "YYYYMMDD HHMMSS;O;H;L;C;V"
+    - Dukascopy      : header "Gmt time,Open,High,Low,Close,Volume",
+                       time "DD.MM.YYYY HH:MM:SS.000"
     """
     if not Path(path).exists():
         raise SystemExit(
@@ -832,10 +834,17 @@ def load_m1_from_csv(path: str) -> pd.DataFrame:
     with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         first = fh.readline()
     sep = ";" if first.count(";") > first.count(",") else ","
-    has_header = any(c.isalpha() for c in first.split(sep)[0])
+    fields = first.rstrip("\n").split(sep)
+    has_header = any(c.isalpha() for c in fields[0])
 
-    if not has_header:
-        # HistData M1: DATE(YYYYMMDD) TIME(HHMMSS);open;high;low;close;volume
+    if not has_header and len(fields) >= 7 and ":" in fields[1] and "." in fields[0]:
+        # HistData MT: DATE(YYYY.MM.DD),TIME(HH:MM),open,high,low,close,volume
+        df = pd.read_csv(path, sep=sep, header=None,
+                         names=["date", "clock", "open", "high", "low", "close", "tick_volume"])
+        df["time"] = pd.to_datetime(df["date"] + " " + df["clock"],
+                                    format="%Y.%m.%d %H:%M", utc=True)
+    elif not has_header:
+        # HistData ASCII: DATE(YYYYMMDD) TIME(HHMMSS);open;high;low;close;volume
         df = pd.read_csv(path, sep=sep, header=None,
                          names=["time", "open", "high", "low", "close", "tick_volume"])
         df["time"] = pd.to_datetime(df["time"], format="%Y%m%d %H%M%S", utc=True)
