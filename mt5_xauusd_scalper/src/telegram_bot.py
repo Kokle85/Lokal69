@@ -53,11 +53,19 @@ class PendingApproval:
         return (datetime.now(timezone.utc) - self.sent_at).total_seconds() > timeout_seconds
 
 
+_STRATEGY_LABELS = {
+    "HIGH_PRECISION_SCALP": "High Precision Scalp",
+    "MOMENTUM_SCALP": "Momentum Scalp",
+    "OPENING_RANGE_BREAKOUT": "ORB",
+}
+
+
 def format_signal_message(signal: Signal, daily_pnl: float, mode: BotMode) -> str:
-    scalp = "BUY SCALP" if signal.direction.value == "BUY" else "SELL SCALP"
-    strategy_label = (
-        "High Precision Scalp" if signal.strategy.value == "HIGH_PRECISION_SCALP" else "Momentum Scalp"
-    )
+    """The order card the operator trades from: lot / entry / SL / TP first,
+    with the dollar outcome of each level, then the diagnostics."""
+    arrow = "🟢 BUY" if signal.direction.value == "BUY" else "🔴 SELL"
+    strategy_label = _STRATEGY_LABELS.get(signal.strategy.value, signal.strategy.value)
+    win_usd = signal.risk_usd * signal.rr
     trade_no_line = (
         f"Trade number today: {signal.trade_number}/{signal.max_trades_today}\n"
         if signal.trade_number
@@ -65,19 +73,16 @@ def format_signal_message(signal: Signal, daily_pnl: float, mode: BotMode) -> st
     )
     note_line = f"Note: {signal.note}\n" if signal.note else ""
     return (
-        f"XAUUSD {scalp}\n"
+        f"{arrow} {signal.symbol} — {strategy_label}\n"
         f"\n"
-        f"Strategy: {strategy_label}\n"
-        f"Regime: {signal.regime.value}\n"
-        f"Entry: {signal.entry:.2f}\n"
-        f"SL: {signal.sl:.2f}\n"
-        f"TP: {signal.tp:.2f}\n"
-        f"Risk: ${signal.risk_usd:.0f}\n"
         f"Lot: {signal.lot:.2f}\n"
-        f"RR: {signal.rr:.1f}\n"
+        f"Entry: {signal.entry:.2f}\n"
+        f"SL: {signal.sl:.2f}  (−${signal.risk_usd:.0f})\n"
+        f"TP: {signal.tp:.2f}  (+${win_usd:.0f}, {signal.rr:.1f}R)\n"
+        f"\n"
+        f"Regime: {signal.regime.value}\n"
         f"Score: {signal.score}/{signal.max_score}\n"
         f"Setup: {signal.setup_reason}\n"
-        f"Spread: OK\n"
         f"{trade_no_line}"
         f"{note_line}"
         f"Daily P/L: {fmt_usd(daily_pnl)}\n"
