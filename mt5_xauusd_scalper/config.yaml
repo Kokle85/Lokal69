@@ -178,17 +178,15 @@ orb:
   # Adaptive position sizing: the day has a risk budget split across trades;
   # each trade's lot is sized from the SL distance to risk its share, so the
   # day can't lose more than the budget. Banked profit extends it.
-  # PROP ACCOUNT SIZING (FundingPips-style: +8%/+5% targets, -10% static max
-  # loss, -5% daily). Deliberately AGGRESSIVE: a bust only costs the challenge
-  # fee, so speed-to-payout beats survival odds. 20k-run Monte Carlo races on
-  # the full-2025 trade set at $300/day:
-  #   Phase 1 (+$2000): 67% pass, ~16 trading days
-  #   Phase 2 (+$1250): 73% pass, ~9 days
-  #   -> reach funded 49%/attempt (expect ~2 attempts / 2 fees)
-  #   Funded: 77% reach a +$1000 payout in ~7 days, 23% bust
-  # Steadier alternatives: $150/day (Phase-1 79%, payout 85% in ~22d) or
-  # $100/day (87%, 91% in ~42d) - one number to change, the edge is identical.
-  # If the prop max loss is TRAILING (not static), bust odds are worse.
+  # PROP ACCOUNT SIZING - FundingPips ONE-PHASE $25k ($210 fee): target +10%
+  # ($2,500), max loss 6% ($1,500), daily loss 3% ($750; one $300-budget trade
+  # a day stays far under it). Deliberately AGGRESSIVE: a bust only costs the
+  # fee, so speed-to-payout beats survival odds. 20k Monte Carlo races
+  # (full-2025 trade set), STATIC max loss, by daily budget:
+  #   $300: 48% pass, ~17 trading days, expected total fees ~$435 (2.1 tries)
+  #   $200: 56%, ~35d, ~$379 | $150: 61%, ~59d, ~$344 | $100: 71%, ~121d, ~$297
+  # If the max loss is TRAILING the odds drop (e.g. $300: 32%, ~3.2 tries) -
+  # check the (i) tooltip on "Max Loss"; if trailing, consider $150-200.
   risk_mode: daily_budget
   daily_risk_budget_usd: 300
   profit_extends_budget: true
