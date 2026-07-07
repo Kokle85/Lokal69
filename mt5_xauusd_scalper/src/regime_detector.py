@@ -116,14 +116,17 @@ class RegimeDetector:
                 Regime.DEAD_MARKET, ["spread too large relative to ATR"]
             )
 
-        # --- CHOPPY
-        choppy, choppy_reason = ind.is_choppy_market(
-            snap.m1, snap.m1_ema_fast, self.cfg.choppy_wick_body_ratio
-        )
+        # --- CHOPPY. Judged on M5, not M1: gold M1 is intrinsically wicky, so an
+        # M1 wick/body test flags almost every bar as choppy and starves the bot
+        # of any trend regime. M1 candle quality is still enforced per-entry in
+        # the strategies. Timeframe conflict remains a genuine no-trade chop.
         m15_up = float(snap.m15_ema_fast.iloc[-1]) > float(snap.m15_ema_slow.iloc[-1])
         m5_up = float(snap.m5_ema_fast.iloc[-1]) > float(snap.m5_ema_slow.iloc[-1])
         if m15_up != m5_up:
-            choppy, choppy_reason = True, "M15 and M5 trend conflict"
+            return RegimeResult(Regime.CHOPPY, ["M15 and M5 trend conflict"])
+        choppy, choppy_reason = ind.is_choppy_market(
+            snap.m5, snap.m5_ema_fast, self.cfg.choppy_wick_body_ratio
+        )
         if choppy:
             return RegimeResult(Regime.CHOPPY, [choppy_reason])
 

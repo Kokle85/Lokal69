@@ -238,7 +238,12 @@ class Backtester:
             )
             regime = self.detector.detect(snap)
             if regime.regime in NO_TRADE_REGIMES or regime.regime is Regime.RANGE:
-                tally[f"3_regime_{regime.regime.value}"] += 1
+                reason = regime.reasons[0] if regime.reasons else ""
+                import re
+
+                reason = re.sub(r"[-+]?\d[\d.]*", "", reason)
+                reason = re.sub(r"\s+", " ", reason).strip()[:40]
+                tally[f"3_regime_{regime.regime.value}: {reason}"] += 1
                 continue
 
             selection = self.selector.select(snap, regime.regime)
