@@ -64,6 +64,17 @@ ORB_GRID: dict[str, list] = {
 }
 
 
+# Grid for tuning the index retest config (--index-grid): RR, pullback depth
+# and the range/breakeven filters that shape a low-win-rate 3:1 system.
+INDEX_ORB_GRID: dict[str, list] = {
+    "tp_r": [2.0, 2.5, 3.0],
+    "retest_entry_pct": [0.3, 0.4, 0.5],
+    "min_range_atr": [0.3, 0.5, 0.7],
+    "move_to_breakeven_at_r": [0.6, 0.8, 1.0],
+    "entry_mode": ["retest"],
+}
+
+
 def apply_orb_params(base: BotConfig, params: dict) -> BotConfig:
     cfg = copy.deepcopy(base)
     cfg.trading_style = "orb"
@@ -76,6 +87,8 @@ def apply_orb_params(base: BotConfig, params: dict) -> BotConfig:
     o.opening_range_minutes = params.get("opening_range_minutes", o.opening_range_minutes)
     o.max_breakout_extension_atr = params.get("max_breakout_extension_atr", o.max_breakout_extension_atr)
     o.entry_window_minutes = params.get("entry_window_minutes", o.entry_window_minutes)
+    o.entry_mode = params.get("entry_mode", o.entry_mode)
+    o.retest_entry_pct = params.get("retest_entry_pct", o.retest_entry_pct)
     # money management (governor reads the daily target from cfg.risk)
     if "daily_profit_target_usd" in params:
         cfg.risk.daily_profit_target_usd = params["daily_profit_target_usd"]
@@ -243,7 +256,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--orb-grid", action="store_true",
-        help="optimize ORB parameters (range length, tp_r, trend filter, range/entry filters)",
+        help="optimize ORB parameters (tp_r, range, breakeven, trades/day, daily target)",
+    )
+    parser.add_argument(
+        "--index-grid", action="store_true",
+        help="optimize the index retest config (RR, pullback depth, range, breakeven)",
     )
     parser.add_argument("--symbol", default=None, help="instrument symbol for data + labeling")
     args = parser.parse_args()
@@ -253,6 +270,13 @@ def main() -> int:
         base_cfg.trading.symbol = args.symbol
         inst = base_cfg.instrument_for(args.symbol)
         base_cfg.trading.allowed_symbol_aliases = inst.aliases if inst else [args.symbol]
+        # Let the grid drive: clear this instrument's per-instrument ORB overrides
+        # so effective_orb() returns the grid-tuned global config, not the pins.
+        if inst and (args.orb_grid or args.index_grid):
+            for f in ("tp_r", "max_trades_per_day", "min_range_atr",
+                      "move_to_breakeven_at_r", "trend_filter", "entry_mode",
+                      "retest_entry_pct"):
+                setattr(inst, f, None)
     m1 = load_m1_from_csv(args.csv) if args.csv else load_m1_from_mt5(base_cfg, args.days)
     logger.info("Optimizing over {} M1 bars", len(m1))
 
@@ -260,7 +284,10 @@ def main() -> int:
         compare_trade_counts(base_cfg, m1, args.spread_points)
         return 0
 
-    if args.orb_grid:
+    if args.index_grid:
+        grid, apply_fn = INDEX_ORB_GRID, apply_orb_params
+        logger.info("Optimizing index retest config ({} levers)", len(grid))
+    elif args.orb_grid:
         grid, apply_fn = ORB_GRID, apply_orb_params
         logger.info("Optimizing ORB parameters ({} levers)", len(grid))
     elif args.sniper_grid:
@@ -288,8 +315,10 @@ def main() -> int:
     symbol = args.symbol or base_cfg.trading.symbol
     # ORB takes fewer, higher-quality trades; a 1-trade/day system naturally has
     # longer losing streaks, so relax both the trade-count and consec-loss gates.
-    min_trades = 40 if args.orb_grid else MIN_TRADES
-    max_consec = 6 if args.orb_grid else MAX_CONSECUTIVE_LOSSES
+    orb_like = args.orb_grid or args.index_grid
+    min_trades = 40 if orb_like else MIN_TRADES
+    # Index retest 3:1 systems have very low win rates -> long losing streaks.
+    max_consec = (10 if args.index_grid else 6) if orb_like else MAX_CONSECUTIVE_LOSSES
     rows: list[dict] = []
     for idx, params in enumerate(combos, 1):
         cfg = apply_fn(base_cfg, params)

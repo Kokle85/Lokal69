@@ -139,12 +139,15 @@ instruments:
     tp_r: 3.0
     entry_mode: retest       # break the range, then enter the 40% pullback, RR 3:1
     retest_entry_pct: 0.40
+  # US500 failed out-of-sample (OOS PF 0.66) with retest 3:1 - disabled until
+  # retuned. Re-enable and optimize with: optimizer.py --symbol US500 --index-grid
   - symbol: US500
     aliases: [US500, SPX500, SP500]
     opens: [newyork]
     tp_r: 3.0
     entry_mode: retest
     retest_entry_pct: 0.40
+    enabled: false
 
 # Opening Range Breakout. Filters are ATR-relative so one config fits gold and
 # index CFDs. SL = opposite side of the range; TP = tp_r x risk.
