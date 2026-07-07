@@ -100,8 +100,29 @@ class TelegramService:
 
     # ------------------------------------------------------------- lifecycle
 
+    def _preflight(self) -> bool:
+        """Can we resolve Telegram's API host? Avoids a flood of retry
+        tracebacks when DNS is poisoned or Telegram is blocked by the ISP."""
+        import socket
+
+        try:
+            socket.getaddrinfo("api.telegram.org", 443)
+            return True
+        except OSError as exc:
+            logger.warning("Telegram host unreachable ({}).", exc)
+            return False
+
     async def start(self) -> None:
         if not self.enabled:
+            return
+        if not self._preflight():
+            logger.warning(
+                "Telegram disabled for this run: cannot reach api.telegram.org "
+                "(DNS/network/ISP block). The bot continues - signals go to the "
+                "log and the dashboard. Fix DNS (1.1.1.1 / 8.8.8.8) or use a VPN, "
+                "or set telegram.enabled: false to silence this."
+            )
+            self.enabled = False
             return
         self.app = Application.builder().token(self.cfg.bot_token).build()
         self.app.add_handler(CommandHandler("status", self._cmd_status))

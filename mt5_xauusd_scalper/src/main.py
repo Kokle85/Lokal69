@@ -45,6 +45,13 @@ def setup_logging() -> None:
     logger.add(sys.stderr, level="INFO")
     Path("logs").mkdir(exist_ok=True)
     logger.add("logs/bot.log", level="DEBUG", rotation="10 MB", retention="14 days")
+    # python-telegram-bot and its HTTP stack log via stdlib logging, not loguru.
+    # If Telegram connectivity drops mid-run they flood stderr with retry
+    # tracebacks; keep them to real errors so the trading log stays readable.
+    import logging
+
+    for noisy in ("telegram", "telegram.ext", "httpx", "httpcore", "apscheduler"):
+        logging.getLogger(noisy).setLevel(logging.CRITICAL)
 
 
 class ScalperBot:
