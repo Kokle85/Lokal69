@@ -516,14 +516,39 @@ def load_m1_from_csv(path: str) -> pd.DataFrame:
 
 
 def load_m1_from_mt5(cfg: BotConfig, days: int) -> pd.DataFrame:
-    from mt5_connector import MT5Connector
+    from mt5_connector import MT5Connector, MT5Error
 
     connector = MT5Connector(cfg.mt5, cfg.trading)
     connector.connect()
     try:
         connector.resolve_symbol()
-        bars = days * 1440
-        return connector.rates("M1", min(bars, 200_000))
+        requested = min(days * 1440, 200_000)
+        # The terminal only caches history it has downloaded. If it has fewer M1
+        # bars than requested, copy_rates_from_pos can return nothing rather than
+        # a partial set - so step the request down until the terminal answers.
+        for count in (requested, 50_000, 20_000, 5_000, 1_000):
+            if count > requested:
+                continue
+            try:
+                df = connector.rates("M1", count)
+            except MT5Error:
+                logger.warning("No M1 history for {} bars, trying fewer...", count)
+                continue
+            got_days = len(df) / 1440.0
+            if len(df) < requested:
+                logger.warning(
+                    "Terminal returned {} M1 bars (~{:.1f} days) of the {} requested. "
+                    "Open the XAUUSD M1 chart in MT5 and scroll back to download more "
+                    "history (Tools > Options > Charts > Max bars in chart).",
+                    len(df), got_days, requested,
+                )
+            return df
+        raise MT5Error(
+            "MT5 returned no M1 history for XAUUSD. Open the XAUUSD chart in the "
+            "terminal, switch to M1, press Home / scroll left to download history, "
+            "raise 'Max bars in chart' in Tools > Options > Charts, then retry "
+            "(start with --days 7)."
+        )
     finally:
         connector.shutdown()
 
