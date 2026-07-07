@@ -12,7 +12,13 @@ from loguru import logger
 # Allow `python src/main.py` from the project root.
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import BotConfig, ConfigError, DailyGoalsConfig, load_config
+from config import (
+    BotConfig,
+    ConfigError,
+    DailyGoalsConfig,
+    load_config,
+    orb_position_management,
+)
 from daily_risk_governor import DailyRiskGovernor
 from execution import ExecutionEngine
 from journal import Journal
@@ -104,10 +110,16 @@ class ScalperBot:
             self.orb = cfg.effective_orb(cfg.trading.symbol)  # per-instrument tp_r etc.
             self.orb_strategy = ORBStrategy(self.orb, cfg.session_opens)
             self.governor: DailyRiskGovernor = DailyRiskGovernor(_orb_goals(cfg, self.orb), today)
+            # ORB trades hold to TP/SL for up to max_trade_minutes; the scalp
+            # position_management (8-min time exit, 0.7R breakeven) would
+            # strangle a 3R runner within minutes.
+            self.pm = orb_position_management(self.orb)
         elif self.sniper:
             self.governor = SniperGovernor(cfg.risk, self.sniper, today)
+            self.pm = cfg.position_management
         else:
             self.governor = DailyRiskGovernor(cfg.daily_goals, today)
+            self.pm = cfg.position_management
         self._traded_sessions: set = set()
 
         self.paused = False
@@ -149,15 +161,73 @@ class ScalperBot:
                 )
             self.auto_trading_allowed = True  # only after manual approval
 
-        self.governor.reset_for_day(
-            now_in_tz(self.cfg.sessions.timezone).date(), float(account.equity)
-        )
+        today = now_in_tz(self.cfg.sessions.timezone).date()
+        self.governor.reset_for_day(today, float(account.equity))
+        self._restore_daily_state(today)
+        self._adopt_open_position(spec)
         self.journal.log_event(
             "INFO", "startup",
             f"Bot started in {mode.value} mode on {spec.name}",
             {"balance": account.balance, "equity": account.equity, "demo": is_demo},
         )
         logger.info("Startup complete | mode={} | symbol={} | demo={}", mode.value, spec.name, is_demo)
+
+    def _restore_daily_state(self, today) -> None:
+        """Re-seed the governor from the journal after a restart. Without this,
+        every restart re-arms a fresh daily budget: N restarts on a bad day = N x
+        the daily loss limit - a prop-account killer."""
+        row = self.journal.daily_stats(today)
+        if row is None:
+            return
+        s = self.governor.state
+        s.realized_pnl = float(row["realized_pnl"] or 0.0)
+        s.trades_today = int(row["trades_count"] or 0)
+        s.wins = int(row["wins"] or 0)
+        s.losses = int(row["losses"] or 0)
+        s.consecutive_losses = int(row["consecutive_losses"] or 0)
+        if row["starting_equity"] is not None and float(row["starting_equity"]) > 0:
+            s.starting_equity = float(row["starting_equity"])
+        # Locks re-arm from the restored numbers (realized loss / trade count).
+        self.governor.check_locks()
+        logger.info(
+            "Restored daily state after restart: realized {} | trades {} | locked {}",
+            fmt_usd(s.realized_pnl), s.trades_today, s.locked,
+        )
+
+    def _adopt_open_position(self, spec) -> None:
+        """Adopt a broker position left open by a previous run (crash/restart)
+        so it keeps getting managed and its close reaches the governor."""
+        from models import StrategyName
+
+        mine = [
+            p for p in self.connector.open_positions()
+            if getattr(p, "magic", 0) == self.cfg.trading.magic_number
+        ]
+        if not mine:
+            return
+        p = mine[0]
+        direction = Direction.BUY if p.type == 0 else Direction.SELL
+        risk = 0.0
+        if p.sl and spec.tick_size > 0:
+            risk = abs(p.price_open - p.sl) / spec.tick_size * spec.tick_value * p.volume
+        self.position = ManagedPosition(
+            ticket=p.ticket, symbol=p.symbol, direction=direction,
+            entry=p.price_open, sl=p.sl, tp=p.tp, lot=p.volume,
+            initial_lot=p.volume, initial_sl=p.sl, risk_usd=risk,
+            # True open time is in server time; counting the duration cap from
+            # the restart is the safe approximation (never closes too early).
+            opened_at=datetime.now(timezone.utc),
+            strategy=StrategyName.ORB if self.orb_mode else StrategyName.HIGH_PRECISION,
+            trade_id=None,  # journal rows for it belong to the previous run
+        )
+        logger.warning(
+            "Adopted open position from previous run: {} {} lot @ {} (ticket {})",
+            direction.value, p.volume, p.price_open, p.ticket,
+        )
+        self.journal.log_event(
+            "WARNING", "adopted_position",
+            f"Adopted {direction.value} {p.volume} lot @ {p.price_open} ticket {p.ticket}",
+        )
 
     # ================================================================ main loop
 
@@ -241,7 +311,14 @@ class ScalperBot:
 
         inst = self.cfg.instrument_for(self.connector.symbol)
         opens = inst.opens if inst else ["london", "newyork"]
-        now = datetime.now(_tz.utc)
+        # Time base: MT5 bar labels are BROKER-SERVER time, not UTC. Using the
+        # wall clock here would compare a genuine-UTC session window against
+        # server-time bar labels and build the "opening range" from bars hours
+        # away from the session open. Drive `now` from the last closed bar so
+        # window and bars share one timeline - exactly like the backtester.
+        now = m1["time"].iloc[-1].to_pydatetime()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_tz.utc)
         ev = self.orb_strategy.evaluate(
             m1, now, self.connector.symbol, opens, m5_atr, spec.point, spread, trend_up=trend_up
         )
@@ -262,7 +339,7 @@ class ScalperBot:
         self.current_regime = f"ORB/{ev.session_name}"
         self.active_strategy = signal.strategy.value
 
-        decision = self.governor.evaluate_new_trade(signal.score)
+        decision = self.governor.evaluate_new_trade(signal.score, self._open_loss_usd())
         await self._flush_lock_events()
         if not decision.allowed:
             logger.warning("ORB signal blocked by governor: {}", decision.reason)
@@ -289,6 +366,10 @@ class ScalperBot:
         signal.lot = lot_result.lot
 
         signal.signal_id = self.journal.record_signal(signal, SignalStatus.SENT)
+        # One signal per session in EVERY mode: without this, SIGNAL_ONLY and
+        # SEMI_AUTO would re-emit the same breakout on each new M1 candle that
+        # keeps the conditions alive (Telegram spam + duplicate journal rows).
+        self._traded_sessions.add(sess_key)
         logger.info(
             "ORB SIGNAL {} {} entry {:.2f} SL {:.2f} TP {:.2f} lot {} ({})",
             signal.direction.value, signal.symbol, signal.entry, signal.sl, signal.tp,
@@ -298,7 +379,6 @@ class ScalperBot:
         if self.cfg.mode is BotMode.SEMI_AUTO:
             self.pending_signals[signal.signal_id] = signal
         if self.cfg.mode in (BotMode.DEMO_AUTO, BotMode.LIVE_AUTO):
-            self._traded_sessions.add(sess_key)
             await self._execute_signal(signal)
 
     async def _scan(self, m1) -> None:
@@ -455,12 +535,13 @@ class ScalperBot:
         current = tick.bid if pos.direction is Direction.BUY else tick.ask
         spec = self.connector.symbol_spec()
 
-        for action in evaluate_position(pos, current, datetime.now(timezone.utc), self.cfg.position_management):
+        for action in evaluate_position(pos, current, datetime.now(timezone.utc), self.pm):
             if action.action is PositionActionType.MOVE_BREAKEVEN:
                 result = self.execution.modify_sl(pos.ticket, action.new_sl, pos.tp, spec)
                 if result.ok:
                     apply_action_to_state(pos, action)
-                    self.journal.update_trade_sl(pos.trade_id, action.new_sl)
+                    if pos.trade_id is not None:
+                        self.journal.update_trade_sl(pos.trade_id, action.new_sl)
                     await self.telegram.send(f"🔒 SL moved to breakeven ({action.reason})")
             elif action.action is PositionActionType.PARTIAL_CLOSE:
                 close_lot = self._round_lot(pos.lot * action.close_fraction, spec)
@@ -470,7 +551,8 @@ class ScalperBot:
                     )
                     if result.ok:
                         apply_action_to_state(pos, action)
-                        self.journal.update_trade_lot(pos.trade_id, pos.lot)
+                        if pos.trade_id is not None:
+                            self.journal.update_trade_lot(pos.trade_id, pos.lot)
                         await self.telegram.send(f"✂️ Partial close {close_lot} lot ({action.reason})")
                 else:
                     logger.info("Partial close skipped: lot too small to split")
@@ -480,7 +562,10 @@ class ScalperBot:
                     pos.ticket, pos.direction, pos.lot, spec, action.action.value.lower()
                 )
                 if result.ok:
-                    await self.telegram.send(f"⏱ Position closed: {action.reason}")
+                    if result.volume < pos.lot:  # partial close fill: retry rest next tick
+                        pos.lot = round(pos.lot - result.volume, 8)
+                    else:
+                        await self.telegram.send(f"⏱ Position closed: {action.reason}")
                 break
 
     def _sync_closed_position(self) -> None:
@@ -491,17 +576,31 @@ class ScalperBot:
             return
 
         day_start = now_in_tz(self.cfg.sessions.timezone).replace(hour=0, minute=0, second=0, microsecond=0)
-        deals = self.connector.today_deals(day_start.astimezone(timezone.utc).replace(tzinfo=None))
-        profit = sum(
-            d.profit + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0)
-            for d in deals
-            if getattr(d, "position_id", None) == pos.ticket and d.entry != 0
+        deals = self.connector.today_deals(day_start.astimezone(timezone.utc))
+        matched = [d for d in deals if getattr(d, "position_id", None) == pos.ticket]
+        outs = [d for d in matched if d.entry != 0]
+        if not outs:
+            # The closing deal hasn't shown up in history yet (server lag).
+            # Committing now would book a real stop-out as a $0 "win" and the
+            # daily-loss lock would never trip. Retry a few ticks first.
+            self._sync_misses = getattr(self, "_sync_misses", 0) + 1
+            if self._sync_misses < 12:
+                logger.warning(
+                    "Position {} gone but no closing deal in history yet (attempt {}) - retrying",
+                    pos.ticket, self._sync_misses,
+                )
+                return
+            logger.error(
+                "Position {} closed but its deal never appeared in history; recording UNKNOWN $0.",
+                pos.ticket,
+            )
+        self._sync_misses = 0
+        # profit from the OUT deals; commission/swap from ALL deals of the
+        # position (the entry deal carries its half of the commission too).
+        profit = sum(d.profit for d in outs) + sum(
+            getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0) for d in matched
         )
-        close_price = 0.0
-        for d in reversed(deals):
-            if getattr(d, "position_id", None) == pos.ticket and d.entry != 0:
-                close_price = d.price
-                break
+        close_price = outs[-1].price if outs else 0.0
 
         duration = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60.0
         reason = self._infer_close_reason(pos, close_price, duration)
@@ -509,7 +608,8 @@ class ScalperBot:
             "Position {} closed: {} @ {} for {} (held {:.1f} min)",
             pos.ticket, reason, close_price, fmt_usd(profit), duration,
         )
-        self.journal.close_trade(pos.trade_id, close_price, profit, reason, duration)
+        if pos.trade_id is not None:
+            self.journal.close_trade(pos.trade_id, close_price, profit, reason, duration)
         events = self.governor.on_trade_closed(profit)
         self.position = None
         self.telegram.send_nowait(
@@ -539,9 +639,9 @@ class ScalperBot:
         if abs(close_price - pos.sl) <= tol:
             # SL at/beyond breakeven that got hit still reports as STOP_LOSS.
             return CloseReason.STOP_LOSS.value
-        if duration >= self.cfg.position_management.max_trade_duration_minutes:
+        if duration >= self.pm.max_trade_duration_minutes:
             return CloseReason.MAX_DURATION.value
-        if duration >= self.cfg.position_management.time_exit_minutes:
+        if duration >= self.pm.time_exit_minutes:
             return CloseReason.TIME_EXIT.value
         return CloseReason.MANUAL.value
 
@@ -693,7 +793,11 @@ class ScalperBot:
         if not decision.allowed:
             self.journal.update_signal_status(signal_id, SignalStatus.CANCELLED)
             return f"Cancelled: {decision.reason}"
-        signal.risk_usd = decision.risk_usd
+        if not self.orb_mode:
+            # ORB risk was sized by orb_position_risk at signal time and the lot
+            # is already computed from it; the governor's flat base risk would
+            # mislabel the trade (e.g. $300 on a lot sized for a $150 share).
+            signal.risk_usd = decision.risk_usd
         self.journal.update_signal_status(signal_id, SignalStatus.APPROVED)
         await self._execute_signal(signal)
         return "Execution attempted - check trade notifications."

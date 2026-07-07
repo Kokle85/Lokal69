@@ -86,12 +86,32 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _never_raise(fallback=None):
+    """Journaling must never outrank trading: the dashboard opens this same
+    SQLite file from another process, so 'database is locked' is a real,
+    routine event. A failed write logs and returns a fallback instead of
+    propagating into (and killing) the trading loop."""
+    def deco(fn):
+        import functools
+
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return fn(self, *args, **kwargs)
+            except sqlite3.Error as exc:
+                logger.error("Journal.{} failed: {} (trading continues)", fn.__name__, exc)
+                return fallback
+        return wrapper
+    return deco
+
+
 class Journal:
     def __init__(self, db_path: str | Path = "data/trading_bot.db") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout=5000")  # tolerate dashboard reads
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         logger.info("Journal database ready at {}", self.db_path)
@@ -229,3 +249,14 @@ class Journal:
             (_now(), level, event_type, message, json.dumps(payload) if payload else None),
         )
         self.conn.commit()
+
+    # Apply the never-raise guard to every write path (ids fall back to -1 so
+    # callers keep working; None-returning writers just skip silently).
+    record_signal = _never_raise(-1)(record_signal)
+    update_signal_status = _never_raise()(update_signal_status)
+    record_trade = _never_raise(-1)(record_trade)
+    close_trade = _never_raise()(close_trade)
+    update_trade_sl = _never_raise()(update_trade_sl)
+    update_trade_lot = _never_raise()(update_trade_lot)
+    upsert_daily_stats = _never_raise()(upsert_daily_stats)
+    log_event = _never_raise()(log_event)

@@ -125,14 +125,21 @@ class TelegramService:
             self.enabled = False
             return
         self.app = Application.builder().token(self.cfg.bot_token).build()
-        self.app.add_handler(CommandHandler("status", self._cmd_status))
-        self.app.add_handler(CommandHandler("pause", self._cmd_pause))
-        self.app.add_handler(CommandHandler("resume", self._cmd_resume))
-        self.app.add_handler(CommandHandler("kill", self._cmd_kill))
-        self.app.add_handler(CommandHandler("mode", self._cmd_mode))
-        self.app.add_handler(CommandHandler("summary", self._cmd_summary))
-        self.app.add_handler(CommandHandler("help", self._cmd_help))
+        # AUTHORIZATION: only the configured chat may command the bot. Without
+        # this filter anyone who finds the bot's @username can /kill or /pause
+        # it mid-trade and read the account status.
+        from telegram.ext import filters as tg_filters
+
+        allowed = tg_filters.Chat(chat_id=int(self.cfg.chat_id))
+        self.app.add_handler(CommandHandler("status", self._cmd_status, filters=allowed))
+        self.app.add_handler(CommandHandler("pause", self._cmd_pause, filters=allowed))
+        self.app.add_handler(CommandHandler("resume", self._cmd_resume, filters=allowed))
+        self.app.add_handler(CommandHandler("kill", self._cmd_kill, filters=allowed))
+        self.app.add_handler(CommandHandler("mode", self._cmd_mode, filters=allowed))
+        self.app.add_handler(CommandHandler("summary", self._cmd_summary, filters=allowed))
+        self.app.add_handler(CommandHandler("help", self._cmd_help, filters=allowed))
         self.app.add_handler(CallbackQueryHandler(self._on_button))
+        self.app.add_error_handler(self._on_error)
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling()
@@ -202,8 +209,18 @@ class TelegramService:
     def cancel_pending(self, signal_id: int) -> Optional[PendingApproval]:
         return self.pending.pop(signal_id, None)
 
+    async def _on_error(self, update, context) -> None:
+        # PTB's own loggers are silenced to CRITICAL in setup_logging; without
+        # this handler an exception in a command/button callback vanishes.
+        logger.error("Telegram handler error: {}", context.error)
+
     async def _on_button(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         query = update.callback_query
+        chat = update.effective_chat
+        if chat is None or str(chat.id) != str(self.cfg.chat_id):
+            logger.warning("Ignoring button press from unauthorized chat {}",
+                           chat.id if chat else "?")
+            return
         await query.answer()
         try:
             action, raw_id = query.data.split(":", 1)
@@ -213,7 +230,8 @@ class TelegramService:
 
         pending = self.pending.pop(signal_id, None)
         if pending is None:
-            await query.edit_message_text(query.message.text + "\n\n⏱ Signal no longer pending.")
+            if query.message:
+                await query.edit_message_text(query.message.text + "\n\n⏱ Signal no longer pending.")
             return
 
         if pending.expired(self.cfg.approval_timeout_seconds):

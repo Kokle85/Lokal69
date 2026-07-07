@@ -89,6 +89,19 @@ class ExecutionEngine:
 
     # ------------------------------------------------------------- orders
 
+    @staticmethod
+    def _order_filling(spec: SymbolSpec) -> int:
+        """Pick a filling type the broker actually allows. Hardcoding IOC makes
+        every open AND close fail with retcode 10030 on FOK/RETURN-only symbols
+        - including the kill switch."""
+        mode = getattr(spec, "filling_mode", 0)
+        ioc = getattr(mt5, "ORDER_FILLING_IOC", 1)
+        if mode == 0 or mode & 2:  # unknown -> keep old behaviour; 2 = IOC bit
+            return ioc
+        if mode & 1:  # 1 = FOK bit
+            return getattr(mt5, "ORDER_FILLING_FOK", ioc)
+        return getattr(mt5, "ORDER_FILLING_RETURN", ioc)
+
     def build_market_request(self, signal: Signal, spec: SymbolSpec, lot: float) -> dict[str, Any]:
         tick = self.connector.tick()
         buying = signal.direction is Direction.BUY
@@ -105,7 +118,7 @@ class ExecutionEngine:
             "magic": self.trading.magic_number,
             "comment": ORDER_COMMENT,
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._order_filling(spec),
         }
 
     def place_market_order(self, signal: Signal, spec: SymbolSpec, lot: float) -> OrderResult:
@@ -131,7 +144,15 @@ class ExecutionEngine:
             self._notify("❌ order_send failed: no response from terminal")
             return OrderResult(False, -1, msg)
 
-        if result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+        partial = getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)
+        if result.retcode == partial and result.volume > 0:
+            # A partial IOC fill IS a live position (with SL/TP). Treating it as
+            # failure would leave a real trade untracked and unmanaged.
+            logger.warning(
+                "Order PARTIALLY filled: {}/{} lot - managing the filled part",
+                result.volume, lot,
+            )
+        elif result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
             msg = f"order_send failed: {result.retcode} {retcode_message(result.retcode)} ({result.comment})"
             logger.error(msg)
             self._notify(f"❌ Order failed: {retcode_message(result.retcode)}")
@@ -179,14 +200,18 @@ class ExecutionEngine:
             "magic": self.trading.magic_number,
             "comment": f"{ORDER_COMMENT}_{reason}"[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._order_filling(spec),
         }
         result = self.connector.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        partial = getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)
+        if result is None or result.retcode not in (mt5.TRADE_RETCODE_DONE, partial):
             code = result.retcode if result else -1
             msg = f"close failed: {code} {retcode_message(code)}"
             logger.error(msg)
             self._notify(f"❌ Position close failed: {retcode_message(code)}")
             return OrderResult(False, code, msg)
-        logger.info("Position {} closed ({}): {} lot @ {}", ticket, reason, lot, result.price)
-        return OrderResult(True, result.retcode, reason, ticket, result.price, lot)
+        closed = result.volume if result.retcode == partial else lot
+        if closed < lot:
+            logger.warning("Close PARTIALLY filled: {}/{} lot - retrying remainder next tick", closed, lot)
+        logger.info("Position {} closed ({}): {} lot @ {}", ticket, reason, closed, result.price)
+        return OrderResult(True, result.retcode, reason, ticket, result.price, closed)

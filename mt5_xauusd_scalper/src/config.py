@@ -371,6 +371,10 @@ class ORBConfig(BaseModel):
             raise ValueError("orb.retest_entry_pct must be between 0 and 1.")
         if self.risk_mode not in {"fixed", "daily_budget"}:
             raise ValueError("orb.risk_mode must be 'fixed' or 'daily_budget'.")
+        if self.daily_risk_budget_usd <= 0 or self.risk_per_trade_usd <= 0:
+            raise ValueError("orb daily_risk_budget_usd and risk_per_trade_usd must be positive.")
+        if self.max_risk_per_trade_usd <= 0:
+            raise ValueError("orb.max_risk_per_trade_usd must be positive.")
         return self
 
 
@@ -400,6 +404,22 @@ class BacktestConfig(BaseModel):
         if v not in {"conservative", "optimistic", "random"}:
             raise ValueError("backtest.intrabar_fill must be conservative, optimistic or random.")
         return v
+
+
+def orb_position_management(orb: "ORBConfig") -> PositionManagementConfig:
+    """Position-management settings for an ORB trade, derived from the ORB
+    config. Shared by the live bot and the backtester so the two paths can
+    never drift: an ORB trade holds to TP/SL (no stale-time scalp exit) and
+    only max_trade_minutes caps its duration."""
+    return PositionManagementConfig(
+        move_to_breakeven_at_r=orb.move_to_breakeven_at_r,
+        partial_close_enabled=orb.partial_close_enabled,
+        partial_close_at_r=orb.partial_close_at_r,
+        partial_close_percent=orb.partial_close_percent,
+        time_exit_minutes=10**9,
+        max_trade_duration_minutes=orb.max_trade_minutes,
+        time_exit_min_r=-10**9,
+    )
 
 
 def _default_instruments() -> list["InstrumentConfig"]:
@@ -474,7 +494,10 @@ class BotConfig(BaseModel):
             val = getattr(inst, field)
             if val is not None:
                 setattr(orb, field, val)
-        return orb
+        # setattr bypasses pydantic validation; re-validate so an instrument
+        # typo (risk_mode: "daily-budget") fails loudly instead of silently
+        # degrading sizing/entry semantics.
+        return ORBConfig.model_validate(orb.model_dump())
 
 
 class ConfigError(Exception):

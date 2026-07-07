@@ -137,6 +137,7 @@ class MT5Connector:
             volume_step=info.volume_step,
             digits=info.digits,
             trade_allowed=info.trade_mode == mt5.SYMBOL_TRADE_MODE_FULL,
+            filling_mode=getattr(info, "filling_mode", 0),
         )
 
     def tick(self) -> Any:
@@ -194,16 +195,29 @@ class MT5Connector:
 
     def open_positions(self) -> list[Any]:
         positions = mt5.positions_get(symbol=self.symbol)
-        return list(positions) if positions else []
+        if positions is None:
+            # None = API error, NOT "no positions". Treating it as empty makes
+            # the bot believe its open trade closed and abandon management.
+            raise MT5Error(f"positions_get failed: {mt5.last_error()}")
+        return list(positions)
 
     def pending_orders(self) -> list[Any]:
         orders = mt5.orders_get(symbol=self.symbol)
-        return list(orders) if orders else []
+        if orders is None:
+            raise MT5Error(f"orders_get failed: {mt5.last_error()}")
+        return list(orders)
 
     def today_deals(self, day_start: datetime) -> list[Any]:
-        deals = mt5.history_deals_get(day_start, datetime.now())
-        if not deals:
-            return []
+        # Deal stamps are broker-server time; pad the window generously on both
+        # sides (naive/local bounds used to miss just-closed deals entirely).
+        from datetime import timedelta, timezone as _tz
+
+        start = day_start if day_start.tzinfo else day_start.replace(tzinfo=_tz.utc)
+        deals = mt5.history_deals_get(
+            start - timedelta(days=1), datetime.now(_tz.utc) + timedelta(days=2)
+        )
+        if deals is None:
+            raise MT5Error(f"history_deals_get failed: {mt5.last_error()}")
         return [d for d in deals if d.symbol == self.symbol and d.magic == self.trading.magic_number]
 
     # ------------------------------------------------------------ orders

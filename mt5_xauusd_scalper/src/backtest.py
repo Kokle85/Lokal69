@@ -28,7 +28,13 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent))
 
 import indicators as ind
-from config import BotConfig, DailyGoalsConfig, PositionManagementConfig, load_config
+from config import (
+    BotConfig,
+    DailyGoalsConfig,
+    PositionManagementConfig,
+    load_config,
+    orb_position_management,
+)
 from cost_model import CostModel
 from daily_risk_governor import DailyRiskGovernor
 from strategy_orb import ORBStrategy
@@ -266,16 +272,7 @@ class Backtester:
         )
 
     def _orb_pm(self) -> PositionManagementConfig:
-        o = self.orb
-        return PositionManagementConfig(
-            move_to_breakeven_at_r=o.move_to_breakeven_at_r,
-            partial_close_enabled=o.partial_close_enabled,
-            partial_close_at_r=o.partial_close_at_r,
-            partial_close_percent=o.partial_close_percent,
-            time_exit_minutes=10**9,           # ORB holds to TP/SL, no stale-time exit
-            max_trade_duration_minutes=o.max_trade_minutes,
-            time_exit_min_r=-10**9,
-        )
+        return orb_position_management(self.orb)
 
     def _m5_context_at(self, bar_ns: int) -> tuple[float, Optional[bool]]:
         """(M5 ATR, trend_up) at the given time, read from the precomputed

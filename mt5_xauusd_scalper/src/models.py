@@ -77,6 +77,8 @@ class SymbolSpec:
     volume_step: float
     digits: int
     trade_allowed: bool = True
+    # SYMBOL_FILLING_* bitmask from the broker (1=FOK, 2=IOC); 0 = unknown.
+    filling_mode: int = 0
 
     def spread_points(self, bid: float, ask: float) -> float:
         return (ask - bid) / self.point if self.point > 0 else 0.0
