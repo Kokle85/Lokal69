@@ -14,9 +14,12 @@ risk_reward_ratio: 3.0             # TP = entry +/- 3 x risk
 zone_lookback_candles: 30
 minimum_upper_wick_touches: 3
 minimum_lower_wick_touches: 3
-touch_tolerance_atr_multiplier: 0.15
-min_zone_size_atr: 0.8
-max_zone_size_atr: 2.0
+touch_tolerance_atr_multiplier: 0.25
+# CALIBRATED on full-2025 XAUUSD M5: a 30-bar window spans 3.9-6.6 x ATR
+# (p10-p75), so the original 0.8-2.0 band matched 0.0% of windows -> 0 trades.
+# 2.0-4.0 selects the tightest ~15% of windows (true consolidations).
+min_zone_size_atr: 2.0
+max_zone_size_atr: 4.0
 min_body_inside_zone_percent: 70
 max_zone_slope_atr: 0.5            # reject trending ("sloped") windows
 
@@ -31,8 +34,11 @@ retest_max_penetration_percent: 50 # cancel if price re-enters deeper than 50% o
 
 # ---- stops ----
 stop_buffer_atr_multiplier: 0.10
-min_stop_distance_atr: 0.5
-max_stop_distance_atr: 2.5
+# COUPLED to the zone band: SL sits beyond the opposite zone side, so the
+# stop distance is at least the zone size. max_stop must exceed max_zone
+# (+ buffers/breakout excess) or every breakout is rejected.
+min_stop_distance_atr: 1.0
+max_stop_distance_atr: 5.5
 
 # ---- filters ----
 use_ema_filter: true
