@@ -16,7 +16,12 @@ from typing import Optional
 import pandas as pd
 
 from config_loader import Settings
-from indicators import atr as atr_series, ema as ema_series, rsi as rsi_series
+from indicators import (
+    atr as atr_series,
+    ema as ema_series,
+    last_closed_htf_rsi,
+    rsi as rsi_series,
+)
 from models import Direction, EntryMode, Signal, Zone
 from zone_detector import detect_zone
 
@@ -139,9 +144,39 @@ class BreakoutStrategy:
                         f"{cfg.rsi_sell_max:.0f}, got {rsi_value:.0f}")
         return None
 
+    def _mtf_block_reason(self, direction: Direction,
+                          mtf: Optional[dict]) -> Optional[str]:
+        """H1+H4 RSI direction gate. `mtf` = {h1, h1_prev, h4} (last CLOSED
+        higher-timeframe bars only). Returns a rejection reason or None."""
+        cfg = self.cfg
+        if not cfg.use_mtf_rsi_filter:
+            return None
+        if not mtf or any(pd.isna(v) for v in
+                          (mtf.get("h1"), mtf.get("h1_prev"), mtf.get("h4"))):
+            return "MTF RSI warmup (H1/H4 history too short)"
+        mid = cfg.mtf_rsi_midline
+        h1, h1_prev, h4 = mtf["h1"], mtf["h1_prev"], mtf["h4"]
+        is_buy = direction is Direction.BUY
+        if cfg.mtf_rsi_mode == "both_agree":
+            ok = (h1 > mid and h4 > mid) if is_buy else (h1 < mid and h4 < mid)
+            if not ok:
+                return (f"MTF RSI: H1 {h1:.0f}/H4 {h4:.0f} not both "
+                        f"{'above' if is_buy else 'below'} {mid:.0f}")
+            return None
+        # cross_confirm: H4 bias + H1 on the right side and MOVING through it
+        if is_buy:
+            ok = h4 > mid and h1 > mid and h1 > h1_prev
+        else:
+            ok = h4 < mid and h1 < mid and h1 < h1_prev
+        if not ok:
+            return (f"MTF RSI cross: H4 {h4:.0f}, H1 {h1_prev:.0f}->{h1:.0f} "
+                    f"do not confirm {direction.value}")
+        return None
+
     def on_bar(self, df: pd.DataFrame, atr_value: Optional[float] = None,
                ema_value: Optional[float] = None,
-               rsi_value: Optional[float] = None) -> Evaluation:
+               rsi_value: Optional[float] = None,
+               mtf_rsi: Optional[dict] = None) -> Evaluation:
         """Evaluate the LAST (closed) candle of `df`. All candles must be closed.
 
         `atr_value`/`ema_value` may be supplied precomputed (the backtester
@@ -166,9 +201,14 @@ class BreakoutStrategy:
                          if cfg.use_ema_filter else 0.0)
             rsi_value = (float(rsi_series(df["close"], cfg.rsi_period).iloc[-1])
                          if cfg.use_rsi_filter else 50.0)
+            if cfg.use_mtf_rsi_filter and mtf_rsi is None:
+                h1, h1_prev = last_closed_htf_rsi(df, 60, cfg.mtf_rsi_period)
+                h4, _ = last_closed_htf_rsi(df, 240, cfg.mtf_rsi_period)
+                mtf_rsi = {"h1": h1, "h1_prev": h1_prev, "h4": h4}
         ema_value = float(ema_value or 0.0)
         rsi_value = 50.0 if rsi_value is None else float(rsi_value)
         self._rsi_now = rsi_value  # available to the retest leg
+        self._mtf_now = mtf_rsi
         if atr_value <= 0 or pd.isna(atr_value):
             ev.rejections.append("ATR unavailable")
             return ev
@@ -215,6 +255,10 @@ class BreakoutStrategy:
         rsi_block = self._rsi_block_reason(direction, rsi_value)
         if rsi_block:
             ev.rejections.append(rsi_block)
+            return ev
+        mtf_block = self._mtf_block_reason(direction, mtf_rsi)
+        if mtf_block:
+            ev.rejections.append(mtf_block)
             return ev
 
         if cfg.entry_mode == EntryMode.DIRECT_BREAKOUT:
@@ -302,6 +346,12 @@ class BreakoutStrategy:
         if rsi_block:
             self.pending = None
             ev.rejections.append(rsi_block + " at retest")
+            return ev
+        mtf_block = self._mtf_block_reason(pending.direction,
+                                           getattr(self, "_mtf_now", None))
+        if mtf_block:
+            self.pending = None
+            ev.rejections.append(mtf_block + " at retest")
             return ev
 
         direction = pending.direction

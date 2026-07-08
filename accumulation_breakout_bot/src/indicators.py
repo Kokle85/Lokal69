@@ -31,6 +31,23 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return out.fillna(100.0).where(avg_loss.notna(), other=float("nan"))
 
 
+def last_closed_htf_rsi(m5: pd.DataFrame, minutes: int, period: int = 14):
+    """RSI on a higher timeframe resampled from M5, using ONLY fully closed
+    HTF bars relative to the last closed M5 candle (no peeking into the
+    still-forming H1/H4 bar). Returns (rsi_last, rsi_prev) or (nan, nan)."""
+    closes = (m5.set_index("time")["close"]
+                .resample(f"{minutes}min", label="left", closed="left").last().dropna())
+    if len(closes) < 3:
+        return float("nan"), float("nan")
+    last_m5_close = m5["time"].iloc[-1] + pd.Timedelta(minutes=5)
+    # a HTF bar opened at O is closed once O + minutes <= last_m5_close
+    closed = closes[closes.index + pd.Timedelta(minutes=minutes) <= last_m5_close]
+    if len(closed) < period + 2:
+        return float("nan"), float("nan")
+    series = rsi(closed, period)
+    return float(series.iloc[-1]), float(series.iloc[-2])
+
+
 def linear_slope(values: np.ndarray) -> float:
     """Least-squares slope per bar of a value series (price units / bar)."""
     n = len(values)

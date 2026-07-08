@@ -85,6 +85,37 @@ class Backtester:
         self._atr = atr_series(self.m5, cfg.atr_period)
         self._ema = ema_series(self.m5["close"], cfg.ema_period)
         self._rsi = rsi_series(self.m5["close"], cfg.rsi_period)
+        self._mtf = self._precompute_mtf_rsi() if cfg.use_mtf_rsi_filter else None
+
+    def _precompute_mtf_rsi(self) -> list:
+        """Per-M5-bar {h1, h1_prev, h4} from the last CLOSED H1/H4 bars only.
+        An HTF bar opened at O is usable for an M5 bar closing at ct when
+        O + timeframe <= ct (vectorized with searchsorted)."""
+        import numpy as np
+        from indicators import rsi as rsi_series
+
+        out: list = [None] * len(self.m5)
+        close_times = (self.m5["time"] + pd.Timedelta(minutes=5)).to_numpy()
+        frames = {}
+        for minutes in (60, 240):
+            closes = (self.m5.set_index("time")["close"]
+                      .resample(f"{minutes}min", label="left", closed="left")
+                      .last().dropna())
+            series = rsi_series(closes, self.cfg.mtf_rsi_period).to_numpy()
+            opens = closes.index.to_numpy()
+            idx = np.searchsorted(opens + np.timedelta64(minutes * 60, "s"),
+                                  close_times, side="right") - 1
+            frames[minutes] = (series, idx)
+        h1s, h1i = frames[60]
+        h4s, h4i = frames[240]
+        for i in range(len(self.m5)):
+            a, b = h1i[i], h4i[i]
+            out[i] = {
+                "h1": h1s[a] if a >= 0 else float("nan"),
+                "h1_prev": h1s[a - 1] if a >= 1 else float("nan"),
+                "h4": h4s[b] if b >= 0 else float("nan"),
+            }
+        return out
 
     def run(self, label: str = "") -> BacktestReport:
         cfg = self.cfg
@@ -133,7 +164,8 @@ class Backtester:
                                  ema_value=float(self._ema.iloc[i])
                                  if cfg.use_ema_filter else 0.0,
                                  rsi_value=float(self._rsi.iloc[i])
-                                 if cfg.use_rsi_filter else 50.0)
+                                 if cfg.use_rsi_filter else 50.0,
+                                 mtf_rsi=self._mtf[i] if self._mtf else None)
             if ev.signal is None:
                 continue
 

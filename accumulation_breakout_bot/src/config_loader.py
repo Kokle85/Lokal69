@@ -133,6 +133,15 @@ class Settings(BaseModel):
     rsi_buy_max: float = 80.0
     rsi_sell_min: float = 20.0
     rsi_sell_max: float = 50.0
+    # Multi-timeframe RSI direction gate: H1 + H4 RSI define the general
+    # direction around the midline; trades only WITH that direction.
+    # "both_agree": H1 and H4 RSI on the same side of the midline.
+    # "cross_confirm": H4 gives the bias, H1 RSI must also be on that side
+    #                  AND moving through it (rising for BUY, falling for SELL).
+    use_mtf_rsi_filter: bool = False
+    mtf_rsi_period: int = 14
+    mtf_rsi_midline: float = 50.0
+    mtf_rsi_mode: str = "both_agree"
     use_session_filter: bool = True
     sessions: SessionsConfig = SessionsConfig()
     max_spread_points: float = 35.0
@@ -173,6 +182,10 @@ class Settings(BaseModel):
         if not (0 <= self.rsi_sell_min < self.rsi_sell_max <= 100
                 and 0 <= self.rsi_buy_min < self.rsi_buy_max <= 100):
             raise ValueError("rsi thresholds must satisfy 0 <= min < max <= 100")
+        if self.mtf_rsi_mode not in {"both_agree", "cross_confirm"}:
+            raise ValueError("mtf_rsi_mode must be 'both_agree' or 'cross_confirm'")
+        if not 0 < self.mtf_rsi_midline < 100:
+            raise ValueError("mtf_rsi_midline must be in (0, 100)")
         levels, pcts = self.take_profit_levels_r, self.take_profit_close_percents
         if not levels or len(levels) != len(pcts):
             raise ValueError("take_profit_levels_r and take_profit_close_percents "

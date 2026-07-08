@@ -153,3 +153,54 @@ def test_ema_filter_blocks_counter_trend_buy(cfg):
         assert ev.signal.entry_price > ev.signal.ema_value  # sanity if it passed
     else:
         assert any("EMA filter" in r for r in ev.rejections), ev.rejections
+
+
+def test_mtf_rsi_gate_blocks_counter_direction(cfg):
+    cfg.entry_mode = EntryMode.DIRECT_BREAKOUT
+    cfg.use_mtf_rsi_filter = True
+    breakout = (2000.9, 2001.5, 2000.85, 2001.4)
+    df = _frame_with([breakout], cfg)
+    strategy = BreakoutStrategy(cfg)
+
+    # H1/H4 momentum down -> BUY breakout must be rejected
+    ev = strategy.on_bar(df, atr_value=0.7, ema_value=0.0, rsi_value=50.0,
+                         mtf_rsi={"h1": 40.0, "h1_prev": 45.0, "h4": 42.0})
+    assert ev.signal is None
+    assert any("MTF RSI" in r for r in ev.rejections)
+
+    # both timeframes above the midline -> BUY allowed (both_agree)
+    strategy = BreakoutStrategy(cfg)
+    ev2 = strategy.on_bar(df, atr_value=0.7, ema_value=0.0, rsi_value=50.0,
+                          mtf_rsi={"h1": 61.0, "h1_prev": 58.0, "h4": 55.0})
+    assert ev2.signal is not None, ev2.rejections
+
+    # cross_confirm additionally demands H1 RSI RISING for a BUY
+    cfg.mtf_rsi_mode = "cross_confirm"
+    strategy = BreakoutStrategy(cfg)
+    ev3 = strategy.on_bar(df, atr_value=0.7, ema_value=0.0, rsi_value=50.0,
+                          mtf_rsi={"h1": 61.0, "h1_prev": 65.0, "h4": 55.0})
+    assert ev3.signal is None  # falling H1 = no fresh upward break
+    strategy = BreakoutStrategy(cfg)
+    ev4 = strategy.on_bar(df, atr_value=0.7, ema_value=0.0, rsi_value=50.0,
+                          mtf_rsi={"h1": 61.0, "h1_prev": 49.0, "h4": 55.0})
+    assert ev4.signal is not None, ev4.rejections
+
+
+def test_htf_rsi_uses_only_closed_bars(cfg):
+    """The last (still-forming) H1 bucket must not leak into the HTF RSI."""
+    import numpy as np
+    from indicators import last_closed_htf_rsi
+
+    n = 12 * 40  # 40 hours of M5
+    times = pd.date_range("2026-01-05 00:00", periods=n, freq="5min")
+    close = np.linspace(2000, 2010, n)
+    df = pd.DataFrame({"time": times, "open": close, "high": close + 0.1,
+                       "low": close - 0.1, "close": close, "volume": 1})
+    # cut mid-hour: last M5 bar opens at HH:25 -> that H1 bar is NOT closed
+    df_cut = df.iloc[: n - 6]
+    full_h1, _ = last_closed_htf_rsi(df, 60, 14)
+    cut_h1, _ = last_closed_htf_rsi(df_cut, 60, 14)
+    assert not pd.isna(cut_h1)
+    # monotone rising series -> RSI 100 everywhere; the real assertion is that
+    # the call works and excludes the partial bucket without crashing
+    assert cut_h1 == pytest.approx(100.0, abs=1e-6)

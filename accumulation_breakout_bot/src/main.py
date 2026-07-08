@@ -89,7 +89,11 @@ class LiveBot:
         if not self.client.is_alive():
             logger.error("MT5 terminal connection lost; retrying")
             return
-        m5 = self.client.m5_candles(count=max(600, self.cfg.ema_period + 50))
+        # MTF RSI needs deep M5 history: H4 RSI(14) converges after ~40 H4
+        # bars = ~2000 M5 candles.
+        need = max(600, self.cfg.ema_period + 50,
+                   2400 if self.cfg.use_mtf_rsi_filter else 0)
+        m5 = self.client.m5_candles(count=need)
         bar_time = m5["time"].iloc[-1]
         if self.last_bar_time is not None and bar_time == self.last_bar_time:
             return  # act once per closed M5 candle
