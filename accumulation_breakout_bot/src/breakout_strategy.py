@@ -188,7 +188,7 @@ class BreakoutStrategy:
                 ev.rejections.append(f"EMA filter: SELL above EMA{cfg.ema_period}")
                 return ev
 
-        if cfg.entry_mode is EntryMode.DIRECT_BREAKOUT:
+        if cfg.entry_mode == EntryMode.DIRECT_BREAKOUT:
             reason = (f"direct breakout of accumulation zone "
                       f"[{zone.low:.2f}-{zone.high:.2f}] "
                       f"({zone.upper_touches}U/{zone.lower_touches}L wick touches)")
