@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+logs/
+data/historical/*
+data/reports/*
+data/journals/*
+!data/historical/.gitkeep
+!data/reports/.gitkeep
+!data/journals/.gitkeep

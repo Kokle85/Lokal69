@@ -1,0 +1,75 @@
+# Accumulation Breakout Bot - configuration.
+# Live trading is DISABLED by default: the bot runs in signal-only mode and
+# never sends orders unless live_trading_enabled is true AND --mode live.
+
+symbol: XAUUSD
+timeframe: M5
+entry_mode: BREAKOUT_RETEST        # BREAKOUT_RETEST | DIRECT_BREAKOUT
+
+# ---- risk ----
+risk_per_trade_percent: 0.5        # % of account balance risked per trade
+risk_reward_ratio: 3.0             # TP = entry +/- 3 x risk
+
+# ---- accumulation zone detection ----
+zone_lookback_candles: 30
+minimum_upper_wick_touches: 3
+minimum_lower_wick_touches: 3
+touch_tolerance_atr_multiplier: 0.15
+min_zone_size_atr: 0.8
+max_zone_size_atr: 2.0
+min_body_inside_zone_percent: 70
+max_zone_slope_atr: 0.5            # reject trending ("sloped") windows
+
+# ---- breakout confirmation ----
+breakout_buffer_atr_multiplier: 0.15
+min_breakout_body_atr_multiplier: 0.4
+max_rejection_wick_percent: 40     # reject breakout candles with big opposing wicks
+
+# ---- retest entry (BREAKOUT_RETEST mode) ----
+retest_timeout_candles: 12         # give up if no retest within N candles
+retest_max_penetration_percent: 50 # cancel if price re-enters deeper than 50% of the zone
+
+# ---- stops ----
+stop_buffer_atr_multiplier: 0.10
+min_stop_distance_atr: 0.5
+max_stop_distance_atr: 2.5
+
+# ---- filters ----
+use_ema_filter: true
+ema_period: 200
+use_session_filter: true
+sessions:                          # BROKER time (matches your MT5 chart clock)
+  london:
+    start: "08:00"
+    end: "12:00"
+  newyork:
+    start: "13:30"
+    end: "17:00"
+max_spread_points: 35
+max_trades_per_day: 2
+cooldown_minutes: 60
+
+# ---- news filter (placeholder interface, disabled by default) ----
+use_news_filter: false
+news_block_minutes_before: 30
+news_block_minutes_after: 30
+
+# ---- indicators ----
+atr_period: 14
+
+# ---- safety ----
+live_trading_enabled: false        # double gate: must be true AND --mode live
+
+# ---- MT5 terminal (leave empty to use the already-logged-in terminal) ----
+mt5:
+  login:
+  password:
+  server:
+  path:
+  magic_number: 26110701
+  deviation_points: 20
+
+# ---- backtest simulation ----
+backtest:
+  spread_points: 25.0              # cost applied on every simulated entry
+  point: 0.01                      # XAUUSD point size (used when MT5 absent)
