@@ -112,6 +112,10 @@ class Settings(BaseModel):
     stop_buffer_atr_multiplier: float = 0.10
     min_stop_distance_atr: float = 0.5
     max_stop_distance_atr: float = 2.5
+    # "zone_opposite" = SL beyond the far side of the zone (original spec);
+    # "zone_mid" = SL beyond the zone midpoint (half the risk, so the 3R
+    # target sits at a reachable distance on M5).
+    stop_mode: str = "zone_opposite"
 
     use_ema_filter: bool = True
     ema_period: int = 200
@@ -150,6 +154,8 @@ class Settings(BaseModel):
             raise ValueError("min_body_inside_zone_percent must be in (0, 100]")
         if not 0 < self.max_rejection_wick_percent <= 100:
             raise ValueError("max_rejection_wick_percent must be in (0, 100]")
+        if self.stop_mode not in {"zone_opposite", "zone_mid"}:
+            raise ValueError("stop_mode must be 'zone_opposite' or 'zone_mid'")
         return self
 
 

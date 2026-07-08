@@ -71,12 +71,16 @@ class BreakoutStrategy:
         is outside the allowed ATR band."""
         stop_buffer = self.cfg.stop_buffer_atr_multiplier * atr_value
         entry = float(candle["close"])
+        # zone_opposite (spec): SL beyond the far zone side. zone_mid: SL
+        # beyond the midpoint - half the risk, so 3R lands within reach.
+        long_anchor = zone.low if self.cfg.stop_mode == "zone_opposite" else zone.mid
+        short_anchor = zone.high if self.cfg.stop_mode == "zone_opposite" else zone.mid
         if direction is Direction.BUY:
-            sl = zone.low - stop_buffer
+            sl = long_anchor - stop_buffer
             risk = entry - sl
             tp = entry + self.cfg.risk_reward_ratio * risk
         else:
-            sl = zone.high + stop_buffer
+            sl = short_anchor + stop_buffer
             risk = sl - entry
             tp = entry - self.cfg.risk_reward_ratio * risk
         if risk <= 0:
@@ -105,8 +109,10 @@ class BreakoutStrategy:
                           atr_value: float) -> str:
         entry = float(candle["close"])
         stop_buffer = self.cfg.stop_buffer_atr_multiplier * atr_value
-        risk = (entry - (zone.low - stop_buffer)) if direction is Direction.BUY \
-            else ((zone.high + stop_buffer) - entry)
+        long_anchor = zone.low if self.cfg.stop_mode == "zone_opposite" else zone.mid
+        short_anchor = zone.high if self.cfg.stop_mode == "zone_opposite" else zone.mid
+        risk = (entry - (long_anchor - stop_buffer)) if direction is Direction.BUY \
+            else ((short_anchor + stop_buffer) - entry)
         return (f"stop distance {risk:.2f} outside "
                 f"[{self.cfg.min_stop_distance_atr}, {self.cfg.max_stop_distance_atr}] x "
                 f"ATR ({atr_value:.2f})")

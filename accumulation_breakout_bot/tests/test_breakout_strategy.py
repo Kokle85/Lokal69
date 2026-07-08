@@ -1,5 +1,6 @@
 """Breakout strategy: direct entries, retest state machine, quality gates."""
 import pandas as pd
+import pytest
 
 from breakout_strategy import BreakoutStrategy
 from conftest import flat_zone_candles, make_candles
@@ -82,6 +83,25 @@ def test_retest_flow_produces_buy(cfg):
     assert ev2.signal.direction is Direction.BUY
     assert ev2.signal.entry_mode is EntryMode.BREAKOUT_RETEST
     assert strategy.pending is None
+
+
+def test_zone_mid_stop_mode_halves_the_risk(cfg):
+    cfg.entry_mode = EntryMode.DIRECT_BREAKOUT
+    breakout = (2000.9, 2001.5, 2000.85, 2001.4)
+
+    cfg.stop_mode = "zone_opposite"
+    full = BreakoutStrategy(cfg).on_bar(_frame_with([breakout], cfg))
+    cfg.stop_mode = "zone_mid"
+    mid = BreakoutStrategy(cfg).on_bar(_frame_with([breakout], cfg))
+
+    assert full.signal is not None and mid.signal is not None
+    assert mid.signal.stop_loss > full.signal.stop_loss  # mid stop sits higher
+    # mid-stop risk = full risk minus half the zone (same entry, same buffer)
+    assert (full.signal.risk_distance - mid.signal.risk_distance
+            == pytest.approx(full.signal.zone.size / 2, abs=1e-9))
+    # TP still at 3R of the (smaller) risk
+    assert mid.signal.take_profit == pytest.approx(
+        mid.signal.entry_price + 3.0 * mid.signal.risk_distance)
 
 
 def test_retest_timeout_cancels(cfg):
