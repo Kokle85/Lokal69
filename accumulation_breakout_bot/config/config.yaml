@@ -13,6 +13,10 @@ risk_reward_ratio: 3.0             # final target (informational; ladder below r
 # third of the position at each. Live execution splits the lot into one MT5
 # order per level (same SL, different TPs). After TP1 fills, the SL of the
 # remaining orders moves to breakeven (set false to keep the original stop).
+# Full-2025 trade-off (T2 tier, RETEST): ladder+BE -> WR 53%, +28.1R, max 6
+# straight losses; ladder no-BE -> WR 41%, +29.3R; SINGLE TP @3R (set
+# levels [3.0], percents [100.0]) -> WR 34% but +47.3R total. The ladder
+# trades ~40% of the yearly R for a much smoother, higher-WR equity curve.
 take_profit_levels_r: [1.0, 2.0, 3.0]
 take_profit_close_percents: [33.0, 33.0, 34.0]
 move_sl_to_breakeven_after_tp1: true
