@@ -125,6 +125,14 @@ class Settings(BaseModel):
 
     use_ema_filter: bool = True
     ema_period: int = 200
+    # RSI momentum filter on the entry candle: BUY needs momentum up but not
+    # exhausted (rsi_buy_min..rsi_buy_max); SELL mirrored.
+    use_rsi_filter: bool = False
+    rsi_period: int = 14
+    rsi_buy_min: float = 50.0
+    rsi_buy_max: float = 80.0
+    rsi_sell_min: float = 20.0
+    rsi_sell_max: float = 50.0
     use_session_filter: bool = True
     sessions: SessionsConfig = SessionsConfig()
     max_spread_points: float = 35.0
@@ -162,6 +170,9 @@ class Settings(BaseModel):
             raise ValueError("max_rejection_wick_percent must be in (0, 100]")
         if self.stop_mode not in {"zone_opposite", "zone_mid"}:
             raise ValueError("stop_mode must be 'zone_opposite' or 'zone_mid'")
+        if not (0 <= self.rsi_sell_min < self.rsi_sell_max <= 100
+                and 0 <= self.rsi_buy_min < self.rsi_buy_max <= 100):
+            raise ValueError("rsi thresholds must satisfy 0 <= min < max <= 100")
         levels, pcts = self.take_profit_levels_r, self.take_profit_close_percents
         if not levels or len(levels) != len(pcts):
             raise ValueError("take_profit_levels_r and take_profit_close_percents "

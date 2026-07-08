@@ -80,10 +80,11 @@ class Backtester:
         self.spread_price = cfg.backtest.spread_points * cfg.backtest.point
         # Indicators computed ONCE over the whole history; recomputing them
         # inside on_bar for every bar would make the run O(n^2).
-        from indicators import atr as atr_series, ema as ema_series
+        from indicators import atr as atr_series, ema as ema_series, rsi as rsi_series
 
         self._atr = atr_series(self.m5, cfg.atr_period)
         self._ema = ema_series(self.m5["close"], cfg.ema_period)
+        self._rsi = rsi_series(self.m5["close"], cfg.rsi_period)
 
     def run(self, label: str = "") -> BacktestReport:
         cfg = self.cfg
@@ -130,7 +131,9 @@ class Backtester:
             ev = strategy.on_bar(window,
                                  atr_value=float(self._atr.iloc[i]),
                                  ema_value=float(self._ema.iloc[i])
-                                 if cfg.use_ema_filter else 0.0)
+                                 if cfg.use_ema_filter else 0.0,
+                                 rsi_value=float(self._rsi.iloc[i])
+                                 if cfg.use_rsi_filter else 50.0)
             if ev.signal is None:
                 continue
 
@@ -147,6 +150,7 @@ class Backtester:
             signal.entry_price += shift
             signal.stop_loss += shift
             signal.take_profit += shift
+            signal.take_profits = [tp + shift for tp in signal.take_profits]
             assert abs(signal.risk_distance - risk) < 1e-9
 
             open_signal = signal

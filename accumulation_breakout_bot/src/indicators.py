@@ -19,6 +19,18 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI over a close series (0-100)."""
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0.0, float("nan"))
+    out = 100.0 - 100.0 / (1.0 + rs)
+    return out.fillna(100.0).where(avg_loss.notna(), other=float("nan"))
+
+
 def linear_slope(values: np.ndarray) -> float:
     """Least-squares slope per bar of a value series (price units / bar)."""
     n = len(values)

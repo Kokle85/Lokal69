@@ -16,7 +16,7 @@ from typing import Optional
 import pandas as pd
 
 from config_loader import Settings
-from indicators import atr as atr_series, ema as ema_series
+from indicators import atr as atr_series, ema as ema_series, rsi as rsi_series
 from models import Direction, EntryMode, Signal, Zone
 from zone_detector import detect_zone
 
@@ -121,8 +121,27 @@ class BreakoutStrategy:
 
     # ------------------------------------------------------------ main entry
 
+    def _rsi_block_reason(self, direction: Direction, rsi_value: float) -> Optional[str]:
+        """RSI momentum gate: BUY wants momentum up but not exhausted; SELL
+        mirrored. Returns a rejection reason or None."""
+        cfg = self.cfg
+        if not cfg.use_rsi_filter:
+            return None
+        if pd.isna(rsi_value):
+            return "RSI warmup"
+        if direction is Direction.BUY:
+            if not (cfg.rsi_buy_min <= rsi_value <= cfg.rsi_buy_max):
+                return (f"RSI filter: BUY needs {cfg.rsi_buy_min:.0f}-"
+                        f"{cfg.rsi_buy_max:.0f}, got {rsi_value:.0f}")
+        else:
+            if not (cfg.rsi_sell_min <= rsi_value <= cfg.rsi_sell_max):
+                return (f"RSI filter: SELL needs {cfg.rsi_sell_min:.0f}-"
+                        f"{cfg.rsi_sell_max:.0f}, got {rsi_value:.0f}")
+        return None
+
     def on_bar(self, df: pd.DataFrame, atr_value: Optional[float] = None,
-               ema_value: Optional[float] = None) -> Evaluation:
+               ema_value: Optional[float] = None,
+               rsi_value: Optional[float] = None) -> Evaluation:
         """Evaluate the LAST (closed) candle of `df`. All candles must be closed.
 
         `atr_value`/`ema_value` may be supplied precomputed (the backtester
@@ -145,7 +164,11 @@ class BreakoutStrategy:
             atr_value = float(atr_series(df, cfg.atr_period).iloc[-1])
             ema_value = (float(ema_series(df["close"], cfg.ema_period).iloc[-1])
                          if cfg.use_ema_filter else 0.0)
+            rsi_value = (float(rsi_series(df["close"], cfg.rsi_period).iloc[-1])
+                         if cfg.use_rsi_filter else 50.0)
         ema_value = float(ema_value or 0.0)
+        rsi_value = 50.0 if rsi_value is None else float(rsi_value)
+        self._rsi_now = rsi_value  # available to the retest leg
         if atr_value <= 0 or pd.isna(atr_value):
             ev.rejections.append("ATR unavailable")
             return ev
@@ -189,6 +212,10 @@ class BreakoutStrategy:
             if direction is Direction.SELL and close >= ema_value:
                 ev.rejections.append(f"EMA filter: SELL above EMA{cfg.ema_period}")
                 return ev
+        rsi_block = self._rsi_block_reason(direction, rsi_value)
+        if rsi_block:
+            ev.rejections.append(rsi_block)
+            return ev
 
         if cfg.entry_mode == EntryMode.DIRECT_BREAKOUT:
             reason = (f"direct breakout of accumulation zone "
@@ -270,6 +297,12 @@ class BreakoutStrategy:
                 self.pending = None
                 ev.rejections.append(f"EMA filter: SELL above EMA{cfg.ema_period} at retest")
                 return ev
+        rsi_block = self._rsi_block_reason(pending.direction,
+                                           getattr(self, "_rsi_now", 50.0))
+        if rsi_block:
+            self.pending = None
+            ev.rejections.append(rsi_block + " at retest")
+            return ev
 
         direction = pending.direction
         self.pending = None
