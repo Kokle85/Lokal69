@@ -1,0 +1,193 @@
+"""Lot sizing and hard per-trade risk validation."""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+from loguru import logger
+
+from config import StrategyTuningConfig, TradingConfig
+from models import Signal, SymbolSpec
+
+
+@dataclass
+class LotResult:
+    ok: bool
+    lot: float
+    reason: str
+    loss_at_sl_usd: float = 0.0
+
+
+@dataclass
+class RiskCheck:
+    ok: bool
+    reason: str
+
+
+def calculate_lot(
+    risk_usd: float,
+    entry: float,
+    sl: float,
+    spec: SymbolSpec,
+    cap_to_max: bool = False,
+) -> LotResult:
+    """Size the position so a stop-out loses ~risk_usd, rounded DOWN to volume_step."""
+    if risk_usd <= 0:
+        return LotResult(False, 0.0, "risk_usd must be positive")
+    sl_distance = abs(entry - sl)
+    if sl_distance <= 0:
+        return LotResult(False, 0.0, "SL distance is zero — trade without SL is forbidden")
+    # Loss per 1.0 lot for a move of `sl_distance`. Prefer contract size on
+    # USD-quoted symbols: brokers sometimes report a bogus trade_tick_value
+    # (seen live: 0.01 on FundingPips gold), which would mislabel a ~$700
+    # stop-out as $7 and size a wildly wrong lot.
+    contract_loss = sl_distance * spec.contract_size if spec.contract_size > 0 else 0.0
+    tick_loss = ((sl_distance / spec.tick_size) * spec.tick_value
+                 if spec.tick_size > 0 and spec.tick_value > 0 else 0.0)
+    loss_per_lot = contract_loss or tick_loss
+    if loss_per_lot <= 0:
+        return LotResult(False, 0.0, "invalid symbol contract/tick data")
+    if contract_loss and tick_loss and not (0.2 <= tick_loss / contract_loss <= 5.0):
+        logger.warning(
+            "Broker tick_value math disagrees with contract size by {:.0f}x "
+            "(tick ${:.2f} vs contract ${:.2f} per lot) - using contract size.",
+            max(tick_loss, contract_loss) / min(tick_loss, contract_loss),
+            tick_loss, contract_loss,
+        )
+    raw_lot = risk_usd / loss_per_lot
+
+    step = spec.volume_step if spec.volume_step > 0 else 0.01
+    lot = math.floor(raw_lot / step + 1e-9) * step
+    lot = round(lot, 8)
+
+    if lot < spec.volume_min:
+        return LotResult(
+            False,
+            0.0,
+            f"calculated lot {lot} below broker minimum {spec.volume_min} "
+            f"(risk ${risk_usd:.0f} too small for SL distance {sl_distance:.2f})",
+        )
+    if lot > spec.volume_max:
+        if not cap_to_max:
+            return LotResult(False, 0.0, f"calculated lot {lot} above broker maximum {spec.volume_max}")
+        lot = spec.volume_max
+
+    actual_loss = loss_per_lot * lot
+    if actual_loss > risk_usd * 1.05:
+        return LotResult(False, 0.0, f"rounded lot risks ${actual_loss:.2f} > allowed ${risk_usd:.2f}")
+    return LotResult(True, lot, "ok", actual_loss)
+
+
+def orb_position_risk(orb, trades_today: int, realized_pnl: float) -> float:
+    """Per-trade risk (USD) for an ORB trade.
+
+    In "daily_budget" mode the day has a total risk budget; each trade risks the
+    remaining budget spread over the remaining trades, so the lot adapts to the
+    SL distance and the day cannot lose more than the budget. Banked profit
+    extends the budget (trading with house money). "fixed" mode just returns
+    risk_per_trade_usd. Always capped by max_risk_per_trade_usd.
+    """
+    if orb.risk_mode == "fixed":
+        return min(orb.risk_per_trade_usd, orb.max_risk_per_trade_usd)
+    budget = orb.daily_risk_budget_usd
+    if orb.profit_extends_budget and realized_pnl > 0:
+        budget += realized_pnl
+    remaining_budget = max(0.0, budget - max(0.0, -realized_pnl))
+    remaining_trades = max(1, orb.max_trades_per_day - trades_today)
+    return min(remaining_budget / remaining_trades, orb.max_risk_per_trade_usd)
+
+
+def check_cost_to_tp(
+    entry: float,
+    tp: float,
+    spread_points: float,
+    point: float,
+    trading: TradingConfig,
+) -> RiskCheck:
+    """Reject trades whose fixed costs eat too much of the profit target.
+
+    Estimated round-trip cost = current spread + cost_buffer_points (slippage
+    in/out + commission expressed in points). If that exceeds
+    max_cost_to_tp_pct of the TP distance, the trade is structurally
+    unprofitable regardless of signal quality.
+    """
+    if point <= 0:
+        return RiskCheck(False, "invalid symbol point size")
+    tp_points = abs(tp - entry) / point
+    if tp_points <= 0:
+        return RiskCheck(False, "TP distance is zero")
+    cost_points = spread_points + trading.cost_buffer_points
+    cost_pct = 100.0 * cost_points / tp_points
+    if cost_pct > trading.max_cost_to_tp_pct:
+        return RiskCheck(
+            False,
+            f"round-trip cost ~{cost_points:.0f}pt is {cost_pct:.0f}% of TP distance "
+            f"{tp_points:.0f}pt (limit {trading.max_cost_to_tp_pct:.0f}%)",
+        )
+    return RiskCheck(True, "ok")
+
+
+def validate_sl_distance(
+    entry: float, sl: float, atr_value: float, tuning: StrategyTuningConfig
+) -> RiskCheck:
+    if atr_value <= 0:
+        return RiskCheck(False, "ATR unavailable for SL validation")
+    distance = abs(entry - sl)
+    if distance <= 0:
+        return RiskCheck(False, "trade has no stop loss")
+    ratio = distance / atr_value
+    if ratio < tuning.min_sl_atr:
+        return RiskCheck(False, f"SL distance {ratio:.2f} ATR below minimum {tuning.min_sl_atr}")
+    if ratio > tuning.max_sl_atr:
+        return RiskCheck(False, f"SL distance {ratio:.2f} ATR above maximum {tuning.max_sl_atr}")
+    return RiskCheck(True, "ok")
+
+
+class RiskManager:
+    """Final gatekeeper for every order. Never bypass; deny by default."""
+
+    def __init__(self, trading: TradingConfig, tuning: StrategyTuningConfig) -> None:
+        self.trading = trading
+        self.tuning = tuning
+
+    def validate_signal(
+        self,
+        signal: Signal,
+        atr_value: float,
+        spread_points: float,
+        open_positions: int,
+        symbol_tradeable: bool,
+        point: float = 0.01,
+    ) -> RiskCheck:
+        if signal.sl <= 0 or signal.sl_distance <= 0:
+            return RiskCheck(False, "signal has no stop loss")
+        if not symbol_tradeable:
+            return RiskCheck(False, "symbol is not tradeable")
+        if open_positions >= self.trading.max_positions:
+            return RiskCheck(False, f"max positions ({self.trading.max_positions}) already open")
+        if spread_points > self.trading.max_spread_points:
+            return RiskCheck(
+                False,
+                f"spread {spread_points:.0f}pt above limit {self.trading.max_spread_points:.0f}pt",
+            )
+        sl_check = validate_sl_distance(signal.entry, signal.sl, atr_value, self.tuning)
+        if not sl_check.ok:
+            return sl_check
+        cost_check = check_cost_to_tp(signal.entry, signal.tp, spread_points, point, self.trading)
+        if not cost_check.ok:
+            return cost_check
+        return RiskCheck(True, "ok")
+
+    def size_position(self, signal: Signal, spec: SymbolSpec,
+                      cap_to_max: bool = False) -> LotResult:
+        # trading.max_lot: the prop firm's REAL per-position limit can be far
+        # below what symbol_info reports (FundingPips gold: 0.4 lot vs 5.0
+        # reported). 0 = trust the broker's volume_max.
+        if self.trading.max_lot > 0 and self.trading.max_lot < spec.volume_max:
+            from dataclasses import replace
+            spec = replace(spec, volume_max=self.trading.max_lot)
+        result = calculate_lot(signal.risk_usd, signal.entry, signal.sl, spec,
+                               cap_to_max=cap_to_max)
+        if not result.ok:
+            logger.warning("Lot sizing rejected: {}", result.reason)
+        return result

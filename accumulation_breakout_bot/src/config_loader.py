@@ -1,0 +1,213 @@
+"""Typed configuration loaded from config/config.yaml (pydantic-validated).
+
+Strategy logic files never hardcode parameters: everything tunable lives in
+the YAML and arrives here, validated, or the bot refuses to start.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import yaml
+from pydantic import BaseModel, field_validator, model_validator
+
+from models import EntryMode
+
+
+class SessionWindow(BaseModel):
+    start: str = "08:00"
+    end: str = "12:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        parts = v.split(":")
+        if len(parts) != 2 or not (0 <= int(parts[0]) <= 23 and 0 <= int(parts[1]) <= 59):
+            raise ValueError(f"session time must be HH:MM, got {v!r}")
+        return v
+
+
+class SessionsConfig(BaseModel):
+    london: SessionWindow = SessionWindow(start="08:00", end="12:00")
+    newyork: SessionWindow = SessionWindow(start="13:30", end="17:00")
+
+
+class MT5Config(BaseModel):
+    login: Optional[int] = None
+    password: Optional[str] = None
+    server: Optional[str] = None
+    path: Optional[str] = None
+    magic_number: int = 26110701
+    deviation_points: int = 20
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE .env parser (no python-dotenv dependency)."""
+    values: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+class TelegramConfig(BaseModel):
+    """Shares the ORB scalper's Telegram bot: token/chat id resolve from (in
+    order) explicit yaml values, process environment, then the env_file -
+    which by default points at the scalper project's .env."""
+
+    enabled: bool = True
+    bot_token: str = ""
+    chat_id: str = ""
+    env_file: str = "../mt5_xauusd_scalper/.env"
+
+    @model_validator(mode="after")
+    def _merge_env(self) -> "TelegramConfig":
+        import os
+
+        file_vals: dict[str, str] = {}
+        if self.env_file:
+            file_vals = _read_env_file(Path(self.env_file))
+        self.bot_token = (self.bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+                          or file_vals.get("TELEGRAM_BOT_TOKEN", ""))
+        self.chat_id = (self.chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+                        or file_vals.get("TELEGRAM_CHAT_ID", ""))
+        return self
+
+
+class BacktestConfig(BaseModel):
+    spread_points: float = 25.0
+    point: float = 0.01
+
+
+class Settings(BaseModel):
+    symbol: str = "XAUUSD"
+    timeframe: str = "M5"
+    entry_mode: EntryMode = EntryMode.BREAKOUT_RETEST
+
+    risk_per_trade_percent: float = 0.5
+    risk_reward_ratio: float = 3.0  # final target (kept for validation labels)
+    # Partial take-profits: close a slice of the position at each level.
+    # MT5 allows one TP per position, so live execution splits the lot into
+    # one order per level (same SL, different TPs).
+    take_profit_levels_r: list[float] = [1.0, 2.0, 3.0]
+    take_profit_close_percents: list[float] = [33.0, 33.0, 34.0]
+    move_sl_to_breakeven_after_tp1: bool = True
+
+    zone_lookback_candles: int = 30
+    minimum_upper_wick_touches: int = 3
+    minimum_lower_wick_touches: int = 3
+    touch_tolerance_atr_multiplier: float = 0.15
+    min_zone_size_atr: float = 0.8
+    max_zone_size_atr: float = 2.0
+    min_body_inside_zone_percent: float = 70.0
+    max_zone_slope_atr: float = 0.5
+
+    breakout_buffer_atr_multiplier: float = 0.15
+    min_breakout_body_atr_multiplier: float = 0.4
+    max_rejection_wick_percent: float = 40.0
+
+    retest_timeout_candles: int = 12
+    retest_max_penetration_percent: float = 50.0
+
+    stop_buffer_atr_multiplier: float = 0.10
+    min_stop_distance_atr: float = 0.5
+    max_stop_distance_atr: float = 2.5
+    # "zone_opposite" = SL beyond the far side of the zone (original spec);
+    # "zone_mid" = SL beyond the zone midpoint (half the risk, so the 3R
+    # target sits at a reachable distance on M5).
+    stop_mode: str = "zone_opposite"
+
+    use_ema_filter: bool = True
+    ema_period: int = 200
+    # RSI momentum filter on the entry candle: BUY needs momentum up but not
+    # exhausted (rsi_buy_min..rsi_buy_max); SELL mirrored.
+    use_rsi_filter: bool = False
+    rsi_period: int = 14
+    rsi_buy_min: float = 50.0
+    rsi_buy_max: float = 80.0
+    rsi_sell_min: float = 20.0
+    rsi_sell_max: float = 50.0
+    # Multi-timeframe RSI direction gate: H1 + H4 RSI define the general
+    # direction around the midline; trades only WITH that direction.
+    # "both_agree": H1 and H4 RSI on the same side of the midline.
+    # "cross_confirm": H4 gives the bias, H1 RSI must also be on that side
+    #                  AND moving through it (rising for BUY, falling for SELL).
+    use_mtf_rsi_filter: bool = False
+    mtf_rsi_period: int = 14
+    mtf_rsi_midline: float = 50.0
+    mtf_rsi_mode: str = "both_agree"
+    use_session_filter: bool = True
+    sessions: SessionsConfig = SessionsConfig()
+    max_spread_points: float = 35.0
+    max_trades_per_day: int = 2
+    cooldown_minutes: int = 60
+
+    use_news_filter: bool = False
+    news_block_minutes_before: int = 30
+    news_block_minutes_after: int = 30
+
+    atr_period: int = 14
+    live_trading_enabled: bool = False
+
+    mt5: MT5Config = MT5Config()
+    telegram: TelegramConfig = TelegramConfig()
+    backtest: BacktestConfig = BacktestConfig()
+
+    @model_validator(mode="after")
+    def _sanity(self) -> "Settings":
+        if self.timeframe != "M5":
+            raise ValueError("this bot trades the M5 timeframe only (timeframe: M5)")
+        if self.risk_reward_ratio <= 0:
+            raise ValueError("risk_reward_ratio must be positive")
+        if not 0 < self.risk_per_trade_percent <= 5:
+            raise ValueError("risk_per_trade_percent must be in (0, 5]")
+        if self.min_zone_size_atr >= self.max_zone_size_atr:
+            raise ValueError("min_zone_size_atr must be < max_zone_size_atr")
+        if self.min_stop_distance_atr >= self.max_stop_distance_atr:
+            raise ValueError("min_stop_distance_atr must be < max_stop_distance_atr")
+        if self.zone_lookback_candles < 10:
+            raise ValueError("zone_lookback_candles must be >= 10")
+        if not 0 < self.min_body_inside_zone_percent <= 100:
+            raise ValueError("min_body_inside_zone_percent must be in (0, 100]")
+        if not 0 < self.max_rejection_wick_percent <= 100:
+            raise ValueError("max_rejection_wick_percent must be in (0, 100]")
+        if self.stop_mode not in {"zone_opposite", "zone_mid"}:
+            raise ValueError("stop_mode must be 'zone_opposite' or 'zone_mid'")
+        if not (0 <= self.rsi_sell_min < self.rsi_sell_max <= 100
+                and 0 <= self.rsi_buy_min < self.rsi_buy_max <= 100):
+            raise ValueError("rsi thresholds must satisfy 0 <= min < max <= 100")
+        if self.mtf_rsi_mode not in {"both_agree", "cross_confirm"}:
+            raise ValueError("mtf_rsi_mode must be 'both_agree' or 'cross_confirm'")
+        if not 0 < self.mtf_rsi_midline < 100:
+            raise ValueError("mtf_rsi_midline must be in (0, 100)")
+        levels, pcts = self.take_profit_levels_r, self.take_profit_close_percents
+        if not levels or len(levels) != len(pcts):
+            raise ValueError("take_profit_levels_r and take_profit_close_percents "
+                             "must be non-empty and the same length")
+        if any(r <= 0 for r in levels) or list(levels) != sorted(levels):
+            raise ValueError("take_profit_levels_r must be positive and ascending")
+        if abs(sum(pcts) - 100.0) > 0.01 or any(p <= 0 for p in pcts):
+            raise ValueError("take_profit_close_percents must be positive and sum to 100")
+        return self
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_settings(path: str | Path = "config/config.yaml") -> Settings:
+    p = Path(path)
+    if not p.exists():
+        raise ConfigError(f"config file not found: {p}")
+    with p.open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh) or {}
+    try:
+        return Settings(**raw)
+    except Exception as exc:  # pydantic ValidationError -> readable message
+        raise ConfigError(f"invalid configuration: {exc}") from exc

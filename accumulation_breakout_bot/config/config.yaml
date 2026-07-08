@@ -1,0 +1,139 @@
+# Accumulation Breakout Bot - configuration.
+# Live trading is DISABLED by default: the bot runs in signal-only mode and
+# never sends orders unless live_trading_enabled is true AND --mode live.
+
+symbol: XAUUSD
+timeframe: M5
+entry_mode: BREAKOUT_RETEST        # BREAKOUT_RETEST | DIRECT_BREAKOUT
+
+# ---- risk ----
+risk_per_trade_percent: 0.5        # % of account balance risked per trade
+risk_reward_ratio: 3.0             # final target (informational; ladder below rules)
+# Partial take-profit ladder: TP1 at 1R, TP2 at 2R, TP3 at 3R, closing a
+# third of the position at each. Live execution splits the lot into one MT5
+# order per level (same SL, different TPs). After TP1 fills, the SL of the
+# remaining orders moves to breakeven (set false to keep the original stop).
+# Full-2025 trade-off (T2 tier, RETEST): ladder+BE -> WR 53%, +28.1R, max 6
+# straight losses; ladder no-BE -> WR 41%, +29.3R; SINGLE TP @3R (set
+# levels [3.0], percents [100.0]) -> WR 34% but +47.3R total. The ladder
+# trades ~40% of the yearly R for a much smoother, higher-WR equity curve.
+take_profit_levels_r: [1.0, 2.0, 3.0]
+take_profit_close_percents: [33.0, 33.0, 34.0]
+move_sl_to_breakeven_after_tp1: true
+
+# ---- accumulation zone detection ----
+# "T2" relaxation tier, calibrated on full-2025 XAUUSD M5 for ~1 signal
+# every 2 days WITH a surviving edge: 142 trades, WR 33%, +43.3R, PF 1.46
+# (RETEST mode). The tighter T0/T1 tiers trade less but sharper (PF 2.0 at
+# ~1/month); the looser T3 tier reaches 2+/day but the edge dies (PF ~1.05).
+# lookback 20 (vs spec 30): smaller zones put the 3R target within reach.
+zone_lookback_candles: 20
+minimum_upper_wick_touches: 2
+minimum_lower_wick_touches: 2
+touch_tolerance_atr_multiplier: 0.35
+# CALIBRATED on full-2025 XAUUSD M5: a 30-bar window spans 3.9-6.6 x ATR
+# (p10-p75), so the original 0.8-2.0 band matched 0.0% of windows -> 0 trades.
+# 1.6-3.4 selects the tightest tail of 20-bar windows (true consolidations).
+min_zone_size_atr: 1.2
+max_zone_size_atr: 4.0
+min_body_inside_zone_percent: 50
+max_zone_slope_atr: 1.0            # reject trending ("sloped") windows
+
+# ---- breakout confirmation ----
+breakout_buffer_atr_multiplier: 0.15
+min_breakout_body_atr_multiplier: 0.25
+max_rejection_wick_percent: 60     # reject breakout candles with big opposing wicks
+
+# ---- retest entry (BREAKOUT_RETEST mode) ----
+retest_timeout_candles: 12         # give up if no retest within N candles
+retest_max_penetration_percent: 50 # cancel if price re-enters deeper than 50% of the zone
+
+# ---- stops ----
+stop_buffer_atr_multiplier: 0.10
+# COUPLED to the zone band: SL sits beyond the opposite zone side, so the
+# stop distance is at least the zone size. max_stop must exceed max_zone
+# (+ buffers/breakout excess) or every breakout is rejected.
+min_stop_distance_atr: 0.5
+max_stop_distance_atr: 3.0
+# zone_mid: SL beyond the zone MIDPOINT (half the risk of the spec's
+# zone_opposite, so 3R lands within M5 reach). Best full-2025 cell:
+# RETEST + zone_mid + ema off -> 10 trades, WR 40%, +6R, PF 2.0.
+# zone_opposite restores the original spec placement.
+stop_mode: zone_mid
+
+# ---- filters ----
+# ema off out-performed ema on in ALL calibrated 2025 variants (small
+# samples - flip to true if you prefer the conservative spec default)
+use_ema_filter: false
+ema_period: 200
+use_session_filter: true
+sessions:                          # BROKER time (matches your MT5 chart clock)
+  london:
+    start: "08:00"
+    end: "12:00"
+  newyork:
+    start: "13:30"
+    end: "17:00"
+max_spread_points: 35
+max_trades_per_day: 3
+cooldown_minutes: 60
+
+# ---- news filter (placeholder interface, disabled by default) ----
+use_news_filter: false
+news_block_minutes_before: 30
+news_block_minutes_after: 30
+
+# ---- RSI momentum filter (implemented, OFF by data) ----
+# 2025 sweep: RSI gating (50-80 buy / 20-50 sell, and 45-75/25-55) filtered
+# almost nothing at the retest entry and slightly REDUCED total R (25.8-26.8R
+# vs 27.8R baseline). Kept available for other symbols/timeframes.
+use_rsi_filter: false
+rsi_period: 14
+rsi_buy_min: 50
+rsi_buy_max: 80
+rsi_sell_min: 20
+rsi_sell_max: 50
+
+# ---- Multi-timeframe RSI direction gate (implemented, OFF by data) ----
+# H1+H4 RSI around the midline define the trade direction; modes:
+# both_agree (H1 & H4 same side) / cross_confirm (H4 bias + H1 breaking
+# through the line in that direction). 2025 verdict at the shipped config:
+#   baseline           145 trg, +27.8R, PF 1.40
+#   both_agree          55 trg,  +8.0R, PF 1.31  (cuts 71% of the profit)
+#   cross_confirm       26 trg,  -6.7R, PF 0.55  (kills the edge)
+# Accumulation breakouts on gold are often REVERSALS - direction filters
+# (EMA, M5 RSI, MTF RSI) consistently cut winners. Available for other markets.
+use_mtf_rsi_filter: false
+mtf_rsi_period: 14
+mtf_rsi_midline: 50
+mtf_rsi_mode: both_agree
+
+# ---- indicators ----
+atr_period: 14
+
+# ---- safety ----
+live_trading_enabled: false        # double gate: must be true AND --mode live
+
+# ---- Telegram (SHARES the ORB scalper's bot) ----
+# Token/chat id resolve from: values here -> environment variables
+# (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) -> the env_file below, which points
+# at the scalper project's .env so both bots message the same chat.
+telegram:
+  enabled: true
+  bot_token: ""
+  chat_id: ""
+  env_file: "../mt5_xauusd_scalper/.env"
+
+# ---- MT5 terminal (leave empty to use the already-logged-in terminal) ----
+mt5:
+  login:
+  password:
+  server:
+  path:
+  magic_number: 26110701
+  deviation_points: 20
+
+# ---- backtest simulation ----
+backtest:
+  spread_points: 25.0              # cost applied on every simulated entry
+  point: 0.01                      # XAUUSD point size (used when MT5 absent)
