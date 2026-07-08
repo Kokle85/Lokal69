@@ -83,6 +83,17 @@ use_news_filter: false
 news_block_minutes_before: 30
 news_block_minutes_after: 30
 
+# ---- RSI momentum filter (implemented, OFF by data) ----
+# 2025 sweep: RSI gating (50-80 buy / 20-50 sell, and 45-75/25-55) filtered
+# almost nothing at the retest entry and slightly REDUCED total R (25.8-26.8R
+# vs 27.8R baseline). Kept available for other symbols/timeframes.
+use_rsi_filter: false
+rsi_period: 14
+rsi_buy_min: 50
+rsi_buy_max: 80
+rsi_sell_min: 20
+rsi_sell_max: 50
+
 # ---- indicators ----
 atr_period: 14
 
