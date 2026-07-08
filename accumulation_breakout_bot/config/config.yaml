@@ -11,25 +11,27 @@ risk_per_trade_percent: 0.5        # % of account balance risked per trade
 risk_reward_ratio: 3.0             # TP = entry +/- 3 x risk
 
 # ---- accumulation zone detection ----
-# lookback 20 (vs spec 30): calibrated on full-2025 XAUUSD M5 - smaller zones
-# put the 3R target within realistic reach; every lb-20 variant tested green
-# (PF 1.09-2.00) while lb-30 variants were flat-to-negative.
+# "T2" relaxation tier, calibrated on full-2025 XAUUSD M5 for ~1 signal
+# every 2 days WITH a surviving edge: 142 trades, WR 33%, +43.3R, PF 1.46
+# (RETEST mode). The tighter T0/T1 tiers trade less but sharper (PF 2.0 at
+# ~1/month); the looser T3 tier reaches 2+/day but the edge dies (PF ~1.05).
+# lookback 20 (vs spec 30): smaller zones put the 3R target within reach.
 zone_lookback_candles: 20
-minimum_upper_wick_touches: 3
-minimum_lower_wick_touches: 3
-touch_tolerance_atr_multiplier: 0.25
+minimum_upper_wick_touches: 2
+minimum_lower_wick_touches: 2
+touch_tolerance_atr_multiplier: 0.35
 # CALIBRATED on full-2025 XAUUSD M5: a 30-bar window spans 3.9-6.6 x ATR
 # (p10-p75), so the original 0.8-2.0 band matched 0.0% of windows -> 0 trades.
 # 1.6-3.4 selects the tightest tail of 20-bar windows (true consolidations).
-min_zone_size_atr: 1.6
-max_zone_size_atr: 3.4
-min_body_inside_zone_percent: 70
-max_zone_slope_atr: 0.5            # reject trending ("sloped") windows
+min_zone_size_atr: 1.2
+max_zone_size_atr: 4.0
+min_body_inside_zone_percent: 50
+max_zone_slope_atr: 1.0            # reject trending ("sloped") windows
 
 # ---- breakout confirmation ----
 breakout_buffer_atr_multiplier: 0.15
-min_breakout_body_atr_multiplier: 0.4
-max_rejection_wick_percent: 40     # reject breakout candles with big opposing wicks
+min_breakout_body_atr_multiplier: 0.25
+max_rejection_wick_percent: 60     # reject breakout candles with big opposing wicks
 
 # ---- retest entry (BREAKOUT_RETEST mode) ----
 retest_timeout_candles: 12         # give up if no retest within N candles
@@ -62,7 +64,7 @@ sessions:                          # BROKER time (matches your MT5 chart clock)
     start: "13:30"
     end: "17:00"
 max_spread_points: 35
-max_trades_per_day: 2
+max_trades_per_day: 3
 cooldown_minutes: 60
 
 # ---- news filter (placeholder interface, disabled by default) ----
