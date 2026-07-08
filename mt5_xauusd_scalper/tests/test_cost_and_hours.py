@@ -210,3 +210,60 @@ def test_lot_adapts_to_sl_at_same_risk():
     tight = calculate_lot(300, 4700, 4697, spec)  # 3.0 SL
     assert wide.ok and tight.ok
     assert tight.lot > wide.lot                   # tighter stop -> bigger lot, same $ risk
+
+
+# ------------------------------------------------------------------ live time base & lot caps
+
+def test_normalize_bar_timeline_removes_server_offset():
+    """FundingPips-style UTC+3 labels must be shifted onto real UTC."""
+    import pandas as pd
+    from datetime import datetime, timedelta, timezone
+    from main import _normalize_bar_timeline
+
+    wall = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+    # server labels run 3h ahead: last closed bar 14:59 (closes 15:00)
+    times = pd.date_range("2026-07-08 14:00", periods=60, freq="1min", tz="UTC")
+    m1 = pd.DataFrame({"time": times, "open": 1.0, "high": 1.0, "low": 1.0,
+                       "close": 1.0, "tick_volume": 1})
+    shifted, offset = _normalize_bar_timeline(m1, wall)
+    assert offset == 180
+    assert shifted["time"].iloc[-1] == pd.Timestamp("2026-07-08 11:59", tz="UTC")
+
+
+def test_normalize_bar_timeline_zero_offset_untouched():
+    import pandas as pd
+    from datetime import datetime, timezone
+    from main import _normalize_bar_timeline
+
+    wall = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+    times = pd.date_range("2026-07-08 11:00", periods=60, freq="1min", tz="UTC")
+    m1 = pd.DataFrame({"time": times, "open": 1.0, "high": 1.0, "low": 1.0,
+                       "close": 1.0, "tick_volume": 1})
+    shifted, offset = _normalize_bar_timeline(m1, wall)
+    assert offset == 0
+    assert shifted is m1  # no copy when nothing to fix
+
+
+def test_size_position_respects_prop_max_lot():
+    """FundingPips gold rule: 0.4 lot cap, far below symbol_info's 5.0."""
+    from datetime import datetime, timezone
+    from config import StrategyTuningConfig, TradingConfig
+    from models import Direction, Regime, Signal, StrategyName, SymbolSpec
+    from risk_manager import RiskManager
+
+    spec = SymbolSpec(name="XAUUSD", point=0.01, tick_size=0.01, tick_value=1.0,
+                      volume_min=0.01, volume_max=5.0, volume_step=0.01, digits=2)
+    signal = Signal(symbol="XAUUSD", direction=Direction.BUY,
+                    strategy=StrategyName.ORB, regime=Regime.TREND_UP,
+                    entry=4000.0, sl=3999.0, tp=4003.0, rr=3.0, score=10,
+                    max_score=10, setup_reason="t", spread_points=20.0,
+                    created_at=datetime.now(timezone.utc), risk_usd=300.0)
+    rm = RiskManager(TradingConfig(max_lot=0.4), StrategyTuningConfig())
+    capped = rm.size_position(signal, spec, cap_to_max=True)
+    assert capped.ok
+    assert capped.lot == 0.4                       # 3.0 lots wanted -> capped
+    assert capped.loss_at_sl_usd == 40.0           # true risk at the cap
+
+    rm2 = RiskManager(TradingConfig(max_lot=0.0), StrategyTuningConfig())
+    uncapped = rm2.size_position(signal, spec, cap_to_max=True)
+    assert uncapped.lot == 3.0                     # broker max 5.0 not binding

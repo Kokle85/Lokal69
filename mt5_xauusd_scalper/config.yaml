@@ -39,6 +39,10 @@ trading:
   # points) exceeds this % of the TP distance - they lose money by construction.
   max_cost_to_tp_pct: 25
   cost_buffer_points: 12
+  # FundingPips per-position cap for gold (their RULE, not what symbol_info
+  # reports). Lots above this are capped and the trade risks proportionally
+  # less; the Telegram card shows the true reduced $ risk.
+  max_lot: 0.4
 
 daily_goals:
   daily_profit_target_usd: 200

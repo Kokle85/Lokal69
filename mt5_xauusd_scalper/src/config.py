@@ -47,6 +47,10 @@ class TradingConfig(BaseModel):
     # distance. Prevents structurally unprofitable trade geometry.
     max_cost_to_tp_pct: float = 25.0
     cost_buffer_points: float = 12.0
+    # Hard per-position lot cap from the PROP FIRM's rules; symbol_info's
+    # volume_max can be far higher (FundingPips gold: 0.4 real vs 5.0
+    # reported). 0 disables the extra cap.
+    max_lot: float = 0.0
     require_stop_loss: bool = True
     allow_trade_without_sl: bool = False
     allow_live_auto: bool = False

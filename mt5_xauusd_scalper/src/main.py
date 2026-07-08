@@ -47,6 +47,30 @@ from utils import fmt_usd, in_session, now_in_tz
 SCAN_INTERVAL_SECONDS = 5
 
 
+def _normalize_bar_timeline(m1, wall_utc: datetime):
+    """Shift broker-server bar labels onto real UTC.
+
+    The last CLOSED M1 bar's close (label + 1 min) should sit within a minute
+    of the wall clock while the market trades; any surplus is the broker's
+    server-clock offset (brokers use half-hour steps). Returns (shifted_frame,
+    offset_minutes). A scan only runs right after a fresh closed candle, so
+    the "stale bars because the market is shut" case never reaches this path.
+    """
+    from datetime import timedelta
+
+    last_close = m1["time"].iloc[-1].to_pydatetime()
+    if last_close.tzinfo is None:
+        from datetime import timezone as _tz
+        last_close = last_close.replace(tzinfo=_tz.utc)
+    last_close += timedelta(minutes=1)
+    offset_min = int(round((last_close - wall_utc).total_seconds() / 1800.0)) * 30
+    offset_min = max(-720, min(720, offset_min))
+    if offset_min:
+        m1 = m1.copy()
+        m1["time"] = m1["time"] - timedelta(minutes=offset_min)
+    return m1, offset_min
+
+
 def _orb_goals(cfg: BotConfig, o) -> DailyGoalsConfig:
     """Daily risk limits for ORB mode (risk section + the effective ORB config)."""
     r = cfg.risk
@@ -121,6 +145,7 @@ class ScalperBot:
             self.governor = DailyRiskGovernor(cfg.daily_goals, today)
             self.pm = cfg.position_management
         self._traded_sessions: set = set()
+        self._notified_blocks: set = set()
 
         self.paused = False
         self.position: Optional[ManagedPosition] = None
@@ -311,11 +336,16 @@ class ScalperBot:
 
         inst = self.cfg.instrument_for(self.connector.symbol)
         opens = inst.opens if inst else ["london", "newyork"]
-        # Time base: MT5 bar labels are BROKER-SERVER time, not UTC. Using the
-        # wall clock here would compare a genuine-UTC session window against
-        # server-time bar labels and build the "opening range" from bars hours
-        # away from the session open. Drive `now` from the last closed bar so
-        # window and bars share one timeline - exactly like the backtester.
+        # Time base: MT5 bar labels are BROKER-SERVER time (FundingPips ~UTC+3),
+        # not UTC. Left as-is, the Skopje session windows fire HOURS away from
+        # the real opens (NY "opened" at 13:59 local, range formed in the dead
+        # lunch lull -> 12pt SL -> 24-lot sizing -> silently rejected). Measure
+        # the server offset against the wall clock and shift the bars to real
+        # UTC so window and bars share one TRUE timeline.
+        m1, offset_min = _normalize_bar_timeline(m1, datetime.now(_tz.utc))
+        if offset_min != getattr(self, "_last_offset_min", None):
+            self._last_offset_min = offset_min
+            logger.info("Broker server clock offset vs UTC: {:+d} minutes", offset_min)
         now = m1["time"].iloc[-1].to_pydatetime()
         if now.tzinfo is None:
             now = now.replace(tzinfo=_tz.utc)
@@ -357,13 +387,24 @@ class ScalperBot:
         if not check.ok:
             logger.warning("ORB signal rejected by risk manager: {}", check.reason)
             self.journal.log_event("WARNING", "risk_block", check.reason)
+            await self._notify_blocked_once(sess_key, check.reason)
             return
 
-        lot_result = self.risk_manager.size_position(signal, spec)
+        # cap_to_max: a tight ORB range can ask for more lots than the broker
+        # allows (FundingPips caps XAUUSD at 5.0). Trade the capped lot at the
+        # correspondingly smaller dollar risk instead of silently skipping.
+        lot_result = self.risk_manager.size_position(signal, spec, cap_to_max=True)
         if not lot_result.ok:
             self.journal.log_event("WARNING", "lot_skip", lot_result.reason)
+            await self._notify_blocked_once(sess_key, lot_result.reason)
             return
         signal.lot = lot_result.lot
+        if lot_result.loss_at_sl_usd < signal.risk_usd - 1.0:
+            logger.warning(
+                "Lot capped at broker max {}: risk reduced ${:.0f} -> ${:.0f}",
+                spec.volume_max, signal.risk_usd, lot_result.loss_at_sl_usd,
+            )
+            signal.risk_usd = round(lot_result.loss_at_sl_usd, 2)
 
         signal.signal_id = self.journal.record_signal(signal, SignalStatus.SENT)
         # One signal per session in EVERY mode: without this, SIGNAL_ONLY and
@@ -684,6 +725,17 @@ class ScalperBot:
                 await self.telegram.send(event.message)
                 self.journal.log_event("WARNING", "daily_lock", event.message, {"reason": event.reason})
                 event._notified = True  # type: ignore[attr-defined]
+
+    async def _notify_blocked_once(self, sess_key, reason: str) -> None:
+        """A signal that fires but cannot be traded must NEVER be silent -
+        that is how the operator misses a session. One notice per session."""
+        if sess_key in self._notified_blocks:
+            return
+        self._notified_blocks.add(sess_key)
+        await self.telegram.send(
+            f"⚠️ ORB signal on {self.connector.symbol} BLOCKED: {reason}\n"
+            f"(session {sess_key[1]}, {sess_key[0]})"
+        )
 
     async def _expire_pending_approvals(self) -> None:
         for pending in self.telegram.pop_expired():

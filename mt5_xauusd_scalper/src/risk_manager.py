@@ -165,8 +165,16 @@ class RiskManager:
             return cost_check
         return RiskCheck(True, "ok")
 
-    def size_position(self, signal: Signal, spec: SymbolSpec) -> LotResult:
-        result = calculate_lot(signal.risk_usd, signal.entry, signal.sl, spec)
+    def size_position(self, signal: Signal, spec: SymbolSpec,
+                      cap_to_max: bool = False) -> LotResult:
+        # trading.max_lot: the prop firm's REAL per-position limit can be far
+        # below what symbol_info reports (FundingPips gold: 0.4 lot vs 5.0
+        # reported). 0 = trust the broker's volume_max.
+        if self.trading.max_lot > 0 and self.trading.max_lot < spec.volume_max:
+            from dataclasses import replace
+            spec = replace(spec, volume_max=self.trading.max_lot)
+        result = calculate_lot(signal.risk_usd, signal.entry, signal.sl, spec,
+                               cap_to_max=cap_to_max)
         if not result.ok:
             logger.warning("Lot sizing rejected: {}", result.reason)
         return result
