@@ -11,15 +11,18 @@ risk_per_trade_percent: 0.5        # % of account balance risked per trade
 risk_reward_ratio: 3.0             # TP = entry +/- 3 x risk
 
 # ---- accumulation zone detection ----
-zone_lookback_candles: 30
+# lookback 20 (vs spec 30): calibrated on full-2025 XAUUSD M5 - smaller zones
+# put the 3R target within realistic reach; every lb-20 variant tested green
+# (PF 1.09-2.00) while lb-30 variants were flat-to-negative.
+zone_lookback_candles: 20
 minimum_upper_wick_touches: 3
 minimum_lower_wick_touches: 3
 touch_tolerance_atr_multiplier: 0.25
 # CALIBRATED on full-2025 XAUUSD M5: a 30-bar window spans 3.9-6.6 x ATR
 # (p10-p75), so the original 0.8-2.0 band matched 0.0% of windows -> 0 trades.
-# 2.0-4.0 selects the tightest ~15% of windows (true consolidations).
-min_zone_size_atr: 2.0
-max_zone_size_atr: 4.0
+# 1.6-3.4 selects the tightest tail of 20-bar windows (true consolidations).
+min_zone_size_atr: 1.6
+max_zone_size_atr: 3.4
 min_body_inside_zone_percent: 70
 max_zone_slope_atr: 0.5            # reject trending ("sloped") windows
 
@@ -37,11 +40,18 @@ stop_buffer_atr_multiplier: 0.10
 # COUPLED to the zone band: SL sits beyond the opposite zone side, so the
 # stop distance is at least the zone size. max_stop must exceed max_zone
 # (+ buffers/breakout excess) or every breakout is rejected.
-min_stop_distance_atr: 1.0
-max_stop_distance_atr: 5.5
+min_stop_distance_atr: 0.5
+max_stop_distance_atr: 3.0
+# zone_mid: SL beyond the zone MIDPOINT (half the risk of the spec's
+# zone_opposite, so 3R lands within M5 reach). Best full-2025 cell:
+# RETEST + zone_mid + ema off -> 10 trades, WR 40%, +6R, PF 2.0.
+# zone_opposite restores the original spec placement.
+stop_mode: zone_mid
 
 # ---- filters ----
-use_ema_filter: true
+# ema off out-performed ema on in ALL calibrated 2025 variants (small
+# samples - flip to true if you prefer the conservative spec default)
+use_ema_filter: false
 ema_period: 200
 use_session_filter: true
 sessions:                          # BROKER time (matches your MT5 chart clock)
