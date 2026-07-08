@@ -66,6 +66,9 @@ class Signal:
     spread_points: float = 0.0
     lot_size: float = 0.0
     reason_for_entry: str = ""
+    # Partial take-profit ladder (ascending prices for BUY, descending for
+    # SELL). take_profit above always equals the FINAL level.
+    take_profits: list[float] = field(default_factory=list)
 
     @property
     def risk_distance(self) -> float:

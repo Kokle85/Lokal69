@@ -1,6 +1,7 @@
 """Backtester: end-to-end on synthetic data, fill rules, metrics, matrix."""
 import numpy as np
 import pandas as pd
+import pytest
 
 from backtester import Backtester, load_m5_csv, run_comparison, _metrics
 from conftest import flat_zone_candles, make_candles
@@ -35,14 +36,50 @@ def _mk_cfg(cfg):
     return cfg
 
 
-def test_backtest_win_hits_tp_at_3r(cfg):
+def test_backtest_win_walks_the_tp_ladder(cfg):
+    """A run to TP3 banks 33% @ 1R + 33% @ 2R + 34% @ 3R = 2.01R."""
     bt = Backtester(_mk_cfg(cfg), _scenario_df(cfg, win=True))
     report = bt.run("win")
     assert report.total_trades == 1
     trade = report.trades[0]
     assert trade.result == "WIN"
-    assert trade.r_result == 3.0
+    assert trade.r_result == pytest.approx(0.33 * 1 + 0.33 * 2 + 0.34 * 3)
     assert trade.direction is Direction.BUY
+
+
+def test_backtest_single_tp_still_pays_full_3r(cfg):
+    c = _mk_cfg(cfg)
+    c.take_profit_levels_r = [3.0]
+    c.take_profit_close_percents = [100.0]
+    report = Backtester(c, _scenario_df(cfg, win=True)).run("single")
+    assert report.total_trades == 1
+    assert report.trades[0].r_result == pytest.approx(3.0)
+
+
+def test_tp1_then_breakeven_stopout_banks_tp1_only(cfg):
+    """Price tags TP1 (+1R), SL moves to breakeven, then collapses: the trade
+    must bank 0.33R total instead of losing."""
+    c = _mk_cfg(cfg)
+    c.move_sl_to_breakeven_after_tp1 = True
+    base = _scenario_df(cfg, win=False).iloc[:-1]  # through the breakout bar
+    entry = 2001.4
+    # zone_opposite geometry: SL ~1999.93, risk ~1.47 -> TP1 ~2002.87 (TP2 ~2004.3)
+    tp1_touch = pd.DataFrame({
+        "time": [base["time"].iloc[-1] + pd.Timedelta(minutes=5)],
+        "open": [entry], "high": [2003.0], "low": [entry - 0.05],
+        "close": [2002.5], "volume": [100],
+    })
+    collapse = pd.DataFrame({
+        "time": [base["time"].iloc[-1] + pd.Timedelta(minutes=10)],
+        "open": [entry + 0.3], "high": [entry + 0.35], "low": [1995.0],
+        "close": [1995.2], "volume": [100],
+    })
+    df = pd.concat([base, tp1_touch, collapse], ignore_index=True)
+    report = Backtester(c, df).run("tp1_be")
+    assert report.total_trades == 1
+    t = report.trades[0]
+    assert t.r_result == pytest.approx(0.33, abs=0.05)
+    assert t.result == "WIN"
 
 
 def test_backtest_loss_hits_sl_at_minus_1r(cfg):

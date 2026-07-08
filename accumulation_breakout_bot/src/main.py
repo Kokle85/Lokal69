@@ -154,18 +154,29 @@ class LiveBot:
         if not self.live:
             return
 
-        result = self.executor.execute(signal, lot.lot, spec)
-        if result.ok:
+        results = self.executor.execute(signal, lot.lot, spec)
+        filled = [r for r in results if r.ok]
+        failed = [r for r in results if not r.ok]
+        if filled:
+            # the TP ladder counts as ONE trade for daily-limit purposes
             self.trades_today += 1
             self.cooldown_until = bar_time + pd.Timedelta(minutes=self.cfg.cooldown_minutes)
-            self.journal.log_trade_open(signal, result.ticket)
-            self.telegram.send_trade_open(signal, result.ticket, result.price,
-                                          result.volume)
+            for r in filled:
+                self.journal.log_trade_open(signal, r.ticket)
+            total_vol = sum(r.volume for r in filled)
+            self.telegram.send_trade_open(signal, filled[0].ticket,
+                                          filled[0].price, total_vol)
+            if failed:
+                self.telegram.send_error(
+                    f"{len(failed)} of {len(results)} TP-ladder orders failed: "
+                    f"{failed[0].comment}"
+                )
         else:
+            reason = failed[0].comment if failed else "no orders attempted"
             self.journal.log_rejection(now, self.cfg.symbol, "M5",
-                                       f"execution failed: {result.comment}",
+                                       f"execution failed: {reason}",
                                        session or "", signal)
-            self.telegram.send_error(f"Order failed: {result.comment}")
+            self.telegram.send_error(f"Order failed: {reason}")
 
 
 # ================================================================== backtest

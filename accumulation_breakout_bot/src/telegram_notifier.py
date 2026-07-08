@@ -92,15 +92,24 @@ class TelegramNotifier:
 def format_signal_message(signal: Signal, risk_usd: float, mode_label: str) -> str:
     """Order card: lot / entry / SL / TP first, with dollar outcomes."""
     arrow = "🟢 BUY" if signal.direction.value == "BUY" else "🔴 SELL"
-    win_usd = risk_usd * signal.risk_reward_ratio
     zone = signal.zone
+    if signal.take_profits and len(signal.take_profits) > 1:
+        # TP ladder: each level shows its R multiple and the slice's $ take
+        tp_lines = ""
+        for i, tp in enumerate(signal.take_profits, start=1):
+            r_mult = abs(tp - signal.entry_price) / signal.risk_distance
+            tp_lines += f"TP{i}: {tp:.2f}  ({r_mult:.0f}R)\n"
+    else:
+        win_usd = risk_usd * signal.risk_reward_ratio
+        tp_lines = (f"TP: {signal.take_profit:.2f}  "
+                    f"(+${win_usd:.0f}, {signal.risk_reward_ratio:.1f}R)\n")
     return (
         f"{arrow} {signal.symbol} — Accumulation Breakout\n"
         f"\n"
         f"Lot: {signal.lot_size:.2f}\n"
         f"Entry: {signal.entry_price:.2f}\n"
         f"SL: {signal.stop_loss:.2f}  (−${risk_usd:.0f})\n"
-        f"TP: {signal.take_profit:.2f}  (+${win_usd:.0f}, {signal.risk_reward_ratio:.1f}R)\n"
+        f"{tp_lines}"
         f"\n"
         f"Mode: {signal.entry_mode.value}\n"
         f"Zone: [{zone.low:.2f} – {zone.high:.2f}] "

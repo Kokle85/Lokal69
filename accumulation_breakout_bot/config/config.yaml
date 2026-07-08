@@ -8,7 +8,14 @@ entry_mode: BREAKOUT_RETEST        # BREAKOUT_RETEST | DIRECT_BREAKOUT
 
 # ---- risk ----
 risk_per_trade_percent: 0.5        # % of account balance risked per trade
-risk_reward_ratio: 3.0             # TP = entry +/- 3 x risk
+risk_reward_ratio: 3.0             # final target (informational; ladder below rules)
+# Partial take-profit ladder: TP1 at 1R, TP2 at 2R, TP3 at 3R, closing a
+# third of the position at each. Live execution splits the lot into one MT5
+# order per level (same SL, different TPs). After TP1 fills, the SL of the
+# remaining orders moves to breakeven (set false to keep the original stop).
+take_profit_levels_r: [1.0, 2.0, 3.0]
+take_profit_close_percents: [33.0, 33.0, 34.0]
+move_sl_to_breakeven_after_tp1: true
 
 # ---- accumulation zone detection ----
 # "T2" relaxation tier, calibrated on full-2025 XAUUSD M5 for ~1 signal

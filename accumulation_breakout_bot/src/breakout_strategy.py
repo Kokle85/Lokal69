@@ -78,17 +78,18 @@ class BreakoutStrategy:
         if direction is Direction.BUY:
             sl = long_anchor - stop_buffer
             risk = entry - sl
-            tp = entry + self.cfg.risk_reward_ratio * risk
         else:
             sl = short_anchor + stop_buffer
             risk = sl - entry
-            tp = entry - self.cfg.risk_reward_ratio * risk
         if risk <= 0:
             return None
         if risk < self.cfg.min_stop_distance_atr * atr_value:
             return None
         if risk > self.cfg.max_stop_distance_atr * atr_value:
             return None
+        # partial TP ladder (1R/2R/3R by default); final level is `take_profit`
+        sign = 1.0 if direction is Direction.BUY else -1.0
+        tps = [entry + sign * level * risk for level in self.cfg.take_profit_levels_r]
         return Signal(
             timestamp=candle["time"].to_pydatetime(),
             symbol=self.cfg.symbol,
@@ -98,11 +99,12 @@ class BreakoutStrategy:
             zone=zone,
             entry_price=entry,
             stop_loss=sl,
-            take_profit=tp,
-            risk_reward_ratio=self.cfg.risk_reward_ratio,
+            take_profit=tps[-1],
+            risk_reward_ratio=self.cfg.take_profit_levels_r[-1],
             atr=atr_value,
             ema_value=ema_value,
             reason_for_entry=reason,
+            take_profits=tps,
         )
 
     def _stop_band_reason(self, candle: pd.Series, zone: Zone, direction: Direction,

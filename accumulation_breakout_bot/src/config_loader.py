@@ -91,7 +91,13 @@ class Settings(BaseModel):
     entry_mode: EntryMode = EntryMode.BREAKOUT_RETEST
 
     risk_per_trade_percent: float = 0.5
-    risk_reward_ratio: float = 3.0
+    risk_reward_ratio: float = 3.0  # final target (kept for validation labels)
+    # Partial take-profits: close a slice of the position at each level.
+    # MT5 allows one TP per position, so live execution splits the lot into
+    # one order per level (same SL, different TPs).
+    take_profit_levels_r: list[float] = [1.0, 2.0, 3.0]
+    take_profit_close_percents: list[float] = [33.0, 33.0, 34.0]
+    move_sl_to_breakeven_after_tp1: bool = True
 
     zone_lookback_candles: int = 30
     minimum_upper_wick_touches: int = 3
@@ -156,6 +162,14 @@ class Settings(BaseModel):
             raise ValueError("max_rejection_wick_percent must be in (0, 100]")
         if self.stop_mode not in {"zone_opposite", "zone_mid"}:
             raise ValueError("stop_mode must be 'zone_opposite' or 'zone_mid'")
+        levels, pcts = self.take_profit_levels_r, self.take_profit_close_percents
+        if not levels or len(levels) != len(pcts):
+            raise ValueError("take_profit_levels_r and take_profit_close_percents "
+                             "must be non-empty and the same length")
+        if any(r <= 0 for r in levels) or list(levels) != sorted(levels):
+            raise ValueError("take_profit_levels_r must be positive and ascending")
+        if abs(sum(pcts) - 100.0) > 0.01 or any(p <= 0 for p in pcts):
+            raise ValueError("take_profit_close_percents must be positive and sum to 100")
         return self
 
 

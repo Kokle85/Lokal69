@@ -158,23 +158,57 @@ class Backtester:
 
     def _manage(self, signal: Signal, bar: pd.Series, candles_open: int,
                 label: str) -> Optional[BacktestTrade]:
-        """Conservative fill model: if one bar spans both SL and TP, the STOP
-        is assumed to hit first."""
+        """Partial-TP simulation with a conservative fill model: if a bar spans
+        both the stop and a target, the STOP is assumed to hit first.
+
+        State lives on the signal object between bars: `_fractions` (remaining
+        slice per TP level), `_sl` (current stop - moves to breakeven after TP1
+        when configured) and `_banked_r` (R already realized by filled TPs).
+        """
+        cfg = self.cfg
+        if not hasattr(signal, "_fractions"):
+            signal._fractions = [p / 100.0 for p in cfg.take_profit_close_percents]
+            signal._sl = signal.stop_loss
+            signal._banked_r = 0.0
         high, low = float(bar["high"]), float(bar["low"])
         buying = signal.direction is Direction.BUY
-        sl_hit = low <= signal.stop_loss if buying else high >= signal.stop_loss
-        tp_hit = high >= signal.take_profit if buying else low <= signal.take_profit
+        risk = signal.risk_distance
+        levels = cfg.take_profit_levels_r
+        tps = signal.take_profits or [signal.take_profit]
 
-        if sl_hit:  # stop-first on both-hit bars
-            return self._close(signal, bar, signal.stop_loss, -1.0, "LOSS")
-        if tp_hit:
-            return self._close(signal, bar, signal.take_profit,
-                               signal.risk_reward_ratio, "WIN")
+        def sl_r() -> float:
+            return ((signal._sl - signal.entry_price) if buying
+                    else (signal.entry_price - signal._sl)) / risk
+
+        # ---- stop first (conservative on bars that span both)
+        sl_hit = low <= signal._sl if buying else high >= signal._sl
+        if sl_hit:
+            remaining = sum(signal._fractions)
+            total_r = signal._banked_r + remaining * sl_r()
+            return self._close(signal, bar, signal._sl, total_r,
+                               "WIN" if total_r > 0 else "LOSS")
+
+        # ---- targets, in ladder order
+        for idx, tp_price in enumerate(tps):
+            if signal._fractions[idx] <= 0:
+                continue
+            hit = high >= tp_price if buying else low <= tp_price
+            if not hit:
+                break  # ladder is ordered; a farther TP can't hit if this didn't
+            signal._banked_r += signal._fractions[idx] * levels[idx]
+            signal._fractions[idx] = 0.0
+            if idx == 0 and cfg.move_sl_to_breakeven_after_tp1:
+                signal._sl = signal.entry_price
+        if sum(signal._fractions) <= 1e-9:
+            return self._close(signal, bar, tps[-1], signal._banked_r, "WIN")
+
+        # ---- time cap
         if candles_open >= MAX_TRADE_CANDLES:
             close = float(bar["close"])
-            r = ((close - signal.entry_price) if buying
-                 else (signal.entry_price - close)) / signal.risk_distance
-            return self._close(signal, bar, close, r, "TIMEOUT")
+            close_r = ((close - signal.entry_price) if buying
+                       else (signal.entry_price - close)) / risk
+            total_r = signal._banked_r + sum(signal._fractions) * close_r
+            return self._close(signal, bar, close, total_r, "TIMEOUT")
         return None
 
     @staticmethod

@@ -49,7 +49,48 @@ class TradeExecutor:
             return getattr(mt5, "ORDER_FILLING_FOK", ioc)
         return getattr(mt5, "ORDER_FILLING_RETURN", ioc)
 
-    def execute(self, signal: Signal, lot: float, spec: SymbolSpec) -> ExecutionResult:
+    @staticmethod
+    def split_lots(total_lot: float, percents: list[float], spec: SymbolSpec) -> list[float]:
+        """Split the total lot into per-TP slices on the broker's volume step.
+        Slices that would fall below volume_min are merged into the next one;
+        the remainder lands on the last slice so the sum stays == total_lot."""
+        step = spec.volume_step if spec.volume_step > 0 else 0.01
+        slices: list[float] = []
+        carry = 0.0
+        for pct in percents[:-1]:
+            raw = total_lot * pct / 100.0 + carry
+            lot = int(raw / step + 1e-9) * step
+            if lot < spec.volume_min:
+                carry = raw          # too small on its own - merge forward
+                slices.append(0.0)
+                continue
+            carry = 0.0
+            slices.append(round(lot, 8))
+        last = round(total_lot - sum(slices), 8)
+        slices.append(last if last >= spec.volume_min else 0.0)
+        if slices[-1] == 0.0 and last > 0:  # everything merged: single order
+            slices = [0.0] * (len(percents) - 1) + [round(total_lot, 8)]
+        return slices
+
+    def execute(self, signal: Signal, lot: float, spec: SymbolSpec) -> list[ExecutionResult]:
+        """One order per TP level (same SL, ascending TPs). MT5 supports a
+        single TP per position, so the ladder is expressed as separate
+        positions. Returns one result per attempted slice."""
+        tps = signal.take_profits or [signal.take_profit]
+        percents = self.cfg.take_profit_close_percents if len(tps) > 1 else [100.0]
+        slices = self.split_lots(lot, percents, spec)
+        # one-position gate applies to the LADDER as a whole, not per slice
+        if self.client.open_positions():
+            return [ExecutionResult(False, comment="a position is already open")]
+        results: list[ExecutionResult] = []
+        for tp_price, slice_lot in zip(tps, slices):
+            if slice_lot <= 0:
+                continue
+            results.append(self._execute_single(signal, slice_lot, tp_price, spec))
+        return results
+
+    def _execute_single(self, signal: Signal, lot: float, tp_price: float,
+                        spec: SymbolSpec) -> ExecutionResult:
         # ---- final hard gates (defense in depth; upstream already checked)
         if not self.cfg.live_trading_enabled:
             return ExecutionResult(False, comment="live_trading_enabled is false")
@@ -62,8 +103,6 @@ class TradeExecutor:
             return ExecutionResult(
                 False, comment=f"spread {spread:.0f}pt above limit at send time"
             )
-        if self.client.open_positions():
-            return ExecutionResult(False, comment="a position is already open")
 
         tick = self.client.tick()
         buying = signal.direction is Direction.BUY
@@ -75,7 +114,7 @@ class TradeExecutor:
             "type": mt5.ORDER_TYPE_BUY if buying else mt5.ORDER_TYPE_SELL,
             "price": price,
             "sl": round(signal.stop_loss, spec.digits),
-            "tp": round(signal.take_profit, spec.digits),
+            "tp": round(tp_price, spec.digits),
             "deviation": self.cfg.mt5.deviation_points,
             "magic": self.cfg.mt5.magic_number,
             "comment": ORDER_COMMENT,
