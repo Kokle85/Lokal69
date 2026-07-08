@@ -94,6 +94,20 @@ rsi_buy_max: 80
 rsi_sell_min: 20
 rsi_sell_max: 50
 
+# ---- Multi-timeframe RSI direction gate (implemented, OFF by data) ----
+# H1+H4 RSI around the midline define the trade direction; modes:
+# both_agree (H1 & H4 same side) / cross_confirm (H4 bias + H1 breaking
+# through the line in that direction). 2025 verdict at the shipped config:
+#   baseline           145 trg, +27.8R, PF 1.40
+#   both_agree          55 trg,  +8.0R, PF 1.31  (cuts 71% of the profit)
+#   cross_confirm       26 trg,  -6.7R, PF 0.55  (kills the edge)
+# Accumulation breakouts on gold are often REVERSALS - direction filters
+# (EMA, M5 RSI, MTF RSI) consistently cut winners. Available for other markets.
+use_mtf_rsi_filter: false
+mtf_rsi_period: 14
+mtf_rsi_midline: 50
+mtf_rsi_mode: both_agree
+
 # ---- indicators ----
 atr_period: 14
 
