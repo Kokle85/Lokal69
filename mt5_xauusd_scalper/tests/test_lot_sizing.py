@@ -53,3 +53,31 @@ def test_no_lot_without_sl():
 def test_zero_risk_rejected():
     result = calculate_lot(0.0, 2000.0, 1999.0, SPEC)
     assert not result.ok
+
+
+# ---------------------------------------------------------- contract-size basis
+
+def test_contract_size_overrides_bogus_tick_value():
+    """FundingPips live: trade_tick_value reported 0.01 on 100oz gold, which
+    mislabels a ~$719 stop-out as $7. Contract size must win."""
+    from models import SymbolSpec
+    from risk_manager import calculate_lot
+
+    bogus = SymbolSpec(name="XAUUSD", point=0.01, tick_size=0.01, tick_value=0.01,
+                       volume_min=0.01, volume_max=5.0, volume_step=0.01, digits=2,
+                       contract_size=100.0)
+    r = calculate_lot(300.0, 4062.69, 4080.67, bogus)
+    # loss per lot = 17.98 x 100 = $1798 -> lot 0.16, real risk ~$287
+    assert r.ok
+    assert r.lot == 0.16
+    assert abs(r.loss_at_sl_usd - 287.68) < 0.5
+
+
+def test_tick_math_still_used_without_contract_size():
+    from models import SymbolSpec
+    from risk_manager import calculate_lot
+
+    spec = SymbolSpec(name="XAUUSD", point=0.01, tick_size=0.01, tick_value=1.0,
+                      volume_min=0.01, volume_max=100.0, volume_step=0.01, digits=2)
+    r = calculate_lot(300.0, 4000.0, 3997.0, spec)
+    assert r.ok and r.lot == 1.0  # 300 / (300 ticks x $1)

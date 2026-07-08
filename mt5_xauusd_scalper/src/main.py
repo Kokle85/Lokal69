@@ -162,6 +162,15 @@ class ScalperBot:
         spec = self.connector.symbol_spec()
         if not spec.trade_allowed:
             raise MT5Error(f"Symbol {spec.name} is not tradeable on this account.")
+        # Sizing sanity line: verify this against the broker's contract spec
+        # (right-click symbol -> Specification). A $1.00 move on 1.0 lot of
+        # standard 100oz gold = $100.
+        per_dollar = (spec.contract_size
+                      or (spec.tick_value / spec.tick_size if spec.tick_size > 0 else 0))
+        logger.info(
+            "Contract math: contract_size={} tick={}@{} -> $1.00 move on 1.0 lot = ${:.2f}",
+            spec.contract_size, spec.tick_value, spec.tick_size, per_dollar,
+        )
 
         account = self.connector.account_info()
         is_demo = self.connector.is_demo_account()
@@ -400,9 +409,10 @@ class ScalperBot:
             return
         signal.lot = lot_result.lot
         if lot_result.loss_at_sl_usd < signal.risk_usd - 1.0:
+            cap = self.cfg.trading.max_lot or spec.volume_max
             logger.warning(
-                "Lot capped at broker max {}: risk reduced ${:.0f} -> ${:.0f}",
-                spec.volume_max, signal.risk_usd, lot_result.loss_at_sl_usd,
+                "Lot capped at max {}: risk reduced ${:.0f} -> ${:.0f}",
+                cap, signal.risk_usd, lot_result.loss_at_sl_usd,
             )
             signal.risk_usd = round(lot_result.loss_at_sl_usd, 2)
 

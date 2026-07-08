@@ -37,10 +37,23 @@ def calculate_lot(
     sl_distance = abs(entry - sl)
     if sl_distance <= 0:
         return LotResult(False, 0.0, "SL distance is zero — trade without SL is forbidden")
-    if spec.tick_size <= 0 or spec.tick_value <= 0:
-        return LotResult(False, 0.0, "invalid symbol tick size/value")
-
-    loss_per_lot = (sl_distance / spec.tick_size) * spec.tick_value
+    # Loss per 1.0 lot for a move of `sl_distance`. Prefer contract size on
+    # USD-quoted symbols: brokers sometimes report a bogus trade_tick_value
+    # (seen live: 0.01 on FundingPips gold), which would mislabel a ~$700
+    # stop-out as $7 and size a wildly wrong lot.
+    contract_loss = sl_distance * spec.contract_size if spec.contract_size > 0 else 0.0
+    tick_loss = ((sl_distance / spec.tick_size) * spec.tick_value
+                 if spec.tick_size > 0 and spec.tick_value > 0 else 0.0)
+    loss_per_lot = contract_loss or tick_loss
+    if loss_per_lot <= 0:
+        return LotResult(False, 0.0, "invalid symbol contract/tick data")
+    if contract_loss and tick_loss and not (0.2 <= tick_loss / contract_loss <= 5.0):
+        logger.warning(
+            "Broker tick_value math disagrees with contract size by {:.0f}x "
+            "(tick ${:.2f} vs contract ${:.2f} per lot) - using contract size.",
+            max(tick_loss, contract_loss) / min(tick_loss, contract_loss),
+            tick_loss, contract_loss,
+        )
     raw_lot = risk_usd / loss_per_lot
 
     step = spec.volume_step if spec.volume_step > 0 else 0.01
@@ -59,7 +72,7 @@ def calculate_lot(
             return LotResult(False, 0.0, f"calculated lot {lot} above broker maximum {spec.volume_max}")
         lot = spec.volume_max
 
-    actual_loss = (sl_distance / spec.tick_size) * spec.tick_value * lot
+    actual_loss = loss_per_lot * lot
     if actual_loss > risk_usd * 1.05:
         return LotResult(False, 0.0, f"rounded lot risks ${actual_loss:.2f} > allowed ${risk_usd:.2f}")
     return LotResult(True, lot, "ok", actual_loss)

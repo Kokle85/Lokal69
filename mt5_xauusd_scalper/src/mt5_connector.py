@@ -138,6 +138,7 @@ class MT5Connector:
             digits=info.digits,
             trade_allowed=info.trade_mode == mt5.SYMBOL_TRADE_MODE_FULL,
             filling_mode=getattr(info, "filling_mode", 0),
+            contract_size=getattr(info, "trade_contract_size", 0.0) or 0.0,
         )
 
     def tick(self) -> Any:
