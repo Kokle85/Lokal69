@@ -41,6 +41,45 @@ class MT5Config(BaseModel):
     deviation_points: int = 20
 
 
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE .env parser (no python-dotenv dependency)."""
+    values: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+class TelegramConfig(BaseModel):
+    """Shares the ORB scalper's Telegram bot: token/chat id resolve from (in
+    order) explicit yaml values, process environment, then the env_file -
+    which by default points at the scalper project's .env."""
+
+    enabled: bool = True
+    bot_token: str = ""
+    chat_id: str = ""
+    env_file: str = "../mt5_xauusd_scalper/.env"
+
+    @model_validator(mode="after")
+    def _merge_env(self) -> "TelegramConfig":
+        import os
+
+        file_vals: dict[str, str] = {}
+        if self.env_file:
+            file_vals = _read_env_file(Path(self.env_file))
+        self.bot_token = (self.bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+                          or file_vals.get("TELEGRAM_BOT_TOKEN", ""))
+        self.chat_id = (self.chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+                        or file_vals.get("TELEGRAM_CHAT_ID", ""))
+        return self
+
+
 class BacktestConfig(BaseModel):
     spread_points: float = 25.0
     point: float = 0.01
@@ -90,6 +129,7 @@ class Settings(BaseModel):
     live_trading_enabled: bool = False
 
     mt5: MT5Config = MT5Config()
+    telegram: TelegramConfig = TelegramConfig()
     backtest: BacktestConfig = BacktestConfig()
 
     @model_validator(mode="after")

@@ -53,11 +53,14 @@ class LiveBot:
                 "config - running SIGNAL-ONLY. Set live_trading_enabled: true "
                 "to actually trade."
             )
+        from telegram_notifier import TelegramNotifier
+
         self.client = MT5Client(cfg.mt5, cfg.symbol)
         self.executor = TradeExecutor(self.client, cfg)
         self.strategy = BreakoutStrategy(cfg)
         self.journal = Journal()
         self.news = NewsFilter(cfg)
+        self.telegram = TelegramNotifier(cfg)
         self.last_bar_time: Optional[pd.Timestamp] = None
         self.trades_today = 0
         self.current_day = None
@@ -69,8 +72,9 @@ class LiveBot:
         spec = self.client.spec()
         if not spec.trade_allowed:
             raise SystemExit(f"{spec.name} is not tradeable on this account")
-        logger.info("Running in {} mode on {}",
-                    "LIVE" if self.live else "SIGNAL-ONLY", self.cfg.symbol)
+        mode_label = "LIVE" if self.live else "SIGNAL-ONLY"
+        logger.info("Running in {} mode on {}", mode_label, self.cfg.symbol)
+        self.telegram.send_startup(self.cfg.symbol, mode_label)
         try:
             while True:
                 try:
@@ -144,6 +148,8 @@ class LiveBot:
                     signal.direction.value, signal.symbol, signal.lot_size,
                     signal.entry_price, signal.stop_loss, signal.take_profit,
                     signal.reason_for_entry)
+        self.telegram.send_signal(signal, lot.loss_at_sl_usd,
+                                  "LIVE" if self.live else "SIGNAL-ONLY")
 
         if not self.live:
             return
@@ -153,10 +159,13 @@ class LiveBot:
             self.trades_today += 1
             self.cooldown_until = bar_time + pd.Timedelta(minutes=self.cfg.cooldown_minutes)
             self.journal.log_trade_open(signal, result.ticket)
+            self.telegram.send_trade_open(signal, result.ticket, result.price,
+                                          result.volume)
         else:
             self.journal.log_rejection(now, self.cfg.symbol, "M5",
                                        f"execution failed: {result.comment}",
                                        session or "", signal)
+            self.telegram.send_error(f"Order failed: {result.comment}")
 
 
 # ================================================================== backtest

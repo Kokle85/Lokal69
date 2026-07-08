@@ -60,6 +60,16 @@ atr_period: 14
 # ---- safety ----
 live_trading_enabled: false        # double gate: must be true AND --mode live
 
+# ---- Telegram (SHARES the ORB scalper's bot) ----
+# Token/chat id resolve from: values here -> environment variables
+# (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) -> the env_file below, which points
+# at the scalper project's .env so both bots message the same chat.
+telegram:
+  enabled: true
+  bot_token: ""
+  chat_id: ""
+  env_file: "../mt5_xauusd_scalper/.env"
+
 # ---- MT5 terminal (leave empty to use the already-logged-in terminal) ----
 mt5:
   login:
