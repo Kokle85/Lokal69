@@ -115,6 +115,25 @@ class ComparableReference(_Contract):
     def _utc(cls, value: datetime | None) -> datetime | None:
         return None if value is None else ensure_utc(value)
 
+    @staticmethod
+    def quality_from_status(status: str) -> Literal["adequate", "small", "insufficient_comparables"]:
+        """Map domain.comparables status (and the persisted sample_quality) to this literal.
+
+        comparables: adequate | small_sample | insufficient_comparables
+        app.comparable_sets.sample_quality: adequate | small | insufficient
+        """
+        mapping: dict[str, Literal["adequate", "small", "insufficient_comparables"]] = {
+            "adequate": "adequate",
+            "small_sample": "small",
+            "small": "small",
+            "insufficient_comparables": "insufficient_comparables",
+            "insufficient": "insufficient_comparables",
+        }
+        try:
+            return mapping[status]
+        except KeyError as exc:
+            raise ValueError(f"unknown comparable status {status!r}") from exc
+
 
 class TaxRuleDependency(_Contract):
     rule_set_id: str

@@ -652,3 +652,11 @@ def test_scenarios_using_an_unrecorded_calculation_are_incomplete() -> None:
     valuation = assemble(tax=None, scenario_set=_alert_ready_with(list(tax_cost_lines(calc))))
     assert valuation.state == ValuationState.INCOMPLETE
     assert any("does not record" in u for u in valuation.unknowns)
+
+
+def test_comparable_quality_vocabularies_map_consistently() -> None:
+    assert ComparableReference.quality_from_status("adequate") == "adequate"
+    assert ComparableReference.quality_from_status("small_sample") == "small"
+    assert ComparableReference.quality_from_status("small") == "small"
+    assert ComparableReference.quality_from_status("insufficient_comparables") == "insufficient_comparables"
+    assert ComparableReference.quality_from_status("insufficient") == "insufficient_comparables"
