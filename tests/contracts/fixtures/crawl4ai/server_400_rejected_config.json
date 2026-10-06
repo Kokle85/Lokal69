@@ -1,0 +1,16 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 400,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "detail": "Rejected config: field 'magic' is not permitted on CrawlerRunConfig from an untrusted request"
+  },
+  "note": "section 0 rule 2 (verified)"
+}

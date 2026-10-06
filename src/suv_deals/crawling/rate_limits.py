@@ -12,7 +12,8 @@ Rules implemented:
 
 - One navigation at a time per host (`in_flight_until` lease) and a minimum delay
   between navigation starts (a capacity-1 token bucket refilled at
-  `1 / max(min_delay_seconds, robots crawl-delay)` tokens per second).
+  `1 / max(min_delay_seconds, robots crawl-delay)` tokens per second). The robots
+  crawl-delay is untrusted input and capped at `MAX_CRAWL_DELAY_SECONDS` (one day).
 - Daily request and byte budgets per source (UTC day) and per-run caps on search
   pages and detail fetches. A refusal is a `Deny`; nothing ever "catches up" by
   raising traffic later.
@@ -54,6 +55,9 @@ from suv_deals.domain.sources import RateBudget
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 INFRASTRUCTURE_ERROR_PREFIX: Final = "crawler_"
 TOKEN_CAPACITY: Final = Decimal(1)
+# robots.txt is untrusted input: a Crawl-delay above one day is treated as one day (at most
+# one navigation per host per day) so absurd values cannot overflow time arithmetic.
+MAX_CRAWL_DELAY_SECONDS: Final = Decimal(86_400)
 # Upper bound for storing a not-before instant (keeps absurd Retry-After values representable).
 _MAX_STORED_WAIT: Final = timedelta(days=365)
 _DELAY_SECONDS = re.compile(r"[0-9]{1,12}")
@@ -103,7 +107,11 @@ def _utc_or_none(value: datetime | None) -> datetime | None:
 
 
 class HostBudgetState(BaseModel):
-    """Mirror of one ops.host_budgets row (per source and host)."""
+    """Mirror of one ops.host_budgets row (columns of the same name).
+
+    `source_key` is carried for route-pause recommendations; `in_flight_until` and
+    `access_blocked_at` have no column yet (see the work-package report).
+    """
 
     model_config = _FROZEN
 
@@ -114,20 +122,26 @@ class HostBudgetState(BaseModel):
     circuit_state: CircuitState = CircuitState.CLOSED
     open_until: datetime | None = None
     consecutive_failures: int = Field(default=0, ge=0)
-    day: date | None = None
+    budget_day: date | None = None
     requests_today: int = Field(default=0, ge=0)
     bytes_today: int = Field(default=0, ge=0)
-    # Not-before instant derived from the most recent Retry-After answer.
-    last_retry_after: datetime | None = None
+    # Most recent Retry-After answer and the not-before instant derived from it.
+    last_retry_after_seconds: int | None = Field(default=None, ge=0)
+    retry_after_until: datetime | None = None
     # Not-before instant from exponential backoff after a transient host failure.
-    backoff_until: datetime | None = None
+    next_request_not_before: datetime | None = None
     # One navigation at a time: lease that expires on its own if a worker dies mid-request.
     in_flight_until: datetime | None = None
     # Set on ACCESS_BLOCKED; cleared only by an explicit permitted action.
     access_blocked_at: datetime | None = None
 
     @field_validator(
-        "refilled_at", "open_until", "last_retry_after", "backoff_until", "in_flight_until", "access_blocked_at"
+        "refilled_at",
+        "open_until",
+        "retry_after_until",
+        "next_request_not_before",
+        "in_flight_until",
+        "access_blocked_at",
     )
     @classmethod
     def _utc(cls, value: datetime | None) -> datetime | None:
@@ -246,18 +260,21 @@ def next_utc_midnight(now: datetime) -> datetime:
 
 
 def effective_delay_seconds(budget: RateBudget, crawl_delay: Decimal | None = None) -> Decimal:
-    """Minimum spacing between navigation starts: the larger of our budget and robots crawl-delay."""
+    """Minimum spacing between navigation starts: the larger of our budget and robots crawl-delay.
+
+    A robots crawl-delay is capped at `MAX_CRAWL_DELAY_SECONDS` (it is untrusted input).
+    """
     delay = Decimal(budget.min_delay_seconds)
     if crawl_delay is not None and crawl_delay.is_finite() and crawl_delay > delay:
-        delay = crawl_delay
+        delay = min(crawl_delay, MAX_CRAWL_DELAY_SECONDS)
     return delay
 
 
 def _roll_day(state: HostBudgetState, now: datetime) -> HostBudgetState:
     today = now.date()
-    if state.day == today:
+    if state.budget_day == today:
         return state
-    return state.model_copy(update={"day": today, "requests_today": 0, "bytes_today": 0})
+    return state.model_copy(update={"budget_day": today, "requests_today": 0, "bytes_today": 0})
 
 
 def available_tokens(
@@ -317,10 +334,10 @@ def decide(
 
     if state.in_flight_until is not None and now < state.in_flight_until:
         return Wait(until=state.in_flight_until, reason=WaitReason.NAVIGATION_IN_FLIGHT)
-    if state.last_retry_after is not None and now < state.last_retry_after:
-        return Wait(until=state.last_retry_after, reason=WaitReason.RETRY_AFTER)
-    if state.backoff_until is not None and now < state.backoff_until:
-        return Wait(until=state.backoff_until, reason=WaitReason.BACKOFF)
+    if state.retry_after_until is not None and now < state.retry_after_until:
+        return Wait(until=state.retry_after_until, reason=WaitReason.RETRY_AFTER)
+    if state.next_request_not_before is not None and now < state.next_request_not_before:
+        return Wait(until=state.next_request_not_before, reason=WaitReason.BACKOFF)
 
     tokens = available_tokens(state, now, budget, crawl_delay)
     if tokens < TOKEN_CAPACITY:
@@ -397,14 +414,14 @@ def clear_access_block(state: HostBudgetState, now: datetime) -> HostBudgetState
 def backoff_delay_seconds(attempt: int, policy: BackoffPolicy, rng: random.Random, *, floor: int) -> int:
     """Exponential backoff with full jitter: uniform(0, min(max, base * 2**(attempt-1))), floored."""
     exponent = min(max(attempt, 1) - 1, 30)
-    ceiling = min(policy.max_delay_seconds, policy.base_delay_seconds * (2**exponent))
+    ceiling = min(policy.max_delay_seconds, policy.base_delay_seconds * (1 << exponent))
     jittered = rng.uniform(0, ceiling)
     return max(floor, math.ceil(jittered))
 
 
 def _circuit_cooldown(failures: int, policy: BackoffPolicy) -> int:
     extra = min(max(0, failures - policy.circuit_failure_threshold), 30)
-    return min(policy.circuit_cooldown_max_seconds, policy.circuit_cooldown_seconds * (2**extra))
+    return min(policy.circuit_cooldown_max_seconds, policy.circuit_cooldown_seconds * (1 << extra))
 
 
 def _bounded_wait(now: datetime, seconds: int) -> datetime:
@@ -426,7 +443,9 @@ def record_outcome(
     if attempt < 1:
         raise ValueError("attempt is 1-based")
     rolled = _roll_day(state, now)
-    base = rolled.model_copy(update={"in_flight_until": None, "bytes_today": rolled.bytes_today + outcome.bytes})
+    base = rolled.model_copy(
+        update={"in_flight_until": None, "bytes_today": rolled.bytes_today + outcome.bytes}
+    )
     access = outcome.access_state
     infrastructure = (outcome.error_code or "").startswith(INFRASTRUCTURE_ERROR_PREFIX)
 
@@ -436,7 +455,7 @@ def record_outcome(
                 "consecutive_failures": 0,
                 "circuit_state": CircuitState.CLOSED,
                 "open_until": None,
-                "backoff_until": None,
+                "next_request_not_before": None,
             }
         )
         return OutcomeResult(
@@ -457,7 +476,8 @@ def record_outcome(
 
     if access == AccessState.POLICY_DENIED:
         return OutcomeResult(
-            state=base, plan=RetryPlan(action=RetryAction.STOP, reason=PlanReason.POLICY_DENIED, attempt=attempt)
+            state=base,
+            plan=RetryPlan(action=RetryAction.STOP, reason=PlanReason.POLICY_DENIED, attempt=attempt),
         )
 
     if access == AccessState.ACCESS_BLOCKED:
@@ -477,7 +497,9 @@ def record_outcome(
         )
 
     if access == AccessState.RATE_LIMITED:
-        return _rate_limited(base, outcome, now, rng, budget, attempt, policy, infrastructure)
+        return _rate_limited(
+            base, outcome, now, rng, attempt=attempt, policy=policy, infrastructure=infrastructure
+        )
 
     # TRANSIENT_ERROR
     delay = backoff_delay_seconds(attempt, policy, rng, floor=budget.min_delay_seconds)
@@ -495,7 +517,7 @@ def _rate_limited(
     outcome: FetchOutcome,
     now: datetime,
     rng: random.Random,
-    budget: RateBudget,
+    *,
     attempt: int,
     policy: BackoffPolicy,
     infrastructure: bool,
@@ -512,9 +534,10 @@ def _rate_limited(
     failed = _register_host_failure(base, now, None, policy)
     updates: dict[str, object] = {}
     if retry_after is not None:
-        updates["last_retry_after"] = _bounded_wait(now, retry_after)
+        updates["retry_after_until"] = _bounded_wait(now, retry_after)
+        updates["last_retry_after_seconds"] = retry_after
     else:
-        updates["backoff_until"] = _bounded_wait(now, delay)
+        updates["next_request_not_before"] = _bounded_wait(now, delay)
     failed = failed.model_copy(update=updates)
 
     if retry_after is not None and retry_after > policy.retry_after_max_seconds:
@@ -544,7 +567,7 @@ def _register_host_failure(
     failures = state.consecutive_failures + 1
     updates: dict[str, object] = {"consecutive_failures": failures}
     if backoff_seconds is not None:
-        updates["backoff_until"] = _bounded_wait(now, backoff_seconds)
+        updates["next_request_not_before"] = _bounded_wait(now, backoff_seconds)
     probe_failed = state.circuit_state == CircuitState.HALF_OPEN
     if probe_failed or failures >= policy.circuit_failure_threshold:
         updates["circuit_state"] = CircuitState.OPEN

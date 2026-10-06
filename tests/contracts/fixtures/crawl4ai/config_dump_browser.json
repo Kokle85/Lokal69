@@ -1,0 +1,24 @@
+{
+  "label": "shape from 0.9.4 source (BrowserConfig dump always carries computed headers); live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/config/dump"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "type": "BrowserConfig",
+    "params": {
+      "user_agent": "SUVDealResearch/0.1 (+private research; contact owner)",
+      "headers": {
+        "type": "dict",
+        "value": {
+          "sec-ch-ua": "\"Chromium\";v=\"116\""
+        }
+      }
+    }
+  }
+}

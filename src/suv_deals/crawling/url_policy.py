@@ -14,8 +14,9 @@ Layers, in order:
 3. Host allow-list: exact host match. Subdomains are only accepted for an
    explicit `*.example.com` rule (which does not match `example.com` itself).
 4. Path allow-list per purpose, using the source's anchored regexes
-   (`re.fullmatch` on the raw path). Dot segments and encoded separators are
-   refused before matching so `/search/../admin` can never satisfy `/search/.*`.
+   (`re.fullmatch` on the raw path). Dot segments (including `..;` matrix forms) and
+   encoded separators are refused before matching so `/search/../admin` can never
+   satisfy `/search/.*`.
    The robots purpose only allows exactly `/robots.txt` without a query.
 5. `resolve_check()` resolves the host at fetch time with `netguard.resolve_public`,
    requiring every DNS answer to be public (DNS rebinding defence).
@@ -150,7 +151,8 @@ def host_of(url: str) -> str | None:
 def _path_is_ambiguous(path: str) -> bool:
     if _ENCODED_SEPARATOR.search(path):
         return True
-    return any(unquote(segment) in {".", ".."} for segment in path.split("/"))
+    # `..;x` is a dot segment for servlet containers that strip matrix parameters.
+    return any(unquote(segment.split(";", 1)[0]) in {".", ".."} for segment in path.split("/"))
 
 
 def _compile_patterns(patterns: Iterable[str], kind: str) -> tuple[re.Pattern[str], ...]:

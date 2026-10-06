@@ -1,0 +1,31 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 422,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "detail": [
+      {
+        "type": "too_short",
+        "loc": [
+          "body",
+          "urls"
+        ],
+        "msg": "List should have at least 1 item after validation, not 0",
+        "input": [],
+        "ctx": {
+          "field_type": "List",
+          "min_length": 1,
+          "actual_length": 0
+        }
+      }
+    ]
+  },
+  "note": "section 8: FastAPI validation detail list"
+}
