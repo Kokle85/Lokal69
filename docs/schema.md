@@ -533,3 +533,39 @@ Exhausted waiting jobs are reconciled into `dead_letter` through `jobs_exhausted
 - Retroactive quarantine of existing revisions is recorded on `app.listings.quarantined`
   plus `ops.audit_events`. Revisions themselves are immutable, and `quarantined` on a
   revision or observation is set at insert time.
+
+## 9. Applied environments
+
+### Supabase project `Lokal69- Sub` (ref `olkcgrahvkvzgnnsqspr`, eu-west-1, PostgreSQL 17.11)
+
+Migrations 0100–0900 were applied on 2026-10-06 through the Supabase connector
+(`apply_migration`), in filename order. The stored SQL matches the files byte for byte (sha256
+checked). Supabase recorded each one under its apply time, not the filename prefix:
+
+| File | Recorded version |
+|---|---|
+| 20261006000100_extensions_roles | 20261006201953 |
+| 20261006000200_core_tables | 20261006202042 |
+| 20261006000300_queue_and_crawl_ops | 20261006202508 |
+| 20261006000400_listings | 20261006202919 |
+| 20261006000500_market_and_valuation | 20261006203049 |
+| 20261006000600_reviews_and_notifications | 20261006203140 |
+| 20261006000700_outbox_events_and_auth_ops | 20261006203308 |
+| 20261006000800_security_rls_grants | 20261006203337 |
+| 20261006000900_backend_role_membership | 20261006203427 |
+
+Before using `supabase db push` against this project, mark the files as applied with
+`supabase migration repair --status applied <filename-version>` (and revert the connector-recorded
+versions), or keep applying new migrations through the same connector/`scripts/migrate.sh` path.
+
+Verified after applying: 27 `app` + 16 `ops` tables; RLS enabled on 43/43; no grants to
+`anon`/`authenticated`/`service_role`/`PUBLIC` on `app`/`ops`; `ops.backend_role_problems()` is `[]`;
+`postgres` can `SET ROLE suv_backend`; `btree_gist` installed in `extensions`.
+
+Advisor notes (2026-10-06):
+- Security WARN ×2 concern `public.rls_auto_enable()` (SECURITY DEFINER, executable by
+  `anon`/`authenticated`). It was not created by these migrations (it came with the project and
+  backs an event trigger). Revoking `EXECUTE` from `anon`/`authenticated` is the owner's call.
+- Performance INFO: 48 unindexed foreign keys and "unused index" on an empty database; add covering
+  indexes only where real query plans need them (spec §11). Three "multiple permissive policies"
+  warnings are the intended self-lookup policies for memberships, workspaces and API credentials.
