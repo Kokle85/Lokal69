@@ -44,7 +44,7 @@ from suv_deals.integrations.event_bridge import (
     VerificationCacheEntry,
     VerificationRateLimiter,
 )
-from suv_deals.integrations.safe_http import SafeHttpClient
+from suv_deals.integrations.safe_http import SafeHttpClient, SafeHttpError, SafeHttpFailure, SafeResponse
 from suv_deals.integrations.webhook_signing import (
     HEADER_ID,
     HEADER_SIGNATURE,
@@ -867,6 +867,30 @@ def test_invalid_outbox_payload_rejected(change: dict[str, Any]) -> None:
     assert "abc" not in info.value.message
 
 
+@pytest.mark.parametrize(
+    ("url", "local_ok", "problem"),
+    [
+        ("https://app.example/reviews/1", False, None),
+        ("http://127.0.0.1:8000/reviews/1", True, None),
+        ("http://127.0.0.1:8000/reviews/1", False, "https"),
+        ("https://app.example/reviews/1?sig=abc", False, "tokens"),
+        ("https://app.example/reviews/1?X-Amz-Signature=abc", False, "tokens"),
+        ("https://app.example/re views/1", False, "whitespace"),
+        ("https://app.example/reviews/1\r\nX: y", False, "whitespace"),
+        ("https://[::1/reviews", False, "malformed"),
+        ("", False, "2048"),
+        ("https://app.example/" + "a" * 2049, False, "2048"),
+    ],
+)
+def test_dashboard_url_problem(url: str, local_ok: bool, problem: str | None) -> None:
+    found = eb.dashboard_url_problem(url, allow_local_http=local_ok)
+    if problem is None:
+        assert found is None
+    else:
+        assert found is not None and problem in found
+        assert "abc" not in found
+
+
 def test_local_dev_dashboard_over_http_is_allowed() -> None:
     event = {**OUTBOX_EVENT, "dashboard_url": "http://127.0.0.1:8000/reviews/1"}
     assert eb.build_occurrence(event)["data"]["dashboard_url"] == "http://127.0.0.1:8000/reviews/1"
@@ -1106,6 +1130,90 @@ async def test_timeout_after_send_is_uncertain_not_blindly_retried() -> None:
 async def test_connection_lost_after_send_is_uncertain() -> None:
     outcome = await run_deliver(Callback(httpx.ReadError("reset")))
     assert outcome.kind is DeliveryOutcomeKind.UNCERTAIN
+
+
+class _RaisingHttp:
+    """SafeHttp double that fails after the receiver's status line was already read."""
+
+    def __init__(self, exc: SafeHttpError) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def post(
+        self,
+        url: str,
+        *,
+        content: bytes,
+        headers: Mapping[str, str],
+        timeout_s: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> SafeResponse:
+        self.calls += 1
+        raise self.exc
+
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        timeout_s: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> SafeResponse:  # pragma: no cover - not used by deliver()
+        raise self.exc
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "kind", "reason"),
+    [
+        # Regression: these used to become UNCERTAIN, and the uncertain follow-up rule would
+        # then re-send a delivery the receiver had explicitly refused with 410/413.
+        (SafeHttpFailure.PROTOCOL_ERROR, 410, DeliveryOutcomeKind.FAILED, DeliveryFailureReason.HTTP_410_GONE),
+        (
+            SafeHttpFailure.CONNECTION_LOST,
+            413,
+            DeliveryOutcomeKind.FAILED,
+            DeliveryFailureReason.HTTP_413_TOO_LARGE,
+        ),
+        (SafeHttpFailure.TIMEOUT_AFTER_SEND, 400, DeliveryOutcomeKind.FAILED, DeliveryFailureReason.HTTP_4XX),
+        (SafeHttpFailure.CONNECTION_LOST, 503, DeliveryOutcomeKind.RETRY, DeliveryFailureReason.HTTP_5XX),
+        (
+            SafeHttpFailure.TIMEOUT_AFTER_SEND,
+            429,
+            DeliveryOutcomeKind.RETRY,
+            DeliveryFailureReason.HTTP_RETRYABLE_4XX,
+        ),
+        (SafeHttpFailure.TIMEOUT_AFTER_SEND, 200, DeliveryOutcomeKind.DELIVERED, None),
+    ],
+)
+async def test_transport_failure_after_status_line_is_classified_by_status(
+    failure: SafeHttpFailure, status: int, kind: DeliveryOutcomeKind, reason: DeliveryFailureReason | None
+) -> None:
+    http = _RaisingHttp(SafeHttpError(failure, possibly_delivered=True, status_code=status))
+    outcome = await eb.deliver(
+        EXPECTED_OCCURRENCE,
+        target(),
+        http,
+        attempt=1,
+        clock=FrozenClock(NOW),
+        access_check=allow,
+        rng=random.Random(1),
+    )
+    assert http.calls == 1
+    assert outcome.kind is kind
+    assert outcome.reason is reason
+    assert outcome.status_code == status
+    assert outcome.send_attempted_at == NOW
+    if kind is DeliveryOutcomeKind.DELIVERED:
+        assert outcome.provider_accepted_at == NOW
+
+
+async def test_transport_failure_without_status_after_send_stays_uncertain() -> None:
+    http = _RaisingHttp(SafeHttpError(SafeHttpFailure.CONNECTION_LOST, possibly_delivered=True))
+    outcome = await eb.deliver(
+        EXPECTED_OCCURRENCE, target(), http, attempt=1, clock=FrozenClock(NOW), access_check=allow
+    )
+    assert outcome.kind is DeliveryOutcomeKind.UNCERTAIN
+    assert outcome.next_attempt_at is None
 
 
 @pytest.mark.parametrize(
