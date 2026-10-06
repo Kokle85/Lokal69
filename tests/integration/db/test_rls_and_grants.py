@@ -136,7 +136,15 @@ def test_backend_cannot_run_owner_maintenance(db_conn: psycopg.Connection) -> No
 
 
 def test_default_privileges_keep_future_objects_private(db_conn: psycopg.Connection) -> None:
+    """Future objects are created by the migration owner (the database owner; on hosted
+    Supabase the non-superuser `postgres` role), so default privileges are checked as that role."""
     with db_conn.transaction(force_rollback=True):
+        owner_row = db_conn.execute(
+            "select pg_catalog.pg_get_userbyid(datdba) from pg_catalog.pg_database"
+            " where datname = current_database()"
+        ).fetchone()
+        assert owner_row is not None
+        db_conn.execute(sql.SQL("set local role {}").format(sql.Identifier(owner_row[0])))
         db_conn.execute("create table app.future_table (id uuid primary key)")
         db_conn.execute("create function app.future_fn() returns int language sql as 'select 1'")
         for role in CLIENT_ROLES:
