@@ -140,6 +140,13 @@ def test_stats_are_per_kind_and_ordered(cands: list[MarketObservation], min_samp
             assert stats.q1 is None and stats.q3 is None
         assert stats.date_from <= stats.date_to
         assert sum(stats.match_quality.values()) == stats.n
+        if stats.evidence_kind not in ADEQUACY_KINDS:
+            assert stats.sample_label == "unverified_claims"  # never "adequate"
+    asking = sorted(s.amount_eur for s in result.selected if s.evidence_kind == EvidenceKind.ASKING_PRICE)
+    if asking:
+        median = quantile(asking, Decimal("0.5"))  # unrounded (spec 3 compare before rounding)
+        expected = "below" if median < 8000 else ("above" if median > 10000 else "within")
+        assert result.mk_band_fit == expected
     adequacy = max(sum(1 for s in result.selected if s.evidence_kind == k) for k in ADEQUACY_KINDS)
     if adequacy >= min_sample:
         assert result.status == "adequate" and not result.research_needed

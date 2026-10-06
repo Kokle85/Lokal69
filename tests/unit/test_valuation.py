@@ -597,3 +597,58 @@ def test_dependency_and_screening_models() -> None:
         ScreeningInput(eligibility=EligibilityState.ELIGIBLE_PRIMARY, eur_payable=Money.of("2800", "CHF"))
     with pytest.raises(ValidationError):
         ComparableReference(comparable_set_id="x", content_hash="nothex", sample_size=1, quality="adequate")
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def _manual_import_lines() -> list[CostLine]:
+    """SYNTHETIC broker-entered import amounts that did not come from any tax calculation."""
+    return [
+        CostLine(
+            category=c,
+            label="SYNTHETIC manual import amount",
+            status=S.QUOTED,
+            currency="EUR",
+            base=eur("1.00"),
+            evidence_ids=("SYNTHETIC-broker-note",),
+            provider="SYNTHETIC broker",
+        )
+        for c in sorted(IMPORT_CATEGORIES)
+    ]
+
+
+def _alert_ready_with(lines: list[CostLine]) -> ScenarioSet:
+    sell = ProceedsEstimate(
+        status=S.ESTIMATED,
+        currency="EUR",
+        base=eur("8000.00"),
+        low=eur("7800.00"),
+        basis="owner_estimate",
+        assumption_approved=True,
+    )
+    buy = PurchaseInput(status=S.QUOTED, amount=eur("2800.00"), evidence_ids=("SYNTHETIC-seller",))
+    return compute_scenarios(buy, other_lines(quoted=True) + lines, sell, [MKD_RATE], APPROVED, as_of=AS_OF)
+
+
+def test_scenario_import_lines_must_come_from_the_recorded_calculation() -> None:
+    calc = active_calc()
+    mismatched = assemble(tax=calc, scenario_set=_alert_ready_with(_manual_import_lines()))
+    assert mismatched.state == ValuationState.INCOMPLETE
+    assert not mismatched.alert_eligible and not mismatched.can_notify
+    assert any("do not all come from the recorded tax calculation" in u for u in mismatched.unknowns)
+    # Lines from a *different* calculation (other inputs) are rejected as well.
+    other_calc = calculate(
+        _rule(TaxRuleStatus.ACTIVE), tax_inputs(customs_value=Money.of("90000", "MKD")), AS_OF
+    )
+    swapped = assemble(tax=calc, scenario_set=_alert_ready_with(list(tax_cost_lines(other_calc))))
+    assert swapped.state == ValuationState.INCOMPLETE and not swapped.alert_eligible
+    matching = assemble(tax=calc, scenario_set=_alert_ready_with(list(tax_cost_lines(calc))))
+    assert matching.state == ValuationState.QUOTE_SUPPORTED and matching.can_notify
+
+
+def test_scenarios_using_an_unrecorded_calculation_are_incomplete() -> None:
+    calc = active_calc()
+    valuation = assemble(tax=None, scenario_set=_alert_ready_with(list(tax_cost_lines(calc))))
+    assert valuation.state == ValuationState.INCOMPLETE
+    assert any("does not record" in u for u in valuation.unknowns)

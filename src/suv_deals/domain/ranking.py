@@ -4,14 +4,15 @@ The ranking orders the human review queue. It is a documented points table, **no
 calibrated probability of profit** and never presented as one. Every feature contribution and
 the ``SCORING_VERSION`` stay visible next to the total (spec 14).
 
-Points table (``SCORING_VERSION = ranking@1.0.0``; total range -35 .. 100):
+Points table (``SCORING_VERSION = ranking@1.0.1``; total range -35 .. 100):
 
 =========================  =========  ==========================================================
 feature                    points     rule
 =========================  =========  ==========================================================
 acquisition_fit            0 .. 20    inside the acquisition band 20; below the band 10 (cheaper is
                                       not unsuitable, but outside the target); above the band
-                                      20 - (excess EUR / 50), floor 0 (EUR 4,000 -> 0); unknown 0
+                                      20 - (excess EUR / 50) rounded down, at most 19.99 and at
+                                      least 0 (EUR 4,000 -> 0); unknown 0
 comparable_quality         0 .. 20    adequate 20; small_sample 8; insufficient / not computed 0
 resale_band_fit            0 .. 10    MK asking median within EUR 8,000-10,000: 10; above: 6;
                                       below / unknown: 0
@@ -33,7 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import Any, Final, Literal
 from uuid import UUID
 
@@ -55,7 +56,7 @@ from suv_deals.domain.listings import NormalizedListing
 from suv_deals.domain.profiles import PRIMARY_MAX_EUR, PRIMARY_MIN_EUR
 from suv_deals.errors import ValidationFailed
 
-SCORING_VERSION: Final = "ranking@1.0.0"
+SCORING_VERSION: Final = "ranking@1.0.1"
 NOT_A_PROBABILITY: Final = (
     "Ranking score for ordering the review queue only; it is not a probability of profit."
 )
@@ -76,6 +77,8 @@ MIN_POINTS: Final[dict[str, Decimal]] = {
 }
 RISK_FLAG_PENALTY: Final = Decimal(-5)
 ABOVE_BAND_EUR_PER_POINT: Final = Decimal(50)
+#: Any price above the band scores strictly less than an in-band price.
+ABOVE_BAND_MAX_POINTS: Final = Decimal("19.99")
 CONTRIBUTION_EUR_PER_POINT: Final = Decimal(100)
 _CENT: Final = Decimal("0.01")
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
@@ -237,7 +240,12 @@ def _acquisition_fit(f: RankingFeatures) -> FeatureContribution:
             f"EUR {price} below the {band} band (outside target, not unsuitable)",
         )
     excess = price - f.band_max_eur
-    points = Decimal(20) - excess / ABOVE_BAND_EUR_PER_POINT
+    # Rounded down and capped below the in-band score: EUR 3,000.20 must never tie with an in-band
+    # price (half-even rounding of 19.996 used to give the full 20.00).
+    points = min(
+        (Decimal(20) - excess / ABOVE_BAND_EUR_PER_POINT).quantize(_CENT, rounding=ROUND_FLOOR),
+        ABOVE_BAND_MAX_POINTS,
+    )
     return _contribution("acquisition_fit", points, f"EUR {price} is EUR {excess} above the {band} band")
 
 

@@ -20,6 +20,7 @@ Rules:
 
 from __future__ import annotations
 
+import decimal
 import re
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime
@@ -54,6 +55,7 @@ _CUBE: Final = f"{{{_ECB_NS}}}Cube"
 _CURRENCY_RE: Final = re.compile(r"^[A-Z]{3}$")
 _RATE_RE: Final = re.compile(r"^[0-9]{1,12}(\.[0-9]{1,12})?$")
 _FORBIDDEN_MARKUP: Final = (b"<!doctype", b"<!entity", b"<!element", b"<!attlist", b"<!notation")
+_CTX: Final = decimal.Context(prec=50)
 
 
 def _parser() -> etree.XMLParser:
@@ -243,6 +245,14 @@ async def fetch_ecb_daily(
     )
 
 
+def _same_rate(a: FxRate, b: FxRate) -> bool:
+    """True when two observations state the same rate: numerically equal in the same
+    direction (``0.94`` == ``0.9400``) or exact inverses when stored the other way round."""
+    if (a.base, a.quote) == (b.base, b.quote):
+        return a.rate == b.rate
+    return (a.base, a.quote) == (b.quote, b.base) and _CTX.multiply(a.rate, b.rate) == 1
+
+
 def select_rate(  # noqa: PLR0917 - positional order is the documented package contract
     rates: Iterable[FxRate],
     base: str,
@@ -282,12 +292,16 @@ def select_rate(  # noqa: PLR0917 - positional order is the documented package c
         warnings.append(message)
         return None, tuple(warnings)
     latest = max(r.rate_date for r in candidates)
-    same_day = sorted((r for r in candidates if r.rate_date == latest), key=lambda r: r.provider)
-    distinct = sorted({f"{r.provider}:{r.base}/{r.quote}={r.rate}" for r in same_day})
-    if len(distinct) > 1:
+    # Prefer an observation stored in the requested direction, then by provider name.
+    same_day = sorted(
+        (r for r in candidates if r.rate_date == latest),
+        key=lambda r: (r.base != base, r.provider, str(r.rate)),
+    )
+    chosen = same_day[0]
+    if any(not _same_rate(chosen, other) for other in same_day[1:]):
+        distinct = sorted({f"{r.provider}:{r.base}/{r.quote}={r.rate}" for r in same_day})
         warnings.append(f"FX_RATE_AMBIGUOUS:{base}/{quote} {latest.isoformat()}: " + ", ".join(distinct))
         return None, tuple(warnings)
-    chosen = same_day[0]
     age = chosen.age_days(on_date)
     if age > max_age_days:
         warnings.append(

@@ -93,6 +93,12 @@ before the Supabase activation gate.
 | `suv_backend` (NOLOGIN, NOINHERIT, no BYPASSRLS) | Schema USAGE plus the explicit per-table grants below. A deployment LOGIN user is made a member, or the process runs `SET ROLE suv_backend` (`Settings.database_set_role`). |
 | migration owner (`postgres` on Supabase, the superuser in tests) | Owns every object, bypasses RLS (RLS is not FORCEd). Used only for migrations, tests and documented maintenance. |
 
+Roles are cluster-global, so `suv_backend` may already exist when a migration runs. The
+owner-only function `ops.backend_role_problems()` lists anything that would void tenant
+isolation (SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, LOGIN, or membership
+in another role, which would allow `SET ROLE` to e.g. the table owner). Migrations 0100
+and 0800 refuse to proceed (`42501`) when it is non-empty.
+
 `service_role` gets no grants. With the BFF-only choice the service key cannot reach
 `app`/`ops` through the Data API anyway. A direct-SQL fallback must use a LOGIN member of
 `suv_backend`. If the service role is ever needed, it requires a new migration with
@@ -210,16 +216,25 @@ Migration 0100 also sets these default privileges for the migration role:
   - an implemented adapter;
   - reviewed terms, with a `proceed_*` decision that names its actor;
   - a technical status that is not untested, access_blocked or parser_unhealthy;
-  - allowed hosts and detail paths, plus search paths for acquisition sources.
+  - allowed hosts; detail paths unless `detail_mode = 'card_only'` (a robots/terms
+    decision that limits the source to search cards); search paths for acquisition
+    sources.
 
   `robots_policy = 'obey'` and `technical_denial_policy = 'stop_and_report'` are fixed.
-- **Fixtures never leak into reality:**
-  - `tax_rule_sets.is_fixture` can never be approved or active;
+- **Fixtures never leak into reality** (spec §18), and `is_fixture` is immutable wherever
+  rows can be updated:
+  - `tax_rule_sets.is_fixture` can never be approved or active, and cannot be flipped even
+    in `draft` (`SV004`);
   - `cost_profiles.is_fixture` is never approved;
   - a non-fixture valuation cannot depend on fixture FX rates, cost evidence, tax rules,
     cost profiles or comparable sets (insert trigger);
-  - a fixture `ops.outbox` row can only be `blocked` or `cancelled`, so fixtures cannot
-    produce external notifications (spec §18).
+  - a non-fixture review case cannot reference a fixture valuation; a review decision
+    carries its case's `is_fixture`, and a real decision cannot cite a fixture valuation
+    (`SV003`);
+  - a fixture `ops.outbox` row can only be `blocked` or `cancelled`; its `is_fixture` (and
+    every other identity column) is frozen, and a fixture review case cannot produce a
+    non-fixture `review_case` event (deferred constraint trigger, checked at commit
+    whatever the write order). Fixtures therefore cannot produce external notifications.
 
 ### Guard SQLSTATEs (raised by triggers; map them in the persistence layer)
 
@@ -227,8 +242,8 @@ Migration 0100 also sets these default privileges for the migration role:
 |---|---|---|
 | `SV001` | Append-only history: UPDATE/DELETE refused | `app.reject_history_mutation()` |
 | `SV002` | State transition not permitted | tax rule lifecycle, valuation state |
-| `SV003` | Dangling, cross-workspace or fixture-contaminated reference, or an estimated valuation without an approved/active tax rule set | `app.valuations_check_dependencies()` |
-| `SV004` | Frozen column modified | `app.guard_frozen_columns()`, listing identity, tax rule content and approval |
+| `SV003` | Dangling, cross-workspace or fixture-contaminated reference, or an estimated valuation without an approved/active tax rule set | `app.valuations_check_dependencies()`, `app.review_cases_check_fixture_lineage()`, `app.review_decisions_check_fixture_lineage()`, `ops.outbox_check_fixture_lineage()` (at commit) |
+| `SV004` | Frozen column modified | `app.guard_frozen_columns()` (incl. outbox event identity), listing identity, tax rule content, approval and `is_fixture` |
 | `SV005` | Monotonic value would decrease (row/case/source version, listing `detail_generation`, promoted `current_generation`, `last_seen_at`) | `app.guard_version()`, `app.listings_guard()` |
 | `SV006` | Detail observation generation was never allocated | `app.detail_observations_check_generation()` |
 
@@ -285,14 +300,15 @@ Content is also frozen on some lifecycle tables (`SV004`):
 
 | Table | What may change |
 |---|---|
-| valuations | only `state`/`stale_*` |
+| valuations | only `state`/`stale_*`, and only "mark stale" |
+| outbox events | only delivery lifecycle columns and `destination_binding_id` (event id, type, aggregate, payload + hash, dedup key, `is_fixture` frozen) |
 | cost profiles | only approval |
 | snapshots | only redaction/purge |
 | credentials | only usage/revocation |
 | cluster members | only confirm/unlink |
 | idempotency records | only outcome/expiry |
 | owner notes | only body/version |
-| review cases | identity: listing, profile, fixture flag |
+| review cases | identity: listing, profile, fixture flag (everything else is lifecycle) |
 | tax rule sets | everything except lifecycle columns, once out of draft |
 
 ## 6. Table catalogue
@@ -308,7 +324,7 @@ Spec §11 lists 37 tables, and all of them exist. This system adds six more:
 | `app.workspaces` | Tenant: name, `display_timezone` (Europe/Skopje), `active` | `tenant_isolation` on `id`; `workspace_member_read` |
 | `app.memberships` | user to workspace, role owner/reviewer/viewer, `active` | PK `(workspace_id, user_id)`; FK `auth.users`; `memberships_user_idx (user_id, workspace_id) WHERE active` |
 | `app.config_revisions` | Immutable business-config history: `revision`, `config`, `config_hash`, `before`, author principal/kind/label, `reason`, `effective_at` | `unique (workspace_id, revision)`; append-only |
-| `app.sources` | Source registry mirroring `SourceConfig`. Typed: key, country, role, mode, adapter(+version), terms status/decision/actor/note/url/reviewed_at, robots/denial policy, host/path allow-lists, timezone, pause fields, `last_live_smoke_at`. Full config in `config` jsonb; row `version` | `unique (workspace_id, source_key)`; activation gate CHECK; `version` never decreases |
+| `app.sources` | Source registry mirroring `SourceConfig`. Typed: key, country, role, mode, adapter(+version), terms status/decision/actor/note/url/reviewed_at, robots/denial policy, host/path allow-lists, timezone, `detail_mode` (`fetch`/`card_only`), pause fields, `last_live_smoke_at`. Full config in `config` jsonb; row `version` | `unique (workspace_id, source_key)`; activation gate CHECK; `version` never decreases |
 | `app.search_profiles` | `profile_key` primary/manual_4000/below_target_watch, labels, `enabled`, `min/max_price_eur numeric(12,2)`, `max_price_inclusive`, `max_mileage_km_exclusive numeric(14,6)`, `criteria`, `config_revision_id` | baseline CHECKs; unique key and queue label per workspace |
 
 ### Queue and crawl operations (migration 0300)
@@ -316,7 +332,7 @@ Spec §11 lists 37 tables, and all of them exist. This system adds six more:
 | Table | Purpose | Key constraints / indexes |
 |---|---|---|
 | `ops.jobs` | Durable queue (spec §13 fields), plus `source_id`, `profile_id`, `partition_key`, `scheduled_slot`, `listing_id` and `generation` (detail/recheck binding), `blocker_code/detail`, `last_error_detail` | See the job invariants below |
-| `ops.crawl_runs` | One traversal: versions, start/end, `outcome` (`running` or a Completeness value or `cancelled`), page/card/new/changed/detail counts, watermarks, `gap_reasons`, `access_state` | `outcome='running'` iff `finished_at` is null; rolling_pages runs carry no watermark |
+| `ops.crawl_runs` | One traversal: versions, start/end, `outcome` (`running` or a Completeness value or `cancelled`), page/card/new/changed/detail counts, watermarks, `gap_reasons`, `access_state` | `outcome='running'` iff `finished_at` is null; rolling_pages runs carry no watermark; `unique (workspace_id, source_id, id)` so card observations, fetch attempts and schedules can only cite a run **of their own source** |
 | `ops.source_schedules` | Per (source, profile, partition): `next_due_at`, `last_slot`, `cursor`, `run_id`, `coverage_mode`, `complete_watermark`, `page_depth`, `last_complete_traversal_at`, `incomplete_since`, `gap_reasons`, `backoff_until`, failures, pause, `row_version` | `unique (workspace_id, source_id, profile_id, partition_key)`; `coverage_mode='rolling_pages'` ⇒ `complete_watermark IS NULL` (never fabricated) |
 | `ops.host_budgets` | Persistent token bucket (`capacity`, `refill_per_second`, `tokens`, `refilled_at`, `next_request_not_before`), circuit breaker, daily counters, Retry-After | `0 <= tokens <= capacity`; `open` needs `open_until`; host lower-case |
 | `ops.robots_revisions` | Every robots.txt fetch: host, time, status, `content_hash`, body (max 512 KiB), `parse_ok` | index `(workspace_id, host, fetched_at desc)` |
@@ -390,14 +406,17 @@ profile, config revision, `fx_rate_ids[]`, `cost_evidence_ids[]`,
 `calculation_version`, currency, base/conservative/upside contribution, expiry,
 `stale_at/reason` and `is_fixture`.
 
-**Valuation invariants:**
+**Valuation invariants** (identical to `domain.valuation.Valuation`, so every row loads):
 
-- Unknown is never zero; estimated values must be complete.
-- `stale` needs a reason.
+- Unknown is never zero: not_started/incomplete/invalid carry no contribution figures;
+  estimated/quote_supported carry base and conservative contributions.
+- `stale_at`/`stale_reason` are set exactly when the state is `stale`.
 - Insert trigger: array ids must exist in the workspace, there is no fixture contamination,
   and a non-fixture estimated/quote-supported valuation needs an approved or active tax
   rule set.
-- Only `state` may change, and only forward to stale or invalid.
+- Content is immutable. The only state change is "mark stale" (from not_started,
+  incomplete, estimated or quote_supported; `domain.valuation.mark_stale`). `invalid` is
+  assigned at insert; `stale` and `invalid` are terminal. A recalculation is a new row.
 
 ### Reviews and notifications (migration 0600)
 
@@ -418,9 +437,14 @@ profile, config revision, `fx_rate_ids[]`, `cost_evidence_ids[]`,
   is set, via a deferred FK that also checks the decision belongs to this case.
 - At most one non-superseded case per (workspace, listing, profile):
   `review_cases_open_uidx`.
+- `superseded_by_id` names a case of the **same listing** (a relisted vehicle is a new
+  incarnation and never inherits review history).
 - The queue index is `review_queue_idx (workspace_id, state, priority desc, created_at,
   id)`.
-- `row_version` never decreases.
+- `row_version` is the optimistic-concurrency case version (`expected_version`). Every
+  accepted change (claim, release, submit, new material information) increments it, as
+  `domain.reviews` does; it never decreases.
+- Fixture lineage: see "Fixtures never leak into reality" above.
 
 ### Outbox, events, pagination, idempotency, audit, gates, credentials (migration 0700)
 
@@ -428,13 +452,13 @@ profile, config revision, `fx_rate_ids[]`, `cost_evidence_ids[]`,
 |---|---|---|
 | `ops.outbox` | Transactional outbox: `event_id` (globally unique), type, version, aggregate type/id/version, destination binding, payload (max 256 KiB) + `payload_hash`, `dedup_key`, state (8 OutboxState values), attempts, lease, `event_created_at`, `send_attempted_at`, `provider_accepted_at`, `owner_seen_at`, `last_error_code`, `blocker_code`, `is_fixture` | See the outbox invariants below |
 | `ops.delivery_attempts` | One row per send: `attempt_id` (unique), number, provider, `sent_at`, `completed_at`, receipt, response code, error, `uncertain` | uncertain ⇒ no receipt (reconciliation appends a new row); append-only |
-| `ops.event_subscriptions` | MCP Events subscription: principal, credential, `event_name`, `canonical_filter` + `filter_hash`, HTTPS `callback_url`, `encrypted_secret bytea` (only ciphertext; the key stays with the event bridge), `secret_version`, verification state/challenge hash/verified_at, `expires_at`, `refresh_deadline`, revocation, `replay_position` (NULL in the MVP), `version` | `unique (principal_id, callback_url, event_name, filter_hash)` (refresh, never duplicate); finite lifetime; callback must be HTTPS without credentials |
+| `ops.event_subscriptions` | MCP Events subscription: principal, credential, `event_name`, `canonical_filter` + `filter_hash`, HTTPS `callback_url`, `encrypted_secret bytea` (only ciphertext; the key stays with the event bridge), `secret_version`, optional `previous_encrypted_secret` + `previous_secret_valid_until` for a short rotation window (both or neither), `credential_id` (FK to `ops.api_credentials` of the same workspace; NULL for OAuth principals), verification state/challenge hash/verified_at, `expires_at`, `refresh_deadline`, revocation, `replay_position` (NULL in the MVP), `version` | `unique (principal_id, callback_url, event_name, filter_hash)` (refresh, never duplicate); finite lifetime; callback must be HTTPS without credentials |
 | `ops.event_deliveries` | Per (subscription, event): state, attempts, lease, `next_attempt_at`, `replay_sequence`, `last_response_code`, `safe_error`, `accepted_at` | `unique (subscription_id, event_id)`; FK `(workspace_id, event_id)` to the outbox |
 | `ops.query_snapshots` | Frozen ordered `result_ids[]` (max 10k) + `projections` bound to principal/workspace/`query_name`/`filter_hash` | `expires_at` within 1 day; DELETE for expiry |
 | `ops.idempotency_records` | (principal, operation, `idempotency_key`) to `request_hash`, state in_progress/completed/failed, `result`, `error_code`, expiry | unique key; identity/hash frozen; completed ⇒ result; failed ⇒ error code |
 | `ops.audit_events` | Actor, action, target, prior/new version, reason, request id, redacted metadata | append-only; indexes by time and target |
 | `ops.activation_gates` | Spec §32 gates per workspace: capability, dependency, required evidence, `status` (GateStatus), owner, next action, evidence, `checked_at` | `unique (workspace_id, capability)`; `live_verified`/`active` ⇒ evidence and `checked_at` |
-| `ops.api_credentials` | Static-bearer/dev MCP credentials: principal and kind, role, `token_hash` (SHA-256, **never the token**), optional non-secret prefix, `scopes[]` (subset of the Scope values), label, finite `expires_at`, revocation, `last_used_at` | `unique (token_hash)`; scopes are validated; rotation means a new row |
+| `ops.api_credentials` | Static-bearer/dev MCP credentials: principal and kind, role, `token_hash` (SHA-256, **never the token**), optional non-secret prefix, `scopes[]` (subset of the Scope values), label, finite `expires_at`, revocation, `last_used_at` | `unique (token_hash)`; scopes are Scope values and never exceed the member role (`api_credentials_role_scopes_ck` mirrors `domain.actor.ROLE_SCOPES`); rotation means a new row |
 
 **Outbox invariants:**
 
@@ -442,8 +466,16 @@ profile, config revision, `fx_rate_ids[]`, `cost_evidence_ids[]`,
 - `delivered` ⇒ `provider_accepted_at`.
 - Accepted ⇒ attempted, and seen ⇒ accepted.
 - `blocked` ⇒ `blocker_code`.
-- A fixture row is only ever `blocked` or `cancelled`.
+- A fixture row is only ever `blocked` or `cancelled`; a fixture review case cannot
+  produce a non-fixture event.
+- Event identity is immutable (`outbox_identity_frozen`): only lifecycle columns and
+  `destination_binding_id` (late routing) change, so the event ID is stable across
+  attempts and the payload always matches `payload_hash`.
 - `unique (workspace_id, dedup_key)`.
+- `event_version` is an integer major version; the payload's own `schema_version`
+  string (e.g. `"1.0"`) lives inside `payload`.
+- `ops.event_deliveries`: `sending` ⇒ a lease; `pending`/`retry_wait` ⇒ no lease token or
+  expiry (a new claim mints a fresh token).
 - Indexes: `outbox_due_idx (workspace_id, available_at, id)` WHERE pending/retry_wait, a
   lease-expiry index, and an attention index (uncertain, blocked, dead_letter).
 
@@ -487,6 +519,17 @@ Exhausted waiting jobs are reconciled into `dead_letter` through `jobs_exhausted
   `revisions_listing_idx` is not created because the unique index covers it.
 - `ops.robots_revisions` and `ops.fetch_attempts` are insert-only by grant, without the
   history trigger, so that retention purges remain possible.
+- **Independent review hardening** (all derived from the spec and the domain contracts):
+  valuation rows obey exactly the `domain.valuation.Valuation` invariants (only "mark
+  stale" after insert); `app.sources.detail_mode` mirrors `SourceConfig.detail_mode` so a
+  `card_only` source can be enabled without detail paths, as `activation_problems()`
+  allows; runs cited by card observations, fetch attempts and schedules belong to the
+  same source; review successors belong to the same listing; outbox events are immutable
+  and fixture lineage is enforced (spec §18); credential scopes never exceed the role;
+  migrations verify the cluster-global `suv_backend` role is safe.
+- `ops.outbox.event_version` is an integer. The domain draft (`domain.notifications`)
+  carries the payload schema version string `"1.0"`; persistence stores the integer major
+  version (1) and keeps the string inside `payload.schema_version`.
 - Retroactive quarantine of existing revisions is recorded on `app.listings.quarantined`
   plus `ops.audit_events`. Revisions themselves are immutable, and `quarantined` on a
   revision or observation is set at insert time.

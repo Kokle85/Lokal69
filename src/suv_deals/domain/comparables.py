@@ -28,12 +28,18 @@ Business rules (spec 15):
   sold-claimed listings stay *asking-price* evidence; an advertised price at removal is never a
   sale price. ``owner_estimate`` is an assumption, not a comparable.
 - Statistics: n, min, max and median always (for n >= 1); quartiles only when n >= 5. Small
-  samples are labelled; every individual point stays visible next to the aggregate.
+  samples are labelled; seller-reported sale statistics are labelled ``unverified_claims`` at any
+  size; every individual point stays visible next to the aggregate. The MK band fit compares
+  the unrounded asking median (spec 3 compare-before-rounding).
+- Condition: a damaged or non-running comparable never values a running target; a damaged or
+  non-running target valued from running comparables is labelled on every such comparable.
 - Stale evidence (older than ``comparable_max_age_days`` at ``as_of``) is excluded but the
   caller keeps it historically. Evidence observed after ``as_of`` is excluded so a set is
   reproducible as of its computation time.
-- Amounts are converted to EUR with the recorded FX rates (explicit direction, unrounded).
-  An unconvertible currency excludes the candidate; it is never treated as zero.
+- Amounts are converted to EUR with the recorded FX rates (explicit direction, unrounded): per
+  currency the latest *reference* rate dated on or before ``as_of`` (customs/payment rates and
+  later-dated rates are never used), independent of input order; the rate used is reported and
+  an old rate is flagged. An unconvertible currency excludes the candidate; it is never zero.
 """
 
 from __future__ import annotations
@@ -56,6 +62,7 @@ from suv_deals.domain.enums import (
     Drive,
     EvidenceKind,
     Fuel,
+    FxPurpose,
     Gearbox,
     PriceBasis,
     SellerType,
@@ -66,7 +73,7 @@ from suv_deals.domain.money import FxRate, Money, convert_to_eur, to_decimal
 from suv_deals.domain.profiles import MK_ASKING_BAND_MAX_EUR, MK_ASKING_BAND_MIN_EUR
 from suv_deals.errors import ValidationFailed
 
-CRITERIA_VERSION: Final = "mk-comparables@1.0.0"
+CRITERIA_VERSION: Final = "mk-comparables@1.1.0"
 
 #: Relative engine tolerances (spec 15 work package: displacement 10 %, power 15 %).
 DISPLACEMENT_TOLERANCE: Final = Decimal("0.10")
@@ -78,6 +85,8 @@ MILEAGE_WIDEN_FACTOR: Final = Decimal(2)
 YEAR_WIDEN_STEP: Final = 1
 #: Bound on input size so one call cannot be used as an unbounded workload.
 MAX_CANDIDATES: Final = 5000
+#: FX rates older than this at ``as_of`` are flagged (same as the SearchProfile.fx_max_age_days default).
+FX_RATE_WARN_AGE_DAYS: Final = 7
 #: Weights by match level. Informational inclusion weights; statistics stay unweighted.
 MATCH_WEIGHTS: Final[dict[str, Decimal]] = {
     "exact": Decimal("1.000000"),
@@ -94,7 +103,8 @@ LocalRegistrationStatus = Literal["locally_registered", "imported_unregistered",
 ComparableStatus = Literal["adequate", "small_sample", "insufficient_comparables"]
 MatchLevel = Literal["exact", "close", "widened"]
 BandFit = Literal["below", "within", "above", "unknown"]
-SampleLabel = Literal["single_observation", "small_sample", "adequate"]
+#: ``unverified_claims`` labels seller-reported sale statistics: never ``adequate`` at any size.
+SampleLabel = Literal["single_observation", "small_sample", "adequate", "unverified_claims"]
 WidenDimension = Literal["mileage", "year", "facelift"]
 
 _STATUS_TO_DB_QUALITY: Final[dict[str, str]] = {
@@ -479,7 +489,11 @@ def select_comparables(
         raise ValidationFailed("duplicate market observation ids in comparable candidates")
     criteria = _criteria(config)
     warnings = _target_warnings(target)
-    rates = list(fx_rates)
+    currencies = {
+        c.amount.currency for c in candidates if c.amount is not None and c.amount.currency != "EUR"
+    }
+    rates, fx_warnings = _usable_rates(fx_rates, as_of, currencies)
+    warnings.extend(fx_warnings)
 
     ordered = sorted(candidates, key=lambda c: str(c.id))
     evaluations = [_evaluate(target, obs, criteria, as_of, rates) for obs in ordered]
@@ -543,8 +557,11 @@ def select_comparables(
         status = "insufficient_comparables"
     if any(s.evidence_kind == EvidenceKind.SELLER_REPORTED_SALE for s in selected):
         warnings.append("SELLER_REPORTED_SALES_UNVERIFIED: seller sale claims never make a set adequate")
+    asking_amounts = sorted(s.amount_eur for s in selected if s.evidence_kind == EvidenceKind.ASKING_PRICE)
     fit, basis = _band_fit(
-        next((s for s in stats if s.evidence_kind == EvidenceKind.ASKING_PRICE), None), status
+        next((s for s in stats if s.evidence_kind == EvidenceKind.ASKING_PRICE), None),
+        quantile(asking_amounts, Decimal("0.5")) if asking_amounts else None,
+        status,
     )
     return ComparableSetResult(
         as_of=as_of,
@@ -579,6 +596,49 @@ def _criteria(config: ComparableConfig) -> MatchingCriteria:
     )
 
 
+def _usable_rates(
+    fx_rates: Sequence[FxRate], as_of: datetime, currencies: set[str]
+) -> tuple[list[FxRate], list[str]]:
+    """Pick exactly one FX rate per EUR currency pair, independent of input order (spec 18 FX).
+
+    Only ``reference`` rates support estimation (customs and payment rates are separate) and only
+    rates dated on or before ``as_of`` keep the set reproducible. Among those the latest rate date
+    wins (then the latest retrieval, provider and rate as deterministic tie-breaks). The rate used
+    for every encountered currency is reported, and an old rate is flagged but not discarded.
+    """
+    best: dict[str, FxRate] = {}
+    ignored = 0
+    for rate in fx_rates:
+        if "EUR" not in (rate.base, rate.quote):
+            continue
+        other = rate.quote if rate.base == "EUR" else rate.base
+        if rate.purpose != FxPurpose.REFERENCE or rate.rate_date > as_of.date():
+            ignored += int(other in currencies)
+            continue
+        current = best.get(other)
+        if current is None or _rate_rank(rate) > _rate_rank(current):
+            best[other] = rate
+    warnings: list[str] = []
+    for currency in sorted(currencies & set(best)):
+        rate = best[currency]
+        age = (as_of.date() - rate.rate_date).days
+        warnings.append(
+            f"FX_RATE_USED: 1 {rate.base} = {rate.rate} {rate.quote} (reference, dated "
+            f"{rate.rate_date.isoformat()}, provider {_bounded(rate.provider, 60)})"
+        )
+        if age > FX_RATE_WARN_AGE_DAYS:
+            warnings.append(f"FX_RATE_OLD: EUR/{currency} rate is {age} days old at as_of")
+    if ignored:
+        warnings.append(
+            f"FX_RATES_IGNORED: {ignored} customs/payment or post-as_of rate(s) not used for estimation"
+        )
+    return [best[c] for c in sorted(best)], warnings
+
+
+def _rate_rank(rate: FxRate) -> tuple[Any, ...]:
+    return (rate.rate_date, rate.retrieved_at, rate.provider, rate.rate)
+
+
 def _target_warnings(target: ComparableTarget) -> list[str]:
     warnings: list[str] = []
     if not _norm(target.make) or not _norm(target.model):
@@ -594,6 +654,10 @@ def _target_warnings(target: ComparableTarget) -> list[str]:
         warnings.append("TARGET_YEAR_FROM_MODEL_YEAR: first registration unknown; model year used")
     if target.mileage_km is None:
         warnings.append("TARGET_MILEAGE_UNKNOWN: mileage window not applied")
+    if _is_damaged(target.damaged_vehicle, target.running):
+        warnings.append(
+            "TARGET_DAMAGED_OR_NON_RUNNING: running-vehicle comparables overstate this target's value"
+        )
     return warnings
 
 
@@ -637,7 +701,10 @@ def _prefilter(
         eur = convert_to_eur(obs.amount, rates)
         if eur is None:
             ev.prefilter.append(ExclusionReason.CURRENCY_UNCONVERTIBLE)
-            ev.notes.append(f"CURRENCY_UNCONVERTIBLE: no recorded EUR/{obs.amount.currency} rate")
+            ev.notes.append(
+                f"CURRENCY_UNCONVERTIBLE: no recorded EUR/{obs.amount.currency} reference rate "
+                "dated on or before as_of"
+            )
         else:
             ev.amount_eur = eur.amount.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN)
     if obs.observed_at > as_of:
@@ -915,12 +982,33 @@ def _match_mileage(ev: _Evaluation, target: ComparableTarget, criteria: Matching
 
 
 def _match_condition(ev: _Evaluation, target: ComparableTarget) -> None:
+    """Spec 15 dimension 8 (condition and running status).
+
+    A damaged or non-running comparable never values a running target (excluded). The reverse is
+    kept but labelled ``target_damaged_comparable_running`` (a ``close`` match): running-vehicle
+    asking prices overstate a damaged target, and that must stay visible next to the number.
+    """
     cond = ev.obs.condition
-    positive = (ClaimStatus.SELLER_CLAIMED, ClaimStatus.VERIFIED)
-    cand_damaged = cond.damaged_vehicle in positive or cond.running == ClaimStatus.SELLER_DENIED
-    target_damaged = target.damaged_vehicle in positive or target.running == ClaimStatus.SELLER_DENIED
+    cand_damaged = _is_damaged(cond.damaged_vehicle, cond.running)
+    target_damaged = _is_damaged(target.damaged_vehicle, target.running)
     if cand_damaged and not target_damaged:
         ev.reject(ExclusionReason.CONDITION_MISMATCH, "comparable is damaged or non-running; target is not")
+    elif target_damaged and not cand_damaged:
+        ev.differences.append(
+            MatchDifference(
+                dimension="condition",
+                code="target_damaged_comparable_running",
+                severity=DifferenceSeverity.DIFFERS,
+                target="damaged_or_non_running",
+                comparable="not_reported_damaged",
+            )
+        )
+
+
+def _is_damaged(damaged_vehicle: ClaimStatus, running: ClaimStatus) -> bool:
+    return damaged_vehicle in (ClaimStatus.SELLER_CLAIMED, ClaimStatus.VERIFIED) or (
+        running == ClaimStatus.SELLER_DENIED
+    )
 
 
 def _context(ev: _Evaluation) -> None:
@@ -1069,9 +1157,13 @@ def _kind_order(kind: EvidenceKind) -> int:
 def _stats(kind: EvidenceKind, items: list[SelectedComparable], min_sample: int) -> EvidenceStats:
     values = sorted(s.amount_eur for s in items)
     n = len(values)
-    label: SampleLabel = (
-        "single_observation" if n == 1 else ("adequate" if n >= min_sample else "small_sample")
-    )
+    label: SampleLabel
+    if kind not in ADEQUACY_KINDS:
+        label = "unverified_claims"  # seller sale claims never become an adequate sample
+    elif n == 1:
+        label = "single_observation"
+    else:
+        label = "adequate" if n >= min_sample else "small_sample"
     quality = {lvl: sum(1 for s in items if s.match_level == lvl) for lvl in MATCH_WEIGHTS}
     times = [s.observation.observed_at for s in items]
     return EvidenceStats(
@@ -1117,20 +1209,27 @@ def quantile(sorted_values: Sequence[Decimal], p: Decimal) -> Decimal:
     return sorted_values[lower] + (sorted_values[lower + 1] - sorted_values[lower]) * fraction
 
 
-def _band_fit(asking: EvidenceStats | None, status: ComparableStatus) -> tuple[BandFit, str]:
-    if asking is None:
+def _band_fit(
+    asking: EvidenceStats | None, unrounded_median: Decimal | None, status: ComparableStatus
+) -> tuple[BandFit, str]:
+    """Band fit of the MK asking median versus EUR 8,000-10,000 (inclusive at both ends).
+
+    The comparison uses the *unrounded* median (spec 3: compare the unrounded Decimal EUR value
+    before rounding for display), so a median of 7,999.995 is ``below`` even though it displays as
+    8,000.00.
+    """
+    if asking is None or unrounded_median is None:
         return "unknown", "no selected MK asking-price comparables"
-    median = asking.median
     fit: BandFit
-    if median < MK_ASKING_BAND_MIN_EUR:
+    if unrounded_median < MK_ASKING_BAND_MIN_EUR:
         fit = "below"
-    elif median > MK_ASKING_BAND_MAX_EUR:
+    elif unrounded_median > MK_ASKING_BAND_MAX_EUR:
         fit = "above"
     else:
         fit = "within"
     quality = "adequate sample" if status == "adequate" else f"{asking.sample_label.replace('_', ' ')}"
     basis = (
-        f"median asking price EUR {median} of {asking.n} MK asking-price comparable(s) ({quality}) "
+        f"median asking price EUR {asking.median} of {asking.n} MK asking-price comparable(s) ({quality}) "
         f"versus the EUR {MK_ASKING_BAND_MIN_EUR}-{MK_ASKING_BAND_MAX_EUR} asking-price research band; "
         "asking prices are not realized sales"
     )
@@ -1375,7 +1474,13 @@ def _engine_code(text: str | None) -> str:
 
 
 def _codes_compatible(a: str, b: str) -> bool:
-    """Equal codes, or one is a >= 3 character prefix of the other (``N47`` vs ``N47D20``)."""
+    """Equal codes, or one is a >= 3 character prefix of the other (``N47`` vs ``N47D20``).
+
+    Equal codes always match, including short ones (``K9`` = ``K9``); only the *prefix* rule needs
+    three characters so that ``N4`` cannot claim to be a variant of ``N47D20``.
+    """
+    if a == b:
+        return True
     shorter, longer = sorted((a, b), key=len)
     return len(shorter) >= 3 and longer.startswith(shorter)
 

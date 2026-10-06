@@ -31,6 +31,7 @@ from suv_deals.domain.costs import (
     compute_scenarios,
     load_cost_profile,
     proceeds_supported,
+    tax_calculation_evidence_id,
     tax_cost_lines,
 )
 from suv_deals.domain.enums import (
@@ -48,6 +49,7 @@ from suv_deals.domain.enums import (
 from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.profiles import ContributionThreshold
 from suv_deals.domain.tax_engine import (
+    IMPORT_CATEGORIES,
     Classification,
     OriginProof,
     OriginProofStatus,
@@ -297,7 +299,7 @@ def test_cost_line_rejects_purchase_floats_and_unflagged_deposits() -> None:
     with pytest.raises(ValidationError, match="PurchaseInput"):
         CostLine(category=C.PURCHASE, label="x", status=S.UNKNOWN, currency="EUR")
     with pytest.raises(ValidationError):
-        CostLine(category=C.TRANSPORT, label="x", status=S.ESTIMATED, currency="EUR", base=700.0)  # type: ignore[arg-type]
+        CostLine(category=C.TRANSPORT, label="x", status=S.ESTIMATED, currency="EUR", base=700.0)
     with pytest.raises(ValidationError, match="refundable"):
         CostLine(category=C.REFUNDABLE_DEPOSIT, label="x", status=S.ESTIMATED, currency="EUR", base=eur("1"))
     with pytest.raises(ValidationError, match="confirmed refund"):
@@ -423,14 +425,17 @@ def test_confirmed_refund_has_no_downside() -> None:
     assert not any("ASSUMED" in a for a in result.assumptions)
 
 
-def test_unknown_deposit_blocks_cash_and_conservative_only() -> None:
+def test_unknown_deposit_blocks_cash_and_economics() -> None:
     deposit = line(C.REFUNDABLE_DEPOSIT, status=S.UNKNOWN, reason="seller terms not yet confirmed")
     lines = [deposit if ln.category == C.REFUNDABLE_DEPOSIT else ln for ln in spec_lines()]
     result = run(lines)
     base, cons = result.scenario(BASE), result.scenario(CONS)
     assert base.cash_required is None and base.refundable_deposits is None
-    assert base.purchase_economic_cost == eur("2800.00")
+    # a refund of an unknown amount cannot be assumed: unknown in every scenario
+    assert base.purchase_economic_cost is None and base.contribution_before_business_tax is None
     assert cons.purchase_economic_cost is None and cons.contribution_before_business_tax is None
+    assert base.known_subtotal == eur("6700.00")
+    assert not any("ASSUMED" in a for a in result.assumptions)  # nothing to assume about an unknown amount
 
 
 def test_cash_before_sale_flag() -> None:
@@ -648,7 +653,7 @@ def _tax_inputs() -> TaxInputs:
         customs_value=Money.of("100000.00", "MKD"),
         customs_value_basis="SYNTHETIC",
         co2_g_km=Decimal("120"),
-        co2_cycle="wltp",  # type: ignore[arg-type]
+        co2_cycle="wltp",
         vehicle_age_years=Decimal("12"),
         engine_displacement_cm3=Decimal("1995"),
     )
@@ -829,3 +834,210 @@ def test_cost_profile_rules(tmp_path: Path) -> None:
     lines = approved.lines()
     assert lines[0].assumption_approved and lines[0].base == eur("700.00")
     assert lines[1].refundable
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_incomplete_calculation_of_a_componentless_rule_is_unknown_not_zero() -> None:
+    """The shipped example rule set (no components, every input missing) must never yield
+    not_applicable (= zero) import costs."""
+    example = load_rule_set_file(REPO / "config" / "tax_rules" / "example_unapproved.json")
+    calc = calculate(example, TaxInputs(), AS_OF)
+    assert not calc.complete
+    lines = tax_cost_lines(calc)
+    assert {ln.category for ln in lines} == set(IMPORT_CATEGORIES)
+    assert all(ln.status == S.UNKNOWN and ln.base is None for ln in lines)
+    result = run(
+        [ln for ln in spec_lines() if ln.category not in IMPORT_CATEGORIES] + list(lines),
+    )
+    assert result.scenario(BASE).import_components is None
+    assert result.scenario(BASE).contribution_before_business_tax is None
+
+
+def _without_other_charges(doc: dict[str, Any]) -> None:
+    doc["components"] = [c for c in doc["components"] if c["category"] != "other_import_charges"]
+
+
+def _synthetic_rule(mutate: Any = None) -> RuleSet:
+    doc = json.loads(
+        (REPO / "tests" / "fixtures" / "tax" / "synthetic_rule_set.json").read_text(encoding="utf-8"),
+        parse_float=Decimal,
+    )
+    doc["sha256"] = None
+    if mutate is not None:
+        mutate(doc)
+    return RuleSet.model_validate(doc)
+
+
+def test_category_without_component_is_not_applicable_only_from_complete_calculation() -> None:
+    rule = _synthetic_rule(_without_other_charges)
+    at = datetime(2026, 6, 1, tzinfo=UTC)
+    complete = calculate(rule, _tax_inputs(), at)
+    assert complete.complete
+    lines = {ln.category: ln for ln in tax_cost_lines(complete)}
+    assert lines[C.OTHER_IMPORT_CHARGES].status == S.NOT_APPLICABLE
+    assert "defines no other_import_charges" in (lines[C.OTHER_IMPORT_CHARGES].reason or "")
+
+    def drop_wltp(doc: dict[str, Any]) -> None:
+        _without_other_charges(doc)
+        del next(c for c in doc["components"] if c["id"] == "co2_charge")["tables"]["wltp"]
+
+    incomplete = calculate(_synthetic_rule(drop_wltp), _tax_inputs(), at)  # wltp unsupported -> unknown
+    assert not incomplete.complete and incomplete.missing_inputs == ()
+    lines = {ln.category: ln for ln in tax_cost_lines(incomplete)}
+    assert lines[C.OTHER_IMPORT_CHARGES].status == S.UNKNOWN
+    assert lines[C.IMPORT_DUTY].status == S.ESTIMATED  # resolved categories stay usable
+
+
+def test_tax_lines_carry_the_exact_calculation_evidence_id() -> None:
+    rule = load_rule_set_file(REPO / "tests" / "fixtures" / "tax" / "synthetic_rule_set.json")
+    calc = calculate(rule, _tax_inputs(), datetime(2026, 6, 1, tzinfo=UTC))
+    expected = tax_calculation_evidence_id(calc)
+    assert expected == f"tax_calculation:{calc.content_sha256()}"
+    assert all(expected in ln.evidence_ids for ln in tax_cost_lines(calc))
+    lines = [ln for ln in spec_lines() if ln.category not in IMPORT_CATEGORIES] + list(tax_cost_lines(calc))
+    rates = [FxRate(**{**ecb("MKD", "61.5").model_dump(), "provider": "SYNTHETIC owner-approved MKD"})]
+    assert run(lines, rates=rates).import_line_sources == (expected,)
+    assert run().import_line_sources == tuple(sorted(f"manual:{c.value}" for c in IMPORT_CATEGORIES))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"basis": "mk_asking_prices", "status": S.QUOTED}, "never quotes"),
+        ({"basis": "mk_asking_prices", "status": S.ACTUAL}, "never quotes"),
+        ({"basis": "owner_estimate", "status": S.ACTUAL}, "never quotes"),
+        ({"basis": "seller_reported_sales", "status": S.QUOTED}, "never quotes"),
+        ({"basis": "verified_sales", "status": S.QUOTED}, "never quotes"),
+        ({"basis": "verified_sales", "evidence_kind": "asking_price"}, "does not match"),
+        ({"basis": "mk_asking_prices", "evidence_kind": "verified_sale"}, "does not match"),
+        ({"basis": "dealer_offer", "evidence_kind": "owner_estimate"}, "does not match"),
+    ],
+)
+def test_proceeds_basis_status_and_evidence_kind_must_agree(kwargs: dict[str, Any], match: str) -> None:
+    status = kwargs.pop("status", S.ESTIMATED)
+    with pytest.raises(ValidationError, match=match):
+        ProceedsEstimate(
+            status=status, currency="EUR", base=eur("9000.00"), evidence_ids=("SYNTHETIC-e",), **kwargs
+        )
+
+
+def test_asking_price_proceeds_never_supported_without_approved_discount() -> None:
+    asking = proceeds(
+        "9000.00", basis="mk_asking_prices", evidence_kind="asking_price", assumption_approved=True
+    )
+    assert not proceeds_supported(asking)
+    unapproved_discount = proceeds(
+        "9000.00", basis="mk_asking_prices", assumption_approved=True, negotiation_discount_pct=Decimal("8")
+    )
+    assert not proceeds_supported(unapproved_discount)
+    approved_discount = unapproved_discount.model_copy(update={"discount_approved": True})
+    assert proceeds_supported(approved_discount)
+    offer = ProceedsEstimate(
+        status=S.QUOTED,
+        currency="EUR",
+        base=eur("8500.00"),
+        basis="dealer_offer",
+        evidence_ids=("SYNTHETIC-dealer-offer",),
+    )
+    assert proceeds_supported(offer)
+    verified = ProceedsEstimate(
+        status=S.ACTUAL,
+        currency="EUR",
+        base=eur("8500.00"),
+        basis="verified_sales",
+        evidence_kind="verified_sale",
+        evidence_ids=("SYNTHETIC-verified-sale",),
+    )
+    assert proceeds_supported(verified)
+
+
+def test_unapproved_non_material_estimate_blocks_alert_and_quote_support() -> None:
+    sell = proceeds("8000.00", low="7800.00", assumption_approved=True)
+    buy = purchase(status=S.QUOTED)
+    lines = [
+        ln if ln.category != C.RISK_RESERVE else line(C.RISK_RESERVE, "0.00")  # convenient, unapproved
+        for ln in _quoted_lines()
+    ]
+    result = run(lines, buy=buy, sell=sell, threshold=APPROVED)
+    assert result.material_support == "estimated"
+    assert any(u.startswith("risk_reserve") for u in result.unsupported_material)
+    assert not result.threshold.alert_eligible
+    assert any("risk_reserve" in b for b in result.threshold.blockers)
+    approved = run(_quoted_lines(), buy=buy, sell=sell, threshold=APPROVED)
+    assert approved.material_support == "quote_supported" and approved.threshold.alert_eligible
+
+
+def test_conflicting_same_day_rates_are_never_chosen_silently() -> None:
+    lines = [ln for ln in spec_lines() if ln.category != C.TRANSPORT]
+    lines.append(line(C.TRANSPORT, "658.00", currency="CHF"))
+    other = ecb("CHF", "0.8000").model_copy(update={"provider": "SYNTHETIC other publisher"})
+    result = run(lines, rates=[ecb("CHF", "0.9400"), other])
+    assert result.scenario(BASE).transport is None
+    assert any(w.startswith("FX_RATE_AMBIGUOUS:CHF->EUR") for w in result.warnings)
+    same_value = ecb("CHF", "0.940000").model_copy(update={"provider": "SYNTHETIC other publisher"})
+    inverse = FxRate(
+        base="CHF",
+        quote="EUR",
+        rate=Decimal("1.25"),
+        rate_date=AS_OF.date() - timedelta(days=1),
+        retrieved_at=AS_OF,
+        provider="SYNTHETIC inverse publisher",
+    )
+    assert run(lines, rates=[ecb("CHF", "0.9400"), same_value]).scenario(BASE).transport == eur("700")
+    consistent = run(lines, rates=[ecb("CHF", "0.8"), inverse])
+    assert consistent.scenario(BASE).transport == eur("822.5")  # 658 / 0.8 == 658 * 1.25
+
+
+def test_deposit_in_price_and_deposit_line_warns_of_double_count() -> None:
+    buy = purchase("3300.00", included_refundable_deposit=eur("500.00"))
+    lines = [ln for ln in spec_lines() if ln.category != C.REFUNDABLE_DEPOSIT]
+    lines.append(line(C.REFUNDABLE_DEPOSIT, "500.00"))
+    result = run(lines, buy=buy)
+    assert any(w.startswith("DEPOSIT_POSSIBLY_COUNTED_TWICE") for w in result.warnings)
+    clean = run([ln for ln in spec_lines() if ln.category != C.REFUNDABLE_DEPOSIT], buy=buy)
+    assert not any("DEPOSIT_POSSIBLY" in w for w in clean.warnings)
+
+
+def test_scoped_quote_without_target_scope_is_not_silently_a_quote() -> None:
+    sell = proceeds("8000.00", low="7800.00", assumption_approved=True)
+    scoped = line(C.TRANSPORT, "700.00", status=S.QUOTED, scope=CostScope(origin_city="SYNTHETIC-Munich"))
+    lines = [scoped if ln.category == C.TRANSPORT else ln for ln in _quoted_lines()]
+    result = run(lines, buy=purchase(status=S.QUOTED), sell=sell, threshold=APPROVED)
+    assert any(w.startswith("COST_SCOPE_UNVERIFIED:transport") for w in result.warnings)
+    assert result.scenario(BASE).transport == eur("700.00")  # amount still modelled ...
+    assert not result.threshold.alert_eligible  # ... but it cannot support an alert as a quote
+    matched = run(
+        lines,
+        buy=purchase(status=S.QUOTED),
+        sell=sell,
+        threshold=APPROVED,
+        target_scope=CostScope(origin_city="SYNTHETIC-Munich"),
+    )
+    assert matched.material_support == "quote_supported" and matched.threshold.alert_eligible
+
+
+@pytest.mark.parametrize(
+    ("assumption", "match"),
+    [
+        ({"status": "estimated", "low": "900", "base": "700"}, "low <= base"),
+        ({"status": "estimated", "base": "-1"}, "negative"),
+        ({"status": "estimated"}, "base amount"),
+        ({"status": "unknown", "base": "700"}, "no amounts"),
+        ({"status": "not_applicable"}, "reason"),
+    ],
+)
+def test_cost_profile_assumptions_are_validated_at_load(assumption: dict[str, Any], match: str) -> None:
+    entry = {"category": "transport", "label": "SYNTHETIC", "note": "SYNTHETIC test", **assumption}
+    with pytest.raises(ValidationError, match=match):
+        CostProfile.model_validate(
+            {"profile_key": "synthetic", "version": 1, "basis": "SYNTHETIC", "assumptions": [entry]}
+        )
+
+
+def test_required_categories_cannot_be_dropped_to_hide_missing_lines() -> None:
+    for required in (frozenset(), REQUIRED_CATEGORIES - {C.REPAIRS}, REQUIRED_CATEGORIES | {C.PURCHASE}):
+        with pytest.raises(ValidationFailed, match="not_applicable line"):
+            run([], required_categories=required)
+    assert run(required_categories=REQUIRED_CATEGORIES).complete

@@ -19,7 +19,9 @@ States (spec 14): ``not_started`` | ``incomplete`` | ``estimated`` | ``quote_sup
 - ``invalid``: the listing failed deterministic screening; terminal.
 
 A non-fixture valuation never uses an unapproved/fixture tax rule: import costs are then
-unknown. Fixture inputs produce a fixture valuation that can never notify.
+unknown. Fixture inputs produce a fixture valuation that can never notify. The scenario
+import lines must come from the recorded tax calculation (``tax_calculation:<sha256>``
+evidence), so the fingerprinted rule is the one the figures used.
 """
 
 from __future__ import annotations
@@ -32,7 +34,13 @@ from typing import Any, Final, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
-from suv_deals.domain.costs import CONTRIBUTION_LABEL, CostProfileRef, ScenarioSet
+from suv_deals.domain.costs import (
+    CONTRIBUTION_LABEL,
+    TAX_CALCULATION_EVIDENCE_PREFIX,
+    CostProfileRef,
+    ScenarioSet,
+    tax_calculation_evidence_id,
+)
 from suv_deals.domain.enums import (
     EligibilityState,
     FxPurpose,
@@ -350,7 +358,15 @@ def assemble_valuation(
     fixture_inputs: bool = False,
     tax_unavailable_reason: str | None = None,
 ) -> Valuation:
-    """Assemble a valuation with state, unknowns, expiry and dependency fingerprint. Pure."""
+    """Assemble a valuation with state, unknowns, expiry and dependency fingerprint. Pure.
+
+    ``fx_rates`` are the FX observations this valuation relies on beyond those the
+    scenarios and the tax engine already report (e.g. the screening conversion). Each one
+    is a fingerprinted dependency and a freshness deadline, so pass only rates actually
+    used, never a whole rate history. When ``tax`` is given, the scenarios' import lines
+    must come from exactly that calculation (``costs.tax_cost_lines``); otherwise the
+    valuation is incomplete, because its figures would not match its recorded rule.
+    """
     as_of = ensure_utc(as_of)
     deps = build_dependencies(
         listing_revision_id=listing_revision_id,
@@ -470,9 +486,20 @@ def _material_unknowns(
     if screening.eur_payable is None:
         unknowns.append("acquisition: EUR payable amount unknown")
     unknowns.extend(f"{u.item}: {u.label} ({u.reason})" for u in scenarios.unknown_lines)
+    calc_sources = [s for s in scenarios.import_line_sources if s.startswith(TAX_CALCULATION_EVIDENCE_PREFIX)]
     if tax is None:
         unknowns.append(f"import tax: {tax_unavailable_reason or 'no applicable ACTIVE rule set'}")
+        if calc_sources:
+            unknowns.append("import tax: scenarios use a tax calculation that this valuation does not record")
     else:
+        expected = tax_calculation_evidence_id(tax)
+        if set(scenarios.import_line_sources) != {expected}:
+            # The recorded calculation (and its fingerprint) must be what the figures used.
+            stray = sorted(set(scenarios.import_line_sources) - {expected})
+            unknowns.append(
+                "import tax: scenario import lines do not all come from the recorded tax calculation "
+                f"({', '.join(stray) or 'no import lines'})"
+            )
         if not tax.complete:
             parts = [*tax.unknown_components, *(f"missing input {m}" for m in tax.missing_inputs)]
             unknowns.append(f"import tax incomplete ({tax.rule_set_id}@{tax.version}): {', '.join(parts)}")

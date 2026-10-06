@@ -11,7 +11,14 @@ Hard rules (spec 3):
 - Mileage must be strictly below 200,000 km (200,000 fails; 199,999.999 passes).
 - Net-only prices with unknown gross, instalments/leasing/deposits, price on request, missing
   prices, missing mileage, mileage ranges, conflicting odometer statements and missing FX are
-  ``needs_facts``; parts/damaged and auction prices are ``rejected``.
+  ``needs_facts``; parts/damaged and auction prices are ``rejected``. A price or mileage of exactly
+  0 is a site placeholder and is treated as missing (unknown is never 0, spec 2).
+- SUV identity: the taxonomy decides when it knows the model (``is_suv`` True passes, False
+  rejects even against a seller "SUV" body type). A body type in ``profile.body_types`` alone
+  passes only when ``profile.require_taxonomy_match`` is False; with the shipped default (True)
+  it is ``needs_facts`` (``TAXONOMY_UNMATCHED``) because marketplaces file pickups and raised
+  estates under "SUV/off-road". A non-SUV body type rejects; unknown model and body is
+  ``needs_facts``.
 - Non-EUR prices use the recorded *reference* rate with its explicit direction
   (1 EUR = x CHF -> CHF / x). A stale rate makes the result ``needs_facts`` only when the EUR value
   lies within ``fx_boundary_margin_pct`` of a band boundary; otherwise it is a warning.
@@ -84,6 +91,7 @@ class ReasonCode(StrEnum):
     AVAILABILITY_RESERVED = "AVAILABILITY_RESERVED"
     AVAILABILITY_UNKNOWN = "AVAILABILITY_UNKNOWN"
     PRICE_MISSING = "PRICE_MISSING"
+    PRICE_ZERO_PLACEHOLDER = "PRICE_ZERO_PLACEHOLDER"
     PRICE_CURRENCY_MISSING = "PRICE_CURRENCY_MISSING"
     PRICE_ON_REQUEST = "PRICE_ON_REQUEST"
     PRICE_TYPE_INSTALMENT = "PRICE_TYPE_INSTALMENT"
@@ -113,6 +121,7 @@ class ReasonCode(StrEnum):
     PRICE_BELOW_BAND = "PRICE_BELOW_BAND"
     PRICE_ABOVE_BAND = "PRICE_ABOVE_BAND"
     MILEAGE_MISSING = "MILEAGE_MISSING"
+    MILEAGE_ZERO_PLACEHOLDER = "MILEAGE_ZERO_PLACEHOLDER"
     MILEAGE_TOO_HIGH = "MILEAGE_TOO_HIGH"
     MILEAGE_RANGE_ONLY = "MILEAGE_RANGE_ONLY"
     MILEAGE_CONFLICT = "MILEAGE_CONFLICT"
@@ -233,6 +242,7 @@ class _PriceFacts:
     eur_exact: Decimal | None = None
     eur_lower: Decimal | None = None
     rate: FxRate | None = None
+    fx_field: str | None = None  # stable fact name, e.g. "fx:CHF/EUR", used by every FX reason
     common: _Rule = field(default_factory=_Rule)  # fails/warnings/info, independent of the band
     undetermined: list[ScreeningReason] = field(default_factory=list)  # needs_facts for the band
 
@@ -352,6 +362,15 @@ def _price_facts(listing: NormalizedListing, fx_rates: Sequence[FxRate], as_of: 
                 ReasonCode.PRICE_BASIS_UNKNOWN, "gross/net basis of the price unknown", "price.basis"
             )
 
+    if base_minor == 0 or lower_minor == 0:
+        # "0 €" is a site placeholder for a missing/on-request price; unknown is never 0 (spec 2).
+        facts.unknown(
+            ReasonCode.PRICE_ZERO_PLACEHOLDER,
+            "advertised amount 0 is a placeholder, not a price",
+            "price.amount_minor",
+        )
+        return facts
+
     if (base_minor is not None or lower_minor is not None) and currency is None:
         facts.unknown(ReasonCode.PRICE_CURRENCY_MISSING, "price currency unknown", "price.currency")
         return facts
@@ -411,16 +430,17 @@ def _price_facts(listing: NormalizedListing, fx_rates: Sequence[FxRate], as_of: 
         facts.eur_lower = facts.lower_bound.amount if facts.lower_bound else None
         return facts
 
+    facts.fx_field = f"fx:{currency}/EUR"
     rate, ignored_future = select_reference_rate(fx_rates, currency, as_of)
     if ignored_future:
         facts.common.add(
             ReasonCode.FX_RATE_FUTURE_DATED,
             ReasonSeverity.WARNING,
             "an FX rate dated after the screening date was ignored",
-            f"fx:{currency}/EUR",
+            facts.fx_field,
         )
     if rate is None:
-        facts.unknown(ReasonCode.FX_MISSING, f"no EUR reference rate for {currency}", f"fx:{currency}/EUR")
+        facts.unknown(ReasonCode.FX_MISSING, f"no EUR reference rate for {currency}", facts.fx_field)
         return facts
     facts.rate = rate
     facts.eur_exact = rate.convert(facts.payable, "EUR").amount if facts.payable else None
@@ -429,7 +449,7 @@ def _price_facts(listing: NormalizedListing, fx_rates: Sequence[FxRate], as_of: 
         ReasonCode.FX_CONVERTED,
         ReasonSeverity.INFO,
         f"converted {currency} to EUR with {rate.provider} reference rate of {rate.rate_date.isoformat()}",
-        f"fx:{currency}/EUR",
+        facts.fx_field,
     )
     return facts
 
@@ -463,7 +483,7 @@ def _band_rule(facts: _PriceFacts, profile: SearchProfile, as_of: date) -> _Rule
                 ReasonCode.FX_STALE_NEAR_BOUNDARY,
                 ReasonSeverity.NEEDS_FACTS,
                 f"FX rate is {facts.rate.age_days(as_of)} days old and the EUR value is near a band boundary",
-                f"fx:{facts.rate.base}/{facts.rate.quote}",
+                facts.fx_field,
                 key,
             )
             return rule
@@ -473,7 +493,7 @@ def _band_rule(facts: _PriceFacts, profile: SearchProfile, as_of: date) -> _Rule
                 ReasonCode.FX_STALE,
                 ReasonSeverity.WARNING,
                 f"FX rate is {facts.rate.age_days(as_of)} days old (far from band boundaries)",
-                f"fx:{facts.rate.base}/{facts.rate.quote}",
+                facts.fx_field,
                 key,
             )
         if profile.min_price_eur is not None and value < profile.min_price_eur:
@@ -586,6 +606,15 @@ def _mileage_rule(listing: NormalizedListing, profile: SearchProfile) -> _Rule:
             ReasonCode.MILEAGE_MISSING, ReasonSeverity.NEEDS_FACTS, "mileage unknown", "vehicle.mileage_km"
         )
         return rule
+    if km == 0:
+        # A used vehicle at 0 km is a missing-value placeholder; unknown is never 0 (spec 2).
+        rule.add(
+            ReasonCode.MILEAGE_ZERO_PLACEHOLDER,
+            ReasonSeverity.NEEDS_FACTS,
+            "mileage 0 km is a placeholder, not an odometer reading",
+            "vehicle.mileage_km",
+        )
+        return rule
     if vehicle.mileage_claim == OdometerClaim.ESTIMATED or vehicle.mileage_original.is_estimate:
         if km < ceiling - ESTIMATE_UNCERTAINTY_KM:
             rule.add(
@@ -671,7 +700,22 @@ def _suv_rule(listing: NormalizedListing, match: TaxonomyMatch | None, profile: 
             )
         return rule
     if body in profile.body_types:
-        if profile.require_taxonomy_match and match is not None:
+        # SUV identity rests on the seller's body type alone. Marketplaces lump pickups and raised
+        # estates into one "SUV/off-road" category, so a profile with require_taxonomy_match=True
+        # (the shipped default) needs the model confirmed before it can be eligible; with False the
+        # body type is accepted and the gap is only a warning.
+        if profile.require_taxonomy_match:
+            detail = (
+                "no vehicle taxonomy supplied" if match is None else "model not in the reference taxonomy"
+            )
+            rule.add(
+                ReasonCode.TAXONOMY_UNMATCHED,
+                ReasonSeverity.NEEDS_FACTS,
+                f"SUV identity from body type only ({detail}); profile requires a taxonomy match",
+                "vehicle.model",
+                key,
+            )
+        elif match is not None:
             rule.add(
                 ReasonCode.TAXONOMY_UNMATCHED,
                 ReasonSeverity.WARNING,

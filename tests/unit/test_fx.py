@@ -286,7 +286,7 @@ class FakeClient:
 
 
 def settings(**kw: Any) -> Settings:
-    return Settings(_env_file=None, **kw)  # type: ignore[call-arg]
+    return Settings(_env_file=None, **kw)
 
 
 async def test_fetch_refuses_when_disabled() -> None:
@@ -351,3 +351,32 @@ async def test_fetch_rejects_hostile_document() -> None:
         await fetch_ecb_daily(settings(fx_fetch_enabled=True), client, clock=FrozenClock(RETRIEVED))
     assert exc.value.code == ErrorCode.DEPENDENCY_UNAVAILABLE
     assert "not allowed" in exc.value.details["reason"]
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_same_rate_in_another_representation_or_direction_is_not_ambiguous() -> None:
+    a = rate(value="0.94")
+    b = rate(value="0.9400", provider="SYNTHETIC mirror")
+    chosen, warnings = select_rate([a, b], "EUR", "CHF", ON, 7)
+    assert chosen is not None and chosen.rate == Decimal("0.94") and warnings == ()
+    inverse = rate(base="CHF", quote="EUR", value="1.25", provider="SYNTHETIC inverse")
+    forward = rate(value="0.8")
+    chosen, warnings = select_rate([inverse, forward], "EUR", "CHF", ON, 7)
+    assert chosen == forward and warnings == ()  # stored in the requested direction preferred
+    chosen, _ = select_rate([inverse, forward], "CHF", "EUR", ON, 7)
+    assert chosen == inverse
+    inconsistent = rate(base="CHF", quote="EUR", value="1.2", provider="SYNTHETIC inverse")
+    chosen, warnings = select_rate([inconsistent, forward], "EUR", "CHF", ON, 7)
+    assert chosen is None and warnings[0].startswith("FX_RATE_AMBIGUOUS")
+
+
+def test_utf16_without_bom_entity_payload_is_rejected() -> None:
+    payload = (
+        '<?xml version="1.0" encoding="UTF-16LE"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>'
+        f"<gesmes:Envelope {NS}><Cube><Cube time='2026-10-05'><Cube currency='CHF' rate='&x;'/></Cube></Cube>"
+        "</gesmes:Envelope>"
+    ).encode("utf-16-le")
+    with pytest.raises(ValidationFailed):
+        parse_ecb_daily_xml(payload, retrieved_at=RETRIEVED)

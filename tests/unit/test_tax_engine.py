@@ -29,6 +29,7 @@ from suv_deals.domain.tax_engine import (
     IncludedCost,
     OriginProof,
     OriginProofStatus,
+    Predicate,
     ReviewRecord,
     RoundingSpec,
     RuleSet,
@@ -68,7 +69,8 @@ SYNTHETIC_SOURCE = RuleSource(
 
 
 def fixture_doc() -> dict[str, Any]:
-    return json.loads(FIXTURE.read_text(encoding="utf-8"), parse_float=Decimal)
+    doc: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"), parse_float=Decimal)
+    return doc
 
 
 def variant(mutate: Callable[[dict[str, Any]], None] | None = None, **fields: Any) -> RuleSet:
@@ -1065,7 +1067,7 @@ def test_total_rounding_applies_after_summing_reported_amounts() -> None:
     ],
 )
 def test_apply_rounding_modes(value: str, quantum: str, mode: str, expected: str) -> None:
-    spec = RoundingSpec(quantum=Decimal(quantum), mode=mode)  # type: ignore[arg-type]
+    spec = RoundingSpec(quantum=Decimal(quantum), mode=mode)
     assert apply_rounding(Decimal(value), spec) == Decimal(expected)
 
 
@@ -1094,7 +1096,7 @@ def test_invalid_inputs_rejected(bad: dict[str, Any]) -> None:
 
 def test_float_inputs_rejected() -> None:
     with pytest.raises(ValidationError, match="float"):
-        TaxInputs(co2_g_km=120.5)  # type: ignore[arg-type]
+        TaxInputs(co2_g_km=120.5)
 
 
 def test_unapproved_classification_is_a_missing_required_input() -> None:
@@ -1187,3 +1189,93 @@ def test_result_models_enforce_labels() -> None:
     unknown = next(c for c in incomplete.components if c.status == ComponentStatus.UNKNOWN)
     with pytest.raises(ValidationError, match="resolved"):
         ComponentResult.model_validate({**unknown.model_dump(), "amount": Money.of("0", "MKD")})
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_customs_rate_dated_after_declaration_is_never_used() -> None:
+    late = customs_rate(rate_date=date(2026, 6, 2))  # observed after the 2026-06-01 declaration
+    calc = calculate(
+        load_rule_set_file(FIXTURE),
+        inputs(customs_value=Money.of("3000.00", "EUR"), customs_fx_rate=late),
+        T0,
+    )
+    duty = calc.components[1]
+    assert duty.status == ComponentStatus.UNKNOWN
+    assert any("CUSTOMS_FX_RATE_AFTER_DECLARATION" in w for w in duty.warnings)
+    assert calc.customs_fx_rate is None and not calc.complete
+    same_day = customs_rate(rate_date=DECL)
+    ok = calculate(
+        load_rule_set_file(FIXTURE),
+        inputs(customs_value=Money.of("3000.00", "EUR"), customs_fx_rate=same_day),
+        T0,
+    )
+    assert ok.components[1].status == ComponentStatus.RESOLVED
+
+
+def test_absurd_amounts_fail_with_typed_errors_never_raw_decimal_errors() -> None:
+    with pytest.raises(ValidationError, match="sanity bound"):
+        inputs(customs_value=Money.of("1e60", "MKD"))
+    with pytest.raises(ValidationError, match="sanity bound"):
+        IncludedCost(label="x", amount=Money.of("1e13", "EUR"), legal_basis="SYNTHETIC basis")
+
+    def huge_fee(d: dict[str, Any]) -> None:
+        component(d, "processing_fee")["amount"] = "1e60"
+
+    with pytest.raises(ValidationFailed, match="precision"):
+        calculate(variant(huge_fee), inputs(), T0)
+    with pytest.raises(ValidationFailed, match="precision"):
+        apply_rounding(Decimal("1e60"), RoundingSpec(quantum=Decimal("0.01"), mode="half_up"))
+
+
+def test_json_nan_and_infinity_constants_are_rejected() -> None:
+    doc = fixture_doc()
+    doc["sha256"] = None
+    text = json.dumps(doc, default=str)
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        with pytest.raises(ValidationFailed, match="JSON"):
+            parse_rule_set_json(text.replace('"rate": "0.10"', f'"rate": {constant}'))
+
+
+def test_boolean_predicate_values_are_rejected() -> None:
+    for value in (True, False, [True]):
+        with pytest.raises(ValidationError, match="boolean"):
+            Predicate(input="co2_g_km", op="gt", value=value)
+
+
+def test_co2_cycle_tables_require_declared_cycle_input() -> None:
+    doc = fixture_doc()
+    doc["sha256"] = None
+    doc["required_inputs"].remove("co2_cycle")
+    problems = rule_set_problems(RuleSet.model_validate(doc))
+    assert any("co2_cycle declared" in p for p in problems), problems
+
+
+def test_fixture_rule_sets_never_enter_review() -> None:
+    draft = RuleSet.model_validate({**fixture_doc(), "status": "draft", "sha256": None})
+    assert draft.is_fixture
+    with pytest.raises(ValidationFailed, match="fixture"):
+        transition_rule_set(draft, TaxRuleStatus.UNDER_REVIEW, at=T0)
+    assert transition_rule_set(draft, TaxRuleStatus.REVOKED, at=T0).status == TaxRuleStatus.REVOKED
+
+
+def test_calculation_content_hash_binds_inputs_and_results() -> None:
+    rule = load_rule_set_file(FIXTURE)
+    first = calculate(rule, inputs(), T0)
+    assert first.content_sha256() == calculate(rule, inputs(), T0).content_sha256()
+    assert len(first.content_sha256()) == 64
+    other = calculate(rule, inputs(customs_value=Money.of("100001.00", "MKD")), T0)
+    assert other.content_sha256() != first.content_sha256()
+
+
+def test_rule_set_for_another_vehicle_category_is_refused() -> None:
+    motorcycle = Classification(
+        tariff_code="8711 20",
+        vehicle_category="motorcycle",
+        evidence_ids=("SYNTHETIC-classification-evidence",),
+        approval_status="approved",
+        approved_by="SYNTHETIC owner",
+    )
+    with pytest.raises(ValidationFailed, match="category"):
+        calculate(load_rule_set_file(FIXTURE), inputs(classification=motorcycle), T0)

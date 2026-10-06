@@ -169,3 +169,18 @@ grant select, insert on table ops.audit_events to suv_backend;
 grant select, insert, update on table ops.activation_gates to suv_backend;
 grant select, insert, update (last_used_at, revoked_at, revoked_by, revoke_reason)
   on table ops.api_credentials to suv_backend;
+
+-- Fail closed if, after all grants, the backend role could bypass RLS or escalate
+-- (see ops.backend_role_problems() in migration 0100).
+do $verify_role$
+declare
+  problems text[] := ops.backend_role_problems('suv_backend');
+begin
+  if pg_catalog.cardinality(problems) > 0 then
+    raise exception using
+      errcode = 'insufficient_privilege',
+      message = 'role suv_backend is unsafe for tenant isolation: '
+             || pg_catalog.array_to_string(problems, ', ');
+  end if;
+end
+$verify_role$;

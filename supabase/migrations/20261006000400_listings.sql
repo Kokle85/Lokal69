@@ -280,8 +280,8 @@ create table app.listing_observations (
   constraint listing_observations_ingestion_uk unique (workspace_id, ingestion_key),
   constraint listing_observations_listing_fk foreign key (workspace_id, source_id, listing_id)
     references app.listings (workspace_id, source_id, id),
-  constraint listing_observations_run_fk foreign key (workspace_id, crawl_run_id)
-    references ops.crawl_runs (workspace_id, id),
+  constraint listing_observations_run_fk foreign key (workspace_id, source_id, crawl_run_id)
+    references ops.crawl_runs (workspace_id, source_id, id),
   constraint listing_observations_job_fk foreign key (workspace_id, job_id)
     references ops.jobs (workspace_id, id),
   constraint listing_observations_page_ck check (page_number >= 1 and position >= 0),

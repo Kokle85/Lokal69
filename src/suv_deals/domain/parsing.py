@@ -95,6 +95,7 @@ class ParseWarning(StrEnum):
     CONFLICTING_PRICE_BASIS = "CONFLICTING_PRICE_BASIS"
     CONFLICTING_NEGOTIABILITY = "CONFLICTING_NEGOTIABILITY"
     PRICE_MISSING = "PRICE_MISSING"
+    PRICE_ZERO_PLACEHOLDER = "PRICE_ZERO_PLACEHOLDER"
     SUB_MINOR_PRECISION = "SUB_MINOR_PRECISION"
     # mileage
     MILEAGE_UNKNOWN = "MILEAGE_UNKNOWN"
@@ -107,6 +108,7 @@ class ParseWarning(StrEnum):
     MILES_CONVERTED = "MILES_CONVERTED"
     MILEAGE_ZERO_TREATED_UNKNOWN = "MILEAGE_ZERO_TREATED_UNKNOWN"
     MILEAGE_IMPLAUSIBLE = "MILEAGE_IMPLAUSIBLE"
+    MILEAGE_NEGATIVE = "MILEAGE_NEGATIVE"
     # power / displacement
     POWER_MISSING = "POWER_MISSING"
     POWER_CONFLICT = "POWER_CONFLICT"
@@ -271,6 +273,10 @@ def _interpret_token(token: str, locale: Locale | None) -> NumberParse:
     if group_seps:
         if len({_sep_kind(c) for c in group_seps}) > 1:
             return NumberParse(ambiguous=True, warnings=(ParseWarning.INVALID_GROUPING,), raw=token)
+        if int_parts[0].startswith("0"):
+            # '0.750' (de) / "0'750" (ch): a leading zero never starts a thousands grouping; it is
+            # far more likely a foreign-locale fraction (0.75), so it is never read as 750.
+            return NumberParse(ambiguous=True, warnings=(ParseWarning.INVALID_GROUPING,), raw=token)
         if not 1 <= len(int_parts[0]) <= 3 or any(len(p) != 3 for p in int_parts[1:]):
             # e.g. '1.5' in de: the group mark is not followed by a three-digit group.
             return NumberParse(ambiguous=True, warnings=(ParseWarning.AMBIGUOUS_SEPARATOR,), raw=token)
@@ -343,6 +349,7 @@ _CURRENCY_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_rx(rf"{_NL}euro{_NR}(?!\s*[1-6]\b)"), "EUR"),  # not the "Euro 5" emissions class
     (_rx(rf"{_NL}CHF{_NR}"), "CHF"),
     (_rx(rf"{_NL}[sS]?Fr\.", 0), "CHF"),
+    (_rx(rf"{_NL}SFr{_NR}", 0), "CHF"),  # bare "Fr" without a dot is not matched ("Fr" = Friday)
     (_rx(rf"{_NL}MKD{_NR}"), "MKD"),
     (_rx(rf"{_NL}ден(?:ари|ар)?{_NR}\.?"), "MKD"),  # noqa: RUF001 (Macedonian Cyrillic wording)
     (_rx("\u00a3", 0), "GBP"),
@@ -353,6 +360,9 @@ _CURRENCY_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
 _NOT_POSSIBLE = (
     r"(?!\s+(?:möglich|moeglich|possibile|possible|disponibile|available|auf\s+anfrage|su\s+richiesta))"
 )
+# Negated damage wording ("keine Defekte", "ohne Motorschaden", "non incidentata") states the
+# opposite and must never classify the vehicle as parts/damaged.
+_NOT_NEGATED = r"(?<!kein )(?<!keine )(?<!keinen )(?<!ohne )(?<!nicht )(?<!non )(?<!senza )(?<!no )(?<!not )"
 
 # (pattern, PriceType) in no particular order; precedence is applied separately.
 _PRICE_TYPE_MARKERS: tuple[tuple[re.Pattern[str], PriceType], ...] = (
@@ -384,11 +394,14 @@ _PRICE_TYPE_MARKERS: tuple[tuple[re.Pattern[str], PriceType], ...] = (
     (_rx(r"\bexport(?:preis)?\b" + _NOT_POSSIBLE), PriceType.EXPORT_NET),
     (_rx(r"\bh(?:ä|ae)ndlerpreis\b"), PriceType.EXPORT_NET),
     (_rx(r"\b(?:export\s+price|prezzo\s+export)\b"), PriceType.EXPORT_NET),
-    (_rx(r"\bbastler\w*"), PriceType.PARTS_OR_DAMAGED),
-    (_rx(r"\bdefekt\w*"), PriceType.PARTS_OR_DAMAGED),
-    (_rx(r"\b(?:motorschaden|getriebeschaden|unfallwagen|unfallfahrzeug)\b"), PriceType.PARTS_OR_DAMAGED),
+    (_rx(_NOT_NEGATED + r"\bbastler\w*"), PriceType.PARTS_OR_DAMAGED),
+    (_rx(_NOT_NEGATED + r"\bdefekt\w*"), PriceType.PARTS_OR_DAMAGED),
+    (
+        _rx(_NOT_NEGATED + r"\b(?:motorschaden|getriebeschaden|unfallwagen|unfallfahrzeug)\b"),
+        PriceType.PARTS_OR_DAMAGED,
+    ),
     (_rx(r"\bper\s+ricambi\b"), PriceType.PARTS_OR_DAMAGED),
-    (_rx(r"\bincidentat[ao]\b"), PriceType.PARTS_OR_DAMAGED),
+    (_rx(_NOT_NEGATED + r"\bincidentat[ao]\b"), PriceType.PARTS_OR_DAMAGED),
     (_rx(r"\bnon\s+marciante\b"), PriceType.PARTS_OR_DAMAGED),
     (_rx(r"\bfor\s+parts\b|\bspares\s+or\s+repair\b"), PriceType.PARTS_OR_DAMAGED),
     (_rx(r"\bpreis\s+auf\s+anfrage\b"), PriceType.PRICE_ON_REQUEST),
@@ -400,40 +413,45 @@ _PRICE_TYPE_MARKERS: tuple[tuple[re.Pattern[str], PriceType], ...] = (
 # (e.g. "Leasing auf Anfrage" next to a real price must not hide the price).
 _GENERIC_ON_REQUEST = _rx(r"(?<!leasing )(?<!finanzierung )\b(?:auf\s+anfrage|su\s+richiesta|on\s+request)\b")
 
-# Precedence: the most specific statement about *what the number is* wins.
+# Precedence: parts/damaged describes the *vehicle* and disqualifies it whatever the number means,
+# so it wins; after that the most specific statement about *what the number is* wins.
 _PRICE_TYPE_PRECEDENCE: tuple[PriceType, ...] = (
+    PriceType.PARTS_OR_DAMAGED,
     PriceType.INSTALMENT,
     PriceType.LEASING,
     PriceType.DEPOSIT,
     PriceType.AUCTION_CURRENT_BID,
     PriceType.AUCTION_START,
     PriceType.PRICE_ON_REQUEST,
-    PriceType.PARTS_OR_DAMAGED,
     PriceType.EXPORT_NET,
 )
 
 _VAT_WORD = r"(?:mwst|ust|mehrwertsteuer|iva|vat)"
-_RATE = r"(?:\d{1,2}(?:[.,]\d{1,2})?\s*%\s*)?"
+_RATE_NUMBER = r"\d{1,2}(?:[.,]\d{1,2})?"
+_RATE = rf"(?:{_RATE_NUMBER}\s*%\s*)?"
+# "zzgl. gesetzl. MwSt." / "inkl. gesetzlicher MwSt." / "inkl. ges. MwSt." are the usual DE forms.
+_LEGAL = r"(?:(?:gesetzl(?:\.|iche[rn]?)?|ges\.)\s*)?"
 _NET_MARKERS: tuple[re.Pattern[str], ...] = (
     _rx(r"\bnetto\b"),
     _rx(r"\bnet\b"),
-    _rx(rf"\bzzgl\.?\s*{_RATE}{_VAT_WORD}\b\.?"),
-    _rx(rf"\bexkl\.?\s*{_RATE}{_VAT_WORD}\b\.?"),
+    _rx(rf"\bzzgl\.?\s*{_RATE}{_LEGAL}{_RATE}{_VAT_WORD}\b\.?"),
+    _rx(rf"\bexkl\.?\s*{_RATE}{_LEGAL}{_RATE}{_VAT_WORD}\b\.?"),
     _rx(rf"\bexcl\.?\s*{_RATE}{_VAT_WORD}\b\.?"),
     _rx(rf"\bohne\s+{_VAT_WORD}\b\.?"),
     _rx(r"\+\s*iva\b"),
-    _rx(r"\biva\s+esclusa\b|\besclusa\s+iva\b|\boltre\s+iva\b|\biva\s+esclusa\b|\b\+\s*vat\b"),
+    _rx(r"\+\s*vat\b"),  # no leading \b: '+' follows a space, which is not a word boundary
+    _rx(r"\biva\s+esclusa\b|\besclusa\s+iva\b|\boltre\s+iva\b"),
     _rx(r"\bplus\s+vat\b"),
 )
 _VAT_SHOWN_MARKERS: tuple[re.Pattern[str], ...] = (
     _rx(r"\b(?:mwst|ust|mehrwertsteuer)\.?\s*ausweisbar\b"),
-    _rx(r"\biva\s+(?:esposta|deducibile|detraibile)\b"),
+    _rx(rf"\biva\s+{_RATE}(?:esposta|deducibile|detraibile)\b"),
     _rx(r"\bvat\s+(?:deductible|qualifying|reclaimable)\b"),
 )
 _GROSS_MARKERS: tuple[re.Pattern[str], ...] = (
-    _rx(rf"\binkl\.?\s*{_RATE}{_VAT_WORD}\b\.?"),
+    _rx(rf"\binkl\.?\s*{_RATE}{_LEGAL}{_RATE}{_VAT_WORD}\b\.?"),
     _rx(rf"\bincl\.?\s*{_RATE}{_VAT_WORD}\b\.?"),
-    _rx(r"\biva\s+(?:inclusa|compresa)\b"),
+    _rx(rf"\biva\s+{_RATE}(?:inclusa|compresa)\b"),
     _rx(r"\bbrutto\b"),
     _rx(r"\bgross\b"),
 )
@@ -466,7 +484,13 @@ _NEGOTIABLE_YES: tuple[re.Pattern[str], ...] = (
     _rx(r"\btrattabil[ei]\b"),
     _rx(r"\bnegotiable\b"),
 )
-_VAT_RATE = _rx(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%")
+# A percentage is a *VAT* rate only when it is attached to VAT wording: "19% MwSt.", "22 % IVA",
+# "MwSt. 19%", "IVA 22% inclusa", "MwSt. ausweisbar 19%". A "0% Finanzierung" or "3% Zinsen" next
+# to an unrelated "inkl. MwSt." is never read as the VAT rate.
+_VAT_RATE_BEFORE_WORD = _rx(rf"(?<![0-9.,])({_RATE_NUMBER})\s*%\s*{_LEGAL}{_VAT_WORD}\b")
+_VAT_RATE_AFTER_WORD = _rx(
+    rf"\b{_VAT_WORD}\b\.?\s*(?:ausweisbar\s*|inclusa\s*|esposta\s*)?[(:]?\s*({_RATE_NUMBER})\s*%"
+)
 
 
 class PriceParse(BaseModel):
@@ -549,7 +573,11 @@ def parse_price(text: str | None, locale: Locale | None, default_currency: str |
     classify the number so it is never mistaken for a full-vehicle payable price. Gross/net/VAT
     wording is recorded exactly as stated; "MwSt. ausweisbar" records a *claimed* reclaimable VAT
     (``vat_reclaimable=YES``), never an entitlement. Several different amounts or currencies yield
-    ``None`` with a warning rather than a guess. ``default_currency`` is used only when the text
+    ``None`` with a warning rather than a guess; ``'0 €'`` is a placeholder (``None`` +
+    ``PRICE_ZERO_PLACEHOLDER``), never a price of zero. Negated damage wording ("keine Defekte",
+    "ohne Motorschaden") is not a parts/damaged classification, and parts/damaged wording wins over
+    every other price type because it disqualifies the vehicle itself. A VAT rate is recorded only
+    when the percentage is attached to VAT wording. ``default_currency`` is used only when the text
     carries no currency marker, and that is flagged ``CURRENCY_DEFAULTED``.
     """
     problem = _too_long_or_empty(text)
@@ -584,11 +612,17 @@ def parse_price(text: str | None, locale: Locale | None, default_currency: str |
             warnings.extend(parsed.warnings)
         else:
             values.append(parsed.value)
+    zero_placeholder = False
     if candidates and len(values) == len(candidates):
         if len(set(values)) == 1:
             amount = values[0]
         else:
             warnings.append(ParseWarning.MULTIPLE_AMOUNTS)
+    if amount is not None and amount == 0:
+        # "0 €" is a site placeholder for a missing/on-request price; unknown is never 0 (spec 2).
+        warnings.append(ParseWarning.PRICE_ZERO_PLACEHOLDER)
+        amount = None
+        zero_placeholder = True
     if (
         amount is not None
         and currency is not None
@@ -601,7 +635,7 @@ def parse_price(text: str | None, locale: Locale | None, default_currency: str |
 
     # Price type.
     found_types = {ptype for pattern, ptype in _PRICE_TYPE_MARKERS if pattern.search(cleaned)}
-    if amount is None and not candidates and _GENERIC_ON_REQUEST.search(cleaned):
+    if amount is None and (not candidates or zero_placeholder) and _GENERIC_ON_REQUEST.search(cleaned):
         found_types.add(PriceType.PRICE_ON_REQUEST)
     ordered = [t for t in _PRICE_TYPE_PRECEDENCE if t in found_types]
     markers.extend(t.value for t in ordered)
@@ -661,15 +695,17 @@ def parse_price(text: str | None, locale: Locale | None, default_currency: str |
     if basis != PriceBasis.UNKNOWN:
         markers.append(f"basis:{basis.value}")
 
-    # Stated VAT rate (only when VAT wording is present).
+    # Stated VAT rate: only a percentage attached to VAT wording (see _VAT_RATE_* patterns).
     vat_rate: Decimal | None = None
-    if re.search(rf"\b{_VAT_WORD}\b", cleaned, _I):
-        rates = {Decimal(m.group(1).replace(",", ".")) for m in _VAT_RATE.finditer(cleaned)}
-        rates = {r for r in rates if Decimal(0) <= r <= Decimal(100)}
-        if len(rates) == 1:
-            vat_rate = next(iter(rates))
-        elif len(rates) > 1:
-            warnings.append(ParseWarning.MULTIPLE_VAT_RATES)
+    rates = {
+        Decimal(m.group(1).replace(",", "."))
+        for pattern in (_VAT_RATE_BEFORE_WORD, _VAT_RATE_AFTER_WORD)
+        for m in pattern.finditer(cleaned)
+    }
+    if len(rates) == 1:
+        vat_rate = next(iter(rates))
+    elif len(rates) > 1:
+        warnings.append(ParseWarning.MULTIPLE_VAT_RATES)
 
     # Negotiability: explicit "not negotiable" wording is masked before looking for "VB".
     neg_masked, negotiable_no = _mask(cleaned, _NEGOTIABLE_NO)
@@ -721,7 +757,7 @@ _RANGE_JOINER = _rx(r"^\s*(?:[-\u2013\u2014]|bis|to|a|до)\s*$")
 _THOUSAND_KM = _rx(
     rf"(?:{_NL}tkm{_NR}|{_NL}t\s*km{_NR}|{_NL}tsd\.?\s*km{_NR}|{_NL}tausend\s*km{_NR}|{_NL}mila\s*km{_NR})"
 )
-_KM_UNIT = _rx(rf"{_NL}(?:km|kms|kilometer[n]?|kilometri|chilometri|км){_NR}\.?")
+_KM_UNIT = _rx(rf"{_NL}(?:km|kms|kilometer[n]?|kilometri|chilometri|км){_NR}(?!\s*/\s*h\b)\.?")
 _MILES_UNIT = _rx(rf"[0-9]\s*mi{_NR}\.?|{_NL}(?:miles?|meilen|miglia|mls){_NR}")
 
 
@@ -751,6 +787,10 @@ def parse_mileage(
       claim ``RANGE_ONLY`` with the bounds in ``original`` (spec 3: an uncertain range never passes).
     - ``'unbekannt'``/``'n.d.'`` -> ``km=None``, claim ``UNKNOWN``.
     - ``'0 km'`` on a used vehicle is treated as a placeholder: ``None`` + warning (unknown never 0).
+    - A value above 2,000,000 km (e.g. the typo ``'150.000 Tkm'``) is implausible: ``km=None`` +
+      ``MILEAGE_IMPLAUSIBLE``; the stated figure stays visible in ``original.amount``.
+    - A negative figure (``'-150.000 km'``) -> ``None`` + ``MILEAGE_NEGATIVE``.
+    - ``km/h`` is a speed, not a mileage unit.
     - No unit and no ``default_unit`` -> ``None`` + ``MILEAGE_UNIT_MISSING``.
     """
     problem = _too_long_or_empty(text)
@@ -793,6 +833,11 @@ def parse_mileage(
     def to_km(amount: Decimal) -> Decimal:
         return _CTX.multiply(amount, MILES_TO_KM) if unit == "mi" else amount
 
+    if _is_negative(cleaned, toks[0]):
+        return MileageParse(
+            original=MileageOriginal(text=raw, unit=unit or "unknown", is_estimate=estimate),
+            warnings=tuple([*warnings, ParseWarning.MILEAGE_NEGATIVE]),
+        )
     values: list[Decimal] = []
     for token in toks:
         parsed = _interpret_token(token.text, locale)
@@ -855,7 +900,12 @@ def parse_mileage(
     if unit == "mi":
         warnings.append(ParseWarning.MILES_CONVERTED)
     if km > MAX_PLAUSIBLE_MILEAGE_KM:
+        # Almost certainly a typo or unit slip ("150.000 Tkm"); acting on it would be a guess.
         warnings.append(ParseWarning.MILEAGE_IMPLAUSIBLE)
+        return MileageParse(
+            original=MileageOriginal(amount=amount, unit=unit, text=raw, is_estimate=estimate),
+            warnings=tuple(warnings),
+        )
     if estimate:
         warnings.append(ParseWarning.MILEAGE_ESTIMATE)
     return MileageParse(
@@ -1126,6 +1176,7 @@ def parse_first_registration(text: str | None, as_of: date | None = None) -> Fir
 # ---------------------------------------------------------------------------------------------
 
 _ISO_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_TIME_PART = re.compile(r"[Tt ]\d")
 _EU_DATETIME = re.compile(
     r"^(?P<d>\d{1,2})[./](?P<m>\d{1,2})[./](?P<y>\d{4})"
     r"(?:\s*,?\s*(?:um\s+|ore\s+|alle\s+)?(?P<H>\d{1,2})[:.](?P<M>\d{2})(?::(?P<S>\d{2}))?(?:\s*uhr)?)?$",
@@ -1212,9 +1263,13 @@ def parse_source_datetime(text: str | None, source_tz: str, as_of: datetime) -> 
                 time_precision = "second" if eu["S"] else "minute"
         else:
             parsed = datetime.fromisoformat(stripped.replace(" ", "T", 1) if " " in stripped else stripped)
-            time_precision = (
-                "second" if parsed.second or parsed.microsecond or stripped.count(":") >= 2 else "minute"
-            )
+            if not _ISO_TIME_PART.search(stripped):
+                # Other ISO date-only forms ('20261006', week dates): no time was stated.
+                time_precision = "day"
+            elif parsed.second or parsed.microsecond or stripped.count(":") >= 2:
+                time_precision = "second"
+            else:
+                time_precision = "minute"
             if parsed.tzinfo is None:
                 naive = parsed
             else:

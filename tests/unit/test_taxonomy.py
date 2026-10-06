@@ -67,7 +67,24 @@ def test_repository_taxonomy_size_and_classes(taxonomy: VehicleTaxonomy) -> None
     suv_models = [m for m in models if m.vehicle_class in SUV_CLASSES]
     assert len(suv_models) >= 45
     excluded = {m.canonical: m.vehicle_class for m in models if m.vehicle_class not in SUV_CLASSES}
-    assert excluded == {"Navara": "pickup", "Outback": "estate"}
+    assert excluded == {
+        "Navara": "pickup",
+        "Hilux": "pickup",
+        "L200": "pickup",
+        "Ranger": "pickup",
+        "Amarok": "pickup",
+        "D-Max": "pickup",
+        "BT-50": "pickup",
+        "Outback": "estate",
+        "XC70": "estate",
+        "A6 allroad": "estate",
+        "A4 allroad": "estate",
+        "Octavia Scout": "estate",
+    }
+    # Exclusions never carry (unverifiable) generation data.
+    assert all(
+        not m.generations for make in taxonomy.document.makes for m in make.models if m.canonical in excluded
+    )
 
 
 def test_repository_taxonomy_generations_are_consistent(taxonomy: VehicleTaxonomy) -> None:
@@ -192,7 +209,23 @@ def test_model_contained_in_field_has_medium_confidence(taxonomy: VehicleTaxonom
 
 
 @pytest.mark.parametrize(
-    ("make", "model", "body"), [("Nissan", "Navara", BodyType.PICKUP), ("Subaru", "Outback", BodyType.ESTATE)]
+    ("make", "model", "body"),
+    [
+        ("Nissan", "Navara", BodyType.PICKUP),
+        ("Nissan", "NP300 Navara 2.5 dCi", BodyType.PICKUP),
+        ("Toyota", "Hilux 2.5 D-4D", BodyType.PICKUP),
+        ("Mitsubishi", "L200 Double Cab", BodyType.PICKUP),
+        ("Ford", "Ranger", BodyType.PICKUP),
+        ("VW", "Amarok", BodyType.PICKUP),
+        ("Isuzu", "D-Max", BodyType.PICKUP),
+        ("Mazda", "BT-50", BodyType.PICKUP),
+        ("Subaru", "Outback", BodyType.ESTATE),
+        ("Volvo", "XC70 D5 AWD", BodyType.ESTATE),
+        ("Audi", "A6 Allroad quattro", BodyType.ESTATE),
+        ("Audi", "allroad quattro 2.5 TDI", BodyType.ESTATE),
+        ("Audi", "A4 allroad", BodyType.ESTATE),
+        ("Skoda", "Octavia Scout", BodyType.ESTATE),
+    ],
 )
 def test_excluded_models_are_not_suv(
     taxonomy: VehicleTaxonomy, make: str, model: str, body: BodyType
@@ -297,6 +330,33 @@ def test_generation_rules(
         } & set(result.warnings)
     else:
         assert warning in result.warnings
+
+
+@pytest.mark.parametrize(
+    ("model", "canonical"),
+    [
+        ("Pajero Pinin 2.0 GDI", "Pajero Pinin"),
+        ("Pajero Sport 2.5 DI-D", "Pajero Sport"),
+        ("Pajero 3.2", "Pajero"),
+    ],
+)
+def test_distinct_pajero_models_never_inherit_pajero_generations(
+    taxonomy: VehicleTaxonomy, model: str, canonical: str
+) -> None:
+    result = taxonomy.match_vehicle("Mitsubishi", model, None, 2003)
+    assert result.model == canonical
+    assert result.is_suv is True
+    if canonical != "Pajero":
+        assert result.generation is None
+        assert TaxonomyWarning.GENERATION_NOT_IN_TAXONOMY in result.warnings
+
+
+@pytest.mark.parametrize(
+    ("make", "model"), [("Audi", "A6 Avant"), ("Skoda", "Octavia Combi"), ("Volvo", "V70")]
+)
+def test_plain_estates_stay_unknown(taxonomy: VehicleTaxonomy, make: str, model: str) -> None:
+    # Only the named raised estates are excluded; other models remain unknown (never False).
+    assert taxonomy.match_vehicle(make, model, None, 2010).is_suv is None
 
 
 def test_model_without_generations(taxonomy: VehicleTaxonomy) -> None:

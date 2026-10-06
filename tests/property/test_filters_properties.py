@@ -23,8 +23,9 @@ from suv_deals.domain.enums import (
     Tristate,
 )
 from suv_deals.domain.filters import screen
-from suv_deals.domain.listings import LocationInfo, NormalizedListing, PriceInfo, VehicleSpec
+from suv_deals.domain.listings import LocationInfo, MileageOriginal, NormalizedListing, PriceInfo, VehicleSpec
 from suv_deals.domain.money import FxRate
+from suv_deals.domain.parsing import parse_mileage
 from suv_deals.domain.profiles import BusinessConfig, load_business_config
 from suv_deals.domain.taxonomy import default_taxonomy
 
@@ -39,7 +40,13 @@ ELIGIBLE = {EligibilityState.ELIGIBLE_PRIMARY, EligibilityState.ELIGIBLE_MANUAL_
 
 
 def synthetic(
-    price_minor: int, mileage_km: Decimal, currency: str = "EUR", country: str = "DE"
+    price_minor: int,
+    mileage_km: Decimal,
+    currency: str = "EUR",
+    country: str = "DE",
+    *,
+    original: MileageOriginal | None = None,
+    claim: OdometerClaim = OdometerClaim.SELLER_REPORTED,
 ) -> NormalizedListing:
     return NormalizedListing(
         source_key="fixture_dealer_de",
@@ -53,7 +60,8 @@ def synthetic(
             model="RAV4",
             body_type=BodyType.SUV,
             mileage_km=mileage_km,
-            mileage_claim=OdometerClaim.SELLER_REPORTED,
+            mileage_original=original or MileageOriginal(),
+            mileage_claim=claim,
         ),
         price=PriceInfo(
             amount_minor=price_minor,
@@ -100,6 +108,31 @@ def test_above_3000_never_primary_even_with_all_profiles(price: int) -> None:
 )
 def test_mileage_at_or_above_200000_never_eligible(price: int, mileage: Decimal) -> None:
     result = screen(synthetic(price, mileage), ALL_ENABLED, [], AS_OF, default_taxonomy())
+    assert result.state not in ELIGIBLE
+
+
+def _de_grouped(value: int) -> str:
+    return f"{value:,}".replace(",", ".")
+
+
+@settings(max_examples=200)
+@given(
+    price=st.integers(min_value=0, max_value=500_000),
+    km=st.integers(min_value=200_000, max_value=1_999_999),
+    miles=st.integers(min_value=124_275, max_value=1_200_000),
+    use_miles=st.booleans(),
+    estimate=st.booleans(),
+)
+def test_parsed_mileage_at_or_above_200000_never_eligible(
+    price: int, km: int, miles: int, use_miles: bool, estimate: bool
+) -> None:
+    """End to end through the locale parser: '200.000 km', 'ca. 250.000 km', '124.275 mi' ..."""
+    prefix = "ca. " if estimate else ""
+    text = prefix + (f"{_de_grouped(miles)} mi" if use_miles else f"{_de_grouped(km)} km")
+    parsed = parse_mileage(text, "de")
+    assert parsed.km is not None and parsed.km >= Decimal("200000")
+    listing = synthetic(price, parsed.km, original=parsed.original, claim=parsed.claim)
+    result = screen(listing, ALL_ENABLED, [], AS_OF, default_taxonomy())
     assert result.state not in ELIGIBLE
 
 

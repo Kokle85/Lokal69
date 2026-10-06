@@ -6,12 +6,15 @@ All listings, URLs (``*.example``), IDs and VINs are SYNTHETIC test data, not re
 from __future__ import annotations
 
 import hashlib
+import itertools
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from suv_deals.domain.enums import Availability, Confidence, Drive, Fuel, Gearbox, Precision
 from suv_deals.domain.identity import (
@@ -136,6 +139,12 @@ def test_canonicalize_url(url: str, expected: str) -> None:
         "",
         "   ",
         "https://dealer.example/" + "a" * 2100,
+        "https://dealer.example:0/x",  # port 0 is not a usable port
+        "https://dealer%2Eexample/x",  # percent-encoded host
+        # IDNA 2003 nameprep would silently rewrite these into a *different* host
+        # (straße -> strasse, full-width letters -> ASCII); they are refused, never rewritten.
+        "https://straße.example/x",
+        "https://\uff44ealer.example/x",  # full-width "d"
     ],
 )
 def test_canonicalize_url_rejects(url: str) -> None:
@@ -326,7 +335,14 @@ def obs(
 def apply(
     state: ListingCurrentState, incoming: DetailObservation
 ) -> tuple[ListingCurrentState, PromotionOutcome]:
+    """Apply a decision the way the persistence layer must: write state only if told to."""
     decision = decide_promotion(state, incoming)
+    if not decision.update_listing_state:
+        assert decision.current_generation == state.current_generation
+        assert decision.accepted_observation_id == state.accepted_observation_id
+        assert decision.current_semantic_hash == state.current_semantic_hash
+        assert decision.revision_number == state.revision_number
+        return state, decision.outcome
     new_state = ListingCurrentState(
         current_generation=decision.current_generation,
         accepted_observation_id=decision.accepted_observation_id,
@@ -426,6 +442,81 @@ def test_conflicting_same_generation_higher_incoming_id_loses() -> None:
     assert not decision.promote_current
     assert decision.accepted_observation_id == uid(10)
     assert decision.current_semantic_hash == HASH_A
+
+
+def test_update_listing_state_flag() -> None:
+    state, _ = apply(ListingCurrentState(), obs(1, 20, HASH_A))
+    assert decide_promotion(state, obs(2, 30, HASH_A)).update_listing_state  # confirm: new generation
+    assert decide_promotion(state, obs(2, 30, HASH_B)).update_listing_state  # new revision
+    assert not decide_promotion(state, obs(1, 20, HASH_A)).update_listing_state  # pure replay
+    assert not decide_promotion(state, obs(1, 30, HASH_A)).update_listing_state  # higher-ID retry
+    lower_retry = decide_promotion(state, obs(1, 10, HASH_A))
+    assert lower_retry.update_listing_state and not lower_retry.promote_current
+    assert lower_retry.accepted_observation_id == uid(10)
+    assert not decide_promotion(state, obs(1, 20, HASH_B)).update_listing_state  # payload mismatch
+    assert not decide_promotion(state, obs(1, 30, HASH_B)).update_listing_state  # loses tie-break
+    state, _ = apply(state, obs(3, 40, HASH_B))
+    assert not decide_promotion(state, obs(2, 35, HASH_A)).update_listing_state  # late, older
+
+
+def test_unchanged_html_with_same_semantic_content_only_confirms() -> None:
+    # Cosmetic/HTML-only differences (raw text, provenance, parser version, observation time) do not
+    # change NormalizedListing.semantic_hash, so a newer generation confirms without a revision.
+    first = make_listing()
+    cosmetic = make_listing(
+        observed_at=OBSERVED + timedelta(hours=6),
+        parser_version="fixture@1.0.1",
+        price=PriceInfo(amount_minor=275000, currency="EUR", raw_text="2.750,- EUR (neu formatiert)"),
+        title="VW  Tiguan -- TOP",
+    )
+    assert first.semantic_hash() == cosmetic.semantic_hash()
+    state, _ = apply(ListingCurrentState(), obs(1, 10, first.semantic_hash()))
+    decision = decide_promotion(state, obs(2, 20, cosmetic.semantic_hash()))
+    assert decision.outcome == PromotionOutcome.CONFIRM_UNCHANGED
+    assert not decision.create_revision
+    changed = make_listing(price=PriceInfo(amount_minor=265000, currency="EUR"))
+    assert decide_promotion(state, obs(2, 20, changed.semantic_hash())).create_revision
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        {10: HASH_A, 20: HASH_B, 30: HASH_A},
+        {10: HASH_B, 20: HASH_A, 30: HASH_A},
+        {10: HASH_A, 20: HASH_A, 30: HASH_B},
+        {15: HASH_B, 20: HASH_A, 30: HASH_B, 40: h("C")},
+    ],
+)
+def test_same_generation_outcome_is_independent_of_completion_order(payloads: dict[int, str]) -> None:
+    """Spec 10 deterministic tie-break: whatever order retries of one generation complete in, the
+    accepted observation is the lowest ID and the current facts are that observation's facts."""
+    lowest = min(payloads)
+    for order in itertools.permutations(payloads):
+        state, _ = apply(ListingCurrentState(), obs(1, 1, h("previous generation")))
+        for observation in order:
+            state, _ = apply(state, obs(2, observation, payloads[observation]))
+        assert state.accepted_observation_id == uid(lowest), order
+        assert state.current_semantic_hash == payloads[lowest], order
+        assert state.current_generation == 2
+
+
+@settings(max_examples=200)
+@given(
+    payloads=st.dictionaries(
+        st.integers(min_value=2, max_value=10_000),
+        st.sampled_from([HASH_A, HASH_B, h("C")]),
+        min_size=1,
+        max_size=5,
+    ),
+    data=st.data(),
+)
+def test_same_generation_order_independence_property(payloads: dict[int, str], data: st.DataObject) -> None:
+    order = data.draw(st.permutations(list(payloads)))
+    state, _ = apply(ListingCurrentState(), obs(1, 1, h("previous generation")))
+    for observation in order:
+        state, _ = apply(state, obs(2, observation, payloads[observation]))
+    assert state.accepted_observation_id == uid(min(payloads))
+    assert state.current_semantic_hash == payloads[min(payloads)]
 
 
 def test_tie_break_is_order_independent() -> None:
@@ -589,6 +680,18 @@ def test_same_vehicle_vin_match_is_strong() -> None:
     assert suggestion.suggest
     assert suggestion.confidence == Confidence.HIGH
     assert "VIN_MATCH" in {s.code for s in suggestion.signals}
+
+
+def test_same_vehicle_vin_match_with_spec_conflict_is_only_low_confidence() -> None:
+    a = make_listing(documentation=Documentation(vin=SYNTHETIC_EU_VIN))
+    b = other_source(
+        documentation=Documentation(vin=SYNTHETIC_EU_VIN), vehicle={"make": "Toyota", "model": "RAV4"}
+    )
+    suggestion = possible_same_vehicle(a, b)
+    codes = {s.code for s in suggestion.signals}
+    assert {"VIN_MATCH", "SPEC_CONFLICT"} <= codes
+    assert suggestion.suggest  # surfaced for human review ...
+    assert suggestion.confidence == Confidence.LOW  # ... but never as a strong match
 
 
 def test_same_vehicle_vin_mismatch_never_suggested() -> None:

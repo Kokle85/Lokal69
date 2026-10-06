@@ -133,6 +133,10 @@ create table ops.event_subscriptions (
   callback_url text not null,
   encrypted_secret bytea not null,
   secret_version integer not null default 1,
+  -- Rotation window: the previous secret (still only ciphertext) may sign
+  -- deliveries until previous_secret_valid_until; then it is cleared.
+  previous_encrypted_secret bytea,
+  previous_secret_valid_until timestamptz,
   verification_state text not null default 'pending',
   verification_challenge_hash text,
   challenge_expires_at timestamptz,
@@ -157,6 +161,10 @@ create table ops.event_subscriptions (
     and pg_catalog.length(callback_url) <= 2048),
   constraint event_subscriptions_secret_ck check (pg_catalog.octet_length(encrypted_secret) between 16 and 4096),
   constraint event_subscriptions_secret_version_ck check (secret_version > 0),
+  constraint event_subscriptions_previous_secret_ck check (
+    (previous_encrypted_secret is null) = (previous_secret_valid_until is null)
+    and (previous_encrypted_secret is null
+         or pg_catalog.octet_length(previous_encrypted_secret) between 16 and 4096)),
   constraint event_subscriptions_verification_ck check (verification_state in ('pending', 'verified', 'failed')),
   constraint event_subscriptions_verified_ck check (verification_state <> 'verified' or verified_at is not null),
   constraint event_subscriptions_challenge_hash_ck check (
@@ -206,6 +214,9 @@ create table ops.event_deliveries (
   constraint event_deliveries_sending_lease_ck check (
     state <> 'sending'
     or (lease_owner is not null and lease_token is not null and lease_expires_at is not null)),
+  -- Waiting deliveries carry no lease; the next claim mints a fresh token (fencing).
+  constraint event_deliveries_waiting_no_lease_ck check (
+    state not in ('pending', 'retry_wait') or (lease_token is null and lease_expires_at is null)),
   constraint event_deliveries_accepted_ck check (state <> 'accepted' or accepted_at is not null),
   constraint event_deliveries_sequence_ck check (replay_sequence is null or replay_sequence > 0),
   constraint event_deliveries_status_ck check (last_response_code is null or last_response_code between 100 and 599),
@@ -360,12 +371,63 @@ create table ops.api_credentials (
     and app.text_array_ok(scopes, 8, 40)
     and scopes <@ array['deals:read', 'reviews:read', 'reviews:write', 'events:subscribe',
                         'rechecks:request', 'notes:write', 'sources:pause', 'config:admin']::text[]),
+  -- Scopes narrow, never widen, the member role (mirrors domain.actor.ROLE_SCOPES), so an
+  -- over-scoped credential can never be minted (spec 20: config:admin is owner-only).
+  constraint api_credentials_role_scopes_ck check (
+    role = 'owner'
+    or (role = 'reviewer'
+        and scopes <@ array['deals:read', 'reviews:read', 'reviews:write', 'events:subscribe',
+                            'rechecks:request', 'notes:write']::text[])
+    or (role = 'viewer' and scopes <@ array['deals:read', 'reviews:read']::text[])),
   constraint api_credentials_label_ck check (pg_catalog.length(label) between 1 and 120),
   constraint api_credentials_expiry_ck check (expires_at > created_at),
   constraint api_credentials_revoke_ck check (
     revoked_at is null or (revoked_at >= created_at and revoke_reason is not null)),
   constraint api_credentials_revoke_reason_ck check (revoke_reason is null or pg_catalog.length(revoke_reason) <= 500)
 );
+
+-- The credential a static-bearer subscription was created with (NULL for OAuth
+-- principals, whose tokens are not stored here).
+alter table ops.event_subscriptions
+  add constraint event_subscriptions_credential_fk foreign key (workspace_id, credential_id)
+  references ops.api_credentials (workspace_id, id);
+
+-- An outbox event is immutable once written: the event ID is stable across
+-- attempts (spec 22), the payload matches its payload_hash, and is_fixture can
+-- never be flipped to turn a blocked fixture row into a deliverable event.
+-- Only delivery lifecycle columns (and late routing to a destination) change.
+create trigger outbox_identity_frozen before update on ops.outbox
+  for each row execute function app.guard_frozen_columns(
+    'state', 'attempts', 'max_attempts', 'available_at', 'lease_owner', 'lease_token',
+    'lease_expires_at', 'last_heartbeat_at', 'send_attempted_at', 'provider_accepted_at',
+    'owner_seen_at', 'last_error_code', 'blocker_code', 'destination_binding_id', 'updated_at',
+    'completed_at');
+
+-- A fixture review case never produces a deliverable (non-fixture) event
+-- (spec 18). Deferred to commit so the check holds whichever of the case and
+-- the outbox row is written first in the domain transaction.
+create or replace function ops.outbox_check_fixture_lineage()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if not new.is_fixture and new.aggregate_type = 'review_case' and exists (
+       select 1
+         from app.review_cases c
+        where c.workspace_id = new.workspace_id
+          and c.id = new.aggregate_id
+          and c.is_fixture) then
+    raise exception using
+      errcode = 'SV003',
+      message = 'a fixture review case cannot produce a non-fixture outbox event';
+  end if;
+  return null;
+end
+$$;
+create constraint trigger outbox_fixture_lineage after insert on ops.outbox
+  deferrable initially deferred
+  for each row execute function ops.outbox_check_fixture_lineage();
 
 create trigger outbox_touch before update on ops.outbox
   for each row execute function app.touch_updated_at();

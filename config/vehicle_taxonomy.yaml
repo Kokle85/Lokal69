@@ -10,11 +10,12 @@
 #
 # Classes: suv | offroad | crossover count as SUV identity; pickup | estate are listed only as
 #   explicit exclusions so that, e.g., a Nissan Navara or Subaru Outback is rejected as NOT_SUV
-#   instead of being treated as unknown.
+#   instead of being treated as unknown. Marketplaces often file pickups and raised estates in an
+#   "SUV / off-road" category, so the common ones are listed as exclusions (no generation data).
 # Scope: models plausibly offered in DE/IT/CH at roughly EUR 2,500-3,000 (mostly model years
 #   ~2004-2014). Models missing from this file are UNKNOWN (never "not an SUV").
 verification: unverified_reference
-version: "2026-10-06.1"
+version: "2026-10-06.2"
 note: >-
   Engineering reference data for owner review; not manufacturer-verified. Do not treat a
   generation code from this file as verified evidence for comparables or tax classification.
@@ -41,6 +42,11 @@ makes:
         class: offroad
         generations:
           - {code: J200, label: "Land Cruiser 200", from_year: 2007, to_year: 2021}
+      - canonical: Hilux
+        aliases: ["Hi-Lux"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
   - canonical: Volkswagen
     aliases: ["VW", "V.W."]
     models:
@@ -55,6 +61,11 @@ makes:
         generations:
           - {code: 7L, label: "Touareg I", from_year: 2002, to_year: 2010}
           - {code: 7P, label: "Touareg II", from_year: 2010, to_year: 2018}
+      - canonical: Amarok
+        aliases: []
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
   - canonical: BMW
     aliases: []
     models:
@@ -84,6 +95,16 @@ makes:
         class: suv
         generations:
           - {code: 4L, label: "Q7 I", from_year: 2005, to_year: 2015, facelift_year: 2009}
+      - canonical: A6 allroad
+        aliases: ["A6 allroad quattro", "allroad", "allroad quattro"]
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
+      - canonical: A4 allroad
+        aliases: ["A4 allroad quattro"]
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
   - canonical: Mercedes-Benz
     aliases: ["Mercedes", "MB", "Mercedes Benz", "Merc"]
     models:
@@ -159,7 +180,7 @@ makes:
         generations:
           - {code: R51, label: "Pathfinder III", from_year: 2005, to_year: 2014}
       - canonical: Navara
-        aliases: []
+        aliases: ["NP300", "NP300 Navara"]
         class: pickup
         exclusion_reason: "pickup truck, not an SUV"
         generations: []
@@ -178,6 +199,21 @@ makes:
         generations:
           - {code: V60, label: "Pajero III", from_year: 1999, to_year: 2006}
           - {code: V80, label: "Pajero IV", from_year: 2006, to_year: 2021}
+      # Distinct models: listed (without generations) so that the longest-alias rule never files
+      # them under Pajero with a Pajero generation.
+      - canonical: Pajero Pinin
+        aliases: ["Pajero-Pinin", "Pinin"]
+        class: suv
+        generations: []
+      - canonical: Pajero Sport
+        aliases: ["Pajero-Sport"]
+        class: suv
+        generations: []
+      - canonical: L200
+        aliases: []
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
       - canonical: ASX
         aliases: []
         class: crossover
@@ -206,6 +242,11 @@ makes:
         class: suv
         generations:
           - {code: ER, label: "CX-7", from_year: 2006, to_year: 2012}
+      - canonical: BT-50
+        aliases: ["BT50"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
   - canonical: Volvo
     aliases: []
     models:
@@ -219,6 +260,11 @@ makes:
         class: suv
         generations:
           - {code: "275", label: "XC90 I", from_year: 2002, to_year: 2014}
+      - canonical: XC70
+        aliases: ["XC 70", "XC-70"]
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
   - canonical: Suzuki
     aliases: []
     models:
@@ -269,6 +315,11 @@ makes:
         class: suv
         generations:
           - {code: 5L, label: "Yeti", from_year: 2009, to_year: 2017}
+      - canonical: Octavia Scout
+        aliases: []
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
   - canonical: Ford
     aliases: []
     models:
@@ -278,6 +329,11 @@ makes:
         generations:
           - {code: C394, label: "Kuga I", from_year: 2008, to_year: 2012}
           - {code: C520, label: "Kuga II", from_year: 2012, to_year: 2019}
+      - canonical: Ranger
+        aliases: []
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
   - canonical: Opel
     aliases: []
     models:
@@ -418,6 +474,14 @@ makes:
         generations:
           - {code: XU30, label: "RX II", from_year: 2003, to_year: 2009}
           - {code: AL10, label: "RX III", from_year: 2008, to_year: 2015}
+  - canonical: Isuzu
+    aliases: []
+    models:
+      - canonical: D-Max
+        aliases: ["DMax"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
   - canonical: Infiniti
     aliases: []
     models:

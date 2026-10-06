@@ -164,14 +164,36 @@ def test_all_timestamps_are_timestamptz_and_no_float_columns(db_conn: psycopg.Co
 
 
 def test_money_columns_are_paired_with_currency(db_conn: psycopg.Connection) -> None:
-    """Every *_minor money column is bigint (never float) per architecture conventions."""
+    """Every *_minor money column is bigint (never float) and carries its currency.
+
+    Architecture convention: ``<name>_minor bigint`` plus ``currency char(3)``, both present or
+    both absent. Either the table's currency column is NOT NULL (e.g. valuations), or a CHECK
+    constraint ties the amount column to a currency column.
+    """
     rows = db_conn.execute(
-        "select table_schema || '.' || table_name || '.' || column_name, data_type"
-        " from information_schema.columns where table_schema in ('app', 'ops')"
-        " and column_name like '%%\\_minor'"
+        "select c.table_schema || '.' || c.table_name, c.column_name, c.data_type"
+        " from information_schema.columns c where c.table_schema in ('app', 'ops')"
+        " and c.column_name like '%%\\_minor'"
     ).fetchall()
     assert rows
-    assert {dtype for _, dtype in rows} == {"bigint"}
+    assert {dtype for _, _, dtype in rows} == {"bigint"}
+    for table, column, _ in rows:
+        currency_cols = db_conn.execute(
+            "select attname, attnotnull, format_type(atttypid, atttypmod) from pg_attribute"
+            " where attrelid = %s::regclass and attnum > 0 and not attisdropped"
+            " and attname like '%%currency'",
+            (table,),
+        ).fetchall()
+        assert currency_cols, f"{table}.{column} has no currency column"
+        assert {fmt for _, _, fmt in currency_cols} == {"character(3)"}, table
+        if any(not_null for _, not_null, _ in currency_cols):
+            continue
+        paired = db_conn.execute(
+            "select count(*) from pg_constraint where conrelid = %s::regclass and contype = 'c'"
+            " and pg_get_constraintdef(oid) like %s and pg_get_constraintdef(oid) ~ 'currency IS NULL'",
+            (table, f"%({column} IS NULL)%"),
+        ).fetchone()
+        assert paired is not None and paired[0] >= 1, f"{table}.{column} is not paired with its currency"
 
 
 def test_listing_revisions_allow_semantic_reversion(db_conn: psycopg.Connection) -> None:

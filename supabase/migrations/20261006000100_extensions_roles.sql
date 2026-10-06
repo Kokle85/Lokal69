@@ -65,6 +65,57 @@ $role$;
 
 create schema if not exists app;
 create schema if not exists ops;
+
+-- Roles are cluster-global, so suv_backend may pre-exist (another database in the
+-- cluster, or a manual creation). Tenant isolation is only real if the role cannot
+-- bypass RLS or escalate: no SUPERUSER/BYPASSRLS/CREATEROLE/CREATEDB/REPLICATION, no
+-- LOGIN (members log in; ADR 0001) and no membership in any other role (which would
+-- allow SET ROLE to, e.g., the table owner). Owner-only; returns the problems found.
+create or replace function ops.backend_role_problems(role_name text default 'suv_backend')
+returns text[]
+language sql
+stable
+set search_path = ''
+as $$
+  select coalesce(pg_catalog.array_agg(p.problem order by p.problem), array[]::text[])
+    from (
+      select 'role ' || role_name || ' does not exist' as problem
+       where not exists (select 1 from pg_catalog.pg_roles where rolname = role_name)
+      union all
+      select v.problem
+        from pg_catalog.pg_roles r,
+             lateral (values
+               (case when r.rolsuper then 'SUPERUSER' end),
+               (case when r.rolbypassrls then 'BYPASSRLS' end),
+               (case when r.rolcreaterole then 'CREATEROLE' end),
+               (case when r.rolcreatedb then 'CREATEDB' end),
+               (case when r.rolreplication then 'REPLICATION' end),
+               (case when r.rolcanlogin then 'LOGIN' end),
+               (case when exists (select 1 from pg_catalog.pg_auth_members m where m.member = r.oid)
+                     then 'member of another role' end)
+             ) as v(problem)
+       where r.rolname = role_name
+         and v.problem is not null
+    ) as p
+$$;
+comment on function ops.backend_role_problems(text) is
+  'Owner-only: unsafe attributes/memberships of the backend role; migrations refuse to proceed when non-empty.';
+
+do $verify_role$
+declare
+  problems text[] := ops.backend_role_problems('suv_backend');
+begin
+  if pg_catalog.cardinality(problems) > 0 then
+    raise exception using
+      errcode = 'insufficient_privilege',
+      message = 'role suv_backend is unsafe for tenant isolation: '
+             || pg_catalog.array_to_string(problems, ', '),
+      hint = 'suv_backend must be NOLOGIN, NOBYPASSRLS, NOSUPERUSER, NOCREATEROLE, NOCREATEDB, '
+          || 'NOREPLICATION and a member of no other role (ADR 0001).';
+  end if;
+end
+$verify_role$;
+
 comment on schema app is
   'Application records. Not exposed to the Supabase Data API (BFF-only, ADR 0001).';
 comment on schema ops is

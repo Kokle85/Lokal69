@@ -300,26 +300,65 @@ def test_real_valuation_cannot_depend_on_fixture_data(seed: Seed, world_a: World
     seed.valuation(ws, world_a.listing_id, world_a.revision_id, is_fixture=False, fx_rate_ids=[real_fx])
 
 
-def test_valuation_state_moves_only_to_stale_or_invalid(seed: Seed, world_a: World) -> None:
-    val = seed.valuation(world_a.workspace_id, world_a.listing_id, world_a.revision_id)
+def test_valuation_state_only_moves_to_stale(seed: Seed, world_a: World) -> None:
+    """Mirrors domain.valuation.mark_stale: the only state change is -> stale; stale/invalid are terminal."""
+    ws, listing, rev = world_a.workspace_id, world_a.listing_id, world_a.revision_id
+    val = seed.valuation(ws, listing, rev)
     conn = seed.conn
+    mark_stale = (
+        "update app.valuations set state = 'stale', stale_at = now(), stale_reason = 'fx changed'"
+        " where id = %s"
+    )
     with violates("valuations_stale_ck"):
         conn.execute("update app.valuations set state = 'stale' where id = %s", (val,))
-    conn.execute(
-        "update app.valuations set state = 'stale', stale_at = now(), stale_reason = 'fx changed'"
-        " where id = %s",
-        (val,),
-    )
-    with pytest.raises(psycopg.Error) as exc:
-        conn.execute("update app.valuations set state = 'incomplete' where id = %s", (val,))
-    assert _sqlstate(exc) == SV_TRANSITION
+    conn.execute(mark_stale, (val,))
+    for target in ("incomplete", "invalid", "estimated"):
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("update app.valuations set state = %s where id = %s", (target, val))
+        assert _sqlstate(exc) == SV_TRANSITION, target
     with pytest.raises(psycopg.Error) as exc:
         conn.execute("update app.valuations set scenarios = '{\"x\": 1}' where id = %s", (val,))
     assert _sqlstate(exc) == SV_FROZEN
-    conn.execute("update app.valuations set state = 'invalid' where id = %s", (val,))
+    # An estimated valuation keeps its figures when it becomes stale, but can never become invalid.
+    estimated = seed.valuation(
+        ws, listing, rev, state="estimated", base_contribution_minor=130000, conservative_contribution_minor=1
+    )
     with pytest.raises(psycopg.Error) as exc:
-        conn.execute("update app.valuations set state = 'stale' where id = %s", (val,))
+        conn.execute("update app.valuations set state = 'invalid' where id = %s", (estimated,))
     assert _sqlstate(exc) == SV_TRANSITION
+    conn.execute(mark_stale, (estimated,))
+    assert seed.scalar("select base_contribution_minor from app.valuations where id = %s", (estimated,)) == (
+        130000
+    )
+    # not_started -> stale is allowed; invalid is assigned at insert and is terminal.
+    not_started = seed.valuation(ws, listing, rev, state="not_started")
+    conn.execute(mark_stale, (not_started,))
+    invalid = seed.valuation(ws, listing, rev, state="invalid")
+    with pytest.raises(psycopg.Error) as exc:
+        conn.execute(mark_stale, (invalid,))
+    assert _sqlstate(exc) == SV_TRANSITION
+
+
+def test_valuation_rows_always_load_into_the_domain_model(seed: Seed, world_a: World) -> None:
+    """invalid carries no figures; stale_at/stale_reason are set exactly when the state is stale."""
+    ws, listing, rev = world_a.workspace_id, world_a.listing_id, world_a.revision_id
+    with violates("valuations_unknown_not_zero_ck"):
+        seed.valuation(ws, listing, rev, state="invalid", base_contribution_minor=0)
+    with violates("valuations_stale_ck"):
+        seed.valuation(ws, listing, rev, state="incomplete", stale_at=T0, stale_reason="synthetic")
+    with violates("valuations_stale_ck"):
+        seed.valuation(ws, listing, rev, state="stale", stale_at=T0)
+    # Expired at assembly time: inserted directly as stale, figures retained.
+    seed.valuation(
+        ws,
+        listing,
+        rev,
+        state="stale",
+        stale_at=T0,
+        stale_reason="freshness_deadline: synthetic",
+        base_contribution_minor=130000,
+        conservative_contribution_minor=-5000,
+    )
 
 
 def test_fx_rate_is_positive_and_directional(seed: Seed, world_a: World) -> None:

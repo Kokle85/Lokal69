@@ -7,7 +7,11 @@ suv_backend under workspace RLS:
 - completion is fenced by job id + running state + lease owner/token + an
   unexpired lease measured with clock_timestamp();
 - the reaper requeues expired leases while attempts remain, otherwise
-  dead-letters, always clearing the old lease.
+  dead-letters, always clearing the old lease;
+- a worker that crashes before commit leaves the job claimable (crash after
+  commit is the expired-lease/reaper path);
+- a worker whose guarded completion fails rolls back its domain writes;
+- two schedulers racing for one slot (spec 9) create exactly one job.
 """
 
 from __future__ import annotations
@@ -244,3 +248,115 @@ def test_heartbeat_extends_only_the_current_lease(
         assert db_conn.execute(heartbeat, (job, claimed[1], "worker-1")).rowcount == 1
     remaining = seed.scalar("select lease_expires_at - now() from ops.jobs where id = %s", (job,))
     assert remaining > timedelta(minutes=4)
+
+
+def test_worker_crash_before_commit_leaves_the_job_claimable(
+    db_url: str, db_conn: psycopg.Connection, seed: Seed, world_a: World
+) -> None:
+    """Crash before commit (spec 31 Queue): the claim rolls back with the dead session."""
+    ws = world_a.workspace_id
+    job = seed.job(ws)
+    crashed = psycopg.connect(db_url)  # not autocommit: the claim stays uncommitted
+    try:
+        crashed.execute("set local role suv_backend")
+        crashed.execute("select set_config('app.workspace_id', %s, true)", (str(ws),))
+        row = crashed.execute(
+            CLAIM_SQL,
+            {"worker_id": "worker-crash", "fresh_uuid": uuid.uuid4(), "lease_duration": "5 minutes"},
+        ).fetchone()
+        assert row is not None and row[0] == job
+        pid = crashed.info.backend_pid
+        # While the crashed worker holds the row lock, another worker skips it (SKIP LOCKED).
+        assert claim(db_conn, ws, "worker-2") is None
+        db_conn.execute("select pg_terminate_backend(%s)", (pid,))
+    finally:
+        crashed.close()
+    again = claim(db_conn, ws, "worker-2")
+    assert again is not None and again[0] == job
+    assert seed.scalar("select attempts from ops.jobs where id = %s", (job,)) == 1
+
+
+def test_lost_lease_rolls_back_the_workers_domain_writes(
+    db_conn: psycopg.Connection, seed: Seed, world_a: World
+) -> None:
+    """A worker whose guarded completion updates 0 rows must commit nothing (spec 13 fencing)."""
+    ws = world_a.workspace_id
+    job = seed.job(ws)
+    claimed = claim(db_conn, ws, "worker-1", lease="1 millisecond")
+    assert claimed is not None and claimed[0] == job
+    db_conn.execute("select pg_sleep(0.01)")
+    marker = unique("domain-write")
+
+    class LeaseLost(Exception):
+        pass
+
+    with pytest.raises(LeaseLost), backend(db_conn, ws):
+        db_conn.execute("select id from ops.jobs where id = %s for update", (job,))
+        db_conn.execute(
+            "insert into ops.audit_events (workspace_id, actor_principal_id, actor_kind, action,"
+            " target_type, target_id, request_id)"
+            " values (%s, %s, 'system', 'listing.promote', 'job', %s, %s)",
+            (ws, uuid.uuid4(), job, marker),
+        )
+        done = db_conn.execute(
+            COMPLETE_SQL,
+            {"job_id": job, "lease_token": claimed[1], "worker_id": "worker-1", "result": "{}"},
+        )
+        if done.rowcount == 0:
+            raise LeaseLost
+    assert seed.scalar("select count(*) from ops.audit_events where request_id = %s", (marker,)) == 0
+    assert seed.scalar("select state from ops.jobs where id = %s", (job,)) == "running"
+
+
+def test_concurrent_schedulers_create_one_discovery_job_per_slot(
+    db_url: str, seed: Seed, world_a: World
+) -> None:
+    """Duplicate schedulers (spec 9, 31): the slot key admits exactly one job under a real race."""
+    ws = world_a.workspace_id
+    slot = seed.scalar("select date_bin('15 minutes', now(), timestamptz '2026-01-01T00:00:00Z')")
+    insert = (
+        "insert into ops.jobs (workspace_id, job_type, dedup_key, source_id, profile_id, partition_key,"
+        " scheduled_slot) values (%(ws)s, 'discovery', %(key)s, %(src)s, %(prof)s, 'default', %(slot)s)"
+        " on conflict do nothing returning id"
+    )
+    results: dict[str, UUID | None] = {}
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def schedule(conn: psycopg.Connection, name: str, hold: float) -> None:
+        try:
+            barrier.wait(timeout=10)
+            with backend(conn, ws):
+                row = conn.execute(
+                    insert,
+                    {
+                        "ws": ws,
+                        "key": f"discovery:{name}:{slot.isoformat()}",
+                        "src": world_a.source_id,
+                        "prof": world_a.profile_id,
+                        "slot": slot,
+                    },
+                ).fetchone()
+                conn.execute("select pg_sleep(%s)", (hold,))
+            results[name] = None if row is None else row[0]
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    with connections(db_url, 2) as (conn_a, conn_b):
+        threads = [
+            threading.Thread(target=schedule, args=(conn_a, "scheduler-a", 0.2)),
+            threading.Thread(target=schedule, args=(conn_b, "scheduler-b", 0.2)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    assert not errors, errors
+    inserted = [job_id for job_id in results.values() if job_id is not None]
+    assert len(results) == 2 and len(inserted) == 1, results
+    assert (
+        seed.scalar(
+            "select count(*) from ops.jobs where workspace_id = %s and scheduled_slot = %s", (ws, slot)
+        )
+        == 1
+    )

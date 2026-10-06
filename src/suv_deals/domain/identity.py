@@ -60,6 +60,33 @@ def _sha256_text(value: str) -> str:
 # ---------------------------------------------------------------------------------------------
 
 
+_HOST_CHARS = re.compile(r"^[a-z0-9_](?:[a-z0-9_.-]*[a-z0-9_])?$")
+
+
+def _canonical_host(hostname: str) -> str:
+    """Lower-case ASCII host; internationalised labels become IDNA ``xn--`` labels.
+
+    Python's ``idna`` codec (IDNA 2003 nameprep) silently *maps* some characters to different
+    ones (``straße`` -> ``strasse``, full-width letters -> ASCII), which would turn the URL into a
+    different host. A host whose encoding does not decode back to the same lower-cased name is
+    therefore rejected instead of being rewritten. Percent signs and other characters that are not
+    valid in a DNS name are rejected too.
+    """
+    name = unicodedata.normalize("NFC", hostname.rstrip(".")).lower()
+    if not name:
+        raise ValidationFailed("URL has no host")
+    try:
+        host = name.encode("idna").decode("ascii").lower()
+        round_trip = host.encode("ascii").decode("idna").lower()
+    except UnicodeError as exc:
+        raise ValidationFailed("URL host is not a valid internationalised domain name") from exc
+    if round_trip != name:
+        raise ValidationFailed("URL host uses characters whose IDNA mapping would change the host")
+    if not _HOST_CHARS.match(host):
+        raise ValidationFailed("URL host contains characters that are not valid in a host name")
+    return host
+
+
 def _is_tracking(name: str, tracking: frozenset[str]) -> bool:
     decoded = unquote(name.replace("+", " ")).strip().lower()
     return decoded in tracking or decoded.startswith("utm_")
@@ -69,8 +96,10 @@ def canonicalize_url(url: str, tracking_params: Iterable[str]) -> str:
     """Return the canonical form of an HTTP(S) listing URL.
 
     Raises ``ValidationFailed`` for non-http(s) schemes, embedded credentials, control characters,
-    a missing/invalid host or port, or a URL longer than 2048 characters. Path case and every
-    non-tracking query parameter (order, value and percent-encoding) are preserved.
+    a missing/invalid host or port (including port 0 and IDNA mappings that would change the host,
+    see ``_canonical_host``), or a URL longer than 2048 characters. Path case and every
+    non-tracking query parameter (order, value and percent-encoding) are preserved; dot segments
+    and ``;``-separated parameters are left untouched because their meaning is source specific.
     """
     if not isinstance(url, str) or not url.strip():
         raise ValidationFailed("URL is empty")
@@ -92,15 +121,10 @@ def canonicalize_url(url: str, tracking_params: Iterable[str]) -> str:
     hostname = parts.hostname
     if not hostname:
         raise ValidationFailed("URL has no host")
-    if ":" in hostname:  # IPv6 literal
-        host = f"[{hostname.lower()}]"
-    else:
-        try:
-            host = hostname.rstrip(".").encode("idna").decode("ascii").lower()
-        except UnicodeError as exc:
-            raise ValidationFailed("URL host is not a valid internationalised domain name") from exc
-        if not host:
-            raise ValidationFailed("URL has no host")
+    # An IPv6 literal keeps its brackets; every other host goes through _canonical_host.
+    host = f"[{hostname.lower()}]" if ":" in hostname else _canonical_host(hostname)
+    if port == 0:
+        raise ValidationFailed("URL port is invalid")
     netloc = host if port is None or port == _DEFAULT_PORTS[scheme] else f"{host}:{port}"
     path = parts.path or "/"
     tracking = frozenset(p.strip().lower() for p in tracking_params if p and p.strip())
@@ -365,12 +389,21 @@ class DetailObservation(BaseModel):
 
 
 class PromotionDecision(BaseModel):
-    """What the caller must do under the listing row lock. Fields named ``current_*`` are the
-    listing's facts *after* applying the decision (unchanged unless ``promote_current``)."""
+    """What the caller must do under the listing row lock.
+
+    ``current_generation``, ``accepted_observation_id``, ``current_semantic_hash``,
+    ``revision_number`` and ``availability`` are the listing's state *after* applying the decision.
+    The caller writes them whenever ``update_listing_state`` is true -- which includes the
+    same-generation equivalent retry whose only change is the tie-break moving
+    ``accepted_observation_id`` to the lower ID (``promote_current`` is false there because the
+    current *facts* do not change). ``promote_current`` means the incoming observation's facts
+    become the current facts; ``create_revision`` means a new immutable revision row is inserted.
+    """
 
     model_config = _FROZEN
 
     outcome: PromotionOutcome
+    update_listing_state: bool
     promote_current: bool
     create_revision: bool
     revision_number: int
@@ -398,7 +431,9 @@ def decide_promotion(state: ListingCurrentState, incoming: DetailObservation) ->
     3. Same generation (a retry/replay of the same scheduled observation):
        a. same observation ID and same hash -> ``DUPLICATE_REPLAY`` (no-op, nothing stored);
        b. different observation ID, same hash -> ``DUPLICATE_REPLAY`` (an equivalent retry; kept as
-          evidence; the accepted ID becomes the lower of the two IDs, the deterministic tie-break);
+          evidence; the accepted ID becomes the lower of the two IDs, the deterministic tie-break,
+          reported with ``update_listing_state=True`` when it changes). Keeping the lowest ID
+          accepted is what makes the final facts independent of completion order;
        c. same observation ID, different hash -> ``INCIDENT_CONFLICTING_REPLAY``: the replayed
           payload contradicts the accepted one; current facts stay, the payload is kept as incident
           evidence (``incident_code='REPLAY_PAYLOAD_MISMATCH'``);
@@ -415,6 +450,7 @@ def decide_promotion(state: ListingCurrentState, incoming: DetailObservation) ->
             outcome=PromotionOutcome.CONFIRM_UNCHANGED
             if unchanged
             else PromotionOutcome.PROMOTE_NEW_REVISION,
+            update_listing_state=True,
             promote_current=True,
             create_revision=not unchanged,
             revision_number=state.revision_number if unchanged else state.revision_number + 1,
@@ -461,6 +497,7 @@ def decide_promotion(state: ListingCurrentState, incoming: DetailObservation) ->
     if incoming.observation_id < accepted:
         return PromotionDecision(
             outcome=PromotionOutcome.INCIDENT_CONFLICTING_REPLAY,
+            update_listing_state=True,
             promote_current=True,
             create_revision=True,
             revision_number=state.revision_number + 1,
@@ -493,13 +530,15 @@ def _keep_current(
     incident_code: str | None = None,
     accepted_observation_id: UUID | None = None,
 ) -> PromotionDecision:
+    accepted = accepted_observation_id or state.accepted_observation_id
     return PromotionDecision(
         outcome=outcome,
+        update_listing_state=accepted != state.accepted_observation_id,
         promote_current=False,
         create_revision=False,
         revision_number=state.revision_number,
         current_generation=state.current_generation,
-        accepted_observation_id=accepted_observation_id or state.accepted_observation_id,
+        accepted_observation_id=accepted,
         current_semantic_hash=state.current_semantic_hash,
         availability=state.availability,
         store_historical_evidence=store_historical_evidence,
@@ -767,7 +806,8 @@ def possible_same_vehicle(
 ) -> SameVehicleSuggestion:
     """Score whether two listings (normally from different sources) may be the same vehicle.
 
-    Strong evidence: equal VINs, only when both are format-valid. Two different valid VINs mean
+    Strong evidence: equal VINs, only when both are format-valid (HIGH confidence unless the
+    specifications conflict, which downgrades the suggestion to LOW). Two different valid VINs mean
     different vehicles (``vin_mismatch=True``, never suggested). Supporting evidence: exact
     specification (make, model, fuel, gearbox, drive, power within 2 kW, displacement), identical
     first registration, mileage within 2 %, price within 10 % (same currency only; no FX here),
@@ -873,8 +913,13 @@ def possible_same_vehicle(
     score = sum((s.weight for s in signals), Decimal(0))
     score = min(max(score, Decimal(0)), Decimal(1))
     vin_match = any(s.code == "VIN_MATCH" for s in signals)
-    if vin_match:
-        confidence: Confidence | None = Confidence.HIGH
+    spec_conflict = any(s.code == "SPEC_CONFLICT" for s in signals)
+    if vin_match and spec_conflict:
+        # Same VIN but e.g. a different make/fuel: a copied, placeholder or mistyped VIN is as likely
+        # as a data error, so it is surfaced for human review at LOW confidence, never HIGH.
+        confidence: Confidence | None = Confidence.LOW
+    elif vin_match:
+        confidence = Confidence.HIGH
     elif score >= MEDIUM_CONFIDENCE_SCORE:
         confidence = Confidence.MEDIUM
     elif score >= SUGGESTION_MIN_SCORE:

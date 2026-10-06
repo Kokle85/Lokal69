@@ -178,9 +178,8 @@ def test_adding_an_unknown_line_always_makes_totals_unknown(
         scenario = after.scenario(name)
         assert scenario.contribution_before_business_tax is None
         assert scenario.cash_required is None
-        if unknown_category != CostCategory.REFUNDABLE_DEPOSIT:
-            assert scenario.total_modelled_cost is None
-            assert scenario.known_subtotal == before.scenario(name).known_subtotal
+        assert scenario.total_modelled_cost is None
+        assert scenario.known_subtotal == before.scenario(name).known_subtotal
         term = TERM_BY_CATEGORY[unknown_category]
         assert getattr(scenario, term.value) is None
 
@@ -206,7 +205,7 @@ def test_a_missing_category_is_never_treated_as_zero(
     mode=st.sampled_from(["half_up", "half_even", "down", "up"]),
 )
 def test_rounding_lands_on_quantum_within_one_step(value: Decimal, quantum: Decimal, mode: str) -> None:
-    rounded = apply_rounding(value, RoundingSpec(quantum=quantum, mode=mode))  # type: ignore[arg-type]
+    rounded = apply_rounding(value, RoundingSpec(quantum=quantum, mode=mode))
     assert (rounded / quantum) == (rounded / quantum).to_integral_value()
     diff = abs(rounded - value)
     if mode in ("half_up", "half_even"):
@@ -237,3 +236,42 @@ def test_negotiation_discount_is_exact(asking: Decimal, pct: Decimal) -> None:
     realized = result.scenario(ScenarioName.BASE).expected_realized_proceeds
     assert realized is not None
     assert realized.amount == asking * (1 - pct / 100)
+
+
+@settings(max_examples=80, deadline=None)
+@given(
+    spec=cost_lines(),
+    approvals=st.lists(st.booleans(), min_size=len(CATEGORIES), max_size=len(CATEGORIES)),
+    buy=cents,
+)
+def test_no_alert_while_any_estimate_is_unapproved(
+    spec: dict[CostCategory, list[Decimal] | None], approvals: list[bool], buy: Decimal
+) -> None:
+    """Spec 18: a threshold alert needs every material assumption approved; an unapproved
+    estimate anywhere (even a convenient zero reserve) always blocks it."""
+    lines = [
+        ln.model_copy(update={"assumption_approved": ok}) if ln.status == CostLineStatus.ESTIMATED else ln
+        for ln, ok in zip(build(spec), [*approvals, False], strict=True)
+    ]
+    result = compute_scenarios(
+        PurchaseInput(status=CostLineStatus.QUOTED, amount=eur(buy), evidence_ids=("SYNTHETIC-seller",)),
+        lines,
+        ProceedsEstimate(
+            status=CostLineStatus.ESTIMATED,
+            currency="EUR",
+            base=eur(Decimal("1000000")),
+            basis="owner_estimate",
+            assumption_approved=True,
+        ),
+        [],
+        ContributionThreshold(
+            approval_status="approved", approved_by="SYNTHETIC owner", approved_at="2026-10-01"
+        ),
+        as_of=AS_OF,
+    )
+    unapproved = [ln for ln in lines if ln.status == CostLineStatus.ESTIMATED and not ln.assumption_approved]
+    if unapproved:
+        assert not result.threshold.alert_eligible
+        assert result.material_support in ("estimated", "incomplete")
+    for ln in unapproved:
+        assert any(u.startswith(ln.category.value) for u in result.unsupported_material)

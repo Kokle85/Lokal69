@@ -24,7 +24,8 @@ Business rules implemented here:
 
   A deposit included in a seller's price is split out before calculating. A refund that
   is not confirmed is a labelled assumption in base/upside; the conservative scenario
-  carries the no-refund downside (the deposit becomes an economic cost).
+  carries the no-refund downside (the deposit becomes an economic cost). A deposit of
+  unknown amount leaves the economic cost unknown in every scenario.
 - Scenarios: conservative = lower proceeds bound and upper cost bounds (incl. reserve);
   base = base values; upside = upper proceeds and lower cost bounds, never beyond the
   stated bounds. Lines sharing a ``correlation_group`` describe one underlying risk: the
@@ -34,7 +35,17 @@ Business rules implemented here:
   Business tax/accounting treatment is not modelled.
 - The EUR 1,500 minimum contribution is PROPOSED/unapproved by default. A threshold
   alert needs an approved threshold, complete scenarios and material inputs supported
-  by quotes/actuals, approved assumptions or an active approved tax rule.
+  by quotes/actuals, approved assumptions or an active approved tax rule. Every other
+  estimate (reserve, selling costs, preparation, ...) must also be an owner-approved
+  assumption (spec 18: material assumptions approved; gate "Cost assumptions"). A quote
+  with a recorded scope that cannot be checked against a target scope counts as an
+  estimate. Asking-price proceeds are never a quote or realized proceeds (spec 15).
+- FX: one non-customs rate per currency pair (payment preferred over reference on the
+  same day); same-day observations that disagree are ambiguous and leave the amount
+  unknown rather than choosing a provider silently.
+- Import lines from ``tax_cost_lines`` carry ``tax_calculation:<sha256>`` evidence and
+  ``ScenarioSet.import_line_sources`` records it, so a valuation can prove its figures
+  used exactly the calculation it fingerprints.
 """
 
 from __future__ import annotations
@@ -302,6 +313,33 @@ ProceedsBasis = Literal[
     "mk_asking_prices", "owner_estimate", "seller_reported_sales", "verified_sales", "dealer_offer"
 ]
 
+#: Spec 15: asking prices, seller-reported sales and owner estimates are never quotes or
+#: realized proceeds. Only a dealer offer is a quote; only verified sales or an accepted
+#: dealer offer can be ``actual``.
+_PROCEEDS_STATUSES: Final[Mapping[str, frozenset[CostLineStatus]]] = MappingProxyType(
+    {
+        "mk_asking_prices": frozenset({CostLineStatus.ESTIMATED, CostLineStatus.UNKNOWN}),
+        "owner_estimate": frozenset({CostLineStatus.ESTIMATED, CostLineStatus.UNKNOWN}),
+        "seller_reported_sales": frozenset({CostLineStatus.ESTIMATED, CostLineStatus.UNKNOWN}),
+        "verified_sales": frozenset(
+            {CostLineStatus.ESTIMATED, CostLineStatus.ACTUAL, CostLineStatus.UNKNOWN}
+        ),
+        "dealer_offer": frozenset(
+            {CostLineStatus.QUOTED, CostLineStatus.ESTIMATED, CostLineStatus.ACTUAL, CostLineStatus.UNKNOWN}
+        ),
+    }
+)
+#: The market-evidence kind each basis may cite (``market_observations.evidence_kind``).
+_PROCEEDS_EVIDENCE_KIND: Final[Mapping[str, EvidenceKind | None]] = MappingProxyType(
+    {
+        "mk_asking_prices": EvidenceKind.ASKING_PRICE,
+        "owner_estimate": EvidenceKind.OWNER_ESTIMATE,
+        "seller_reported_sales": EvidenceKind.SELLER_REPORTED_SALE,
+        "verified_sales": EvidenceKind.VERIFIED_SALE,
+        "dealer_offer": None,
+    }
+)
+
 
 class ProceedsEstimate(_Contract):
     """Expected realized proceeds in MK. Asking prices are not realized sales (spec 15)."""
@@ -333,6 +371,13 @@ class ProceedsEstimate(_Contract):
             _check_range(self.low, self.base, self.high, self.currency)
         if self.status in _EVIDENCED_STATUSES and not self.evidence_ids:
             raise ValueError(f"{self.status.value} proceeds need evidence_ids")
+        if self.status not in _PROCEEDS_STATUSES[self.basis]:
+            raise ValueError(
+                f"a {self.basis} basis cannot be {self.status.value}: asking prices, seller reports and "
+                "owner estimates are never quotes or realized proceeds"
+            )
+        if self.evidence_kind is not None and self.evidence_kind != _PROCEEDS_EVIDENCE_KIND[self.basis]:
+            raise ValueError(f"evidence_kind {self.evidence_kind.value} does not match basis {self.basis}")
         if self.negotiation_discount_pct is not None and self.basis != "mk_asking_prices":
             raise ValueError("a negotiation discount only applies to asking-price evidence")
         if self.discount_approved and self.negotiation_discount_pct is None:
@@ -374,20 +419,30 @@ class CostAssumption(_Contract):
             raise ValueError("cost profile assumptions are unknown, estimated or not_applicable")
         if self.category == CostCategory.PURCHASE:
             raise ValueError("the purchase comes from listing price evidence, not a cost profile")
+        # The same line rules as CostLine, enforced at load time (not first at use).
+        values = (self.low, self.base, self.high)
+        if self.status == CostLineStatus.ESTIMATED:
+            if self.base is None:
+                raise ValueError("an estimated assumption needs a base amount")
+            _check_range(self._money(self.low), self._money(self.base), self._money(self.high), self.currency)
+        elif any(v is not None for v in values):
+            raise ValueError(f"a {self.status.value} assumption carries no amounts (unknown is never zero)")
+        if self.status == CostLineStatus.NOT_APPLICABLE and not self.reason:
+            raise ValueError("a not_applicable assumption requires a reason")
         return self
 
-    def to_line(self, *, approved: bool) -> CostLine:
-        def money(value: Decimal | None) -> Money | None:
-            return None if value is None else Money(amount=value, currency=self.currency)
+    def _money(self, value: Decimal | None) -> Money | None:
+        return None if value is None else Money(amount=value, currency=self.currency)
 
+    def to_line(self, *, approved: bool) -> CostLine:
         return CostLine(
             category=self.category,
             label=self.label,
             status=self.status,
             currency=self.currency,
-            low=money(self.low),
-            base=money(self.base),
-            high=money(self.high),
+            low=self._money(self.low),
+            base=self._money(self.base),
+            high=self._money(self.high),
             reason=self.reason,
             cash_before_sale=self.cash_before_sale,
             refundable=self.category == CostCategory.REFUNDABLE_DEPOSIT
@@ -476,11 +531,24 @@ def load_cost_profile(path: Path) -> CostProfile:
 # --------------------------------------------------------------------------- tax -> cost lines
 
 
+TAX_CALCULATION_EVIDENCE_PREFIX: Final = "tax_calculation:"
+
+
+def tax_calculation_evidence_id(calc: TaxCalculation) -> str:
+    """Evidence id binding a cost line to one exact tax calculation (see ``tax_cost_lines``)."""
+    return f"{TAX_CALCULATION_EVIDENCE_PREFIX}{calc.content_sha256()}"
+
+
 def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = None) -> tuple[CostLine, ...]:
     """One line per import category from a tax calculation (in the rule currency).
 
-    No calculation -> every import category is ``unknown`` (never zero). Lines from an
-    ACTIVE, approved, non-fixture, complete calculation are ``rule_supported``.
+    No calculation -> every import category is ``unknown`` (never zero). A category the
+    rule set defines no component for is ``not_applicable`` only when the calculation is
+    complete (the rule set is then the authority that nothing is levied); from an
+    incomplete calculation or a rule set without components it stays ``unknown``.
+    Lines from an ACTIVE, approved, non-fixture, complete calculation are
+    ``rule_supported``. Every line carries the rule identity and the
+    ``tax_calculation:<sha256>`` evidence id of the exact calculation.
     """
     if calc is None:
         reason = missing_reason or "no applicable ACTIVE tax rule set; import costs unknown"
@@ -495,13 +563,16 @@ def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = 
             for c in sorted(IMPORT_CATEGORIES)
         )
     totals = calc.category_totals()
-    evidence = (f"tax_rule_set:{calc.rule_set_id}@{calc.version}:{calc.rule_sha256 or 'unhashed'}",)
+    evidence = (
+        f"tax_rule_set:{calc.rule_set_id}@{calc.version}:{calc.rule_sha256 or 'unhashed'}",
+        tax_calculation_evidence_id(calc),
+    )
     supported = calc.production_ready
     lines: list[CostLine] = []
     for category in sorted(IMPORT_CATEGORIES):
         label = f"{category.value} ({calc.rule_set_id}@{calc.version}, {calc.rule_status.value})"
         total = totals.get(category)
-        if total is None:
+        if total is None and calc.complete and calc.components:
             lines.append(
                 CostLine(
                     category=category,
@@ -511,6 +582,20 @@ def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = 
                     reason=f"rule {calc.rule_set_id}@{calc.version} defines no {category.value} component"[
                         :500
                     ],
+                    evidence_ids=evidence,
+                )
+            )
+        elif total is None:
+            lines.append(
+                CostLine(
+                    category=category,
+                    label=label,
+                    status=CostLineStatus.UNKNOWN,
+                    currency=calc.currency,
+                    reason=(
+                        f"rule {calc.rule_set_id}@{calc.version} defines no {category.value} component and "
+                        "the calculation is incomplete; not established (unknown, not zero)"
+                    )[:500],
                     evidence_ids=evidence,
                 )
             )
@@ -626,6 +711,9 @@ class ScenarioSet(_Contract):
     evidence_ids: tuple[str, ...]
     earliest_expiry: datetime | None
     fx_rates_used: tuple[FxRate, ...]
+    #: Where each import-category line came from: ``tax_calculation:<sha256>`` for lines made
+    #: by ``tax_cost_lines`` from one exact calculation, ``manual:<category>`` otherwise.
+    import_line_sources: tuple[str, ...] = ()
     #: sha256 over every scenario input (purchase, lines, proceeds, scope, currency, FX age).
     inputs_sha256: str
     contribution_label: str = CONTRIBUTION_LABEL
@@ -642,6 +730,13 @@ class ScenarioSet(_Contract):
 _SCENARIOS: Final = (ScenarioName.CONSERVATIVE, ScenarioName.BASE, ScenarioName.UPSIDE)
 
 
+def _same_rate(a: FxRate, b: FxRate) -> bool:
+    """True when two observations state the same exchange rate (either stored direction)."""
+    if (a.base, a.quote) == (b.base, b.quote):
+        return a.rate == b.rate
+    return (a.base, a.quote) == (b.quote, b.base) and _CTX.multiply(a.rate, b.rate) == 1
+
+
 class _Converter:
     """Converts to the valuation currency with explicit direction; never with customs rates."""
 
@@ -653,7 +748,10 @@ class _Converter:
         self.warnings: list[str] = []
         self.used: dict[tuple[str, str, date, str, str], FxRate] = {}
 
-    def rate_for(self, currency: str) -> FxRate | None:
+    def rate_for(self, currency: str) -> tuple[FxRate | None, str | None]:
+        """Latest non-customs rate on or before the valuation date (payment preferred over
+        reference on the same day). Same-day observations that disagree are ambiguous:
+        no silent choice between providers -> ``(None, warning)``."""
         candidates = [
             r
             for r in self.rates
@@ -662,14 +760,24 @@ class _Converter:
             and r.rate_date <= self.on_date
         ]
         if not candidates:
-            return None
-        candidates.sort(key=lambda r: (r.rate_date, r.purpose == FxPurpose.PAYMENT, r.provider))
-        return candidates[-1]
+            return None, None
+        latest = max(r.rate_date for r in candidates)
+        same_day = [r for r in candidates if r.rate_date == latest]
+        group = [r for r in same_day if r.purpose == FxPurpose.PAYMENT] or same_day
+        group.sort(key=lambda r: (r.provider, r.base, str(r.rate)))
+        chosen = group[0]
+        if any(not _same_rate(chosen, other) for other in group[1:]):
+            listed = ", ".join(sorted({f"{r.provider}:{r.base}/{r.quote}={r.rate}" for r in group}))
+            return None, f"FX_RATE_AMBIGUOUS:{currency}->{self.target} {latest.isoformat()}: {listed}"
+        return chosen, None
 
     def convert(self, money: Money | None, what: str) -> Money | None:
         if money is None or money.currency == self.target:
             return money
-        rate = self.rate_for(money.currency)
+        rate, problem = self.rate_for(money.currency)
+        if problem is not None:
+            self.warnings.append(f"{problem} (for {what})")
+            return None
         if rate is None:
             note = (
                 " (ECB does not publish MKD; an owner-approved source is required)"
@@ -792,6 +900,15 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
     as_of = ensure_utc(as_of)
     if fx_max_age_days < 0:
         raise ValidationFailed("fx_max_age_days must not be negative")
+    dropped = REQUIRED_CATEGORIES - required_categories
+    if dropped or CostCategory.PURCHASE in required_categories:
+        # Dropping a category would let a missing line count as zero. A category that does not
+        # apply is excluded with a not_applicable line and a reason, never by omission.
+        raise ValidationFailed(
+            "required_categories must cover every spec 18 cost category (purchase excluded); "
+            "exclude a category with a not_applicable line and a reason",
+            details={"dropped": sorted(c.value for c in dropped)},
+        )
     on_date = as_of.date()
     ccy = valuation_currency
     conv = _Converter(fx_rates, ccy, on_date, fx_max_age_days)
@@ -801,6 +918,7 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
     unknown: list[UnknownLine] = []
     evidence: list[str] = [*purchase.evidence_ids, *proceeds.evidence_ids]
     expiries: list[datetime] = []
+    import_sources: list[str] = []
 
     # -- purchase (deposit split out first)
     purchase_amount = conv.convert(purchase.amount, "purchase")
@@ -834,6 +952,17 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
             expiries.append(line.expires_at)
         if status != line.status:
             warnings.append(f"QUOTE_EXPIRED:{line.display_name()}: treated as an estimate")
+        if status == CostLineStatus.QUOTED and line.scope is not None and target_scope is None:
+            # The quote's coverage cannot be checked against this vehicle: it is never applied
+            # silently as a quote; it counts as an (unapproved) estimate for support purposes.
+            status = CostLineStatus.ESTIMATED
+            warnings.append(
+                f"COST_SCOPE_UNVERIFIED:{line.display_name()}: no target scope supplied; "
+                "treated as an estimate"
+            )
+        if line.category in IMPORT_CATEGORIES:
+            refs = [e for e in line.evidence_ids if e.startswith(TAX_CALCULATION_EVIDENCE_PREFIX)]
+            import_sources.extend(refs or [f"manual:{line.category.value}"])
         item = _Item(
             item=line.category.value,
             label=line.label,
@@ -877,6 +1006,14 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
     present = {line.category for line in lines}
     if purchase.included_refundable_deposit is not None:
         present.add(CostCategory.REFUNDABLE_DEPOSIT)
+        if any(
+            line.category == CostCategory.REFUNDABLE_DEPOSIT and line.status in _AMOUNT_STATUSES
+            for line in lines
+        ):
+            warnings.append(
+                "DEPOSIT_POSSIBLY_COUNTED_TWICE: the purchase already includes a refundable deposit and "
+                "refundable_deposit lines are also supplied; each deposit must appear exactly once"
+            )
     for category in sorted(required_categories - present):
         reason = "no line supplied for a required category (unknown, not zero)"
         items.append(
@@ -942,8 +1079,8 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
             confirmed = bool(deposit_line and deposit_line.refund_confirmed)
             prereqs = deposit_line.refund_prerequisites if deposit_line else ()
             deposits.append((item.label, item.amounts if item.known else None, confirmed, prereqs))
-    for label, _, confirmed, prereqs in deposits:
-        if not confirmed:
+    for label, deposit_amounts, confirmed, prereqs in deposits:
+        if deposit_amounts is not None and not confirmed:
             needs = "; ".join(prereqs) if prereqs else "prerequisites not recorded"
             assumptions.append(
                 f"refund of '{label}' is ASSUMED in base/upside (unconfirmed; prerequisites: {needs}); "
@@ -958,11 +1095,14 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
             members = [i for i in items if i.category is not None and TERM_BY_CATEGORY[i.category] == t]
             return _sum(i.amounts[scenario] if i.known else None for i in members)
 
+        # A deposit of unknown amount can be neither assumed refunded nor priced as lost, so
+        # it leaves the economic cost unknown in every scenario.
         lost: Decimal | None = Decimal(0)
         for _label, amounts, confirmed, _prereqs in deposits:
-            if confirmed or name != ScenarioName.CONSERVATIVE:
-                continue
-            lost = None if amounts is None or lost is None else _CTX.add(lost, amounts[name])
+            if amounts is None:
+                lost = None
+            elif lost is not None and not confirmed and name == ScenarioName.CONSERVATIVE:
+                lost = _CTX.add(lost, amounts[name])
         acquisition = term(Term.ACQUISITION_COSTS)
         economic = _sum([purchase_cash, acquisition, lost])
         transport = term(Term.TRANSPORT)
@@ -1004,7 +1144,7 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
         known_subtotal = sum(known_parts, Decimal(0))
 
         scenario_assumptions = list(assumptions)
-        if name == ScenarioName.CONSERVATIVE and any(not d[2] for d in deposits):
+        if name == ScenarioName.CONSERVATIVE and any(d[1] is not None and not d[2] for d in deposits):
             scenario_assumptions.append("no-refund downside: unconfirmed deposits counted as economic cost")
         complete = None not in (total_cost, contribution, cash_required)
         results.append(
@@ -1039,10 +1179,11 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
             )
         )
 
-    # -- support level of material inputs
+    # -- support level: material lines need quotes/actuals/active-rule amounts for
+    # quote_supported; every remaining estimate (reserve, selling, preparation, ...) must be
+    # an owner-approved assumption, otherwise it is unsupported and blocks a threshold alert.
     unsupported: list[str] = []
     strict_ok = True
-    material = [i for i in items if i.category in MATERIAL_CATEGORIES]
     if purchase.status == CostLineStatus.UNKNOWN or purchase_cash is None:
         strict_ok = False
     elif purchase.status not in _EVIDENCED_STATUSES:
@@ -1051,16 +1192,21 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
             unsupported.append(
                 f"purchase: {purchase.status.value} (seller has not confirmed the payable amount)"
             )
-    for item in material:
+    for item in items:
         if not item.known:
             strict_ok = False
             continue
-        if not _strictly_supported(item.status, item.line):
+        if _strictly_supported(item.status, item.line):
+            continue
+        approved = (
+            item.status == CostLineStatus.ESTIMATED
+            and item.line is not None
+            and item.line.assumption_approved
+        )
+        if item.category in MATERIAL_CATEGORIES or not approved:
             strict_ok = False
-            if not (item.status == CostLineStatus.ESTIMATED and item.line and item.line.assumption_approved):
-                unsupported.append(
-                    f"{item.item}: {item.label} ({item.status.value}, assumption not approved)"
-                )
+        if not approved:
+            unsupported.append(f"{item.item}: {item.label} ({item.status.value}, assumption not approved)")
     if not proceeds_supported(proceeds):
         unsupported.append(f"proceeds: {proceeds.label()} (not an approved/realized basis)")
     any_unknown = bool(unknown)
@@ -1099,6 +1245,7 @@ def compute_scenarios(  # noqa: PLR0917 - positional order is the documented pac
         evidence_ids=tuple(sorted(set(evidence))),
         earliest_expiry=min(expiries) if expiries else None,
         fx_rates_used=tuple(conv.used[k] for k in sorted(conv.used)),
+        import_line_sources=tuple(sorted(set(import_sources))),
         inputs_sha256=scenario_inputs_sha256(
             purchase,
             lines,
@@ -1138,15 +1285,23 @@ def scenario_inputs_sha256(
 
 
 def proceeds_supported(proceeds: ProceedsEstimate) -> bool:
-    """Proceeds can support an alert only as a realized/quoted basis or an approved assumption
-    (an asking-price basis additionally needs a known, approved negotiation discount)."""
-    if proceeds.status in (CostLineStatus.QUOTED, CostLineStatus.ACTUAL):
-        return True
-    if proceeds.status != CostLineStatus.ESTIMATED or not proceeds.assumption_approved:
+    """Proceeds can support an alert only as a realized/quoted basis or an approved assumption.
+
+    An asking-price basis always additionally needs a known, approved negotiation discount
+    (spec 15: asking prices are not realized sales).
+    """
+    if proceeds.status == CostLineStatus.UNKNOWN:
         return False
     if proceeds.basis == "mk_asking_prices":
-        return proceeds.negotiation_discount_pct is not None and proceeds.discount_approved
-    return True
+        return (
+            proceeds.status == CostLineStatus.ESTIMATED
+            and proceeds.assumption_approved
+            and proceeds.negotiation_discount_pct is not None
+            and proceeds.discount_approved
+        )
+    if proceeds.status in (CostLineStatus.QUOTED, CostLineStatus.ACTUAL):
+        return True
+    return proceeds.status == CostLineStatus.ESTIMATED and proceeds.assumption_approved
 
 
 def _evaluate_threshold(

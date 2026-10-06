@@ -82,6 +82,9 @@ create table app.sources (
   allowed_search_paths text[] not null default '{}',
   allowed_detail_paths text[] not null default '{}',
   source_timezone text not null default 'Europe/Berlin',
+  -- SourceConfig.detail_mode: 'fetch' fetches detail pages; 'card_only' limits the
+  -- source to search-result cards (robots/terms decision), so it needs no detail paths.
+  detail_mode text not null default 'fetch',
   config jsonb not null default '{}'::jsonb,
   paused boolean not null default false,
   pause_reason text,
@@ -115,13 +118,16 @@ create table app.sources (
   constraint sources_allowed_search_paths_ck check (app.text_array_ok(allowed_search_paths, 50, 500)),
   constraint sources_allowed_detail_paths_ck check (app.text_array_ok(allowed_detail_paths, 50, 500)),
   constraint sources_timezone_ck check (source_timezone ~ '^[A-Za-z0-9_+/-]{1,64}$'),
+  constraint sources_detail_mode_ck check (detail_mode in ('fetch', 'card_only')),
   constraint sources_config_ck check (pg_catalog.jsonb_typeof(config) = 'object'),
   constraint sources_pause_ck check (not paused or (pause_reason is not null and paused_at is not null)),
   constraint sources_pause_reason_ck check (pause_reason is null or pg_catalog.length(pause_reason) between 3 and 2000),
   constraint sources_version_ck check (version > 0),
   -- Activation gate, mirroring domain.sources.activation_problems(): a source can
   -- only be enabled with an implemented adapter, a reviewed terms decision that
-  -- names its actor, a tested and unblocked adapter and a host/path policy.
+  -- names its actor, a tested and unblocked adapter and a host/path policy
+  -- (detail paths only when detail pages are fetched; search paths only for
+  -- acquisition sources).
   constraint sources_enable_gate_ck check (
     not enabled or (
       adapter_version <> 'unimplemented'
@@ -130,7 +136,7 @@ create table app.sources (
       and terms_decision_actor is not null
       and technical_status not in ('untested', 'access_blocked', 'parser_unhealthy')
       and pg_catalog.cardinality(allowed_hosts) > 0
-      and pg_catalog.cardinality(allowed_detail_paths) > 0
+      and (detail_mode = 'card_only' or pg_catalog.cardinality(allowed_detail_paths) > 0)
       and (role <> 'acquisition' or pg_catalog.cardinality(allowed_search_paths) > 0)
     )
   )

@@ -267,3 +267,13 @@ def test_risk_flags_from_listing() -> None:
     mechanical, document = risk_flags_from_listing(listing)
     assert set(mechanical) == {"non_running", "faults_reported", "accident_claims_conflict"}
     assert set(document) == {"vin_missing", "coc_missing", "co2_missing"}
+
+
+@pytest.mark.parametrize("price", ["3000.01", "3000.20", "3000.49", "3000.50"])
+def test_any_price_above_band_scores_below_an_in_band_price(price: str) -> None:
+    # Regression: half-even rounding gave EUR 3,000.20 (19.996 points) the full in-band 20.00.
+    inside = rank_candidate(features(acquisition_price_eur=Decimal("3000"))).contribution("acquisition_fit")
+    above = rank_candidate(features(acquisition_price_eur=Decimal(price))).contribution("acquisition_fit")
+    assert inside.points == Decimal("20.00")
+    assert above.points <= Decimal("19.99")
+    assert above.points < inside.points

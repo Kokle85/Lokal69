@@ -30,8 +30,9 @@ Claims (spec 21 "Claim and optimistic concurrency"):
 Submission (``evaluate_submit``) checks, in this order: scope, workspace, case id, superseded,
 claim ownership (``ALREADY_CLAIMED`` if another holder is active, else ``CLAIM_EXPIRED``),
 claim expiry, expected case version, listing revision, valuation applicability, outcome rules
-(shortlist needs a current valuation and passes the eligibility/availability/freshness/
-fingerprint guard of spec 18). The decision records the authenticated actor from
+(shortlist needs a current valuation, at least one cited evidence id, and passes the
+eligibility/availability/freshness/fingerprint guard of spec 18; needs_information lists the
+missing items). The decision records the authenticated actor from
 ``ActorContext`` only; request bodies have no actor fields (``extra="forbid"``), so caller text
 cannot impersonate an owner. The summary is a concise rationale and evidence trail, never
 hidden chain-of-thought.
@@ -248,6 +249,11 @@ class ReviewCaseSnapshot(BaseModel):
             raise ValueError("only a superseded case names its successor")
         if self.valuation_id is None and self.valuation_state is not None:
             raise ValueError("valuation_state needs a valuation_id")
+        if (
+            self.latest_decision_listing_revision is not None
+            and self.latest_decision_listing_revision > self.listing_revision
+        ):
+            raise ValueError("a decision cannot reference a listing revision newer than the case")
         return self
 
     def claim_active(self, now: datetime) -> bool:
@@ -490,7 +496,8 @@ def evaluate_claim(
             raise AlreadyClaimed()
         rotated = True
     elif case.state == ReviewState.CLAIMED:
-        took_over = True  # an expired claim is released implicitly
+        # An expired claim is released implicitly; only another principal "takes over" (audit label).
+        took_over = case.claim_holder != actor.principal_id
     elif case.state not in CLAIMABLE_STATES:
         raise ValidationFailed(
             f"a {case.state.value} case is closed for review claims", details={"state": case.state.value}
@@ -668,6 +675,9 @@ def _check_outcome(case: ReviewCaseSnapshot, request: SubmitRequest, guard: Subm
         return
     if request.valuation_id is None or case.valuation_state not in _SHORTLIST_VALUATION_STATES:
         raise ValidationFailed("a shortlist decision must cite the current, usable valuation")
+    if not request.evidence_ids:
+        # Spec 14/21: decisions cite the evidence ids they rest on; a shortlist is never evidence-free.
+        raise ValidationFailed("a shortlist decision must cite at least one evidence id")
     if guard is None:
         raise ValidationFailed("a shortlist decision needs the pre-decision guard facts")
     stale: list[str] = []

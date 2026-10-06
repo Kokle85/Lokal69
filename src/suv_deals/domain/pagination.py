@@ -140,7 +140,7 @@ def sort_value_of(value: object) -> SortValue:
     if isinstance(value, Decimal):
         return format(value, "f")
     if isinstance(value, datetime):
-        return ensure_utc(value).isoformat().replace("+00:00", "Z")
+        return _aware(value).isoformat().replace("+00:00", "Z")
     if isinstance(value, date):
         return value.isoformat()
     raise ValidationFailed(f"unsupported sort value type {type(value).__name__}")

@@ -276,6 +276,13 @@ declare
   lifecycle_cols constant text[] := array[
     'status', 'approved_by', 'approved_at', 'approval_reference', 'valid_to', 'updated_at'];
 begin
+  -- A synthetic/example rule set can never be relabelled as real (or vice
+  -- versa), not even while it is a draft (spec 16/18: no invented taxes).
+  if new.is_fixture is distinct from old.is_fixture then
+    raise exception using
+      errcode = 'SV004',
+      message = 'tax rule set is_fixture is immutable; create a new rule set';
+  end if;
   if old.status <> 'draft'
      and (pg_catalog.to_jsonb(new) - lifecycle_cols) is distinct from (pg_catalog.to_jsonb(old) - lifecycle_cols) then
     raise exception using
@@ -409,10 +416,15 @@ create index cost_evidence_listing_idx on app.cost_evidence (workspace_id, listi
 -- Reproducible valuations (spec 18). One valuation references one listing
 -- revision, comparable set, tax rule set, FX observations, cost profile and
 -- configuration revision, plus a dependency fingerprint used for invalidation.
--- Unknown stays unknown: not_started/incomplete valuations carry no
--- contribution figures; estimated/quote_supported ones carry both base and
--- conservative contributions. Content is immutable; only state may move to
--- stale/invalid (with reason).
+-- The invariants mirror suv_deals.domain.valuation.Valuation exactly, so every
+-- stored row loads into the domain model:
+--   * unknown stays unknown: not_started/incomplete/invalid valuations carry no
+--     contribution figures; estimated/quote_supported carry base and
+--     conservative contributions;
+--   * stale_at/stale_reason are set exactly when the state is stale;
+--   * content is immutable; the only state change is "mark stale"
+--     (domain.valuation.mark_stale); invalid and stale are terminal. A
+--     recalculation is a NEW row.
 create table app.valuations (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references app.workspaces (id),
@@ -462,13 +474,13 @@ create table app.valuations (
   constraint valuations_calculation_version_ck check (pg_catalog.length(calculation_version) between 1 and 80),
   constraint valuations_currency_ck check (currency ~ '^[A-Z]{3}$'),
   constraint valuations_unknown_not_zero_ck check (
-    state not in ('not_started', 'incomplete')
+    state not in ('not_started', 'incomplete', 'invalid')
     or (base_contribution_minor is null and conservative_contribution_minor is null
         and upside_contribution_minor is null)),
   constraint valuations_complete_figures_ck check (
     state not in ('estimated', 'quote_supported')
     or (base_contribution_minor is not null and conservative_contribution_minor is not null)),
-  constraint valuations_stale_ck check (state <> 'stale' or (stale_at is not null and stale_reason is not null)),
+  constraint valuations_stale_ck check ((state = 'stale') = (stale_at is not null and stale_reason is not null)),
   constraint valuations_stale_reason_ck check (stale_reason is null or pg_catalog.length(stale_reason) <= 500)
 );
 create index valuations_revision_idx on app.valuations (workspace_id, listing_revision_id, created_at desc);
@@ -532,7 +544,9 @@ begin
 end
 $$;
 
--- State may only move forward to stale or invalid; invalid is terminal.
+-- The only state change is marking a current valuation stale (spec 18:
+-- "mark the old valuation stale immediately, then enqueue recomputation").
+-- invalid is assigned at insert only; stale and invalid are terminal.
 create or replace function app.valuations_guard_state()
 returns trigger
 language plpgsql
@@ -540,7 +554,8 @@ set search_path = ''
 as $$
 begin
   if new.state is distinct from old.state
-     and (old.state = 'invalid' or new.state not in ('stale', 'invalid')) then
+     and not (new.state = 'stale'
+              and old.state in ('not_started', 'incomplete', 'estimated', 'quote_supported')) then
     raise exception using
       errcode = 'SV002',
       message = pg_catalog.format('valuation state %s -> %s is not permitted', old.state, new.state);

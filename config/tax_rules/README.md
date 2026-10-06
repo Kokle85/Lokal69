@@ -76,7 +76,8 @@ Nothing in a rule file is executed. Each component has `id`, `kind`, `label`,
 - CO2: a missing or unsupported cycle makes the component unknown. WLTP and NEDC values
   are never converted into each other.
 - Money in another currency is converted only with a customs-purpose rate for exactly
-  that pair. A rule naming `customs_value` never falls back to the invoice price.
+  that pair, never with a rate observed after the declaration date. A rule naming
+  `customs_value` never falls back to the invoice price.
 - Rounding `stage`: `before_dependents` (rounded value feeds later components) or
   `reported_only` (later components use the unrounded value). Totals sum reported
   amounts, then apply `rounding_rules.total`.
@@ -86,9 +87,23 @@ Nothing in a rule file is executed. Each component has `id`, `kind`, `label`,
 Unique ids; ids never shadow inputs; references only to declared inputs and earlier
 components (listed in `depends_on`); unit declarations; brackets sorted,
 non-overlapping, contiguous when declared, only the last open-ended; non-negative
-amounts/rates; rates at most 1; matching component currency; approved/active/superseded/
-expired versions need sources, approver, approval time, review record, valid_from,
-currency, categories, components, explicit rounding and a matching `sha256`.
+amounts/rates; rates at most 1; matching component currency; per-cycle CO2 tables need
+`co2_cycle` declared as an input; predicate values are text, numbers or ISO dates (never
+booleans); JSON `NaN`/`Infinity` are refused; approved/active/superseded/expired versions
+need sources, approver, approval time, review record, valid_from, currency, categories,
+components, explicit rounding and a matching `sha256`. Fixture rule sets can only be
+`draft`, `unapproved` or `revoked` and never enter review.
+
+A calculation is refused when the inputs name another jurisdiction, or an approved
+classification names a vehicle category the rule set does not cover. Money inputs above
+the engine's sanity bound are rejected as input errors.
+
+### Turning a calculation into cost lines
+
+`costs.tax_cost_lines` makes one line per import category. A category the rule set
+defines no component for is `not_applicable` only when the calculation is complete;
+otherwise it is `unknown` (never zero). Every line carries the rule identity and the
+`tax_calculation:<sha256>` of the exact calculation, which the valuation checks.
 
 ### Hashing
 

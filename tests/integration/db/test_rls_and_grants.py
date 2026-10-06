@@ -151,6 +151,25 @@ def test_default_privileges_keep_future_objects_private(db_conn: psycopg.Connect
         ).fetchone() == (False,)
 
 
+def test_backend_role_cannot_bypass_rls_or_escalate(db_conn: psycopg.Connection) -> None:
+    """Roles are cluster-global: migrations verify a pre-existing suv_backend fails closed."""
+    assert db_conn.execute("select ops.backend_role_problems()").fetchone() == ([],)
+    unsafe = f"suv_test_unsafe_{uuid.uuid4().hex[:12]}"
+    db_conn.execute(sql.SQL("create role {} login bypassrls createdb").format(sql.Identifier(unsafe)))
+    try:
+        db_conn.execute(sql.SQL("grant pg_monitor to {}").format(sql.Identifier(unsafe)))
+        row = db_conn.execute("select ops.backend_role_problems(%s)", (unsafe,)).fetchone()
+        assert row is not None
+        assert set(row[0]) == {"BYPASSRLS", "CREATEDB", "LOGIN", "member of another role"}
+    finally:
+        db_conn.execute(sql.SQL("drop role {}").format(sql.Identifier(unsafe)))
+    missing = db_conn.execute("select ops.backend_role_problems('suv_test_no_such_role')").fetchone()
+    assert missing == (["role suv_test_no_such_role does not exist"],)
+    for role in ("suv_backend", *CLIENT_ROLES):
+        with pytest.raises(errors.InsufficientPrivilege), as_role(db_conn, role):
+            db_conn.execute("select ops.backend_role_problems()")
+
+
 def test_security_definer_function_is_hardened(db_conn: psycopg.Connection) -> None:
     row = db_conn.execute(
         "select p.prosecdef, p.proconfig, p.provolatile,"
@@ -395,6 +414,45 @@ def test_membership_and_workspace_bootstrap_by_user(
         )
 
 
+def test_backend_manages_members_of_its_own_workspace_only(
+    db_conn: psycopg.Connection, seed: Seed, world_a: World, world_b: World
+) -> None:
+    """Owner-guarded membership writes run as suv_backend: FK to auth.users, column-limited update."""
+    ws = world_a.workspace_id
+    member = seed.user()
+    with backend(db_conn, ws):
+        db_conn.execute(
+            "insert into app.memberships (workspace_id, user_id, role) values (%s, %s, 'viewer')",
+            (ws, member),
+        )
+        assert (
+            db_conn.execute(
+                "update app.memberships set role = 'reviewer' where workspace_id = %s and user_id = %s",
+                (ws, member),
+            ).rowcount
+            == 1
+        )
+    with pytest.raises(errors.ForeignKeyViolation), backend(db_conn, ws):
+        db_conn.execute(
+            "insert into app.memberships (workspace_id, user_id, role) values (%s, %s, 'viewer')",
+            (ws, uuid.uuid4()),
+        )
+    with pytest.raises(errors.InsufficientPrivilege), backend(db_conn, ws):
+        db_conn.execute("update app.memberships set user_id = %s where user_id = %s", (seed.user(), member))
+    # The member's bootstrap view shows the new role; workspace B's backend cannot see or change it.
+    with backend(db_conn, user_id=member):
+        assert db_conn.execute("select workspace_id, role from app.memberships").fetchall() == [
+            (ws, "reviewer")
+        ]
+    with backend(db_conn, world_b.workspace_id):
+        assert (
+            db_conn.execute(
+                "update app.memberships set active = false where user_id = %s", (member,)
+            ).rowcount
+            == 0
+        )
+
+
 def test_active_workspace_ids_for_backend(db_conn: psycopg.Connection, seed: Seed, world_a: World) -> None:
     inactive = seed.workspace("Inactive", active=False)
     with backend(db_conn):
@@ -606,8 +664,9 @@ def test_backend_review_flow_respects_grants(db_conn: psycopg.Connection, seed: 
     with backend(db_conn, ws):
         decision = db_conn.execute(
             "insert into app.review_decisions (workspace_id, case_id, case_version, listing_id,"
-            " listing_revision_id, actor_principal_id, actor_kind, outcome, reason_codes, summary)"
-            " values (%s, %s, 1, %s, %s, %s, 'mcp_client', 'watch', %s, %s) returning id",
+            " listing_revision_id, actor_principal_id, actor_kind, outcome, reason_codes, summary,"
+            " is_fixture)"
+            " values (%s, %s, 1, %s, %s, %s, 'mcp_client', 'watch', %s, %s, true) returning id",
             (ws, case, listing, rev, holder, ["SYNTHETIC"], "Synthetic decision for a synthetic listing."),
         ).fetchone()
         assert decision is not None

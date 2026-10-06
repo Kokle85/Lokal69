@@ -36,7 +36,7 @@ from suv_deals.domain.filters import (
 )
 from suv_deals.domain.listings import LocationInfo, MileageOriginal, NormalizedListing, PriceInfo, VehicleSpec
 from suv_deals.domain.money import FxRate
-from suv_deals.domain.parsing import parse_mileage
+from suv_deals.domain.parsing import parse_mileage, parse_price
 from suv_deals.domain.profiles import BusinessConfig, load_business_config
 from suv_deals.domain.provenance import FieldConflict
 from suv_deals.domain.taxonomy import VehicleTaxonomy, default_taxonomy
@@ -46,11 +46,18 @@ AS_OF = date(2026, 10, 6)
 OBSERVED = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
 
 
-def business_config(*, manual: bool = False, below: bool = False) -> BusinessConfig:
+def business_config(
+    *, manual: bool = False, below: bool = False, require_taxonomy: bool = True
+) -> BusinessConfig:
+    flag = {"require_taxonomy_match": require_taxonomy}
     return load_business_config(
         CONFIG_DIR,
         overrides={
-            "profiles": {"manual_4000": {"enabled": manual}, "below_target_watch": {"enabled": below}}
+            "profiles": {
+                "primary": flag,
+                "manual_4000": {"enabled": manual, **flag},
+                "below_target_watch": {"enabled": below, **flag},
+            }
         },
     )
 
@@ -412,6 +419,59 @@ def test_unknown_basis_with_vat_wording(overrides: dict[str, Any], code: ReasonC
     assert code in result.codes()
 
 
+@pytest.mark.parametrize(
+    "price",
+    [
+        {"amount_minor": 0},
+        {"amount_minor": 0, "basis": PriceBasis.UNKNOWN},
+        {"basis": PriceBasis.NET, "amount_minor": 231100, "gross_amount_minor": 0},
+        {"type": PriceType.EXPORT_NET, "basis": PriceBasis.NET, "amount_minor": 0},
+    ],
+)
+def test_zero_price_is_a_placeholder_never_eligible(price: dict[str, Any]) -> None:
+    # Unknown is never 0 (spec 2): a "0 €" placeholder must not land in any queue, including the
+    # below-target watch whose band (< EUR 2,500) would otherwise contain it.
+    for config in (DEFAULT_CONFIG, business_config(manual=True, below=True)):
+        result = run(listing(price=price), config=config)
+        assert result.state == EligibilityState.NEEDS_FACTS
+        assert ReasonCode.PRICE_ZERO_PLACEHOLDER in result.codes()
+        assert result.eur_amount is None
+        assert "price.amount_minor" in result.missing_facts
+
+
+def test_zero_mileage_is_a_placeholder() -> None:
+    result = run(listing(vehicle={"mileage_km": Decimal("0")}))
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert ReasonCode.MILEAGE_ZERO_PLACEHOLDER in result.codes()
+    assert "vehicle.mileage_km" in result.missing_facts
+
+
+def test_parsed_plus_vat_price_is_net_even_for_private_seller() -> None:
+    parsed = parse_price("2.750 € + VAT", "de")
+    assert parsed.basis == PriceBasis.NET
+    item = listing(
+        price={
+            "amount_minor": parsed.amount_minor,
+            "currency": parsed.currency,
+            "basis": parsed.basis,
+            "type": parsed.price_type,
+            "vat_treatment": parsed.vat_treatment,
+        },
+        seller_type=SellerType.PRIVATE,
+    )
+    result = run(item)
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert ReasonCode.PRICE_BASIS_NET_ONLY in result.codes()
+
+
+def test_parsed_negated_damage_wording_stays_eligible() -> None:
+    parsed = parse_price("2.750 € inkl. MwSt., keine Defekte", "de")
+    item = listing(
+        price={"type": parsed.price_type, "basis": parsed.basis, "amount_minor": parsed.amount_minor}
+    )
+    assert run(item).state == EligibilityState.ELIGIBLE_PRIMARY
+
+
 def test_missing_price_needs_facts() -> None:
     result = run(listing(price={"amount_minor": None, "currency": None}))
     assert result.state == EligibilityState.NEEDS_FACTS
@@ -535,6 +595,30 @@ def test_stale_fx_near_boundary_needs_facts() -> None:
     result = run(chf_listing("2790.00"), rates=[stale])
     assert result.state == EligibilityState.NEEDS_FACTS
     assert ReasonCode.FX_STALE_NEAR_BOUNDARY in result.codes()
+    # Same fact name as FX_MISSING, so a missing-facts list is stable whatever the FX problem.
+    assert result.missing_facts == ("fx:CHF/EUR",)
+
+
+@pytest.mark.parametrize(
+    ("chf", "near"),
+    [
+        ("2250.00", False),  # EUR 2419.35: 80.65 below 2,500 (> 3 % = 75)
+        ("2260.00", True),  # EUR 2430.11: within 75 of 2,500
+        ("2324.99", True),  # EUR 2499.99
+        ("2400.00", False),  # EUR 2580.65: 80.65 above 2,500
+        ("2700.00", False),  # EUR 2903.23: 96.77 below 3,000 (> 3 % = 90)
+        ("2710.00", True),  # EUR 2913.98: within 90 of 3,000
+        ("2850.00", True),  # EUR 3064.52: above the band but within 90 -> cannot reject on a stale rate
+        ("2880.00", False),  # EUR 3096.77: far enough above to reject despite the stale rate
+    ],
+)
+def test_stale_fx_margin_applies_at_both_band_edges(chf: str, near: bool) -> None:
+    # SYNTHETIC rate 0.93 CHF per EUR; the margin is fx_boundary_margin_pct (3 %) of each bound.
+    stale = chf_rate("0.93", rate_date=date(2026, 9, 20))
+    codes = run(chf_listing(chf), rates=[stale]).codes()
+    assert (ReasonCode.FX_STALE_NEAR_BOUNDARY in codes) is near
+    if not near:
+        assert ReasonCode.FX_STALE in codes
 
 
 def test_stale_fx_far_from_boundary_is_warning() -> None:
@@ -591,10 +675,43 @@ def test_unknown_model_and_body_needs_facts() -> None:
     assert ReasonCode.SUV_IDENTITY_UNKNOWN in result.codes()
 
 
-def test_unmatched_model_with_suv_body_passes_with_warning() -> None:
+def test_unmatched_model_with_suv_body_needs_facts_when_taxonomy_required() -> None:
+    # Shipped profiles set require_taxonomy_match: true; a seller "SUV" category alone is not
+    # enough because marketplaces file pickups and raised estates there too.
     result = run(listing(vehicle={"make": "Example", "model": "Trail", "body_type": BodyType.SUV}))
+    assert result.state == EligibilityState.NEEDS_FACTS
+    reason = next(r for r in result.reasons if r.code == ReasonCode.TAXONOMY_UNMATCHED)
+    assert reason.severity == ReasonSeverity.NEEDS_FACTS
+    assert "vehicle.model" in result.missing_facts
+
+
+def test_unmatched_model_with_suv_body_passes_when_taxonomy_not_required() -> None:
+    result = run(
+        listing(vehicle={"make": "Example", "model": "Trail", "body_type": BodyType.SUV}),
+        config=business_config(require_taxonomy=False),
+    )
     assert result.state == EligibilityState.ELIGIBLE_PRIMARY
-    assert ReasonCode.TAXONOMY_UNMATCHED in result.codes()
+    reason = next(r for r in result.reasons if r.code == ReasonCode.TAXONOMY_UNMATCHED)
+    assert reason.severity == ReasonSeverity.WARNING
+
+
+@pytest.mark.parametrize(
+    ("make", "model", "body"),
+    [
+        ("Toyota", "Hilux", BodyType.SUV),
+        ("Mitsubishi", "L200", BodyType.OFFROAD),
+        ("Ford", "Ranger", BodyType.SUV),
+        ("Volvo", "XC70", BodyType.SUV),
+        ("Audi", "A6 allroad quattro", BodyType.CROSSOVER),
+    ],
+)
+def test_pickups_and_raised_estates_in_suv_category_are_rejected(
+    make: str, model: str, body: BodyType
+) -> None:
+    for config in (DEFAULT_CONFIG, business_config(require_taxonomy=False)):
+        result = run(listing(vehicle={"make": make, "model": model, "body_type": body}), config=config)
+        assert result.state == EligibilityState.REJECTED
+        assert ReasonCode.NOT_SUV in result.codes()
 
 
 def test_taxonomy_match_passes_without_body_type() -> None:
@@ -614,13 +731,23 @@ def test_taxonomy_suv_with_contradicting_body_warns() -> None:
     assert ReasonCode.BODY_TYPE_CONFLICTS_TAXONOMY in result.codes()
 
 
-def test_without_taxonomy_body_type_decides() -> None:
+def test_without_taxonomy_required_match_needs_facts() -> None:
     result = run(listing(), use_taxonomy=False)
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert {ReasonCode.TAXONOMY_NOT_SUPPLIED, ReasonCode.TAXONOMY_UNMATCHED} <= result.codes()
+    assert result.taxonomy_match is None
+
+
+def test_without_taxonomy_body_type_decides_when_match_not_required() -> None:
+    config = business_config(require_taxonomy=False)
+    result = run(listing(), config=config, use_taxonomy=False)
     assert result.state == EligibilityState.ELIGIBLE_PRIMARY
     assert ReasonCode.TAXONOMY_NOT_SUPPLIED in result.codes()
     assert result.taxonomy_match is None
-    unknown = run(listing(vehicle={"body_type": BodyType.UNKNOWN}), use_taxonomy=False)
+    unknown = run(listing(vehicle={"body_type": BodyType.UNKNOWN}), config=config, use_taxonomy=False)
     assert unknown.state == EligibilityState.NEEDS_FACTS
+    hatchback = run(listing(vehicle={"body_type": BodyType.HATCHBACK}), config=config, use_taxonomy=False)
+    assert hatchback.state == EligibilityState.REJECTED
 
 
 @pytest.mark.parametrize(

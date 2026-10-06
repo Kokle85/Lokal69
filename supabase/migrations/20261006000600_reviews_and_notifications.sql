@@ -5,9 +5,10 @@
 -- preferences (spec 22).
 -- =============================================================================
 
--- Review case per (listing, profile). row_version is the case version that
--- clients pass as expected_version; it changes on material information, not on
--- claim/release. Claims store only a hash of the opaque claim token.
+-- Review case per (listing, profile). row_version is the optimistic-concurrency
+-- case version that clients pass as expected_version; every accepted change
+-- (claim, release, submit, new material information) increments it
+-- (domain.reviews). Claims store only a SHA-256 of the opaque claim token.
 create table app.review_cases (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references app.workspaces (id),
@@ -40,8 +41,10 @@ create table app.review_cases (
     references app.valuations (workspace_id, listing_id, id),
   constraint review_cases_profile_fk foreign key (workspace_id, profile_key)
     references app.search_profiles (workspace_id, profile_key),
-  constraint review_cases_superseded_by_fk foreign key (workspace_id, superseded_by_id)
-    references app.review_cases (workspace_id, id),
+  -- A successor case belongs to the same listing (a relisted vehicle is a new
+  -- listing incarnation and never inherits review history, spec 10).
+  constraint review_cases_superseded_by_fk foreign key (workspace_id, listing_id, superseded_by_id)
+    references app.review_cases (workspace_id, listing_id, id),
   constraint review_cases_state_ck check (state in (
     'pending', 'claimed', 'needs_information', 'watch', 'shortlisted', 'rejected', 'superseded')),
   constraint review_cases_queue_label_ck check (pg_catalog.length(queue_label) between 3 and 120),
@@ -256,6 +259,67 @@ create table app.notification_preferences (
   constraint notification_preferences_row_version_ck check (row_version > 0)
 );
 
+-- Fixture data never flows into real review records (spec 18: fixtures are
+-- visibly labelled and cannot generate notifications or real opportunities).
+create or replace function app.review_cases_check_fixture_lineage()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if not new.is_fixture and new.valuation_id is not null and exists (
+       select 1
+         from app.valuations v
+        where v.workspace_id = new.workspace_id
+          and v.id = new.valuation_id
+          and v.is_fixture) then
+    raise exception using
+      errcode = 'SV003',
+      message = 'a non-fixture review case cannot reference a fixture valuation';
+  end if;
+  return new;
+end
+$$;
+
+-- A decision carries its case's fixture flag, and a real decision never cites
+-- a fixture valuation.
+create or replace function app.review_decisions_check_fixture_lineage()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  case_fixture boolean;
+begin
+  select c.is_fixture
+    into case_fixture
+    from app.review_cases c
+   where c.workspace_id = new.workspace_id
+     and c.id = new.case_id;
+  if case_fixture is not null and case_fixture <> new.is_fixture then
+    raise exception using
+      errcode = 'SV003',
+      message = 'a review decision must carry the is_fixture flag of its case';
+  end if;
+  if not new.is_fixture and new.valuation_id is not null and exists (
+       select 1
+         from app.valuations v
+        where v.workspace_id = new.workspace_id
+          and v.id = new.valuation_id
+          and v.is_fixture) then
+    raise exception using
+      errcode = 'SV003',
+      message = 'a non-fixture review decision cannot cite a fixture valuation';
+  end if;
+  return new;
+end
+$$;
+
+create trigger review_cases_fixture_lineage before insert or update of valuation_id, is_fixture
+  on app.review_cases
+  for each row execute function app.review_cases_check_fixture_lineage();
+create trigger review_decisions_fixture_lineage before insert on app.review_decisions
+  for each row execute function app.review_decisions_check_fixture_lineage();
 create trigger review_cases_touch before update on app.review_cases
   for each row execute function app.touch_updated_at();
 create trigger review_cases_version_guard before update on app.review_cases

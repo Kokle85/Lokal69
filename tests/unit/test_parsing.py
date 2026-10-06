@@ -100,6 +100,11 @@ def test_parse_number_locales(text: str, locale: str | None, expected: str) -> N
         ("27.50.00", "de", ParseWarning.AMBIGUOUS_SEPARATOR),
         ("1 234'567", None, ParseWarning.INVALID_GROUPING),
         ("12.34.567", "de", ParseWarning.AMBIGUOUS_SEPARATOR),
+        # A leading zero never starts a thousands grouping: '0.750' is not 750 (likely 0.75).
+        ("0.750", "de", ParseWarning.INVALID_GROUPING),
+        ("0.750.000", "it", ParseWarning.INVALID_GROUPING),
+        ("0'750", "ch", ParseWarning.INVALID_GROUPING),
+        ("0,750", "en", ParseWarning.INVALID_GROUPING),
     ],
 )
 def test_parse_number_ambiguous_returns_none(text: str, locale: str | None, warning: str) -> None:
@@ -298,6 +303,52 @@ def test_parse_price_boundary_aware_words_do_not_reclassify(text: str) -> None:
     assert parse_price(text, "de").price_type == PriceType.FULL_VEHICLE_ASKING
 
 
+@pytest.mark.parametrize(
+    ("text", "locale"),
+    [
+        ("2.750 € keine Defekte", "de"),
+        ("2.750 € nicht defekt", "de"),
+        ("2.750 € kein Unfallwagen", "de"),
+        ("2.750 € ohne Motorschaden", "de"),
+        ("2.750 € keinen Getriebeschaden", "de"),
+        ("2.750 € non incidentata", "it"),
+        ("2.750 € senza incidenti, non incidentata", "it"),
+    ],
+)
+def test_parse_price_negated_damage_wording_is_not_parts(text: str, locale: str) -> None:
+    result = parse_price(text, locale)  # type: ignore[arg-type]
+    assert result.price_type == PriceType.FULL_VEHICLE_ASKING
+    assert result.amount == Decimal("2750")
+
+
+def test_parse_price_parts_wins_over_instalment_wording() -> None:
+    # The damage statement disqualifies the vehicle whatever the number means.
+    result = parse_price("Finanzierung ab 99 €/Monat, Motorschaden", "de")
+    assert result.price_type == PriceType.PARTS_OR_DAMAGED
+    assert ParseWarning.MULTIPLE_PRICE_TYPES in result.warnings
+    assert PriceType.INSTALMENT.value in result.markers
+
+
+@pytest.mark.parametrize("text", ["0 €", "EUR 0,-", "0,00 €"])
+def test_parse_price_zero_is_a_placeholder_not_a_price(text: str) -> None:
+    result = parse_price(text, "de")
+    assert result.amount is None
+    assert result.amount_minor is None
+    assert result.price_type == PriceType.UNKNOWN
+    assert ParseWarning.PRICE_ZERO_PLACEHOLDER in result.warnings
+
+
+def test_parse_price_zero_with_on_request_wording() -> None:
+    assert parse_price("0 € auf Anfrage", "de").price_type == PriceType.PRICE_ON_REQUEST
+    assert parse_price("0 € Preis auf Anfrage", "de").price_type == PriceType.PRICE_ON_REQUEST
+
+
+def test_parse_price_bare_sfr_marker() -> None:
+    result = parse_price("SFr 12'500", "ch")
+    assert result.currency == "CHF"
+    assert result.amount == Decimal("12500")
+
+
 def test_parse_price_generic_on_request_ignored_when_amount_present() -> None:
     result = parse_price("2.750 € Besichtigung auf Anfrage", "de")
     assert result.price_type == PriceType.FULL_VEHICLE_ASKING
@@ -322,6 +373,18 @@ def test_parse_price_multiple_types_use_precedence() -> None:
         ("2.311 € esclusa IVA", "it", PriceBasis.NET, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
         ("2.311 € oltre IVA", "it", PriceBasis.NET, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
         ("2,311 EUR excl. VAT", "en", PriceBasis.NET, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
+        ("2.311 € + VAT", "de", PriceBasis.NET, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
+        ("2.311 € zzgl. gesetzl. MwSt.", "de", PriceBasis.NET, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
+        (
+            "2.311 € zzgl. 19 % gesetzl. MwSt.",
+            "de",
+            PriceBasis.NET,
+            VatTreatment.NOT_STATED,
+            Tristate.UNKNOWN,
+        ),
+        ("2.750 € inkl. gesetzl. MwSt.", "de", PriceBasis.GROSS, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
+        ("2.750 € inkl. ges. MwSt.", "de", PriceBasis.GROSS, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
+        ("2.750 € IVA 22% esposta", "it", PriceBasis.GROSS, VatTreatment.VAT_SHOWN, Tristate.YES),
         ("2.750 € inkl. MwSt", "de", PriceBasis.GROSS, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
         ("2.750 € inkl. 19 % MwSt.", "de", PriceBasis.GROSS, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
         ("2.750 € IVA inclusa", "it", PriceBasis.GROSS, VatTreatment.NOT_STATED, Tristate.UNKNOWN),
@@ -353,6 +416,22 @@ def test_parse_price_vat_rate_stated() -> None:
     assert parse_price("2.750 € IVA 22% inclusa", "it").vat_rate_stated == Decimal("22")
     assert parse_price("2.750 € 7,7 % MwSt. inkl.", "de").vat_rate_stated == Decimal("7.7")
     assert parse_price("2.750 € 19%", "de").vat_rate_stated is None  # no VAT word -> not a VAT rate
+    assert parse_price("2.750 € MwSt. ausweisbar 19%", "de").vat_rate_stated == Decimal("19")
+    assert parse_price("2.750 € (MwSt. 19%)", "de").vat_rate_stated == Decimal("19")
+
+
+@pytest.mark.parametrize(
+    ("text", "rate"),
+    [
+        ("0% Finanzierung, 2.750 € inkl. MwSt.", None),  # 0 % financing is not a VAT rate
+        ("2.750 € inkl. 19% MwSt., 0% Zinsen", "19"),
+        ("3% Rabatt, 2.750 € IVA inclusa", None),
+    ],
+)
+def test_parse_price_vat_rate_needs_attached_vat_wording(text: str, rate: str | None) -> None:
+    result = parse_price(text, "de")
+    assert result.vat_rate_stated == (Decimal(rate) if rate else None)
+    assert ParseWarning.MULTIPLE_VAT_RATES not in result.warnings
 
 
 def test_parse_price_conflicting_basis() -> None:
@@ -552,10 +631,28 @@ def test_parse_mileage_ambiguous_locale() -> None:
     assert result.ambiguous
 
 
-def test_parse_mileage_implausible_is_flagged_not_hidden() -> None:
-    result = parse_mileage("2.500.000 km", "de")
-    assert result.km == Decimal("2500000")
+@pytest.mark.parametrize(("text", "stated"), [("2.500.000 km", "2500000"), ("150.000 Tkm", "150000000")])
+def test_parse_mileage_implausible_is_unknown_but_visible(text: str, stated: str) -> None:
+    # '150.000 Tkm' is a unit slip; acting on 150 million km would be a guess, so km is unknown,
+    # while the stated figure stays visible in the original.
+    result = parse_mileage(text, "de")
+    assert result.km is None
+    assert result.original.amount == Decimal(stated)
     assert ParseWarning.MILEAGE_IMPLAUSIBLE in result.warnings
+
+
+def test_parse_mileage_negative_is_unknown() -> None:
+    result = parse_mileage("-150.000 km", "de")
+    assert result.km is None
+    assert ParseWarning.MILEAGE_NEGATIVE in result.warnings
+    # A range dash is not a minus sign.
+    assert parse_mileage("150.000 - 160.000 km", "de").claim == OdometerClaim.RANGE_ONLY
+
+
+def test_speed_in_km_per_hour_is_not_a_mileage_unit() -> None:
+    result = parse_mileage("180 km/h", "de")
+    assert result.km is None
+    assert ParseWarning.MILEAGE_UNIT_MISSING in result.warnings
 
 
 def test_parse_mileage_multiple_numbers() -> None:
@@ -741,6 +838,14 @@ def test_source_datetime_date_only_precision() -> None:
     result = parse_source_datetime("2026-10-05", "Europe/Rome", AS_OF)
     assert result.timestamp.value == datetime(2026, 10, 4, 22, 0, tzinfo=UTC)
     assert result.timestamp.precision == Precision.DAY
+    assert result.time_precision == "day"
+    assert ParseWarning.DATE_ONLY_START_OF_DAY_ASSUMED in result.warnings
+
+
+@pytest.mark.parametrize(("text", "day"), [("20261005", 5), ("2026-W41-1", 5)])
+def test_source_datetime_other_iso_date_only_forms_have_day_precision(text: str, day: int) -> None:
+    result = parse_source_datetime(text, "Europe/Berlin", AS_OF)
+    assert result.timestamp.value == datetime(2026, 10, day - 1, 22, 0, tzinfo=UTC)
     assert result.time_precision == "day"
     assert ParseWarning.DATE_ONLY_START_OF_DAY_ASSUMED in result.warnings
 

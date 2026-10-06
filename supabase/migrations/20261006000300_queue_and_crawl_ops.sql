@@ -146,6 +146,9 @@ create table ops.crawl_runs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint crawl_runs_workspace_id_uk unique (workspace_id, id),
+  -- Target for (workspace_id, source_id, run) references: a card observation,
+  -- fetch attempt or schedule can only cite a run of its own source.
+  constraint crawl_runs_source_id_uk unique (workspace_id, source_id, id),
   constraint crawl_runs_source_fk foreign key (workspace_id, source_id)
     references app.sources (workspace_id, id),
   constraint crawl_runs_profile_fk foreign key (workspace_id, profile_id)
@@ -216,8 +219,8 @@ create table ops.source_schedules (
     references app.sources (workspace_id, id),
   constraint source_schedules_profile_fk foreign key (workspace_id, profile_id)
     references app.search_profiles (workspace_id, id),
-  constraint source_schedules_run_fk foreign key (workspace_id, run_id)
-    references ops.crawl_runs (workspace_id, id),
+  constraint source_schedules_run_fk foreign key (workspace_id, source_id, run_id)
+    references ops.crawl_runs (workspace_id, source_id, id),
   constraint source_schedules_partition_ck check (partition_key ~ '^[A-Za-z0-9_:.-]{1,80}$'),
   constraint source_schedules_interval_ck check (interval_seconds between 60 and 86400),
   constraint source_schedules_cursor_ck check (cursor is null or pg_catalog.jsonb_typeof(cursor) = 'object'),
@@ -380,8 +383,8 @@ create table ops.fetch_attempts (
     references app.sources (workspace_id, id),
   constraint fetch_attempts_job_fk foreign key (workspace_id, job_id)
     references ops.jobs (workspace_id, id),
-  constraint fetch_attempts_run_fk foreign key (workspace_id, crawl_run_id)
-    references ops.crawl_runs (workspace_id, id),
+  constraint fetch_attempts_run_fk foreign key (workspace_id, source_id, crawl_run_id)
+    references ops.crawl_runs (workspace_id, source_id, id),
   constraint fetch_attempts_snapshot_fk foreign key (workspace_id, snapshot_id)
     references ops.source_snapshots (workspace_id, id),
   constraint fetch_attempts_purpose_ck check (purpose in ('search', 'detail', 'robots', 'diagnostic')),

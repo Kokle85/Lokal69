@@ -36,6 +36,7 @@ from suv_deals.domain.enums import (
     Drive,
     EvidenceKind,
     Fuel,
+    FxPurpose,
     Gearbox,
     PriceBasis,
     SellerType,
@@ -975,3 +976,138 @@ def test_proceeds_kwargs_build_costs_proceeds_estimate() -> None:
     unknown = proceeds_from_comparables(select_comparables(target(), [], DEFAULT, AS_OF), None)
     estimate = costs.ProceedsEstimate(**unknown.as_proceeds_estimate_kwargs())
     assert estimate.status == CostLineStatus.UNKNOWN
+    for amounts in (("7600", "7800", "8000"), ("7800",)):  # adequate and small verified-sale samples
+        sales = [obs(kind=EvidenceKind.VERIFIED_SALE, amount=a) for a in amounts]
+        verified = proceeds_from_comparables(
+            select_comparables(target(), sales, DEFAULT, AS_OF), Decimal("10")
+        )
+        estimate = costs.ProceedsEstimate(**verified.as_proceeds_estimate_kwargs())
+        assert estimate.basis == "verified_sales" and estimate.negotiation_discount_pct is None
+        assert estimate.base == Money.of("7800.00", "EUR")
+
+
+# ----------------------------------------------------------------------------------------- review regressions
+
+
+def test_equal_short_engine_codes_match() -> None:
+    # Regression: two identical 2-character codes were treated as incompatible (ENGINE_MISMATCH).
+    same = obs(engine_code="K9")
+    other = obs(engine_code="M9")
+    result = select_comparables(target(engine_code="k9"), [same, other], Windows(min_sample=1), AS_OF)
+    assert same.id in selected_ids(result)
+    assert "engine_code_variant" not in {d.code for d in result.selected[0].differences}
+    assert reasons_of(result, other.id) == (ExclusionReason.ENGINE_MISMATCH,)
+    # the prefix rule still needs three characters
+    short_prefix = obs(engine_code="N4")
+    result2 = select_comparables(target(engine_code="N47D20"), [short_prefix], Windows(min_sample=1), AS_OF)
+    assert reasons_of(result2, short_prefix.id) == (ExclusionReason.ENGINE_MISMATCH,)
+
+
+@pytest.mark.parametrize(
+    ("amounts", "fit", "display_median"),
+    [
+        # true median 7,999.995 displays as 8,000.00 but is below the band (spec 3 compare unrounded)
+        (("7999.99", "8000.00"), "below", Decimal("8000.00")),
+        # true median 10,000.005 displays as 10,000.00 but is above the band
+        (("10000.00", "10000.01"), "above", Decimal("10000.00")),
+    ],
+)
+def test_band_fit_compares_unrounded_median(
+    amounts: tuple[str, ...], fit: str, display_median: Decimal
+) -> None:
+    result = select_comparables(target(), [obs(amount=a) for a in amounts], DEFAULT, AS_OF)
+    stats = result.stats_for(EvidenceKind.ASKING_PRICE)
+    assert stats is not None and stats.median == display_median
+    assert result.mk_band_fit == fit
+
+
+def test_damaged_target_is_labelled_against_running_comparables() -> None:
+    running = obs()
+    damaged_comp = obs(condition=ConditionSummary(damaged_vehicle=ClaimStatus.SELLER_CLAIMED))
+    for target_condition in (
+        {"damaged_vehicle": ClaimStatus.SELLER_CLAIMED},
+        {"running": ClaimStatus.SELLER_DENIED},
+    ):
+        result = select_comparables(
+            target(**target_condition), [running, damaged_comp], Windows(min_sample=1), AS_OF
+        )
+        by_id = {s.observation_id: s for s in result.selected}
+        assert set(by_id) == {running.id, damaged_comp.id}
+        assert "target_damaged_comparable_running" in {d.code for d in by_id[running.id].differences}
+        assert by_id[running.id].match_level == "close"
+        assert "target_damaged_comparable_running" not in {d.code for d in by_id[damaged_comp.id].differences}
+        assert any(w.startswith("TARGET_DAMAGED_OR_NON_RUNNING") for w in result.warnings)
+    healthy = select_comparables(target(), [running], Windows(min_sample=1), AS_OF)
+    assert not any(w.startswith("TARGET_DAMAGED") for w in healthy.warnings)
+
+
+def test_seller_reported_sale_stats_are_never_labelled_adequate() -> None:
+    claims = [obs(kind=EvidenceKind.SELLER_REPORTED_SALE, amount=str(8000 + i)) for i in range(6)]
+    result = select_comparables(target(), claims, Windows(min_sample=1), AS_OF)
+    stats = result.stats_for(EvidenceKind.SELLER_REPORTED_SALE)
+    assert stats is not None and stats.n == 6
+    assert stats.sample_label == "unverified_claims"
+    assert result.status == "insufficient_comparables"
+    single = select_comparables(target(), claims[:1], Windows(min_sample=1), AS_OF)
+    single_stats = single.stats_for(EvidenceKind.SELLER_REPORTED_SALE)
+    assert single_stats is not None and single_stats.sample_label == "unverified_claims"
+
+
+def _rate(rate: str, rate_date: date, purpose: FxPurpose = FxPurpose.REFERENCE) -> FxRate:
+    # SYNTHETIC rates for tests only.
+    return FxRate(
+        base="EUR",
+        quote="MKD",
+        rate=Decimal(rate),
+        rate_date=rate_date,
+        retrieved_at=AS_OF,
+        provider="synthetic-test",
+        purpose=purpose,
+    )
+
+
+def test_fx_rate_choice_is_order_independent_and_latest_reference_rate_wins() -> None:
+    o = obs(amount="615000", currency="MKD")
+    old, current = _rate("50", date(2020, 1, 1)), _rate("61.5", date(2026, 10, 5))
+    a = select_comparables(target(), [o], Windows(min_sample=1), AS_OF, [old, current])
+    b = select_comparables(target(), [o], Windows(min_sample=1), AS_OF, [current, old])
+    assert a == b
+    assert a.selected[0].amount_eur == Decimal("10000.000000")
+    assert any(w.startswith("FX_RATE_USED: 1 EUR = 61.5 MKD") and "2026-10-05" in w for w in a.warnings)
+    assert not any(w.startswith("FX_RATE_OLD") for w in a.warnings)
+
+
+def test_fx_customs_payment_and_future_rates_never_used_for_estimation() -> None:
+    o = obs(amount="615000", currency="MKD")
+    unusable = [
+        _rate("70", date(2026, 10, 5), FxPurpose.CUSTOMS),
+        _rate("60", date(2026, 10, 5), FxPurpose.PAYMENT),
+        _rate("40", date(2026, 12, 1)),  # dated after as_of: the set would not be reproducible
+    ]
+    result = select_comparables(target(), [o], Windows(min_sample=1), AS_OF, unusable)
+    assert reasons_of(result, o.id) == (ExclusionReason.CURRENCY_UNCONVERTIBLE,)
+    assert any(w.startswith("FX_RATES_IGNORED: 3") for w in result.warnings)
+
+
+def test_old_fx_rate_is_flagged_not_hidden() -> None:
+    o = obs(amount="615000", currency="MKD")
+    result = select_comparables(
+        target(), [o], Windows(min_sample=1), AS_OF, [_rate("61.5", date(2026, 9, 1))]
+    )
+    assert result.selected[0].amount_eur == Decimal("10000.000000")
+    assert any(w.startswith("FX_RATE_OLD: EUR/MKD rate is 35 days old") for w in result.warnings)
+
+
+def test_inverse_direction_rate_converts_by_stored_direction() -> None:
+    # SYNTHETIC: 1 MKD = 0.016 EUR expressed with MKD as base -> multiply MKD by 0.016
+    inverse = FxRate(
+        base="MKD",
+        quote="EUR",
+        rate=Decimal("0.016"),
+        rate_date=date(2026, 10, 5),
+        retrieved_at=AS_OF,
+        provider="synthetic-test",
+    )
+    o = obs(amount="625000", currency="MKD")
+    result = select_comparables(target(), [o], Windows(min_sample=1), AS_OF, [inverse])
+    assert result.selected[0].amount_eur == Decimal("10000.000000")

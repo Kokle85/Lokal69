@@ -88,6 +88,9 @@ _FIXTURE_STATUSES: Final = frozenset({TaxRuleStatus.DRAFT, TaxRuleStatus.UNAPPRO
 _CLOSED_STATUSES: Final = frozenset({TaxRuleStatus.SUPERSEDED, TaxRuleStatus.EXPIRED, TaxRuleStatus.REVOKED})
 
 _MAX_RULE_JSON_BYTES: Final = 1_000_000
+#: Sanity bound for money inputs (any currency). Larger values are input errors, and they
+#: would exceed the exact-arithmetic precision used for rounding.
+MAX_INPUT_AMOUNT: Final = Decimal("1000000000000")
 _HEX64: Final = r"^[0-9a-f]{64}$"
 _ID_PATTERN: Final = r"^[a-z][a-z0-9_]{0,63}$"
 _CODE_PATTERN: Final = r"^[a-z0-9_]{1,60}$"
@@ -268,6 +271,8 @@ class IncludedCost(_Contract):
     def _non_negative(cls, value: Money) -> Money:
         if value.amount < 0:
             raise ValueError("included cost must not be negative")
+        if value.amount > MAX_INPUT_AMOUNT:
+            raise ValueError("included cost exceeds the input sanity bound")
         return value
 
 
@@ -321,6 +326,8 @@ class TaxInputs(_Contract):
     def _money_non_negative(cls, value: Money | None) -> Money | None:
         if value is not None and value.amount < 0:
             raise ValueError("amount must not be negative")
+        if value is not None and value.amount > MAX_INPUT_AMOUNT:
+            raise ValueError("amount exceeds the input sanity bound")
         return value
 
     @model_validator(mode="after")
@@ -385,6 +392,15 @@ class Predicate(_Contract):
     input: str = Field(min_length=1, max_length=120)
     op: Literal["eq", "ne", "in", "not_in", "lt", "le", "gt", "ge"]
     value: int | Decimal | str | tuple[str, ...]
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _no_bool(cls, value: Any) -> Any:
+        # JSON true/false would otherwise be coerced to 1/0 and compared as a number.
+        items = value if isinstance(value, list | tuple) else (value,)
+        if any(isinstance(item, bool) for item in items):
+            raise ValueError("boolean predicate values are not allowed; use explicit text or numbers")
+        return value
 
     @model_validator(mode="after")
     def _shape(self) -> Predicate:
@@ -652,11 +668,14 @@ def _predicate_problems(
     return problems
 
 
-def _bracket_problems(owner: str, comp: BracketComponent) -> list[str]:
+def _bracket_problems(owner: str, comp: BracketComponent, declared: frozenset[str]) -> list[str]:
     problems: list[str] = []
     is_co2 = comp.input == "co2_g_km"
     if is_co2 and comp.tables is None:
         problems.append(f"{owner}: co2_g_km brackets must be keyed by CO2 cycle (tables)")
+    if comp.tables is not None and "co2_cycle" not in declared:
+        # The table is selected by the measurement cycle, so the cycle is an input of the rule.
+        problems.append(f"{owner}: per-cycle CO2 tables need co2_cycle declared as an input")
     if not is_co2 and comp.tables is not None:
         problems.append(f"{owner}: per-cycle tables are only valid for co2_g_km")
     for table_key, rows in comp.all_tables().items():
@@ -727,7 +746,7 @@ def rule_set_problems(rule_set: RuleSet) -> list[str]:
         elif isinstance(comp, BracketComponent):
             problems.extend(_numeric_input_problems(owner, comp.input, declared, units))
             problems.extend(_term_problems(owner, comp.base, seen, comp.depends_on, declared))
-            problems.extend(_bracket_problems(owner, comp))
+            problems.extend(_bracket_problems(owner, comp, declared))
         elif isinstance(comp, PerUnitComponent):
             problems.extend(_numeric_input_problems(owner, comp.input, declared, units))
         seen.append(comp.id)
@@ -799,16 +818,26 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"JSON constant {name} is not allowed in a tax rule set")
+
+
 def parse_rule_set_json(data: str | bytes) -> RuleSet:
     """Parse, structurally validate and semantically verify (incl. sha256) a rule-set JSON.
 
-    JSON numbers are parsed as ``Decimal`` (never float); duplicate keys are rejected.
+    JSON numbers are parsed as ``Decimal`` (never float); ``NaN``/``Infinity`` constants
+    and duplicate keys are rejected.
     """
     raw = data.encode("utf-8") if isinstance(data, str) else data
     if len(raw) > _MAX_RULE_JSON_BYTES:
         raise ValidationFailed("tax rule set document is too large")
     try:
-        parsed = json.loads(raw, parse_float=Decimal, object_pairs_hook=_reject_duplicate_keys)
+        parsed = json.loads(
+            raw,
+            parse_float=Decimal,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValidationFailed(f"tax rule set is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
@@ -903,6 +932,9 @@ def transition_rule_set(
     at = ensure_utc(at)
     if not can_transition(rule_set.status, target):
         raise ValidationFailed(f"tax rule status {rule_set.status.value} -> {target.value} is not permitted")
+    if rule_set.is_fixture and target not in _FIXTURE_STATUSES:
+        # Synthetic rule sets never enter review/approval (DB constraint tax_rule_sets_fixture_ck).
+        raise ValidationFailed(f"fixture rule sets can never move to {target.value}")
     update: dict[str, Any] = {"status": target}
     if target == TaxRuleStatus.APPROVED:
         if rule_set.is_fixture:
@@ -1089,6 +1121,14 @@ class TaxCalculation(_Contract):
             and self.rule_sha256 is not None
         )
 
+    def content_sha256(self) -> str:
+        """Canonical hash of this exact result (rule identity, inputs used, amounts, status).
+
+        Cost lines derived from it carry ``tax_calculation:<hash>`` as evidence so a
+        valuation can verify that its scenarios used exactly the calculation it records.
+        """
+        return sha256_json(self.model_dump(mode="json"))
+
     def category_totals(self) -> dict[CostCategory, CategoryTotal]:
         """Per-category status/amount. A category is unknown if any of its components is
         unknown *or* a required input is missing (the rule says it cannot be trusted)."""
@@ -1125,11 +1165,18 @@ _ROUNDING_MODES: Final[Mapping[str, str]] = MappingProxyType(
 
 
 def apply_rounding(value: Decimal, spec: RoundingSpec) -> Decimal:
-    """Round ``value`` to a multiple of ``spec.quantum`` with the declared mode."""
-    units = _CTX.divide(value, spec.quantum).quantize(
-        Decimal(1), rounding=_ROUNDING_MODES[spec.mode], context=_CTX
-    )
-    return _CTX.multiply(units, spec.quantum)
+    """Round ``value`` to a multiple of ``spec.quantum`` with the declared mode.
+
+    Raises ``ValidationFailed`` (never a raw ``decimal`` error) when the value is too large
+    to round exactly at the engine precision.
+    """
+    try:
+        units = _CTX.divide(value, spec.quantum).quantize(
+            Decimal(1), rounding=_ROUNDING_MODES[spec.mode], context=_CTX
+        )
+        return _CTX.multiply(units, spec.quantum)
+    except decimal.DecimalException as exc:
+        raise ValidationFailed("amount cannot be rounded exactly; it exceeds the engine precision") from exc
 
 
 def _as_decimal(value: object) -> Decimal:
@@ -1332,6 +1379,13 @@ class _Resolver:
             self.inputs.declaration_date,
         )
         warnings: list[str] = []
+        if on is not None and rate.rate_date > on:
+            # A rate observed after the declaration date cannot be the rate prescribed for it.
+            return _MoneyResolved(
+                None,
+                "rate dated after declaration",
+                [f"CUSTOMS_FX_RATE_AFTER_DECLARATION:{rate.rate_date.isoformat()}>{on.isoformat()}"],
+            )
         if start or end:
             if on is None:
                 return _MoneyResolved(None, "rate period unverifiable", ["CUSTOMS_FX_PERIOD_UNVERIFIABLE"])
@@ -1556,6 +1610,15 @@ def calculate(rule_set: RuleSet, inputs: TaxInputs, as_of: datetime) -> TaxCalcu
     currency = rule_set.currency
     if inputs.jurisdiction is not None and inputs.jurisdiction != rule_set.jurisdiction:
         raise ValidationFailed("inputs are for a different jurisdiction than the rule set")
+    classified = inputs.classification
+    if (
+        classified is not None
+        and classified.approval_status == "approved"
+        and classified.vehicle_category is not None
+        and rule_set.vehicle_categories
+        and classified.vehicle_category not in rule_set.vehicle_categories
+    ):
+        raise ValidationFailed("the approved vehicle classification is not a category this rule set covers")
     effective_date = inputs.declaration_date or as_of.date()
     if inputs.declaration_date is None:
         warnings.append("DECLARATION_DATE_UNKNOWN: rule effectiveness checked against as_of date")

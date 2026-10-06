@@ -83,9 +83,9 @@ def test_parsers_never_raise_and_never_go_negative(text: str) -> None:
         number = parse_number(text, locale)
         assert number.value is None or number.value >= 0
         price = parse_price(text, locale)
-        assert price.amount is None or price.amount >= 0
+        assert price.amount is None or price.amount > 0  # unknown is never 0
         mileage = parse_mileage(text, locale)
-        assert mileage.km is None or mileage.km > 0
+        assert mileage.km is None or 0 < mileage.km <= Decimal("2000000")
 
 
 @given(miles=st.integers(min_value=1, max_value=900_000))
