@@ -1,0 +1,81 @@
+# Seller inquiry authorization -- APPLICATION AUDIT RECORD (spec v1.1 section 37.1).
+#
+# Records Vasko's bounded STANDING authorization of 6 October 2026: when the system identifies a
+# promising deal it may automatically send ONE initial inquiry per actual vehicle/seller pair
+# (across all sites and sending accounts) to the verified seller of the exact listing, asking only
+# (1) whether the vehicle is available, (2) for its vehicle documents (registration documents,
+# CoC) and (3) the seller's lowest/final price.
+#
+# - No per-message approval, no first-message approval and no first-template approval. The
+#   original-language preview and the Macedonian translation are informational audit views.
+# - Sender setup, credentials, recipient/language verification, suppression, rate caps and the
+#   kill switch are technical/safety prerequisites, not disguised approval requests.
+# - NOT authorized: follow-ups, outgoing replies, offers, price acceptance, negotiation beyond
+#   asking the lowest price, reservations, viewing appointments, deposits, purchases, resale
+#   promises or payments. A seller's response can never broaden this authority.
+#
+# This file is an application record, not an assistant-side rule. Later explicit owner changes
+# govern the runtime configuration: record them as a NEW version (and an app.config_revisions
+# row with actor, reason, before/after). Revocation sets `revocation.revoked: true`.
+kind: seller_inquiry_authorization
+record_type: application_audit_record
+version: 1
+owner: Vasko
+effective_date: "2026-10-06"
+recorded_at: "2026-10-06"
+source: "Owner instruction of 2026-10-06, recorded in specification v1.1 section 37.1"
+approval_mode: no_message_approval
+purpose: initial_availability_documents_price
+questions:
+  - availability
+  - vehicle_documents
+  - lowest_final_price
+recipient_class: verified_seller_of_exact_listing
+max_inquiries_per_vehicle_seller_pair: 1
+# Templates may receive ordinary wording fixes inside this scope without approval; a change that
+# adds commitments, personal data or unrelated questions fails the template-scope validator.
+scope_version: 1
+languages: [de, it, fr, en]
+english_requires_positive_evidence: true
+allowed_outgoing_data_categories:
+  - verified_sender_display_name
+  - verified_sender_email
+  - vehicle_make_model
+  - listing_reference
+  - listing_url
+  - three_permitted_questions
+excluded_data_categories:
+  - home_address
+  - telephone
+  - identity_documents
+  - bank_details
+  - finances
+  - acquisition_budget
+  - target_resale_price
+  - profit_calculation
+  - unrelated_business_information
+attachments_allowed: false
+cc_bcc_allowed: false
+additional_recipients_allowed: false
+follow_ups_allowed: false
+not_authorized:
+  - follow_up
+  - outgoing_reply
+  - offer
+  - price_acceptance
+  - negotiation_beyond_lowest_price
+  - reservation
+  - viewing_appointment
+  - deposit
+  - purchase
+  - resale_promise
+  - payment
+# Research profiles inside the automatic outreach scope. The disabled manual_4000 and
+# below_target_watch profiles stay OUT of scope unless the owner explicitly lists them here.
+profiles_in_scope:
+  - primary
+revocation:
+  revoked: false
+  revoked_at: null
+  revoked_by: null
+  reason: null

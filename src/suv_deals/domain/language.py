@@ -93,17 +93,12 @@ _FUNCTION_WORDS: Final[Mapping[str, str]] = {
         "de het een en van is met voor op niet zijn ook aan er maar nog wel als dan bij uit deze "
         "dit wordt worden zeer goed goede heeft geen"
     ),
-    "pl": (
-        "i w z na do nie się jest to że o od po ze jak ale tak są oraz przez dla bardzo jego "
-        "który która"
-    ),
+    "pl": ("i w z na do nie się jest to że o od po ze jak ale tak są oraz przez dla bardzo jego który która"),
     "es": (
         "el la los las de del y en es un una con por para que no muy se su sus al lo más como "
         "pero sin está tiene"
     ),
-    "pt": (
-        "o a os as de do da dos das e em um uma com para por não que se no na muito mais tem são"
-    ),
+    "pt": ("o a os as de do da dos das e em um uma com para por não que se no na muito mais tem são"),
     "cs": ("a v na je se s z k o do to že pro jako ale nebo jsem jsou byl bylo velmi"),
     "hr": ("i u je na se za od da su s sa ne bez ili ali vrlo bio bilo"),
 }
@@ -214,7 +209,7 @@ _WORD_OWNERS, _LANG_FUNCTION_WORDS = _build_lexicon()
 _URL_RE: Final = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 _EMAIL_RE: Final = re.compile(r"\S+@\S+")
 # Words are maximal runs of letters, optionally joined by an internal apostrophe ("it's").
-_WORD_RE: Final = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?")
+_WORD_RE: Final = re.compile(r"[^\W\d_]+(?:['\u2019][^\W\d_]+)?")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -418,6 +413,9 @@ def _excerpt(original: str, word: str | None) -> str | None:
         match = re.search(rf"(?<!\w){re.escape(word)}(?!\w)", prepared.lower())
         if match:
             start = max(0, match.start() - EXCERPT_CHARS // 4)
+            if start > 0:  # begin at a word boundary, never mid-word
+                boundary = prepared.find(" ", start, match.start())
+                start = boundary + 1 if boundary != -1 else match.start()
     window = prepared[start : start + EXCERPT_CHARS * 2]
     return sanitize_seller_text(window, max_length=EXCERPT_CHARS)
 
@@ -429,7 +427,7 @@ def detect_text_language(text: str | None) -> TextLanguageDetection:
     prepared = _prepare(text)
     folded = prepared.lower()  # not casefold(): it would turn "ß" into "ss"
     non_latin = _non_latin_share(folded)
-    tokens = [m.group(0).replace("’", "'") for m in _WORD_RE.finditer(folded)][:MAX_TOKENS]
+    tokens = [m.group(0).replace("\u2019", "'") for m in _WORD_RE.finditer(folded)][:MAX_TOKENS]
     if non_latin >= Decimal("0.5"):
         return TextLanguageDetection(
             language=None,
@@ -498,7 +496,9 @@ def detect_text_language(text: str | None) -> TextLanguageDetection:
 
     share = best.score / (best.score + second.score)
     coverage = min(Decimal(1), Decimal(best.evidence_tokens) / Decimal(FULL_EVIDENCE_TOKENS))
-    confidence = (share * (Decimal("0.5") + Decimal("0.5") * coverage)).quantize(_CENT, rounding=ROUND_HALF_UP)
+    confidence = (share * (Decimal("0.5") + Decimal("0.5") * coverage)).quantize(
+        _CENT, rounding=ROUND_HALF_UP
+    )
     words = tuple(evidence[best.language][:12])
     return TextLanguageDetection(
         language=best.language,

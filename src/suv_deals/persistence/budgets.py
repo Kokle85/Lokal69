@@ -16,19 +16,22 @@ Protocol (no network I/O inside a transaction):
 3. `release` -- short transaction: lock the host row, fold the outcome in with
    `record_outcome()` (or `abandon_request()` when there is no outcome) and persist.
 
-Equivalents for columns ``ops.host_budgets`` does not have (an additive migration adding
-``in_flight_until``, ``in_flight_token`` and ``access_blocked_at`` is requested in the work
-package report):
+Columns (migration ``20261006000950``):
 
-- Navigation lease: stored in ``next_request_not_before`` as exactly ``refilled_at +
-  in_flight_lease_seconds`` (``start_request`` sets both in the same instant). On load, that
-  exact equality identifies a lease; any other value is a backoff not-before. A lease that
-  expires on its own (crashed worker) simply lets the next request through. On release the
-  lease is cleared only if it is still the caller's own (same instant, microsecond precision);
-  a stale holder never clears a newer worker's lease.
-- Access block: stored as ``circuit_state = 'open'`` with ``open_until`` at a far-future
-  sentinel (year 9999). Only `clear_access_block` (explicit owner action, audited) lifts it,
-  and the next request is a single half-open probe.
+- Navigation lease: ``in_flight_until`` + ``in_flight_token`` (a fresh UUID per `acquire`). On
+  release the lease is cleared only when the stored token is still the caller's own; a stale
+  holder whose lease expired and was re-taken never clears the newer worker's lease. A lease
+  that expires on its own (crashed worker) simply lets the next request through.
+- Access block: ``access_blocked_at`` + ``access_blocked_reason``. Only `clear_access_block`
+  (explicit owner action, audited) lifts it, and the next request is a single half-open probe.
+
+Compatibility mirror of the previous layout (kept because existing readers and the
+persistence-core tests inspect it): ``next_request_not_before`` is written as the later of the
+lease end and any backoff not-before, and a block is also written as ``circuit_state = 'open'``
+with ``open_until`` at the far-future `ACCESS_BLOCK_SENTINEL`. The real columns are
+authoritative; the mirror can only shorten a lease (an operator moving it earlier releases the
+lease sooner), never extend one. Rows written before the migration (sentinel without
+``access_blocked_at``) are still read as blocked.
 
 An ``ACCESS_BLOCKED`` outcome yields a `RoutePauseRecommendation`; the gate keeps it for the
 caller (`take_pause_recommendations`, `last_result`), who pauses the source route and opens one
@@ -45,7 +48,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg import sql
 
@@ -77,6 +80,7 @@ from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Scope
 from suv_deals.domain.sources import RateBudget
 from suv_deals.errors import NotFound, ValidationFailed
+from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import mapped_errors
@@ -86,10 +90,12 @@ ACCESS_BLOCK_SENTINEL: Final = datetime(9999, 1, 1, tzinfo=UTC)
 _HOST_RE: Final = re.compile(r"^[a-z0-9.-]{1,253}$")
 _INT32_MAX: Final = 2_147_483_647
 _RELEASE_ATTEMPTS: Final = 3
+_MAX_BLOCK_REASON: Final = 500
 _ROW_COLUMNS: Final = sql.SQL(
     "id, host, tokens, refilled_at, next_request_not_before, circuit_state, open_until,"
     " consecutive_failures, budget_day, requests_today, bytes_today, last_retry_after_seconds,"
-    " retry_after_until, row_version, updated_at"
+    " retry_after_until, row_version, updated_at, in_flight_until, in_flight_token,"
+    " access_blocked_at, access_blocked_reason"
 )
 
 
@@ -104,29 +110,53 @@ def _utc(value: datetime | None) -> datetime | None:
     return None if value is None else ensure_utc(value)
 
 
-def state_from_row(row: Mapping[str, Any], source_key: str, policy: BackoffPolicy) -> HostBudgetState:
-    """Map an ``ops.host_budgets`` row to the pure `HostBudgetState` (see module docstring)."""
+def _lease_and_backoff(
+    row: Mapping[str, Any], policy: BackoffPolicy
+) -> tuple[datetime | None, datetime | None]:
+    """``(in_flight_until, backoff not-before)`` from the real lease columns and the mirror."""
+    mirror = _utc(row["next_request_not_before"])
+    lease = _utc(row.get("in_flight_until"))
+    if lease is None and row.get("in_flight_token") is None and "in_flight_until" not in row:
+        # Pre-migration row layout: the lease was encoded as refilled_at + lease seconds.
+        refilled = _utc(row["refilled_at"])
+        if (
+            mirror is not None
+            and refilled is not None
+            and mirror == refilled + timedelta(seconds=policy.in_flight_lease_seconds)
+        ):
+            return mirror, None
+        return None, mirror
+    if lease is None:
+        return None, mirror
+    if mirror is None:
+        return lease, None
+    # The mirror is written as max(lease end, backoff): it may shorten a lease, never extend it.
+    return min(lease, mirror), (mirror if mirror > lease else None)
+
+
+def _legacy_block(row: Mapping[str, Any]) -> bool:
     open_until = _utc(row["open_until"])
-    blocked = row["circuit_state"] == CircuitState.OPEN.value and (
+    return row["circuit_state"] == CircuitState.OPEN.value and (
         open_until is not None and open_until >= ACCESS_BLOCK_SENTINEL
     )
-    refilled = _utc(row["refilled_at"])
-    not_before = _utc(row["next_request_not_before"])
-    in_flight: datetime | None = None
-    if (
-        not_before is not None
-        and refilled is not None
-        and not_before == refilled + timedelta(seconds=policy.in_flight_lease_seconds)
-    ):
-        in_flight, not_before = not_before, None
+
+
+def state_from_row(row: Mapping[str, Any], source_key: str, policy: BackoffPolicy) -> HostBudgetState:
+    """Map an ``ops.host_budgets`` row to the pure `HostBudgetState` (see module docstring)."""
+    legacy = _legacy_block(row)
+    blocked_at = _utc(row.get("access_blocked_at"))
+    if blocked_at is None and legacy:
+        blocked_at = _utc(row["updated_at"])  # written before the access_blocked_at column existed
+    in_flight, not_before = _lease_and_backoff(row, policy)
     tokens = Decimal(row["tokens"])
     return HostBudgetState(
         source_key=source_key,
         host=row["host"],
         tokens=min(max(tokens, Decimal(0)), TOKEN_CAPACITY),
-        refilled_at=refilled,
-        circuit_state=CircuitState.CLOSED if blocked else CircuitState(row["circuit_state"]),
-        open_until=None if blocked else open_until,
+        refilled_at=_utc(row["refilled_at"]),
+        # The sentinel is only the compatibility mirror of a block, never a real circuit state.
+        circuit_state=CircuitState.CLOSED if legacy else CircuitState(row["circuit_state"]),
+        open_until=None if legacy else _utc(row["open_until"]),
         consecutive_failures=int(row["consecutive_failures"]),
         budget_day=row["budget_day"],
         requests_today=int(row["requests_today"]),
@@ -135,8 +165,15 @@ def state_from_row(row: Mapping[str, Any], source_key: str, policy: BackoffPolic
         retry_after_until=_utc(row["retry_after_until"]),
         next_request_not_before=not_before,
         in_flight_until=in_flight,
-        access_blocked_at=_utc(row["updated_at"]) if blocked else None,
+        access_blocked_at=blocked_at,
     )
+
+
+def _block_reason(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = redact(str(value)).strip()
+    return cleaned[:_MAX_BLOCK_REASON] or None
 
 
 def _later(a: datetime | None, b: datetime | None) -> datetime | None:
@@ -148,7 +185,12 @@ def _later(a: datetime | None, b: datetime | None) -> datetime | None:
 
 
 def _row_params(
-    state: HostBudgetState, budget: RateBudget | None, crawl_delay: Decimal | None
+    state: HostBudgetState,
+    budget: RateBudget | None,
+    crawl_delay: Decimal | None,
+    *,
+    in_flight_token: UUID | None = None,
+    blocked_reason: str | None = None,
 ) -> dict[str, Any]:
     blocked = state.access_blocked_at is not None
     refill = None
@@ -156,9 +198,16 @@ def _row_params(
         refill = (Decimal(1) / effective_delay_seconds(budget, crawl_delay)).quantize(Decimal("0.00000001"))
         refill = max(refill, Decimal("0.00000001"))
     retry_after = state.last_retry_after_seconds
+    if state.in_flight_until is not None and in_flight_token is None:
+        raise ValueError("a navigation lease is always stored with its token")
     return {
+        "in_flight_until": state.in_flight_until,
+        "in_flight_token": in_flight_token if state.in_flight_until is not None else None,
+        "access_blocked_at": state.access_blocked_at,
+        "access_blocked_reason": (blocked_reason or "access_blocked") if blocked else None,
         "tokens": state.tokens.quantize(Decimal("0.0001")),
         "refilled_at": state.refilled_at,
+        # Compatibility mirror: the later of the lease end and the backoff not-before.
         "next_request_not_before": _later(state.in_flight_until, state.next_request_not_before),
         "circuit_state": CircuitState.OPEN.value if blocked else state.circuit_state.value,
         "open_until": ACCESS_BLOCK_SENTINEL if blocked else state.open_until,
@@ -176,6 +225,10 @@ def _row_params(
 
 _PERSIST_SQL: Final = (
     "update ops.host_budgets set"
+    " in_flight_until = %(in_flight_until)s::timestamptz,"
+    " in_flight_token = %(in_flight_token)s::uuid,"
+    " access_blocked_at = %(access_blocked_at)s::timestamptz,"
+    " access_blocked_reason = %(access_blocked_reason)s,"
     " tokens = %(tokens)s,"
     " refilled_at = coalesce(%(refilled_at)s::timestamptz, refilled_at),"
     " next_request_not_before = %(next_request_not_before)s::timestamptz,"
@@ -248,7 +301,7 @@ class DbBudgetGate:
             else {key: frozenset(_host(h) for h in hosts) for key, hosts in source_hosts.items()}
         )
         self._usage: dict[str, RunUsage] = {}
-        self._leases: dict[int, tuple[BudgetRequest, datetime]] = {}
+        self._leases: dict[int, tuple[BudgetRequest, UUID]] = {}
         self._results: dict[tuple[str, str], OutcomeResult] = {}
         self._pauses: list[RoutePauseRecommendation] = []
 
@@ -321,12 +374,12 @@ class DbBudgetGate:
                 crawl_delay=delay,
                 policy=self._policy,
             )
-            await conn.execute(
-                _PERSIST_SQL,
-                {**_row_params(started, budget, delay), "workspace_id": self._workspace_id, "id": row["id"]},
+            token = uuid4()
+            params = _row_params(
+                started, budget, delay, in_flight_token=token, blocked_reason=row["access_blocked_reason"]
             )
-        assert started.in_flight_until is not None
-        self._leases[id(request)] = (request, started.in_flight_until)
+            await conn.execute(_PERSIST_SQL, {**params, "workspace_id": self._workspace_id, "id": row["id"]})
+        self._leases[id(request)] = (request, token)
         if request.purpose == "search":
             usage = usage.model_copy(update={"search_pages": usage.search_pages + 1})
         elif request.purpose == "detail":
@@ -342,7 +395,7 @@ class DbBudgetGate:
         Retry-After, the bytes used) and leaving the navigation lease to expire on its own.
         """
         entry = self._leases.pop(id(request), None)
-        own_lease = entry[1] if entry is not None and entry[0] is request else None
+        own_token = entry[1] if entry is not None and entry[0] is request else None
         budget = self._budgets.get(request.source_key)
         host = _host(request.host)
         delay = self._crawl_delays.get(host)
@@ -355,18 +408,24 @@ class DbBudgetGate:
                     return None
                 now = await _db_clock(conn)
                 state = state_from_row(row, request.source_key, self._policy)
-                ours = own_lease is not None and state.in_flight_until == own_lease
+                stored_token = row["in_flight_token"]
+                ours = own_token is not None and stored_token == own_token
                 # A newer holder's lease (ours expired and was re-taken) must survive our release.
-                foreign_lease = None if ours else state.in_flight_until
-                base = state.model_copy(update={"in_flight_until": own_lease if ours else None})
+                foreign_until = _utc(row["in_flight_until"])
+                foreign = None if ours or stored_token is None or foreign_until is None else stored_token
+                base = state.model_copy(update={"in_flight_until": state.in_flight_until if ours else None})
                 if outcome is None or budget is None:
                     updated = abandon_request(base, now)
                 else:
                     result = record_outcome(base, outcome, now, self._rng, budget=budget, policy=self._policy)
                     updated = result.state
-                if foreign_lease is not None:
-                    updated = updated.model_copy(update={"in_flight_until": foreign_lease})
-                params = _row_params(updated, budget, delay)
+                if foreign is not None:
+                    updated = updated.model_copy(update={"in_flight_until": foreign_until})
+                reason = row["access_blocked_reason"]
+                pause = None if result is None else result.pause
+                if reason is None and pause is not None and pause.reason == "access_blocked":
+                    reason = _block_reason(pause.evidence)
+                params = _row_params(updated, budget, delay, in_flight_token=foreign, blocked_reason=reason)
                 await conn.execute(
                     _PERSIST_SQL, {**params, "workspace_id": self._workspace_id, "id": row["id"]}
                 )
