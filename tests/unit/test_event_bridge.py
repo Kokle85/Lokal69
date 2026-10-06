@@ -1167,7 +1167,12 @@ class _RaisingHttp:
     [
         # Regression: these used to become UNCERTAIN, and the uncertain follow-up rule would
         # then re-send a delivery the receiver had explicitly refused with 410/413.
-        (SafeHttpFailure.PROTOCOL_ERROR, 410, DeliveryOutcomeKind.FAILED, DeliveryFailureReason.HTTP_410_GONE),
+        (
+            SafeHttpFailure.PROTOCOL_ERROR,
+            410,
+            DeliveryOutcomeKind.FAILED,
+            DeliveryFailureReason.HTTP_410_GONE,
+        ),
         (
             SafeHttpFailure.CONNECTION_LOST,
             413,

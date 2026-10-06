@@ -1496,9 +1496,7 @@ def _outcome_for_status(
             elapsed=elapsed,
             **base,
         )
-    retry_after = (
-        parse_retry_after(retry_after_header, finished) if status in _RETRY_AFTER_STATUSES else None
-    )
+    retry_after = parse_retry_after(retry_after_header, finished) if status in _RETRY_AFTER_STATUSES else None
     reason = DeliveryFailureReason.HTTP_5XX if status >= 500 else DeliveryFailureReason.HTTP_RETRYABLE_4XX
     return _retry_or_dead_letter(
         base,

@@ -124,6 +124,19 @@ async def test_response_body_is_bounded() -> None:
     assert not small.truncated
 
 
+@pytest.mark.parametrize("bad", [0, -1])
+async def test_explicit_non_positive_response_limit_is_rejected_not_defaulted(bad: int) -> None:
+    # Regression: `max_response_bytes=0` used to fall back silently to the 64 KiB default.
+    async def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never called
+        return httpx.Response(200, content=b"x" * 100)
+
+    async with client(handler) as http:
+        with pytest.raises(ValueError):
+            await http.post(URL, content=b"{}", headers={}, max_response_bytes=bad)
+        with pytest.raises(ValueError):
+            await http.post(URL, content=b"{}", headers={}, timeout_s=0)
+
+
 async def test_request_body_is_bounded() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never called
         return httpx.Response(200)
@@ -408,3 +421,81 @@ async def test_real_tls_rejects_certificate_for_another_hostname(tmp_path: objec
     assert isinstance(result, SafeHttpError)
     assert result.failure is SafeHttpFailure.TLS_FAILED
     assert sni_seen == ["receiver.example.com"]
+
+
+# --------------------------------------------------------------------------- real sockets: send evidence
+
+
+async def _plain_server_attempt(
+    behaviour: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    limits: HttpLimits,
+    timeout_s: float | None = None,
+) -> SafeHttpError:
+    """POST over a real local socket (plain HTTP) so httpcore emits its real trace events.
+
+    DNS is pinned to 127.0.0.1 by patching the module's resolver hook; everything else
+    (URL policy, tracer, timeouts, classification) runs unmodified.
+    """
+
+    async def loopback(host: str, port: int, resolver: object = None) -> list[ipaddress.IPv4Address]:
+        return [ipaddress.IPv4Address("127.0.0.1")]
+
+    monkeypatch.setattr("suv_deals.integrations.safe_http.resolve_public", loopback)
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            await reader.readexactly(2)  # the b"{}" body: the request is completely received
+            if behaviour == "status_then_reset":
+                writer.write(b"HTTP/1.1 410 Gone\r\nContent-Length: 100\r\n\r\npartial")
+                await writer.drain()
+                writer.transport.abort()
+            elif behaviour == "silent":
+                await reader.read()  # never answer; return once the client gives up and closes
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    http = SafeHttpClient(allowed_schemes=("http",), allowed_ports=(port,), limits=limits)
+    try:
+        with pytest.raises(SafeHttpError) as info:
+            await http.post(
+                f"http://receiver.example.com:{port}/cb", content=b"{}", headers={}, timeout_s=timeout_s
+            )
+    finally:
+        await http.aclose()
+        server.close()
+        await server.wait_closed()
+    return info.value
+
+
+async def test_real_read_timeout_after_complete_send_is_possibly_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    err = await _plain_server_attempt("silent", monkeypatch, limits=HttpLimits(read_timeout_s=0.2))
+    assert err.failure is SafeHttpFailure.TIMEOUT_AFTER_SEND
+    assert err.possibly_delivered
+    assert err.status_code is None
+
+
+async def test_real_total_deadline_after_send_uses_trace_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    err = await _plain_server_attempt(
+        "silent", monkeypatch, limits=HttpLimits(read_timeout_s=5), timeout_s=0.2
+    )
+    assert err.failure is SafeHttpFailure.TIMEOUT_AFTER_SEND
+    assert err.possibly_delivered
+    assert err.detail == "total_deadline"
+
+
+async def test_real_status_line_then_reset_keeps_the_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The receiver's answer (410) is known even though the body never completed; callers
+    # classify by it instead of treating the delivery as uncertain.
+    err = await _plain_server_attempt("status_then_reset", monkeypatch, limits=HttpLimits())
+    assert err.status_code == 410
+    assert err.possibly_delivered
+    assert err.failure in {SafeHttpFailure.PROTOCOL_ERROR, SafeHttpFailure.CONNECTION_LOST}

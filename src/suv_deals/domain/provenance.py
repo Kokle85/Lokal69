@@ -43,7 +43,11 @@ class FieldProvenance(BaseModel):
 
 
 class FieldConflict(BaseModel):
-    """Two or more supported values disagree; neither silently wins."""
+    """Two or more supported values disagree; neither silently wins.
+
+    For numeric fields `values` are plain decimal strings in canonical units (e.g. km:
+    ``["187500", "87500"]``; ranges as ``"low-high"``). Descriptive text belongs in `locations`.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

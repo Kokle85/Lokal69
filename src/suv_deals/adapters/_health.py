@@ -84,12 +84,19 @@ def assess_samples(
         reasons_degraded.append("some links point to unexpected hosts or paths")
 
     reachable = [s for s in samples if s.access_state == AccessState.OK]
-    failures = sum(1 for s in reachable if not s.ok)
-    failure_rate = _rate(failures, len(reachable))
+    # Pages that loaded but did not have the expected shape (empty application shell, result page
+    # without results or empty-result wording, detail URL redirected elsewhere) are parser-drift
+    # evidence, not access problems: they count as parse failures. Transport errors, 429, 404/410
+    # and our own policy refusals do not.
+    attempted = [s for s in samples if s.access_state in (AccessState.OK, AccessState.UNEXPECTED_CONTENT)]
+    unexpected_content = sum(1 for s in samples if s.access_state == AccessState.UNEXPECTED_CONTENT)
+    metrics["unexpected_content_rate"] = _fmt(_rate(unexpected_content, size))
+    failures = sum(1 for s in attempted if not s.ok)
+    failure_rate = _rate(failures, len(attempted))
     metrics["parse_failure_rate"] = _fmt(failure_rate)
-    if reachable and failure_rate >= thresholds.parse_failure_rate_unhealthy:
+    if attempted and failure_rate >= thresholds.parse_failure_rate_unhealthy:
         reasons_unhealthy.append("high parse failure rate on reachable pages")
-    elif reachable and failure_rate >= thresholds.parse_failure_rate_degraded:
+    elif attempted and failure_rate >= thresholds.parse_failure_rate_degraded:
         reasons_degraded.append("elevated parse failure rate on reachable pages")
 
     details = [s for s in reachable if s.page_type == "detail" and s.ok]

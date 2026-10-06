@@ -89,6 +89,7 @@ async def test_normal_detail(de_adapter: SchemaOrgDealerAdapter, detail: DetailF
 
     p = listing.price
     assert (p.amount_minor, p.currency) == (275000, "EUR")
+    assert p.amount_minor is not None
     assert Decimal(2500) <= Decimal(p.amount_minor) / 100 <= Decimal(3000)
     assert p.basis == PriceBasis.GROSS
     assert p.type == PriceType.FULL_VEHICLE_ASKING

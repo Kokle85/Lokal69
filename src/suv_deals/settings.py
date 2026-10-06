@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     slack_bot_token: SecretStr | None = None
     slack_signing_secret: SecretStr | None = None
     slack_channel_id: str | None = None
+    # Non-secret Slack destination binding (all must match inbound/outbound events).
+    slack_team_id: str | None = None
+    slack_app_id: str | None = None
+    slack_bot_id: str | None = None
+    slack_bot_user_id: str | None = None
+    slack_destination_approval_ref: str | None = None
+    # Optional explicit egress proxy for webhook callbacks (loses IP pinning; documented).
+    callback_egress_proxy_url: str | None = None
     event_bridge_enabled: bool = False
     event_bridge_provider: Literal["disabled", "mcp_events", "slack"] = "disabled"
     mcp_events_enabled: bool = False
@@ -74,6 +82,11 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_api_key: SecretStr | None = None
     llm_daily_budget_eur: Decimal = Decimal(0)
+
+    # Optional official mobile.de Search API (entitlement NOT verified; disabled).
+    mobile_de_api_enabled: bool = False
+    mobile_de_api_credentials: SecretStr | None = None
+    mobile_de_api_entitlement_reference: str | None = None
 
     fx_fetch_enabled: bool = False
     fx_ecb_daily_url: str = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"

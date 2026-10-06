@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -51,6 +52,7 @@ class SourceConfig(BaseModel):
     terms_decision_note: str | None = Field(default=None, max_length=2000)
     technical_denial_policy: str = Field(default="stop_and_report", pattern=r"^stop_and_report$")
     robots_policy: str = Field(default="obey", pattern=r"^obey$")
+    allowed_schemes: tuple[Literal["https", "http"], ...] = ("https",)
     allowed_hosts: tuple[str, ...] = ()
     allowed_search_paths: tuple[str, ...] = ()  # regex patterns on path (anchored)
     allowed_detail_paths: tuple[str, ...] = ()
@@ -66,6 +68,15 @@ class SourceConfig(BaseModel):
         "referrer",
     )
     source_timezone: str = "Europe/Berlin"
+    # "fetch": detail pages are fetched when allowed; "card_only": robots/terms decision limits the
+    # source to search-result cards (owner opens detail pages manually).
+    detail_mode: Literal["fetch", "card_only"] = "fetch"
+    # Optional Crawl4AI per-source options (CSS-only wait condition; never JavaScript).
+    crawl_locale: str | None = Field(default=None, pattern=r"^[a-z]{2}-[A-Z]{2}$")
+    crawl_timezone_id: str | None = Field(default=None, max_length=64)
+    crawl_wait_for_css: str | None = Field(default=None, max_length=200)
+    robots_checked_at: datetime | None = None
+    robots_summary: str | None = Field(default=None, max_length=2000)
     rate_budget: RateBudget = RateBudget()
     search: dict[str, str] = Field(default_factory=dict)  # adapter-specific, documented per source
     notes: str | None = Field(default=None, max_length=4000)
@@ -98,7 +109,7 @@ def activation_problems(cfg: SourceConfig) -> list[str]:
         problems.append("no allowed hosts")
     if not cfg.allowed_search_paths and cfg.role == "acquisition":
         problems.append("no allowed search paths")
-    if not cfg.allowed_detail_paths:
+    if not cfg.allowed_detail_paths and cfg.detail_mode == "fetch":
         problems.append("no allowed detail paths")
     return problems
 

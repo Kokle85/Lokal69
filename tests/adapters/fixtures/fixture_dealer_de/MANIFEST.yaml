@@ -152,3 +152,11 @@ routes:
     file: captcha.html
     status: 503
     description: "challenge interstitial served with 503"
+  "https://dealer.example/fahrzeug/TEST-222":
+    file: search_page1.html
+    final_url: "https://dealer.example/suche?typ=suv"
+    description: "detail URL redirected to the result list (a removal pattern); must not yield another car's listing"
+  "https://dealer.example/fahrzeug/TEST-223":
+    file: detail_normal.html
+    final_url: "http://169.254.169.254/latest/meta-data/"
+    description: "redirect to a metadata address; the fixture client refuses it like a real client"

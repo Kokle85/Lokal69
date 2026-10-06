@@ -285,7 +285,11 @@ def test_post_body_minimal_escaped_and_tagged() -> None:
     "change",
     [
         {"dashboard_url": "http://app.example/x"},
+        {"dashboard_url": "http://127.0.0.1:8000/reviews/1"},  # no local http in Slack
         {"dashboard_url": "https://app.example/x y"},
+        {"dashboard_url": "https://app.example/reviews/1?token=SYNTHETIC"},
+        {"dashboard_url": "https://user:pw@app.example/reviews/1"},
+        {"dashboard_url": "https://app.example/reviews/1#frag"},
         {"case_version": "1"},
         {"deduplication_key": ""},
         {"event_id": "nope"},
@@ -492,6 +496,33 @@ async def test_reconcile_ignores_other_bots_quoting_the_reference() -> None:
     message = {"type": "message", "bot_id": "B0SOMEONEELSE", "ts": "1.2", "text": f"copy of [ref {REF}]"}
     result, _ = await reconcile(history([message]))
     assert result.state is ReconcileState.NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "message", "user": "U0OWNER0001", "ts": "1.2", "text": f"did this arrive? {REF}"},
+        {"type": "message", "ts": "1.3", "text": f"[ref {REF}]"},  # no author identity at all
+        {"type": "message", "app_id": "A0SOMEONEELS", "ts": "1.4", "text": f"[ref {REF}]"},
+    ],
+)
+async def test_reconcile_never_counts_messages_not_authored_by_our_app(message: dict[str, Any]) -> None:
+    # Regression: a human quoting the reference used to count as the receipt, which would
+    # mark an uncertain post delivered although our message may never have been posted.
+    result, _ = await reconcile(history([message]))
+    assert result.state is ReconcileState.NOT_FOUND
+
+
+async def test_reconcile_accepts_our_app_id_when_bot_id_missing() -> None:
+    message = {"type": "message", "app_id": "A0SYNTHETIC", "ts": "1.5", "text": f"[ref {REF}]"}
+    result, _ = await reconcile(history([message]))
+    assert result.state is ReconcileState.FOUND
+    unconfigured = config(bot_id=None, app_id=None)
+    human = {"type": "message", "user": "U0OWNER0001", "ts": "1.6", "text": f"[ref {REF}]"}
+    result2, _ = await reconcile(history([human]), cfg=unconfigured)
+    assert result2.state is ReconcileState.NOT_FOUND
+    result3, _ = await reconcile(history([{**human, "bot_id": "B0ANY0000001"}]), cfg=unconfigured)
+    assert result3.state is ReconcileState.FOUND
 
 
 async def test_reconcile_paginates_and_bounds_pages() -> None:

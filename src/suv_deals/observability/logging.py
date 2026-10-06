@@ -93,7 +93,7 @@ _SLACK_TOKEN = re.compile(r"\b(xox[abeoprs]|xapp)-[A-Za-z0-9-]{4,}")
 _SLACK_HOOK = re.compile(r"(hooks\.slack\.com)(?:/|%2F)[^\s\"'<>&]+", re.IGNORECASE)
 _SUPABASE_KEY = re.compile(r"\b(sb_secret|sb_publishable)_[A-Za-z0-9_-]{4,}")
 # Provider API keys that may appear without a key name (LLM_API_KEY values: sk-..., sk-proj-..., sk-ant-...).
-_PROVIDER_API_KEY = re.compile(r"\b(sk)-(?:[a-z]{2,8}-)?[A-Za-z0-9_-]{16,}")
+_PROVIDER_API_KEY = re.compile(r"\bsk-(?:[a-z0-9]{2,8}-){0,2}[A-Za-z0-9_-]{16,}")
 _QUERY_PARAM = re.compile(r"([?&;])([\w.\-\[\]]{1,64})=([^&\s#'\"<>]*)")
 _KV_SECRET = re.compile(
     rf"(?<![A-Za-z0-9])({_SENSITIVE_KV_NAMES})([\"']?\s*[:=]\s*[\"']?)(?!\[REDACTED)([^\s\"'&,;}}]+)",
@@ -138,6 +138,16 @@ def _query_sub(match: re.Match[str]) -> str:
     return match.group(0)
 
 
+def _provider_key_sub(match: re.Match[str]) -> str:
+    # Real keys are high-entropy (upper + lower case + digits); a lowercase URL slug such as
+    # `sk-skoda-octavia-2015` is not a key and stays readable.
+    text = match.group(0)
+    tail = text[3:]
+    if any(c.isupper() for c in tail) and any(c.islower() for c in tail) and any(c.isdigit() for c in tail):
+        return f"sk-{REDACTED}"
+    return text
+
+
 def _auth_sub(match: re.Match[str]) -> str:
     scheme = f"{match.group(3)} " if match.group(3) else ""
     return f"{match.group(1)}{match.group(2)}{scheme}{REDACTED}"
@@ -154,7 +164,7 @@ _RULES: Final[tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]
     (_WHSEC, rf"\1_{REDACTED}"),
     (_SLACK_TOKEN, rf"\1-{REDACTED}"),
     (_SUPABASE_KEY, rf"\1_{REDACTED}"),
-    (_PROVIDER_API_KEY, rf"\1-{REDACTED}"),
+    (_PROVIDER_API_KEY, _provider_key_sub),
     (_QUERY_PARAM, _query_sub),
     (_KV_SECRET, rf"\1\2{REDACTED}"),
     (_COOKIE, rf"\1{REDACTED}"),

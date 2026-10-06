@@ -58,13 +58,10 @@ async def test_placeholders_raise_with_checklist_pointer(source_key: str, client
     identity = adapter.canonicalize("https://placeholder.example/x?utm_source=a&id=7#f")
     assert identity.canonical_url == "https://placeholder.example/x?id=7"
     assert identity.identity_method == "canonical_url"
-    calls = [
-        lambda: adapter.build_search(profile, None),
-        lambda: adapter.parse_detail(raw_document("https://placeholder.example/x", "<html></html>")),
-    ]
-    for call in calls:
-        with pytest.raises(AdapterUnimplemented, match="activation checklist"):
-            call()
+    with pytest.raises(AdapterUnimplemented, match="activation checklist"):
+        adapter.build_search(profile, None)
+    with pytest.raises(AdapterUnimplemented, match="activation checklist"):
+        adapter.parse_detail(raw_document("https://placeholder.example/x", "<html></html>"))
     with pytest.raises(AdapterUnimplemented, match="not verified"):
         await adapter.discover(
             SearchRequest(source_key=source_key, profile_key="primary", url="https://placeholder.example/s"),

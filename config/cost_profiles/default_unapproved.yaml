@@ -1,0 +1,103 @@
+# Default cost profile (spec section 18). STATUS: UNAPPROVED. NO AMOUNTS.
+#
+# Every spec section 18 cost category is listed with status `unknown` and a note. No
+# amount here is invented: an unknown line makes the dependent scenario totals unknown
+# (never zero) until the owner records a quote, an actual or an approved assumption.
+# Activation gate "Cost assumptions" (spec 32): owner-selected business assumptions/quotes
+# and currency treatment are required before any threshold-driven alert.
+#
+# How categories feed the spec 18 arithmetic (domain/costs.py TERM_BY_CATEGORY):
+#   purchase (from listing price evidence)       -> purchase_cash_outlay_excluding_deposits
+#   bank_fx_charges, travel_inspection          -> acquisition_costs (part of purchase_economic_cost)
+#   transport, export_plates_insurance          -> transport
+#   customs_broker                              -> clearance
+#   import_duty, motor_vehicle_tax, import_vat,
+#     other_import_charges                      -> import_components (tax engine, approved rules only)
+#   homologation_registration                   -> included_registration
+#   repairs                                     -> repairs
+#   preparation, storage_holding                -> preparation
+#   risk_reserve                                -> reserves
+#   selling_costs                               -> selling_costs
+#   refundable_deposit                          -> refundable_deposits (cash, not cost, unless the
+#                                                  refund is unconfirmed in the conservative scenario)
+#
+# Amounts, when added later, must be quoted decimal strings ("700.00"), never bare
+# floats; YAML floats are rejected on load.
+profile_key: default
+version: 1
+basis: >-
+  Placeholder profile listing every required cost category as unknown. No business
+  assumptions have been selected or approved by the owner.
+currency: EUR
+approval_status: unapproved
+approved_by: null
+approved_at: null
+is_fixture: false
+notes:
+  - "Vehicle purchase payable amount: taken per listing from price evidence (PurchaseInput), never from this profile."
+  - "Business tax/accounting treatment is not modelled; results are an estimated contribution before business tax."
+assumptions:
+  - category: bank_fx_charges
+    label: Bank transfer and currency conversion charges / exchange spread
+    status: unknown
+    note: Depends on the owner's bank, payment route and currency; needs a bank quote or approved assumption.
+  - category: travel_inspection
+    label: Travel and pre-purchase inspection
+    status: unknown
+    note: Only if a trip or third-party inspection is planned; record not_applicable with a reason otherwise.
+  - category: transport
+    label: Transport to North Macedonia (incl. loading / non-running surcharges)
+    status: unknown
+    note: Needs a transporter quote scoped to the origin city and vehicle condition (running vs non-running).
+  - category: export_plates_insurance
+    label: Export registration/plates, insurance and documentation
+    status: unknown
+    note: Only where actually needed for the planned transport method; period and destination must be stated.
+  - category: customs_broker
+    label: Customs broker / clearance charges
+    status: unknown
+    note: Needs a broker quote; scope (declaration type, documents) must be recorded.
+  - category: import_duty
+    label: Import duty (tax engine)
+    status: unknown
+    note: Computed only by an ACTIVE, owner-approved tax rule set; unknown until such a rule exists.
+  - category: motor_vehicle_tax
+    label: Motor-vehicle tax (tax engine)
+    status: unknown
+    note: Computed only by an ACTIVE, owner-approved tax rule set; CO2 cycle must be documented.
+  - category: import_vat
+    label: Import VAT (tax engine)
+    status: unknown
+    note: Computed only by an ACTIVE, owner-approved tax rule set whose taxable base is explicit.
+  - category: other_import_charges
+    label: Other applicable import charges (tax engine)
+    status: unknown
+    note: Computed only by an ACTIVE, owner-approved tax rule set.
+  - category: homologation_registration
+    label: Homologation / CoC / document acquisition, inspection and registration
+    status: unknown
+    note: Include only where the business model includes registration before sale; otherwise not_applicable with a reason.
+  - category: repairs
+    label: Mechanical repairs, tyres, brakes, fluids, bodywork and cleaning
+    status: unknown
+    note: Per vehicle; based on inspection findings or an approved assumption with low/base/high bounds.
+  - category: preparation
+    label: Sale preparation and advertising
+    status: unknown
+    note: Per vehicle or an approved assumption.
+  - category: storage_holding
+    label: Storage and capital/holding cost
+    status: unknown
+    note: Depends on expected time to sale and financing; owner assumption required.
+  - category: risk_reserve
+    label: Risk reserve for unverified mechanical/documentary issues
+    status: unknown
+    note: Owner-selected reserve policy required; use a correlation_group with repairs if both cover the same risk.
+  - category: selling_costs
+    label: Selling fees
+    status: unknown
+    note: Marketplace/agent fees in MK; owner assumption or actual fee schedule required.
+  - category: refundable_deposit
+    label: Refundable deposits (e.g. VAT/export deposit)
+    status: unknown
+    note: Per transaction from seller terms; record not_applicable with a reason when the seller requires none.

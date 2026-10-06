@@ -868,12 +868,19 @@ class SchemaOrgDealerAdapter:
         if cls.access_state != AccessState.OK:
             return self._failed_page(request, document, cls)
         assert page is not None and extraction is not None
-        if base != request.url and self.policy.is_detail_url(base):
+        if base != request.url and not self.policy.is_search_url(base):
+            # Redirected away from the search policy (detail page, home page with "featured"
+            # cars, expired-search landing page): never a result page, never complete coverage.
+            to_detail = self.policy.is_detail_url(base)
             return self._failed_page(
                 request,
                 document,
                 AccessClassification(
-                    AccessState.UNEXPECTED_CONTENT, "detail", "search URL redirected to a detail page"
+                    AccessState.UNEXPECTED_CONTENT,
+                    "detail" if to_detail else "unknown",
+                    "search URL redirected to a detail page"
+                    if to_detail
+                    else "search URL redirected outside the search path policy",
                 ),
             )
         observations = extraction.observations
@@ -1668,7 +1675,11 @@ class SchemaOrgDealerAdapter:
         if structured is not None:
             differing = [(loc, m) for loc, m in text_mentions if not structured.consistent_with(m)]
             claim = (
-                OdometerClaim.RANGE_ONLY if structured.low_km is not None else OdometerClaim.SELLER_REPORTED
+                OdometerClaim.RANGE_ONLY
+                if structured.low_km is not None
+                else OdometerClaim.ESTIMATED
+                if original.is_estimate
+                else OdometerClaim.SELLER_REPORTED
             )
             if differing:
                 values = [structured.value] + [_mileage_value(m) for _, m in differing]
@@ -1735,7 +1746,32 @@ class SchemaOrgDealerAdapter:
         estimate = False
         if isinstance(raw_val, str) and re.search(r"[A-Za-z]", raw_val):
             found = find_mileages(raw_val)
-            if found and found[0].range_low is None:
+            if found and found[0].range_low is not None:
+                ranged = found[0]
+                low_km = ranged.range_low_km
+                assert low_km is not None
+                if not _mileage_plausible(ranged.km):
+                    col.warn("MILEAGE_IMPLAUSIBLE")
+                    return None, MileageOriginal()
+                col.prov(
+                    "vehicle.mileage_km",
+                    ExtractionMethod.JSON_LD,
+                    Confidence.HIGH,
+                    selector=selector,
+                    raw=raw_text,
+                    transformation="range only; no exact odometer value",
+                )
+                original = MileageOriginal(
+                    unit=ranged.unit,
+                    text=bounded(raw_text, 200),
+                    is_estimate=ranged.is_estimate,
+                    range_low=ranged.range_low,
+                    range_high=ranged.amount,
+                )
+                return _MileageStatement(
+                    exact_km=None, low_km=low_km, high_km=ranged.km, unit=ranged.unit
+                ), original
+            if found:
                 amount, unit_l, estimate = found[0].amount, found[0].unit, found[0].is_estimate
             else:
                 col.warn("MILEAGE_UNPARSEABLE")

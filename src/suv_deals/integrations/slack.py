@@ -44,6 +44,7 @@ from suv_deals.clock import Clock, ensure_utc
 from suv_deals.errors import AppError, ErrorCode, Forbidden, ValidationFailed
 from suv_deals.integrations.event_bridge import (
     ActivationRoute,
+    dashboard_url_problem,
     parse_retry_after,
     select_activation_route,
 )
@@ -268,8 +269,10 @@ class SlackReviewNotice(BaseModel):
     @field_validator("dashboard_url")
     @classmethod
     def _https_dashboard(cls, value: str) -> str:
-        if not value.startswith("https://") or any(c.isspace() for c in value):
-            raise ValueError("dashboard_url must be an https URL")
+        # Same rule as the MCP Events payload (no tokens/credentials in links), https only.
+        problem = dashboard_url_problem(value, allow_local_http=False)
+        if problem is not None:
+            raise ValueError(problem)
         return value
 
 
@@ -444,8 +447,23 @@ class ReconcileResult:
     pages_read: int = 0
 
 
+def _message_is_ours(message: Mapping[str, Any], config: SlackConfig) -> bool:
+    """Only a message authored by our app/bot can be the receipt of an uncertain post.
+
+    A human (or another bot) quoting the reference must never mark the delivery done.
+    """
+    bot_id = message.get("bot_id")
+    app_id = message.get("app_id")
+    if config.bot_id is not None or config.app_id is not None:
+        return (config.bot_id is not None and bot_id == config.bot_id) or (
+            config.app_id is not None and app_id == config.app_id
+        )
+    # Without a configured identity, require at least an app/bot author.
+    return (isinstance(bot_id, str) and bool(bot_id)) or (isinstance(app_id, str) and bool(app_id))
+
+
 def _message_has_ref(message: Mapping[str, Any], ref: str, config: SlackConfig) -> bool:
-    if config.bot_id is not None and message.get("bot_id") not in {None, config.bot_id}:
+    if not _message_is_ours(message, config):
         return False
     metadata = message.get("metadata")
     if isinstance(metadata, Mapping) and metadata.get("event_type") == METADATA_EVENT_TYPE:

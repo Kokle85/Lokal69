@@ -21,6 +21,7 @@ Rules implemented here (spec sections 3, 7, 24, 31):
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 from collections.abc import Iterable, Iterator
@@ -203,6 +204,29 @@ _MONTHLY = re.compile(
 )
 
 
+class _Claimed:
+    """Disjoint [start, end) spans already claimed by an earlier pattern; O(log n) overlap checks.
+
+    A linear scan over all earlier spans made matching quadratic in the number of matches,
+    which seller-controlled pages can make arbitrarily large.
+    """
+
+    __slots__ = ("_ends", "_starts")
+
+    def __init__(self) -> None:
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+
+    def overlaps(self, start: int, end: int) -> bool:
+        index = bisect.bisect_left(self._starts, end)  # spans starting before `end`
+        return index > 0 and self._ends[index - 1] > start
+
+    def add(self, start: int, end: int) -> None:
+        index = bisect.bisect_left(self._starts, start)
+        self._starts.insert(index, start)
+        self._ends.insert(index, end)
+
+
 @dataclass(frozen=True, slots=True)
 class MoneyMatch:
     amount: Decimal
@@ -226,16 +250,16 @@ def find_money(text: str) -> list[MoneyMatch]:
     so a model designation followed by a price ("Ridge 2.4 CHF 2'750.50") is not read as CHF 2.40.
     """
     found: list[MoneyMatch] = []
-    spans: list[tuple[int, int]] = []
+    claimed = _Claimed()
     for regex in (_PRICE_CUR_FIRST, _PRICE_NUM_FIRST):
         for match in regex.finditer(text):
-            if any(match.start() < end and start < match.end() for start, end in spans):
+            if claimed.overlaps(match.start(), match.end()):
                 continue
             currency = currency_code(match.group("cur"))
             amount = parse_locale_number(match.group("num"), kind="money")
             if currency is None or amount is None:
                 continue
-            spans.append((match.start(), match.end()))
+            claimed.add(match.start(), match.end())
             tail = text[match.end() : match.end() + 25]
             found.append(
                 MoneyMatch(
@@ -317,7 +341,7 @@ def _unit_of(unit_raw: str) -> tuple[Literal["km", "mi"], Decimal, bool]:
 
 
 def _mileage_from(
-    num_raw: str, unit_raw: str, raw: str, start: int, prefix: str, low_raw: str | None = None
+    num_raw: str, unit_raw: str, raw: str, start: int, prefix: str, *, low_raw: str | None = None
 ) -> MileageMatch | None:
     amount = parse_locale_number(num_raw, kind="count")
     if amount is None:
@@ -349,11 +373,11 @@ def _mileage_from(
 
 def find_mileages(text: str) -> list[MileageMatch]:
     """All `<number> km|mi`, `<low> - <high> km` and Italian-style `km <number>` mentions, by position."""
-    spans: list[tuple[int, int]] = []
+    claimed = _Claimed()
     results: list[MileageMatch] = []
     for regex in (_MILEAGE_RANGE, _MILEAGE_AFTER, _MILEAGE_BEFORE):
         for match in regex.finditer(text):
-            if any(match.start() < end and start < match.end() for start, end in spans):
+            if claimed.overlaps(match.start(), match.end()):
                 continue
             item = _mileage_from(
                 match.group("num"),
@@ -364,7 +388,7 @@ def find_mileages(text: str) -> list[MileageMatch]:
                 low_raw=match.groupdict().get("low"),
             )
             if item is not None:
-                spans.append((match.start(), match.end()))
+                claimed.add(match.start(), match.end())
                 results.append(item)
     results.sort(key=lambda m: m.start)
     return results
@@ -570,7 +594,36 @@ _ACTIVE_MARKUP = re.compile(
     r"\bon(error|load|click|mouseover|focus|submit)\s*=",
     re.IGNORECASE,
 )
-_SCRIPT_BLOCK = re.compile(r"<\s*(script|style)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
+_SCRIPT_OPEN = re.compile(r"<\s*(script|style)\b[^<>]{0,500}>", re.IGNORECASE)
+_SCRIPT_CLOSE = {
+    "script": re.compile(r"<\s*/\s*script\s*>", re.IGNORECASE),
+    "style": re.compile(r"<\s*/\s*style\s*>", re.IGNORECASE),
+}
+
+
+def _drop_script_blocks(text: str) -> str:
+    """Remove `<script>...</script>` / `<style>...</style>` blocks in one linear pass.
+
+    A lazy `.*?` regex is quadratic on seller text with thousands of unclosed openers
+    (a CPU denial of service per parsed listing). An unclosed opener keeps the following text
+    as data; the opener tag itself is removed later with the other tag-like strings.
+    """
+    parts: list[str] = []
+    pos = 0
+    while True:
+        opener = _SCRIPT_OPEN.search(text, pos)
+        if opener is None:
+            parts.append(text[pos:])
+            break
+        closer = _SCRIPT_CLOSE[opener.group(1).lower()].search(text, opener.end())
+        if closer is None:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos : opener.start()])
+        pos = closer.end()
+    return " ".join(parts)
+
+
 _TAG_LIKE = re.compile(r"<\s*/?\s*[A-Za-z!][^<>]{0,500}>")
 _MAX_MARKUP_INPUT = 200_000
 
@@ -597,12 +650,12 @@ def html_to_text(markup: str) -> CleanText:
             text = str(fragment.text_content())
             removed = bool(_TAG_LIKE.search(source))
         except (etree.ParserError, ValueError):
-            text = _TAG_LIKE.sub(" ", _SCRIPT_BLOCK.sub(" ", source))
+            text = _TAG_LIKE.sub(" ", _drop_script_blocks(source))
             removed = True
     # Entity-encoded markup decodes to literal tags; remove those too (defence in depth).
     if _TAG_LIKE.search(text):
         active = active or bool(_ACTIVE_MARKUP.search(text))
-        text = _TAG_LIKE.sub(" ", _SCRIPT_BLOCK.sub(" ", text))
+        text = _TAG_LIKE.sub(" ", _drop_script_blocks(text))
         removed = True
     text = _CONTROL.sub("", text)
     lines = [collapse_ws(line) for line in text.split("\n")]

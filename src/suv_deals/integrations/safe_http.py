@@ -321,7 +321,10 @@ class SafeHttpClient:
         request_headers = dict(headers or {})
         if any(name.lower() in _FORBIDDEN_REQUEST_HEADERS for name in request_headers):
             raise ValueError("caller may not set Host or hop-by-hop headers")
-        limit = max_response_bytes or self._limits.max_response_bytes
+        # Explicit values are honoured exactly; 0 must not silently fall back to the default.
+        limit = max_response_bytes if max_response_bytes is not None else self._limits.max_response_bytes
+        if limit <= 0:
+            raise ValueError("max_response_bytes must be positive")
         total = timeout_s if timeout_s is not None else self._limits.total_timeout_s
         if total <= 0:
             raise ValueError("timeout must be positive")

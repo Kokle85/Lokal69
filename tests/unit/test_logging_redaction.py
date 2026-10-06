@@ -175,7 +175,10 @@ def test_ids_dates_prices_are_not_mistaken_for_phones(text: str) -> None:
 
 
 def test_non_sensitive_names_are_kept() -> None:
-    text = "token_count=5 tokens: 7 secret_version=2 keyword=suv page=2 risk-adjusted task-queue-name-long"
+    text = (
+        "token_count=5 tokens: 7 secret_version=2 keyword=suv page=2 risk-adjusted task-queue-name-long "
+        "https://www.example.sk/sk-skoda-octavia-combi-2015-diesel"
+    )
     assert redact(text) == text
 
 

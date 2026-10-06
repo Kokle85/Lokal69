@@ -81,8 +81,7 @@ def test_locale_numbers(raw: str, kind: str, expected: Decimal) -> None:
     ],
 )
 def test_ambiguous_or_malformed_numbers_are_unknown(raw: str) -> None:
-    kind = "money"
-    result = parse_locale_number(raw, kind=kind)
+    result = parse_locale_number(raw, kind="money")
     if raw == "1.23":
         assert result == Decimal("1.23")  # two decimals are unambiguous
     else:

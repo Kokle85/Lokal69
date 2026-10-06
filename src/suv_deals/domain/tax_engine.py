@@ -1054,7 +1054,10 @@ class TaxCalculation(_Contract):
     jurisdiction: str
     currency: str
     effective_date: date
+    rule_valid_from: date | None
+    rule_valid_to: date | None
     as_of: datetime
+    customs_fx_rate: FxRate | None  # the customs rate actually used for a conversion
     components: tuple[ComponentResult, ...]
     complete: bool
     total_import_cost: Money | None
@@ -1168,6 +1171,7 @@ class _Resolver:
     def __init__(self, inputs: TaxInputs, rule_currency: str) -> None:
         self.inputs = inputs
         self.currency = rule_currency
+        self.customs_rate_used: FxRate | None = None
 
     # -- presence used for required_inputs
     def present(self, name: str) -> bool:
@@ -1336,6 +1340,7 @@ class _Resolver:
         else:
             warnings.append("CUSTOMS_FX_EFFECTIVE_PERIOD_NOT_RECORDED")
         converted = rate.convert(money, self.currency)
+        self.customs_rate_used = rate
         display = (
             f"{_show(money.amount)} {money.currency} -> {_show(converted.amount)} {self.currency} "
             f"(customs {rate.base}/{rate.quote}={rate.rate} {rate.rate_date.isoformat()} {rate.provider})"
@@ -1648,7 +1653,10 @@ def calculate(rule_set: RuleSet, inputs: TaxInputs, as_of: datetime) -> TaxCalcu
         jurisdiction=rule_set.jurisdiction,
         currency=currency,
         effective_date=effective_date,
+        rule_valid_from=rule_set.valid_from,
+        rule_valid_to=rule_set.valid_to,
         as_of=as_of,
+        customs_fx_rate=resolver.customs_rate_used,
         components=tuple(results),
         complete=complete,
         total_import_cost=total,

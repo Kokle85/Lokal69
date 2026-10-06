@@ -195,6 +195,44 @@ def classify_status_only(document: RawDocument) -> AccessClassification | None:
         return AccessClassification(AccessState.TRANSIENT_ERROR, "unknown", f"HTTP {status}")
     if not 200 <= status < 300:
         return AccessClassification(AccessState.UNEXPECTED_CONTENT, "unknown", f"HTTP {status}")
+    if not fetch.success or fetch.access_state != AccessState.OK:
+        # HTTP success with a failed crawl (spec section 8): the crawl client already classified
+        # this response (anti-bot interstitial, stale cache hit, wait condition, empty or oversize
+        # body). Its verdict is never upgraded to OK by looking at whatever HTML it kept.
+        state = fetch.access_state if fetch.access_state != AccessState.OK else AccessState.UNEXPECTED_CONTENT
+        evidence = f"HTTP {status}; crawl client reported {fetch.error_code or state.value}"
+        return AccessClassification(state, "unknown", evidence)
+    return None
+
+
+def _content_denial(page: PageView, *, content_present: bool) -> AccessClassification | None:
+    """Blocked/removed classification from page wording, or None.
+
+    Without expected content the order is strong denial wording -> explicit removal wording ->
+    weak widget markers -> login wall -> paywall. Removal outranks weak signals because
+    removed-listing pages routinely keep a newsletter/contact reCAPTCHA widget or a header login
+    form, and classifying them as blocked would pause the whole source route.
+    """
+    title_lower = (page.title or "").lower()
+    strong = _first_marker(f"{title_lower} {page.text_lower}", STRONG_CHALLENGE_MARKERS) or _first_marker(
+        page.raw_lower, ("cf-challenge", "cf_chl_", "challenge-platform")
+    )
+    if strong and (not content_present or strong in title_lower):
+        return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"challenge marker '{strong}'")
+    if content_present:
+        return None
+    removed = has_removed_marker(page)
+    if removed:
+        return AccessClassification(AccessState.REMOVED, "removed", f"removed-listing marker '{removed}'")
+    weak = _first_marker(page.raw_lower, WEAK_CHALLENGE_MARKERS)
+    if weak:
+        return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"challenge marker '{weak}'")
+    login = _first_marker(f"{title_lower} {page.text_lower}", LOGIN_WORDS)
+    if page.has_password_input and login:
+        return AccessClassification(AccessState.ACCESS_BLOCKED, "login", f"login wall ('{login}')")
+    paywall = _first_marker(f"{title_lower} {page.text_lower}", PAYWALL_MARKERS)
+    if paywall:
+        return AccessClassification(AccessState.ACCESS_BLOCKED, "paywall", f"paywall marker '{paywall}'")
     return None
 
 
@@ -226,6 +264,20 @@ def classify_document(
             marker = has_removed_marker(page)
             if marker:
                 return AccessClassification(AccessState.REMOVED, "removed", f"HTTP 404; '{marker}'")
+        if (
+            state == AccessState.UNEXPECTED_CONTENT
+            and page is not None
+            and status is not None
+            and 200 <= status < 300
+        ):
+            # The crawl client flagged a 2xx page (e.g. its wait condition failed). A challenge or an
+            # explicit removal page explains why; refine to that state, never to OK. Weak widget
+            # markers on a page that does carry the expected content do not turn it into a block.
+            refined = _content_denial(page, content_present=content_present)
+            if refined is not None:
+                return AccessClassification(
+                    refined.access_state, refined.page_type, f"{status_class.evidence}; {refined.evidence}"
+                )
         return status_class
 
     final_host = _host_of(document.final_url or document.url)
@@ -243,36 +295,18 @@ def classify_document(
             AccessState.UNEXPECTED_CONTENT, "empty_shell", "empty or unparseable body"
         )
 
-    title_lower = (page.title or "").lower()
-    strong = _first_marker(f"{title_lower} {page.text_lower}", STRONG_CHALLENGE_MARKERS) or _first_marker(
-        page.raw_lower, ("cf-challenge", "cf_chl_", "challenge-platform")
-    )
-    if strong and (not content_present or strong in title_lower):
-        return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"challenge marker '{strong}'")
-    if not content_present:
-        # Explicit removal wording outranks weak signals: removed-listing pages routinely keep a
-        # newsletter/contact reCAPTCHA widget or a header login form, and classifying them as
-        # blocked would pause the whole source route. Strong denial wording is handled above.
-        removed = has_removed_marker(page)
-        if removed:
-            return AccessClassification(AccessState.REMOVED, "removed", f"removed-listing marker '{removed}'")
-        weak = _first_marker(page.raw_lower, WEAK_CHALLENGE_MARKERS)
-        if weak:
-            return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"challenge marker '{weak}'")
-        login = _first_marker(f"{title_lower} {page.text_lower}", LOGIN_WORDS)
-        if page.has_password_input and login:
-            return AccessClassification(AccessState.ACCESS_BLOCKED, "login", f"login wall ('{login}')")
-        paywall = _first_marker(f"{title_lower} {page.text_lower}", PAYWALL_MARKERS)
-        if paywall:
-            return AccessClassification(AccessState.ACCESS_BLOCKED, "paywall", f"paywall marker '{paywall}'")
-        if (
-            len(page.text_lower) < EMPTY_SHELL_MAX_TEXT
-            and page.json_ld.blocks == 0
-            and not has_empty_result_marker(page)
-        ):
-            return AccessClassification(
-                AccessState.UNEXPECTED_CONTENT,
-                "empty_shell",
-                f"only {len(page.text_lower)} characters of visible text and no structured content",
-            )
+    denial = _content_denial(page, content_present=content_present)
+    if denial is not None:
+        return denial
+    if (
+        not content_present
+        and len(page.text_lower) < EMPTY_SHELL_MAX_TEXT
+        and page.json_ld.blocks == 0
+        and not has_empty_result_marker(page)
+    ):
+        return AccessClassification(
+            AccessState.UNEXPECTED_CONTENT,
+            "empty_shell",
+            f"only {len(page.text_lower)} characters of visible text and no structured content",
+        )
     return AccessClassification(AccessState.OK, "unknown", None)

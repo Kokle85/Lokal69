@@ -33,8 +33,13 @@ the owner (or a schedule the owner configured in the client) asks it to look.
 
 - `route=none`, `bridge_status=unavailable` unless `ALLOW_EXTERNAL_NOTIFICATIONS=true` **and**
   `EVENT_BRIDGE_ENABLED=true`.
+- `route=none`, `bridge_status=unavailable` with named blockers when the selected route cannot
+  work: native events without a valid `MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY` (subscription
+  secrets could not be stored), or Slack without `NOTIFICATION_PROVIDER=slack`, `SLACK_BOT_TOKEN`,
+  `SLACK_SIGNING_SECRET` and `SLACK_CHANNEL_ID`. Blockers name settings, never values.
 - `bridge_status=configured` when a route is selected but `EVENT_BRIDGE_VERIFIED_AT` (an aware
-  ISO timestamp recorded after a successful end-to-end canary, section 8) is missing or invalid.
+  ISO timestamp recorded after a successful end-to-end canary, section 8) is missing, invalid or
+  in the future.
 - `bridge_status=verified` only with that recorded timestamp.
 - It **raises** `ActivationRouteConflict` instead of guessing when:
   - native events (`MCP_EVENTS_ENABLED`, `EVENT_BRIDGE_PROVIDER=mcp_events` or
@@ -60,7 +65,7 @@ the owner (or a schedule the owner configured in the client) asks it to look.
 | Callback URL | `https://` on port 443 only, public DNS name or public IP literal, no credentials/fragment, ≤ 2048 chars, else `-32602` | `validate_callback_url` |
 | Identity | `sub_` + first 32 hex of SHA-256 over canonical JSON of {principal (from auth), workspace, callback URL, event name, arguments}. Key order cannot create duplicates; body fields cannot change the principal. The id is a routing handle, never accepted as input | `subscription_identity` |
 | TTL | omitted → server default; number → grant ≤ n, **clamped up** to the server minimum; `null` (no expiry requested) → MVP still grants a finite lifetime; `refreshBefore` is never null; delivery stops when it passes. `maxAgeMs` accepted and ignored | `grant_ttl` |
-| Cursor | Always `cursor: null`. A client-supplied non-null cursor cannot be replayed, so the result says `truncated: true`. Catch-up is the pending-review tool | `subscribe_result` |
+| Cursor | Always `cursor: null, truncated: false`, the verified rule for an event type without replay (research doc sections 4 and 13). A client-supplied cursor is accepted and ignored (we never issue one). Catch-up is the pending-review tool | `subscribe_result` |
 | Refresh / rotation | Same identity → update the existing record. A new secret replaces the stored one; during `secret_rotation_overlap` deliveries are signed with both keys (space-separated, newest first). Rotation invalidates the cached verification | `signing_secrets`, `needs_verification` |
 | Verification | Before any application data: POST `{"type":"verification","challenge":<32 random bytes, urlsafe>}` with `webhook-id: msg_verification_<random>`, signed headers and `X-MCP-Subscription-Id`. Require **2xx** and a constant-time-equal echo `{"challenge": ...}`. Single use, accepted only within 60 s of issue | `run_verification_challenge`, `ChallengeLedger` |
 | Verification failures | `-32015 CallbackEndpointError` with `data.reason` ∈ `challenge_failed`, `timeout`, `connection_refused`, `tls_error`, `http_4xx`, `http_5xx` (a refused redirect or bad echo is `challenge_failed`; a destination our SSRF policy refuses is `connection_refused`) | `VerificationResult.raise_for_failure` |
@@ -70,7 +75,7 @@ the owner (or a schedule the owner configured in the client) asks it to look.
 | Headers | `Content-Type: application/json`, `webhook-id` (= `eventId`), `webhook-timestamp` (Unix seconds of signing), `webhook-signature` (`v1,<base64>`), `X-MCP-Subscription-Id` | `webhook_signing.build_signed_request` |
 | Signature | Standard Webhooks HMAC-SHA256 over `id.timestamp.body` via the `standardwebhooks` library; body serialized **once** (canonical JSON) and those exact bytes sent; UTC-converted timestamps (the library relabels instead of converting); `str` body (bytes would sign their repr) | `sign` |
 | Size | Complete body ≤ **262,144 bytes**; larger payloads are never sent (`FAILED payload_too_large`) | `WEBHOOK_BODY_LIMIT_BYTES` |
-| Responses | 2xx = **receipt** (`provider_accepted_at`), never review completion. 410/413 = terminal for that delivery only (subscription stays). 3xx = refused, never followed. 408/425/429/5xx and failures before sending = retry with exponential backoff + jitter, honouring `Retry-After`. Other 4xx = terminal. A timeout or connection loss after the request was sent = **UNCERTAIN** | `deliver` |
+| Responses | 2xx = **receipt** (`provider_accepted_at`), never review completion. 410/413 = terminal for that delivery only (subscription stays). 3xx = refused, never followed. 408/425/429/5xx and failures before sending = retry with exponential backoff + jitter, honouring `Retry-After`. Other 4xx = terminal. When the status line arrived but the body or deadline then failed, the outcome follows that status (a 410 followed by a reset is still terminal, never uncertain). A timeout or connection loss after the request was sent **without** a status = **UNCERTAIN** | `deliver` |
 | Retries | Same `eventId`/`webhook-id` on every attempt; fresh `webhook-timestamp` and signature each time; bounded attempts and time window | `deliver`, `RetryPolicy` |
 | Unsubscribe | Resolved from (principal from auth, workspace, url, name, canonical args); no secret; idempotent; always returns `{}` | `validate_unsubscribe_params`, `unsubscribe_result` |
 | SSRF | Validate at subscribe time, then resolve DNS **at connection time** (every answer must be public; mixed answers fail), connect to the validated IP with the hostname for SNI, certificate verification and `Host`; no redirects; no environment proxies; keep-alive disabled so a TLS session for one hostname is never reused for another | `safe_http.SafeHttpClient` |
@@ -159,14 +164,17 @@ approval reference is recorded, the channel matches `SLACK_CHANNEL_ID`, and nati
 not the selected route. It implements:
 
 - `chat.postMessage` with the bot token in the `Authorization` header, a minimal escaped text
-  that ends with a stable short reference `[ref SDR-XXXXXXXXXXXX]`, and message metadata
+  that ends with a stable short reference `[ref SDR-XXXXXXXXXXXX]` and an https dashboard link that
+  passes the same no-token/no-credential check as the MCP Events payload
+  (`event_bridge.dashboard_url_problem`), and message metadata
   `{"event_type":"suv_deals.review_pending","event_payload":{"event_ref","dedup_key"}}`;
 - classification: `ok:true` → posted (receipt); `ratelimited`/429/`service_unavailable`/
   `request_timeout` → retry; `internal_error`/`fatal_error`, Slack 5xx, unparseable 2xx and
   timeouts after sending → **uncertain**; other errors → failed;
 - `reconcile_uncertain_post`: `conversations.history?include_all_metadata=true` from one minute
   before the attempt, bounded pages, matching our metadata `event_ref` (or the text reference)
-  from our bot. Result `found` / `not_found` / `unknown` (lookup failed: keep `uncertain`
+  only on messages authored by our bot id / app id (without a configured identity: by some app or
+  bot). A human quoting the reference never counts as the receipt. Result `found` / `not_found` / `unknown` (lookup failed: keep `uncertain`
   visible, do not resend). Needs a token with `channels:history`/`groups:history`; usable only
   once a real token exists;
 - inbound verification: `v0=` HMAC-SHA256 over `v0:<timestamp>:<raw body bytes>` with the signing
@@ -183,7 +191,10 @@ not the selected route. It implements:
 - [ ] Clear user approval for the channel, event category and data included (recorded as the
       destination binding approval reference)
 - [ ] A connected posting identity with minimum required scope (`chat:write`, plus
-      `channels:history`/`groups:history` for reconciliation) and private-channel membership
+      `channels:history`/`groups:history` for reconciliation) and private-channel membership.
+      Register the custom metadata type `suv_deals.review_pending` under
+      `metadata.event_subscriptions` in the app manifest: Slack ignores unregistered metadata
+      (with only a warning), and reconciliation then has only the text reference
 - [ ] A separately verified consumer/automation route capable of receiving the relevant event type
 - [ ] Confirmation that bot-authored messages are not filtered out by that route
 - [ ] A tested mechanism for the consumer to call the authenticated MCP tools
@@ -206,12 +217,15 @@ dashboard/MCP queue.
   DE/IT/CH/MK/international phone numbers, including inside exception messages and tracebacks.
   `httpx`/`httpcore` loggers are raised to WARNING because they log full request URLs. Never log
   callback URLs; use `safe_url_for_log()` (scheme + host). `scripts/redact_logs.py` applies the
-  same function to existing log files.
+  same function to existing log files. The patterns run in linear time on untrusted text (seller
+  descriptions can reach logs), and identifier fields such as `source_key`/`dedup_key` are kept.
 - `observability/metrics.py`: `suv_deals_outbox_events{provider,state}`,
   `suv_deals_outbox_delivery_attempts_total{provider,outcome}`,
   `suv_deals_outbox_delivery_latency_seconds{provider}`,
   `suv_deals_callback_verifications_total{result}` and
-  `suv_deals_inbound_webhook_rejections_total{provider,reason}`; no URL/host/ID labels.
+  `suv_deals_inbound_webhook_rejections_total{provider,reason}`; no URL/host/ID labels. Source,
+  API-route and MCP-tool labels are restricted to the configured sets (`source_keys`, `api_routes`,
+  `tool_names`) and capped at `max_dynamic_label_values` distinct values each (overflow is `other`).
 - `observability/audit.py`: audit `event_subscription.create|refresh|verify|unsubscribe|revoke`,
   `secret.rotate` and `notification.route_change` with the verified actor; metadata is redacted
   (secret-named keys lose their values).

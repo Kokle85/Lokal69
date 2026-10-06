@@ -37,6 +37,8 @@ class SourceCapabilities(BaseModel):
     detail_required_for_price: bool = False
     max_page_size: int | None = None
     countries: tuple[str, ...] = ()
+    # False for placeholder adapters whose capabilities are conservative defaults, not established facts.
+    verified: bool = False
 
 
 class SearchRequest(BaseModel):
@@ -69,9 +71,15 @@ class FetchOutcome(BaseModel):
     bytes: int = Field(default=0, ge=0)
     redirect_count: int = Field(default=0, ge=0)
     retry_after_seconds: int | None = Field(default=None, ge=0)
-    # Allow-listed response headers only (content-type, retry-after, last-modified, etag, x-robots-tag).
+    # Allow-listed response headers only
+    # (content-type, retry-after, last-modified, etag, x-robots-tag, x-robots-status).
     response_headers: dict[str, str] = Field(default_factory=dict)
     crawler_version: str | None = None
+    server_processing_ms: int | None = Field(default=None, ge=0)
+    cache_status: str | None = Field(default=None, max_length=40)
+    # True when the failure is in our own crawler infrastructure (crawler down, crawler 5xx/429,
+    # bad crawler response) rather than at the target host; never counted against the host circuit.
+    infrastructure_failure: bool = False
     fetched_at: datetime
 
     @field_validator("fetched_at")
@@ -136,6 +144,8 @@ class DiscoveryPage(BaseModel):
     fetched_at: datetime
     fetch: FetchOutcome
     page_type: PageType = "search"
+    # Search-page diagnostics (dropped off-policy links, refused next link, ...).
+    warnings: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _classified(self) -> DiscoveryPage:
@@ -192,6 +202,10 @@ class ParseOutcome(BaseModel):
     price_minor: int | None = None
     mileage_km: Decimal | None = None
     unexpected_host: bool = False
+    # Search-page signals for pagination/result-count/locale tripwires (None = not applicable/unknown).
+    pagination_marker_present: bool | None = None
+    result_count_reported: int | None = Field(default=None, ge=0)
+    locale: str | None = Field(default=None, max_length=20)
     observed_at: datetime
 
 
@@ -202,6 +216,8 @@ class ParserHealth(BaseModel):
     sample_size: int
     reasons: tuple[str, ...] = ()
     metrics: dict[str, str] = Field(default_factory=dict)
+    # e.g. "pause_new_alerts", "quarantine_new_revisions"; never bulk removal of listings.
+    recommended_actions: tuple[str, ...] = ()
 
 
 @runtime_checkable
