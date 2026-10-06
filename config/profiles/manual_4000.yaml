@@ -1,0 +1,13 @@
+# Older EUR 4,000 ceiling: optional MANUAL-REVIEW profile, DISABLED by default.
+# Enabling it requires an auditable config revision and produces a visibly different queue.
+# It never replaces the primary EUR 2,500-3,000 target.
+key: manual_4000
+label: "Manual review: up to EUR 4,000 (disabled by default)"
+queue_label: "Manual EUR 4,000 review queue"
+enabled: false
+min_price_eur: "2500.00"
+max_price_eur: "4000.00"
+max_mileage_km_exclusive: "200000"
+source_countries: [DE, IT, CH]
+body_types: [suv, offroad, crossover]
+require_taxonomy_match: true

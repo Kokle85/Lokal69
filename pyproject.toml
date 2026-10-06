@@ -1,0 +1,95 @@
+[project]
+name = "suv-deals"
+version = "0.1.0"
+description = "Private, auditable European SUV deal-discovery and human-review system (DE/IT/CH -> MK)."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Proprietary - private use only" }
+dependencies = [
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.11,<3",
+  "pyyaml>=6.0.2,<7",
+  "psycopg[binary,pool]>=3.3,<4",
+  "httpx>=0.28,<0.29",
+  "fastapi>=0.142,<0.143",
+  "starlette>=1.7,<2",
+  "uvicorn[standard]>=0.54,<0.55",
+  "click>=8.1,<9",
+  "pyjwt[crypto]>=2.15,<3",
+  "cryptography>=46",
+  "standardwebhooks>=1.1,<2",
+  "mcp>=2.3,<2.4",
+  "prometheus-client>=0.23,<1",
+  "lxml>=6.0,<7",
+  "anyio>=4.10,<5",
+]
+
+[project.scripts]
+suv-deals = "suv_deals.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.2,<2",
+  "pytest-cov>=7.0,<8",
+  "hypothesis>=6.140,<7",
+  "respx>=0.23,<0.24",
+  "ruff>=0.14,<1",
+  "mypy>=1.18,<2",
+  "types-pyyaml>=6.0",
+  "freezegun>=1.5,<2",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/suv_deals"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF", "DTZ", "PL", "SIM"]
+ignore = [
+  "S101",     # assert is fine in tests and internal invariants
+  "PLR0913",  # domain constructors legitimately take many args
+  "PLR2004",  # magic values are business constants documented in config
+  "PLR0911",
+  "PLR0912",
+  "PLR0915",
+  "RUF012",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PLR", "DTZ", "B011"]
+"scripts/**" = ["S"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["suv_deals"]
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["standardwebhooks.*", "prometheus_client.*", "lxml.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers --import-mode=importlib"
+pythonpath = ["."]
+markers = [
+  "db: requires a real PostgreSQL (TEST_DATABASE_ADMIN_URL)",
+  "live: touches a live external source; never run automatically",
+  "e2e: browser end-to-end tests (Playwright)",
+  "slow: slow tests",
+]
+filterwarnings = ["error::pydantic.warnings.PydanticDeprecatedSince20"]

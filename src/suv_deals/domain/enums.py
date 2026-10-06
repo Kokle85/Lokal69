@@ -1,0 +1,388 @@
+"""Shared enumerations. Values are persisted; never rename a value without a migration.
+
+`UNKNOWN` members mean "not established". They are never equivalent to
+zero, false or not-applicable (spec section 2).
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class Country(StrEnum):
+    DE = "DE"
+    IT = "IT"
+    CH = "CH"
+    MK = "MK"
+    AT = "AT"
+    FR = "FR"
+    NL = "NL"
+    BE = "BE"
+    SI = "SI"
+    HR = "HR"
+    PL = "PL"
+    CZ = "CZ"
+    ES = "ES"
+
+
+class Availability(StrEnum):
+    AVAILABLE = "available"
+    RESERVED = "reserved"
+    REMOVED = "removed"  # never equated with sold
+    SOLD_CLAIMED = "sold_claimed"
+    UNKNOWN = "unknown"
+
+
+class ClaimStatus(StrEnum):
+    """Status of a seller/vehicle statement. Extraction confidence is separate."""
+
+    VERIFIED = "verified"  # supported by owner-verified evidence (inspection, document)
+    SELLER_CLAIMED = "seller_claimed"
+    SELLER_DENIED = "seller_denied"  # seller positively states the opposite
+    CONFLICTING = "conflicting"
+    UNKNOWN = "unknown"
+
+
+class Tristate(StrEnum):
+    YES = "yes"
+    NO = "no"
+    UNKNOWN = "unknown"
+
+
+class Precision(StrEnum):
+    DAY = "day"
+    MONTH = "month"
+    YEAR = "year"
+    UNKNOWN = "unknown"
+
+
+class Fuel(StrEnum):
+    DIESEL = "diesel"
+    PETROL = "petrol"
+    HYBRID_PETROL = "hybrid_petrol"
+    HYBRID_DIESEL = "hybrid_diesel"
+    PLUGIN_HYBRID = "plugin_hybrid"
+    LPG = "lpg"
+    CNG = "cng"
+    ELECTRIC = "electric"
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+class Gearbox(StrEnum):
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+    SEMI_AUTOMATIC = "semi_automatic"
+    UNKNOWN = "unknown"
+
+
+class Drive(StrEnum):
+    FWD = "fwd"
+    RWD = "rwd"
+    AWD = "awd"  # permanent or automatic all-wheel drive
+    FOUR_WD = "4wd"  # part-time / selectable 4x4
+    UNKNOWN = "unknown"
+
+
+class BodyType(StrEnum):
+    SUV = "suv"
+    OFFROAD = "offroad"
+    CROSSOVER = "crossover"
+    PICKUP = "pickup"
+    ESTATE = "estate"
+    SEDAN = "sedan"
+    HATCHBACK = "hatchback"
+    VAN = "van"
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+class SteeringSide(StrEnum):
+    LEFT = "left"
+    RIGHT = "right"
+    UNKNOWN = "unknown"
+
+
+class PriceBasis(StrEnum):
+    GROSS = "gross"
+    NET = "net"
+    UNKNOWN = "unknown"
+
+
+class PriceType(StrEnum):
+    FULL_VEHICLE_ASKING = "full_vehicle_asking"
+    INSTALMENT = "instalment"
+    LEASING = "leasing"
+    DEPOSIT = "deposit"
+    AUCTION_START = "auction_start"
+    AUCTION_CURRENT_BID = "auction_current_bid"
+    EXPORT_NET = "export_net"
+    PARTS_OR_DAMAGED = "parts_or_damaged"
+    PRICE_ON_REQUEST = "price_on_request"
+    UNKNOWN = "unknown"
+
+
+class VatTreatment(StrEnum):
+    """Seller-stated VAT wording only; never an inferred entitlement."""
+
+    VAT_SHOWN = "vat_shown"  # e.g. "MwSt. ausweisbar", "IVA esposta"
+    MARGIN_SCHEME = "margin_scheme"  # e.g. "Differenzbesteuert §25a"
+    PRIVATE_SALE = "private_sale"
+    NOT_STATED = "not_stated"
+    UNKNOWN = "unknown"
+
+
+class SellerType(StrEnum):
+    DEALER = "dealer"
+    PRIVATE = "private"
+    UNKNOWN = "unknown"
+
+
+class OdometerClaim(StrEnum):
+    SELLER_REPORTED = "seller_reported"
+    DOCUMENTED = "documented"  # service records/inspection referenced by seller
+    VERIFIED = "verified"  # owner-verified evidence
+    ESTIMATED = "estimated"  # seller gave a rough figure ("ca.", "approx")
+    RANGE_ONLY = "range_only"
+    CONFLICTING = "conflicting"
+    UNKNOWN = "unknown"
+
+
+class Co2Cycle(StrEnum):
+    NEDC = "nedc"
+    NEDC_CORRELATED = "nedc_correlated"
+    WLTP = "wltp"
+    UNKNOWN = "unknown"
+
+
+class Confidence(StrEnum):
+    """Extraction reliability. Says nothing about the truth of the seller claim."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ExtractionMethod(StrEnum):
+    JSON_LD = "json_ld"
+    MICRODATA = "microdata"
+    CSS = "css"
+    XPATH = "xpath"
+    REGEX = "regex"
+    API_FIELD = "api_field"
+    LLM_FALLBACK = "llm_fallback"
+    MANUAL = "manual"
+    DERIVED = "derived"
+
+
+class AccessState(StrEnum):
+    OK = "ok"
+    ACCESS_BLOCKED = "access_blocked"  # 401/403/CAPTCHA/explicit automated denial/paywall/login
+    RATE_LIMITED = "rate_limited"  # 429; back off, never evade
+    NOT_FOUND = "not_found"
+    REMOVED = "removed"  # explicit removed-listing page
+    TRANSIENT_ERROR = "transient_error"  # timeouts, 5xx, connection failures
+    UNEXPECTED_CONTENT = "unexpected_content"  # empty app shell, wrong page type, mismatched final URL
+    POLICY_DENIED = "policy_denied"  # our own URL/robots policy refused the request
+
+
+class Completeness(StrEnum):
+    COMPLETE = "complete"  # provider cursor finished or cutoff reached under a stable sort
+    BUDGET_LIMITED = "budget_limited"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
+class CoverageMode(StrEnum):
+    WATERMARK = "watermark"
+    ROLLING_PAGES = "rolling_pages"
+
+
+class TechnicalStatus(StrEnum):
+    UNTESTED = "untested"
+    FIXTURE_TESTED = "fixture_tested"
+    LIVE_SMOKE_PASSED = "live_smoke_passed"
+    DEGRADED = "degraded"
+    PARSER_UNHEALTHY = "parser_unhealthy"
+    ACCESS_BLOCKED = "access_blocked"
+
+
+class TermsStatus(StrEnum):
+    UNREVIEWED = "unreviewed"
+    PERMITTED = "permitted"  # explicit permission/agreement on file
+    NO_RESTRICTION_FOUND = "no_restriction_found"  # not the same as a licence
+    RESTRICTED = "restricted"
+
+
+class TermsDecision(StrEnum):
+    PENDING = "pending"
+    # Owner acknowledged a restriction: an audit record only, not permission.
+    PROCEED_ACKNOWLEDGED = "proceed_acknowledged"
+    PROCEED_PERMITTED = "proceed_permitted"  # permission/agreement on file
+    DO_NOT_USE = "do_not_use"
+
+
+class SourceMode(StrEnum):
+    PUBLIC_HTML = "public_html"
+    OFFICIAL_API = "official_api"
+    FIXTURE = "fixture"
+
+
+class EligibilityState(StrEnum):
+    ELIGIBLE_PRIMARY = "eligible_primary"
+    ELIGIBLE_MANUAL_PROFILE = "eligible_manual_profile"
+    NEEDS_FACTS = "needs_facts"
+    REJECTED = "rejected"
+
+
+class ValuationState(StrEnum):
+    NOT_STARTED = "not_started"
+    INCOMPLETE = "incomplete"
+    ESTIMATED = "estimated"
+    QUOTE_SUPPORTED = "quote_supported"
+    STALE = "stale"
+    INVALID = "invalid"
+
+
+class ReviewState(StrEnum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    NEEDS_INFORMATION = "needs_information"
+    WATCH = "watch"
+    SHORTLISTED = "shortlisted"
+    REJECTED = "rejected"
+    SUPERSEDED = "superseded"
+
+
+class ReviewOutcome(StrEnum):
+    NEEDS_INFORMATION = "needs_information"
+    WATCH = "watch"
+    SHORTLISTED = "shortlisted"
+    REJECTED = "rejected"
+
+
+class JobState(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    RETRY_WAIT = "retry_wait"
+    BLOCKED = "blocked"
+    DEAD_LETTER = "dead_letter"
+    CANCELLED = "cancelled"
+
+
+class JobType(StrEnum):
+    DISCOVERY = "discovery"
+    DETAIL = "detail"
+    RECHECK = "recheck"
+    VALUATION = "valuation"
+    COMPARABLES = "comparables"
+    STALE_SWEEP = "stale_sweep"
+    REPROCESS = "reprocess"
+
+
+class OutboxState(StrEnum):
+    PENDING = "pending"
+    SENDING = "sending"
+    RETRY_WAIT = "retry_wait"
+    DELIVERED = "delivered"
+    UNCERTAIN = "uncertain"
+    BLOCKED = "blocked"
+    DEAD_LETTER = "dead_letter"
+    CANCELLED = "cancelled"
+
+
+class EvidenceKind(StrEnum):
+    """MK market evidence (spec section 15)."""
+
+    ASKING_PRICE = "asking_price"
+    SELLER_REPORTED_SALE = "seller_reported_sale"
+    VERIFIED_SALE = "verified_sale"
+    OWNER_ESTIMATE = "owner_estimate"
+
+
+class CostLineStatus(StrEnum):
+    QUOTED = "quoted"
+    ESTIMATED = "estimated"
+    ACTUAL = "actual"
+    NOT_APPLICABLE = "not_applicable"  # requires a reason
+    UNKNOWN = "unknown"
+
+
+class CostCategory(StrEnum):
+    PURCHASE = "purchase"
+    BANK_FX_CHARGES = "bank_fx_charges"
+    TRAVEL_INSPECTION = "travel_inspection"
+    TRANSPORT = "transport"
+    EXPORT_PLATES_INSURANCE = "export_plates_insurance"
+    CUSTOMS_BROKER = "customs_broker"
+    IMPORT_DUTY = "import_duty"
+    MOTOR_VEHICLE_TAX = "motor_vehicle_tax"
+    IMPORT_VAT = "import_vat"
+    OTHER_IMPORT_CHARGES = "other_import_charges"
+    HOMOLOGATION_REGISTRATION = "homologation_registration"
+    REPAIRS = "repairs"
+    PREPARATION = "preparation"
+    RISK_RESERVE = "risk_reserve"
+    STORAGE_HOLDING = "storage_holding"
+    SELLING_COSTS = "selling_costs"
+    REFUNDABLE_DEPOSIT = "refundable_deposit"
+
+
+class TaxRuleStatus(StrEnum):
+    DRAFT = "draft"
+    UNDER_REVIEW = "under_review"
+    APPROVED = "approved"
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    UNAPPROVED = "unapproved"  # example/fixture rule sets; never selectable for production
+
+
+class ScenarioName(StrEnum):
+    CONSERVATIVE = "conservative"
+    BASE = "base"
+    UPSIDE = "upside"
+
+
+class FxPurpose(StrEnum):
+    REFERENCE = "reference"
+    CUSTOMS = "customs"
+    PAYMENT = "payment"
+
+
+class Role(StrEnum):
+    OWNER = "owner"
+    REVIEWER = "reviewer"
+    VIEWER = "viewer"
+
+
+class Scope(StrEnum):
+    DEALS_READ = "deals:read"
+    REVIEWS_READ = "reviews:read"
+    REVIEWS_WRITE = "reviews:write"
+    EVENTS_SUBSCRIBE = "events:subscribe"
+    RECHECKS_REQUEST = "rechecks:request"
+    NOTES_WRITE = "notes:write"
+    SOURCES_PAUSE = "sources:pause"
+    CONFIG_ADMIN = "config:admin"
+
+
+class ProfileKey(StrEnum):
+    PRIMARY = "primary"
+    MANUAL_4000 = "manual_4000"
+    BELOW_TARGET_WATCH = "below_target_watch"
+
+
+class GateStatus(StrEnum):
+    """Honest completion states (spec section 32)."""
+
+    NOT_REQUESTED = "not_requested"
+    IMPLEMENTED = "implemented"
+    FIXTURE_VERIFIED = "fixture_verified"
+    INTEGRATION_VERIFIED = "integration_verified"
+    LIVE_VERIFIED = "live_verified"
+    ACTIVE = "active"
+    BLOCKED = "blocked"
