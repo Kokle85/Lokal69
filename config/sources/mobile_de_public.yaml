@@ -1,0 +1,31 @@
+# mobile.de public listings (DE). Candidate acquisition source - DISABLED.
+# Terms and technical status are recorded independently (spec section 5).
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: mobile_de_public
+display_name: "mobile.de public listings (DE)"
+country: DE
+role: acquisition
+mode: public_html
+adapter: mobile_de_public
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: restricted
+terms_url: https://www.mobile.de/service/agbPublic
+terms_reviewed_at: 2026-10-06T00:00:00Z
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+# Left empty on purpose: hosts and paths are added only after permitted routes are verified.
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Public terms (checked 2026-10-06) contain a scraping restriction in section 11.
+  Determine which terms apply to this project's use before any decision. Permission or a
+  suitable agreement is the lower-risk activation route. The optional official Search API is
+  tracked separately as source mobile_de_api.

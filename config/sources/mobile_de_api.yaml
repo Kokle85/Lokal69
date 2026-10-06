@@ -1,0 +1,30 @@
+# Optional official mobile.de Search API (spec section 5). Feature-flagged, DISABLED.
+# Documentation: https://services.mobile.de/docs/search-api.html (checked 2026-10-06).
+# Not verified: eligibility, account, contract, price, quota or entitlement. Marketplace
+# login credentials are not API credentials. API onboarding must not block the
+# public-page adapter framework.
+source_key: mobile_de_api
+display_name: "mobile.de Search API (official, DE)"
+country: DE
+role: acquisition
+mode: official_api
+adapter: mobile_de_api
+adapter_version: unimplemented   # client raises DependencyUnavailable until entitlement is verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed         # API agreement/terms not obtained
+terms_url: null
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Entitlement unverified. Activation requires an owner-approved account/agreement, a recorded
+  entitlement reference, server-side credentials, an implementation written from the official
+  documentation, recorded fixtures and a successful low-volume test.

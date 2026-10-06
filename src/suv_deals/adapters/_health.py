@@ -48,7 +48,9 @@ def _fmt(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.001'))}"
 
 
-def assess_samples(samples: list[ParseOutcome], thresholds: HealthThresholds = DEFAULT_THRESHOLDS) -> ParserHealth:
+def assess_samples(
+    samples: list[ParseOutcome], thresholds: HealthThresholds = DEFAULT_THRESHOLDS
+) -> ParserHealth:
     """Assess a batch of parse outcomes. Pure and deterministic."""
     size = len(samples)
     if size < thresholds.min_sample_size:
@@ -62,7 +64,9 @@ def assess_samples(samples: list[ParseOutcome], thresholds: HealthThresholds = D
     metrics: dict[str, str] = {"sample_size": str(size)}
 
     blocked = sum(
-        1 for s in samples if s.access_state == AccessState.ACCESS_BLOCKED or s.page_type in _BLOCKED_PAGE_TYPES
+        1
+        for s in samples
+        if s.access_state == AccessState.ACCESS_BLOCKED or s.page_type in _BLOCKED_PAGE_TYPES
     )
     challenge_rate = _rate(blocked, size)
     metrics["challenge_rate"] = _fmt(challenge_rate)
@@ -90,14 +94,22 @@ def assess_samples(samples: list[ParseOutcome], thresholds: HealthThresholds = D
 
     details = [s for s in reachable if s.page_type == "detail" and s.ok]
     if details:
-        for name, attr in (("price", "has_price"), ("mileage", "has_mileage"), ("make_model", "has_make_model")):
+        for name, attr in (
+            ("price", "has_price"),
+            ("mileage", "has_mileage"),
+            ("make_model", "has_make_model"),
+        ):
             coverage = _rate(sum(1 for s in details if getattr(s, attr)), len(details))
             metrics[f"{name}_coverage"] = _fmt(coverage)
             if len(details) >= thresholds.min_sample_size:
                 if coverage < thresholds.coverage_unhealthy:
-                    reasons_unhealthy.append(f"{name} extraction coverage fell below {thresholds.coverage_unhealthy}")
+                    reasons_unhealthy.append(
+                        f"{name} extraction coverage fell below {thresholds.coverage_unhealthy}"
+                    )
                 elif coverage < thresholds.coverage_degraded:
-                    reasons_degraded.append(f"{name} extraction coverage below {thresholds.coverage_degraded}")
+                    reasons_degraded.append(
+                        f"{name} extraction coverage below {thresholds.coverage_degraded}"
+                    )
 
     priced = [s for s in reachable if s.price_minor is not None]
     currencies = Counter(s.currency for s in priced if s.currency)

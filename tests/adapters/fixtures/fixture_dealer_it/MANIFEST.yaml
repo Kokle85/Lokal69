@@ -1,0 +1,33 @@
+source_key: fixture_dealer_it
+designation: synthetic
+created: 2026-10-06
+parser_version: schemaorg_dealer@1.0.0
+description: >-
+  Hand-written SYNTHETIC pages for a fictional Italian dealer on the reserved example-style host
+  concessionario.example. Italian wording for VAT, negotiation, mileage and removal.
+files:
+  search_page.html: "Search page with an ItemList inside @graph; prices written '2.900'; 199.999 km and 200.000 km cards."
+  search_empty.html: "Empty result signalled only by wording ('Nessun veicolo trovato'), no JSON-LD."
+  detail_iva_esposta.html: "'IVA esposta', 'Prezzo trattabile', 'km 199.999' (JSON-LD string), BHP power, country as a Country node, format-invalid VIN (contains I/O)."
+  detail_200000.html: "Mileage exactly 200000 km (parsed; eligibility rejects later), 'IVA inclusa', 'prezzo fisso'."
+  detail_removed.html: "Explicit removed listing ('non è più disponibile')."
+  detail_injection_microdata.html: "Italian/English prompt injection and entity-encoded script in a microdata description; labelled odometer contradicting JSON-LD."
+routes:
+  "https://concessionario.example/usato/ricerca?categoria=suv":
+    file: search_page.html
+    description: "search"
+  "https://concessionario.example/usato/ricerca?categoria=cabrio":
+    file: search_empty.html
+    description: "empty search"
+  "https://concessionario.example/usato/auto/example-trail-it301":
+    file: detail_iva_esposta.html
+    description: "detail 199.999 km"
+  "https://concessionario.example/usato/auto/example-ridge-it302":
+    file: detail_200000.html
+    description: "detail 200.000 km"
+  "https://concessionario.example/usato/auto/example-summit-it303":
+    file: detail_removed.html
+    description: "removed listing"
+  "https://concessionario.example/usato/auto/example-trail-it304":
+    file: detail_injection_microdata.html
+    description: "injection in microdata description"

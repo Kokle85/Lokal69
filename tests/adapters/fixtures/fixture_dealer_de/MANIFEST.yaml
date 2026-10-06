@@ -1,0 +1,154 @@
+source_key: fixture_dealer_de
+designation: synthetic
+created: 2026-10-06
+parser_version: schemaorg_dealer@1.0.0
+description: >-
+  Hand-written SYNTHETIC pages for a fictional German dealer on the reserved example-style host
+  dealer.example. Not captured from any real website; no real vehicle, offer, person or business.
+  Covers the spec section 31 fixture set for an activated adapter.
+files:
+  search_page1.html: "Paginated search page 1: ItemList (3 valid cards, 1 off-host card), rel=next to page 2, tracking params, promotion badges and view counts."
+  search_page1_reordered.html: "Same three cards in a different order with different badges/view counts/tracking params (card_hash stability)."
+  search_page2.html: "Paginated search page 2 (last page, no rel=next); one card with embedded data, one bare relative URL."
+  search_empty.html: "Empty result page: ItemList numberOfItems 0 plus 'keine passenden Fahrzeuge gefunden'."
+  search_anchor_fallback.html: "Result page without JSON-LD: cards found through anchors matching the detail path; financing amount before the price."
+  search_next_offpolicy.html: "rel=next outside the search path policy; result links to a look-alike host, a disallowed path and a javascript: URL."
+  search_all_offhost.html: "Every ItemList link points to an unexpected host."
+  detail_normal.html: "Normal detail: EUR 2,750 gross 'inkl. 19% MwSt.', 187.500 km, 103 kW/140 BHP, first registration 2011-05, AWD, VIN (synthetic), contact form with a reCAPTCHA widget."
+  detail_price_on_request.html: "Missing-price detail: Offer without price, 'Preis auf Anfrage'."
+  detail_mileage_conflict.html: "Contradictory mileage: JSON-LD 187500 km versus title '87.500 km'."
+  detail_net_price.html: "Net/gross wording: 'Nettopreis ... zzgl. 19% MwSt.', 'Bruttopreis ... inkl. MwSt.', 'MwSt. ausweisbar'; structured net and gross price specifications."
+  detail_margin_scheme.html: "Margin scheme: 'Differenzbesteuert nach §25a UStG', 'VB', mileage exactly 200.000 km (parsed; eligibility rejects later)."
+  detail_instalment.html: "Instalment-only price ('ab 99 EUR mtl.') with a monthly UnitPriceSpecification."
+  detail_sold.html: "Offer availability SoldOut (sold_claimed)."
+  detail_removed.html: "Explicit removed-listing page ('nicht mehr verfügbar') with a similar-vehicles list."
+  detail_malformed.html: "Known malformed markup: broken JSON-LD block."
+  detail_markup_changed.html: "Changed markup: no structured data at all."
+  detail_injection.html: "Seller description with a prompt-injection attempt and XSS payloads (script/img onerror), XSS in the name."
+  login_wall.html: "Login wall: password form plus sign-in wording."
+  captcha.html: "CAPTCHA/challenge page ('kein Roboter', g-recaptcha)."
+  empty_shell.html: "Empty JavaScript application shell."
+  not_found.html: "Generic 404 page without removal wording."
+  rate_limited.html: "429 body."
+  server_error.html: "503 maintenance body."
+routes:
+  "https://dealer.example/suche?typ=suv":
+    file: search_page1.html
+    description: "search page 1"
+  "https://dealer.example/suche?typ=suv&seite=2":
+    file: search_page2.html
+    description: "search page 2"
+  "https://dealer.example/suche?typ=suv&variante=umsortiert":
+    file: search_page1_reordered.html
+    description: "reordered page 1"
+  "https://dealer.example/suche?typ=cabrio":
+    file: search_empty.html
+    description: "empty result"
+  "https://dealer.example/suche?typ=liste":
+    file: search_anchor_fallback.html
+    description: "anchor fallback search"
+  "https://dealer.example/suche?typ=offpolicy":
+    file: search_next_offpolicy.html
+    description: "off-policy next link and result links"
+  "https://dealer.example/suche?typ=fremd":
+    file: search_all_offhost.html
+    description: "all result links off-host"
+  "https://dealer.example/suche?typ=blockiert":
+    file: captcha.html
+    description: "challenge page served with 200"
+  "https://dealer.example/suche?typ=gesperrt":
+    file: captcha.html
+    status: 403
+    description: "challenge page served with 403"
+  "https://dealer.example/suche?typ=login":
+    file: login_wall.html
+    description: "login wall on search"
+  "https://dealer.example/suche?typ=shell":
+    file: empty_shell.html
+    description: "empty application shell on search"
+  "https://dealer.example/suche?typ=langsam":
+    simulate: timeout
+    description: "simulated timeout"
+  "https://dealer.example/suche?typ=verbindung":
+    simulate: connection_error
+    description: "simulated connection failure"
+  "https://dealer.example/suche?typ=viel":
+    file: rate_limited.html
+    status: 429
+    headers: {retry-after: "120"}
+    description: "rate limited with Retry-After seconds"
+  "https://dealer.example/suche?typ=viel-datum":
+    file: rate_limited.html
+    status: 429
+    headers: {retry-after: "Tue, 06 Oct 2026 10:05:00 GMT"}
+    description: "rate limited with Retry-After HTTP date"
+  "https://dealer.example/suche?typ=wartung":
+    file: server_error.html
+    status: 503
+    description: "server error"
+  "https://dealer.example/suche?typ=umleitung":
+    file: search_page1.html
+    final_url: "https://elsewhere.example/suche?typ=suv"
+    description: "redirect to another host"
+  "https://dealer.example/suche?typ=zu-detail":
+    file: detail_normal.html
+    final_url: "https://dealer.example/fahrzeug/TEST-204"
+    description: "search URL redirected to a detail page"
+  "https://dealer.example/fahrzeug/TEST-204":
+    file: detail_normal.html
+    description: "normal detail"
+  "https://dealer.example/fahrzeug/TEST-205":
+    file: detail_price_on_request.html
+    description: "price on request"
+  "https://dealer.example/fahrzeug/TEST-206":
+    file: detail_mileage_conflict.html
+    description: "mileage conflict"
+  "https://dealer.example/fahrzeug/TEST-207":
+    file: detail_net_price.html
+    description: "net price with VAT shown"
+  "https://dealer.example/fahrzeug/TEST-208":
+    file: detail_margin_scheme.html
+    description: "margin scheme, 200000 km"
+  "https://dealer.example/fahrzeug/TEST-209":
+    file: detail_removed.html
+    description: "removed listing page (200)"
+  "https://dealer.example/fahrzeug/TEST-210":
+    file: detail_removed.html
+    status: 410
+    description: "removed listing page (410 Gone)"
+  "https://dealer.example/fahrzeug/TEST-211":
+    file: detail_sold.html
+    description: "sold"
+  "https://dealer.example/fahrzeug/TEST-212":
+    file: detail_malformed.html
+    description: "broken JSON-LD"
+  "https://dealer.example/fahrzeug/TEST-213":
+    file: detail_injection.html
+    description: "prompt injection and XSS in seller text"
+  "https://dealer.example/fahrzeug/TEST-214":
+    file: login_wall.html
+    description: "login wall on detail"
+  "https://dealer.example/fahrzeug/TEST-215":
+    file: captcha.html
+    description: "challenge on detail"
+  "https://dealer.example/fahrzeug/TEST-216":
+    file: not_found.html
+    status: 404
+    description: "404 without removal wording"
+  "https://dealer.example/fahrzeug/TEST-217":
+    file: empty_shell.html
+    description: "empty shell on detail"
+  "https://dealer.example/fahrzeug/TEST-218":
+    file: detail_instalment.html
+    description: "instalment-only price"
+  "https://dealer.example/fahrzeug/TEST-219":
+    file: detail_markup_changed.html
+    description: "markup changed, no structured data"
+  "https://dealer.example/fahrzeug/TEST-220":
+    file: detail_removed.html
+    status: 404
+    description: "404 with explicit removal wording"
+  "https://dealer.example/fahrzeug/TEST-221":
+    file: captcha.html
+    status: 503
+    description: "challenge interstitial served with 503"

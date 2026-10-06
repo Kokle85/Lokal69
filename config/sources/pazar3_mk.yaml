@@ -1,0 +1,28 @@
+# Pazar3 (MK). Comparable-evidence candidate (role mk_comparable), never an acquisition source.
+# DISABLED; exact public routes and terms must be verified first. Asking prices from this
+# source are asking prices, not realized sales (spec section 15).
+source_key: pazar3_mk
+display_name: "Pazar3 public listings (MK comparables)"
+country: MK
+role: mk_comparable
+mode: public_html
+adapter: pazar3_mk
+adapter_version: unimplemented
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null            # exact terms page not yet identified/verified
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Skopje
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Comparable-source candidate from spec sections 5 and 15. Collect only vehicle-relevant
+  data; avoid seller personal contact details. Routes, terms and robots are unverified.

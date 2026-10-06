@@ -469,6 +469,10 @@ class SafeHttpClient:
 
 async def _read_bounded(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
     """Read at most `limit` raw bytes (identity encoding requested; no decompression bombs)."""
+    if response.is_stream_consumed:
+        # Already buffered by the transport (e.g. in-memory test transports).
+        data = response.content
+        return data[:limit], len(data) > limit
     buffer = bytearray()
     truncated = False
     async for chunk in response.aiter_raw():

@@ -1,0 +1,32 @@
+# AutoScout24 Switzerland public listings (CH). Candidate acquisition source - DISABLED.
+# Each AutoScout24 country is registered and gated separately.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: autoscout24_ch
+display_name: "AutoScout24 Switzerland public listings (CH)"
+country: CH
+role: acquisition
+mode: public_html
+adapter: autoscout24_public_ch
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Verify separately from other AutoScout24 markets (spec section 5). The autoscout24.com consumer
+  terms (https://www.autoscout24.com/company/agb/, checked 2026-10-06; sections 8.2-8.3 restrict
+  automated queries and the creation/commercial use of a derived database) are recorded for the
+  DE/IT sources. Whether they or separate Swiss terms govern AutoScout24 Switzerland has not been
+  reviewed, so terms_status stays unreviewed (a stricter gate than restricted) until the
+  CH-specific terms are identified and reviewed.

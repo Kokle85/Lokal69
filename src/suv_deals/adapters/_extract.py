@@ -11,8 +11,8 @@ consolidated into `domain/parsing.py` once it lands (tracked as an open issue).
 Rules implemented here (spec sections 3, 7, 24, 31):
 - Decimal only. JSON-LD is decoded with `parse_float=Decimal` so no binary float
   ever touches a price, mileage or power value.
-- DE/IT/CH separators: `.` `,` apostrophes (`'` `’`), NBSP/narrow NBSP/thin space
-  as grouping, trailing `.–`/`,-` "no cents" notation. Plain ASCII spaces are never
+- DE/IT/CH separators: `.` `,` apostrophes (ASCII and U+2019), NBSP/narrow NBSP/thin space
+  as grouping, trailing `.-` / `,-` (also with en/em dash) "no cents" notation. Plain ASCII spaces are never
   treated as grouping inside free text (they would merge adjacent numbers).
 - Miles -> km uses the exact factor 1.609344 and keeps the unrounded result.
 - Seller text is untrusted: markup is removed, length is bounded and
@@ -44,13 +44,13 @@ HP_TO_KW = Decimal("0.74569987158227022")  # mechanical/imperial horsepower (UN/
 
 NumberKind = Literal["money", "count"]
 
-_GROUPING_CHARS = ("'", "’", "ʼ", " ", " ", " ", " ", " ")
-_DASH_CENTS = re.compile(r"[.,]\s?[-–—]{1,2}$")
-_TRAILING_DASH = re.compile(r"[-–—]{1,2}$")
+_GROUPING_CHARS = ("'", "\u2019", "\u02bc", "\u00a0", "\u202f", "\u2009", "\u2007", " ")
+_DASH_CENTS = re.compile(r"[.,]\s?[-\u2013\u2014]{1,2}$")
+_TRAILING_DASH = re.compile(r"[-\u2013\u2014]{1,2}$")
 _DIGITS_AND_SEPARATORS = re.compile(r"\d[\d.,]*")
 
 # Number token used inside free text: grouping only with . , apostrophes or typographic spaces.
-_NUM_TOKEN = r"\d{1,3}(?:[.,'’   ]\d{3})+|\d+"
+_NUM_PATTERN = r"\d{1,3}(?:[.,'\u2019\u00a0\u202f\u2009]\d{3})+|\d+"
 
 
 def _grouped_digits(value: str, sep: str) -> str | None:
@@ -150,7 +150,7 @@ def miles_to_km(miles: Decimal) -> Decimal:
 # --------------------------------------------------------------------------- whitespace
 
 
-_WS = re.compile(r"[ \t\r\f\v      ​]+")
+_WS = re.compile(r"[ \t\r\f\v\u00a0\u202f\u2009\u2007\u2002\u2003\u200b]+")
 _MULTI_NL = re.compile(r"\n\s*\n+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -174,7 +174,7 @@ def bounded(text: str | None, limit: int) -> str | None:
 # --------------------------------------------------------------------------- money in text
 
 _CURRENCY_ALIASES: dict[str, str] = {
-    "€": "EUR",
+    "\u20ac": "EUR",
     "eur": "EUR",
     "euro": "EUR",
     "chf": "CHF",
@@ -183,14 +183,17 @@ _CURRENCY_ALIASES: dict[str, str] = {
     "ден": "MKD",
     "ден.": "MKD",
 }
-_CUR = r"€|Euro|EUR|CHF|SFr\.|MKD|ден\.?"
+_CUR = r"\u20ac|Euro|EUR|CHF|SFr\.|MKD|ден\.?"
 _MONEY_NUM = (
-    r"\d{1,3}(?:[.,'’   ]\d{3})+(?:[.,](?:\d{1,2}|\s?[-–—]{1,2}))?"
-    r"|\d+(?:[.,](?:\d{1,2}|\s?[-–—]{1,2}))?"
+    r"\d{1,3}(?:[.,'\u2019\u00a0\u202f\u2009]\d{3})+(?:[.,](?:\d{1,2}|\s?[-\u2013\u2014]{1,2}))?"
+    r"|\d+(?:[.,](?:\d{1,2}|\s?[-\u2013\u2014]{1,2}))?"
 )
-_PRICE_RE = re.compile(
-    rf"(?<![A-Za-z])(?P<cur1>{_CUR})\s?(?P<num1>{_MONEY_NUM})(?![\d])"
-    rf"|(?<![\w.,'’])(?P<num2>{_MONEY_NUM})\s?(?P<cur2>{_CUR})(?![A-Za-z])",
+_PRICE_CUR_FIRST = re.compile(
+    rf"(?<![A-Za-z])(?P<cur>{_CUR})\s?(?P<num>{_MONEY_NUM})(?![\d])",
+    re.IGNORECASE,
+)
+_PRICE_NUM_FIRST = re.compile(
+    rf"(?<![\w.,'\u2019])(?P<num>{_MONEY_NUM})\s?(?P<cur>{_CUR})(?![A-Za-z])",
     re.IGNORECASE,
 )
 _MONTHLY = re.compile(
@@ -217,42 +220,67 @@ def currency_code(token: str) -> str | None:
 
 
 def find_money(text: str) -> list[MoneyMatch]:
-    """All currency amounts in free text, in order. Instalment-like amounts are flagged `monthly`."""
+    """All currency amounts in free text, in order. Instalment-like amounts are flagged `monthly`.
+
+    Currency-first amounts ("CHF 2'750.50") are matched before number-first ones ("2.750 EUR")
+    so a model designation followed by a price ("Ridge 2.4 CHF 2'750.50") is not read as CHF 2.40.
+    """
     found: list[MoneyMatch] = []
-    for match in _PRICE_RE.finditer(text):
-        cur_raw = match.group("cur1") or match.group("cur2") or ""
-        num_raw = match.group("num1") or match.group("num2") or ""
-        currency = currency_code(cur_raw)
-        amount = parse_locale_number(num_raw, kind="money")
-        if currency is None or amount is None:
-            continue
-        tail = text[match.end() : match.end() + 25]
-        found.append(
-            MoneyMatch(
-                amount=amount,
-                currency=currency,
-                raw=match.group(0),
-                start=match.start(),
-                monthly=bool(_MONTHLY.match(tail)),
+    spans: list[tuple[int, int]] = []
+    for regex in (_PRICE_CUR_FIRST, _PRICE_NUM_FIRST):
+        for match in regex.finditer(text):
+            if any(match.start() < end and start < match.end() for start, end in spans):
+                continue
+            currency = currency_code(match.group("cur"))
+            amount = parse_locale_number(match.group("num"), kind="money")
+            if currency is None or amount is None:
+                continue
+            spans.append((match.start(), match.end()))
+            tail = text[match.end() : match.end() + 25]
+            found.append(
+                MoneyMatch(
+                    amount=amount,
+                    currency=currency,
+                    raw=match.group(0),
+                    start=match.start(),
+                    monthly=bool(_MONTHLY.match(tail)),
+                )
             )
-        )
+    found.sort(key=lambda m: m.start)
     return found
+
+
+def plain(value: Decimal) -> str:
+    """Fixed-point text of a Decimal without exponent ("187500", "199999.616256")."""
+    return f"{value.normalize():f}"
 
 
 # --------------------------------------------------------------------------- mileage in text
 
 _KM_UNITS = r"km|kilometern?|kilometres?|kilometers|chilometri"
 _MI_UNITS = r"miles|meilen|miglia|mi"
+# German "Tkm" / "Tsd. km" = thousand kilometres ("150 Tkm"); always a rounded figure.
+_KKM_UNITS = r"tkm|tsd\.?\s?km"
+_ANY_UNIT = rf"{_KKM_UNITS}|{_KM_UNITS}|{_MI_UNITS}"
 _MILEAGE_AFTER = re.compile(
-    rf"(?<![\w.,'’])(?P<num>{_NUM_TOKEN})\s?(?P<unit>{_KM_UNITS}|{_MI_UNITS})\b(?!\s*/\s*h)",
+    rf"(?<![\w.,'\u2019])(?P<num>{_NUM_PATTERN})\s?(?P<unit>{_ANY_UNIT})\b(?!\s*/\s*h)",
     re.IGNORECASE,
 )
+# "150.000 - 160.000 km", "150.000 bis 160.000 km", "da 150.000 a 160.000 km": an uncertain range.
+_RANGE_SEP = r"\s?(?:-|\u2013|\u2014|bis|to|a|fino\s+a)\s?"
+_MILEAGE_RANGE = re.compile(
+    rf"(?<![\w.,'\u2019])(?P<low>{_NUM_PATTERN})\s?(?:{_ANY_UNIT})?{_RANGE_SEP}"
+    rf"(?P<num>{_NUM_PATTERN})\s?(?P<unit>{_ANY_UNIT})\b(?!\s*/\s*h)",
+    re.IGNORECASE,
+)
+# Italian-style "km 199.999": only grouped numbers or 5+ digits, so "km 2011" (a year) is not mileage.
 _MILEAGE_BEFORE = re.compile(
-    rf"(?<![\w/])(?P<unit>km)\.?\s?:?\s?(?P<num>{_NUM_TOKEN})(?![\d])(?![.,'’]\d)",
+    r"(?<![\w/])(?P<unit>km)\.?\s?:?\s?"
+    r"(?P<num>\d{1,3}(?:[.,'\u2019\u00a0\u202f\u2009]\d{3})+|\d{5,})(?![\d])(?![.,'\u2019]\d)",
     re.IGNORECASE,
 )
 _ESTIMATE = re.compile(
-    r"(ca\.?|circa|approx\.?|approximately|etwa|ungefähr|rund|about|~|≈)\s*$", re.IGNORECASE
+    r"(ca\.?|circa|approx\.?|approximately|etwa|ungefähr|rund|about|~|\u2248)\s*$", re.IGNORECASE
 )
 _ODOMETER_LABEL = re.compile(
     r"(kilometerstand|km-stand|kilometer-stand|laufleistung|tachostand|chilometraggio|percorrenza|"
@@ -263,37 +291,69 @@ _ODOMETER_LABEL = re.compile(
 
 @dataclass(frozen=True, slots=True)
 class MileageMatch:
-    km: Decimal  # canonical, unrounded
-    amount: Decimal  # as written
+    km: Decimal  # canonical, unrounded (upper bound for a range)
+    amount: Decimal  # as written, in `unit` (upper bound for a range)
     unit: Literal["km", "mi"]
     raw: str
     is_estimate: bool
     start: int
+    range_low: Decimal | None = None  # lower bound as written, in `unit`; None = exact statement
+
+    @property
+    def range_low_km(self) -> Decimal | None:
+        if self.range_low is None:
+            return None
+        return miles_to_km(self.range_low) if self.unit == "mi" else self.range_low
 
 
-def _mileage_from(num_raw: str, unit_raw: str, raw: str, start: int, prefix: str) -> MileageMatch | None:
+def _unit_of(unit_raw: str) -> tuple[Literal["km", "mi"], Decimal, bool]:
+    """(canonical unit, multiplier, rounded figure) of a mileage unit token."""
+    lowered = re.sub(r"\s+", "", unit_raw.lower())
+    if lowered in {"mi", "miles", "meilen", "miglia"}:
+        return "mi", Decimal(1), False
+    if lowered in {"tkm", "tsdkm", "tsd.km"}:
+        return "km", Decimal(1000), True
+    return "km", Decimal(1), False
+
+
+def _mileage_from(
+    num_raw: str, unit_raw: str, raw: str, start: int, prefix: str, low_raw: str | None = None
+) -> MileageMatch | None:
     amount = parse_locale_number(num_raw, kind="count")
     if amount is None:
         return None
-    unit: Literal["km", "mi"] = "mi" if unit_raw.lower() in {"mi", "miles", "meilen", "miglia"} else "km"
+    unit, factor, rounded = _unit_of(unit_raw)
+    amount *= factor
+    low: Decimal | None = None
+    if low_raw is not None:
+        low_value = parse_locale_number(low_raw, kind="count")
+        if low_value is None:
+            return None
+        low = low_value * factor
+        # "2 - 150.000 km" (model number) and "2011 - 150.000 km" (year) are not ranges; the
+        # caller then reads the upper number alone as an exact statement.
+        is_year = re.fullmatch(r"(?:19[5-9]\d|20\d\d)", low_raw.strip()) is not None
+        if not (low < amount and low >= 1000 and not is_year):
+            return None
     km = miles_to_km(amount) if unit == "mi" else amount
     return MileageMatch(
         km=km,
         amount=amount,
         unit=unit,
         raw=raw,
-        is_estimate=bool(_ESTIMATE.search(prefix)),
+        is_estimate=rounded or bool(_ESTIMATE.search(prefix)),
         start=start,
+        range_low=low,
     )
 
 
 def find_mileages(text: str) -> list[MileageMatch]:
-    """All `<number> km|mi` and Italian-style `km <number>` mentions, ordered by position."""
-    seen: set[int] = set()
+    """All `<number> km|mi`, `<low> - <high> km` and Italian-style `km <number>` mentions, by position."""
+    spans: list[tuple[int, int]] = []
     results: list[MileageMatch] = []
-    for regex in (_MILEAGE_AFTER, _MILEAGE_BEFORE):
+    for regex in (_MILEAGE_RANGE, _MILEAGE_AFTER, _MILEAGE_BEFORE):
         for match in regex.finditer(text):
-            if any(match.start() <= s < match.end() for s in seen):
+            if any(match.start() < end and start < match.end() for start, end in spans):
                 continue
             item = _mileage_from(
                 match.group("num"),
@@ -301,9 +361,10 @@ def find_mileages(text: str) -> list[MileageMatch]:
                 match.group(0),
                 match.start(),
                 text[max(0, match.start() - 14) : match.start()],
+                low_raw=match.groupdict().get("low"),
             )
             if item is not None:
-                seen.add(match.start())
+                spans.append((match.start(), match.end()))
                 results.append(item)
     results.sort(key=lambda m: m.start)
     return results
@@ -317,19 +378,34 @@ def find_labelled_odometer(text: str) -> list[MileageMatch]:
     """
     results: list[MileageMatch] = []
     for label in _ODOMETER_LABEL.finditer(text):
-        window = text[label.end() : label.end() + 40]
+        window = text[label.end() : label.end() + 50]
         est = re.match(r"(ca\.?|circa|etwa|approx\.?)\s*", window, re.IGNORECASE)
         offset = est.end() if est else 0
-        num = re.match(rf"(?P<num>{_NUM_TOKEN})(?![\d])\s?(?P<unit>{_KM_UNITS}|{_MI_UNITS})?\b", window[offset:])
-        if not num:
-            continue
-        item = _mileage_from(
-            num.group("num"),
-            num.group("unit") or "km",
-            text[label.start() : label.end() + offset + num.end()],
-            label.start(),
-            "ca." if est else "",
-        )
+        rest = window[offset:]
+        item: MileageMatch | None = None
+        ranged = _MILEAGE_RANGE.match(rest)
+        if ranged:
+            item = _mileage_from(
+                ranged.group("num"),
+                ranged.group("unit"),
+                text[label.start() : label.end() + offset + ranged.end()],
+                label.start(),
+                "ca." if est else "",
+                low_raw=ranged.group("low"),
+            )
+        if item is None:
+            num = re.match(
+                rf"(?P<num>{_NUM_PATTERN})(?![\d])\s?(?P<unit>{_ANY_UNIT})?\b", rest, re.IGNORECASE
+            )
+            if not num:
+                continue
+            item = _mileage_from(
+                num.group("num"),
+                num.group("unit") or "km",
+                text[label.start() : label.end() + offset + num.end()],
+                label.start(),
+                "ca." if est else "",
+            )
         if item is not None:
             results.append(item)
     return results
@@ -519,7 +595,7 @@ def html_to_text(markup: str) -> CleanText:
             for br in fragment.iter("br", "p", "li", "div", "tr"):
                 br.tail = "\n" + (br.tail or "")
             text = str(fragment.text_content())
-            removed = "<" in source
+            removed = bool(_TAG_LIKE.search(source))
         except (etree.ParserError, ValueError):
             text = _TAG_LIKE.sub(" ", _SCRIPT_BLOCK.sub(" ", source))
             removed = True
@@ -544,7 +620,10 @@ _INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
             r"\b(ignore|disregard|forget|override)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all|any|your)\b"
             r"[^.\n]{0,30}\b(instructions?|prompts?|rules|directives)\b",
         ),
-        ("ignore_instructions_de", r"\b(ignorier\w*|vergiss|missachte\w*)\b[^.\n]{0,40}\b(anweisung\w*|instruktion\w*)"),
+        (
+            "ignore_instructions_de",
+            r"\b(ignorier\w*|vergiss|missachte\w*)\b[^.\n]{0,40}\b(anweisung\w*|instruktion\w*)",
+        ),
         ("ignore_instructions_it", r"\b(ignora\w*|dimentica\w*)\b[^.\n]{0,40}\b(istruzion\w*)"),
         ("system_prompt", r"\b(system\s?prompt|developer message|jailbreak)\b"),
         ("role_override", r"\byou are (now )?(an?|the) (ai|assistant|language model|llm|agent|bot)\b"),
@@ -730,6 +809,7 @@ class PageView:
 
 _MAX_HTML = 6_000_000
 _CONTAINER_TAGS = frozenset({"article", "li", "tr"})
+_XML_DECLARATION = re.compile(r"^﻿?\s*<\?xml[^>]{0,200}\?>", re.IGNORECASE)
 
 
 def _element_text(element: Any) -> str:
@@ -753,7 +833,9 @@ def parse_page(html: str | None) -> PageView | None:
     """Parse HTML once. Returns None for empty/unparseable documents."""
     if html is None or not html.strip():
         return None
-    source = html[:_MAX_HTML]
+    # lxml refuses str input that carries an XML encoding declaration (XHTML pages); the text
+    # is already decoded, so the declaration is dropped before parsing.
+    source = _XML_DECLARATION.sub("", html[:_MAX_HTML], count=1)
     try:
         tree = lxml_html.document_fromstring(source)
     except (etree.ParserError, ValueError):
@@ -768,9 +850,7 @@ def parse_page(html: str | None) -> PageView | None:
     title = collapse_ws(_element_text(title_el)) if title_el is not None else None
     lang_raw = tree.get("lang")
     lang = str(lang_raw).strip()[:10] if lang_raw else None
-    has_password = any(
-        str(inp.get("type") or "").strip().lower() == "password" for inp in tree.iter("input")
-    )
+    has_password = any(str(inp.get("type") or "").strip().lower() == "password" for inp in tree.iter("input"))
     next_links: list[str] = []
     for el in tree.iter("link", "a"):
         rel = str(el.get("rel") or "").lower().split()

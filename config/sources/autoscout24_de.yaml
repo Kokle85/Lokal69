@@ -1,0 +1,27 @@
+# AutoScout24 Germany public listings (DE). Candidate acquisition source - DISABLED.
+# Each AutoScout24 country is registered and gated separately.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: autoscout24_de
+display_name: "AutoScout24 Germany public listings (DE)"
+country: DE
+role: acquisition
+mode: public_html
+adapter: autoscout24_public_de
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: restricted
+terms_url: https://www.autoscout24.com/company/agb/
+terms_reviewed_at: 2026-10-06T00:00:00Z
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or country-specific (autoscout24.de) and business-use terms apply must be verified before a decision.

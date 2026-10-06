@@ -21,7 +21,7 @@ import hashlib
 import re
 from collections.abc import Iterable
 from typing import Literal
-from urllib.parse import unquote_plus, urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, unquote_plus, urljoin, urlsplit, urlunsplit
 
 from suv_deals.adapters.base import CanonicalIdentity
 from suv_deals.domain.sources import SourceConfig
@@ -103,6 +103,20 @@ def build_identity(source_key: str, canonical_url: str, provider_id: str | None)
     )
 
 
+_ENCODED_SEPARATOR = re.compile(r"%(2f|5c)", re.IGNORECASE)
+
+
+def path_is_ambiguous(path: str) -> bool:
+    """True for paths a browser/server could resolve differently from the regex check.
+
+    `/fahrzeug/../admin`, `/fahrzeug/%2e%2e/admin` and encoded separators (`%2F`, `%5C`)
+    would let a permissive pattern such as `/fahrzeug/.+` reach other paths on the host.
+    """
+    if "\\" in path or _ENCODED_SEPARATOR.search(path):
+        return True
+    return any(unquote(segment) in {".", ".."} for segment in path.split("/"))
+
+
 def _compile(patterns: Iterable[str], field: str, source_key: str) -> tuple[re.Pattern[str], ...]:
     compiled: list[re.Pattern[str]] = []
     for pattern in patterns:
@@ -143,6 +157,8 @@ class UrlPolicy:
         if not patterns or not self.host_allowed(url):
             return False
         path = urlsplit(url.strip()).path or "/"
+        if path_is_ambiguous(path):
+            return False
         return any(p.fullmatch(path) for p in patterns)
 
     def is_search_url(self, url: str) -> bool:

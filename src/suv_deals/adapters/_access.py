@@ -13,7 +13,10 @@ A successful HTTP status is not proof of usable content. This module separates:
 Markers are generic wording/attribute signals, not site-specific selectors. When the
 page carries the structured content the caller expects (`content_present`), weak
 signals such as an embedded reCAPTCHA contact-form widget do not mark the page as
-blocked; strong denial wording in the page title still does.
+blocked; strong denial wording in the page title still does. Without expected content the
+order is: strong denial wording -> explicit removal wording -> weak widget markers ->
+login wall -> paywall -> empty shell, so a removed-listing page with a footer reCAPTCHA or
+a header login form is `removed`, not a source-wide block.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from dataclasses import dataclass
 from suv_deals.adapters._extract import PageView
 from suv_deals.adapters.base import PageType, RawDocument
 from suv_deals.domain.enums import AccessState
+from suv_deals.netguard import UnsafeDestination, parse_safe_url
 
 STRONG_CHALLENGE_MARKERS: tuple[str, ...] = (
     "cf-challenge",
@@ -92,21 +96,29 @@ REMOVED_MARKERS: tuple[str, ...] = (
     "no longer available",
     "n'est plus disponible",
 )
+# Explicit "no results" wording. Bare counters such as "Merkliste (0 Fahrzeuge)" or
+# "Vergleich: 0 Angebote" are NOT empty-result evidence: only result-count nouns
+# ("0 Treffer", "0 risultati") or a count followed by "found" wording qualify, so a header
+# widget on a page whose results failed to render is never reported as a complete empty search.
 _EMPTY_RESULT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
         r"keine (passenden )?fahrzeuge gefunden",
+        r"keine (passenden )?angebote gefunden",
         r"keine treffer",
-        r"keine ergebnisse",
-        r"(?<!\d)0 (treffer|fahrzeuge|ergebnisse|angebote)\b",
+        r"keine (such)?ergebnisse",
+        r"(?<![\d.,])0 (treffer|ergebnisse|suchergebnisse)\b",
+        r"(?<![\d.,])0 (fahrzeuge|angebote) gefunden",
         r"nessun (risultato|veicolo|annuncio)",
-        r"(?<!\d)0 (risultati|veicoli|annunci)\b",
+        r"(?<![\d.,])0 risultati\b",
+        r"(?<![\d.,])0 (veicoli|annunci) trovati",
         r"no (results|vehicles|matching vehicles) (found|available)",
-        r"(?<!\d)0 (results|vehicles)\b",
+        r"(?<![\d.,])0 (results|search results)\b",
+        r"(?<![\d.,])0 vehicles found",
         r"aucun (résultat|véhicule)",
     )
 )
-EMPTY_SHELL_MAX_TEXT = 120
+EMPTY_SHELL_MAX_TEXT = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,10 +148,13 @@ def has_removed_marker(page: PageView) -> str | None:
 
 
 def _host_of(url: str | None) -> str | None:
+    """Normalised (IDNA, lower-case) host of a URL; None for anything structurally unsafe."""
     if not url:
         return None
-    match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#:@]+)", url.strip())
-    return match.group(1).lower().rstrip(".") if match else None
+    try:
+        return parse_safe_url(url.strip()).hostname
+    except UnsafeDestination:
+        return None
 
 
 def _blocked_page_type(page: PageView | None, status: int | None) -> PageType:
@@ -200,9 +215,13 @@ def classify_document(
             return AccessClassification(state, _blocked_page_type(page, status), status_class.evidence)
         if state == AccessState.TRANSIENT_ERROR and page is not None and status is not None:
             # Some challenge interstitials are served with 5xx; they are denials, not outages.
-            marker = _first_marker(f"{(page.title or '').lower()} {page.text_lower}", STRONG_CHALLENGE_MARKERS)
+            marker = _first_marker(
+                f"{(page.title or '').lower()} {page.text_lower}", STRONG_CHALLENGE_MARKERS
+            )
             if marker:
-                return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"HTTP {status}; '{marker}'")
+                return AccessClassification(
+                    AccessState.ACCESS_BLOCKED, "challenge", f"HTTP {status}; '{marker}'"
+                )
         if state == AccessState.NOT_FOUND and page is not None and not content_present:
             marker = has_removed_marker(page)
             if marker:
@@ -214,8 +233,15 @@ def classify_document(
         return AccessClassification(
             AccessState.UNEXPECTED_CONTENT, "unknown", f"final URL host {final_host!r} is not an allowed host"
         )
+    content_type = (document.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type and "html" not in content_type and not content_type.endswith("xml"):
+        return AccessClassification(
+            AccessState.UNEXPECTED_CONTENT, "unknown", f"non-HTML content type {content_type[:60]!r}"
+        )
     if page is None:
-        return AccessClassification(AccessState.UNEXPECTED_CONTENT, "empty_shell", "empty or unparseable body")
+        return AccessClassification(
+            AccessState.UNEXPECTED_CONTENT, "empty_shell", "empty or unparseable body"
+        )
 
     title_lower = (page.title or "").lower()
     strong = _first_marker(f"{title_lower} {page.text_lower}", STRONG_CHALLENGE_MARKERS) or _first_marker(
@@ -224,6 +250,12 @@ def classify_document(
     if strong and (not content_present or strong in title_lower):
         return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"challenge marker '{strong}'")
     if not content_present:
+        # Explicit removal wording outranks weak signals: removed-listing pages routinely keep a
+        # newsletter/contact reCAPTCHA widget or a header login form, and classifying them as
+        # blocked would pause the whole source route. Strong denial wording is handled above.
+        removed = has_removed_marker(page)
+        if removed:
+            return AccessClassification(AccessState.REMOVED, "removed", f"removed-listing marker '{removed}'")
         weak = _first_marker(page.raw_lower, WEAK_CHALLENGE_MARKERS)
         if weak:
             return AccessClassification(AccessState.ACCESS_BLOCKED, "challenge", f"challenge marker '{weak}'")
@@ -233,10 +265,11 @@ def classify_document(
         paywall = _first_marker(f"{title_lower} {page.text_lower}", PAYWALL_MARKERS)
         if paywall:
             return AccessClassification(AccessState.ACCESS_BLOCKED, "paywall", f"paywall marker '{paywall}'")
-        removed = has_removed_marker(page)
-        if removed:
-            return AccessClassification(AccessState.REMOVED, "removed", f"removed-listing marker '{removed}'")
-        if len(page.text_lower) < EMPTY_SHELL_MAX_TEXT and not has_empty_result_marker(page):
+        if (
+            len(page.text_lower) < EMPTY_SHELL_MAX_TEXT
+            and page.json_ld.blocks == 0
+            and not has_empty_result_marker(page)
+        ):
             return AccessClassification(
                 AccessState.UNEXPECTED_CONTENT,
                 "empty_shell",

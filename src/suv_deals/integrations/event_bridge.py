@@ -14,9 +14,10 @@ clock and randomness. Wire details follow docs/research/mcp_events_and_webhooks.
 - `ttlMs` omitted -> server default; a number -> grant <= n, clamped *up* to a
   server minimum; `null` (no expiry requested) -> this MVP still grants a finite
   lifetime, so `refreshBefore` is never null. `maxAgeMs` is accepted and ignored.
-- No replay in the MVP: `cursor` is always null; the durable pending-review
-  tool is the catch-up path. A client-supplied non-null cursor cannot be
-  honoured, so the result reports `truncated: true`.
+- No replay in the MVP: `cursor` is always null and `truncated` is always
+  false (research doc sections 4 and 13: an event type without replay returns
+  `cursor: null, truncated: false`); the durable pending-review tool is the
+  catch-up path. A client-supplied cursor is accepted and ignored.
 - Before any application data a signed, single-use, 60-second challenge must be
   echoed by a 2xx response (constant-time compare).
 - Exactly one occurrence per request; `eventId` = outbox event UUID = `webhook-id`
@@ -47,11 +48,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator
 
-from suv_deals.clock import Clock, ensure_utc
+from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import OutboxState, ProfileKey, ReviewState, Scope
 from suv_deals.errors import AppError, ErrorCode, ValidationFailed
 from suv_deals.integrations.safe_http import SafeHttp, SafeHttpError, SafeHttpFailure, SafeResponse
+from suv_deals.integrations.secret_box import SecretBoxConfigError, parse_keyring
 from suv_deals.integrations.webhook_signing import (
     InvalidWebhookSecret,
     WebhookPayloadTooLarge,
@@ -398,8 +400,9 @@ def grant_ttl(raw_ttl: object, policy: SubscriptionPolicy = DEFAULT_POLICY) -> t
     if raw_ttl is None:
         # No-expiry is requested, but the MVP grants only finite lifetimes (refreshBefore never null).
         return "no_expiry", policy.max_ttl
-    requested = timedelta(milliseconds=_non_negative_int(raw_ttl, "ttlMs"))
-    granted = min(requested, policy.max_ttl)
+    requested_ms = _non_negative_int(raw_ttl, "ttlMs")
+    max_ms = policy.max_ttl // timedelta(milliseconds=1)
+    granted = timedelta(milliseconds=min(requested_ms, max_ms))  # cap before timedelta (overflow)
     return "value", max(granted, policy.min_ttl)
 
 
@@ -476,7 +479,7 @@ def validate_subscribe_params(
         raise invalid_params("cursor must be a string or null", field_name="cursor")
     if "maxAgeMs" in params and params["maxAgeMs"] is not None:
         _non_negative_int(params["maxAgeMs"], "maxAgeMs")  # accepted and ignored (no replay)
-    raw_ttl = params["ttlMs"] if "ttlMs" in params else _MISSING
+    raw_ttl = params.get("ttlMs", _MISSING)
     ttl_kind, granted = grant_ttl(raw_ttl, policy)
     now = ensure_utc(clock.now())
     host = urlsplit(url).hostname or ""
@@ -509,9 +512,11 @@ def subscribe_result(
     result: dict[str, Any] = {
         "id": request.subscription_id,
         "refreshBefore": rfc3339(request.expires_at),
+        # review.pending.v1 does not support replay: the verified rule for such event types
+        # is `cursor: null, truncated: false`, also when the client sent a cursor (we never
+        # issue one). `truncated: true` is reserved for a future replay implementation.
         "cursor": None,
-        # We never issue replay cursors; a supplied cursor means history we cannot provide.
-        "truncated": request.cursor_supplied,
+        "truncated": False,
     }
     if delivery_status is not None:
         result["deliveryStatus"] = dict(delivery_status)
@@ -849,7 +854,7 @@ class BlockReason(StrEnum):
     REVOKED = "subscription_revoked"
     UNVERIFIED = "subscription_unverified"
     EXPIRED = "subscription_expired"
-    NO_SECRET = "subscription_no_secret"
+    NO_SECRET = "subscription_no_secret"  # noqa: S105 - a reason label, not a secret
     WRONG_EVENT = "subscription_wrong_event"
 
 
@@ -913,6 +918,39 @@ def signing_secrets(
 # --------------------------------------------------------------------------- occurrence
 
 
+_LOCAL_HOSTS: Final = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def dashboard_url_problem(value: str, *, allow_local_http: bool) -> str | None:
+    """Why a dashboard link may not leave the system, or None when it is acceptable.
+
+    Links must require normal dashboard authentication (spec 22): absolute https
+    (plain http only for local development when allowed), no embedded
+    credentials, no fragment and no token-like query parameters.
+    """
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return "dashboard_url must be a string of at most 2048 characters"
+    if any(ch.isspace() or ord(ch) < 0x20 or ch == "\x7f" for ch in value):
+        return "dashboard_url must not contain whitespace or control characters"
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+    except ValueError:
+        return "dashboard_url is malformed"
+    if parts.scheme not in {"https", "http"} or not hostname:
+        return "dashboard_url must be an absolute http(s) URL"
+    if parts.scheme == "http" and not (allow_local_http and hostname in _LOCAL_HOSTS):
+        return "dashboard_url must use https outside local development"
+    if parts.username or parts.password or "@" in parts.netloc:
+        return "dashboard_url must not embed credentials"
+    if parts.fragment:
+        return "dashboard_url must not contain a fragment"
+    for name, _ in parse_qsl(parts.query, keep_blank_values=True):
+        if _SECRET_QUERY_NAME.fullmatch(name):
+            return "dashboard_url must not embed access tokens"
+    return None
+
+
 class ReviewPendingSignal(BaseModel):
     """Read view of the internal `review.pending` outbox payload (spec 22).
 
@@ -942,18 +980,9 @@ class ReviewPendingSignal(BaseModel):
     @field_validator("dashboard_url")
     @classmethod
     def _safe_dashboard_url(cls, value: str) -> str:
-        parts = urlsplit(value)
-        if parts.scheme not in {"https", "http"} or not parts.hostname:
-            raise ValueError("dashboard_url must be an absolute http(s) URL")
-        if parts.scheme == "http" and parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            raise ValueError("dashboard_url must use https outside local development")
-        if parts.username or parts.password or "@" in parts.netloc:
-            raise ValueError("dashboard_url must not embed credentials")
-        if parts.fragment:
-            raise ValueError("dashboard_url must not contain a fragment")
-        for name, _ in parse_qsl(parts.query, keep_blank_values=True):
-            if _SECRET_QUERY_NAME.fullmatch(name):
-                raise ValueError("dashboard_url must not embed access tokens")
+        problem = dashboard_url_problem(value, allow_local_http=True)
+        if problem is not None:
+            raise ValueError(problem)
         return value
 
 
@@ -1105,7 +1134,7 @@ def parse_retry_after(value: str | None, now: datetime) -> timedelta | None:
 def backoff_delay(attempt: int, policy: RetryPolicy, rng: random.Random) -> timedelta:
     """Exponential backoff with equal jitter: half fixed, half random (attempt is 1-based)."""
     exponent = min(max(attempt - 1, 0), 30)
-    ceiling = min(policy.max_delay, policy.base_delay * (2**exponent))
+    ceiling = min(policy.max_delay, policy.base_delay * (1 << exponent))
     half = ceiling / 2
     return half + timedelta(seconds=rng.uniform(0, half.total_seconds()))
 
@@ -1353,21 +1382,30 @@ def _classify_transport_error(
         return DeliveryOutcome(
             kind=DeliveryOutcomeKind.FAILED,
             reason=reason,
-            wire_error=CallbackErrorReason.CONNECTION_REFUSED,
+            wire_error=(
+                CallbackErrorReason.CONNECTION_REFUSED
+                if reason is DeliveryFailureReason.DESTINATION_REJECTED
+                else None
+            ),
             elapsed=elapsed,
             **base,
+        )
+    if exc.status_code is not None:
+        # The receiver's status line arrived before the body/deadline failed, so its answer
+        # is known: a 2xx is a receipt, 410/413/other 4xx stay terminal (never re-sent via
+        # the uncertain path), 408/425/429/5xx are retried.
+        return _outcome_for_status(
+            exc.status_code,
+            None,
+            base,
+            now=now,
+            finished=ensure_utc(clock.now()),
+            elapsed=elapsed,
+            policy=policy,
+            rng=rng,
+            first_attempt_at=first_attempt_at,
         )
     reason, wire = _TRANSPORT_CLASSIFICATION[exc.failure]
-    if exc.status_code is not None and 200 <= exc.status_code < 300:
-        # A 2xx status line arrived before the body/deadline failed: that is a receipt.
-        return DeliveryOutcome(
-            kind=DeliveryOutcomeKind.DELIVERED,
-            status_code=exc.status_code,
-            send_attempted_at=now,
-            provider_accepted_at=ensure_utc(clock.now()),
-            elapsed=elapsed,
-            **base,
-        )
     if exc.possibly_delivered:
         return DeliveryOutcome(
             kind=DeliveryOutcomeKind.UNCERTAIN,
@@ -1403,8 +1441,31 @@ def _classify_status(
     rng: random.Random,
     first_attempt_at: datetime | None,
 ) -> DeliveryOutcome:
-    status = response.status_code
-    elapsed = response.elapsed
+    return _outcome_for_status(
+        response.status_code,
+        response.headers.get("retry-after"),
+        base,
+        now=now,
+        finished=finished,
+        elapsed=response.elapsed,
+        policy=policy,
+        rng=rng,
+        first_attempt_at=first_attempt_at,
+    )
+
+
+def _outcome_for_status(
+    status: int,
+    retry_after_header: str | None,
+    base: Mapping[str, Any],
+    *,
+    now: datetime,
+    finished: datetime,
+    elapsed: timedelta | None,
+    policy: RetryPolicy,
+    rng: random.Random,
+    first_attempt_at: datetime | None,
+) -> DeliveryOutcome:
     if 200 <= status < 300:
         return DeliveryOutcome(
             kind=DeliveryOutcomeKind.DELIVERED,
@@ -1430,15 +1491,13 @@ def _classify_status(
             kind=DeliveryOutcomeKind.FAILED,
             status_code=status,
             reason=terminal,
-            wire_error=_status_reason(status) if status >= 400 else CallbackErrorReason.HTTP_4XX,
+            wire_error=CallbackErrorReason.HTTP_5XX if 500 <= status < 600 else CallbackErrorReason.HTTP_4XX,
             send_attempted_at=now,
             elapsed=elapsed,
             **base,
         )
     retry_after = (
-        parse_retry_after(response.headers.get("retry-after"), finished)
-        if status in _RETRY_AFTER_STATUSES
-        else None
+        parse_retry_after(retry_after_header, finished) if status in _RETRY_AFTER_STATUSES else None
     )
     reason = DeliveryFailureReason.HTTP_5XX if status >= 500 else DeliveryFailureReason.HTTP_RETRYABLE_4XX
     return _retry_or_dead_letter(
@@ -1531,11 +1590,40 @@ def _parse_verified_at(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def select_activation_route(settings: Settings) -> ActivationSelection:
+def _route_blockers(settings: Settings, route: ActivationRoute) -> list[str]:
+    """Configuration the selected route cannot work without (names only, never values)."""
+    blockers: list[str] = []
+    if route is ActivationRoute.MCP_EVENTS:
+        key = settings.mcp_event_subscription_secret_encryption_key
+        if key is None or not key.get_secret_value().strip():
+            blockers.append("mcp_event_subscription_secret_encryption_key is not configured")
+        else:
+            try:
+                parse_keyring(key.get_secret_value())
+            except SecretBoxConfigError:
+                blockers.append("mcp_event_subscription_secret_encryption_key is invalid")
+    elif route is ActivationRoute.SLACK:
+        if settings.notification_provider != "slack":
+            blockers.append("notification_provider is not slack")
+        for name, secret in (
+            ("slack_bot_token", settings.slack_bot_token),
+            ("slack_signing_secret", settings.slack_signing_secret),
+        ):
+            if secret is None or not secret.get_secret_value():
+                blockers.append(f"{name} is not configured")
+        if not settings.slack_channel_id:
+            blockers.append("slack_channel_id is not configured")
+    return blockers
+
+
+def select_activation_route(settings: Settings, *, clock: Clock | None = None) -> ActivationSelection:
     """Pick the single activation route. Native MCP Events and Slack must never both be on.
 
     Raises `ActivationRouteConflict` for contradictory configuration instead of
     silently preferring one route (two routes would start duplicate review runs).
+    A route whose required configuration is missing is reported as `none` /
+    `unavailable` with the blockers. `verified` requires a recorded canary time
+    (EVENT_BRIDGE_VERIFIED_AT) that parses as an aware timestamp not in the future.
     """
     native = (
         settings.mcp_events_enabled
@@ -1557,8 +1645,18 @@ def select_activation_route(settings: Settings) -> ActivationSelection:
     if blockers:
         return ActivationSelection(ActivationRoute.NONE, BridgeStatus.UNAVAILABLE, tuple(blockers))
     route = ActivationRoute(settings.event_bridge_provider)
-    verified_at = _parse_verified_at(settings.event_bridge_verified_at)
+    blockers = _route_blockers(settings, route)
+    if blockers:
+        return ActivationSelection(ActivationRoute.NONE, BridgeStatus.UNAVAILABLE, tuple(blockers))
+    raw_verified = settings.event_bridge_verified_at
+    verified_at = _parse_verified_at(raw_verified)
+    now = ensure_utc((clock or SystemClock()).now())
     if verified_at is None:
+        if raw_verified:
+            blockers.append("event_bridge_verified_at is not an aware ISO 8601 timestamp")
         blockers.append("no recorded end-to-end canary (event_bridge_verified_at)")
+        return ActivationSelection(route, BridgeStatus.CONFIGURED, tuple(blockers))
+    if verified_at > now + timedelta(minutes=5):
+        blockers.append("event_bridge_verified_at is in the future")
         return ActivationSelection(route, BridgeStatus.CONFIGURED, tuple(blockers))
     return ActivationSelection(route, BridgeStatus.VERIFIED, ())

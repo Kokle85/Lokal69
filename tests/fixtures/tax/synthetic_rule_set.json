@@ -1,0 +1,219 @@
+{
+  "rule_set_id": "SYNTHETIC-TEST-ONLY-xx-passenger-import",
+  "jurisdiction": "XX",
+  "version": "synthetic-1",
+  "status": "unapproved",
+  "valid_from": "2026-01-01",
+  "valid_to": "2027-01-01",
+  "currency": "MKD",
+  "vehicle_categories": [
+    "passenger_car"
+  ],
+  "description": "SYNTHETIC TEST FIXTURE. Jurisdiction XX is a user-assigned code, not a country. Every rate, bracket and amount here is invented to exercise the engine; none is a real tax, tariff, coefficient or VAT rate of North Macedonia or anywhere else.",
+  "sources": [],
+  "approved_by": null,
+  "approved_at": null,
+  "required_inputs": [
+    "declaration_date",
+    "classification",
+    "customs_value",
+    "origin_evidence",
+    "co2_g_km",
+    "co2_cycle"
+  ],
+  "optional_inputs": [
+    "preferential_origin_country",
+    "engine_displacement_cm3",
+    "vehicle_age_years",
+    "customs_fx_rate"
+  ],
+  "input_units": {
+    "co2_g_km": "g/km",
+    "engine_displacement_cm3": "cm3",
+    "vehicle_age_years": "years"
+  },
+  "components": [
+    {
+      "id": "duty_listed_origin",
+      "kind": "percentage",
+      "label": "SYNTHETIC duty, accepted preferential proof from a listed country",
+      "category": "import_duty",
+      "currency": "MKD",
+      "alternative_group": "duty",
+      "applies_when": [
+        {
+          "input": "preferential_origin_country",
+          "op": "in",
+          "value": [
+            "AT",
+            "DE",
+            "IT"
+          ]
+        }
+      ],
+      "rate": "0.02",
+      "base": [
+        "customs_value"
+      ]
+    },
+    {
+      "id": "duty_standard",
+      "kind": "percentage",
+      "label": "SYNTHETIC duty, standard",
+      "category": "import_duty",
+      "currency": "MKD",
+      "alternative_group": "duty",
+      "applies_when": [
+        {
+          "input": "preferential_origin_country",
+          "op": "not_in",
+          "value": [
+            "AT",
+            "DE",
+            "IT"
+          ]
+        }
+      ],
+      "rate": "0.10",
+      "base": [
+        "customs_value"
+      ]
+    },
+    {
+      "id": "co2_charge",
+      "kind": "bracket",
+      "label": "SYNTHETIC CO2 charge",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "input": "co2_g_km",
+      "base": [
+        "customs_value"
+      ],
+      "rounding": {
+        "quantum": "1",
+        "mode": "half_up",
+        "stage": "before_dependents"
+      },
+      "tables": {
+        "wltp": [
+          {
+            "lower_inclusive": "0",
+            "upper_exclusive": "100",
+            "amount": "1000"
+          },
+          {
+            "lower_inclusive": "100",
+            "upper_exclusive": "150",
+            "amount_per_unit_above_lower": "50"
+          },
+          {
+            "lower_inclusive": "150",
+            "upper_exclusive": null,
+            "rate_of_base": "0.05"
+          }
+        ],
+        "nedc": [
+          {
+            "lower_inclusive": "0",
+            "upper_exclusive": "90",
+            "amount": "1200"
+          },
+          {
+            "lower_inclusive": "90",
+            "upper_exclusive": "140",
+            "amount_per_unit_above_lower": "60"
+          },
+          {
+            "lower_inclusive": "140",
+            "upper_exclusive": null,
+            "amount": "9000"
+          }
+        ],
+        "nedc_correlated": [
+          {
+            "lower_inclusive": "0",
+            "upper_exclusive": "95",
+            "amount": "1100"
+          },
+          {
+            "lower_inclusive": "95",
+            "upper_exclusive": null,
+            "amount": "5000"
+          }
+        ]
+      }
+    },
+    {
+      "id": "age_fee",
+      "kind": "bracket",
+      "label": "SYNTHETIC age fee",
+      "category": "other_import_charges",
+      "currency": "MKD",
+      "input": "vehicle_age_years",
+      "brackets": [
+        {
+          "lower_inclusive": "0",
+          "upper_exclusive": "5",
+          "amount": "0"
+        },
+        {
+          "lower_inclusive": "5",
+          "upper_exclusive": "10",
+          "amount": "500"
+        },
+        {
+          "lower_inclusive": "10",
+          "upper_exclusive": null,
+          "amount": "1500"
+        }
+      ]
+    },
+    {
+      "id": "displacement_fee",
+      "kind": "per_unit",
+      "label": "SYNTHETIC displacement fee above threshold",
+      "category": "other_import_charges",
+      "currency": "MKD",
+      "input": "engine_displacement_cm3",
+      "amount_per_unit": "0.5",
+      "threshold": "1600"
+    },
+    {
+      "id": "processing_fee",
+      "kind": "fixed",
+      "label": "SYNTHETIC fixed processing fee",
+      "category": "other_import_charges",
+      "currency": "MKD",
+      "amount": "123.45"
+    },
+    {
+      "id": "vat",
+      "kind": "percentage",
+      "label": "SYNTHETIC import VAT on explicitly listed base",
+      "category": "import_vat",
+      "currency": "MKD",
+      "depends_on": [
+        "duty_listed_origin",
+        "duty_standard",
+        "co2_charge"
+      ],
+      "rate": "0.20",
+      "base": [
+        "customs_value",
+        "duty_listed_origin",
+        "duty_standard",
+        "co2_charge"
+      ]
+    }
+  ],
+  "rounding_rules": {
+    "component_default": {
+      "quantum": "0.01",
+      "mode": "half_up"
+    },
+    "total": null
+  },
+  "missing_input_behavior": "return_incomplete",
+  "sha256": "be2412a15136f280fecf537efdd1699b11f899f6ff326936135786f57e8e9659",
+  "is_fixture": true
+}

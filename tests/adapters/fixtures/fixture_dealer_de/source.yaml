@@ -1,0 +1,29 @@
+# SYNTHETIC fixture source for the generic schema.org dealer adapter. Not a real dealer.
+# dealer.example is a reserved example-style name; nothing here is ever fetched from a network.
+# Disabled in file; tests may enable it in memory (model_copy) with a synthetic terms record.
+source_key: fixture_dealer_de
+display_name: "Synthetic fixture dealer (DE) - not a real source"
+country: DE
+role: acquisition
+mode: fixture
+adapter: schemaorg_dealer
+adapter_version: schemaorg_dealer@1.0.0
+enabled: false
+technical_status: fixture_tested
+terms_status: unreviewed
+terms_url: null
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Berlin
+allowed_hosts: ["dealer.example"]
+allowed_search_paths: ["/suche"]
+allowed_detail_paths: ["/fahrzeug/[A-Z0-9-]{3,40}"]
+search:
+  search_url: "https://dealer.example/suche?typ=suv"
+  page_param: seite
+  provides_listing_ids: "true"
+notes: "SYNTHETIC fixture source (designation: synthetic, created 2026-10-06)."

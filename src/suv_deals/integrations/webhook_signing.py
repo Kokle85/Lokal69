@@ -261,6 +261,8 @@ _LIBRARY_REASONS: tuple[tuple[str, VerificationFailureReason], ...] = (
 
 
 def _reason_from_library(exc: Exception) -> VerificationFailureReason:
+    if isinstance(exc, UnicodeDecodeError):
+        return VerificationFailureReason.INVALID_BODY
     if isinstance(exc, WebhookVerificationError):
         text = str(exc)
         for prefix, reason in _LIBRARY_REASONS:
@@ -371,4 +373,3 @@ class WebhookReplayGuard:
 
     def __len__(self) -> int:
         return len(self._seen)
-
