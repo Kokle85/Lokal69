@@ -230,9 +230,12 @@ CandidateStatus = Literal["pending", "needs_information", "watch", "shortlisted"
 
 
 class ToolInput(BaseModel):
-    """Base for tool arguments: frozen, closed (unknown fields are validation errors)."""
+    """Base for tool arguments: frozen, closed (unknown fields are validation errors).
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    ``hide_input_in_errors`` keeps submitted values (e.g. claim tokens) out of error messages.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
 
 # --------------------------------------------------------------------------- tool inputs
@@ -357,7 +360,11 @@ class ToolError(ErrorPayload):
     """Typed tool error (``isError: true`` result content). Same codes as the dashboard API."""
 
     model_config = ConfigDict(
-        frozen=True, extra="forbid", json_schema_serialization_defaults_required=True, title="ToolError"
+        frozen=True,
+        extra="forbid",
+        json_schema_serialization_defaults_required=True,
+        hide_input_in_errors=True,
+        title="ToolError",
     )
 
 

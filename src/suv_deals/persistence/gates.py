@@ -242,15 +242,15 @@ def _text(value: str | None, limit: int, name: str, *, required: bool) -> str | 
     return cleaned or None
 
 
-async def upsert_gate(
+async def upsert_gate(  # noqa: PLR0917 - positional public contract (WP7a API)
     conn: Conn,
     actor: ActorContext,
-    *,
     capability: str,
     dependency: str,
     required_evidence: str,
     status: GateStatus,
     evidence: Mapping[str, Any] | None = None,
+    *,
     owner: str | None = None,
     next_action: str | None = None,
 ) -> GateRecord:

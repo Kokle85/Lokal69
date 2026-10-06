@@ -45,8 +45,8 @@ from suv_deals.domain.enums import (
     EligibilityState,
     EvidenceKind,
     Fuel,
-    Gearbox,
     GateStatus,
+    Gearbox,
     JobState,
     OutboxState,
     Precision,
@@ -54,7 +54,6 @@ from suv_deals.domain.enums import (
     ReviewOutcome,
     ReviewState,
     Role,
-    ScenarioName,
     TaxRuleStatus,
     TechnicalStatus,
     TermsDecision,
@@ -76,6 +75,7 @@ from suv_deals.domain.reviews import (
 )
 from suv_deals.domain.sources import RateBudget
 from suv_deals.domain.tax_engine import (
+    IMPORT_CATEGORIES,
     Classification,
     OriginProof,
     OriginProofStatus,
@@ -164,6 +164,7 @@ from suv_deals.views.operations import (
     TechnicalView,
     TermsView,
 )
+from suv_deals.views.reviews import ReviewPendingOccurrenceData
 from suv_deals.views.valuations import ScenarioView, ThresholdView
 
 REPO = Path(__file__).resolve().parents[2]
@@ -332,7 +333,10 @@ def tax_inputs() -> TaxInputs:
     return TaxInputs(
         declaration_date=date(2026, 11, 2),
         classification=Classification(
-            tariff_code="8703 23", evidence_ids=("e",), approval_status="approved", approved_by="SYNTHETIC owner"
+            tariff_code="8703 23",
+            evidence_ids=("e",),
+            approval_status="approved",
+            approved_by="SYNTHETIC owner",
         ),
         origin_proof=OriginProof(proof_type="none", acceptance_status=OriginProofStatus.NOT_AVAILABLE),
         customs_value=Money.of("100000.00", "MKD"),
@@ -345,10 +349,14 @@ def tax_inputs() -> TaxInputs:
 
 
 def cost_lines(calc: TaxCalculation | None) -> list[CostLine]:
-    from suv_deals.domain.tax_engine import IMPORT_CATEGORIES
-
     lines = [
-        CostLine(category=c, label=f"SYNTHETIC {c.value}", status=CostLineStatus.ESTIMATED, currency="EUR", base=eur(v))
+        CostLine(
+            category=c,
+            label=f"SYNTHETIC {c.value}",
+            status=CostLineStatus.ESTIMATED,
+            currency="EUR",
+            base=eur(v),
+        )
         for c, v in (
             (CostCategory.TRANSPORT, "700.00"),
             (CostCategory.CUSTOMS_BROKER, "250.00"),
@@ -406,7 +414,9 @@ def valuation(calc: TaxCalculation | None, **overrides: Any) -> Valuation:
     values: dict[str, Any] = {
         "listing_revision_id": str(REVISION_ID),
         "screening": ScreeningInput(
-            eligibility=EligibilityState.ELIGIBLE_PRIMARY, profile_key=ProfileKey.PRIMARY, eur_payable=eur("2750")
+            eligibility=EligibilityState.ELIGIBLE_PRIMARY,
+            profile_key=ProfileKey.PRIMARY,
+            eur_payable=eur("2750"),
         ),
         "comparable": ComparableReference(
             comparable_set_id=str(SET_ID),
@@ -501,7 +511,9 @@ def test_envelope_shape_and_rfc3339(listing: NormalizedListing) -> None:
     assert set(dumped) == {"schema_version", "request_id", "as_of", "data", "warnings", "next_cursor"}
     assert dumped["schema_version"] == "1.0"
     assert dumped["as_of"] == "2026-10-06T10:05:00Z"
-    assert dumped["warnings"] == [{"code": "FIXTURE_DATA", "message": warning(WarningCode.FIXTURE_DATA).message}]
+    assert dumped["warnings"] == [
+        {"code": "FIXTURE_DATA", "message": warning(WarningCode.FIXTURE_DATA).message}
+    ]
     assert dumped["next_cursor"] == "opaque.cursor"
     text = env.to_text()
     assert json.loads(text) == dumped
@@ -511,13 +523,13 @@ def test_envelope_shape_and_rfc3339(listing: NormalizedListing) -> None:
 def test_envelope_rejects_bad_metadata(listing: NormalizedListing) -> None:
     data = CandidateListView(items=())
     with pytest.raises(ValidationError):
-        envelope(data, request_id="req-1", as_of=datetime(2026, 10, 6, 10, 0), next_cursor=None)  # noqa: DTZ001
+        envelope(data, request_id="req-1", as_of=datetime(2026, 10, 6, 10, 0), next_cursor=None)
     with pytest.raises(ValidationError):
         envelope(data, request_id="has space", as_of=NOW)
     with pytest.raises(ValidationError):
         envelope(data, request_id="req-1", as_of=NOW, next_cursor="x" * 2049)
     with pytest.raises(ValidationError):
-        ResponseWarning(code="NOT_A_CODE", message="x")  # type: ignore[arg-type]
+        ResponseWarning(code="NOT_A_CODE", message="x")
     with pytest.raises(ValidationError):
         ResponseEnvelope[CandidateListView].model_validate(
             {"request_id": "r", "as_of": NOW, "data": {"items": []}, "unexpected": 1}
@@ -526,7 +538,14 @@ def test_envelope_rejects_bad_metadata(listing: NormalizedListing) -> None:
 
 def test_envelope_schema_requires_every_key() -> None:
     schema = model_schema(envelope_model_for(CandidateListView), mode="serialization")
-    assert set(schema["required"]) == {"schema_version", "request_id", "as_of", "data", "warnings", "next_cursor"}
+    assert set(schema["required"]) == {
+        "schema_version",
+        "request_id",
+        "as_of",
+        "data",
+        "warnings",
+        "next_cursor",
+    }
     assert schema["properties"]["as_of"]["format"] == "date-time"
     assert schema["properties"]["next_cursor"]["maxLength"] == 2048
     assert schema["properties"]["warnings"]["items"]["required"] == ["code", "message"]
@@ -546,8 +565,8 @@ def test_decimal_strings_never_floats() -> None:
         with pytest.raises((ValueError, ArithmeticError)):
             decimal_str(bad)  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
-        AmountView(status="known", amount=2750.5, currency="EUR")  # type: ignore[arg-type]
-    assert AmountView(status="known", amount=Decimal("1.50"), currency="EUR").amount == "1.50"  # type: ignore[arg-type]
+        AmountView(status="known", amount=2750.5, currency="EUR")
+    assert AmountView(status="known", amount=Decimal("1.50"), currency="EUR").amount == "1.50"
 
 
 def test_amount_view_unknown_is_never_zero() -> None:
@@ -627,7 +646,10 @@ def test_candidate_detail_from_domain(listing: NormalizedListing, config: Any) -
         conflicts=listing.conflicts,
         availability_history=(
             AvailabilityPoint(
-                observed_at=listing.observed_at, availability=Availability.AVAILABLE, observed_via="detail", revision_number=3
+                observed_at=listing.observed_at,
+                availability=Availability.AVAILABLE,
+                observed_via="detail",
+                revision_number=3,
             ),
         ),
         price_history=price_history([(3, listing.observed_at, listing.price)]),
@@ -635,7 +657,11 @@ def test_candidate_detail_from_domain(listing: NormalizedListing, config: Any) -
         latest_valuation=None,
         comparable_set=None,
         review_case=ReviewCaseRef(
-            case_id=CASE_ID, case_version=1, state=ReviewState.PENDING, profile=ProfileKey.PRIMARY, queue_label="Primary"
+            case_id=CASE_ID,
+            case_version=1,
+            state=ReviewState.PENDING,
+            profile=ProfileKey.PRIMARY,
+            queue_label="Primary",
         ),
         due_diligence=build_checklist(listing, None, None),
         notes=(note,),
@@ -750,7 +776,9 @@ def test_comparable_set_view_separates_asking_and_sales(listing: NormalizedListi
         obs(EvidenceKind.SELLER_REPORTED_SALE, "8500.00"),
         obs(EvidenceKind.ASKING_PRICE, "7000.00", fuel=Fuel.PETROL),
     ]
-    result = select_comparables(ComparableTarget.from_listing(listing, listing_id=LISTING_ID), candidates, config, NOW)
+    result = select_comparables(
+        ComparableTarget.from_listing(listing, listing_id=LISTING_ID), candidates, config, NOW
+    )
     members = comparable_members(
         result, include_excluded=True, excluded_observations={c.id: c for c in candidates}
     )
@@ -934,9 +962,13 @@ def test_claim_result_and_queue_never_leak_tokens() -> None:
     with pytest.raises(ValidationError):  # superseded cases are never queue items
         ReviewQueueItem.model_validate({**item.model_dump(), "state": ReviewState.SUPERSEDED})
     with pytest.raises(ValidationError):
-        ReviewQueuePage.model_validate({**page.model_dump(), "include_needs_information": False, "items": [
-            {**item.model_dump(), "state": ReviewState.NEEDS_INFORMATION}
-        ]})
+        ReviewQueuePage.model_validate(
+            {
+                **page.model_dump(),
+                "include_needs_information": False,
+                "items": [{**item.model_dump(), "state": ReviewState.NEEDS_INFORMATION}],
+            }
+        )
 
 
 def test_release_and_decision_views() -> None:
@@ -983,7 +1015,11 @@ def test_release_and_decision_views() -> None:
         claim=ClaimStateView(claimed=False, held_by_caller=False, expires_at=None),
         candidate=summary(
             NormalizedListing.model_validate(
-                {k: v for k, v in spec_json_block("### Example normalized revision").items() if k not in ("listing_id", "revision")}
+                {
+                    k: v
+                    for k, v in spec_json_block("### Example normalized revision").items()
+                    if k not in ("listing_id", "revision")
+                }
             ),
             case_id=CASE_ID,
             review_state=ReviewState.WATCH,
@@ -1025,7 +1061,11 @@ def test_note_and_recheck_views() -> None:
     assert "no arbitrary URL" in result.notice
     with pytest.raises(ValidationError):
         RecheckRequestResult(
-            job_id=uuid4(), listing_id=LISTING_ID, state=JobState.SUCCEEDED, deduplicated=False, available_at=None
+            job_id=uuid4(),
+            listing_id=LISTING_ID,
+            state=JobState.SUCCEEDED,
+            deduplicated=False,
+            available_at=None,
         )
 
 
@@ -1059,8 +1099,6 @@ def test_event_payload_matches_notification_builder(is_fixture: bool) -> None:
 
 
 def test_occurrence_data_schema_matches_event_bridge() -> None:
-    from suv_deals.views.reviews import ReviewPendingOccurrenceData
-
     ours = model_schema(ReviewPendingOccurrenceData, mode="validation")
     theirs = event_bridge.payload_schema()
     assert set(ours["properties"]) == set(theirs["properties"])
@@ -1150,7 +1188,9 @@ def test_health_view_contract() -> None:
     view = health()
     dumped = view.model_dump(mode="json")
     assert dumped["ready"] is True and dumped["activation_blockers"][0]["status"] == "blocked"
-    assert health(sources=(coverage(gap_reasons=("see https://status.example/page",)),))  # plain links are fine
+    assert health(
+        sources=(coverage(gap_reasons=("see https://status.example/page",)),)
+    )  # plain links are fine
     with pytest.raises(ValidationError):  # ready must reflect the checks
         health(readiness=(ReadinessCheck(name="database", status="unavailable", detail=None),))
     with pytest.raises(ValidationError):  # active gates are not blockers
@@ -1285,7 +1325,9 @@ def test_overview_counts_must_match() -> None:
 def test_settings_labels(config: Any) -> None:
     view = SettingsView.from_config(config, config_revision=None, can_administer=False, gates=(gate(),))
     profiles = {p.profile_key: p for p in view.profiles}
-    assert profiles[ProfileKey.PRIMARY].enabled and profiles[ProfileKey.PRIMARY].status_label.startswith("ENABLED")
+    assert profiles[ProfileKey.PRIMARY].enabled and profiles[ProfileKey.PRIMARY].status_label.startswith(
+        "ENABLED"
+    )
     manual = profiles[ProfileKey.MANUAL_4000]
     assert manual.enabled is False and manual.optional is True
     assert manual.status_label.startswith("DISABLED") and "EUR 4,000.00" in manual.status_label

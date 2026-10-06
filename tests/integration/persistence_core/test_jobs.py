@@ -104,9 +104,7 @@ async def test_concurrent_schedulers_create_exactly_one_job_per_slot(
     ids = {job_id for job_id, _ in results}
     assert len(ids) == 1 and sum(created for _, created in results) == 1
     assert (
-        seed.scalar(
-            "select count(*) from ops.jobs where workspace_id = %s and job_type = 'discovery'", (ws,)
-        )
+        seed.scalar("select count(*) from ops.jobs where workspace_id = %s and job_type = 'discovery'", (ws,))
         == 1
     )
     # The slot stays taken forever, even after the job finished (spec 9: never scheduled twice).
@@ -171,7 +169,9 @@ async def test_claim_skips_rows_locked_by_another_transaction(
     assert job is not None and job.id == locked_job
 
 
-async def test_claim_filters_job_types_priority_and_due_time(db: Database, world_a: World, seed: Seed) -> None:
+async def test_claim_filters_job_types_priority_and_due_time(
+    db: Database, world_a: World, seed: Seed
+) -> None:
     ws = world_a.workspace_id
     future = seed.scalar("select now() + interval '1 hour'")
     await _enqueue(db, ws, available_at=future, priority=1000)
@@ -331,7 +331,9 @@ async def test_heartbeat_extends_only_the_current_lease(db: Database, world_a: W
     job = await jobs.claim(db, ws, "worker-1", [JobType.VALUATION], 30)
     assert job is not None
     assert await jobs.heartbeat(db, job, 600)
-    remaining = seed.scalar("select lease_expires_at - clock_timestamp() from ops.jobs where id = %s", (job_id,))
+    remaining = seed.scalar(
+        "select lease_expires_at - clock_timestamp() from ops.jobs where id = %s", (job_id,)
+    )
     assert remaining > timedelta(minutes=9)
     forged = job.model_copy(update={"lease_token": uuid.uuid4()})
     assert await jobs.heartbeat(db, forged, 600) is False
@@ -373,7 +375,9 @@ async def test_retry_at_is_never_in_the_past_and_details_are_redacted(
         )
     detail = job_row(seed, job_id)["last_error_detail"]
     assert "abc123secret" not in detail and "eyJabc" not in detail
-    assert seed.scalar("select available_at >= now() - interval '1 second' from ops.jobs where id = %s", (job_id,))
+    assert seed.scalar(
+        "select available_at >= now() - interval '1 second' from ops.jobs where id = %s", (job_id,)
+    )
     with pytest.raises(ValidationFailed):
         async with db.transaction(system(ws)) as conn:
             await jobs.fail_retry(conn, job, "not a code!")
@@ -449,7 +453,9 @@ async def test_unknown_payload_version_blocks_the_job_with_a_typed_blocker(
     async with db.transaction(owner) as conn:
         unblocked = await jobs.unblock(conn, owner, newer, reason="compatible worker deployed")
     assert unblocked.state == JobState.QUEUED
-    upgraded = await jobs.claim(db, ws, "new-worker", [JobType.VALUATION], 60, payload_versions={JobType.VALUATION: {1, 2}})
+    upgraded = await jobs.claim(
+        db, ws, "new-worker", [JobType.VALUATION], 60, payload_versions={JobType.VALUATION: {1, 2}}
+    )
     assert upgraded is not None and upgraded.id == newer and upgraded.payload_version == 2
 
 
@@ -475,9 +481,12 @@ async def test_cancel_only_from_queued_or_retry_wait_and_scoped(
     async with db.transaction(reviewer) as conn:
         cancelled = await jobs.cancel(conn, reviewer, recheck, reason="owner changed mind")
     assert cancelled.state == JobState.CANCELLED and cancelled.completed_at is not None
-    assert seed.scalar(
-        "select count(*) from ops.audit_events where target_id = %s and action = 'job.cancel'", (recheck,)
-    ) == 1
+    assert (
+        seed.scalar(
+            "select count(*) from ops.audit_events where target_id = %s and action = 'job.cancel'", (recheck,)
+        )
+        == 1
+    )
     running = await jobs.claim(db, ws, "w", [JobType.VALUATION], 60)
     assert running is not None
     with pytest.raises(VersionConflict):

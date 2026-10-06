@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
+import psycopg
 import pytest
 from tests.integration.db.helpers import Seed, World, unique
 from tests.integration.persistence_core.support import expire_event_lease, member, system
@@ -85,7 +86,9 @@ async def test_event_is_created_in_the_domain_transaction_and_rolls_back_with_it
     assert len(row["payload_hash"]) == 64
 
 
-async def test_duplicate_business_key_returns_the_existing_event(db: Database, world_a: World, seed: Seed) -> None:
+async def test_duplicate_business_key_returns_the_existing_event(
+    db: Database, world_a: World, seed: Seed
+) -> None:
     ws = world_a.workspace_id
     actor = system(ws)
     dedup = unique("review.pending")
@@ -139,13 +142,15 @@ async def test_fixture_events_are_blocked_and_never_claimed(db: Database, world_
     claimed = await outbox.claim_events(db, ws, "dispatcher-1", 60, 10)
     assert claimed == []
     assert seed.scalar("select state from ops.outbox where id = %s", (contaminated,)) == "blocked"
-    assert seed.scalar("select blocker_code from ops.outbox where id = %s", (contaminated,)) == FIXTURE_BLOCKER
+    assert (
+        seed.scalar("select blocker_code from ops.outbox where id = %s", (contaminated,)) == FIXTURE_BLOCKER
+    )
     # A non-fixture event for a fixture review case cannot even commit (deferred lineage check).
     with pytest.raises(ValidationFailed):
         async with mapped_errors(), db.transaction(actor) as conn:
             await _event(conn, actor, aggregate_id=fixture_case)
     # The fixture row can never be flipped to deliverable.
-    with pytest.raises(Exception, match="SV004|immutable"):
+    with pytest.raises(psycopg.Error, match=r"SV004|immutable"):
         seed.conn.execute("update ops.outbox set is_fixture = false where event_id = %s", (fixture_id,))
 
 
@@ -201,7 +206,11 @@ async def test_successful_delivery_records_receipt_and_separate_timestamps(
             )
     async with db.transaction(actor) as conn:
         await outbox.mark_owner_seen(
-            conn, actor, event_id, evidence_source="provider_read_receipt", seen_at=started + timedelta(seconds=1)
+            conn,
+            actor,
+            event_id,
+            evidence_source="provider_read_receipt",
+            seen_at=started + timedelta(seconds=1),
         )
     assert _state(seed, event_id)["owner_seen_at"] is not None
 
@@ -271,7 +280,9 @@ async def test_timeout_after_acceptance_stays_uncertain_and_is_not_resent(
     ]
 
 
-async def test_reconciliation_without_delivery_allows_a_retry(db: Database, world_a: World, seed: Seed) -> None:
+async def test_reconciliation_without_delivery_allows_a_retry(
+    db: Database, world_a: World, seed: Seed
+) -> None:
     ws = world_a.workspace_id
     actor = system(ws)
     async with db.transaction(actor) as conn:
@@ -352,7 +363,13 @@ async def test_retries_end_in_dead_letter_and_terminal_errors_stay_visible(
         claimed = {e.event_id: e for e in await outbox.claim_events(db, ws, "d", 60, 10)}
         async with db.transaction(actor) as conn:
             await outbox.record_attempt(
-                conn, claimed[event_id], uuid.uuid4(), DeliveryOutcome.RETRYABLE, None, 503, "HTTP_503",
+                conn,
+                claimed[event_id],
+                uuid.uuid4(),
+                DeliveryOutcome.RETRYABLE,
+                None,
+                503,
+                "HTTP_503",
                 provider="mcp_events",
             )
             assert await outbox.mark_retry(conn, claimed[event_id], timedelta(0), "HTTP_503") == expected
@@ -365,7 +382,9 @@ async def test_retries_end_in_dead_letter_and_terminal_errors_stay_visible(
     assert _state(seed, event_id)["completed_at"] is not None
 
 
-async def test_stale_events_are_cancelled_with_an_audit_record(db: Database, world_a: World, seed: Seed) -> None:
+async def test_stale_events_are_cancelled_with_an_audit_record(
+    db: Database, world_a: World, seed: Seed
+) -> None:
     ws = world_a.workspace_id
     actor = system(ws)
     async with db.transaction(actor) as conn:
@@ -381,7 +400,8 @@ async def test_stale_events_are_cancelled_with_an_audit_record(db: Database, wor
     assert _state(seed, leased_id)["state"] == "cancelled"
     assert (
         seed.scalar(
-            "select count(*) from ops.audit_events where workspace_id = %s and action = 'outbox.cancel_stale'",
+            "select count(*) from ops.audit_events"
+            " where workspace_id = %s and action = 'outbox.cancel_stale'",
             (ws,),
         )
         == 2
@@ -398,3 +418,42 @@ async def test_exhausted_waiting_events_are_dead_lettered(db: Database, world_a:
     reaped = await outbox.reap_expired_events(db, ws)
     assert reaped.exhausted == (event_id,)
     assert seed.scalar("select state from ops.outbox where id = %s", (exhausted,)) == "dead_letter"
+
+
+async def test_attempt_provider_defaults_to_the_destination_binding(
+    db: Database, world_a: World, world_b: World, seed: Seed
+) -> None:
+    ws = world_a.workspace_id
+    actor = system(ws)
+    binding = seed.insert_id(
+        "app.destination_bindings", workspace_id=ws, provider="mcp_events", label="Synthetic MCP Events route"
+    )
+    foreign_binding = seed.insert_id(
+        "app.destination_bindings",
+        workspace_id=world_b.workspace_id,
+        provider="slack",
+        label="Synthetic foreign route",
+        external_workspace_id="T0SYNTH",
+        external_channel_id="C0SYNTH",
+    )
+    async with db.transaction(actor) as conn:
+        bound_id, _ = await _event(conn, actor, destination_binding_id=binding)
+        unbound_id, _ = await _event(conn, actor)
+    with pytest.raises(NotFound):  # another workspace's binding is indistinguishable from none
+        async with db.transaction(actor) as conn:
+            await _event(conn, actor, destination_binding_id=foreign_binding)
+    claimed = {e.event_id: e for e in await outbox.claim_events(db, ws, "d", 60, 10)}
+    async with db.transaction(actor) as conn:
+        await outbox.record_attempt(
+            conn, claimed[bound_id], uuid.uuid4(), DeliveryOutcome.ACCEPTED, "r-1", 200
+        )
+        with pytest.raises(ValidationFailed):
+            await outbox.record_attempt(
+                conn, claimed[unbound_id], uuid.uuid4(), DeliveryOutcome.ACCEPTED, "r-2", 200
+            )
+    assert (
+        seed.scalar(
+            "select provider from ops.delivery_attempts where outbox_id = %s", (claimed[bound_id].id,)
+        )
+        == "mcp_events"
+    )

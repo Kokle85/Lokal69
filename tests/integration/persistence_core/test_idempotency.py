@@ -123,9 +123,7 @@ async def test_concurrent_duplicate_waits_and_replays_instead_of_double_submitti
     assert isinstance(first, NewRequest)
     assert second == Replay(result={"decision": "first"})
     assert effects == ["first"]
-    assert seed.scalar(
-        "select count(*) from ops.idempotency_records where idempotency_key = %s", (key,)
-    ) == 1
+    assert seed.scalar("select count(*) from ops.idempotency_records where idempotency_key = %s", (key,)) == 1
 
 
 def _expired_record(seed: Seed, actor: ActorContext, key: str, request_hash: str) -> None:
@@ -177,7 +175,9 @@ async def test_same_key_in_another_workspace_is_refused_without_leaking(
     assert "secret_of_a" not in str(excinfo.value.to_payload())
 
 
-async def test_inputs_are_validated_and_hashes_come_from_the_validated_model(db: Database, world_a: World) -> None:
+async def test_inputs_are_validated_and_hashes_come_from_the_validated_model(
+    db: Database, world_a: World
+) -> None:
     actor = member(world_a.workspace_id, Role.REVIEWER)
     async with db.transaction(actor) as conn:
         with pytest.raises(ValidationFailed):

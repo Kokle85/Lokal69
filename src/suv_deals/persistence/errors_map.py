@@ -77,6 +77,17 @@ class LeaseLost(AppError):
         super().__init__(ErrorCode.VERSION_CONFLICT, message, retryable=False)
 
 
+class TransactionAborted(AppError):
+    """A statement failed earlier and the caller swallowed its error: nothing was committed.
+
+    PostgreSQL turns COMMIT of an aborted transaction into a silent ROLLBACK; the unit-of-work
+    helpers raise this instead so a partial "success" can never be reported.
+    """
+
+    def __init__(self, message: str = "An earlier statement failed; nothing was committed") -> None:
+        super().__init__(ErrorCode.INTERNAL_ERROR, message, retryable=False)
+
+
 class TransientConflict(AppError):
     """Serialization failure, deadlock or lock timeout: retry the whole transaction."""
 

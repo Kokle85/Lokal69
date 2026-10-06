@@ -30,6 +30,8 @@ If `jobs.complete` (or any fenced update) raises `LeaseLost`, the exception leav
 rolls back; a newer lease holder owns the work. Transient failures (serialization, deadlock,
 lock timeout) surface as `TransientConflict`; `retry_transient` re-runs a whole unit of work.
 Database errors, including deferred-constraint failures at COMMIT, are mapped to `AppError`s.
+If the caller swallows a database error and leaves the block normally, PostgreSQL would turn the
+COMMIT into a silent ROLLBACK; the helpers raise `TransactionAborted` instead.
 """
 
 from __future__ import annotations
@@ -41,14 +43,14 @@ from contextlib import asynccontextmanager
 from typing import Final
 from uuid import UUID
 
-from psycopg import sql
+from psycopg import pq, sql
 from pydantic import BaseModel, ConfigDict
 
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import TechnicalStatus
 from suv_deals.errors import AppError, NotFound, SourcePaused
 from suv_deals.persistence.database import Conn, Database, fetch_one
-from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
+from suv_deals.persistence.errors_map import LeaseLost, TransactionAborted, mapped_errors
 from suv_deals.persistence.jobs import ClaimedJob, JobRecord, job_columns
 
 LOCK_ORDER: Final[tuple[str, ...]] = (
@@ -163,6 +165,7 @@ async def unit_of_work(db: Database, actor: ActorContext) -> AsyncIterator[Conn]
     """
     async with mapped_errors(), db.transaction(actor) as conn, mapped_errors():
         yield conn
+        _refuse_aborted(conn)
 
 
 @asynccontextmanager
@@ -172,6 +175,13 @@ async def job_unit_of_work(db: Database, job: ClaimedJob) -> AsyncIterator[tuple
     async with mapped_errors(), db.transaction(workspace_id=job.workspace_id) as conn, mapped_errors():
         locked = await lock_job(conn, job.workspace_id, job.id, job.lease_token, job.lease_owner)
         yield conn, locked
+        _refuse_aborted(conn)
+
+
+def _refuse_aborted(conn: Conn) -> None:
+    """COMMIT of an aborted transaction is a silent ROLLBACK: surface it as an error."""
+    if conn.info.transaction_status == pq.TransactionStatus.INERROR:
+        raise TransactionAborted()
 
 
 async def retry_transient[T](

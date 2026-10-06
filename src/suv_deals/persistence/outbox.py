@@ -484,7 +484,7 @@ async def record_attempt(  # noqa: PLR0917 - positional public contract (WP7a AP
     error: str | None = None,
     uncertain: bool | None = None,
     *,
-    provider: Provider,
+    provider: Provider | None = None,
     error_detail: str | None = None,
     sent_at: datetime | None = None,
 ) -> UUID:
@@ -492,11 +492,14 @@ async def record_attempt(  # noqa: PLR0917 - positional public contract (WP7a AP
 
     ``uncertain`` defaults to ``outcome is UNCERTAIN`` and must agree with it; an uncertain
     attempt carries no receipt. ``attempt_id`` is the stable reference sent to the provider.
+    ``provider`` defaults to the provider of the event's destination binding.
     """
     outcome = DeliveryOutcome(outcome)
     is_uncertain = outcome == DeliveryOutcome.UNCERTAIN if uncertain is None else bool(uncertain)
     if is_uncertain != (outcome == DeliveryOutcome.UNCERTAIN):
         raise ValidationFailed("uncertain must match the uncertain outcome")
+    if provider is None:
+        provider = await _binding_provider(conn, event)
     if provider not in ("slack", "mcp_events"):
         raise ValidationFailed("unknown provider")
     if is_uncertain and receipt is not None:
@@ -527,6 +530,26 @@ async def record_attempt(  # noqa: PLR0917 - positional public contract (WP7a AP
         raise LeaseLost()
     result: UUID = row["id"]
     return result
+
+
+async def _binding_provider(conn: Conn, event: ClaimedEvent) -> Provider:
+    if event.destination_binding_id is None:
+        raise ValidationFailed("provider is required for an event without a destination binding")
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select provider from app.destination_bindings"
+            " where workspace_id = %(workspace_id)s and id = %(id)s",
+            {"workspace_id": event.workspace_id, "id": event.destination_binding_id},
+        )
+    if row is None:
+        raise NotFound("Destination binding not found")
+    value = row["provider"]
+    if value == "slack":
+        return "slack"
+    if value == "mcp_events":
+        return "mcp_events"
+    raise ValidationFailed("unknown provider")  # pragma: no cover - CHECK constraint
 
 
 async def mark_delivered(

@@ -36,10 +36,18 @@ from enum import StrEnum
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from suv_deals.clock import ensure_utc
-from suv_deals.domain.enums import OdometerClaim, Precision, PriceBasis, PriceType, Tristate, VatTreatment
+from suv_deals.domain.enums import (
+    ClaimStatus,
+    OdometerClaim,
+    Precision,
+    PriceBasis,
+    PriceType,
+    Tristate,
+    VatTreatment,
+)
 from suv_deals.domain.listings import MileageOriginal, PartialDate, SourceTimestamp
 from suv_deals.domain.money import Money, exponent
 from suv_deals.errors import ValidationFailed
@@ -132,6 +140,16 @@ class ParseWarning(StrEnum):
     DATE_ONLY_START_OF_DAY_ASSUMED = "DATE_ONLY_START_OF_DAY_ASSUMED"
     DST_GAP_NONEXISTENT_TIME = "DST_GAP_NONEXISTENT_TIME"
     DST_FOLD_AMBIGUOUS_TIME = "DST_FOLD_AMBIGUOUS_TIME"
+    TWO_DIGIT_YEAR_EXPANDED = "TWO_DIGIT_YEAR_EXPANDED"
+    # technical inspection / roadworthiness wording
+    INSPECTION_EXPIRED = "INSPECTION_EXPIRED"
+    INSPECTION_NOT_VALID = "INSPECTION_NOT_VALID"
+    INSPECTION_NOT_FRESH = "INSPECTION_NOT_FRESH"
+    INSPECTION_CONFLICTING = "INSPECTION_CONFLICTING"
+    INSPECTION_CONDITIONAL = "INSPECTION_CONDITIONAL"
+    INSPECTION_DATE_AMBIGUOUS = "INSPECTION_DATE_AMBIGUOUS"
+    INSPECTION_DATE_IMPLAUSIBLE = "INSPECTION_DATE_IMPLAUSIBLE"
+    INSPECTION_EXPIRY_IMPRECISE = "INSPECTION_EXPIRY_IMPRECISE"
 
 
 def locale_for_country(country: str | None) -> Locale | None:
@@ -394,6 +412,7 @@ _PRICE_TYPE_MARKERS: tuple[tuple[re.Pattern[str], PriceType], ...] = (
     (_rx(r"\bexport(?:preis)?\b" + _NOT_POSSIBLE), PriceType.EXPORT_NET),
     (_rx(r"\bh(?:ä|ae)ndlerpreis\b"), PriceType.EXPORT_NET),
     (_rx(r"\b(?:export\s+price|prezzo\s+export)\b"), PriceType.EXPORT_NET),
+    (_rx(r"\bprix\s+(?:[àa]\s+l['\u2019]\s*)?export\b"), PriceType.EXPORT_NET),  # Swiss romandie
     (_rx(_NOT_NEGATED + r"\bbastler\w*"), PriceType.PARTS_OR_DAMAGED),
     (_rx(_NOT_NEGATED + r"\bdefekt\w*"), PriceType.PARTS_OR_DAMAGED),
     (
@@ -426,7 +445,8 @@ _PRICE_TYPE_PRECEDENCE: tuple[PriceType, ...] = (
     PriceType.EXPORT_NET,
 )
 
-_VAT_WORD = r"(?:mwst|ust|mehrwertsteuer|iva|vat)"
+# "MWST" (Swiss spelling) is matched case-insensitively as "mwst"; "TVA" is the Swiss-French form.
+_VAT_WORD = r"(?:mwst|ust|mehrwertsteuer|iva|vat|tva)"
 _RATE_NUMBER = r"\d{1,2}(?:[.,]\d{1,2})?"
 _RATE = rf"(?:{_RATE_NUMBER}\s*%\s*)?"
 # "zzgl. gesetzl. MwSt." / "inkl. gesetzlicher MwSt." / "inkl. ges. MwSt." are the usual DE forms.
@@ -442,6 +462,7 @@ _NET_MARKERS: tuple[re.Pattern[str], ...] = (
     _rx(r"\+\s*vat\b"),  # no leading \b: '+' follows a space, which is not a word boundary
     _rx(r"\biva\s+esclusa\b|\besclusa\s+iva\b|\boltre\s+iva\b"),
     _rx(r"\bplus\s+vat\b"),
+    _rx(r"\bhors\s+tva\b|\btva\s+en\s+sus\b|\+\s*tva\b"),
 )
 _VAT_SHOWN_MARKERS: tuple[re.Pattern[str], ...] = (
     _rx(r"\b(?:mwst|ust|mehrwertsteuer)\.?\s*ausweisbar\b"),
@@ -452,6 +473,7 @@ _GROSS_MARKERS: tuple[re.Pattern[str], ...] = (
     _rx(rf"\binkl\.?\s*{_RATE}{_LEGAL}{_RATE}{_VAT_WORD}\b\.?"),
     _rx(rf"\bincl\.?\s*{_RATE}{_VAT_WORD}\b\.?"),
     _rx(rf"\biva\s+{_RATE}(?:inclusa|compresa)\b"),
+    _rx(rf"\btva\s+{_RATE}(?:incluse|comprise)\b|\bttc\b"),
     _rx(r"\bbrutto\b"),
     _rx(r"\bgross\b"),
 )
@@ -476,6 +498,7 @@ _NEGOTIABLE_NO: tuple[re.Pattern[str], ...] = (
     _rx(r"\bprezzo\s+fisso\b"),
     _rx(r"\bfixed\s+price\b"),
     _rx(r"\bnon[-\s]negotiable\b|\bnot\s+negotiable\b"),
+    _rx(r"\bprix\s+ferme\b|\bnon\s+n[ée]gociable\b"),
 )
 _NEGOTIABLE_YES: tuple[re.Pattern[str], ...] = (
     _rx(r"\bVB\b|\bVHB\b|\bONO\b", 0),  # case-sensitive abbreviations
@@ -483,6 +506,7 @@ _NEGOTIABLE_YES: tuple[re.Pattern[str], ...] = (
     _rx(r"\bverhandelbar\b"),
     _rx(r"\btrattabil[ei]\b"),
     _rx(r"\bnegotiable\b"),
+    _rx(r"\bn[ée]gociable\b|(?<![^\W\d_])[àa]\s+(?:discuter|d[ée]battre)\b"),
 )
 # A percentage is a *VAT* rate only when it is attached to VAT wording: "19% MwSt.", "22 % IVA",
 # "MwSt. 19%", "IVA 22% inclusa", "MwSt. ausweisbar 19%". A "0% Finanzierung" or "3% Zinsen" next
@@ -1309,4 +1333,436 @@ def parse_source_datetime(text: str | None, source_tz: str, as_of: datetime) -> 
         ),
         time_precision=time_precision if value is not None else None,
         warnings=tuple(warnings),
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# Technical inspection and roadworthiness wording (spec 7 documentation, spec 19 due diligence)
+# ---------------------------------------------------------------------------------------------
+
+InspectionKind = Literal["hu_tuv", "mfk", "revisione", "unknown"]
+_RuleKind = Literal["hu_tuv", "mfk", "revisione", "collaudo"]
+_Role = Literal["expired", "not_valid", "not_fresh", "expiry", "last", "bare", "fresh"]
+
+# ENGINEERING DEFAULTS (sanity bounds, not business rules).
+MAX_INSPECTION_TEXT_LENGTH = 200_000
+INSPECTION_YEARS_AHEAD = 5  # no periodic inspection is valid further ahead than this
+INSPECTION_YEARS_BACK = 30
+_MAX_INSPECTION_EVIDENCE = 8
+_EVIDENCE_LIMIT = 120
+_CONDITION_WINDOW = 40
+_MASK = "\x00"  # masked spans never match again and never join neighbouring words
+
+_FR_MONTHS: dict[str, int] = {
+    "janvier": 1,
+    "janv": 1,
+    "février": 2,
+    "fevrier": 2,
+    "févr": 2,
+    "fevr": 2,
+    "mars": 3,
+    "avril": 4,
+    "avr": 4,
+    "juin": 6,
+    "juillet": 7,
+    "juil": 7,
+    "août": 8,
+    "aout": 8,
+    "septembre": 9,
+    "octobre": 10,
+    "novembre": 11,
+    "décembre": 12,
+    "decembre": 12,
+    "déc": 12,
+}
+_INSPECTION_MONTHS: dict[str, int] = {**_MONTH_NAMES, **_FR_MONTHS}
+_MONTH_ALT = "|".join(sorted((re.escape(m) for m in _INSPECTION_MONTHS), key=len, reverse=True))
+# A date right after inspection wording. Only digits and real month names: never an arbitrary word.
+_IDATE = (
+    r"(?P<date>"
+    r"[0-9]{1,2}\.[0-9]{1,2}\.(?:[0-9]{4}|[0-9]{2})"
+    r"|[0-9]{1,2}/[0-9]{1,2}/(?:[0-9]{4}|[0-9]{2})"
+    r"|[0-9]{4}-[0-9]{1,2}(?:-[0-9]{1,2})?"
+    r"|[0-9]{1,2} ?[./-] ?(?:[0-9]{4}|[0-9]{2})"
+    rf"|(?:{_MONTH_ALT})\.? [0-9]{{4}}"
+    r"|(?:19|20)[0-9]{2}"
+    r")(?![0-9])"
+)
+_ID_DMY = re.compile(r"([0-9]{1,2})[./]([0-9]{1,2})[./]([0-9]{4}|[0-9]{2})")
+_ID_ISO = re.compile(r"([0-9]{4})-([0-9]{1,2})(?:-([0-9]{1,2}))?")
+_ID_MY = re.compile(r"([0-9]{1,2}) ?[./-] ?([0-9]{4}|[0-9]{2})")
+_ID_NAME = re.compile(r"([^\W\d_]+)\.? ([0-9]{4})")
+_ID_YEAR = re.compile(r"[0-9]{4}")
+
+_HU = (
+    r"(?:hu(?: ?(?:/|\+|&|und|u\.) ?au)?|t(?:ü|ue|u)v(?: ?(?:/|\+|&|und|u\.) ?au)?"
+    r"|hauptuntersuchung)"
+)
+_MFK = r"(?:mfk|motorfahrzeugkontrolle)"
+_EXPD = r"expertis(?:é|ée|és|ées|ee|ees)\b"  # participle only; the noun "expertise" is not a claim
+_NOT_DATE_NEXT = r"(?! ?(?:im |am |ab |: ?)?[0-9])"
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectionRule:
+    role: _Role
+    kind: _RuleKind
+    pattern: re.Pattern[str]
+
+
+def _irule(role: _Role, kind: _RuleKind, pattern: str) -> _InspectionRule:
+    return _InspectionRule(role, kind, re.compile(pattern, re.IGNORECASE))
+
+
+# Applied in this order; every match is masked before the next rule runs, so a negated or dated
+# statement ("nicht ab MFK", "ab MFK 03.2025") can never be re-read as a bare positive one.
+_INSPECTION_RULES: tuple[_InspectionRule, ...] = (
+    # Explicitly expired.
+    _irule("expired", "hu_tuv", rf"\b{_HU} ?(?:ist )?(?:abgelaufen|[üu]berf[äa]llig|[üu]berzogen)\b"),
+    _irule("expired", "hu_tuv", rf"\b{_HU} ?(?:ist )?f[äa]llig\b{_NOT_DATE_NEXT}"),
+    _irule("expired", "mfk", rf"\b{_MFK} ?(?:ist )?(?:abgelaufen|[üu]berf[äa]llig)\b"),
+    _irule("expired", "revisione", r"\brevisione (?:è |e )?scadut[ao]\b|\bscadut[ao] (?:la )?revisione\b"),
+    _irule("expired", "collaudo", r"\bcollaudo (?:è |e )?scaduto\b"),
+    _irule("expired", "mfk", r"\bexpertise (?:est )?(?:[ée]chue|expir[ée]e|p[ée]rim[ée]e|d[ée]pass[ée]e)\b"),
+    # No valid inspection (DE/IT: the inspection is a hard validity date).
+    _irule(
+        "not_valid",
+        "hu_tuv",
+        rf"\b(?:ohne|kein(?:e[nr]?)?) (?:g[üu]ltige[nr]? )?{_HU}\b(?![-\u2013][^\W\d_])",
+    ),
+    _irule("not_valid", "revisione", r"\b(?:senza|non) (?:la )?revision(?:e|at[ao])\b"),
+    _irule(
+        "not_valid",
+        "revisione",
+        r"\bda revisionare\b|\brevisione (?:da fare|non (?:fatta|effettuata|valida))\b",
+    ),
+    # Not freshly inspected for the sale (CH/FR: says nothing positive about current validity).
+    _irule("not_fresh", "mfk", rf"\bvor (?:der )?{_MFK}\b"),
+    _irule("not_fresh", "mfk", rf"\bnicht (?:frisch )?ab (?:der )?{_MFK}\b"),
+    _irule("not_fresh", "mfk", rf"\b(?:ohne|keine) (?:frische )?{_MFK}\b"),
+    _irule("not_fresh", "mfk", rf"\bmuss (?:noch )?(?:zur|an die|in die) {_MFK}\b"),
+    _irule("not_fresh", "mfk", r"\bnicht (?:frisch )?vorgef[üu]hrt\b"),
+    _irule("not_fresh", "mfk", rf"\b{_MFK} ?(?:ist )?f[äa]llig\b{_NOT_DATE_NEXT}"),
+    _irule("not_fresh", "collaudo", r"\b(?:senza|non) (?:il )?collaud(?:o|at[ao])\b|\bda collaudare\b"),
+    _irule("not_fresh", "mfk", rf"\bsans (?:l['\u2019] ?)?expertise\b|\b(?:non|pas) {_EXPD}"),
+    _irule("not_fresh", "mfk", r"\b[àa] expertiser\b|\bavant (?:l['\u2019] ?)?expertise\b"),
+    # Stated expiry / next due date.
+    _irule(
+        "expiry",
+        "hu_tuv",
+        rf"\b{_HU} ?(?P<fresh>(?:neu|frisch),? )?"
+        rf"(?:(?:g[üu]ltig )?bis (?:ende |zum )?|f[äa]llig (?:im |am |ab )?|: ?)?{_IDATE}",
+    ),
+    _irule("expiry", "mfk", rf"\b{_MFK} (?:g[üu]ltig )?bis (?:ende |zum )?{_IDATE}"),
+    _irule("expiry", "mfk", rf"\bn[äa]chste {_MFK} ?(?:im |am |: ?)?{_IDATE}"),
+    _irule("expiry", "mfk", rf"\b{_MFK} f[äa]llig (?:im |am |ab |: ?)?{_IDATE}"),
+    _irule(
+        "expiry",
+        "revisione",
+        r"\brevision(?:e|at[ao]) (?:valida )?"
+        r"(?:fino (?:all['\u2019]|al|a) ?|(?:in )?scadenza (?:il |a |nel )?|scade (?:il |a |nel )?)"
+        rf"(?:: ?)?{_IDATE}",
+    ),
+    _irule("expiry", "revisione", rf"\bscadenza (?:della )?revisione ?(?:: ?|il |a |nel )?{_IDATE}"),
+    _irule("expiry", "revisione", rf"\bprossima revisione ?(?:: ?|il |a |nel |entro (?:il )?)?{_IDATE}"),
+    _irule("expiry", "mfk", rf"\bprochaine expertise ?(?:: ?|en |le |au |pour )?{_IDATE}"),
+    _irule("expiry", "mfk", rf"\bexpertise valable jusqu['\u2019] ?(?:au |à |a |en |fin )?{_IDATE}"),
+    # Date of the last inspection (not an expiry).
+    _irule("last", "hu_tuv", rf"\b(?:letzte|zuletzt) {_HU} ?(?:am |im |vom |: ?)?{_IDATE}"),
+    _irule("last", "mfk", rf"\b(?:letzte|zuletzt) {_MFK} ?(?:im |am |vom |: ?)?{_IDATE}"),
+    _irule("last", "mfk", rf"\b(?:frisch )?ab (?:der )?{_MFK} (?:vom |am |im |: ?)?{_IDATE}"),
+    _irule("last", "mfk", rf"\b{_MFK} (?:vom|am|gemacht|erledigt|bestanden) (?:am |im )?{_IDATE}"),
+    _irule("last", "mfk", rf"\b(?:frisch )?vorgef[üu]hrt (?:am|im) {_IDATE}"),
+    _irule("last", "revisione", rf"\bultima revisione ?(?:: ?|il |a |nel |in |del )?{_IDATE}"),
+    _irule("last", "revisione", rf"\brevisione (?:fatta|effettuata|eseguita) (?:il |a |nel |in )?{_IDATE}"),
+    _irule("last", "revisione", rf"\b(?:appena )?revisionat[ao] (?:il |a |nel |in )?{_IDATE}"),
+    _irule("last", "collaudo", rf"\bultimo collaudo ?(?:: ?|il |nel |del )?{_IDATE}"),
+    _irule("last", "collaudo", rf"\b(?:appena )?collaudat[ao] (?:il |a |nel |in )?{_IDATE}"),
+    _irule("last", "mfk", rf"\bderni[èe]re expertise ?(?:: ?|en |le |du |au |de )?{_IDATE}"),
+    _irule("last", "mfk", rf"\bexpertise (?:du|de|le|en) {_IDATE}"),
+    _irule("last", "mfk", rf"\b(?:fra[îi]chement )?{_EXPD} (?:le |en |du |au |depuis )?{_IDATE}"),
+    # A date next to bare MFK/revisione/expertise/collaudo wording: last inspection or next due?
+    _irule("bare", "mfk", rf"\b{_MFK} ?:? ?{_IDATE}"),
+    _irule("bare", "revisione", rf"\brevisione ?:? ?{_IDATE}"),
+    _irule("bare", "collaudo", rf"\bcollaudo ?:? ?{_IDATE}"),
+    _irule("bare", "mfk", rf"\bexpertise ?:? ?{_IDATE}"),
+    # Freshly inspected (seller wording; positive only when not conditional).
+    _irule("fresh", "hu_tuv", rf"\b{_HU} ?[:\-\u2013]? ?(?:neu|frisch)\b"),
+    _irule("fresh", "hu_tuv", rf"\b(?:neue[rn]?|frische[rn]?) {_HU}\b"),
+    _irule("fresh", "mfk", rf"\bab (?:der )?{_MFK}\b"),
+    _irule("fresh", "mfk", rf"\b{_MFK} ?[:\-\u2013]? ?(?:neu|frisch)\b|\b(?:neue|frische) {_MFK}\b"),
+    _irule("fresh", "mfk", r"\bfrisch vorgef[üu]hrt\b"),
+    _irule("fresh", "revisione", r"\b(?:appena )?revisionat[ao]\b"),
+    _irule("fresh", "revisione", r"\brevisione (?:appena )?(?:fatta|effettuata|nuova)\b"),
+    _irule("fresh", "collaudo", r"\b(?:appena )?collaudat[ao]\b|\bcollaudo (?:nuovo|fatto|appena fatto)\b"),
+    _irule("fresh", "mfk", rf"\b(?:fra[îi]chement )?{_EXPD}"),
+    _irule("fresh", "mfk", r"\bexpertise (?:du jour|r[ée]cente|neuve|fra[îi]che)\b"),
+)
+
+# Wording that makes a fresh-inspection statement an offer instead of a fact
+# ("ab MFK auf Wunsch", "TÜV neu gegen Aufpreis", "MFK + CHF 500", "revisione su richiesta").
+_INSPECTION_CONDITIONAL = re.compile(
+    r"\bauf wunsch\b|\baufpreis\b|\bzuschlag\b|\bnach absprache\b|\bm(?:ö|oe?)glich\b|\boptional\b"
+    r"|\bwahlweise\b|\bfalls gew[üu]nscht\b|\b(?:su|a) richiesta\b|\bsupplemento\b|\bpossibile\b"
+    r"|\bsur demande\b|\ben option\b|\bsuppl[ée]ment\b|\bpossible\b|\bon request\b"
+    r"|\+ ?(?:chf|sfr|fr\.|eur\b|€)",
+    re.IGNORECASE,
+)
+_CLAUSE_BREAK = re.compile(r"[!?;|\u2022\u00b7]")
+
+
+class InspectionParse(BaseModel):
+    """Technical-inspection wording on a listing page. Seller statements only, never verified.
+
+    ``roadworthy_claim`` answers "does the seller's wording claim a valid/fresh inspection?":
+    ``seller_claimed`` (fresh-inspection wording or a stated expiry not before ``as_of``),
+    ``seller_denied`` (explicitly expired, "no valid inspection", or a stated expiry before
+    ``as_of``), ``conflicting`` (both) or ``unknown``. It is never ``verified``: only an
+    owner-held report can verify an inspection (spec 19).
+    """
+
+    model_config = _FROZEN
+
+    roadworthy_claim: ClaimStatus = ClaimStatus.UNKNOWN
+    inspection_expiry: PartialDate = PartialDate()
+    last_inspection: PartialDate = PartialDate()
+    inspection_kind: InspectionKind = "unknown"
+    fresh_inspection: bool = False
+    evidence: tuple[str, ...] = Field(default=(), max_length=_MAX_INSPECTION_EVIDENCE)
+    warnings: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _never_verified(self) -> InspectionParse:
+        if self.roadworthy_claim == ClaimStatus.VERIFIED:
+            raise ValueError("seller inspection wording is never a verified inspection result")
+        if self.fresh_inspection and self.roadworthy_claim != ClaimStatus.SELLER_CLAIMED:
+            raise ValueError("fresh_inspection requires a positive seller claim")
+        return self
+
+
+def _expand_year(digits: str, as_of: date, warnings: list[str]) -> int:
+    """'27' -> 2027 relative to ``as_of``: the century that keeps the year at most
+    ``INSPECTION_YEARS_AHEAD`` years ahead (the plausibility window is checked by the caller)."""
+    if len(digits) == 4:
+        return int(digits)
+    warnings.append(ParseWarning.TWO_DIGIT_YEAR_EXPANDED)
+    year = as_of.year // 100 * 100 + int(digits)
+    if year > as_of.year + INSPECTION_YEARS_AHEAD:
+        year -= 100
+    return year
+
+
+def _inspection_date(raw: str, as_of: date) -> tuple[PartialDate | None, list[str]]:
+    """Parse the date captured by ``_IDATE`` at its stated precision (never inventing a day)."""
+    warnings: list[str] = []
+    text = raw.strip()
+    month: int | None = None
+    day: int | None = None
+    if (m := _ID_DMY.fullmatch(text)) is not None:
+        day, month, year = int(m[1]), int(m[2]), _expand_year(m[3], as_of, warnings)
+    elif (m := _ID_ISO.fullmatch(text)) is not None:
+        year, month, day = int(m[1]), int(m[2]), int(m[3]) if m[3] else None
+    elif (m := _ID_MY.fullmatch(text)) is not None:
+        month, year = int(m[1]), _expand_year(m[2], as_of, warnings)
+    elif (m := _ID_NAME.fullmatch(text)) is not None:
+        month, year = _INSPECTION_MONTHS.get(m[1].lower()), int(m[2])
+    elif _ID_YEAR.fullmatch(text) is not None:
+        year = int(text)
+    else:
+        return None, [*warnings, ParseWarning.DATE_UNPARSEABLE]
+    if month is not None and not 1 <= month <= 12:
+        return None, [*warnings, ParseWarning.INVALID_DATE]
+    if day is not None:
+        try:
+            date(year, month or 0, day)
+        except ValueError:
+            return None, [*warnings, ParseWarning.INVALID_DATE]
+    if not as_of.year - INSPECTION_YEARS_BACK <= year <= as_of.year + INSPECTION_YEARS_AHEAD:
+        return None, [*warnings, ParseWarning.INSPECTION_DATE_IMPLAUSIBLE]
+    if day is not None and month is not None:
+        return PartialDate(value=f"{year:04d}-{month:02d}-{day:02d}", precision=Precision.DAY), warnings
+    if month is not None:
+        return PartialDate(value=f"{year:04d}-{month:02d}", precision=Precision.MONTH), warnings
+    return PartialDate(value=f"{year:04d}", precision=Precision.YEAR), warnings
+
+
+def _compare_to(value: PartialDate, as_of: date) -> int | None:
+    """-1 if ``value`` lies wholly before ``as_of``, 1 if wholly after, 0 if it contains it;
+    ``None`` if unknown. Month precision means the whole month (an inspection due "05/2027" is
+    valid through May 2027)."""
+    if value.value is None or value.year is None:
+        return None
+    if value.precision == Precision.DAY:
+        stated = date.fromisoformat(value.value)
+        return (stated > as_of) - (stated < as_of)
+    if value.precision == Precision.MONTH:
+        key, ref = (value.year, value.month or 0), (as_of.year, as_of.month)
+    else:
+        key, ref = (value.year, 0), (as_of.year, 0)
+    return (key > ref) - (key < ref)
+
+
+def _is_conditional(text: str, start: int, end: int) -> bool:
+    before = text[max(0, start - _CONDITION_WINDOW) : start]
+    after = text[end : end + _CONDITION_WINDOW]
+    breaks = list(_CLAUSE_BREAK.finditer(before))
+    if breaks:
+        before = before[breaks[-1].end() :]
+    first = _CLAUSE_BREAK.search(after)
+    if first is not None:
+        after = after[: first.start()]
+    return _INSPECTION_CONDITIONAL.search(f"{before} {after}") is not None
+
+
+def _as_of_date(as_of: date) -> date:
+    if isinstance(as_of, datetime):
+        try:
+            return ensure_utc(as_of).date()
+        except ValueError as exc:
+            raise ValidationFailed("as_of must be timezone-aware") from exc
+    return as_of
+
+
+def parse_inspection(text: str | None, locale: Locale | None, as_of: date) -> InspectionParse:
+    """Read technical-inspection (roadworthiness) wording from listing text.
+
+    Recognised (case-insensitive, whitespace-normalised; all SELLER wording, never verified):
+
+    - DE HU/TÜV (``hu_tuv``): ``'HU/AU neu'``, ``'TÜV neu'``, ``'neuer TÜV'`` (fresh);
+      ``'HU bis 05/2027'``, ``'TÜV 05/2027'``, ``'HU 05/27'``, ``'TÜV: 05.2027'`` (expiry: in DE a
+      date next to HU/TÜV is the due date); ``'TÜV abgelaufen'``, ``'TÜV fällig'`` (expired);
+      ``'ohne TÜV'``, ``'kein TÜV'`` (no valid inspection -> ``seller_denied``).
+    - CH MFK (``mfk``): ``'ab MFK'``, ``'frisch ab MFK'``, ``'MFK neu'``, ``'frisch vorgeführt'``
+      (fresh); ``'MFK bis 06/2026'``, ``'nächste MFK 06/2026'`` (expiry); ``'letzte MFK 2025'``,
+      ``'ab MFK 03.2025'`` (last inspection, not an expiry); ``'vor MFK'``, ``'nicht ab MFK'``,
+      ``'ohne MFK'``, ``'muss zur MFK'`` (not freshly inspected: never positive; validity unknown,
+      ``INSPECTION_NOT_FRESH``); ``'MFK abgelaufen'`` (expired). A bare ``'MFK 05.2024'`` is
+      ambiguous (Swiss ads use it for the last inspection) and yields no date
+      (``INSPECTION_DATE_AMBIGUOUS``).
+    - IT revisione (``revisione``): ``'revisionata'``, ``'revisione fatta'`` (fresh);
+      ``'revisione fino a 05/2027'``, ``'scadenza revisione 05/2027'`` (expiry); ``'ultima
+      revisione 2025'`` (last); ``'revisione scaduta'`` (expired); ``'senza revisione'``,
+      ``'da revisionare'`` (no valid inspection). Ticino ``'collaudata'``/``'senza collaudo'`` are
+      MFK wording when ``locale='ch'`` and revisione wording otherwise.
+    - FR (Swiss romandie, ``mfk``): ``'expertisé(e)'``, ``'expertise du jour'`` (fresh);
+      ``'prochaine expertise 06/2027'`` (expiry); ``'dernière expertise 2025'``, ``'expertisée le
+      03.2025'`` (last); ``'sans expertise'``, ``'non expertisé'``, ``'à expertiser'`` (not fresh).
+
+    Rules: negated, expired and dated statements are matched first and masked, so they can never
+    be re-read as a bare positive. A stated expiry before ``as_of`` (month precision: before the
+    ``as_of`` month) is ``INSPECTION_EXPIRED`` and never positive; a year-only expiry in the
+    ``as_of`` year is ``INSPECTION_EXPIRY_IMPRECISE`` and not positive. Fresh wording next to
+    "auf Wunsch"/"gegen Aufpreis"/"+ CHF"/"su richiesta"/"sur demande" is an offer, not a fact
+    (``INSPECTION_CONDITIONAL``, not positive). Two-digit years map to the century that keeps the
+    year at most ``INSPECTION_YEARS_AHEAD`` years after ``as_of`` (``TWO_DIGIT_YEAR_EXPANDED``);
+    years outside ``as_of - 30 .. as_of + 5`` are ``INSPECTION_DATE_IMPLAUSIBLE``. Different
+    stated expiries are ``MULTIPLE_DATES`` (no expiry). Positive and negative wording together is
+    ``conflicting``. ``locale`` only decides the kind of Ticino ``collaudo`` wording.
+    """
+    as_day = _as_of_date(as_of)
+    if text is None or not text.strip():
+        return InspectionParse(warnings=(ParseWarning.EMPTY_INPUT,))
+    if len(text) > MAX_INSPECTION_TEXT_LENGTH:
+        return InspectionParse(warnings=(ParseWarning.INPUT_TOO_LONG,))
+    cleaned = re.sub(r"\s+", " ", _clean(text))
+    work = cleaned
+    warnings: list[str] = []
+    evidence: list[str] = []
+    kinds: set[InspectionKind] = set()
+    expiries: list[PartialDate] = []
+    lasts: list[PartialDate] = []
+    expired_wording = not_valid = not_fresh = ambiguous = conditional = False
+    fresh = False
+
+    for rule in _INSPECTION_RULES:
+        matches = list(rule.pattern.finditer(work))
+        if not matches:
+            continue
+        kind: InspectionKind = (
+            rule.kind if rule.kind != "collaudo" else "mfk" if locale == "ch" else "revisione"
+        )
+        for match in matches:
+            kinds.add(kind)
+            if rule.role == "fresh":
+                if _is_conditional(cleaned, match.start(), match.end()):
+                    conditional = True
+                else:
+                    fresh = True
+            elif rule.role == "expired":
+                expired_wording = True
+            elif rule.role == "not_valid":
+                not_valid = True
+            elif rule.role == "not_fresh":
+                not_fresh = True
+            elif rule.role == "bare":
+                ambiguous = True
+            else:  # expiry / last: a dated statement
+                parsed, date_warnings = _inspection_date(match.group("date"), as_day)
+                warnings.extend(date_warnings)
+                if parsed is not None:
+                    (expiries if rule.role == "expiry" else lasts).append(parsed)
+                if rule.role == "expiry" and match.groupdict().get("fresh"):
+                    fresh = True
+            snippet = match.group(0).strip()
+            if snippet and len(evidence) < _MAX_INSPECTION_EVIDENCE and snippet not in evidence:
+                evidence.append(snippet[:_EVIDENCE_LIMIT])
+        for match in reversed(matches):
+            work = work[: match.start()] + _MASK * (match.end() - match.start()) + work[match.end() :]
+
+    expiry = PartialDate()
+    distinct_expiries = list(dict.fromkeys(expiries))
+    if len(distinct_expiries) > 1:
+        warnings.append(ParseWarning.MULTIPLE_DATES)
+    elif distinct_expiries:
+        expiry = distinct_expiries[0]
+    expiry_cmp = _compare_to(expiry, as_day)
+    expiry_past = expiry_cmp is not None and expiry_cmp < 0
+    expiry_valid = expiry_cmp is not None and (
+        expiry_cmp > 0 or (expiry_cmp == 0 and expiry.precision != Precision.YEAR)
+    )
+    if expiry_cmp == 0 and expiry.precision == Precision.YEAR:
+        warnings.append(ParseWarning.INSPECTION_EXPIRY_IMPRECISE)
+
+    last = PartialDate()
+    distinct_lasts = list(dict.fromkeys(lasts))
+    if len(distinct_lasts) > 1:
+        warnings.append(ParseWarning.MULTIPLE_DATES)
+    elif distinct_lasts:
+        last_cmp = _compare_to(distinct_lasts[0], as_day)
+        if last_cmp is not None and last_cmp > 0:
+            warnings.append(ParseWarning.FUTURE_DATE)
+        else:
+            last = distinct_lasts[0]
+
+    if expired_wording or expiry_past:
+        warnings.append(ParseWarning.INSPECTION_EXPIRED)
+    if not_valid:
+        warnings.append(ParseWarning.INSPECTION_NOT_VALID)
+    if not_fresh:
+        warnings.append(ParseWarning.INSPECTION_NOT_FRESH)
+    if ambiguous:
+        warnings.append(ParseWarning.INSPECTION_DATE_AMBIGUOUS)
+    if conditional:
+        warnings.append(ParseWarning.INSPECTION_CONDITIONAL)
+
+    positive = fresh or expiry_valid
+    negative = expired_wording or not_valid or expiry_past
+    claim: ClaimStatus
+    if positive and (negative or not_fresh):
+        claim = ClaimStatus.CONFLICTING
+        warnings.append(ParseWarning.INSPECTION_CONFLICTING)
+    elif negative:
+        claim = ClaimStatus.SELLER_DENIED
+    elif positive:
+        claim = ClaimStatus.SELLER_CLAIMED
+    else:
+        claim = ClaimStatus.UNKNOWN
+    return InspectionParse(
+        roadworthy_claim=claim,
+        inspection_expiry=expiry,
+        last_inspection=last,
+        inspection_kind=next(iter(kinds)) if len(kinds) == 1 else "unknown",
+        fresh_inspection=fresh and claim == ClaimStatus.SELLER_CLAIMED,
+        evidence=tuple(evidence),
+        warnings=tuple(dict.fromkeys(warnings)),
     )

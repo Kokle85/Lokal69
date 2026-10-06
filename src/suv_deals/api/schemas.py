@@ -103,7 +103,7 @@ def _to_input[InputT: ToolInput](model: type[InputT], data: Mapping[str, Any], n
 class ApiQuery(BaseModel):
     """Query-string parameters (strings parsed into types); unknown parameters are refused."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
 
 class CandidateListQuery(ApiQuery):

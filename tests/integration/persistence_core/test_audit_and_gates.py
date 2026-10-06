@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 
+import psycopg
 import pytest
 from tests.integration.db.helpers import Seed, World
 from tests.integration.persistence_core.support import member, system
@@ -60,7 +61,7 @@ async def test_audit_events_are_redacted_and_bound_to_the_verified_actor(
         assert leaked not in reason and leaked not in metadata
     assert '"outcome": "succeeded"' in metadata and "SYNTHETIC" in metadata
     # The trail is append-only for every role (SV001), and suv_backend has no UPDATE grant at all.
-    with pytest.raises(Exception, match="append-only|SV001"):
+    with pytest.raises(psycopg.Error, match=r"append-only|SV001"):
         seed.conn.execute("update ops.audit_events set reason = 'x' where id = %s", (audit_id,))
     with pytest.raises(Forbidden):
         async with mapped_errors(), db.transaction(actor) as conn:
@@ -120,7 +121,8 @@ async def test_spec_gates_are_seeded_honestly_and_never_overwritten(
     assert [g.capability for g in listed] == sorted(g.capability for g in listed)
     assert (
         seed.scalar(
-            "select count(*) from ops.audit_events where workspace_id = %s and action like 'activation_gate.%%'",
+            "select count(*) from ops.audit_events"
+            " where workspace_id = %s and action like 'activation_gate.%%'",
             (ws,),
         )
         == 15

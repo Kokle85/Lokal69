@@ -148,11 +148,14 @@ async def test_access_blocked_is_persisted_and_recommends_a_route_pause(
     owner = member(ws, Role.OWNER)
     cleared = await gate.clear_access_block(owner, HOST, reason="permitted access restored by the provider")
     assert cleared.access_blocked_at is None
-    assert seed.scalar(
-        "select count(*) from ops.audit_events where workspace_id = %s"
-        " and action = 'host_budget.clear_access_block'",
-        (ws,),
-    ) == 1
+    assert (
+        seed.scalar(
+            "select count(*) from ops.audit_events where workspace_id = %s"
+            " and action = 'host_budget.clear_access_block'",
+            (ws,),
+        )
+        == 1
+    )
     probe = await gate.acquire(_request())
     assert isinstance(probe, Allow) and probe.probe
     assert _row(seed, ws)["circuit_state"] == "half_open"

@@ -219,6 +219,7 @@ async def delete_expired(conn: Conn, actor: ActorContext, *, limit: int = 1000) 
         raise Forbidden("Only system maintenance or an owner may purge snapshots")
     if not 1 <= limit <= 10_000:
         raise ValidationFailed("invalid purge limit")
+    # No row locks here: suv_backend has SELECT/INSERT/DELETE only (FOR UPDATE needs UPDATE).
     async with mapped_errors():
         cur = await conn.execute(
             "delete from ops.query_snapshots where id in ("

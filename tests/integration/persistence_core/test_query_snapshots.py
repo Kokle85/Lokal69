@@ -46,7 +46,12 @@ async def _queue(conn: Conn, actor: ActorContext) -> tuple[list[UUID], list[dict
     rows = await cur.fetchall()
     ids = [r["id"] for r in rows]
     projections = [
-        {"case_id": str(r["id"]), "priority": r["priority"], "state": r["state"], "row_version": r["row_version"]}
+        {
+            "case_id": str(r["id"]),
+            "priority": r["priority"],
+            "state": r["state"],
+            "row_version": r["row_version"],
+        }
         for r in rows
     ]
     return ids, projections
@@ -67,7 +72,9 @@ async def _start(db: Database, actor: ActorContext, limit: int = 3) -> CursorPag
         )
 
 
-async def _next(db: Database, actor: ActorContext, cursor: str, *, filters: dict[str, Any] | None = None) -> CursorPage:
+async def _next(
+    db: Database, actor: ActorContext, cursor: str, *, filters: dict[str, Any] | None = None
+) -> CursorPage:
     async with db.transaction(actor) as conn:
         return await query_snapshots.next_page(
             conn,
@@ -90,7 +97,10 @@ async def test_pages_are_stable_under_reprioritisation_status_changes_inserts_an
     assert list(first.page.ids) == [cases[70], cases[60], cases[50]]
     assert first.page.total == 7 and first.page.next_ordinal == 3 and first.next_cursor is not None
     # Between pages: reprioritise, change status, insert and delete.
-    seed.conn.execute("update app.review_cases set priority = 1000, row_version = row_version + 1 where id = %s", (cases[10],))
+    seed.conn.execute(
+        "update app.review_cases set priority = 1000, row_version = row_version + 1 where id = %s",
+        (cases[10],),
+    )
     seed.conn.execute(
         "update app.review_cases set state = 'claimed', claim_holder = %s, claim_token_hash = %s,"
         " claimed_at = now(), claim_expires_at = now() + interval '5 minutes', row_version = row_version + 1"
@@ -147,7 +157,13 @@ async def test_snapshot_is_bound_to_principal_workspace_query_and_filters(
     async with db.transaction(reviewer) as conn:
         with pytest.raises(ValidationFailed):
             await query_snapshots.page(
-                conn, reviewer, snapshot_id, 2, 2, query_name="deals_list_candidates", filter_hash=filter_hash(FILTERS)
+                conn,
+                reviewer,
+                snapshot_id,
+                2,
+                2,
+                query_name="deals_list_candidates",
+                filter_hash=filter_hash(FILTERS),
             )
         ok = await query_snapshots.page(
             conn, reviewer, snapshot_id, 2, 2, query_name=QUERY, filter_hash=filter_hash(FILTERS)
@@ -204,7 +220,9 @@ async def test_snapshot_input_validation(db: Database, world_a: World) -> None:
             )
         with pytest.raises(ValidationFailed):
             await query_snapshots.create_snapshot(conn, reviewer, "nothex", [], [], query_name=QUERY)
-        empty = await query_snapshots.create_snapshot(conn, reviewer, filter_hash(FILTERS), [], [], query_name=QUERY)
+        empty = await query_snapshots.create_snapshot(
+            conn, reviewer, filter_hash(FILTERS), [], [], query_name=QUERY
+        )
         page = await query_snapshots.page(
             conn, reviewer, empty, 0, None, query_name=QUERY, filter_hash=filter_hash(FILTERS)
         )

@@ -43,6 +43,7 @@ VIEW_CONFIG: Final = ConfigDict(
     frozen=True,
     extra="forbid",
     json_schema_serialization_defaults_required=True,
+    hide_input_in_errors=True,
 )
 
 
@@ -263,7 +264,11 @@ DEFAULT_WARNING_MESSAGES: Final[dict[WarningCode, str]] = {
 
 class ResponseWarning(ViewModel):
     model_config = ConfigDict(
-        frozen=True, extra="forbid", json_schema_serialization_defaults_required=True, title="Warning"
+        frozen=True,
+        extra="forbid",
+        json_schema_serialization_defaults_required=True,
+        hide_input_in_errors=True,
+        title="Warning",
     )
 
     code: WarningCode

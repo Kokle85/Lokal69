@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final, Literal
 from uuid import UUID
@@ -658,7 +657,3 @@ class OutboxItemView(ViewModel):
 
 class OutboxPage(ViewModel):
     items: tuple[OutboxItemView, ...] = Field(max_length=100)
-
-
-def decimal_or_none(value: Decimal | None) -> str | None:
-    return None if value is None else decimal_str(value)

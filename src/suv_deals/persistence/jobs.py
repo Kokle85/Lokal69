@@ -53,7 +53,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import JobState, JobType, Scope
-from suv_deals.errors import Forbidden, NotFound, ValidationFailed, VersionConflict
+from suv_deals.errors import Forbidden, IdempotencyConflict, NotFound, ValidationFailed, VersionConflict
 from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
@@ -254,8 +254,6 @@ class QueueStats(BaseModel):
 # Enqueue
 # --------------------------------------------------------------------------------------------
 
-_OPEN_STATE_VALUES: Final = [s.value for s in OPEN_STATES]
-
 _INSERT_COLUMNS: Final = sql.SQL(
     "workspace_id, job_type, dedup_key, payload_version, payload, priority, available_at,"
     " max_attempts, source_id, profile_id, partition_key, listing_id, generation, scheduled_slot"
@@ -280,12 +278,12 @@ _ENQUEUE_SLOT_SQL: Final = sql.SQL(
 ).format(columns=_INSERT_COLUMNS, values=_INSERT_VALUES)
 
 _FIND_OPEN_SQL: Final = (
-    "select id from ops.jobs"
+    "select id, job_type from ops.jobs"
     " where workspace_id = %(workspace_id)s and dedup_key = %(dedup_key)s"
     " and state in ('queued', 'running', 'retry_wait', 'blocked')"
 )
 _FIND_SLOT_SQL: Final = (
-    "select id from ops.jobs"
+    "select id, job_type from ops.jobs"
     " where workspace_id = %(workspace_id)s and source_id = %(source_id)s"
     " and profile_id = %(profile_id)s and partition_key = %(partition_key)s"
     " and scheduled_slot = %(scheduled_slot)s"
@@ -298,6 +296,11 @@ def _require_enqueue(actor: ActorContext, job_type: JobType) -> None:
         return
     if actor.principal_kind != "system" and not actor.has(Scope.CONFIG_ADMIN):
         raise Forbidden("Only system workers or an owner may enqueue this job type")
+
+
+def _same_type(existing: Mapping[str, Any], spec: JobSpec) -> None:
+    if existing["job_type"] != spec.job_type.value:
+        raise IdempotencyConflict("The dedup key is already used by a job of another type")
 
 
 def _spec_params(actor: ActorContext, spec: JobSpec, scheduled_slot: datetime | None) -> dict[str, Any]:
@@ -335,6 +338,7 @@ async def enqueue(conn: Conn, actor: ActorContext, spec: JobSpec) -> tuple[UUID,
                 return row["id"], True
             existing = await fetch_one(conn, _FIND_OPEN_SQL, params)
             if existing is not None:
+                _same_type(existing, spec)
                 return existing["id"], False
     raise TransientConflict("The job changed state concurrently; retry")
 
@@ -362,6 +366,7 @@ async def enqueue_slot(
             if existing is None:
                 existing = await fetch_one(conn, _FIND_OPEN_SQL, params)
             if existing is not None:
+                _same_type(existing, spec)
                 return existing["id"], False
     raise TransientConflict("The scheduler slot changed concurrently; retry")
 

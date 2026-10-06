@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -26,6 +27,7 @@ from suv_deals.persistence import gates, jobs, outbox
 from suv_deals.persistence.database import Database, fetch_one
 from suv_deals.persistence.errors_map import (
     LeaseLost,
+    TransactionAborted,
     TransientConflict,
     is_retryable_db_error,
     map_db_error,
@@ -43,9 +45,9 @@ pytestmark = pytest.mark.db
 
 
 def _raise(conn: psycopg.Connection, sqlstate: str) -> psycopg.Error:
-    statement = sql.SQL("do $$ begin raise exception using errcode = {}, message = 'synthetic'; end $$").format(
-        sql.Literal(sqlstate)
-    )
+    statement = sql.SQL(
+        "do $$ begin raise exception using errcode = {}, message = 'synthetic'; end $$"
+    ).format(sql.Literal(sqlstate))
     with pytest.raises(psycopg.Error) as excinfo:
         conn.execute(statement)
     return excinfo.value
@@ -94,10 +96,11 @@ async def test_real_constraint_violations_are_mapped(db: Database, world_a: Worl
     with pytest.raises(ValidationFailed) as excinfo:
         async with unit_of_work(db, actor) as conn:
             await conn.execute(
-                "insert into ops.jobs (workspace_id, job_type, dedup_key, state) values (%s, 'valuation', %s, 'bogus')",
+                "insert into ops.jobs (workspace_id, job_type, dedup_key, priority)"
+                " values (%s, 'valuation', %s, 5000)",
                 (ws, unique("job")),
             )
-    assert excinfo.value.details == {"constraint": "jobs_state_ck"}
+    assert excinfo.value.details == {"constraint": "jobs_priority_ck"}
     # Unique violation outside an ON CONFLICT path.
     event_id = uuid.uuid4()
     with pytest.raises(VersionConflict):
@@ -120,22 +123,27 @@ async def test_real_constraint_violations_are_mapped(db: Database, world_a: Worl
 async def test_statement_and_lock_timeouts_are_retryable(db_url: str, world_a: World, seed: Seed) -> None:
     ws = world_a.workspace_id
     job_id = seed.job(ws)
-    fast = Database(db_url, set_role="suv_backend", statement_timeout_ms=100, lock_timeout_ms=100)
-    await fast.open()
+    slow_queries = Database(db_url, set_role="suv_backend", statement_timeout_ms=100)
+    busy_rows = Database(db_url, set_role="suv_backend", statement_timeout_ms=5_000, lock_timeout_ms=100)
+    await slow_queries.open()
+    await busy_rows.open()
     holder = await psycopg.AsyncConnection.connect(db_url)
     try:
         with pytest.raises(AppError) as slow:
-            async with unit_of_work(fast, system(ws)) as conn:
+            async with unit_of_work(slow_queries, system(ws)) as conn:
                 await conn.execute("select pg_sleep(1)")
         assert slow.value.code == ErrorCode.DEPENDENCY_UNAVAILABLE and slow.value.retryable
         await holder.execute("select id from ops.jobs where id = %s for update", (job_id,))
         with pytest.raises(TransientConflict):
-            async with unit_of_work(fast, system(ws)) as conn:
-                await conn.execute("update ops.jobs set priority = 1 where workspace_id = %s and id = %s", (ws, job_id))
+            async with unit_of_work(busy_rows, system(ws)) as conn:
+                await conn.execute(
+                    "update ops.jobs set priority = 1 where workspace_id = %s and id = %s", (ws, job_id)
+                )
     finally:
         await holder.rollback()
         await holder.close()
-        await fast.close()
+        await slow_queries.close()
+        await busy_rows.close()
 
 
 async def test_retry_transient_reruns_the_whole_unit_of_work(db: Database, world_a: World) -> None:
@@ -272,3 +280,17 @@ async def test_concurrent_transactions_on_one_job_serialise_on_the_row_lock(
     await task
     assert seed.scalar("select state from ops.jobs where id = %s", (job_id,)) == "running"
     assert (await jobs.reap_expired(db, ws)).requeued == (job_id,)
+
+
+async def test_a_swallowed_database_error_never_reports_a_silent_commit(
+    db: Database, world_a: World, world_b: World, seed: Seed
+) -> None:
+    ws = world_a.workspace_id
+    actor = system(ws)
+    dedup = unique("valuation")
+    with pytest.raises(TransactionAborted):
+        async with unit_of_work(db, actor) as conn:
+            await jobs.enqueue(conn, actor, spec(dedup_key=dedup))
+            with contextlib.suppress(NotFound):  # a careless caller carries on regardless
+                await jobs.enqueue(conn, actor, spec(source_id=world_b.source_id))
+    assert seed.scalar("select count(*) from ops.jobs where dedup_key = %s", (dedup,)) == 0
