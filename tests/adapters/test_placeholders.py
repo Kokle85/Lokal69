@@ -11,6 +11,7 @@ from tests.adapters.conftest import raw_document
 
 from suv_deals.adapters import (
     autoscout_public,
+    ch_marketplaces,
     it_marketplaces,
     mk_comparables,
     mobile_de_api,
@@ -35,6 +36,9 @@ PLACEHOLDER_SOURCES = (
     "automobile_it",
     "pazar3_mk",
     "reklama5_mk",
+    "carforyou_ch",
+    "tutti_ch",
+    "comparis_ch",
 )
 DOCUMENTED_URLS = {
     "https://www.mobile.de/service/agbPublic",
@@ -78,7 +82,8 @@ async def test_placeholders_raise_with_checklist_pointer(source_key: str, client
 
 
 @pytest.mark.parametrize(
-    "module", [mobile_de_public, autoscout_public, it_marketplaces, mk_comparables, mobile_de_api]
+    "module",
+    [mobile_de_public, autoscout_public, it_marketplaces, mk_comparables, mobile_de_api, ch_marketplaces],
 )
 def test_no_guessed_urls_or_selectors_in_placeholder_modules(module: object) -> None:
     source = inspect.getsource(module)  # type: ignore[arg-type]
@@ -97,6 +102,17 @@ def test_each_autoscout_country_is_registered_separately() -> None:
     }
     for key in keys:
         assert key in ADAPTERS
+
+
+def test_swiss_marketplace_placeholders_are_registered_for_ch_only() -> None:
+    keys = {cls.ADAPTER_KEY: cls.COUNTRY for cls in ch_marketplaces.CH_MARKETPLACE_ADAPTERS}
+    assert keys == {"carforyou_ch_public": "CH", "tutti_ch_public": "CH", "comparis_ch_public": "CH"}
+    for key, cls in zip(keys, ch_marketplaces.CH_MARKETPLACE_ADAPTERS, strict=True):
+        assert ADAPTERS[key] is cls
+        assert cls.ADAPTER_VERSION == "unimplemented" and cls.CAPABILITIES_VERIFIED is False
+    carforyou = load_registry(REPO / "config").config("carforyou_ch")
+    with pytest.raises(ValidationFailed):
+        ch_marketplaces.CarForYouChPublicAdapter(carforyou.model_copy(update={"country": "DE"}))
 
 
 def test_country_and_role_are_enforced() -> None:

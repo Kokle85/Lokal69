@@ -19,6 +19,16 @@ terms_decision_actor: null
 terms_decision_note: null
 technical_denial_policy: stop_and_report
 robots_policy: obey
+source_timezone: Europe/Zurich
+# Robots record (fact only, not permission). Checked 2026-10-06; not re-fetched by the offline
+# change that added this record. The robots module must fetch and store the revision before any
+# activation step.
+robots_checked_at: 2026-10-06T00:00:00Z
+robots_summary: >-
+  robots.txt checked 2026-10-06: it contains no 'User-agent: *' group. Recorded as a fact, NOT as
+  permission. Without a '*' group robots.txt sets no rules for a crawler that no named group matches
+  (RFC 9309 section 2.2.1), but robots silence is never permission; named groups must still be checked
+  against our user agent, and the terms remain unreviewed.
 allowed_hosts: []
 allowed_search_paths: []
 allowed_detail_paths: []

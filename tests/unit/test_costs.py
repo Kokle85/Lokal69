@@ -772,9 +772,9 @@ def test_default_cost_profile_lists_every_category_unknown() -> None:
     assert all(ln.status == S.UNKNOWN and not ln.assumption_approved for ln in lines)
     result = run(list(lines))
     assert not result.complete and result.scenario(BASE).contribution_before_business_tax is None
-    assert len(result.unknown_lines) == len(REQUIRED_CATEGORIES)
+    assert len(result.unknown_lines) == len(profile.assumptions)  # incl. the CH-scoped lines
     ref = profile.reference()
-    assert ref.version == 1 and len(ref.sha256) == 64 and ref.approval_status == "unapproved"
+    assert ref.version == 2 and len(ref.sha256) == 64 and ref.approval_status == "unapproved"
 
 
 def test_cost_profile_rules(tmp_path: Path) -> None:

@@ -24,7 +24,7 @@ Binding rules (spec sections 2, 3, 7, 17, 31):
   never silently treated as UTC (spec 7).
 - Technical-inspection wording (HU/TÜV, Swiss MFK/expertise, Italian revisione) is a seller claim,
   never a verified inspection; negated, expired or conditional wording is never positive.
-- Swiss price wording (``CHF``/``Fr.`` with apostrophe grouping and ``.-``/``.–`` endings, ``MWST``,
+- Swiss price wording (``CHF``/``Fr.`` with apostrophe grouping and ``.-``/dash endings, ``MWST``,
   ``TVA``, ``Exportpreis``, ``Händlerpreis``) is parsed like DE/IT wording; the Swiss VAT rate is
   only ever *recorded as stated*, never assumed.
 """
@@ -1730,17 +1730,20 @@ def parse_inspection(text: str | None, locale: Locale | None, as_of: date) -> In
 
     expiry = PartialDate()
     distinct_expiries = list(dict.fromkeys(expiries))
+    # Any stated expiry in the past blocks a positive claim, even when another (different) expiry
+    # is stated too; several different expiries leave the expiry itself unknown.
+    expiry_past = any((_compare_to(e, as_day) or 0) < 0 for e in distinct_expiries)
+    expiry_valid = False
     if len(distinct_expiries) > 1:
         warnings.append(ParseWarning.MULTIPLE_DATES)
     elif distinct_expiries:
         expiry = distinct_expiries[0]
-    expiry_cmp = _compare_to(expiry, as_day)
-    expiry_past = expiry_cmp is not None and expiry_cmp < 0
-    expiry_valid = expiry_cmp is not None and (
-        expiry_cmp > 0 or (expiry_cmp == 0 and expiry.precision != Precision.YEAR)
-    )
-    if expiry_cmp == 0 and expiry.precision == Precision.YEAR:
-        warnings.append(ParseWarning.INSPECTION_EXPIRY_IMPRECISE)
+        expiry_cmp = _compare_to(expiry, as_day)
+        expiry_valid = expiry_cmp is not None and (
+            expiry_cmp > 0 or (expiry_cmp == 0 and expiry.precision != Precision.YEAR)
+        )
+        if expiry_cmp == 0 and expiry.precision == Precision.YEAR:
+            warnings.append(ParseWarning.INSPECTION_EXPIRY_IMPRECISE)
 
     last = PartialDate()
     distinct_lasts = list(dict.fromkeys(lasts))

@@ -503,9 +503,21 @@ class CostProfile(_Contract):
             is_fixture=self.is_fixture,
         )
 
-    def lines(self) -> tuple[CostLine, ...]:
+    def lines(self, target_scope: CostScope | None = None) -> tuple[CostLine, ...]:
+        """Profile lines for one valuation.
+
+        With a ``target_scope``, assumptions scoped to a different case are left out: a line
+        scoped to ``origin_country: CH`` (a Swiss export declaration, say) does not apply to a
+        German purchase and must not turn its totals unknown. Unscoped assumptions, and scoped
+        ones whose scope cannot be checked against the target (fields unset on either side),
+        always apply. Without a target scope every line is returned.
+        """
         approved = self.approval_status == "approved"
-        return tuple(a.to_line(approved=approved) for a in self.assumptions)
+        return tuple(
+            a.to_line(approved=approved)
+            for a in self.assumptions
+            if target_scope is None or a.scope is None or not a.scope.conflicts_with(target_scope)
+        )
 
     def missing_categories(self) -> frozenset[CostCategory]:
         return REQUIRED_CATEGORIES - {a.category for a in self.assumptions}

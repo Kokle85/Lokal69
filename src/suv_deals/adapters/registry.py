@@ -25,6 +25,11 @@ from suv_deals.adapters.autoscout_public import (
     AutoScout24ItPublicAdapter,
 )
 from suv_deals.adapters.base import SourceAdapter
+from suv_deals.adapters.ch_marketplaces import (
+    CarForYouChPublicAdapter,
+    ComparisChPublicAdapter,
+    TuttiChPublicAdapter,
+)
 from suv_deals.adapters.dealer_inventory import SchemaOrgDealerAdapter
 from suv_deals.adapters.it_marketplaces import AutomobileItPublicAdapter, SubitoPublicAdapter
 from suv_deals.adapters.mk_comparables import Pazar3Adapter, Reklama5Adapter
@@ -45,6 +50,9 @@ ADAPTERS: MappingProxyType[str, AdapterClass] = MappingProxyType(
         AutoScout24ChPublicAdapter.ADAPTER_KEY: AutoScout24ChPublicAdapter,
         SubitoPublicAdapter.ADAPTER_KEY: SubitoPublicAdapter,
         AutomobileItPublicAdapter.ADAPTER_KEY: AutomobileItPublicAdapter,
+        CarForYouChPublicAdapter.ADAPTER_KEY: CarForYouChPublicAdapter,
+        TuttiChPublicAdapter.ADAPTER_KEY: TuttiChPublicAdapter,
+        ComparisChPublicAdapter.ADAPTER_KEY: ComparisChPublicAdapter,
         Pazar3Adapter.ADAPTER_KEY: Pazar3Adapter,
         Reklama5Adapter.ADAPTER_KEY: Reklama5Adapter,
         MobileDeSearchApiAdapter.ADAPTER_KEY: MobileDeSearchApiAdapter,

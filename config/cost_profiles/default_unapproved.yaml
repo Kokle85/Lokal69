@@ -23,8 +23,15 @@
 #
 # Amounts, when added later, must be quoted decimal strings ("700.00"), never bare
 # floats; YAML floats are rejected on load.
+#
+# Scoped lines ("ch_purchase"): lines with `scope: {origin_country: CH}` apply only to vehicles
+# bought in Switzerland. `CostProfile.lines(target_scope=...)` leaves them out for a DE/IT
+# purchase, so they never turn those totals unknown. They are listed IN ADDITION to the general
+# lines; where a CH line is the Swiss form of a general line (export plates, VAT deposit), its
+# note says which one to record not_applicable so that nothing is counted twice.
+# See docs/markets/switzerland.md.
 profile_key: default
-version: 1
+version: 2
 basis: >-
   Placeholder profile listing every required cost category as unknown. No business
   assumptions have been selected or approved by the owner.
@@ -36,6 +43,16 @@ is_fixture: false
 notes:
   - "Vehicle purchase payable amount: taken per listing from price evidence (PurchaseInput), never from this profile."
   - "Business tax/accounting treatment is not modelled; results are an estimated contribution before business tax."
+  - >-
+    CH purchase (ch_purchase scope): Switzerland is not in the EU. A vehicle bought in Switzerland
+    does NOT carry EU preferential origin for the North Macedonian import, and the purchase country
+    never proves origin. Origin stays separate evidence in the tax engine (TaxInputs.origin_proof);
+    no line of this profile models duty, and no preference is assumed.
+  - >-
+    CH purchase: Swiss VAT (MWST/TVA/IVA) is part of a Swiss dealer's payable price unless the seller
+    agrees in writing to invoice the export sale without Swiss VAT; the conditions (export by the
+    seller or buyer, customs export evidence, deadlines) are the seller's to state and the owner's to
+    confirm. Never assumed from "Export" or "exkl. MWST" wording; the Swiss VAT rate is never hardcoded.
 assumptions:
   - category: bank_fx_charges
     label: Bank transfer and currency conversion charges / exchange spread
@@ -101,3 +118,55 @@ assumptions:
     label: Refundable deposits (e.g. VAT/export deposit)
     status: unknown
     note: Per transaction from seller terms; record not_applicable with a reason when the seller requires none.
+  # ------------------------------------------------------------------ CH purchase (ch_purchase)
+  - category: customs_broker
+    label: "CH purchase: Swiss export declaration (Ausfuhrdeklaration) via forwarder/customs broker in Switzerland"
+    status: unknown
+    scope:
+      origin_country: CH
+      note: "ch_purchase: applies only to vehicles bought in Switzerland"
+    note: >-
+      ch_purchase. In addition to the MK import clearance line. The vehicle leaves Switzerland under an
+      export declaration lodged with Swiss customs (BAZG/FOCBS); who lodges it (dealer, forwarder or
+      buyer), the fee and the documents (invoice, Swiss vehicle registration document) need a quote.
+      The export declaration is also the evidence a Swiss seller needs before an export sale can be
+      invoiced without Swiss VAT. A Swiss purchase does not give EU preferential origin for the MK
+      import; origin evidence is handled separately by the tax engine.
+  - category: customs_broker
+    label: "CH purchase: transit through the EU (e.g. T1 transit declaration and guarantee)"
+    status: unknown
+    scope:
+      origin_country: CH
+      note: "ch_purchase: applies only to vehicles bought in Switzerland"
+    note: >-
+      ch_purchase. Every road route from Switzerland to North Macedonia leaves Switzerland through an EU
+      member state (DE, FR, IT or AT). A vehicle bought in Switzerland is not EU goods, so the forwarder
+      must state the transit procedure for the whole route (for example a T1 transit declaration with a
+      guarantee up to the MK border office), its fee and guarantee cost, and any non-EU countries on the
+      route (e.g. via Serbia). Needs a forwarder/customs broker quote; nothing assumed.
+  - category: export_plates_insurance
+    label: "CH purchase: Swiss export plates and insurance (only if the vehicle is driven out)"
+    status: unknown
+    scope:
+      origin_country: CH
+      note: "ch_purchase: applies only to vehicles bought in Switzerland"
+    note: >-
+      ch_purchase. The Swiss form of the general export plates line: when this line is used, record the
+      general line not_applicable ("covered by the CH line") so nothing is counted twice. Only when the
+      vehicle is driven: cantonal export plates and insurance covering every transit country and the
+      whole period. Whether the canton requires a valid MFK for export plates must be confirmed; a car
+      sold 'vor MFK'/'ohne MFK' may have to go by truck. Record not_applicable (reason: truck transport)
+      when the vehicle is trucked; the truck itself belongs to the transport line.
+  - category: refundable_deposit
+    label: "CH purchase: Swiss VAT charged by the seller pending export evidence"
+    status: unknown
+    scope:
+      origin_country: CH
+      note: "ch_purchase: applies only to vehicles bought in Switzerland"
+    note: >-
+      ch_purchase. The Swiss form of the general refundable deposit line: when this line is used, record
+      the general line not_applicable so nothing is counted twice. Some Swiss sellers invoice Swiss VAT
+      and refund it only after the export declaration is presented; others invoice the export sale
+      without Swiss VAT, or not at all. The arrangement, amount (at the seller's stated rate), refund
+      prerequisites and timing must come from the seller in writing; never assumed. Record
+      not_applicable with a reason when the seller confirms no Swiss VAT is charged.

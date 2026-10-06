@@ -41,7 +41,7 @@ config/sources/*.yaml  ->  scheduler (15 min slots, ops.source_schedules)
 | `domain/provenance.py` | `FieldProvenance`, `FieldConflict` | enums |
 | `domain/profiles.py` | `SearchProfile`, `BusinessConfig`, baseline validation, YAML loader | enums |
 | `domain/sources.py` | `SourceConfig`, `RateBudget`, `activation_problems()` | enums |
-| `domain/parsing.py` | Locale number/price/mileage/date parsing (DE/IT/CH/MK) | money, listings |
+| `domain/parsing.py` | Locale number/price/mileage/date parsing (DE/IT/CH/MK), technical-inspection wording (HU/TÜV, MFK, revisione) | money, listings |
 | `domain/identity.py` | URL canonicalisation, identity/card hashes, revision promotion rules | listings |
 | `domain/taxonomy.py` | SUV make/model/generation taxonomy matching (`config/vehicle_taxonomy.yaml`) | enums |
 | `domain/filters.py` | Deterministic eligibility screening per profile | profiles, money, taxonomy |

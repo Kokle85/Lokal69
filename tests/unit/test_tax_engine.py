@@ -846,6 +846,26 @@ def test_swiss_origin_is_not_interchangeable_with_listed_countries() -> None:
     assert calc.components[1].inputs_used["preferential_origin_country"] == "CH"
 
 
+def test_swiss_purchase_without_proof_never_implies_eu_preferential_origin() -> None:
+    # Bought from a Swiss seller and dispatched from Switzerland: CH is non-EU and the purchase
+    # country is never origin evidence, so nothing resolves to the listed (preferential) rate.
+    swiss = {"seller_country": "CH", "dispatch_country": "CH"}
+    unproven = calculate(
+        load_rule_set_file(FIXTURE), inputs(origin_proof=None, origin_country="DE", **swiss), T0
+    )
+    st = statuses(unproven)
+    assert st["duty_listed_origin"] == ComponentStatus.UNKNOWN
+    assert st["duty_standard"] == ComponentStatus.UNKNOWN
+    assert "origin_evidence" in unproven.missing_inputs
+    assert unproven.total_import_cost is None
+    # Positively no proof: the standard duty applies, never the listed-country preference.
+    no_preference = calculate(load_rule_set_file(FIXTURE), inputs(origin_proof=no_proof(), **swiss), T0)
+    assert statuses(no_preference)["duty_listed_origin"] == ComponentStatus.NOT_APPLICABLE
+    assert amounts(no_preference)["duty_standard"] == Decimal("10000.00")
+    used = next(c for c in no_preference.components if c.component_id == "duty_standard").inputs_used
+    assert used["preferential_origin_country"] == "none"
+
+
 @pytest.mark.parametrize(
     ("proof", "listed", "standard"),
     [

@@ -1,0 +1,34 @@
+# CarForYou (CH). Candidate acquisition source - DISABLED, nothing verified.
+# Candidate domain (UNVERIFIED, not opened): www.carforyou.ch
+# Exact domain(s), operator, terms, robots directives and public routes must be verified first.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: carforyou_ch
+display_name: "CarForYou public listings (CH)"
+country: CH
+role: acquisition
+mode: public_html
+adapter: carforyou_ch_public
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null            # exact terms page not yet identified/verified
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Zurich
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Swiss used-car marketplace candidate (spec section 5: Swiss sources are verified separately).
+  Candidate domain www.carforyou.ch is UNVERIFIED: nothing was fetched. Verify before adding any host or
+  path: the exact domain(s) and operator; which terms apply (Swiss, consumer or business) and whether
+  they restrict automated access or derived databases; robots.txt for the intended paths; whether public
+  result and detail routes exist and may be used; the language versions (DE/FR/IT); and how prices and
+  VAT are shown (CHF, MWST wording). No route, selector or listing-ID pattern is encoded.

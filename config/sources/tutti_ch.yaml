@@ -1,0 +1,35 @@
+# tutti.ch (CH). Candidate acquisition source (general classifieds) - DISABLED, nothing verified.
+# Candidate domain (UNVERIFIED, not opened): www.tutti.ch
+# Exact domain(s), operator, terms, robots directives and public routes must be verified first.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: tutti_ch
+display_name: "tutti.ch public classifieds (CH)"
+country: CH
+role: acquisition
+mode: public_html
+adapter: tutti_ch_public
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null            # exact terms page not yet identified/verified
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Zurich
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Swiss general-classifieds candidate with private and dealer car ads. Candidate domain www.tutti.ch is
+  UNVERIFIED: nothing was fetched. Verify before adding any host or path: the exact domain(s) and
+  operator; which terms apply and whether they restrict automated access or derived databases;
+  robots.txt for the intended paths; whether a public vehicle category with result and detail routes
+  exists and may be used; and the language versions (DE/FR/IT). Classifieds carry private sellers:
+  store no seller contact data, record the seller type (a private sale has no reclaimable VAT) and keep
+  untrusted ad text bounded. No route, selector or listing-ID pattern is encoded.

@@ -1,0 +1,53 @@
+# TEMPLATE: how a permitted Swiss dealer inventory website would be configured for the
+# generic schema.org adapter (adapters/dealer_inventory.py). This is NOT a real source:
+# hosts/paths are empty and it stays disabled. Copy it to a new file per dealer.
+#
+# Activation steps for a real dealer: the same checklist as example_dealer_template_de.yaml
+# (docs/source_access_register.md#activation-checklist): terms/permission record, verified
+# hosts/paths/search_url, robots check, permitted fixtures + MANIFEST.yaml, live low-volume
+# smoke, then enable through an auditable configuration revision.
+#
+# Swiss specifics (docs/markets/switzerland.md):
+#  - Language region: set crawl_locale per dealer: de-CH (German-speaking cantons),
+#    fr-CH (Romandie) or it-CH (Ticino). The adapter's wording rules cover DE/FR/IT.
+#  - Prices are CHF with apostrophe grouping ("2'990.-", "Fr. 2'990.–"); VAT wording is
+#    MWST / TVA / IVA; the inspection is the MFK (FR "expertise", IT "collaudo").
+#  - Zone-less dealer timestamps are read in Europe/Zurich.
+#
+# Example shapes (commented out; do not uncomment with invented values):
+#   allowed_hosts: ["<dealer-host>"]
+#   allowed_search_paths: ["/<verified-result-path>"]
+#   allowed_detail_paths: ["/<verified-detail-prefix>/[A-Za-z0-9-]{3,60}"]
+#   search:
+#     search_url: "https://<dealer-host>/<verified-result-path>"
+source_key: example_dealer_template_ch
+display_name: "Example dealer template (CH) - not a real source"
+country: CH
+role: acquisition
+mode: public_html
+adapter: schemaorg_dealer
+adapter_version: schemaorg_dealer@1.1.0
+enabled: false
+# The generic adapter code is fixture-verified against synthetic fixture sources (incl. the
+# Swiss fixture_dealer_ch), but this template has no captured pages of any real dealer.
+technical_status: untested
+terms_status: unreviewed
+terms_url: null
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Zurich
+crawl_locale: de-CH
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Template only. Duplicate per permitted Swiss dealer and fill hosts/paths/search_url from verified,
+  permitted pages. Switzerland has German (de-CH), French (fr-CH) and Italian (it-CH) language regions:
+  set crawl_locale to the dealer's language. CHF prices, MWST/TVA/IVA and MFK/expertise/collaudo wording
+  are handled by the generic adapter; a Swiss dealer's "Export" or "exkl. MWST" wording is a seller
+  statement, not a confirmed VAT-free purchase.

@@ -39,6 +39,15 @@ EXPECTED_SOURCES = {
     "reklama5_mk",
     "mobile_de_api",
     "example_dealer_template_de",
+    "carforyou_ch",
+    "tutti_ch",
+    "comparis_ch",
+    "example_dealer_template_ch",
+}
+CH_MARKETPLACE_CANDIDATES = {
+    "carforyou_ch": ("carforyou_ch_public", "www.carforyou.ch"),
+    "tutti_ch": ("tutti_ch_public", "www.tutti.ch"),
+    "comparis_ch": ("comparis_ch_public", "www.comparis.ch"),
 }
 
 
@@ -84,9 +93,70 @@ def test_autoscout_ch_is_reviewed_separately() -> None:
     assert cfg.terms_status == TermsStatus.UNREVIEWED
     assert "terms not reviewed" in activation_problems(cfg)
     assert cfg.notes is not None and "Swiss" in cfg.notes
+    assert cfg.source_timezone == "Europe/Zurich"
+    # The robots record is a fact, never permission; it does not open any gate.
+    assert cfg.robots_checked_at == datetime(2026, 10, 6, tzinfo=UTC)
+    assert cfg.robots_summary is not None
+    assert "User-agent: *" in cfg.robots_summary and "NOT as permission" in cfg.robots_summary
+    assert cfg.allowed_hosts == () and "adapter is unimplemented" in activation_problems(cfg)
 
 
-@pytest.mark.parametrize("key", ["subito_it", "automobile_it", "pazar3_mk", "reklama5_mk", "mobile_de_api"])
+@pytest.mark.parametrize("key", sorted(CH_MARKETPLACE_CANDIDATES))
+def test_swiss_marketplace_candidates_are_gated_placeholders(key: str) -> None:
+    cfg = load_registry(REPO / "config").config(key)
+    adapter_key, domain = CH_MARKETPLACE_CANDIDATES[key]
+    assert (cfg.country, cfg.role, cfg.adapter, cfg.adapter_version) == (
+        "CH",
+        "acquisition",
+        adapter_key,
+        "unimplemented",
+    )
+    assert cfg.enabled is False and cfg.terms_status == TermsStatus.UNREVIEWED
+    assert cfg.allowed_hosts == () and cfg.search == {}
+    assert cfg.source_timezone == "Europe/Zurich"
+    assert cfg.notes is not None
+    assert domain in cfg.notes and "UNVERIFIED" in cfg.notes  # candidate domain, recorded as unverified
+    assert "robots" in cfg.notes and "terms" in cfg.notes
+    gate = gate_status(cfg)
+    assert not gate.adapter_implemented and not gate.active
+    assert {"adapter is unimplemented", "terms not reviewed", "no allowed hosts"} <= set(gate.problems)
+
+
+def test_comparis_is_flagged_as_an_aggregator() -> None:
+    notes = load_registry(REPO / "config").config("comparis_ch").notes or ""
+    assert "aggregator" in notes and "attribution" in notes and "original source" in notes
+
+
+def test_swiss_dealer_template() -> None:
+    template = load_registry(REPO / "config").config("example_dealer_template_ch")
+    assert (template.country, template.adapter, template.adapter_version) == (
+        "CH",
+        "schemaorg_dealer",
+        "schemaorg_dealer@1.1.0",
+    )
+    assert (template.crawl_locale, template.source_timezone) == ("de-CH", "Europe/Zurich")
+    assert template.enabled is False and template.allowed_hosts == () and template.search == {}
+    assert template.technical_status == TechnicalStatus.UNTESTED
+    notes = template.notes or ""
+    assert all(code in notes for code in ("de-CH", "fr-CH", "it-CH"))
+    assert isinstance(build_adapter(template), SchemaOrgDealerAdapter)
+    with pytest.raises(SourcePaused):
+        build_active_adapter(template)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "subito_it",
+        "automobile_it",
+        "pazar3_mk",
+        "reklama5_mk",
+        "mobile_de_api",
+        "carforyou_ch",
+        "tutti_ch",
+        "comparis_ch",
+    ],
+)
 def test_unreviewed_sources(key: str) -> None:
     cfg = load_registry(REPO / "config").config(key)
     assert cfg.terms_status == TermsStatus.UNREVIEWED and cfg.terms_url is None
@@ -118,7 +188,7 @@ def test_registry_builds_every_adapter_and_nothing_is_active() -> None:
     assert all(not g.active and g.problems for g in gates)
     assert all("source is disabled in configuration" in g.problems for g in gates)
     implemented = {g.source_key for g in gates if g.adapter_implemented}
-    assert implemented == {"example_dealer_template_de"}
+    assert implemented == {"example_dealer_template_de", "example_dealer_template_ch"}
     json.dumps([g.as_dict() for g in gates])  # serialisable for API/MCP/status pages
 
 
