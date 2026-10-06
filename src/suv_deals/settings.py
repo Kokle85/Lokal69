@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     database_url: SecretStr | None = None
     database_pool_min: int = 1
     database_pool_max: int = 5
+    # Optional `SET ROLE` executed on every pooled connection (ADR 0001), e.g. suv_backend.
+    database_set_role: str | None = None
     supabase_url: str | None = None
     supabase_publishable_key: str | None = None
     supabase_secret_key: SecretStr | None = None
@@ -72,6 +74,9 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_api_key: SecretStr | None = None
     llm_daily_budget_eur: Decimal = Decimal(0)
+
+    fx_fetch_enabled: bool = False
+    fx_ecb_daily_url: str = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
 
     tax_rule_set_id: str | None = None
     primary_min_price_eur: Decimal = Decimal(2500)
