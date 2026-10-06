@@ -332,7 +332,9 @@ def verify_inbound(
     except ValueError:
         raise WebhookVerificationFailed(VerificationFailureReason.INVALID_BODY) from None
     subscription = lowered.get(HEADER_SUBSCRIPTION.lower())
-    return VerifiedWebhook(webhook_id=msg_id, timestamp=signed_at, payload=payload, subscription_id=subscription)
+    return VerifiedWebhook(
+        webhook_id=msg_id, timestamp=signed_at, payload=payload, subscription_id=subscription
+    )
 
 
 @dataclass
