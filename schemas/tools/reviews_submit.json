@@ -1,0 +1,512 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Submit a review decision"
+  },
+  "description": "Persist an evidence-grounded decision (needs_information, watch, shortlisted, rejected) against the exact case version, listing revision and valuation, citing evidence ids and reason codes. The summary is a concise rationale, not hidden reasoning. Never buys, bids, pays or contacts sellers.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": "reviews_submit",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "case_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "claim_token": {
+        "description": "Opaque claim token returned once by reviews_claim.",
+        "maxLength": 256,
+        "minLength": 20,
+        "pattern": "^[A-Za-z0-9_-]{20,256}$",
+        "type": "string"
+      },
+      "evidence_ids": {
+        "description": "Evidence ids the decision cites.",
+        "items": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "maxItems": 100,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "expected_version": {
+        "description": "Case version the caller saw (row version); a changed case returns VERSION_CONFLICT.",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "idempotency_key": {
+        "description": "Client-chosen key scoped to the caller and operation; a retry with the same key and request returns the original result.",
+        "maxLength": 128,
+        "minLength": 8,
+        "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+        "type": "string"
+      },
+      "listing_revision": {
+        "description": "Listing revision number the decision is about.",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "missing_information": {
+        "default": [],
+        "description": "Open questions (needs_information decisions).",
+        "items": {
+          "maxLength": 300,
+          "type": "string"
+        },
+        "maxItems": 30,
+        "type": "array"
+      },
+      "model_run_id": {
+        "default": null,
+        "description": "Assistant model run id, if any.",
+        "maxLength": 200,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "outcome": {
+        "enum": [
+          "needs_information",
+          "watch",
+          "shortlisted",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "reason_codes": {
+        "description": "Short reason codes.",
+        "items": {
+          "maxLength": 80,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$",
+          "type": "string"
+        },
+        "maxItems": 20,
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "summary": {
+        "description": "Concise rationale and evidence trail (not hidden reasoning).",
+        "maxLength": 4000,
+        "minLength": 10,
+        "type": "string"
+      },
+      "valuation_id": {
+        "default": null,
+        "description": "Valuation the decision cites, if any.",
+        "format": "uuid",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "case_id",
+      "claim_token",
+      "expected_version",
+      "listing_revision",
+      "outcome",
+      "reason_codes",
+      "summary",
+      "evidence_ids",
+      "idempotency_key"
+    ],
+    "title": "reviews_submit",
+    "type": "object"
+  },
+  "name": "reviews_submit",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "One immutable ``app.review_decisions`` row (spec 14, 21).",
+        "properties": {
+          "actor": {
+            "additionalProperties": false,
+            "description": "The authenticated actor recorded by the server (request bodies carry no actor fields).",
+            "properties": {
+              "principal_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "principal_kind": {
+                "enum": [
+                  "user",
+                  "mcp_client",
+                  "system"
+                ],
+                "type": "string"
+              },
+              "role": {
+                "enum": [
+                  "owner",
+                  "reviewer",
+                  "viewer"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "principal_id",
+              "principal_kind",
+              "role"
+            ],
+            "title": "DecisionActorView",
+            "type": "object"
+          },
+          "case_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "case_state": {
+            "enum": [
+              "pending",
+              "claimed",
+              "needs_information",
+              "watch",
+              "shortlisted",
+              "rejected",
+              "superseded"
+            ],
+            "type": "string"
+          },
+          "case_version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "decided_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "decision_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "input_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "is_fixture": {
+            "type": "boolean"
+          },
+          "listing_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "listing_revision": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "listing_revision_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "missing_information": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 30,
+            "type": "array"
+          },
+          "model_name": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_run_id": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_version": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_case_version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "notice": {
+            "default": "A reviewer's recommendation with its evidence trail; it does not turn seller claims into verified facts.",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "needs_information",
+              "watch",
+              "shortlisted",
+              "rejected"
+            ],
+            "type": "string"
+          },
+          "prompt_template_version": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "summary": {
+            "maxLength": 4000,
+            "minLength": 10,
+            "type": "string"
+          },
+          "supersedes_decision_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_request_id": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "valuation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "decision_id",
+          "case_id",
+          "case_version",
+          "case_state",
+          "new_case_version",
+          "listing_id",
+          "listing_revision_id",
+          "listing_revision",
+          "valuation_id",
+          "outcome",
+          "reason_codes",
+          "summary",
+          "evidence_ids",
+          "missing_information",
+          "actor",
+          "model_name",
+          "model_version",
+          "model_run_id",
+          "prompt_template_version",
+          "tool_request_id",
+          "input_hash",
+          "decided_at",
+          "supersedes_decision_id",
+          "is_fixture",
+          "notice"
+        ],
+        "title": "ReviewDecisionView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "reviews_submit_result",
+    "type": "object"
+  },
+  "paginated": false,
+  "requiredScope": "reviews:write",
+  "title": "Submit a review decision"
+}
