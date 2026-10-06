@@ -8,6 +8,11 @@ JWTs, keys, credentials in URLs, e-mail addresses, phone numbers) and ``metadata
 `observability.audit.redact_metadata` (secret-named keys lose their values, strings are
 redacted, size bounded to 16 KiB). Secrets are therefore never stored.
 
+The audit outcome (``succeeded``/``denied``/``failed``; there is no column for it) is stored as
+``metadata["audit_outcome"]`` and the verified client id as ``metadata["actor_client_id"]``.
+Both keys are reserved: caller values under those names are replaced, so they cannot be spoofed,
+while every other caller key (for example a review decision ``outcome``) is kept unchanged.
+
 Recording needs no scope: denials are audited too (``access.denied``). Reading the trail is an
 owner/system operation.
 """
@@ -37,6 +42,8 @@ AuditOutcome = Literal["succeeded", "denied", "failed"]
 _ACTION_RE: Final = re.compile(r"^[a-z][a-z0-9_.:]{2,99}$")
 _TARGET_TYPE_RE: Final = re.compile(r"^[a-z][a-z0-9_.]{2,59}$")
 MAX_REASON_CHARS: Final = 1000
+AUDIT_OUTCOME_KEY: Final = "audit_outcome"
+ACTOR_CLIENT_KEY: Final = "actor_client_id"
 
 _LIST_SQL: Final = (
     "select id, workspace_id, actor_principal_id, actor_kind, actor_role, action, target_type,"
@@ -90,9 +97,10 @@ def safe_metadata(
     actor: ActorContext, metadata: Mapping[str, Any] | None, outcome: AuditOutcome
 ) -> dict[str, Any]:
     data = redact_metadata(metadata)
-    data["outcome"] = outcome
+    data.pop(ACTOR_CLIENT_KEY, None)  # reserved: only the verified actor supplies it
+    data[AUDIT_OUTCOME_KEY] = outcome
     if actor.client_id:
-        data["actor_client_id"] = redact(actor.client_id)[:200]
+        data[ACTOR_CLIENT_KEY] = redact(actor.client_id)[:200]
     return data
 
 

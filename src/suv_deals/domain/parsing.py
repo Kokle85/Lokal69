@@ -22,6 +22,11 @@ Binding rules (spec sections 2, 3, 7, 17, 31):
 - A first-registration month is never turned into an invented day (spec 7).
 - A zone-less source timestamp gets the documented source zone and ``zone_assumed=True``; it is
   never silently treated as UTC (spec 7).
+- Technical-inspection wording (HU/TÜV, Swiss MFK/expertise, Italian revisione) is a seller claim,
+  never a verified inspection; negated, expired or conditional wording is never positive.
+- Swiss price wording (``CHF``/``Fr.`` with apostrophe grouping and ``.-``/``.–`` endings, ``MWST``,
+  ``TVA``, ``Exportpreis``, ``Händlerpreis``) is parsed like DE/IT wording; the Swiss VAT rate is
+  only ever *recorded as stated*, never assumed.
 """
 
 from __future__ import annotations
@@ -1401,6 +1406,12 @@ _HU = (
 _MFK = r"(?:mfk|motorfahrzeugkontrolle)"
 _EXPD = r"expertis(?:é|ée|és|ées|ee|ees)\b"  # participle only; the noun "expertise" is not a claim
 _NOT_DATE_NEXT = r"(?! ?(?:im |am |ab |: ?)?[0-9])"
+# Words that may sit between a negation and the inspection wording ("nicht mehr ab MFK", "non è
+# ancora revisionata", "pas encore expertisée"). A closed list: "non fumatori, revisionata" is no
+# negation of the inspection.
+_DE_FILL = r"(?:(?:mehr|frisch|neu|direkt|ganz) ){0,2}"
+_IT_FILL = r"(?:(?:ancora|è|e|la|il|stata|stato|mai|più|piu) ){0,3}"
+_FR_FILL = r"(?:(?:encore|été|ete|du tout|jamais) ){0,2}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1430,7 +1441,7 @@ _INSPECTION_RULES: tuple[_InspectionRule, ...] = (
         "hu_tuv",
         rf"\b(?:ohne|kein(?:e[nr]?)?) (?:g[üu]ltige[nr]? )?{_HU}\b(?![-\u2013][^\W\d_])",
     ),
-    _irule("not_valid", "revisione", r"\b(?:senza|non) (?:la )?revision(?:e|at[ao])\b"),
+    _irule("not_valid", "revisione", rf"\b(?:senza|non) {_IT_FILL}revision(?:e|at[ao])\b"),
     _irule(
         "not_valid",
         "revisione",
@@ -1438,13 +1449,14 @@ _INSPECTION_RULES: tuple[_InspectionRule, ...] = (
     ),
     # Not freshly inspected for the sale (CH/FR: says nothing positive about current validity).
     _irule("not_fresh", "mfk", rf"\bvor (?:der )?{_MFK}\b"),
-    _irule("not_fresh", "mfk", rf"\bnicht (?:frisch )?ab (?:der )?{_MFK}\b"),
+    _irule("not_fresh", "mfk", rf"\bnicht {_DE_FILL}ab (?:der )?{_MFK}\b"),
+    _irule("not_fresh", "hu_tuv", rf"\b(?:ohne|kein(?:e[nr]?)?|nicht) (?:neue[rn]?|frische[rn]?) {_HU}\b"),
     _irule("not_fresh", "mfk", rf"\b(?:ohne|keine) (?:frische )?{_MFK}\b"),
     _irule("not_fresh", "mfk", rf"\bmuss (?:noch )?(?:zur|an die|in die) {_MFK}\b"),
-    _irule("not_fresh", "mfk", r"\bnicht (?:frisch )?vorgef[üu]hrt\b"),
+    _irule("not_fresh", "mfk", rf"\bnicht {_DE_FILL}vorgef[üu]hrt\b"),
     _irule("not_fresh", "mfk", rf"\b{_MFK} ?(?:ist )?f[äa]llig\b{_NOT_DATE_NEXT}"),
-    _irule("not_fresh", "collaudo", r"\b(?:senza|non) (?:il )?collaud(?:o|at[ao])\b|\bda collaudare\b"),
-    _irule("not_fresh", "mfk", rf"\bsans (?:l['\u2019] ?)?expertise\b|\b(?:non|pas) {_EXPD}"),
+    _irule("not_fresh", "collaudo", rf"\b(?:senza|non) {_IT_FILL}collaud(?:o|at[ao])\b|\bda collaudare\b"),
+    _irule("not_fresh", "mfk", rf"\bsans (?:l['\u2019] ?)?expertise\b|\b(?:non|pas) {_FR_FILL}{_EXPD}"),
     _irule("not_fresh", "mfk", r"\b[àa] expertiser\b|\bavant (?:l['\u2019] ?)?expertise\b"),
     # Stated expiry / next due date.
     _irule(
@@ -1502,12 +1514,17 @@ _INSPECTION_RULES: tuple[_InspectionRule, ...] = (
 # Wording that makes a fresh-inspection statement an offer instead of a fact
 # ("ab MFK auf Wunsch", "TÜV neu gegen Aufpreis", "MFK + CHF 500", "revisione su richiesta").
 _INSPECTION_CONDITIONAL = re.compile(
-    r"\bauf wunsch\b|\baufpreis\b|\bzuschlag\b|\bnach absprache\b|\bm(?:ö|oe?)glich\b|\boptional\b"
-    r"|\bwahlweise\b|\bfalls gew[üu]nscht\b|\b(?:su|a) richiesta\b|\bsupplemento\b|\bpossibile\b"
-    r"|\bsur demande\b|\ben option\b|\bsuppl[ée]ment\b|\bpossible\b|\bon request\b"
-    r"|\+ ?(?:chf|sfr|fr\.|eur\b|€)",
+    r"\bauf wunsch\b|\baufpreis\b|\bzuschlag\b|\bnach absprache\b|\bwahlweise\b|\bfalls gew[üu]nscht\b"
+    r"|\b(?:su|a) richiesta\b|\bsupplemento\b|\bsur demande\b|\ben option\b|\bsuppl[ée]ment\b"
+    r"|\bon request\b|\+ ?(?:chf|sfr|fr\.|eur\b|\u20ac)",
     re.IGNORECASE,
 )
+# "possible"-type wording only counts directly after the statement ("ab MFK möglich"), so an
+# unrelated "Probefahrt möglich" in the next sentence does not hide a real claim.
+_INSPECTION_POSSIBLE = re.compile(
+    r"^\W{0,3}(?:(?:ist|sind|è|e|est) )?(?:m(?:ö|oe?)glich|optional|possibile|possible)\b", re.IGNORECASE
+)
+_POSSIBLE_WINDOW = 20
 _CLAUSE_BREAK = re.compile(r"[!?;|\u2022\u00b7]")
 
 
@@ -1611,7 +1628,9 @@ def _is_conditional(text: str, start: int, end: int) -> bool:
     first = _CLAUSE_BREAK.search(after)
     if first is not None:
         after = after[: first.start()]
-    return _INSPECTION_CONDITIONAL.search(f"{before} {after}") is not None
+    if _INSPECTION_CONDITIONAL.search(f"{before} {after}") is not None:
+        return True
+    return _INSPECTION_POSSIBLE.search(text[end : end + _POSSIBLE_WINDOW]) is not None
 
 
 def _as_of_date(as_of: date) -> date:

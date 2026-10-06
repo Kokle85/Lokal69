@@ -28,7 +28,9 @@ Worker unit of work (spec 13 "Network I/O happens outside database transactions"
 If `jobs.complete` (or any fenced update) raises `LeaseLost`, the exception leaves the
 ``async with`` block, so the ENTIRE transaction (domain writes, downstream jobs, outbox rows)
 rolls back; a newer lease holder owns the work. Transient failures (serialization, deadlock,
-lock timeout) surface as `TransientConflict`; `retry_transient` re-runs a whole unit of work.
+lock timeout) surface as `TransientConflict` and statement timeouts as `StatementTimeout`;
+`retry_transient` re-runs a whole unit of work only for those two (never after an ambiguous
+connection loss during COMMIT).
 Database errors, including deferred-constraint failures at COMMIT, are mapped to `AppError`s.
 If the caller swallows a database error and leaves the block normally, PostgreSQL would turn the
 COMMIT into a silent ROLLBACK; the helpers raise `TransactionAborted` instead.
@@ -50,7 +52,7 @@ from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import TechnicalStatus
 from suv_deals.errors import AppError, NotFound, SourcePaused
 from suv_deals.persistence.database import Conn, Database, fetch_one
-from suv_deals.persistence.errors_map import LeaseLost, TransactionAborted, mapped_errors
+from suv_deals.persistence.errors_map import LeaseLost, TransactionAborted, is_rerunnable, mapped_errors
 from suv_deals.persistence.jobs import ClaimedJob, JobRecord, job_columns
 
 LOCK_ORDER: Final[tuple[str, ...]] = (
@@ -191,10 +193,14 @@ async def retry_transient[T](
     base_delay_seconds: float = 0.05,
     rng: random.Random | None = None,
 ) -> T:
-    """Re-run a whole unit of work on retryable failures (serialization, deadlock, lock timeout).
+    """Re-run a whole unit of work after a failure that PROVES it rolled back.
 
-    ``operation`` must open its own transaction each time. `LeaseLost` and other non-retryable
-    errors propagate immediately.
+    Only `TransientConflict` (serialization failure, deadlock, lock timeout) and
+    `StatementTimeout` are re-run: both abort the transaction before COMMIT. Everything else
+    propagates immediately, in particular `LeaseLost`, and `DependencyUnavailable` from a
+    connection lost during COMMIT, after which the commit may have succeeded: re-running a
+    non-idempotent unit of work then could duplicate its business effect. ``operation`` must
+    open its own transaction each time.
     """
     if attempts < 1:
         raise ValueError("attempts must be at least 1")
@@ -203,7 +209,7 @@ async def retry_transient[T](
         try:
             return await operation()
         except AppError as exc:
-            if isinstance(exc, LeaseLost) or not exc.retryable or attempt == attempts:
+            if not is_rerunnable(exc) or attempt == attempts:
                 raise
             await asyncio.sleep(jitter.uniform(0, base_delay_seconds * (2 ** (attempt - 1))))
     raise AssertionError("unreachable")  # pragma: no cover

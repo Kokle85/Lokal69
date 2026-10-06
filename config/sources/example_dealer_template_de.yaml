@@ -31,7 +31,7 @@ country: DE
 role: acquisition
 mode: public_html
 adapter: schemaorg_dealer
-adapter_version: schemaorg_dealer@1.0.0
+adapter_version: schemaorg_dealer@1.1.0
 enabled: false
 # The generic adapter code is fixture-verified against synthetic fixture sources, but this
 # template has no captured pages of any real dealer, so the source itself is untested.

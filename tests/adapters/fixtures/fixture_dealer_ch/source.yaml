@@ -6,7 +6,7 @@ country: CH
 role: acquisition
 mode: fixture
 adapter: schemaorg_dealer
-adapter_version: schemaorg_dealer@1.0.0
+adapter_version: schemaorg_dealer@1.1.0
 enabled: false
 technical_status: fixture_tested
 terms_status: unreviewed

@@ -122,13 +122,21 @@ from suv_deals.domain.listings import (
     sha256_json,
 )
 from suv_deals.domain.money import CURRENCY_EXPONENTS, Money
+from suv_deals.domain.parsing import (
+    MAX_INSPECTION_TEXT_LENGTH,
+    InspectionParse,
+    locale_for_country,
+    parse_inspection,
+)
 from suv_deals.domain.profiles import SearchProfile
 from suv_deals.domain.provenance import FieldConflict, FieldProvenance
 from suv_deals.domain.sources import SourceConfig
 from suv_deals.errors import ValidationFailed
 
 ADAPTER_KEY = "schemaorg_dealer"
-ADAPTER_VERSION = "schemaorg_dealer@1.0.0"
+# 1.1.0: technical-inspection wording (condition.roadworthy, documentation.inspection_expiry),
+# Swiss "ohne MWST"/"Export ohne MWST" and Swiss-French TVA/export price wording.
+ADAPTER_VERSION = "schemaorg_dealer@1.1.0"
 
 # Sanity bounds (ENGINEERING DEFAULTS), not business rules: values outside them are data errors.
 # 100 million major units keeps every supported currency (incl. MKD) far inside a bigint.
@@ -191,8 +199,9 @@ def _rx(*patterns: str) -> re.Pattern[str]:
 _GROSS_WORDING = _rx(
     r"inkl\.?\s*(\d{1,2}(?:[.,]\d)?\s*%\s*)?(mwst|mwst\.|ust|mehrwertsteuer)",
     r"inklusive\s+(\d{1,2}(?:[.,]\d)?\s*%\s*)?(mwst|mehrwertsteuer)",
-    r"incl\.?\s*(\d{1,2}(?:[.,]\d)?\s*%\s*)?vat",
+    r"incl\.?\s*(\d{1,2}(?:[.,]\d)?\s*%\s*)?(vat|tva)",
     r"including\s+vat",
+    r"\btva\s+(\d{1,2}(?:[.,]\d)?\s*%\s*)?(incluse|comprise)",
     r"iva\s+(inclusa|compresa)",
     r"\bprezzo\s+ivato\b",
     r"bruttopreis",
@@ -206,7 +215,11 @@ _NET_WORDING = _rx(
     r"preis\s+netto",
     r"\+\s*(\d{1,2}(?:[.,]\d)?\s*%\s*)?(mwst|iva|vat)\b",
     r"plus\s+vat",
-    r"excl\.?\s*vat",
+    r"excl\.?\s*(vat|tva)",
+    # Swiss "Export ohne MWST" / "Preis ohne MWST"; "ohne MWST-Ausweis" (VAT not shown) is not net.
+    r"\bohne\s+(mwst|mehrwertsteuer|ust)\b(?!\s?-?\s?ausweis)",
+    r"\bhors\s+tva\b",
+    r"\btva\s+en\s+sus\b",
     r"iva\s+esclusa",
     r"oltre\s+iva",
     r"\bhors\s+taxes?\b",
@@ -267,6 +280,8 @@ _EXPORT_PRICE = _rx(
     r"h[äa]ndler\s*-?\s*/?\s*exportpreis",
     r"prezzo\s+(per\s+(l'?)?)?export",
     r"export\s+price",
+    r"\bexport\s+ohne\s+(mwst|mehrwertsteuer|ust)\b",
+    r"\bprix\s+([àa]\s+l['\u2019]\s*)?export",
 )
 _SELLER_FEES = _rx(
     r"zzgl\.?\s+(überführung|ueberfuehrung|zulassung|bereitstellung)",
@@ -500,6 +515,11 @@ def _money_minor(amount: Decimal, currency: str) -> int | None:
         return Money.of(amount, currency).to_minor()
     except ValidationFailed:
         return None
+
+
+def _inspection_note(result: InspectionParse, text: str) -> str:
+    kind = "" if result.inspection_kind == "unknown" else f"{result.inspection_kind}: "
+    return f"{kind}{text}"
 
 
 # --------------------------------------------------------------------------- results
@@ -1329,6 +1349,7 @@ class SchemaOrgDealerAdapter:
         documentation = self._documentation(vehicle, col)
         co2 = self._co2(vehicle, page, col)
         condition = self._condition(vehicle, offer, seller_text.excerpt, col)
+        condition, documentation = self._inspection(page, condition, documentation, col)
         if (
             condition.damaged_vehicle == ClaimStatus.SELLER_CLAIMED
             and price.type == PriceType.FULL_VEHICLE_ASKING
@@ -2354,6 +2375,57 @@ class SchemaOrgDealerAdapter:
         return Documentation(
             vin=vin, vin_format_valid=valid, emissions_class=emissions, previous_owners=owners
         )
+
+    def _inspection(
+        self, page: PageView, condition: ConditionClaims, documentation: Documentation, col: _Collector
+    ) -> tuple[ConditionClaims, Documentation]:
+        """Technical-inspection wording in the visible page text (HU/TÜV, MFK/expertise, revisione).
+
+        Seller wording only: ``condition.roadworthy`` is at most ``seller_claimed`` and the stated
+        expiry is never a verified inspection result (spec 19). Negated ("ohne MFK", "nicht ab
+        MFK"), expired and conditional ("ab MFK auf Wunsch") wording is never positive. A stated
+        expiry before ``observed_at`` adds ``INSPECTION_EXPIRED``.
+        """
+        text = page.visible_text
+        if len(text) > MAX_INSPECTION_TEXT_LENGTH:
+            col.warn("INSPECTION_TEXT_TOO_LONG")  # never truncated: a cut could drop a negation
+            return condition, documentation
+        result = parse_inspection(text, locale_for_country(self.config.country), col.observed_at)
+        for code in result.warnings:
+            if code != "EMPTY_INPUT":
+                col.warn(code if code.startswith("INSPECTION_") else f"INSPECTION_{code}")
+        raw = "; ".join(result.evidence) or None
+        if result.roadworthy_claim != ClaimStatus.UNKNOWN:
+            col.prov(
+                "condition.roadworthy",
+                ExtractionMethod.REGEX,
+                Confidence.MEDIUM,
+                selector="visible_text",
+                raw=raw,
+                transformation=_inspection_note(result, "seller wording only; never a verified inspection"),
+            )
+            if result.roadworthy_claim == ClaimStatus.CONFLICTING:
+                col.conflict(
+                    "condition.roadworthy",
+                    list(result.evidence),
+                    ["visible_text"] * len(result.evidence),
+                    note="contradictory inspection wording",
+                )
+            condition = condition.model_copy(update={"roadworthy": result.roadworthy_claim})
+        expiry = result.inspection_expiry
+        if expiry.value is not None:
+            col.prov(
+                "documentation.inspection_expiry",
+                ExtractionMethod.REGEX,
+                Confidence.MEDIUM,
+                selector="visible_text",
+                raw=raw,
+                transformation=_inspection_note(
+                    result, f"stated expiry {expiry.value} ({expiry.precision.value}); seller wording"
+                ),
+            )
+            documentation = documentation.model_copy(update={"inspection_expiry": expiry})
+        return condition, documentation
 
     @staticmethod
     def _co2(vehicle: dict[str, Any], page: PageView, col: _Collector) -> Co2Info:

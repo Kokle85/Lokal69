@@ -9,6 +9,10 @@ and ``active`` require recorded evidence and a check time (enforced here and by 
 ``blocked`` or ``not_requested``; never ``active``) and never overwrites a gate that already
 exists. `list_gates` feeds ``doctor``, readiness/health and the MCP ``deals_health`` tool.
 Evidence is redacted (no secrets) before it is stored; every change is audited.
+
+System checks may record verification progress (``fixture_verified`` ... ``live_verified``) or a
+``blocked`` state, but ``active`` is an activation decision (spec 32: owner approval is part of
+the evidence) and needs ``config:admin``, which system principals never hold.
 """
 
 from __future__ import annotations
@@ -259,6 +263,8 @@ async def upsert_gate(  # noqa: PLR0917 - positional public contract (WP7a API)
     if not isinstance(capability, str) or not _CAPABILITY_RE.fullmatch(capability):
         raise ValidationFailed("capability must be a lower-case name")
     status = GateStatus(status)
+    if status == GateStatus.ACTIVE:
+        actor.require(Scope.CONFIG_ADMIN)  # activation is the owner's decision, never a system's
     clean_evidence = redact_metadata(evidence)
     if status in _EVIDENCE_REQUIRED and not clean_evidence:
         raise ValidationFailed("live_verified and active gates require recorded evidence")

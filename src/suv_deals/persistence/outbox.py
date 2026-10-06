@@ -6,9 +6,11 @@
   payload passes the notification payload guard and is stored with its SHA-256 hash; event
   identity (id, type, aggregate, payload, hash, dedup key, ``is_fixture``) is frozen by a trigger.
 - Fixtures never become deliverable (spec 18): a fixture event is inserted ``blocked``
-  (``FIXTURE_EVENT``, the CHECK constraint forbids any other open state); at claim time any
-  pending row that still looks like a fixture (payload ``fixture`` flag, or a fixture review
-  case aggregate) is refused and moved to ``blocked`` instead of being leased.
+  (``FIXTURE_EVENT``, the CHECK constraint forbids any other open state). A payload "looks like
+  a fixture" exactly as `domain.notifications.to_mcp_occurrence` decides it: a present, non-false
+  ``fixture`` marker, or a ``[SYNTHETIC FIXTURE]`` summary prefix. Such a payload is refused for a
+  real event at enqueue time; at claim time any pending row that still looks like a fixture (or
+  belongs to a fixture review case) is never leased and is moved to ``blocked`` instead.
 - `claim_events` leases due rows with ``FOR UPDATE SKIP LOCKED`` (one fresh token per row,
   ``attempts + 1``). Every lifecycle update (`begin_send`, `record_attempt`, `mark_*`) is fenced
   on id + ``state = 'sending'`` + token + owner + unexpired lease (database time); zero rows
@@ -43,7 +45,12 @@ from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import OutboxState, Scope
 from suv_deals.domain.listings import sha256_json
-from suv_deals.domain.notifications import FIXTURE_BLOCKER, MAX_PAYLOAD_BYTES, guard_payload
+from suv_deals.domain.notifications import (
+    FIXTURE_BLOCKER,
+    FIXTURE_SUMMARY_PREFIX,
+    MAX_PAYLOAD_BYTES,
+    guard_payload,
+)
 from suv_deals.errors import Forbidden, IdempotencyConflict, NotFound, ValidationFailed, VersionConflict
 from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit
@@ -206,9 +213,22 @@ _INSERT_SQL: Final = (
     " returning event_id"
 )
 _FIND_DEDUP_SQL: Final = (
-    "select event_id, event_type, aggregate_type, aggregate_id from ops.outbox"
+    "select event_id, event_type, aggregate_type, aggregate_id, is_fixture from ops.outbox"
     " where workspace_id = %(workspace_id)s and dedup_key = %(dedup_key)s"
 )
+
+
+def payload_looks_like_fixture(payload: Mapping[str, Any]) -> bool:
+    """The fixture test of `domain.notifications.to_mcp_occurrence`, applied before storage.
+
+    Any present marker other than ``None``/``False`` counts (``0``, ``"yes"``...), as does a
+    summary starting with ``[SYNTHETIC FIXTURE]`` (case-insensitive, leading whitespace ignored).
+    """
+    marker = payload.get("fixture")
+    if marker is not None and marker is not False:
+        return True
+    summary = payload.get("summary")
+    return isinstance(summary, str) and summary.lstrip().upper().startswith(FIXTURE_SUMMARY_PREFIX)
 
 
 async def enqueue_event(
@@ -249,8 +269,7 @@ async def enqueue_event(
         raise ValidationFailed("max_attempts must be between 1 and 50")
     body = dict(payload)
     guard_payload(body, max_bytes=MAX_PAYLOAD_BYTES)
-    marker = body.get("fixture", False)
-    if marker not in (False, None) and not is_fixture:
+    if payload_looks_like_fixture(body) and not is_fixture:
         raise ValidationFailed("a fixture payload must be stored as a fixture event")
     resolved_id = _resolve_event_id(event_id, body)
     params = {
@@ -279,11 +298,14 @@ async def enqueue_event(
             existing = await fetch_one(conn, _FIND_DEDUP_SQL, params)
             if existing is None:
                 continue
-            if (existing["event_type"], existing["aggregate_type"], existing["aggregate_id"]) != (
-                event_type,
-                aggregate_type,
-                aggregate_id,
-            ):
+            if (
+                existing["event_type"],
+                existing["aggregate_type"],
+                existing["aggregate_id"],
+                existing["is_fixture"],
+            ) != (event_type, aggregate_type, aggregate_id, bool(is_fixture)):
+                # Also refuses a real event whose key is held by a (blocked) fixture event: it
+                # would otherwise be silently swallowed and never delivered.
                 raise IdempotencyConflict("The dedup key is already used by a different event")
             return existing["event_id"], False
     raise TransientConflict("The outbox changed concurrently; retry")
@@ -306,18 +328,30 @@ def _resolve_event_id(event_id: UUID | None, payload: Mapping[str, Any]) -> UUID
 # Dispatch
 # --------------------------------------------------------------------------------------------
 
-_REFUSE_FIXTURES_SQL: Final = """
+# "Looks like a fixture" in SQL, identical to `payload_looks_like_fixture` (plus the row flag
+# and fixture review-case lineage). Shared by the refusal and the claim so a suspicious row can
+# never be leased, even if the refusal statement skipped it because another transaction held it.
+_SUSPICIOUS: Final = sql.SQL(
+    "(o.is_fixture"
+    " or (o.payload -> 'fixture' is not null"
+    "     and o.payload -> 'fixture' not in ('false'::jsonb, 'null'::jsonb))"
+    " or (pg_catalog.jsonb_typeof(o.payload -> 'summary') = 'string'"
+    "     and pg_catalog.starts_with(pg_catalog.upper(pg_catalog.regexp_replace("
+    "       o.payload ->> 'summary', '^[[:space:]]+', '')), %(fixture_prefix)s))"
+    " or (o.aggregate_type = 'review_case' and exists ("
+    "       select 1 from app.review_cases c"
+    "        where c.workspace_id = o.workspace_id and c.id = o.aggregate_id and c.is_fixture)))"
+)
+
+_REFUSE_FIXTURES_SQL: Final = sql.SQL(
+    """
 with suspicious as (
   select o.id
   from ops.outbox o
   where o.workspace_id = %(workspace_id)s
     and o.state in ('pending', 'retry_wait')
     and o.available_at <= now()
-    and (o.is_fixture
-         or coalesce(o.payload -> 'fixture', 'false'::jsonb) <> 'false'::jsonb
-         or (o.aggregate_type = 'review_case' and exists (
-               select 1 from app.review_cases c
-               where c.workspace_id = o.workspace_id and c.id = o.aggregate_id and c.is_fixture)))
+    and {suspicious}
   for update of o skip locked
 )
 update ops.outbox o
@@ -328,19 +362,21 @@ where o.id = suspicious.id
   and o.workspace_id = %(workspace_id)s
 returning o.event_id
 """
+).format(suspicious=_SUSPICIOUS)
 
 _CLAIM_SQL: Final = sql.SQL(
     """
 with picked as (
-  select id
-  from ops.outbox
-  where workspace_id = %(workspace_id)s
-    and state in ('pending', 'retry_wait')
-    and not is_fixture
-    and attempts < max_attempts
-    and available_at <= now()
-  order by available_at, id
-  for update skip locked
+  select o.id
+  from ops.outbox o
+  where o.workspace_id = %(workspace_id)s
+    and o.state in ('pending', 'retry_wait')
+    and not o.is_fixture
+    and o.attempts < o.max_attempts
+    and o.available_at <= now()
+    and not {suspicious}
+  order by o.available_at, o.id
+  for update of o skip locked
   limit %(limit)s
 )
 update ops.outbox o
@@ -349,13 +385,13 @@ set state = 'sending',
     lease_token = gen_random_uuid(),
     lease_expires_at = now() + %(lease)s::interval,
     last_heartbeat_at = now(),
-    attempts = attempts + 1
+    attempts = o.attempts + 1
 from picked
 where o.id = picked.id
   and o.workspace_id = %(workspace_id)s
 returning {columns}
 """
-).format(columns=_columns("o"))
+).format(columns=_columns("o"), suspicious=_SUSPICIOUS)
 
 _FENCE: Final = sql.SQL(
     " where workspace_id = %(workspace_id)s and id = %(id)s and state = 'sending'"
@@ -373,7 +409,10 @@ _RECORD_ATTEMPT_SQL: Final = sql.SQL(
     " update ops.outbox set send_attempted_at = case"
     "   when send_attempted_at is not null and send_attempted_at >= last_heartbeat_at"
     "     then send_attempted_at"
-    "   else coalesce(%(sent_at)s::timestamptz, clock_timestamp()) end"
+    # A send happens under THIS lease: never before the claim, never in the future. A backdated
+    # sent_at would make the reaper believe nothing was sent and resend blindly.
+    "   else least(greatest(coalesce(%(sent_at)s::timestamptz, clock_timestamp()), last_heartbeat_at),"
+    "     clock_timestamp()) end"
     "{fence} returning send_attempted_at)"
     " insert into ops.delivery_attempts (workspace_id, outbox_id, attempt_id, attempt_number,"
     " provider, sent_at, completed_at, external_receipt, response_code, error_code, error_detail,"
@@ -445,8 +484,12 @@ async def claim_events(
         raise ValidationFailed("lease_seconds must be between 0.05 and 3600")
     if not 1 <= limit <= 100:
         raise ValidationFailed("limit must be between 1 and 100")
-    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn:
-        await conn.execute(_REFUSE_FIXTURES_SQL, {"workspace_id": workspace_id, "blocker": FIXTURE_BLOCKER})
+    prefix = FIXTURE_SUMMARY_PREFIX.upper()
+    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
+        await conn.execute(
+            _REFUSE_FIXTURES_SQL,
+            {"workspace_id": workspace_id, "blocker": FIXTURE_BLOCKER, "fixture_prefix": prefix},
+        )
         rows = await fetch_all(
             conn,
             _CLAIM_SQL,
@@ -455,6 +498,7 @@ async def claim_events(
                 "owner": dispatcher_id,
                 "lease": timedelta(seconds=float(lease_seconds)),
                 "limit": limit,
+                "fixture_prefix": prefix,
             },
         )
     events = [ClaimedEvent.model_validate(r) for r in rows]
@@ -771,7 +815,8 @@ async def mark_owner_seen(
         raise ValidationFailed("unsupported read evidence")
     async with mapped_errors():
         cur = await conn.execute(
-            "update ops.outbox set owner_seen_at = least(%(seen)s::timestamptz, clock_timestamp())"
+            "update ops.outbox set owner_seen_at ="
+            " greatest(provider_accepted_at, least(%(seen)s::timestamptz, clock_timestamp()))"
             " where workspace_id = %(workspace_id)s and event_id = %(event_id)s"
             " and state = 'delivered' and provider_accepted_at is not null and owner_seen_at is null",
             {"workspace_id": actor.workspace_id, "event_id": event_id, "seen": _aware(seen_at)},
@@ -849,7 +894,7 @@ async def reap_expired_events(
         "delay": timedelta(seconds=retry_delay_seconds),
         "limit": limit,
     }
-    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn:
+    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
         rows = await fetch_all(conn, _REAP_SQL, params)
         exhausted = await fetch_all(conn, _EXHAUSTED_SQL, params)
     buckets: dict[str, list[UUID]] = {"retry_wait": [], "uncertain": [], "dead_letter": []}

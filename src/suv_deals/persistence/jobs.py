@@ -483,7 +483,7 @@ async def claim(
         missing = [t for t in types if JobType(t) not in payload_versions]
         if missing:
             raise ValidationFailed("payload_versions must list every claimed job type")
-    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn:
+    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
         for _ in range(_MAX_INCOMPATIBLE_PER_CLAIM):
             row = await fetch_one(
                 conn,
@@ -520,7 +520,7 @@ async def claim(
 async def heartbeat(db: Database, job: ClaimedJob, lease_seconds: float) -> bool:
     """Extend the caller's own unexpired lease. ``False`` means the lease is lost: stop working."""
     lease = _lease_duration(lease_seconds)
-    async with mapped_errors(), db.transaction(workspace_id=job.workspace_id) as conn:
+    async with mapped_errors(), db.transaction(workspace_id=job.workspace_id) as conn, mapped_errors():
         cur = await conn.execute(_HEARTBEAT_SQL, {**_fence(job), "lease": lease})
         return cur.rowcount == 1
 
@@ -687,7 +687,12 @@ async def cancel(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str |
 
 
 async def unblock(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str) -> JobRecord:
-    """Explicit operator action: move a ``blocked`` job back to ``queued`` (audited)."""
+    """Explicit operator action: move a ``blocked`` job back to ``queued`` (audited).
+
+    The job always gets at least one attempt (``attempts`` is lowered to ``max_attempts - 1``
+    when it was used up); otherwise it could never be claimed and reconciliation would
+    dead-letter it at once, silently defeating the operator's decision.
+    """
     if actor.principal_kind != "system":
         actor.require(Scope.CONFIG_ADMIN)
     async with mapped_errors():
@@ -701,6 +706,7 @@ async def unblock(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str)
             conn,
             sql.SQL(
                 "update ops.jobs set state = 'queued', available_at = clock_timestamp(),"
+                " attempts = least(attempts, max_attempts - 1),"
                 " blocker_code = null, blocker_detail = null, lease_owner = null,"
                 " lease_token = null, lease_expires_at = null, completed_at = null"
                 " where workspace_id = %(workspace_id)s and id = %(id)s and state = 'blocked'"
@@ -717,7 +723,12 @@ async def unblock(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str)
             "job",
             job_id,
             reason=reason,
-            metadata={"job_type": job.job_type.value, "blocker_code": job.blocker_code},
+            metadata={
+                "job_type": job.job_type.value,
+                "blocker_code": job.blocker_code,
+                "attempts_before": job.attempts,
+                "attempts_after": int(updated["attempts"]),
+            },
         )
     return JobRecord.model_validate(updated)
 
@@ -799,7 +810,7 @@ async def reap_expired(
     requeued: list[UUID] = []
     dead: list[UUID] = []
     by_type: dict[JobType, int] = {}
-    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn:
+    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
         rows = await fetch_all(
             conn,
             _REAP_SQL,
@@ -821,7 +832,7 @@ async def reconcile_exhausted(db: Database, workspace_id: UUID, *, limit: int = 
     """Dead-letter queued/retry_wait jobs with ``attempts >= max_attempts`` (never invisible)."""
     if not 1 <= limit <= 10_000:
         raise ValidationFailed("invalid reconciliation limit")
-    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn:
+    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
         rows = await fetch_all(conn, _RECONCILE_SQL, {"workspace_id": workspace_id, "limit": limit})
     return tuple(row["id"] for row in rows)
 

@@ -59,7 +59,7 @@ async def test_audit_events_are_redacted_and_bound_to_the_verified_actor(
     assert request_id == actor.request_id
     for leaked in ("eyJhbGci", "sk-live-SyntheticKey", "secret-path", "seller@example.com", "171 1234567"):
         assert leaked not in reason and leaked not in metadata
-    assert '"outcome": "succeeded"' in metadata and "SYNTHETIC" in metadata
+    assert '"audit_outcome": "succeeded"' in metadata and "SYNTHETIC" in metadata
     # The trail is append-only for every role (SV001), and suv_backend has no UPDATE grant at all.
     with pytest.raises(psycopg.Error, match=r"append-only|SV001"):
         seed.conn.execute("update ops.audit_events set reason = 'x' where id = %s", (audit_id,))

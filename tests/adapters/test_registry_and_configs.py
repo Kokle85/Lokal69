@@ -101,7 +101,7 @@ def test_roles_and_modes() -> None:
     assert all(registry.config(k).country == "MK" for k in ("pazar3_mk", "reklama5_mk"))
     assert registry.config("mobile_de_api").mode == SourceMode.OFFICIAL_API
     template = registry.config("example_dealer_template_de")
-    assert template.adapter == "schemaorg_dealer" and template.adapter_version == "schemaorg_dealer@1.0.0"
+    assert template.adapter == "schemaorg_dealer" and template.adapter_version == "schemaorg_dealer@1.1.0"
 
 
 def test_registry_builds_every_adapter_and_nothing_is_active() -> None:

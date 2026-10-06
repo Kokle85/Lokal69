@@ -1,7 +1,7 @@
 source_key: fixture_dealer_de
 designation: synthetic
 created: 2026-10-06
-parser_version: schemaorg_dealer@1.0.0
+parser_version: schemaorg_dealer@1.1.0
 description: >-
   Hand-written SYNTHETIC pages for a fictional German dealer on the reserved example-style host
   dealer.example. Not captured from any real website; no real vehicle, offer, person or business.

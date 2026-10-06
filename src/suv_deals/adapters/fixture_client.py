@@ -6,7 +6,7 @@ It never touches the network. Each fixture directory contains a `MANIFEST.yaml`:
 source_key: fixture_dealer_de
 designation: synthetic            # synthetic | real (real captures need retention permission)
 created: 2026-10-06
-parser_version: schemaorg_dealer@1.0.0
+parser_version: schemaorg_dealer@1.1.0
 description: ...
 files:                            # every fixture file with a description
   detail_normal.html: "..."

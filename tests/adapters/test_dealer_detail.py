@@ -66,7 +66,7 @@ async def test_normal_detail(de_adapter: SchemaOrgDealerAdapter, detail: DetailF
     assert listing.source_listing_id == "TEST-204"
     assert listing.canonical_url == f"{DE}/TEST-204"
     assert listing.observed_at == NOW
-    assert listing.parser_version == "schemaorg_dealer@1.0.0"
+    assert listing.parser_version == "schemaorg_dealer@1.1.0"
     assert listing.language == "de"
     assert listing.title == "Example Trail 2.0 Diesel 4x4"
     assert listing.seller_type == SellerType.DEALER

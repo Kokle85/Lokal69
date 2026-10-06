@@ -19,9 +19,15 @@ tests) is the only database identifier exposed, in `details`, for check/not-null
 | `42501` insufficient_privilege (RLS/grants) | row outside the workspace or missing grant | `Forbidden` |
 | `40001` / `40P01` serialization / deadlock | retry the whole transaction | `TransientConflict` (retryable) |
 | `55P03` lock_not_available (lock_timeout) | row busy | `TransientConflict` (retryable) |
-| `57014` query_canceled (statement_timeout) | too slow | `DependencyUnavailable` (retryable) |
+| `57014` query_canceled (statement_timeout) | too slow | `StatementTimeout` (DEPENDENCY_UNAVAILABLE, retryable) |
+| `25P02` in_failed_sql_transaction | an earlier error was swallowed | `TransactionAborted` (not retryable) |
 | `08xxx` / OperationalError | connection lost | `DependencyUnavailable` (retryable) |
 | anything else | unexpected | `AppError(INTERNAL_ERROR)` |
+
+Only `TransientConflict` and `StatementTimeout` prove that the transaction was rolled back, so
+only they may re-run a whole unit of work automatically (`transactions.retry_transient`). A lost
+connection (`DependencyUnavailable`) is ambiguous when it happens during COMMIT: the commit may
+have succeeded, so it is never retried blindly.
 """
 
 from __future__ import annotations
@@ -59,6 +65,7 @@ SERIALIZATION_FAILURE: Final = "40001"
 DEADLOCK_DETECTED: Final = "40P01"
 LOCK_NOT_AVAILABLE: Final = "55P03"
 QUERY_CANCELED: Final = "57014"
+IN_FAILED_TRANSACTION: Final = "25P02"
 
 _TRANSIENT: Final = frozenset({SERIALIZATION_FAILURE, DEADLOCK_DETECTED, LOCK_NOT_AVAILABLE})
 
@@ -95,6 +102,14 @@ class TransientConflict(AppError):
         super().__init__(ErrorCode.VERSION_CONFLICT, message, retryable=True, retry_after_seconds=1)
 
 
+class StatementTimeout(AppError):
+    """A statement inside the transaction hit ``statement_timeout`` (57014): the transaction
+    was aborted, so nothing was committed and the whole unit of work may be re-run."""
+
+    def __init__(self, message: str = "The database did not answer in time") -> None:
+        super().__init__(ErrorCode.DEPENDENCY_UNAVAILABLE, message, retryable=True, retry_after_seconds=2)
+
+
 def sqlstate_of(exc: BaseException) -> str | None:
     return exc.sqlstate if isinstance(exc, psycopg.Error) else None
 
@@ -104,6 +119,11 @@ def constraint_of(exc: BaseException) -> str | None:
         return None
     name = exc.diag.constraint_name
     return name if isinstance(name, str) and name else None
+
+
+def is_rerunnable(exc: BaseException) -> bool:
+    """True only for failures that prove the transaction rolled back (safe to re-run)."""
+    return isinstance(exc, TransientConflict | StatementTimeout)
 
 
 def is_retryable_db_error(exc: BaseException) -> bool:
@@ -173,12 +193,9 @@ def map_db_error(
             return TransientConflict("The record is busy; retry shortly")
         return TransientConflict()
     if state == QUERY_CANCELED:
-        return AppError(
-            ErrorCode.DEPENDENCY_UNAVAILABLE,
-            "The database did not answer in time",
-            retryable=True,
-            retry_after_seconds=2,
-        )
+        return StatementTimeout()
+    if state == IN_FAILED_TRANSACTION:
+        return TransactionAborted()
     if state.startswith("08") or isinstance(exc, psycopg.OperationalError):
         return DependencyUnavailable("The database is unavailable")
     return AppError(ErrorCode.INTERNAL_ERROR, "Database operation failed")
