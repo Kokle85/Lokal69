@@ -5,6 +5,9 @@ All pages are SYNTHETIC (fixtures/fixture_dealer_ch/MANIFEST.yaml or inline test
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+import pytest
 from tests.adapters.conftest import DetailFn, car_page, raw_document
 
 from suv_deals.adapters.dealer_inventory import SchemaOrgDealerAdapter
@@ -157,3 +160,51 @@ def test_swiss_french_export_and_inspection_wording(ch_adapter: SchemaOrgDealerA
 def test_vat_not_shown_wording_is_not_a_net_price(ch_adapter: SchemaOrgDealerAdapter) -> None:
     listing = _inline(ch_adapter, f"{CH}/40605", LD_CH, "<p>CHF 2'990.- ohne MWST-Ausweis.</p>")
     assert listing.price.basis != PriceBasis.NET
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_spec_table_negative_answer_is_never_positive(ch_adapter: SchemaOrgDealerAdapter) -> None:
+    # Visible text joins a definition list as "Ab MFK Nein": a "no" answer, not a fresh MFK.
+    listing = _inline(
+        ch_adapter,
+        f"{CH}/40606",
+        LD_CH,
+        "<dl><dt>Ab MFK</dt><dd>Nein</dd><dt>Garantie</dt><dd>Ja</dd></dl>",
+    )
+    assert listing.condition.roadworthy == ClaimStatus.UNKNOWN
+    assert "condition.roadworthy" not in listing.provenance
+    assert "INSPECTION_NOT_FRESH" in listing.warnings
+
+
+def test_italian_engine_overhaul_is_not_a_roadworthiness_claim(it_adapter: SchemaOrgDealerAdapter) -> None:
+    listing = _inline(
+        it_adapter,
+        f"{IT}/example-trail-it602",
+        LD_DE,
+        "<p>Motore revisionato, cambio automatico revisionato.</p>",
+    )
+    assert listing.condition.roadworthy == ClaimStatus.UNKNOWN
+    assert not any(w.startswith("INSPECTION_") for w in listing.warnings)
+
+
+@pytest.mark.parametrize(
+    ("fetched_at", "claim", "expired"),
+    [
+        # 2026-10-31 22:30 in Zurich: October, the stated month, is still running.
+        (datetime(2026, 10, 31, 21, 30, tzinfo=UTC), ClaimStatus.SELLER_CLAIMED, False),
+        # 2026-11-01 00:30 in Zurich (still 31 October in UTC): the MFK month has passed.
+        (datetime(2026, 10, 31, 23, 30, tzinfo=UTC), ClaimStatus.SELLER_DENIED, True),
+    ],
+)
+def test_expiry_is_compared_with_the_observation_day_in_the_source_zone(
+    ch_adapter: SchemaOrgDealerAdapter, fetched_at: datetime, claim: ClaimStatus, expired: bool
+) -> None:
+    document = raw_document(f"{CH}/40607", car_page(LD_CH, "<p>Occasion, MFK bis 10/2026.</p>"))
+    document = document.model_copy(update={"fetched_at": fetched_at})
+    parsed = ch_adapter.parse_detail(document)
+    assert parsed.listing is not None, parsed.errors
+    assert parsed.listing.condition.roadworthy == claim
+    assert ("INSPECTION_EXPIRED" in parsed.listing.warnings) is expired
+    assert parsed.listing.documentation.inspection_expiry.value == "2026-10"

@@ -59,9 +59,11 @@ All of this is **seller wording**. It is stored with provenance and is never a v
 | `ab Platz` | Sold as seen, collected at the dealer's yard | No price effect. The buyer arranges collection and transport. |
 | `ab MFK`, `frisch ab MFK`, `MFK neu`, `frisch vorgeführt` | Freshly passed the Swiss periodic inspection (MFK, Motorfahrzeugkontrolle) | `condition.roadworthy = seller_claimed` (never `verified`) |
 | `vor MFK`, `nicht ab MFK`, `ohne MFK`, `muss zur MFK` | Sold before or without a fresh inspection | **Never positive.** `roadworthy` stays `unknown`, warning `INSPECTION_NOT_FRESH` |
+| `Ab MFK: Nein`, `Ab MFK Nein` (spec table), `MFK neu: nein`, `ab MFK nicht möglich` | A "no" answer to the fresh-inspection field | **Never positive.** Same as above (`INSPECTION_NOT_FRESH`). `Ab MFK: Ja` stays a seller claim. |
 | `MFK abgelaufen` | The inspection is overdue | `seller_denied`, warning `INSPECTION_EXPIRED` |
 | `MFK bis 06/2026`, `nächste MFK 06/2028` | Next inspection due | `documentation.inspection_expiry`. A date before the observation month is `INSPECTION_EXPIRED` and never positive. |
 | `letzte MFK 2025`, `ab MFK 03.2025` | Date of the last inspection | Recorded as the last inspection, not as an expiry. Not positive by itself. |
+| `ab MFK vor 3 Jahren`, `expertisée il y a 2 ans`, `collaudata un anno fa` | Last inspection, relative to the unknown date the ad was written | **Never positive** (`conflicting` next to fresh wording). No date is derived. Warning `INSPECTION_DATE_RELATIVE`. |
 | `MFK 05.2024` (bare date) | Ambiguous: Swiss ads use this for the last inspection | No date is stored. Warning `INSPECTION_DATE_AMBIGUOUS`. |
 | `expertisé(e)`, `expertisée du jour` / `sans expertise`, `non expertisé` / `dernière expertise 2025` | The same in French (expertise = MFK) | Fresh / never positive / last inspection |
 | `collaudata` / `senza collaudo` | The same in Ticino Italian | Fresh / never positive (MFK wording when the locale is `ch`) |
@@ -69,14 +71,16 @@ All of this is **seller wording**. It is stored with provenance and is never a v
 
 The same parser also reads DE wording (`HU/AU neu`, `TÜV neu`, `HU bis 05/2027`, `TÜV 05/2027`,
 `HU 05/27`, `ohne TÜV`) and IT wording (`revisionata`, `revisione fino a 05/2027`,
-`revisione scaduta`, `senza revisione`). A two-digit year (`05/27`) becomes 20xx inside a sanity
+`revisione scaduta`, `senza revisione`). Italian overhaul wording such as `motore revisionato`
+(engine overhauled) or `revisione del cambio` is not inspection wording and is ignored. A two-digit year (`05/27`) becomes 20xx inside a sanity
 window around the observation date: at most 5 years ahead and 30 years back. Otherwise the date is
 `INSPECTION_DATE_IMPLAUSIBLE` and is not stored.
 
 Code: `domain/parsing.py` (`parse_inspection`, `parse_price`). The generic dealer adapter
 (`adapters/dealer_inventory.py`, `schemaorg_dealer@1.1.0`) fills `condition.roadworthy` and
 `documentation.inspection_expiry` from the visible page text with provenance (method `regex`,
-confidence `medium`). It adds `INSPECTION_EXPIRED` when the stated expiry is before `observed_at`.
+confidence `medium`). It adds `INSPECTION_EXPIRED` when the stated expiry is before `observed_at`
+(compared with the observation day in the source time zone, `Europe/Zurich` for Swiss sources).
 A seller's inspection wording is never an inspection report (spec 19: "needs inspection" and
 "needs documents" stay open until the owner holds the report).
 
@@ -104,15 +108,15 @@ Switzerland is **not** in the EU. Buying there differs from buying in DE or IT.
    evidence arrives. That is a cash deposit with refund risk (spec 17). The owner must get the
    arrangement **in writing from the seller**. It is never assumed from "Export" or "exkl. MWST"
    wording, and the Swiss VAT rate is never assumed.
-3. **Transit.** Every road route from Switzerland to North Macedonia leaves Switzerland through an EU
-   member state (DE, FR, IT or AT). A car bought in Switzerland is not EU goods, so it normally
+3. **Transit.** Every road route from Switzerland to North Macedonia crosses at least one EU member
+   state (DE, FR, IT or AT; a route via Liechtenstein continues through AT). A car bought in Switzerland is not EU goods, so it normally
    travels under a transit procedure (for example a T1 transit declaration with a guarantee) to the
    MK border office, as the forwarder arranges. The route may also cross non-EU states, for example
    Serbia. The forwarder or customs broker must confirm the procedure, the guarantee and the fee.
 4. **Truck or driven.** A truck needs a transport quote from the Swiss origin city. Driving needs
-   Swiss export plates and insurance that cover every transit country and the whole period. The
-   canton decides whether a valid MFK is required for export plates. A car sold `vor MFK` or
-   `ohne MFK` may have to go by truck.
+   Swiss export plates and insurance that cover every transit country and the whole period.
+   Ask the cantonal office that would issue the export plates (to be confirmed which one) whether
+   a valid MFK is required. A car sold `vor MFK` or `ohne MFK` may have to go by truck.
 5. **Origin.** The purchase country is never proof of origin. **A Swiss purchase does not give EU
    preferential origin for the MK import.** The tax engine (`domain/tax_engine.py`) takes origin
    only from an accepted origin proof (`TaxInputs.origin_proof`). Seller and dispatch countries never

@@ -2383,14 +2383,19 @@ class SchemaOrgDealerAdapter:
 
         Seller wording only: ``condition.roadworthy`` is at most ``seller_claimed`` and the stated
         expiry is never a verified inspection result (spec 19). Negated ("ohne MFK", "nicht ab
-        MFK"), expired and conditional ("ab MFK auf Wunsch") wording is never positive. A stated
-        expiry before ``observed_at`` adds ``INSPECTION_EXPIRED``.
+        MFK", "Ab MFK: Nein"), expired and conditional ("ab MFK auf Wunsch") wording is never
+        positive. A stated expiry before ``observed_at`` (its calendar day in the source time zone)
+        adds ``INSPECTION_EXPIRED``.
         """
         text = page.visible_text
         if len(text) > MAX_INSPECTION_TEXT_LENGTH:
             col.warn("INSPECTION_TEXT_TOO_LONG")  # never truncated: a cut could drop a negation
             return condition, documentation
-        result = parse_inspection(text, locale_for_country(self.config.country), col.observed_at)
+        # A stated expiry is a calendar date/month of the source's country: compare it with the
+        # observation day there, not in UTC ("MFK bis 10/2026" observed 2026-10-31T23:30Z is
+        # already November in Zurich). The zone was validated in __init__.
+        observed_local = col.observed_at.astimezone(ZoneInfo(self.config.source_timezone)).date()
+        result = parse_inspection(text, locale_for_country(self.config.country), observed_local)
         for code in result.warnings:
             if code != "EMPTY_INPUT":
                 col.warn(code if code.startswith("INSPECTION_") else f"INSPECTION_{code}")

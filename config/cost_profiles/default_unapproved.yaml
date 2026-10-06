@@ -139,8 +139,8 @@ assumptions:
       origin_country: CH
       note: "ch_purchase: applies only to vehicles bought in Switzerland"
     note: >-
-      ch_purchase. Every road route from Switzerland to North Macedonia leaves Switzerland through an EU
-      member state (DE, FR, IT or AT). A vehicle bought in Switzerland is not EU goods, so the forwarder
+      ch_purchase. Every road route from Switzerland to North Macedonia crosses at least one EU member
+      state (DE, FR, IT or AT). A vehicle bought in Switzerland is not EU goods, so the forwarder
       must state the transit procedure for the whole route (for example a T1 transit declaration with a
       guarantee up to the MK border office), its fee and guarantee cost, and any non-EU countries on the
       route (e.g. via Serbia). Needs a forwarder/customs broker quote; nothing assumed.

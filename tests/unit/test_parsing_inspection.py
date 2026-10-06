@@ -429,3 +429,169 @@ def test_occasion_wording_has_no_price_effect() -> None:
 )
 def test_swiss_french_negotiability(text: str, negotiable: Tristate) -> None:
     assert parse_price(text, "ch").negotiable == negotiable
+
+
+# ---------------------------------------------------------------------------------------------
+# Independent review regressions
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "locale"),
+    [
+        # Spec tables and forms: visible text joins the label and its value with a space.
+        ("Ab MFK: Nein", "ch"),
+        ("Ab MFK Nein", "ch"),
+        ("Ab MFK? Nein", "ch"),
+        ("Frisch ab MFK: nein", "ch"),
+        ("Ab MFK / nein", "ch"),
+        ("MFK neu: nein", "ch"),
+        ("Frisch vorgeführt: nein", "ch"),
+        ("TÜV neu: nein", "de"),
+        ("HU/AU neu: Nein", "de"),
+        ("Neuer TÜV: nein", "de"),
+        ("Expertisé: non", "ch"),
+        ("Expertisée - non", "ch"),
+        ("Revisionata: no", "it"),
+        ("Collaudata: no", "ch"),
+        ("ab MFK nicht möglich", "ch"),
+        ("TÜV neu ist nicht möglich", "de"),
+    ],
+)
+def test_negative_answer_after_fresh_wording_is_never_positive(text: str, locale: str) -> None:
+    result = parse_inspection(text, locale, AS_OF)  # type: ignore[arg-type]
+    assert result.roadworthy_claim == UNKNOWN
+    assert result.fresh_inspection is False
+    assert ParseWarning.INSPECTION_NOT_FRESH in result.warnings
+
+
+@pytest.mark.parametrize(
+    ("text", "locale"),
+    [
+        ("Ab MFK: Ja", "ch"),
+        ("TÜV neu: ja", "de"),
+        ("Expertisé: oui", "ch"),
+        ("Ab MFK, non fumeur", "ch"),
+        ("Expertisée non-fumeur", "ch"),
+        ("Auto revisionata, non fumatori", "it"),
+        ("Revisionata non fumatori", "it"),
+        ("Véhicule expertisé non accidenté", "ch"),
+        ("Revisionata non incidentata", "it"),
+        ("Expertisée non négociable", "ch"),
+    ],
+)
+def test_positive_answers_and_non_smoker_wording_stay_claims(text: str, locale: str) -> None:
+    result = parse_inspection(text, locale, AS_OF)  # type: ignore[arg-type]
+    assert result.roadworthy_claim == CLAIMED
+    assert result.fresh_inspection is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "motore revisionato",
+        "Motore completamente revisionato a 180000 km",
+        "cambio automatico revisionato",
+        "turbo revisionato, auto in ordine",
+        "testata revisionata",
+        "frizione appena revisionata",
+        "motore revisionato nel 2024",
+        "revisione completa del motore",
+        "revisione fatta al cambio",
+        "revisione motore",
+    ],
+)
+def test_italian_component_overhaul_is_not_inspection_wording(text: str) -> None:
+    # "revisionato" with a component means "overhauled", not "passed the periodic inspection".
+    result = parse_inspection(text, "it", AS_OF)
+    assert result.roadworthy_claim == UNKNOWN
+    assert result.inspection_kind == "unknown"
+    assert result.last_inspection.value is None
+    assert result.evidence == ()
+
+
+def test_component_overhaul_does_not_hide_a_real_inspection_statement() -> None:
+    both = parse_inspection("Motore revisionato, auto revisionata", "it", AS_OF)
+    assert (both.roadworthy_claim, both.evidence) == (CLAIMED, ("revisionata",))
+    dated = parse_inspection("Cambio revisionato, revisione fino a 05/2027", "it", AS_OF)
+    assert dated.inspection_expiry.value == "2027-05"
+    assert dated.roadworthy_claim == CLAIMED
+
+
+@pytest.mark.parametrize("text", ["TÜV 2000 km", "HU 2025 km", "TÜV 2030 kW", "HU 2028 €", "MFK 2024 CHF"])
+def test_year_followed_by_a_unit_is_a_quantity_not_a_date(text: str) -> None:
+    result = parse_inspection(text, "de", AS_OF)
+    assert result.inspection_expiry.value is None
+    assert result.roadworthy_claim == UNKNOWN
+    assert ParseWarning.INSPECTION_EXPIRED not in result.warnings
+
+
+def test_two_digit_year_past_the_window_ahead_is_a_past_expiry_not_a_lost_date() -> None:
+    # '99' cannot be 2099 (more than 5 years ahead): it is read as 1999, a past expiry. Reading it
+    # as an implausible 2099 instead would drop the date and let other fresh wording win (found by
+    # the property test with "ab MFK HU 12/99").
+    alone = parse_inspection("HU 05/99", "de", AS_OF)
+    assert (alone.inspection_expiry.value, alone.roadworthy_claim) == ("1999-05", DENIED)
+    with_fresh = parse_inspection("ab MFK, HU 12/99", "ch", AS_OF)
+    assert with_fresh.roadworthy_claim == ClaimStatus.CONFLICTING
+    assert ParseWarning.INSPECTION_EXPIRED in with_fresh.warnings
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["HU bis 05/1990", "TÜV neu, HU bis 05/1990", "MFK bis 1980", "revisione fino a 05/1985, revisionata"],
+)
+def test_stated_expiry_older_than_the_window_is_still_a_past_expiry(text: str) -> None:
+    # Too old to store as a date, but a stated expiry in the past is never a positive claim.
+    result = parse_inspection(text, "de", AS_OF)
+    assert result.inspection_expiry.value is None
+    assert ParseWarning.INSPECTION_DATE_IMPLAUSIBLE in result.warnings
+    assert ParseWarning.INSPECTION_EXPIRED in result.warnings
+    assert result.roadworthy_claim in (DENIED, ClaimStatus.CONFLICTING)
+    assert result.fresh_inspection is False
+
+
+def test_implausible_future_expiry_is_dropped_without_a_denial() -> None:
+    result = parse_inspection("HU bis 05/2040", "de", AS_OF)
+    assert result.inspection_expiry.value is None
+    assert result.roadworthy_claim == UNKNOWN
+    assert ParseWarning.INSPECTION_EXPIRED not in result.warnings
+
+
+@pytest.mark.parametrize(
+    ("text", "locale"),
+    [
+        ("ab MFK vor 3 Jahren", "ch"),
+        ("Ab MFK seit 2 Jahren", "ch"),
+        ("ab MFK vor ca. 2 Jahren", "ch"),
+        ("letzte MFK vor 4 Jahren", "ch"),
+        ("TÜV neu vor 2 Jahren", "de"),
+        ("HU/AU neu seit 2 Wochen", "de"),
+        ("expertisée il y a 3 ans", "ch"),
+        ("dernière expertise il y a 2 ans", "ch"),
+        ("revisionata 2 anni fa", "it"),
+        ("ultima revisione tre anni fa", "it"),
+        ("collaudata un anno fa", "ch"),
+    ],
+)
+def test_last_inspection_relative_to_an_unknown_writing_date_is_not_fresh(text: str, locale: str) -> None:
+    # "3 years ago" relative to when the ad was written: never a fresh inspection, no derived date.
+    result = parse_inspection(text, locale, AS_OF)  # type: ignore[arg-type]
+    assert result.roadworthy_claim == UNKNOWN
+    assert result.fresh_inspection is False
+    assert result.last_inspection.value is None and result.inspection_expiry.value is None
+    assert ParseWarning.INSPECTION_DATE_RELATIVE in result.warnings
+
+
+@pytest.mark.parametrize(
+    "text", ["ab MFK vor Auslieferung", "TÜV neu vor Übergabe", "Frisch ab MFK, Probefahrt vor 2 Tagen"]
+)
+def test_before_delivery_promises_and_unrelated_relative_dates_keep_the_claim(text: str) -> None:
+    assert parse_inspection(text, "ch", AS_OF).roadworthy_claim == CLAIMED
+
+
+@pytest.mark.parametrize("text", ["TÜV seit 2 Jahren abgelaufen", "MFK seit 3 Monaten überfällig"])
+def test_expired_since_wording_is_denied(text: str) -> None:
+    result = parse_inspection(text, "ch", AS_OF)
+    assert result.roadworthy_claim == DENIED
+    assert ParseWarning.INSPECTION_EXPIRED in result.warnings

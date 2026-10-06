@@ -53,6 +53,22 @@ NEGATED_FORMS = (
     "pas encore expertisée",
     "à expertiser",
     "expertise échue",
+    # Negative answers after fresh wording (spec tables/forms; review regression).
+    "Ab MFK: Nein",
+    "ab MFK nein",
+    "Ab MFK? Nein",
+    "MFK neu: nein",
+    "TÜV neu: nein",
+    "HU/AU neu: Nein",
+    "Expertisé: non",
+    "Revisionata: no",
+    "Collaudata: no",
+    "ab MFK nicht möglich",
+    # Last inspection relative to an unknown writing date (review regression).
+    "ab MFK vor 3 Jahren",
+    "TÜV neu vor 2 Jahren",
+    "expertisée il y a 2 ans",
+    "revisionata 2 anni fa",
 )
 POSITIVE_FORMS = ("ab MFK", "frisch ab MFK", "MFK neu", "TÜV neu", "HU/AU neu", "revisionata", "expertisé")
 FILLER_WORDS = (
@@ -198,3 +214,66 @@ def test_word_soup_respects_the_model_invariants(words: list[str], as_of: date) 
     assert result.roadworthy_claim != ClaimStatus.VERIFIED
     if result.fresh_inspection:
         assert result.roadworthy_claim == ClaimStatus.SELLER_CLAIMED
+
+
+IT_COMPONENTS = (
+    "motore",
+    "cambio",
+    "cambio automatico",
+    "turbo",
+    "testata",
+    "frizione",
+    "iniettori",
+    "pompa",
+)
+NEUTRAL_WORDS = (
+    "Occasione",
+    "km",
+    "120000",
+    "tagliando",
+    "fatto",
+    "ottime",
+    "condizioni",
+    "2024",
+    "nel",
+    "a",
+)
+
+
+@settings(max_examples=300)
+@given(
+    component=st.sampled_from(IT_COMPONENTS),
+    adverb=st.sampled_from(["", "completamente ", "appena ", "già "]),
+    ending=st.sampled_from(["revisionato", "revisionata", "revisionati", "revisionate"]),
+    before=st.lists(st.sampled_from(NEUTRAL_WORDS), max_size=4),
+    after=st.lists(st.sampled_from(NEUTRAL_WORDS), max_size=4),
+    case=st.integers(min_value=0, max_value=3),
+    as_of=AS_OF,
+)
+def test_italian_component_overhaul_is_never_an_inspection_claim(
+    component: str, adverb: str, ending: str, before: list[str], after: list[str], case: int, as_of: date
+) -> None:
+    phrase = _case(f"{component} {adverb}{ending}", case)
+    text = " ".join(p for p in (_filler(before), phrase, _filler(after)) if p)
+    result = parse_inspection(text, "it", as_of)
+    assert result.roadworthy_claim == ClaimStatus.UNKNOWN, text
+    assert result.fresh_inspection is False
+
+
+@settings(max_examples=300)
+@given(
+    template=st.sampled_from(
+        ["HU bis {mm}/{yyyy}", "TÜV {mm}/{yyyy}", "MFK bis {mm}/{yyyy}", "revisione fino a {mm}/{yyyy}"]
+    ),
+    as_of=AS_OF,
+    years_back=st.integers(min_value=1, max_value=80),
+    fresh=st.sampled_from(["", "ab MFK", "TÜV neu", "revisionata", "expertisé"]),
+)
+def test_four_digit_past_expiry_blocks_a_claim_even_outside_the_window(
+    template: str, as_of: date, years_back: int, fresh: str
+) -> None:
+    # A stated expiry in the past, however old (stored or not), is never a positive claim.
+    text = template.format(mm=f"{as_of.month:02d}", yyyy=f"{as_of.year - years_back:04d}")
+    result = parse_inspection(f"{fresh} {text}".strip(), "de", as_of)
+    assert result.roadworthy_claim not in (ClaimStatus.SELLER_CLAIMED, ClaimStatus.VERIFIED), text
+    assert ParseWarning.INSPECTION_EXPIRED in result.warnings
