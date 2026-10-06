@@ -275,7 +275,7 @@ class DbBudgetGate:
         delay = self._crawl_delays.get(host)
         usage = self.run_usage(request.source_key)
         refill = (Decimal(1) / effective_delay_seconds(budget, delay)).quantize(Decimal("0.00000001"))
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn:
+        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
             hosts = sorted(await self._hosts_of(conn, request.source_key) | {host})
             await conn.execute(
                 _ENSURE_ROW_SQL,
@@ -338,7 +338,7 @@ class DbBudgetGate:
         host = _host(request.host)
         delay = self._crawl_delays.get(host)
         result: OutcomeResult | None = None
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn:
+        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
             row = await fetch_one(conn, _LOCK_ONE_SQL, {"workspace_id": self._workspace_id, "host": host})
             if row is None:
                 return
@@ -367,7 +367,7 @@ class DbBudgetGate:
     # ------------------------------------------------------------------ reads and operator actions
 
     async def host_state(self, source_key: str, host: str) -> HostBudgetState | None:
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn:
+        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
             row = await fetch_one(
                 conn, _READ_ONE_SQL, {"workspace_id": self._workspace_id, "host": _host(host)}
             )
@@ -375,7 +375,7 @@ class DbBudgetGate:
 
     async def daily_usage(self, source_key: str) -> DailyUsage:
         """Source-wide usage for today's UTC day (database time), across all of its hosts."""
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn:
+        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
             hosts = sorted(await self._hosts_of(conn, source_key))
             now = await _db_clock(conn)
             row = await fetch_one(
@@ -397,7 +397,7 @@ class DbBudgetGate:
         if actor.workspace_id != self._workspace_id:
             raise NotFound("Host budget not found")
         name = _host(host)
-        async with mapped_errors(), self._db.transaction(actor) as conn:
+        async with mapped_errors(), self._db.transaction(actor) as conn, mapped_errors():
             row = await fetch_one(conn, _LOCK_ONE_SQL, {"workspace_id": self._workspace_id, "host": name})
             if row is None:
                 raise NotFound("Host budget not found")
