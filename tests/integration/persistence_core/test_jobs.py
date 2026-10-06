@@ -216,7 +216,7 @@ async def test_crash_before_commit_returns_the_job_through_the_reaper(
     expire_job_lease(seed, job_id)
     reaped = await jobs.reap_expired(db, ws, retry_delay_seconds=0)
     assert reaped.requeued == (job_id,) and reaped.dead_lettered == ()
-    assert reaped.expired_by_type == {JobType.VALUATION: 1}
+    assert reaped.expired_by_type == {JobType.VALUATION: 1} and reaped.dead_lettered_by_type == {}
     row = job_row(seed, job_id)
     assert row["state"] == "retry_wait" and row["lease_token"] is None and row["lease_owner"] is None
     assert row["last_error_code"] == "LEASE_EXPIRED" and "worker-crash" in row["last_error_detail"]
@@ -412,6 +412,7 @@ async def test_expired_lease_without_attempts_left_is_dead_lettered(
     expire_job_lease(seed, job_id)
     reaped = await jobs.reap_expired(db, ws)
     assert reaped.dead_lettered == (job_id,) and reaped.requeued == ()
+    assert reaped.dead_lettered_by_type == {JobType.VALUATION: 1} == reaped.expired_by_type
     row = job_row(seed, job_id)
     assert row["state"] == "dead_letter" and row["completed_at"] is not None and row["lease_token"] is None
 

@@ -343,7 +343,11 @@ class ThresholdView(ViewModel):
         return self
 
     @classmethod
-    def of(cls, evaluation: ThresholdEvaluation, *, figures_visible: bool) -> ThresholdView:
+    def of(
+        cls, evaluation: ThresholdEvaluation, *, figures_visible: bool, alert_allowed: bool = True
+    ) -> ThresholdView:
+        """``alert_allowed`` is the valuation's own eligibility: a stale, fixture or otherwise
+        non-alertable valuation never shows an alert-eligible threshold."""
         status: Literal["unapproved", "approved"] = (
             "approved" if evaluation.approval_status == "approved" else "unapproved"
         )
@@ -361,7 +365,9 @@ class ThresholdView(ViewModel):
             proposed_only=evaluation.proposed_only,
             would_meet=evaluation.would_meet if figures_visible else None,
             would_meet_by_scenario=by_scenario,
-            alert_eligible=evaluation.alert_eligible and status == "approved" and figures_visible,
+            alert_eligible=(
+                evaluation.alert_eligible and status == "approved" and figures_visible and alert_allowed
+            ),
             blockers=evaluation.blockers[:50],
         )
 
@@ -549,6 +555,10 @@ class ValuationView(ViewModel):
             raise ValueError(f"a {self.state.value} valuation shows base and conservative contributions")
         if self.is_fixture and (self.fixture_label is None or self.alert_eligible):
             raise ValueError("fixture valuations are labelled and never alert eligible")
+        if self.alert_eligible and self.state not in _FIGURE_STATES:
+            raise ValueError(f"a {self.state.value} valuation is never alert eligible")
+        if self.threshold is not None and self.threshold.alert_eligible and not self.alert_eligible:
+            raise ValueError("the threshold cannot be alert eligible when the valuation is not")
         if (self.state == ValuationState.STALE) != (self.stale_at is not None):
             raise ValueError("stale_at is set exactly when the state is stale")
         names = [s.scenario for s in self.scenarios]
@@ -620,7 +630,11 @@ class ValuationView(ViewModel):
             threshold=(
                 None
                 if scenarios is None
-                else ThresholdView.of(scenarios.threshold, figures_visible=figures_visible)
+                else ThresholdView.of(
+                    scenarios.threshold,
+                    figures_visible=figures_visible,
+                    alert_allowed=valuation.alert_eligible,
+                )
             ),
             material_support=None if scenarios is None else scenarios.material_support,
             unsupported_material=() if scenarios is None else scenarios.unsupported_material[:50],

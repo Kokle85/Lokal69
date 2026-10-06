@@ -404,7 +404,7 @@
           "field_provenance": {
             "items": {
               "additionalProperties": false,
-              "description": "Where one normalized field came from. ``confidence`` is extraction reliability only.",
+              "description": "Where one normalized field came from (spec 7). ``confidence`` is extraction reliability only.\n\n``source_url`` is the page the value was read from; it is omitted (null) unless it is a safe\nabsolute http(s) link without credentials.",
               "properties": {
                 "claim_status": {
                   "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
@@ -486,6 +486,13 @@
                     "null"
                   ]
                 },
+                "source_url": {
+                  "maxLength": 2048,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "transformation": {
                   "maxLength": 200,
                   "type": [
@@ -503,6 +510,7 @@
                 "selector",
                 "raw_text",
                 "transformation",
+                "source_url",
                 "snapshot_id",
                 "evidence_id",
                 "observed_at"

@@ -7,6 +7,7 @@ specification itself, so the exported schemas cannot drift from the acceptance c
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -556,3 +557,117 @@ def test_pydantic_errors_hide_submitted_values() -> None:
             {"case_id": UID, "claim_token": secret, "idempotency_key": KEY}
         )
     assert secret not in str(info.value)
+
+
+# =========================================================================== review regressions
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1759744800",  # epoch seconds in a string: pydantic alone reads this as 2025-10-06
+        "1759744800.5",
+        "2026-10-06 10:00:00Z",  # space separator
+        "2026-10-06T10:00Z",  # no seconds
+        "2026-10-06T10:00:00+0200",  # offset without a colon
+        "2026-10-06",
+        " 2026-10-06T10:00:00Z",
+    ],
+)
+def test_changed_since_is_strict_rfc3339(value: str) -> None:
+    invalid("deals_list_candidates", changed_since=value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-10-06T10:00:00Z", "2026-10-06T10:00:00Z"),
+        ("2026-10-06t12:00:00+02:00", "2026-10-06T10:00:00Z"),
+        ("2026-10-06T10:00:00.250-00:00", "2026-10-06T10:00:00.250000Z"),
+    ],
+)
+def test_changed_since_accepts_rfc3339(value: str, expected: str) -> None:
+    model = validate_tool_input("deals_list_candidates", {"changed_since": value})
+    assert isinstance(model, DealsListCandidatesInput)
+    assert model.filters()["changed_since"] == expected
+
+
+@pytest.mark.parametrize(
+    ("changes", "field"),
+    [
+        ({"reason_codes": ["SAME", "SAME"]}, "reason_codes"),
+        ({"evidence_ids": [UID, UID]}, "evidence_ids"),
+        ({"summary": "<thinking>hidden</thinking> watch"}, "summary"),
+        ({"model_run_id": "run\x07id"}, "model_run_id"),
+    ],
+)
+def test_domain_rule_failures_name_the_field(changes: dict[str, Any], field: str) -> None:
+    # Regression: domain-rule failures used to report only "arguments", hiding the bad field.
+    args = {**VALID["reviews_submit"], **changes}
+    with pytest.raises(ValidationFailed) as info:
+        validate_tool_input("reviews_submit", args)
+    assert info.value.details["fields"] == [field]
+    rendered = json.dumps(info.value.to_payload())
+    assert "hidden" not in rendered and TOKEN not in rendered  # names only, never values
+
+
+# =========================================================================== schema vs validator
+
+_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$")
+
+
+def _rfc3339_date_time(value: object) -> bool:
+    return not isinstance(value, str) or _RFC3339.fullmatch(value) is not None
+
+
+#: Arguments the published schema must reject (expressible in JSON Schema) - and so must we.
+STRUCTURALLY_INVALID: list[tuple[str, dict[str, Any]]] = [
+    *[(name, {**args, "unexpected_field": 1}) for name, args in VALID.items()],
+    *[(name, {**VALID[name], "limit": bad}) for name in PAGINATED for bad in (0, 101, "25", True, None)],
+    *[(name, {**VALID[name], "cursor": "c" * 2049}) for name in PAGINATED],
+    *[(name, {**VALID[name], field: "not-a-uuid"}) for name, field in ID_FIELDS.items()],
+    *[(name, {**VALID[name], "idempotency_key": "short"}) for name in WITH_KEY],
+    ("reviews_submit", {**VALID["reviews_submit"], "reason_codes": []}),
+    ("reviews_submit", {**VALID["reviews_submit"], "summary": "too short"}),
+    ("reviews_submit", {**VALID["reviews_submit"], "outcome": "buy"}),
+    ("reviews_submit", {**VALID["reviews_submit"], "evidence_ids": [UID, UID]}),
+    ("reviews_release", {**VALID["reviews_release"], "claim_token": "t" * 19}),
+    ("deals_list_candidates", {"country": "de"}),
+    ("deals_list_candidates", {"status": "claimed"}),
+    ("deals_list_candidates", {"changed_since": "1759744800"}),
+    ("deals_get_candidate", {**VALID["deals_get_candidate"], "revision": 0}),
+    ("sources_pause", {**VALID["sources_pause"], "reason": "ab"}),
+]
+
+#: Arguments both must accept.
+VALID_VARIANTS: list[tuple[str, dict[str, Any]]] = [
+    *VALID.items(),
+    ("deals_list_candidates", {"profile": "manual_4000", "country": "IT", "status": "watch", "limit": 100}),
+    ("deals_list_candidates", {"changed_since": "2026-10-06T10:00:00+02:00", "cursor": None}),
+    ("deals_get_candidate", {**VALID["deals_get_candidate"], "revision": 3}),
+    ("deals_get_comparables", {**VALID["deals_get_comparables"], "include_excluded": True, "limit": 1}),
+    ("reviews_list_pending", {"include_needs_information": False, "cursor": "opaque"}),
+    ("reviews_submit", {**VALID["reviews_submit"], "valuation_id": None, "model_run_id": None}),
+    ("reviews_submit", {**VALID["reviews_submit"], "valuation_id": UID, "missing_information": ["VIN"]}),
+]
+
+
+def _schema_errors(name: str, args: dict[str, Any]) -> list[str]:
+    jsonschema = pytest.importorskip("jsonschema")
+    checker = jsonschema.FormatChecker()
+    checker.checks("date-time")(_rfc3339_date_time)
+    validator = jsonschema.Draft202012Validator(tool_input_schema(name), format_checker=checker)
+    return [error.message for error in validator.iter_errors(args)]
+
+
+@pytest.mark.parametrize(("name", "args"), VALID_VARIANTS)
+def test_schema_and_validator_accept_the_same_valid_arguments(name: str, args: dict[str, Any]) -> None:
+    assert not _schema_errors(name, args), _schema_errors(name, args)
+    validate_tool_input(name, args)
+
+
+@pytest.mark.parametrize(("name", "args"), STRUCTURALLY_INVALID)
+def test_schema_and_validator_reject_the_same_structural_errors(name: str, args: dict[str, Any]) -> None:
+    assert _schema_errors(name, args), f"published schema accepts invalid {name} arguments"
+    with pytest.raises(ValidationFailed):
+        validate_tool_input(name, args)

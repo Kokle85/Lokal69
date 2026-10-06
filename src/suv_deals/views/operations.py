@@ -1,7 +1,9 @@
 """Operational read models: health, readiness, sources, overview, settings, identity and outbox.
 
 - Health and readiness never contain secrets, connection strings or URLs with credentials
-  (spec 20, 30). ``HealthView`` refuses any string that looks like one.
+  (spec 20, 30). Free text written by people (gate notes, readiness details, gap reasons) is
+  redacted when it looks like a credential; ``HealthView``/``ReadinessView`` still refuse any
+  other string that does, as a backstop.
 - Terms status/decision stay separate from technical status (spec 5): a recorded terms decision
   is an audit of the owner's choice, not legal permission.
 - Activation gates use the honest completion states of spec 32.
@@ -17,7 +19,7 @@ from enum import StrEnum
 from typing import Any, Final, Literal
 from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from suv_deals.domain.enums import (
     AccessState,
@@ -64,6 +66,22 @@ _FORBIDDEN_TEXT: Final = re.compile(
 )
 
 
+REDACTED_TEXT: Final = "[redacted: text resembled a credential]"
+
+
+def redact_secrets(value: str) -> str:
+    """The text, or a fixed marker when it looks like a credential (the text is never echoed).
+
+    Free-text fields written by people (gate notes, readiness details, gap reasons) are redacted
+    rather than refused, so one unlucky phrase cannot take ``deals_health`` or ``/readyz`` down.
+    """
+    return REDACTED_TEXT if _FORBIDDEN_TEXT.search(value) else value
+
+
+def _redact_optional(value: str | None) -> str | None:
+    return None if value is None else redact_secrets(value)
+
+
 def _walk_strings(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -86,6 +104,11 @@ class GateView(ViewModel):
     next_action: str | None = Field(max_length=2000)
     checked_at: UtcDatetime | None
 
+    @field_validator("dependency", "required_evidence", "owner", "next_action")
+    @classmethod
+    def _redact(cls, value: str | None) -> str | None:
+        return _redact_optional(value)
+
     @property
     def is_blocker(self) -> bool:
         return self.status != GateStatus.ACTIVE
@@ -101,6 +124,11 @@ class ReadinessCheck(ViewModel):
     name: Literal["database", "schema", "config"]
     status: ComponentState
     detail: str | None = Field(max_length=300)
+
+    @field_validator("detail")
+    @classmethod
+    def _redact(cls, value: str | None) -> str | None:
+        return _redact_optional(value)
 
 
 class BuildInfo(ViewModel):
@@ -136,6 +164,11 @@ class SourceCoverageView(ViewModel):
     last_complete_traversal_at: UtcDatetime | None
     incomplete_since: UtcDatetime | None
     gap_reasons: tuple[str, ...] = Field(max_length=50)
+
+    @field_validator("gap_reasons")
+    @classmethod
+    def _redact(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(redact_secrets(reason) for reason in value)
 
     @model_validator(mode="after")
     def _state(self) -> SourceCoverageView:

@@ -269,6 +269,14 @@ ops.jobs row -> app.sources -> app.listings -> app.listing_revisions
 - `current_revision_id` and the `(current_generation, current_observation_id)` pointer are
   `DEFERRABLE INITIALLY DEFERRED`. A revision and its promotion may be written in either
   order inside one transaction.
+- Extended order used by the persistence core: API/MCP mutations take
+  `ops.idempotency_records` first; `ops.audit_events` and `ops.delivery_attempts` are
+  insert-only and written last; `ops.host_budgets`, `ops.query_snapshots` and
+  `ops.activation_gates` are only touched in their own short transactions.
+- `Database.transaction` raises `TransactionFailed` instead of letting PostgreSQL silently
+  turn COMMIT into ROLLBACK after a swallowed error, and only converts connection-class
+  errors (SQLSTATE 08xxx / none) into `DependencyUnavailable`; lock, serialization and
+  timeout errors propagate to `persistence.errors_map`.
 
 ## 5. Append-only history
 

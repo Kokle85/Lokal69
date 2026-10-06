@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     mcp_oauth_client_secret: SecretStr | None = None
     mcp_cursor_signing_secret: SecretStr | None = None
     mcp_allowed_origins: str = ""  # comma-separated
+    # Dashboard API CORS allow-list (comma-separated origins). Empty = origin of APP_BASE_URL only.
+    api_allowed_origins: str = ""
 
     scheduler_interval_seconds: int = Field(default=900, ge=60)
     source_network_enabled: bool = False

@@ -19,13 +19,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from suv_deals.domain.enums import ProfileKey, ReviewOutcome, Scope
 from suv_deals.errors import HTTP_STATUS, AppError, ErrorCode, ValidationFailed
 from suv_deals.mcp.schemas import (
+    AwareDatetime,
     CaseVersion,
     ClaimToken,
     Cursor,
@@ -52,6 +53,7 @@ from suv_deals.mcp.schemas import (
     SummaryText,
     ToolInput,
     ValuationIdRef,
+    validation_error_fields,
 )
 from suv_deals.views.candidates import CandidateDetail, CandidateListView
 from suv_deals.views.common import (
@@ -61,6 +63,7 @@ from suv_deals.views.common import (
     UtcDatetime,
     ViewModel,
     envelope_model_for,
+    is_valid_request_id,
 )
 from suv_deals.views.comparables import ComparableSetView
 from suv_deals.views.notes import NoteView, RecheckRequestResult
@@ -93,8 +96,8 @@ def _to_input[InputT: ToolInput](model: type[InputT], data: Mapping[str, Any], n
     try:
         return model.model_validate(dict(data))
     except ValidationError as exc:
-        fields = sorted({".".join(str(p) for p in err["loc"]) or "request" for err in exc.errors()})
-        raise ValidationFailed(f"Invalid {name} request", details={"fields": fields[:20]}) from None
+        fields = validation_error_fields(exc, root="request")
+        raise ValidationFailed(f"Invalid {name} request", details={"fields": fields}) from None
 
 
 # --------------------------------------------------------------------------- query models
@@ -112,7 +115,7 @@ class CandidateListQuery(ApiQuery):
     profile: ProfileKey | None = None
     country: Annotated[str, Field(pattern=r"^[A-Z]{2}$")] | None = None
     status: Literal["pending", "needs_information", "watch", "shortlisted", "rejected"] | None = None
-    changed_since: datetime | None = None
+    changed_since: AwareDatetime | None = None  # RFC 3339 with an offset, exactly as for MCP
 
     def to_tool_input(self) -> DealsListCandidatesInput:
         data = self.model_dump(exclude_none=True)
@@ -250,7 +253,13 @@ class ApiErrorResponse(ViewModel):
 
 
 def api_error(error: AppError, *, request_id: str, as_of: datetime) -> tuple[int, ApiErrorResponse]:
-    """HTTP status (``errors.HTTP_STATUS``) and safe body for an ``AppError``."""
+    """HTTP status (``errors.HTTP_STATUS``) and safe body for an ``AppError``.
+
+    Building the error body never fails: a malformed ``request_id`` (it may come from a client
+    header) is replaced by a fresh server-generated id.
+    """
+    if not is_valid_request_id(request_id):
+        request_id = f"req-{uuid4().hex}"
     body = ApiErrorResponse(
         request_id=request_id,
         as_of=as_of,

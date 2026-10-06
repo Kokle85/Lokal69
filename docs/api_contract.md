@@ -87,6 +87,8 @@ Every `/api/*` success body (and every MCP tool result) is a `ResponseEnvelope`:
 - External source links carry `rel: "noopener noreferrer"` and must open without access to the
   app's window.
 - `warnings[]` items have a typed `code` (`views.common.WarningCode`) and a readable `message`.
+  At most 50 distinct warnings are returned; beyond that the 50th is a `PARTIAL_RESULTS` warning
+  saying how many were omitted (a long warning list never fails the response).
 - All views are closed objects (unknown fields never appear) and every declared key is present.
 
 ## 3. Errors
@@ -112,7 +114,11 @@ Failed `/api/*` requests return `ApiErrorResponse`:
 MCP tools return the same `ToolError` payload in an `isError: true` result (HTTP 200 on the MCP
 transport); protocol problems (unknown tool, malformed JSON-RPC) are JSON-RPC errors instead.
 Messages and details are safe: no SQL, tokens, cookies, credential-bearing URLs or stack traces.
-`retry_after_seconds` accompanies `RATE_LIMITED` when known (`Retry-After` header too).
+`retry_after_seconds` accompanies `RATE_LIMITED` when known (`Retry-After` header too); it is
+clamped to 0-86,400 seconds. Validation failures list the failing field names in
+`details.fields` (including fields that break a domain rule, such as duplicate reason codes),
+never the submitted values. Rendering an error never fails: a malformed correlation id is
+omitted, and a malformed request id is replaced by a server-generated one.
 
 | Code | HTTP status | Retryable by default | Meaning |
 |---|---|---|---|
@@ -195,7 +201,10 @@ Route notes:
   database, schema compatibility and critical configuration and returns 503 with
   `ready: false` when any check fails. Neither is authenticated, so neither returns versions of
   dependencies, hostnames, URLs or secrets. Source health is not part of readiness; it is in
-  `deals_health` and `/api/overview` (authenticated).
+  `deals_health` and `/api/overview` (authenticated). Free text in readiness details, gate notes
+  and coverage-gap reasons that looks like a credential (credential URLs, connection strings,
+  bearer tokens, `token=`-style parameters, `password:`-style pairs) is replaced by
+  `[redacted: text resembled a credential]` instead of failing the response.
 - **`/api/me`** lists the principal's memberships (bootstrap before a workspace is chosen) and the
   scopes of the selected workspace's role.
 - **`/api/overview`** shows running/paused sources, the last successful scan, coverage gaps
@@ -203,16 +212,21 @@ Route notes:
   counts per queue, failed deliveries and activation blockers.
 - **`/api/candidates`** filters: `profile` (`primary`, `manual_4000`, `below_target_watch`),
   `country` (seller country, `^[A-Z]{2}$`), `status` (`pending`, `needs_information`, `watch`,
-  `shortlisted`, `rejected`), `changed_since` (RFC 3339 with a timezone), plus `cursor`/`limit`.
+  `shortlisted`, `rejected`), `changed_since` (RFC 3339 `date-time` with an offset, e.g.
+  `2026-10-06T10:00:00Z`; epoch numbers, a space separator or `+0200` offsets are refused),
+  plus `cursor`/`limit`.
 - **`/api/candidates/{listing_id}`** returns the current revision unless `revision` is given; an
   older revision adds a `REVISION_NOT_CURRENT` warning. It includes provenance (extraction
-  confidence, not truth), conflicts, availability and price history, screening reasons, the
+  confidence, not truth; the source URL only when it is a safe http(s) link), conflicts, availability and price history, screening reasons, the
   latest valuation and comparable references, the due-diligence checklist and notes.
 - **`/api/comparables/{set_id}`**: `include_excluded` (default `false`) adds excluded evidence with
   reasons. Asking-price, seller-reported-sale and verified-sale statistics are separate fields.
+  Each member carries its duplicate cluster (`duplicate_cluster_id`) when the observation is
+  loaded.
 - **`/api/valuations/{valuation_id}`**: scenario lines with statuses, totals only when complete,
   `known_subtotal` otherwise, threshold `PROPOSED`/`APPROVED`, dependency fingerprint, versions,
-  expiry and the fixture label.
+  expiry and the fixture label. `threshold.alert_eligible` is never true unless the valuation
+  itself is `alert_eligible` (a stale or fixture valuation is never alert eligible).
 - **`/api/reviews`**: `include_needs_information` (default `true`). Items expose the claim state
   (`claimed`, `held_by_caller`, `expires_at`) but never a token or another reviewer's identity.
 - **Claim** returns the claim token once with its expiry, the case version and the exact revision

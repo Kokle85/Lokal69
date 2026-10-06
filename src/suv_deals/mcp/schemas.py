@@ -79,6 +79,10 @@ _CONTROL_RE: Final = re.compile(
     "[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]"
 )
 _FIELD_NAME_RE: Final = re.compile(r"^[A-Za-z0-9_.]{1,80}$")
+#: RFC 3339 ``date-time`` (section 5.6) with a mandatory offset; ``T``/``Z`` case-insensitive.
+_RFC3339_RE: Final = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$"
+)
 
 IDEMPOTENCY_KEY_PATTERN: Final = r"^[A-Za-z0-9._:-]{8,128}$"
 CLAIM_TOKEN_PATTERN: Final = r"^[A-Za-z0-9_-]{20,256}$"  # noqa: S105 - a format, not a secret
@@ -109,9 +113,14 @@ def _require_content(minimum: int) -> Any:
 
 
 def _aware_datetime(value: object) -> object:
+    """RFC 3339 ``date-time`` strings only (``format: date-time`` in the published schema).
+
+    Pydantic alone would also accept epoch numbers in strings (``"1759744800"``), a space
+    separator, minute precision and ``+0200`` offsets; none of those is RFC 3339.
+    """
     if isinstance(value, datetime):
         return value
-    if isinstance(value, str):
+    if isinstance(value, str) and _RFC3339_RE.fullmatch(value):
         return value
     raise ValueError("must be an RFC 3339 date-time string with a timezone")
 
@@ -242,7 +251,7 @@ class ToolInput(BaseModel):
 
 
 class DealsHealthInput(ToolInput):
-    """``deals_health`` takes no arguments."""
+    """deals_health takes no arguments."""
 
 
 class DealsListCandidatesInput(ToolInput):
@@ -330,8 +339,36 @@ class ReviewsSubmitInput(ToolInput):
         try:
             return SubmitRequest.model_validate(self.model_dump())
         except ValidationError as exc:
-            fields = sorted({".".join(str(p) for p in err["loc"]) or "request" for err in exc.errors()})
-            raise ValueError(f"violates review submission rules: {', '.join(fields)}") from None
+            fields = tuple(sorted({_loc_path(err["loc"]) or "request" for err in exc.errors()}))
+            raise SubmitRuleError(fields) from None
+
+
+class SubmitRuleError(ValueError):
+    """``reviews_submit`` broke a domain rule; ``fields`` names the fields (never their values)."""
+
+    def __init__(self, fields: tuple[str, ...]) -> None:
+        super().__init__(f"violates review submission rules: {', '.join(fields)}")
+        self.fields = fields
+
+
+def _loc_path(loc: tuple[int | str, ...]) -> str:
+    return ".".join(str(part) for part in loc)
+
+
+def validation_error_fields(exc: ValidationError, *, root: str = "arguments") -> list[str]:
+    """Sorted, bounded field paths of a validation failure; values are never included.
+
+    Paths that are not plain field names (e.g. an unknown key carrying markup) become
+    ``<unrecognised field>``; domain-rule failures name the fields they concern.
+    """
+    fields: set[str] = set()
+    for err in exc.errors():
+        path = _loc_path(err["loc"])
+        cause = (err.get("ctx") or {}).get("error")
+        candidates = list(cause.fields) if not path and isinstance(cause, SubmitRuleError) else [path or root]
+        for candidate in candidates:
+            fields.add(candidate if _FIELD_NAME_RE.fullmatch(candidate) else "<unrecognised field>")
+    return sorted(fields)[:20]
 
 
 class DealsRequestRecheckInput(ToolInput):
@@ -622,12 +659,8 @@ def validate_tool_input(name: str, arguments: Mapping[str, Any] | None) -> ToolI
     try:
         return spec.input_model.model_validate(dict(arguments or {}))
     except ValidationError as exc:
-        fields: set[str] = set()
-        for err in exc.errors():
-            path = ".".join(str(p) for p in err["loc"]) or "arguments"
-            fields.add(path if _FIELD_NAME_RE.fullmatch(path) else "<unrecognised field>")
         raise ValidationFailed(
-            f"Invalid arguments for {name}", details={"fields": sorted(fields)[:20]}
+            f"Invalid arguments for {name}", details={"fields": validation_error_fields(exc)}
         ) from None
 
 
@@ -756,6 +789,7 @@ __all__ = [
     "ReviewsSubmitInput",
     "SourceVersion",
     "SourcesPauseInput",
+    "SubmitRuleError",
     "SummaryText",
     "ToolAnnotations",
     "ToolError",
@@ -775,4 +809,5 @@ __all__ = [
     "tool_spec",
     "tools_for_scopes",
     "validate_tool_input",
+    "validation_error_fields",
 ]

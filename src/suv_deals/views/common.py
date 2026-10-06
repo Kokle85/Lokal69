@@ -107,6 +107,13 @@ Sha256Hex = Annotated[str, Field(pattern=_HEX64_PATTERN)]
 MachineLabel = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,79}$")]
 
 _REQUEST_ID_PATTERN: Final = r"^[\x21-\x7e]{1,200}$"
+_REQUEST_ID_RE: Final = re.compile(_REQUEST_ID_PATTERN)
+MAX_RETRY_AFTER_SECONDS: Final = 86_400
+
+
+def is_valid_request_id(value: object) -> bool:
+    """Printable ASCII without spaces, 1-200 characters (request and correlation ids)."""
+    return isinstance(value, str) and _REQUEST_ID_RE.fullmatch(value) is not None
 
 
 def money_display(money: Money) -> Decimal:
@@ -314,8 +321,19 @@ def envelope[DataT](
     warnings: Sequence[ResponseWarning] = (),
     next_cursor: str | None = None,
 ) -> ResponseEnvelope[DataT]:
-    """Build the response envelope; duplicate warnings (same code and message) are collapsed."""
+    """Build the response envelope; duplicate warnings (same code and message) are collapsed.
+
+    More than ``MAX_WARNINGS`` distinct warnings are cut to the first ``MAX_WARNINGS - 1`` plus
+    one ``PARTIAL_RESULTS`` warning saying how many were omitted, so a long warning list can
+    never make the response itself fail.
+    """
     unique = tuple(dict.fromkeys(warnings))
+    if len(unique) > MAX_WARNINGS:
+        omitted = len(unique) - (MAX_WARNINGS - 1)
+        unique = (
+            *unique[: MAX_WARNINGS - 1],
+            warning(WarningCode.PARTIAL_RESULTS, f"{omitted} further warnings were omitted."),
+        )
     return ResponseEnvelope[DataT](
         request_id=request_id,
         as_of=as_of,
@@ -340,20 +358,31 @@ class ErrorPayload(ViewModel):
     code: ErrorCode
     message: str = Field(min_length=1, max_length=500)
     retryable: bool
-    retry_after_seconds: int | None = Field(default=None, ge=0, le=86_400)
+    retry_after_seconds: int | None = Field(default=None, ge=0, le=MAX_RETRY_AFTER_SECONDS)
     correlation_id: str | None = Field(default=None, pattern=_REQUEST_ID_PATTERN)
     details: dict[str, ErrorDetailValue] | None = None
 
     @classmethod
     def from_app_error(cls, error: AppError, correlation_id: str | None = None) -> ErrorPayload:
+        """Safe payload for any ``AppError``. Rendering an error never fails itself.
+
+        ``retry_after_seconds`` is clamped to 0-86,400 (a negative or non-integer hint is
+        dropped) and a malformed ``correlation_id`` is omitted rather than raising.
+        """
         return cls(
             code=error.code,
             message=error.message[:500] or error.code.value,
             retryable=error.retryable,
-            retry_after_seconds=error.retry_after_seconds,
-            correlation_id=correlation_id,
+            retry_after_seconds=_safe_retry_after(error.retry_after_seconds),
+            correlation_id=correlation_id if is_valid_request_id(correlation_id) else None,
             details=_safe_details(error.details),
         )
+
+
+def _safe_retry_after(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return min(value, MAX_RETRY_AFTER_SECONDS)
 
 
 def _safe_details(details: dict[str, Any]) -> dict[str, ErrorDetailValue] | None:

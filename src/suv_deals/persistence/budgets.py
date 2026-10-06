@@ -40,7 +40,8 @@ from __future__ import annotations
 
 import random
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import AsyncIterator, Collection, Mapping
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -79,10 +80,12 @@ from suv_deals.errors import NotFound, ValidationFailed
 from suv_deals.persistence import audit
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import mapped_errors
+from suv_deals.persistence.transactions import retry_transient
 
 ACCESS_BLOCK_SENTINEL: Final = datetime(9999, 1, 1, tzinfo=UTC)
 _HOST_RE: Final = re.compile(r"^[a-z0-9.-]{1,253}$")
 _INT32_MAX: Final = 2_147_483_647
+_RELEASE_ATTEMPTS: Final = 3
 _ROW_COLUMNS: Final = sql.SQL(
     "id, host, tokens, refilled_at, next_request_not_before, circuit_state, open_until,"
     " consecutive_failures, budget_day, requests_today, bytes_today, last_retry_after_seconds,"
@@ -275,7 +278,7 @@ class DbBudgetGate:
         delay = self._crawl_delays.get(host)
         usage = self.run_usage(request.source_key)
         refill = (Decimal(1) / effective_delay_seconds(budget, delay)).quantize(Decimal("0.00000001"))
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
+        async with self._transaction() as conn:
             hosts = sorted(await self._hosts_of(conn, request.source_key) | {host})
             await conn.execute(
                 _ENSURE_ROW_SQL,
@@ -332,33 +335,44 @@ class DbBudgetGate:
         return decision
 
     async def release(self, request: BudgetRequest, outcome: FetchOutcome | None) -> None:
+        """Fold the outcome in (or abandon the lease) in its own short transaction.
+
+        A lock timeout, deadlock or statement timeout proves the transaction rolled back, so the
+        release is re-run a few times rather than losing the outcome (an access block, a
+        Retry-After, the bytes used) and leaving the navigation lease to expire on its own.
+        """
         entry = self._leases.pop(id(request), None)
         own_lease = entry[1] if entry is not None and entry[0] is request else None
         budget = self._budgets.get(request.source_key)
         host = _host(request.host)
         delay = self._crawl_delays.get(host)
-        result: OutcomeResult | None = None
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
-            row = await fetch_one(conn, _LOCK_ONE_SQL, {"workspace_id": self._workspace_id, "host": host})
-            if row is None:
-                return
-            now = await _db_clock(conn)
-            state = state_from_row(row, request.source_key, self._policy)
-            ours = own_lease is not None and state.in_flight_until == own_lease
-            # A newer holder's lease (ours expired and was re-taken) must survive our release.
-            foreign_lease = None if ours else state.in_flight_until
-            base = state.model_copy(update={"in_flight_until": own_lease if ours else None})
-            if outcome is None or budget is None:
-                updated = abandon_request(base, now)
-            else:
-                result = record_outcome(base, outcome, now, self._rng, budget=budget, policy=self._policy)
-                updated = result.state
-            if foreign_lease is not None:
-                updated = updated.model_copy(update={"in_flight_until": foreign_lease})
-            await conn.execute(
-                _PERSIST_SQL,
-                {**_row_params(updated, budget, delay), "workspace_id": self._workspace_id, "id": row["id"]},
-            )
+
+        async def once() -> OutcomeResult | None:
+            result: OutcomeResult | None = None
+            async with self._transaction() as conn:
+                row = await fetch_one(conn, _LOCK_ONE_SQL, {"workspace_id": self._workspace_id, "host": host})
+                if row is None:
+                    return None
+                now = await _db_clock(conn)
+                state = state_from_row(row, request.source_key, self._policy)
+                ours = own_lease is not None and state.in_flight_until == own_lease
+                # A newer holder's lease (ours expired and was re-taken) must survive our release.
+                foreign_lease = None if ours else state.in_flight_until
+                base = state.model_copy(update={"in_flight_until": own_lease if ours else None})
+                if outcome is None or budget is None:
+                    updated = abandon_request(base, now)
+                else:
+                    result = record_outcome(base, outcome, now, self._rng, budget=budget, policy=self._policy)
+                    updated = result.state
+                if foreign_lease is not None:
+                    updated = updated.model_copy(update={"in_flight_until": foreign_lease})
+                params = _row_params(updated, budget, delay)
+                await conn.execute(
+                    _PERSIST_SQL, {**params, "workspace_id": self._workspace_id, "id": row["id"]}
+                )
+            return result
+
+        result = await retry_transient(once, attempts=_RELEASE_ATTEMPTS)
         if result is not None:
             self._results[(request.source_key, host)] = result
             if result.pause is not None:
@@ -367,7 +381,7 @@ class DbBudgetGate:
     # ------------------------------------------------------------------ reads and operator actions
 
     async def host_state(self, source_key: str, host: str) -> HostBudgetState | None:
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
+        async with self._transaction() as conn:
             row = await fetch_one(
                 conn, _READ_ONE_SQL, {"workspace_id": self._workspace_id, "host": _host(host)}
             )
@@ -375,7 +389,7 @@ class DbBudgetGate:
 
     async def daily_usage(self, source_key: str) -> DailyUsage:
         """Source-wide usage for today's UTC day (database time), across all of its hosts."""
-        async with mapped_errors(), self._db.transaction(workspace_id=self._workspace_id) as conn, mapped_errors():
+        async with self._transaction() as conn:
             hosts = sorted(await self._hosts_of(conn, source_key))
             now = await _db_clock(conn)
             row = await fetch_one(
@@ -397,7 +411,7 @@ class DbBudgetGate:
         if actor.workspace_id != self._workspace_id:
             raise NotFound("Host budget not found")
         name = _host(host)
-        async with mapped_errors(), self._db.transaction(actor) as conn, mapped_errors():
+        async with self._transaction(actor) as conn:
             row = await fetch_one(conn, _LOCK_ONE_SQL, {"workspace_id": self._workspace_id, "host": name})
             if row is None:
                 raise NotFound("Host budget not found")
@@ -422,6 +436,18 @@ class DbBudgetGate:
         return cleared
 
     # ------------------------------------------------------------------ helpers
+
+    @asynccontextmanager
+    async def _transaction(self, actor: ActorContext | None = None) -> AsyncIterator[Conn]:
+        """One short gate transaction. Errors raised inside it are mapped there, so a lock timeout
+        on a busy host row is a retryable `TransientConflict`, not "database unavailable"."""
+        scope = (
+            self._db.transaction(workspace_id=self._workspace_id)
+            if actor is None
+            else self._db.transaction(actor)
+        )
+        async with mapped_errors(), scope as conn, mapped_errors():
+            yield conn
 
     async def _hosts_of(self, conn: Conn, source_key: str) -> frozenset[str]:
         if self._source_hosts is not None:

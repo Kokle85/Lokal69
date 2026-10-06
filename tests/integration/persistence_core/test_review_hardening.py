@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -28,6 +28,7 @@ from suv_deals.errors import (
     DependencyUnavailable,
     ErrorCode,
     Forbidden,
+    IdempotencyConflict,
     NotFound,
     ValidationFailed,
 )
@@ -49,7 +50,9 @@ SOURCE = "fixture_dealer_review"
 BUDGET = RateBudget(min_delay_seconds=5, max_search_pages_per_run=20, daily_request_budget=100)
 
 
-async def _event(conn: Conn, actor: ActorContext, payload: dict[str, Any], **kwargs: Any) -> tuple[UUID, bool]:
+async def _event(
+    conn: Conn, actor: ActorContext, payload: dict[str, Any], **kwargs: Any
+) -> tuple[UUID, bool]:
     return await outbox.enqueue_event(
         conn,
         actor,
@@ -92,7 +95,63 @@ async def test_fixture_marker_semantics_match_the_domain(db: Database, world_a: 
     claimed = await outbox.claim_events(db, ws, "dispatcher-1", 60, 10)
     assert [e.event_id for e in claimed] == [real_id]
     assert seed.scalar("select state from ops.outbox where id = %s", (contaminated,)) == "blocked"
-    assert seed.scalar("select blocker_code from ops.outbox where id = %s", (contaminated,)) == FIXTURE_BLOCKER
+    assert (
+        seed.scalar("select blocker_code from ops.outbox where id = %s", (contaminated,)) == FIXTURE_BLOCKER
+    )
+
+
+async def test_the_claim_statement_itself_never_leases_a_fixture_looking_row(
+    db: Database, world_a: World, seed: Seed
+) -> None:
+    """Defect: only the separate refusal statement looked at payload markers; a suspicious row it
+    skipped (locked by another transaction at that instant) could still be leased by the claim
+    statement right after. The claim now excludes such rows itself."""
+    ws = world_a.workspace_id
+    for payload in (
+        {"schema_version": "1.0", "fixture": True},
+        {"schema_version": "1.0", "summary": f"{FIXTURE_SUMMARY_PREFIX} leaked row"},
+    ):
+        seed.outbox(ws, payload=payload)
+    async with db.transaction(workspace_id=ws) as conn:
+        cur = await conn.execute(
+            outbox._CLAIM_SQL,  # the claim alone, without the preceding refusal statement
+            {
+                "workspace_id": ws,
+                "owner": "dispatcher-1",
+                "lease": timedelta(seconds=60),
+                "limit": 10,
+                "fixture_prefix": FIXTURE_SUMMARY_PREFIX.upper(),
+            },
+        )
+        assert await cur.fetchall() == []
+
+
+async def test_a_fixture_event_cannot_swallow_a_real_events_dedup_key(db: Database, world_a: World) -> None:
+    """Defect: a real event reusing a fixture event's dedup key got ``created=False`` and the
+    blocked fixture's id back, so it was silently never delivered."""
+    actor = system(world_a.workspace_id)
+    dedup = unique("review.pending")
+    aggregate = uuid.uuid4()
+
+    async def enqueue(conn: Conn, *, fixture: bool) -> tuple[UUID, bool]:
+        return await outbox.enqueue_event(
+            conn,
+            actor,
+            event_type="review.pending",
+            event_version=1,
+            aggregate_type="review_case",
+            aggregate_id=aggregate,
+            aggregate_version=1,
+            payload={"schema_version": "1.0", **({"fixture": True} if fixture else {})},
+            dedup_key=dedup,
+            is_fixture=fixture,
+        )
+
+    async with db.transaction(actor) as conn:
+        _, created = await enqueue(conn, fixture=True)
+        assert created
+        with pytest.raises(IdempotencyConflict):
+            await enqueue(conn, fixture=False)
 
 
 async def test_record_attempt_cannot_backdate_a_send_before_the_lease(
@@ -280,7 +339,9 @@ def test_statement_timeout_maps_to_a_retryable_dependency_error(db_conn: psycopg
 # --------------------------------------------------------------------------------------------
 
 
-async def test_audit_outcome_never_overwrites_caller_metadata(db: Database, world_a: World, seed: Seed) -> None:
+async def test_audit_outcome_never_overwrites_caller_metadata(
+    db: Database, world_a: World, seed: Seed
+) -> None:
     """Defect: the audit outcome was written into ``metadata["outcome"]``, silently replacing
     the caller's own ``outcome`` (e.g. the review decision outcome)."""
     ws = world_a.workspace_id

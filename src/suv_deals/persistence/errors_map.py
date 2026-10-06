@@ -19,7 +19,7 @@ tests) is the only database identifier exposed, in `details`, for check/not-null
 | `42501` insufficient_privilege (RLS/grants) | row outside the workspace or missing grant | `Forbidden` |
 | `40001` / `40P01` serialization / deadlock | retry the whole transaction | `TransientConflict` (retryable) |
 | `55P03` lock_not_available (lock_timeout) | row busy | `TransientConflict` (retryable) |
-| `57014` query_canceled (statement_timeout) | too slow | `StatementTimeout` (DEPENDENCY_UNAVAILABLE, retryable) |
+| `57014` query_canceled (statement_timeout) | too slow | `StatementTimeout` (retryable) |
 | `25P02` in_failed_sql_transaction | an earlier error was swallowed | `TransactionAborted` (not retryable) |
 | `08xxx` / OperationalError | connection lost | `DependencyUnavailable` (retryable) |
 | anything else | unexpected | `AppError(INTERNAL_ERROR)` |

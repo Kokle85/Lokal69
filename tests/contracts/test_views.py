@@ -8,6 +8,7 @@ review.pending event builders). All data is SYNTHETIC.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -90,9 +91,22 @@ from suv_deals.domain.tax_engine import (
     transition_rule_set,
 )
 from suv_deals.domain.taxonomy import load_taxonomy
-from suv_deals.domain.valuation import ComparableReference, ScreeningInput, Valuation, assemble_valuation
-from suv_deals.errors import AppError, ErrorCode, NotFound, VersionConflict
+from suv_deals.domain.valuation import (
+    ComparableReference,
+    InvalidationReason,
+    ScreeningInput,
+    Valuation,
+    assemble_valuation,
+    mark_stale,
+)
+from suv_deals.errors import AppError, ErrorCode, NotFound, RateLimited, VersionConflict
 from suv_deals.integrations import event_bridge
+from suv_deals.mcp.schemas import (
+    exported_schema_documents,
+    tool_error,
+    tool_error_schema,
+    tool_output_schema,
+)
 from suv_deals.views import (
     AmountView,
     AvailabilityPoint,
@@ -104,6 +118,7 @@ from suv_deals.views import (
     ComparableSetRef,
     ComparableSetView,
     ErrorPayload,
+    FieldProvenanceView,
     FreshnessFlag,
     FreshnessView,
     GateView,
@@ -136,6 +151,8 @@ from suv_deals.views import (
     SellerTextView,
     SettingsView,
     SourceLink,
+    SourceListView,
+    SourcePauseResult,
     SourceRunState,
     SourceStatusView,
     ValuationRef,
@@ -153,6 +170,7 @@ from suv_deals.views import (
 from suv_deals.views.common import envelope_model_for
 from suv_deals.views.jsonschema import find_refs, model_schema, open_objects
 from suv_deals.views.operations import (
+    REDACTED_TEXT,
     BuildInfo,
     CrawlRunView,
     DeliveryCounts,
@@ -163,6 +181,7 @@ from suv_deals.views.operations import (
     SourceCoverageView,
     TechnicalView,
     TermsView,
+    redact_secrets,
 )
 from suv_deals.views.reviews import ReviewPendingOccurrenceData
 from suv_deals.views.valuations import ScenarioView, ThresholdView
@@ -605,7 +624,7 @@ def test_listing_document_accepts_spec_example() -> None:
         ListingRevisionDocument.model_validate({**example, "unexpected": True})
 
 
-def test_candidate_detail_from_domain(listing: NormalizedListing, config: Any) -> None:
+def candidate_detail(listing: NormalizedListing, config: Any) -> CandidateDetail:
     result = screen(listing, config, [], NOW.date(), load_taxonomy())
     rank = rank_candidate(
         RankingFeatures(
@@ -629,7 +648,7 @@ def test_candidate_detail_from_domain(listing: NormalizedListing, config: Any) -
         updated_at=NOW,
         row_version=1,
     )
-    detail = CandidateDetail(
+    return CandidateDetail(
         summary=summary(listing, rank=RankView.of(rank).summary()),
         revision=RevisionView(
             revision_id=REVISION_ID,
@@ -668,6 +687,10 @@ def test_candidate_detail_from_domain(listing: NormalizedListing, config: Any) -
         rank=RankView.of(rank),
         source_link=SourceLink(url=listing.canonical_url, source_key=listing.source_key),
     )
+
+
+def test_candidate_detail_from_domain(listing: NormalizedListing, config: Any) -> None:
+    detail = candidate_detail(listing, config)
     dumped = detail.model_dump(mode="json")
     assert not no_floats(dumped)
     provenance = dumped["field_provenance"][0]
@@ -747,7 +770,7 @@ def test_price_history_changes(listing: NormalizedListing) -> None:
 # =========================================================================== comparables
 
 
-def test_comparable_set_view_separates_asking_and_sales(listing: NormalizedListing, config: Any) -> None:
+def comparable_candidates() -> list[MarketObservation]:
     def obs(kind: EvidenceKind, amount: str, fuel: Fuel = Fuel.DIESEL) -> MarketObservation:
         return MarketObservation(
             id=uuid4(),
@@ -770,12 +793,16 @@ def test_comparable_set_view_separates_asking_and_sales(listing: NormalizedListi
             ),
         )
 
-    candidates = [
+    return [
         obs(EvidenceKind.ASKING_PRICE, "8900.00"),
         obs(EvidenceKind.ASKING_PRICE, "9200.00"),
         obs(EvidenceKind.SELLER_REPORTED_SALE, "8500.00"),
         obs(EvidenceKind.ASKING_PRICE, "7000.00", fuel=Fuel.PETROL),
     ]
+
+
+def test_comparable_set_view_separates_asking_and_sales(listing: NormalizedListing, config: Any) -> None:
+    candidates = comparable_candidates()
     result = select_comparables(
         ComparableTarget.from_listing(listing, listing_id=LISTING_ID), candidates, config, NOW
     )
@@ -1162,26 +1189,66 @@ def health(**overrides: Any) -> HealthView:
     return HealthView(**values)
 
 
-@pytest.mark.parametrize(
-    "detail",
-    [
-        "postgresql://suv:secret@db.internal:5432/app",
-        "https://user:pw@crawler.internal/",
-        "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
-        "callback https://hook.example/x?token=abc",
-        "whsec_c2VjcmV0",
-        "password = hunter2",
-    ],
+SECRET_LIKE = (
+    "postgresql://suv:secret@db.internal:5432/app",
+    "https://user:pw@crawler.internal/",
+    "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
+    "callback https://hook.example/x?token=abc",
+    "whsec_c2VjcmV0",
+    "password = hunter2",
 )
-def test_health_refuses_secrets(detail: str) -> None:
+
+
+@pytest.mark.parametrize("detail", SECRET_LIKE)
+def test_health_never_echoes_secrets(detail: str) -> None:
     checks = (
         ReadinessCheck(name="database", status="unavailable", detail=detail),
         ReadinessCheck(name="schema", status="ok", detail=None),
     )
+    assert checks[0].detail == REDACTED_TEXT
+    blocker = GateView.model_validate({**gate().model_dump(), "next_action": detail, "owner": detail})
+    assert blocker.next_action == REDACTED_TEXT and blocker.owner == REDACTED_TEXT
+    view = health(
+        ready=False,
+        readiness=checks,
+        activation_blockers=(blocker,),
+        sources=(coverage(gap_reasons=(detail, "never scanned")),),
+    )
+    text = json.dumps(view.model_dump(mode="json"))
+    assert detail not in text and REDACTED_TEXT in text
+    assert view.sources[0].gap_reasons == (REDACTED_TEXT, "never scanned")
+    ready = ReadinessView(ready=False, checks=checks, build_id="dev")
+    assert detail not in json.dumps(ready.model_dump(mode="json"))
+    # Backstop: any other string that looks like a credential is still refused outright.
     with pytest.raises(ValidationError):
-        health(ready=False, readiness=checks)
-    with pytest.raises(ValidationError):
-        ReadinessView(ready=False, checks=checks, build_id="dev")
+        health(sources=(coverage(source_key=detail[:80]),))
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Owner must approve the API token: scope deals:read",
+        "see https://status.example/?country_code=DE",
+        "Bearer token issuance pending",
+    ],
+)
+def test_health_survives_credential_like_gate_notes(phrase: str) -> None:
+    # Regression: a gate note that merely resembles a credential used to make deals_health fail.
+    blocker = GateView(
+        capability="mcp_authentication",
+        dependency="Approved persistent access",
+        required_evidence=phrase,
+        status=GateStatus.BLOCKED,
+        owner=None,
+        next_action=phrase,
+        checked_at=None,
+    )
+    view = health(activation_blockers=(blocker,))
+    assert view.activation_blockers[0].required_evidence == REDACTED_TEXT
+    assert phrase not in json.dumps(view.model_dump(mode="json"))
+    assert (
+        redact_secrets("Fixture tests pass; live smoke pending") == "Fixture tests pass; live smoke pending"
+    )
 
 
 def test_health_view_contract() -> None:
@@ -1407,6 +1474,33 @@ def test_error_payload_is_safe() -> None:
     assert len(ErrorPayload.from_app_error(long).message) == 500
 
 
+@pytest.mark.parametrize(
+    ("hint", "expected"), [(172_800, 86_400), (30, 30), (0, 0), (-5, None), (None, None)]
+)
+def test_error_payload_never_fails_on_retry_after(hint: int | None, expected: int | None) -> None:
+    # Regression: an out-of-range retry hint used to make rendering the error itself fail.
+    payload = ErrorPayload.from_app_error(RateLimited(retry_after_seconds=hint))
+    assert payload.retry_after_seconds == expected and payload.code == ErrorCode.RATE_LIMITED
+
+
+@pytest.mark.parametrize("correlation_id", ["", "has space", "x" * 201, "tab\there", "line\n"])
+def test_error_payload_drops_malformed_correlation_ids(correlation_id: str) -> None:
+    payload = ErrorPayload.from_app_error(NotFound(), correlation_id=correlation_id)
+    assert payload.correlation_id is None and payload.code == ErrorCode.NOT_FOUND
+    assert ErrorPayload.from_app_error(NotFound(), correlation_id="req-7f3a").correlation_id == "req-7f3a"
+
+
+def test_envelope_caps_warnings_instead_of_failing() -> None:
+    many = [warning(WarningCode.STALE_DATA, f"listing {i} is stale") for i in range(80)]
+    env = envelope(CandidateListView(items=()), request_id="req-1", as_of=NOW, warnings=many)
+    assert len(env.warnings) == 50
+    assert env.warnings[:49] == tuple(many[:49])
+    assert env.warnings[-1].code == WarningCode.PARTIAL_RESULTS
+    assert env.warnings[-1].message == "31 further warnings were omitted."
+    exact = envelope(CandidateListView(items=()), request_id="req-1", as_of=NOW, warnings=many[:50])
+    assert exact.warnings == tuple(many[:50])
+
+
 # =========================================================================== schemas of outputs
 
 OUTPUT_VIEWS: tuple[type[BaseModel], ...] = (
@@ -1446,3 +1540,257 @@ def test_secret_str_is_not_a_view_type() -> None:
     # Claim tokens leave the domain only through ClaimResult (once); SecretStr never serialises.
     assert "claim_token" not in ReviewQueueItem.model_fields
     assert SecretStr("x").get_secret_value() == "x"
+
+
+# =========================================================================== review regressions
+
+
+def test_provenance_carries_a_safe_source_url(listing: NormalizedListing) -> None:
+    # Spec 7: field provenance includes the source URL; unsafe links are never emitted.
+    base = listing.provenance["price.amount_minor"]
+    safe = base.model_copy(update={"source_url": "https://dealer.example/vehicles/TEST-204"})
+    view = FieldProvenanceView.of("price.amount_minor", safe)
+    assert view.model_dump(mode="json")["source_url"] == "https://dealer.example/vehicles/TEST-204"
+    for unsafe in ("javascript:alert(1)", "https://user:pw@dealer.example/x", "ftp://dealer.example/x"):
+        assert FieldProvenanceView.of("x", base.model_copy(update={"source_url": unsafe})).source_url is None
+        with pytest.raises(ValidationError):
+            FieldProvenanceView.model_validate({**view.model_dump(), "source_url": unsafe})
+    assert "source_url" in model_schema(FieldProvenanceView, mode="serialization")["required"]
+
+
+def test_comparable_members_carry_duplicate_cluster(listing: NormalizedListing, config: Any) -> None:
+    # Spec 15: every selected comparable records its duplicate cluster.
+    cluster = uuid4()
+    candidates = [c.model_copy(update={"cluster_id": cluster}) for c in comparable_candidates()]
+    result = select_comparables(
+        ComparableTarget.from_listing(listing, listing_id=LISTING_ID), candidates, config, NOW
+    )
+    members = comparable_members(
+        result, include_excluded=True, excluded_observations={c.id: c for c in candidates}
+    )
+    selected = [m for m in members if m.role == "selected"]
+    assert selected and all(m.duplicate_cluster_id == cluster for m in selected)
+    unloaded = comparable_members(result, include_excluded=True)
+    assert all(m.duplicate_cluster_id is None for m in unloaded if m.role == "excluded")
+
+
+def test_stale_valuation_threshold_is_never_alert_eligible() -> None:
+    # Regression: a stale valuation showed threshold.alert_eligible=true while the valuation
+    # itself (and every dispatcher) treats it as not alert eligible.
+    approved = ContributionThreshold(
+        amount_eur=Decimal("100"),
+        approval_status="approved",
+        approved_by="SYNTHETIC owner",
+        approved_at="2026-10-01",
+    )
+    calc = calculate(active_rule(), tax_inputs(), AS_OF)
+    lines = [
+        line.model_copy(update={"assumption_approved": True})
+        if line.status == CostLineStatus.ESTIMATED and not line.rule_supported
+        else line
+        for line in cost_lines(calc)
+    ]
+    purchase = PURCHASE.model_copy(update={"assumption_approved": True})
+    proceeds = PROCEEDS.model_copy(update={"assumption_approved": True})
+    scenarios = compute_scenarios(purchase, lines, proceeds, [MKD_RATE], approved, as_of=AS_OF)
+    current = valuation(calc, scenarios=scenarios)
+    assert current.alert_eligible and scenarios.threshold.alert_eligible
+
+    def view_of(v: Valuation) -> ValuationView:
+        return ValuationView.of(
+            v,
+            valuation_id=VALUATION_ID,
+            listing_id=LISTING_ID,
+            cost_lines=lines,
+            purchase=purchase,
+            proceeds=proceeds,
+        )
+
+    live = view_of(current)
+    assert live.alert_eligible and live.threshold is not None and live.threshold.alert_eligible
+    stale = view_of(mark_stale(current, [InvalidationReason.CONFIG], AS_OF + timedelta(hours=1)))
+    assert stale.state == ValuationState.STALE and stale.alert_eligible is False
+    assert stale.threshold is not None and stale.threshold.alert_eligible is False
+    assert stale.threshold.would_meet is True  # the figures stay visible, labelled stale
+    with pytest.raises(ValidationError):  # the invariant also holds for hand-built views
+        ValuationView.model_validate(
+            {**stale.model_dump(), "threshold": {**stale.threshold.model_dump(), "alert_eligible": True}}
+        )
+    with pytest.raises(ValidationError):
+        ValuationView.model_validate({**stale.model_dump(), "alert_eligible": True})
+
+
+# =========================================================================== JSON Schema conformance
+
+_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$")
+
+
+def _rfc3339_date_time(value: object) -> bool:
+    return not isinstance(value, str) or _RFC3339.fullmatch(value) is not None
+
+
+def schema_errors(instance: Any, schema: dict[str, Any]) -> list[str]:
+    """Draft 2020-12 validation with ``uuid`` and RFC 3339 ``date-time`` format checks.
+
+    ``jsonschema`` is installed with the MCP SDK; it is only used here, as a test oracle.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    checker = jsonschema.FormatChecker()
+    checker.checks("date-time")(_rfc3339_date_time)
+    validator = jsonschema.Draft202012Validator(schema, format_checker=checker)
+    return [
+        f"{'/'.join(str(p) for p in err.absolute_path)}: {err.message[:200]}"
+        for err in validator.iter_errors(instance)
+    ]
+
+
+def wire(data: BaseModel) -> Any:
+    env = envelope(data, request_id="req-1", as_of=NOW, warnings=[warning(WarningCode.FIXTURE_DATA)])
+    return json.loads(env.to_text())
+
+
+def test_tool_results_conform_to_published_output_schemas(
+    listing: NormalizedListing,
+    config: Any,
+    estimated_valuation: Valuation,
+    incomplete_valuation: Valuation,
+) -> None:
+    claimed, grant = claimed_case()
+    request = SubmitRequest(
+        case_id=CASE_ID,
+        claim_token=TOKEN,
+        expected_version=2,
+        listing_revision=3,
+        outcome=ReviewOutcome.WATCH,
+        reason_codes=("PRICE_IN_BAND",),
+        summary="Watch: price in band, documents pending.",
+        evidence_ids=(uuid4(),),
+        idempotency_key="key-12345678",
+    )
+    decision = ReviewDecisionView.of(
+        evaluate_submit(claimed, actor(), request, now=NOW + timedelta(minutes=2)), decision_id=uuid4()
+    )
+    candidates = comparable_candidates()
+    result = select_comparables(
+        ComparableTarget.from_listing(listing, listing_id=LISTING_ID), candidates, config, NOW
+    )
+    comparables = ComparableSetView.of(
+        result,
+        comparable_set_id=SET_ID,
+        listing_id=LISTING_ID,
+        target_revision_id=REVISION_ID,
+        include_excluded=True,
+        members=comparable_members(
+            result, include_excluded=True, excluded_observations={c.id: c for c in candidates}
+        ),
+    )
+    detail = candidate_detail(listing, config)
+    reference = ValuationRef(
+        valuation_id=VALUATION_ID,
+        state=estimated_valuation.state,
+        research_candidate=estimated_valuation.research_candidate,
+        is_fixture=estimated_valuation.is_fixture,
+        created_at=estimated_valuation.created_at,
+        expires_at=estimated_valuation.expires_at,
+        dependency_fingerprint=estimated_valuation.dependency_fingerprint,
+        conservative_contribution=AmountView.of(estimated_valuation.conservative_contribution),
+        base_contribution=AmountView.of(estimated_valuation.base_contribution),
+    )
+    detail_with_refs = CandidateDetail.model_validate(
+        {**detail.model_dump(), "latest_valuation": reference.model_dump()}
+    )
+    fixture_valuation = valuation(calculate(load_rule_set_file(TAX_FIXTURE), tax_inputs(), AS_OF))
+    stale_valuation = mark_stale(estimated_valuation, [InvalidationReason.CONFIG], AS_OF + timedelta(hours=1))
+    note = detail.notes[0]
+    cases: dict[str, list[BaseModel]] = {
+        "deals_health": [health()],
+        "deals_list_candidates": [CandidateListView(items=(summary(listing),)), CandidateListView(items=())],
+        "deals_get_candidate": [detail, detail_with_refs],
+        "deals_get_comparables": [comparables],
+        "deals_get_valuation": [
+            valuation_view(v)
+            for v in (estimated_valuation, incomplete_valuation, fixture_valuation, stale_valuation)
+        ],
+        "reviews_claim": [ClaimResult.of(grant), ClaimResult.from_stored(grant.redacted_result())],
+        "reviews_release": [
+            ReleaseResultView.of(evaluate_release(claimed, actor(), TOKEN, NOW + timedelta(minutes=1)))
+        ],
+        "reviews_submit": [decision],
+        "deals_request_recheck": [
+            RecheckRequestResult(
+                job_id=uuid4(),
+                listing_id=LISTING_ID,
+                state=JobState.QUEUED,
+                deduplicated=False,
+                available_at=NOW,
+            )
+        ],
+        "deals_add_note": [note],
+        "sources_pause": [
+            SourcePauseResult(
+                source_id=SOURCE_ID,
+                source_key="mobile_de_public",
+                already_paused=False,
+                version=5,
+                paused_at=NOW,
+                reason="CAPTCHA observed",
+            )
+        ],
+    }
+    for name, outputs in cases.items():
+        schema = tool_output_schema(name)
+        for data in outputs:
+            assert not schema_errors(wire(data), schema), (name, schema_errors(wire(data), schema)[:5])
+    error = tool_error(VersionConflict(current_version=4), correlation_id="req-1").model_dump(mode="json")
+    assert not schema_errors(error, tool_error_schema())
+
+    # API-only views against their envelope schemas.
+    for data in (
+        SourceListView(items=(source_status(),)),
+        SettingsView.from_config(config, config_revision=None, can_administer=False, gates=(gate(),)),
+    ):
+        schema = model_schema(envelope_model_for(type(data)), mode="serialization")
+        assert not schema_errors(wire(data), schema), type(data).__name__
+
+    # Committed document schemas against real documents (and the spec's own listing example).
+    documents = exported_schema_documents()
+    case_view = ReviewCaseView(
+        case_id=CASE_ID,
+        case_version=decision.new_case_version,
+        state=decision.case_state,
+        listing_id=LISTING_ID,
+        revision_id=REVISION_ID,
+        listing_revision=3,
+        profile=ProfileKey.PRIMARY,
+        queue_label="Primary EUR 2,500-3,000",
+        readiness="not_valued",
+        priority=0,
+        claim=ClaimStateView(claimed=False, held_by_caller=False, expires_at=None),
+        candidate=summary(listing, case_id=CASE_ID, review_state=decision.case_state),
+        valuation=reference,
+        latest_decision_id=decision.decision_id,
+        decisions=(decision,),
+        superseded_by_id=None,
+        reason=None,
+        is_fixture=False,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    assert not schema_errors(case_view.model_dump(mode="json"), documents["review.schema.json"])
+    example = spec_json_block("### Example normalized revision")
+    assert not schema_errors(example, documents["listing.schema.json"])
+    dumped_listing = ListingRevisionDocument.model_validate(example).model_dump(mode="json")
+    assert not schema_errors(dumped_listing, documents["listing.schema.json"])
+    assert not schema_errors(
+        valuation_view(estimated_valuation).model_dump(mode="json"), documents["valuation.schema.json"]
+    )
+    for is_fixture in (False, True):
+        draft = build_review_pending_event(
+            pending_case(is_fixture=is_fixture),
+            dashboard_base_url="https://app.example",
+            event_id=uuid4(),
+            occurred_at=NOW,
+            readiness="needs_import_costs",
+        )
+        assert not schema_errors(draft.payload, documents["event.schema.json"])
+        assert schema_errors({**draft.payload, "extra": 1}, documents["event.schema.json"])

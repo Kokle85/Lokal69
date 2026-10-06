@@ -88,6 +88,7 @@ from suv_deals.views.operations import (
     ThresholdSettingView,
     WorkspaceView,
     profile_status_label,
+    redact_secrets,
 )
 from suv_deals.views.reviews import (
     ClaimResult,
@@ -197,5 +198,6 @@ __all__ = [
     "price_history",
     "profile_status_label",
     "provenance_views",
+    "redact_secrets",
     "warning",
 ]

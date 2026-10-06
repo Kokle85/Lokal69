@@ -309,8 +309,25 @@ class SellerTextView(ViewModel):
     description_excerpt: str | None = Field(max_length=4000)
 
 
+def safe_http_url(value: str | None) -> str | None:
+    """``value`` if it is an absolute http(s) URL without embedded credentials, else ``None``."""
+    if value is None:
+        return None
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    if parts.scheme not in ("https", "http") or not parts.hostname or parts.username or parts.password:
+        return None
+    return value
+
+
 class FieldProvenanceView(ViewModel):
-    """Where one normalized field came from. ``confidence`` is extraction reliability only."""
+    """Where one normalized field came from (spec 7). ``confidence`` is extraction reliability only.
+
+    ``source_url`` is the page the value was read from; it is omitted (null) unless it is a safe
+    absolute http(s) link without credentials.
+    """
 
     field_path: str = Field(min_length=1, max_length=200)
     method: ExtractionMethod
@@ -320,9 +337,17 @@ class FieldProvenanceView(ViewModel):
     selector: str | None = Field(max_length=300)
     raw_text: str | None = Field(max_length=500)
     transformation: str | None = Field(max_length=200)
+    source_url: str | None = Field(max_length=2048)
     snapshot_id: UUID | None
     evidence_id: UUID | None
     observed_at: UtcDatetime
+
+    @field_validator("source_url")
+    @classmethod
+    def _safe_source_url(cls, value: str | None) -> str | None:
+        if value is not None and safe_http_url(value) is None:
+            raise ValueError("source_url must be an absolute http(s) URL without credentials")
+        return value
 
     @classmethod
     def of(
@@ -341,6 +366,7 @@ class FieldProvenanceView(ViewModel):
             selector=provenance.selector,
             raw_text=provenance.raw_text,
             transformation=provenance.transformation,
+            source_url=safe_http_url(provenance.source_url),
             snapshot_id=provenance.snapshot_id,
             evidence_id=evidence_id,
             observed_at=provenance.observed_at,
@@ -495,11 +521,8 @@ class SourceLink(ViewModel):
     @field_validator("url")
     @classmethod
     def _safe_url(cls, value: str) -> str:
-        parts = urlsplit(value)
-        if parts.scheme not in ("https", "http") or not parts.hostname:
-            raise ValueError("source link must be an absolute http(s) URL")
-        if parts.username or parts.password:
-            raise ValueError("source link must not embed credentials")
+        if safe_http_url(value) is None:
+            raise ValueError("source link must be an absolute http(s) URL without credentials")
         return value
 
 

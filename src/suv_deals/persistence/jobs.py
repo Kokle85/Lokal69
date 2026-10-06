@@ -229,7 +229,10 @@ class ReapResult(BaseModel):
 
     requeued: tuple[UUID, ...] = ()
     dead_lettered: tuple[UUID, ...] = ()
+    # Every expired lease per job type (requeued + dead-lettered): `record_lease_expiration`.
     expired_by_type: dict[JobType, int] = Field(default_factory=dict)
+    # The dead-lettered subset per job type: `record_dead_letter`.
+    dead_lettered_by_type: dict[JobType, int] = Field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -810,6 +813,7 @@ async def reap_expired(
     requeued: list[UUID] = []
     dead: list[UUID] = []
     by_type: dict[JobType, int] = {}
+    dead_by_type: dict[JobType, int] = {}
     async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
         rows = await fetch_all(
             conn,
@@ -824,8 +828,17 @@ async def reap_expired(
     for row in rows:
         job_type = JobType(row["job_type"])
         by_type[job_type] = by_type.get(job_type, 0) + 1
-        (requeued if row["state"] == JobState.RETRY_WAIT.value else dead).append(row["id"])
-    return ReapResult(requeued=tuple(requeued), dead_lettered=tuple(dead), expired_by_type=by_type)
+        if row["state"] == JobState.RETRY_WAIT.value:
+            requeued.append(row["id"])
+        else:
+            dead.append(row["id"])
+            dead_by_type[job_type] = dead_by_type.get(job_type, 0) + 1
+    return ReapResult(
+        requeued=tuple(requeued),
+        dead_lettered=tuple(dead),
+        expired_by_type=by_type,
+        dead_lettered_by_type=dead_by_type,
+    )
 
 
 async def reconcile_exhausted(db: Database, workspace_id: UUID, *, limit: int = 500) -> tuple[UUID, ...]:

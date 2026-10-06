@@ -406,7 +406,7 @@
           "members": {
             "items": {
               "additionalProperties": false,
-              "description": "One selected or excluded MK observation, with its match differences or exclusion reasons.",
+              "description": "One selected or excluded MK observation, with its match differences or exclusion reasons.\n\n``duplicate_cluster_id`` is the observation's duplicate cluster (spec 15); ``duplicate_of``\nnames the kept observation for a member excluded as a duplicate. ``url`` is null unless it\nis a safe absolute http(s) link.",
               "properties": {
                 "advertised": {
                   "additionalProperties": false,
@@ -559,6 +559,13 @@
                   },
                   "maxItems": 50,
                   "type": "array"
+                },
+                "duplicate_cluster_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "duplicate_of": {
                   "format": "uuid",
@@ -772,6 +779,7 @@
                 "differences",
                 "exclusion_reasons",
                 "duplicate_of",
+                "duplicate_cluster_id",
                 "exclusion_details",
                 "advertised",
                 "amount_eur",

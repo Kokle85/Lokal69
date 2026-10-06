@@ -19,16 +19,30 @@ from typing import Any
 from uuid import UUID
 
 import psycopg
+import psycopg_pool
 from psycopg import AsyncConnection, sql
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from suv_deals.domain.actor import ActorContext
-from suv_deals.errors import DependencyUnavailable
+from suv_deals.errors import AppError, DependencyUnavailable, ErrorCode
 
 _ROLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 Conn = AsyncConnection[DictRow]
+
+
+class TransactionFailed(AppError):
+    """The transaction block finished while PostgreSQL had already aborted it."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ErrorCode.INTERNAL_ERROR, message, retryable=False)
+
+
+def _is_connection_error(exc: psycopg.Error) -> bool:
+    """Connection-class failures (SQLSTATE 08xxx, admin shutdown, or no SQLSTATE at all)."""
+    state = exc.sqlstate
+    return state is None or state.startswith("08") or state in {"57P01", "57P02", "57P03"}
 
 
 class Database:
@@ -118,8 +132,15 @@ class Database:
                     ),
                 )
                 yield conn
+                if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+                    # PostgreSQL would turn COMMIT into a silent ROLLBACK; never hide that.
+                    raise TransactionFailed("transaction aborted by an earlier error")
         except psycopg.OperationalError as exc:
-            raise DependencyUnavailable("database unavailable") from exc
+            if _is_connection_error(exc):
+                raise DependencyUnavailable("database unavailable") from exc
+            raise  # lock/serialization/timeout errors are mapped by the caller (errors_map)
+        except psycopg_pool.PoolTimeout as exc:
+            raise DependencyUnavailable("database pool exhausted") from exc
 
     async def ping(self) -> bool:
         try:

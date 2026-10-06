@@ -101,7 +101,7 @@
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "``deals_health`` takes no arguments.",
+    "description": "deals_health takes no arguments.",
     "properties": {},
     "title": "deals_health",
     "type": "object"

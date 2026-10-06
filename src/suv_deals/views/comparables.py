@@ -29,7 +29,7 @@ from suv_deals.domain.comparables import (
 )
 from suv_deals.domain.enums import Availability, EvidenceKind, PriceBasis, SellerType
 from suv_deals.domain.profiles import MK_ASKING_BAND_MAX_EUR, MK_ASKING_BAND_MIN_EUR
-from suv_deals.views.candidates import BandFit, SampleQuality
+from suv_deals.views.candidates import BandFit, SampleQuality, safe_http_url
 from suv_deals.views.common import (
     AmountView,
     DecimalStr,
@@ -128,7 +128,12 @@ class MkBandView(ViewModel):
 
 
 class ComparableMemberView(ViewModel):
-    """One selected or excluded MK observation, with its match differences or exclusion reasons."""
+    """One selected or excluded MK observation, with its match differences or exclusion reasons.
+
+    ``duplicate_cluster_id`` is the observation's duplicate cluster (spec 15); ``duplicate_of``
+    names the kept observation for a member excluded as a duplicate. ``url`` is null unless it
+    is a safe absolute http(s) link.
+    """
 
     ordinal: int = Field(ge=0)
     observation_id: UUID
@@ -141,6 +146,7 @@ class ComparableMemberView(ViewModel):
     differences: tuple[MatchDifference, ...] = Field(max_length=50)
     exclusion_reasons: tuple[ExclusionReason, ...] = Field(max_length=30)
     duplicate_of: UUID | None
+    duplicate_cluster_id: UUID | None
     exclusion_details: tuple[str, ...] = Field(max_length=30)
     advertised: AmountView
     amount_eur: AmountView
@@ -171,6 +177,7 @@ def _observation_fields(obs: MarketObservation | None) -> dict[str, object]:
     if obs is None:
         return {
             "advertised": AmountView.unknown("observation details not loaded"),
+            "duplicate_cluster_id": None,
             "price_basis": None,
             "observed_at": None,
             "source_key": None,
@@ -186,10 +193,11 @@ def _observation_fields(obs: MarketObservation | None) -> dict[str, object]:
         }
     return {
         "advertised": AmountView.of(obs.amount, unknown_reason="no advertised amount"),
+        "duplicate_cluster_id": obs.cluster_id,
         "price_basis": obs.price_basis,
         "observed_at": obs.observed_at,
         "source_key": obs.source_key,
-        "url": obs.url,
+        "url": safe_http_url(obs.url),
         "make": obs.vehicle.make,
         "model": obs.vehicle.model,
         "generation": obs.vehicle.generation,

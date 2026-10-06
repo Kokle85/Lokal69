@@ -36,7 +36,7 @@ from suv_deals.api.schemas import (
     api_error,
 )
 from suv_deals.domain.enums import Scope
-from suv_deals.errors import HTTP_STATUS, ErrorCode, NotFound, ValidationFailed, VersionConflict
+from suv_deals.errors import HTTP_STATUS, ErrorCode, NotFound, RateLimited, ValidationFailed, VersionConflict
 from suv_deals.mcp.schemas import (
     TOOL_NAMES,
     TOOLS,
@@ -257,8 +257,13 @@ def test_query_models_parse_strings_then_apply_tool_rules() -> None:
     tool_input = query.to_tool_input()
     assert isinstance(tool_input, DealsListCandidatesInput)
     assert tool_input.limit == 50 and tool_input.country == "DE"
-    with pytest.raises(ValidationFailed):  # naive timestamps are refused by the tool rules
-        CandidateListQuery.model_validate({"changed_since": "2026-10-06T10:00:00"}).to_tool_input()
+    # Same RFC 3339 rule as the MCP tool: naive timestamps and epoch strings are refused while
+    # parsing the query (regression: the query model used to read "1759744800" as a date).
+    for bad in ("2026-10-06T10:00:00", "1759744800", "2026-10-06 10:00:00Z"):
+        with pytest.raises(ValueError, match="changed_since"):
+            CandidateListQuery.model_validate({"changed_since": bad})
+    shifted = CandidateListQuery.model_validate({"changed_since": "2026-10-06T12:00:00+02:00"})
+    assert shifted.to_tool_input().filters()["changed_since"] == "2026-10-06T10:00:00Z"
     with pytest.raises(ValueError, match="limit"):
         CandidateListQuery.model_validate({"limit": "101"})
     with pytest.raises(ValueError, match="extra"):
@@ -283,6 +288,35 @@ def test_api_errors_use_http_status_map() -> None:
     assert api_error(NotFound(), request_id="req-2", as_of=NOW)[0] == 404
     for code in ErrorCode:
         assert code in HTTP_STATUS
+
+
+@pytest.mark.parametrize("request_id", ["", "has space", "x" * 201])
+def test_api_error_never_fails_on_a_bad_request_id(request_id: str) -> None:
+    # Regression: a malformed (client-supplied) request id made building the error body fail.
+    status, body = api_error(RateLimited(retry_after_seconds=10**6), request_id=request_id, as_of=NOW)
+    assert status == 429
+    dumped = body.model_dump(mode="json")
+    assert dumped["request_id"].startswith("req-") and dumped["request_id"] != request_id
+    assert dumped["error"]["correlation_id"] == dumped["request_id"]
+    assert dumped["error"]["retry_after_seconds"] == 86_400
+
+
+def test_api_bodies_name_fields_that_break_domain_rules() -> None:
+    body = SubmitReviewRequest.model_validate(
+        {
+            "claim_token": "t" * 43,
+            "expected_version": 2,
+            "listing_revision": 3,
+            "outcome": "watch",
+            "reason_codes": ["SAME", "SAME"],
+            "summary": "Watch: price in band, documents pending.",
+            "evidence_ids": [],
+            "idempotency_key": "key-0001-abcd",
+        }
+    )
+    with pytest.raises(ValidationFailed) as info:
+        body.to_tool_input(UID)
+    assert info.value.details == {"fields": ["reason_codes"]}
 
 
 # =========================================================================== documentation
