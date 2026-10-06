@@ -27,6 +27,7 @@ ROLE_SCOPES: dict[Role, frozenset[Scope]] = {
             Scope.EVENTS_SUBSCRIBE,
             Scope.RECHECKS_REQUEST,
             Scope.NOTES_WRITE,
+            Scope.INQUIRIES_READ,
         }
     ),
     Role.OWNER: frozenset(Scope),
@@ -67,7 +68,7 @@ class ActorContext:
             principal_id=principal_id or UUID(int=0),
             principal_kind="system",
             role=Role.OWNER,
-            scopes=frozenset(Scope) - {Scope.CONFIG_ADMIN},
+            scopes=frozenset(Scope) - {Scope.CONFIG_ADMIN, Scope.MAIL_INGEST},
             request_id=request_id,
             display_name="system",
         )

@@ -77,6 +77,33 @@ class Settings(BaseSettings):
     mcp_event_subscription_secret_encryption_key: SecretStr | None = None
     event_bridge_verified_at: str | None = None
 
+    # --- Spec v1.1 section 37: bounded automatic seller inquiry ------------------------
+    # Standing owner authorization (2026-10-06): one inquiry per vehicle/seller pair asking
+    # availability, documents and lowest/final price. No per-message approval gate. Sending stays
+    # off until the sender account is technically verified (mode disabled_until_sender_ready).
+    seller_inquiry_mode: Literal["disabled_until_sender_ready", "automatic", "paused"] = (
+        "disabled_until_sender_ready"
+    )
+    seller_inquiry_kill_switch: bool = False
+    seller_inquiry_authorization_scope: Literal["availability_documents_lowest_price_once"] = (
+        "availability_documents_lowest_price_once"
+    )
+    seller_inquiry_require_message_approval: bool = False
+    seller_inquiry_max_per_24h: int = Field(default=2, ge=0, le=20)
+    seller_inquiry_max_per_rolling_15d: int = Field(default=5, ge=0, le=100)
+    seller_email_provider: Literal["", "outlook_local", "gmail_api", "microsoft_graph"] = ""
+    seller_email_account_id: str | None = None
+    seller_email_from: str | None = None
+    seller_email_reply_to: str | None = None
+    seller_email_oauth_secret_reference: str | None = None
+    seller_reply_ingest_mode: Literal["local_classic_outlook", "provider_api", "disabled"] = (
+        "local_classic_outlook"
+    )
+    seller_reply_signal_provider: Literal["slack", "disabled"] = "slack"
+    mail_reconcile_interval_seconds: int = Field(default=120, ge=30, le=3600)
+    mail_worker_ingest_api_url: str | None = None
+    mail_worker_credential_reference: str | None = None
+
     llm_extraction_enabled: bool = False
     llm_provider: str | None = None
     llm_model: str | None = None

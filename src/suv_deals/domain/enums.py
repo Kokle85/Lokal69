@@ -368,6 +368,11 @@ class Scope(StrEnum):
     NOTES_WRITE = "notes:write"
     SOURCES_PAUSE = "sources:pause"
     CONFIG_ADMIN = "config:admin"
+    # Spec v1.1 section 37.8: read-only inquiry/reply tools and the narrowly granted kill switch.
+    INQUIRIES_READ = "inquiries:read"
+    INQUIRIES_PAUSE = "inquiries:pause"
+    # Mailbox-bound local reply worker: binding sync + correlated reply ingest only.
+    MAIL_INGEST = "mail:ingest"
 
 
 class ProfileKey(StrEnum):
@@ -386,3 +391,84 @@ class GateStatus(StrEnum):
     LIVE_VERIFIED = "live_verified"
     ACTIVE = "active"
     BLOCKED = "blocked"
+
+
+# --- Spec v1.1 section 37: bounded automatic seller inquiries ------------------------------
+
+
+class InquiryReadiness(StrEnum):
+    """Separate from investment readiness (spec 37.2)."""
+
+    INQUIRY_READY = "inquiry_ready"
+    NEEDS_FACTS = "needs_facts"
+    NEEDS_TECHNICAL_REVIEW = "needs_technical_review"
+    NOT_ELIGIBLE = "not_eligible"
+
+
+class InquiryState(StrEnum):
+    """Seller inquiry lifecycle (spec 37.5). `accepted` = provider accepted, not delivered/read."""
+
+    CANDIDATE = "candidate"
+    QUALIFYING = "qualifying"
+    RESERVED = "reserved"
+    QUEUED = "queued"
+    SENDING = "sending"
+    ACCEPTED = "accepted"
+    HELD_FACTS = "held_facts"
+    UNCERTAIN = "uncertain"
+    SUPPRESSED = "suppressed"
+    FAILED_DEFINITE = "failed_definite"
+    CANCELLED = "cancelled"
+    REPLIED = "replied"
+    BOUNCED = "bounced"
+    SELLER_OPTED_OUT = "seller_opted_out"
+    NO_REPLY_YET = "no_reply_yet"
+
+
+class SuppressionReason(StrEnum):
+    HARD_BOUNCE = "hard_bounce"
+    COMPLAINT = "complaint"
+    SELLER_OPT_OUT = "seller_opt_out"
+    SOURCE_PAUSED = "source_paused"
+    SENDER_REVOKED = "sender_revoked"
+    UNRESOLVED_SEND_OUTCOME = "unresolved_send_outcome"
+    KILL_SWITCH = "kill_switch"
+    CONTRADICTORY_AVAILABILITY = "contradictory_availability"
+    MANUAL = "manual"
+
+
+class EmailProviderKind(StrEnum):
+    OUTLOOK_LOCAL = "outlook_local"  # classic Outlook for Windows via the local worker
+    GMAIL_API = "gmail_api"
+    MICROSOFT_GRAPH = "microsoft_graph"
+
+
+class MessageLanguage(StrEnum):
+    """Supported inquiry template languages. English only with positive evidence (spec 37.3)."""
+
+    DE = "de"
+    IT = "it"
+    FR = "fr"
+    EN = "en"
+
+
+class ReplyMessageType(StrEnum):
+    SELLER_REPLY = "seller_reply"
+    AUTO_REPLY = "auto_reply"
+    BOUNCE = "bounce"
+    DELIVERY_NOTICE = "delivery_notice"
+    SPAM = "spam"
+    AMBIGUOUS = "ambiguous"  # quarantined until verified
+
+
+class AvailabilityEvidenceKind(StrEnum):
+    """Evidence behind an availability event (spec 37.9). Never proves a purchase or price."""
+
+    SOURCE_OBSERVATION = "source_observation"
+    SOURCE_SOLD_BADGE = "source_sold_badge"
+    SOURCE_REMOVED_PAGE = "source_removed_page"
+    SELLER_REPORTED_SOLD = "seller_reported_sold"
+    SELLER_REPORTED_AVAILABLE = "seller_reported_available"
+    SELLER_REPORTED_RESERVED = "seller_reported_reserved"
+    COMPLETE_SCAN_ABSENCE = "complete_scan_absence"
+    MANUAL = "manual"
