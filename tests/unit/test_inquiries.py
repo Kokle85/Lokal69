@@ -164,6 +164,7 @@ INQUIRY = UUID(int=41)
 URL = "https://www.example-marketplace.invalid/listing/SYNTH-1"
 REF = "SYNTH-1"
 SELLER_ADDRESS = "verkauf@autohaus-example.invalid"
+REPLY_TO = "vasko@example.invalid"
 DE_TEXT = (
     "Verkaufe unseren gepflegten Geländewagen. Fahrzeug ist unfallfrei, TÜV neu, Scheckheft gepflegt. "
     "Nichtraucherfahrzeug mit Anhängerkupplung und Sitzheizung."
@@ -1845,15 +1846,23 @@ def test_binding_is_immutable_once_reserved() -> None:
         apply_binding(InquiryState.QUEUED, BINDING, other_sender)
 
 
+RESERVED_AT = NOW - timedelta(hours=1)
+
+
 def _facts(**overrides: Any) -> DispatchFacts:
     data: dict[str, Any] = {
         "now": NOW,
         "state": InquiryState.QUEUED,
         "binding": BINDING,
+        "identity": IDENTITY,
+        "reserved_at": RESERVED_AT,
         "authorization": AUTH,
         "workspace_id": WS,
         "current_listing": SNAPSHOT,
         "source": inputs().source,
+        "disqualifiers": DisqualifierFacts(),
+        "other_inquiries": (),
+        "related_links": (),
         "sender": sender(),
         "recipient_recheck": ContactRecheck(material_change=False, recheck_required=False, changes=()),
         "rate_caps": evaluate_rate_caps([], now=NOW, policy=RateCapPolicy()),
@@ -2044,8 +2053,20 @@ def test_message_and_envelope_must_match_the_binding() -> None:
         _facts(envelope=MessageEnvelope(to=(SELLER_ADDRESS,), reply_to=("x@example.invalid",)))
     )
     assert "REPLY_TO_BINDING_MISMATCH" in other_reply.reasons
-    case_only = dispatch_preflight(_facts(envelope=MessageEnvelope(to=("verkauf@AUTOHAUS-example.invalid",))))
+    case_only = dispatch_preflight(
+        _facts(
+            envelope=MessageEnvelope(
+                to=("verkauf@AUTOHAUS-example.invalid",), reply_to=("vasko@EXAMPLE.invalid",)
+            )
+        )
+    )
     assert case_only.outcome == PreflightOutcome.PROCEED  # domain case is canonicalised
+    missing_reply_to = dispatch_preflight(_facts(envelope=MessageEnvelope(to=(SELLER_ADDRESS,))))
+    assert "REPLY_TO_BINDING_MISMATCH" in missing_reply_to.reasons  # replies must reach the bound mailbox
+    local_case = dispatch_preflight(
+        _facts(envelope=MessageEnvelope(to=("Verkauf@autohaus-example.invalid",), reply_to=(REPLY_TO,)))
+    )
+    assert "RECIPIENT_BINDING_MISMATCH" in local_case.reasons  # the local part is never case-folded
 
 
 @pytest.mark.parametrize(
@@ -2119,3 +2140,345 @@ def test_no_follow_up_is_possible_after_acceptance() -> None:
     }
     assert not reachable & {InquiryState.QUEUED, InquiryState.SENDING, InquiryState.RESERVED}
     assert reachable <= POSSIBLY_TRANSMITTED_STATES
+
+
+# ---------------------------------------------------------------------------------------------
+# Identity prerequisites, binding cross-checks and dispatch-time re-checks (hardening)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_inquiry_identity_needs_a_linked_seller_entity() -> None:
+    missing = readiness(identity=None)
+    assert missing.readiness == InquiryReadiness.NEEDS_FACTS
+    assert "INQUIRY_IDENTITY_MISSING" in missing.codes()
+    alias_only = SellerIdentity(
+        seller_type=SellerType.DEALER, aliases=(_alias("dealer-1", "fixture_dealer_de"),)
+    )
+    alias_identity = build_inquiry_identity(
+        WS, vehicle_cluster_id=None, listing_incarnation_id=INCARNATION, seller=alias_only
+    )
+    alias_recipient = verify_recipient(_recipient_evidence(seller=alias_only), now=NOW)
+    unlinked = readiness(identity=alias_identity, recipient=alias_recipient)
+    assert unlinked.readiness == InquiryReadiness.NEEDS_FACTS
+    assert unlinked.codes() & {"SELLER_ENTITY_UNLINKED", "RECIPIENT_SELLER_MISMATCH"} == {
+        "SELLER_ENTITY_UNLINKED"
+    }
+    assert severity_of(unlinked, "SELLER_ENTITY_UNLINKED") == ReadinessSeverity.NEEDS_FACTS
+    other_incarnation = build_inquiry_identity(
+        WS, vehicle_cluster_id=None, listing_incarnation_id=UUID(int=4040), seller=SELLER
+    )
+    mismatch = readiness(identity=other_incarnation)
+    assert mismatch.readiness == InquiryReadiness.NEEDS_TECHNICAL_REVIEW
+    assert "INQUIRY_IDENTITY_MISMATCH" in mismatch.codes()
+    clustered = build_inquiry_identity(
+        WS, vehicle_cluster_id=CLUSTER, listing_incarnation_id=INCARNATION, seller=SELLER
+    )
+    assert readiness(identity=clustered).readiness == InquiryReadiness.INQUIRY_READY
+
+
+@pytest.mark.parametrize(
+    ("overrides", "problem"),
+    [
+        ({"readiness": readiness(sender=sender(kill_switch=True))}, "RESERVATION_ON_HOLD"),
+        (
+            {
+                "identity": build_inquiry_identity(
+                    WS, vehicle_cluster_id=CLUSTER, listing_incarnation_id=INCARNATION, seller=SELLER
+                )
+            },
+            "READINESS_FOR_OTHER_IDENTITY",
+        ),
+        (
+            {"listing": SNAPSHOT.model_copy(update={"listing_incarnation_id": UUID(int=4041)})},
+            "LISTING_IDENTITY_MISMATCH",
+        ),
+        (
+            {
+                "message": RenderedMessage(
+                    **{
+                        **MESSAGE.model_dump(),
+                        "body": MESSAGE.body.replace("Guten Tag,", "Sehr geehrte Damen und Herren,"),
+                        "body_hash": message_body_hash(
+                            MESSAGE.subject,
+                            MESSAGE.body.replace("Guten Tag,", "Sehr geehrte Damen und Herren,"),
+                        ),
+                    }
+                )
+            },
+            "NOT_TEMPLATE_RENDERING",
+        ),
+        ({"sender": sender(from_address="not an address")}, "SENDER_NOT_USABLE"),
+    ],
+)
+def test_binding_cross_checks(overrides: dict[str, Any], problem: str) -> None:
+    with pytest.raises(ValidationFailed) as exc:
+        _bind(**overrides)
+    assert problem in exc.value.details["problems"]
+
+
+def test_cooldown_counts_only_live_or_transmitted_contacts() -> None:
+    def item(n: int, state: InquiryState, attempts: int = 0) -> ExistingInquiry:
+        return _existing(
+            state, inquiry_id=UUID(int=5000 + n), attempts=attempts, reserved_at=NOW - timedelta(days=n)
+        )
+
+    items = [
+        item(1, InquiryState.CANCELLED),  # never transmitted: contacted nobody
+        item(2, InquiryState.SUPPRESSED),
+        item(3, InquiryState.QUALIFYING),
+        item(4, InquiryState.RESERVED),
+        item(5, InquiryState.QUEUED),
+        item(6, InquiryState.FAILED_DEFINITE, attempts=1),
+        item(7, InquiryState.CANCELLED, attempts=1),  # an attempt existed: it may have left
+        item(8, InquiryState.NO_REPLY_YET, attempts=1),
+    ]
+    times = seller_contact_times(items, IDENTITY.seller_key)
+    assert times == tuple(NOW - timedelta(days=n) for n in (4, 5, 6, 7, 8))
+    assert evaluate_seller_cooldown(times, now=NOW).active
+    assert not evaluate_seller_cooldown(seller_contact_times(items[:3], IDENTITY.seller_key), now=NOW).active
+
+
+def test_correlated_reply_or_bounce_resolves_an_uncertain_send() -> None:
+    decision = reconcile_uncertain(ReconciliationEvidence(correlated_inbound=True, sent_items="not_found"))
+    assert decision.next_state == InquiryState.ACCEPTED
+    assert decision.reasons == ("CORRELATED_INBOUND_MESSAGE",)
+    assert decision.release_reservation is False
+    require_transition(
+        InquiryState.UNCERTAIN, InquiryState.ACCEPTED, TransitionContext(reconciliation=decision)
+    )
+
+
+def _racing(
+    n: int, *, reserved_at: datetime | None, state: InquiryState = InquiryState.QUEUED
+) -> ExistingInquiry:
+    return ExistingInquiry(
+        inquiry_id=UUID(int=n),
+        identity_key=IDENTITY.key(),
+        vehicle=IDENTITY.vehicle,
+        seller_key=IDENTITY.seller_key,
+        state=state,
+        reserved_at=reserved_at,
+    )
+
+
+def test_concurrent_reservations_of_one_identity_never_both_send() -> None:
+    # Two workers reserved the same vehicle/seller pair (e.g. through two aliases before a merge).
+    me = BINDING.inquiry_id
+    earlier = _racing(1, reserved_at=RESERVED_AT - timedelta(minutes=1))
+    later = _racing(2, reserved_at=RESERVED_AT + timedelta(minutes=1))
+    loses = dispatch_preflight(_facts(other_inquiries=(earlier,)))
+    assert loses.outcome == PreflightOutcome.CANCEL_STALE and "DUPLICATE_INQUIRY" in loses.reasons
+    assert loses.target_state == InquiryState.CANCELLED
+    wins = dispatch_preflight(_facts(other_inquiries=(later,)))
+    assert wins.outcome == PreflightOutcome.PROCEED
+    same_time_smaller_id = _racing(int(me.int) - 1, reserved_at=RESERVED_AT)
+    assert "DUPLICATE_INQUIRY" in dispatch_preflight(_facts(other_inquiries=(same_time_smaller_id,))).reasons
+    unknown_time = _racing(3, reserved_at=None)
+    assert "DUPLICATE_INQUIRY" in dispatch_preflight(_facts(other_inquiries=(unknown_time,))).reasons
+    sent_later = _racing(4, reserved_at=RESERVED_AT + timedelta(hours=1), state=InquiryState.SENDING)
+    assert "DUPLICATE_INQUIRY" in dispatch_preflight(_facts(other_inquiries=(sent_later,))).reasons
+    myself = _racing(me.int, reserved_at=RESERVED_AT)
+    assert dispatch_preflight(_facts(other_inquiries=(myself,))).outcome == PreflightOutcome.PROCEED
+
+
+def test_identity_merge_at_dispatch_cannot_double_send() -> None:
+    # After a cluster merge the queued inquiry's identity changed: it is cancelled and requalified.
+    merged = build_inquiry_identity(
+        WS, vehicle_cluster_id=CLUSTER, listing_incarnation_id=INCARNATION, seller=SELLER
+    )
+    changed = dispatch_preflight(_facts(identity=merged))
+    assert changed.target_state == InquiryState.CANCELLED and "INQUIRY_IDENTITY_CHANGED" in changed.reasons
+    # The same vehicle under another (alias) seller identity was already contacted: hold.
+    other_seller = ExistingInquiry(
+        inquiry_id=UUID(int=6001),
+        identity_key="another-identity",
+        vehicle=IDENTITY.vehicle,
+        seller_key="seller_alias:" + "b" * 64,
+        state=InquiryState.ACCEPTED,
+        transmission_attempts=1,
+        reserved_at=RESERVED_AT + timedelta(minutes=5),
+    )
+    held = dispatch_preflight(_facts(other_inquiries=(other_seller,)))
+    assert held.outcome == PreflightOutcome.HOLD and "POSSIBLE_DUPLICATE_CONTACT" in held.reasons
+    later_reserved = other_seller.model_copy(
+        update={"state": InquiryState.QUEUED, "transmission_attempts": 0}
+    )
+    assert dispatch_preflight(_facts(other_inquiries=(later_reserved,))).outcome == PreflightOutcome.PROCEED
+    earlier_reserved = later_reserved.model_copy(update={"reserved_at": RESERVED_AT - timedelta(minutes=5)})
+    assert (
+        "POSSIBLE_DUPLICATE_CONTACT"
+        in dispatch_preflight(_facts(other_inquiries=(earlier_reserved,))).reasons
+    )
+
+
+def test_possible_same_vehicle_link_is_rechecked_at_dispatch() -> None:
+    link = RelatedListingLink(
+        related_listing_id=UUID(int=7001),
+        relation="possible_same_unresolved",
+        related_inquiry_state=InquiryState.ACCEPTED,
+        related_inquiry_id=UUID(int=7002),
+        related_reserved_at=RESERVED_AT + timedelta(hours=2),
+    )
+    held = dispatch_preflight(_facts(related_links=(link,)))
+    assert held.outcome == PreflightOutcome.HOLD and held.reasons == ("POSSIBLE_DUPLICATE_CONTACT",)
+    queued_later = link.model_copy(update={"related_inquiry_state": InquiryState.QUEUED})
+    assert dispatch_preflight(_facts(related_links=(queued_later,))).outcome == PreflightOutcome.PROCEED
+    queued_earlier = queued_later.model_copy(update={"related_reserved_at": RESERVED_AT - timedelta(hours=2)})
+    assert dispatch_preflight(_facts(related_links=(queued_earlier,))).outcome == PreflightOutcome.HOLD
+    self_link = queued_earlier.model_copy(update={"related_inquiry_id": BINDING.inquiry_id})
+    assert dispatch_preflight(_facts(related_links=(self_link,))).outcome == PreflightOutcome.PROCEED
+
+
+@pytest.mark.parametrize(
+    ("disqualifiers", "outcome", "target", "code"),
+    [
+        (
+            DisqualifierFacts(fraud_warnings=("payment_before_viewing",)),
+            "cancel",
+            InquiryState.CANCELLED,
+            "FRAUD_WARNING",
+        ),
+        (
+            DisqualifierFacts(identity_conflict_open=True),
+            "cancel",
+            InquiryState.CANCELLED,
+            "IDENTITY_CONFLICT",
+        ),
+        (DisqualifierFacts(seller_opted_out=True), "suppress", InquiryState.SUPPRESSED, "SELLER_OPTED_OUT"),
+        (
+            DisqualifierFacts(availability_conflict=True),
+            "suppress",
+            InquiryState.SUPPRESSED,
+            "CONTRADICTORY_AVAILABILITY",
+        ),
+        (
+            DisqualifierFacts(
+                active_suppressions=(
+                    SuppressionRecord(
+                        scope="seller",
+                        key=IDENTITY.seller_key,
+                        reason=SuppressionReason.COMPLAINT,
+                        effective_at=NOW - timedelta(minutes=1),
+                    ),
+                )
+            ),
+            "suppress",
+            InquiryState.SUPPRESSED,
+            "SUPPRESSED_COMPLAINT",
+        ),
+    ],
+)
+def test_disqualifiers_are_rechecked_at_dispatch(
+    disqualifiers: DisqualifierFacts, outcome: str, target: InquiryState, code: str
+) -> None:
+    decision = dispatch_preflight(_facts(disqualifiers=disqualifiers))
+    assert decision.outcome == PreflightOutcome.CANCEL_STALE
+    assert decision.target_state == target and code in decision.reasons
+    if outcome == "suppress":
+        assert decision.suppression_reason is not None
+
+
+def test_seller_cooldown_is_rechecked_at_dispatch() -> None:
+    other_car = build_inquiry_identity(
+        WS, vehicle_cluster_id=UUID(int=8001), listing_incarnation_id=UUID(int=8002), seller=SELLER
+    )
+    contacted = ExistingInquiry(
+        inquiry_id=UUID(int=8003),
+        identity_key=other_car.key(),
+        vehicle=other_car.vehicle,
+        seller_key=other_car.seller_key,
+        state=InquiryState.ACCEPTED,
+        transmission_attempts=1,
+        reserved_at=NOW - timedelta(days=2),
+        last_contact_at=NOW - timedelta(days=2),
+    )
+    held = dispatch_preflight(_facts(other_inquiries=(contacted,)))
+    assert held.outcome == PreflightOutcome.HOLD and held.reasons == ("SELLER_COOLDOWN",)
+    assert held.next_attempt_at == NOW - timedelta(days=2) + SELLER_COOLDOWN
+    old = contacted.model_copy(
+        update={"last_contact_at": NOW - timedelta(days=8), "reserved_at": NOW - timedelta(days=8)}
+    )
+    assert dispatch_preflight(_facts(other_inquiries=(old,))).outcome == PreflightOutcome.PROCEED
+    racing_later = contacted.model_copy(
+        update={
+            "state": InquiryState.QUEUED,
+            "transmission_attempts": 0,
+            "last_contact_at": None,
+            "reserved_at": RESERVED_AT + timedelta(minutes=1),
+        }
+    )
+    assert dispatch_preflight(_facts(other_inquiries=(racing_later,))).outcome == PreflightOutcome.PROCEED
+    racing_earlier = racing_later.model_copy(update={"reserved_at": RESERVED_AT - timedelta(minutes=1)})
+    assert "SELLER_COOLDOWN" in dispatch_preflight(_facts(other_inquiries=(racing_earlier,))).reasons
+    no_time = contacted.model_copy(update={"last_contact_at": None, "reserved_at": None})
+    unknown = dispatch_preflight(_facts(other_inquiries=(no_time,)))
+    assert unknown.outcome == PreflightOutcome.HOLD and unknown.next_attempt_at is None
+    cancelled_unsent = racing_earlier.model_copy(update={"state": InquiryState.CANCELLED})
+    assert dispatch_preflight(_facts(other_inquiries=(cancelled_unsent,))).outcome == PreflightOutcome.PROCEED
+
+
+def test_hold_reports_the_latest_known_retry_time() -> None:
+    caps = evaluate_rate_caps(
+        _debits(NOW - timedelta(hours=3), NOW - timedelta(hours=2)), now=NOW, policy=RateCapPolicy()
+    )
+    other_car = build_inquiry_identity(
+        WS, vehicle_cluster_id=UUID(int=8101), listing_incarnation_id=UUID(int=8102), seller=SELLER
+    )
+    contacted = ExistingInquiry(
+        inquiry_id=UUID(int=8103),
+        identity_key=other_car.key(),
+        vehicle=other_car.vehicle,
+        seller_key=other_car.seller_key,
+        state=InquiryState.NO_REPLY_YET,
+        transmission_attempts=1,
+        last_contact_at=NOW - timedelta(days=1),
+    )
+    decision = dispatch_preflight(_facts(rate_caps=caps, other_inquiries=(contacted,)))
+    assert set(decision.reasons) == {"RATE_CAP_REACHED", "SELLER_COOLDOWN"}
+    assert decision.next_attempt_at == NOW - timedelta(days=1) + SELLER_COOLDOWN
+    zero = evaluate_rate_caps([], now=NOW, policy=RateCapPolicy(max_per_24h=0))
+    assert dispatch_preflight(_facts(rate_caps=zero)).next_attempt_at is None
+
+
+def test_only_the_exact_template_rendering_is_dispatched() -> None:
+    reworded = MESSAGE.body.replace("Guten Tag,", "Sehr geehrte Damen und Herren,")
+    in_scope_but_hand_built = RenderedMessage(
+        **{
+            **MESSAGE.model_dump(),
+            "body": reworded,
+            "body_hash": message_body_hash(MESSAGE.subject, reworded),
+        }
+    )
+    decision = dispatch_preflight(_facts(message=in_scope_but_hand_built))
+    assert decision.target_state == InquiryState.CANCELLED
+    assert {"MESSAGE_NOT_TEMPLATE_RENDERING", "MESSAGE_BINDING_MISMATCH"} <= set(decision.reasons)
+    html = MessageEnvelope(
+        to=(SELLER_ADDRESS,), reply_to=(REPLY_TO,), extra_headers={"Content-Type": "text/html; charset=utf-8"}
+    )
+    assert "SCOPE_VALIDATION_FAILED" in dispatch_preflight(_facts(envelope=html)).reasons
+    multipart = MessageEnvelope(
+        to=(SELLER_ADDRESS,),
+        reply_to=(REPLY_TO,),
+        extra_headers={"Content-Type": "multipart/mixed; boundary=x"},
+    )
+    assert "SCOPE_VALIDATION_FAILED" in dispatch_preflight(_facts(envelope=multipart)).reasons
+    plain = MessageEnvelope(
+        to=(SELLER_ADDRESS,),
+        reply_to=(REPLY_TO,),
+        extra_headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Transfer-Encoding": "quoted-printable",
+            "MIME-Version": "1.0",
+            "Message-ID": "<synthetic-inquiry-1@example.invalid>",
+        },
+    )
+    assert dispatch_preflight(_facts(envelope=plain)).outcome == PreflightOutcome.PROCEED
+
+
+def test_dispatch_facts_require_the_rechecks() -> None:
+    data = _facts().model_dump()
+    assert DispatchFacts(**data) == _facts()
+    for field in ("identity", "reserved_at", "disqualifiers", "other_inquiries", "related_links"):
+        partial = {k: v for k, v in data.items() if k != field}
+        with pytest.raises(ValidationError):
+            DispatchFacts(**partial)

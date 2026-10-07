@@ -528,3 +528,26 @@ def test_revision_change_alone_is_not_a_contact_change() -> None:
     result = detect_contact_change(_bound(), current, now=NOW)
     assert not result.material_change and not result.recheck_required
     assert result.changes == (ContactChange.REVISION_CHANGED,)
+
+
+@pytest.mark.parametrize(
+    ("excerpt", "shown"),
+    [
+        ("E-Mail: info@autohaus-example.invalid", True),
+        ("E-Mail: info@AUTOHAUS-example.invalid.", True),  # sentence end; domain case-insensitive
+        ("(info@autohaus-example.invalid)", True),
+        ("E-Mail: sales.info@autohaus-example.invalid", False),  # longer address on the left
+        ("E-Mail: my-info@autohaus-example.invalid", False),
+        ("E-Mail: info@autohaus-example.invalid.example", False),  # longer domain on the right
+        ("E-Mail: info@autohaus-example.invalid-shop.example", False),
+        ("E-Mail: INFO@autohaus-example.invalid", False),  # the local part is never case-folded
+        ("E-Mail: info [at] autohaus-example.invalid", False),  # obfuscated: not shown, not guessed
+    ],
+)
+def test_excerpt_must_show_exactly_this_address(excerpt: str, shown: bool) -> None:
+    decision = verify(evidence(address="info@autohaus-example.invalid", extraction_excerpt=excerpt))
+    assert decision.verified == shown
+    if not shown:
+        assert decision.reasons == (RecipientReason.EXCERPT_DOES_NOT_SHOW_ADDRESS,)
+    dealer_decision = verify(dealer(address="info@autohaus-example.invalid", extraction_excerpt=excerpt))
+    assert dealer_decision.verified == shown

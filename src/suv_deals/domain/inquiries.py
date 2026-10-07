@@ -9,10 +9,12 @@ Contents:
 - ``InquiryIdentity``: workspace + canonical vehicle identity (confirmed vehicle cluster, else the
   listing incarnation) + verified seller identity + purpose. Never a source listing id alone, so
   one car advertised on three sites by one seller is one inquiry whatever relay address is shown.
-  ``evaluate_duplicate_contact`` applies the one-inquiry rule (a price change, relisting, profile
-  switch, sender change or retry never resets it) and suppresses the additional send while a
-  plausible cross-site duplicate is unresolved; ``reconcile_identity_merge`` keeps exactly one
-  inquiry when identities merge later.
+  Readiness requires a persisted seller entity (an alias-derived key could change when a further
+  alias is found). ``evaluate_duplicate_contact`` applies the one-inquiry rule (a price change,
+  relisting, profile switch, sender change or retry never resets it) and suppresses the additional
+  send while a plausible cross-site duplicate is unresolved; at dispatch it is re-run with a
+  deterministic tie-break (earliest reservation, then id) so two racing reservations can never
+  both transmit. ``reconcile_identity_merge`` keeps exactly one inquiry when identities merge.
 - ``evaluate_inquiry_readiness``: ``inquiry_ready`` is separate from investment readiness and
   implements the six checks of spec 37.2. Missing CoC/origin/CO2/registration copies/last price are
   the reason to ask, never blockers; an unapproved tax rule or the PROPOSED EUR 1,500 threshold
@@ -21,7 +23,9 @@ Contents:
   scope/template/body-hash plus sender/recipient binding once reserved.
 - Rolling 24 h / 15 day rate caps (ceilings, not targets; transactional enforcement is the
   database layer's), seller-level cooldown, suppression matching and ``dispatch_preflight``
-  (proceed / cancel_stale / hold) immediately before transmission.
+  (proceed / cancel_stale / hold) immediately before transmission, which re-checks the listing
+  facts, disqualifiers, suppressions, kill switch, duplicates, seller cooldown, sender, recipient,
+  language, quota and that the message is the exact registered template rendering.
 - The uncertain-send policy: ``should_retry`` only after a proven pre-submission failure with no
   possibly running prior attempt, or with provider-documented idempotency; never another account.
   An empty Sent Items search is not proof of non-submission; uncertain sends keep their
@@ -90,6 +94,7 @@ from suv_deals.domain.seller_templates import (
     MessageEnvelope,
     QuestionId,
     RenderedMessage,
+    rendering_problems,
     validate_scope,
 )
 from suv_deals.errors import IdempotencyConflict, ValidationFailed
@@ -365,12 +370,27 @@ class ExistingInquiry(BaseModel):
         return self.state in POSSIBLY_TRANSMITTED_STATES or self.transmission_attempts > 0
 
 
+#: Reserved-but-untransmitted states that still hold the seller's contact slot (cooldown).
+_HOLDS_CONTACT_SLOT: Final = frozenset(
+    {InquiryState.RESERVED, InquiryState.QUEUED, InquiryState.FAILED_DEFINITE}
+)
+
+
 def seller_contact_times(existing: Sequence[ExistingInquiry], seller_key: str) -> tuple[datetime, ...]:
-    """Reservation/transmission times of every inquiry to this seller (input to the cooldown)."""
+    """Contact times of the inquiries to this seller that count for the seller-level cooldown.
+
+    Counts every (possibly) transmitted inquiry and every live reservation (reserved, queued or a
+    retryable definite failure). A cancelled or suppressed reservation that never transmitted, and
+    records that were never reserved, contacted nobody and do not count.
+    """
     times: list[datetime] = []
     for item in existing:
+        if item.seller_key != seller_key:
+            continue
+        if not (item.possibly_transmitted or item.state in _HOLDS_CONTACT_SLOT):
+            continue
         moment = item.last_contact_at or item.reserved_at
-        if item.seller_key == seller_key and moment is not None:
+        if moment is not None:
             times.append(moment)
     return tuple(times)
 
@@ -384,6 +404,13 @@ class RelatedListingLink(BaseModel):
     relation: Literal["confirmed_same_vehicle", "possible_same_unresolved", "rejected_not_same"]
     related_inquiry_state: InquiryState | None = None
     related_vehicle: VehicleIdentityRef | None = None
+    related_inquiry_id: UUID | None = None  # for the deterministic dispatch-time tie-break
+    related_reserved_at: datetime | None = None
+
+    @field_validator("related_reserved_at")
+    @classmethod
+    def _aware(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _utc(value)
 
 
 DuplicateOutcome = Literal[
@@ -415,18 +442,46 @@ _ACTIVE_STATES_FOR_OTHERS: Final = (
 )
 
 
+_RESERVED_UNSENT: Final = frozenset({InquiryState.RESERVED, InquiryState.QUEUED})
+
+
+def _precedes(other_id: UUID | None, other_reserved_at: datetime | None, current: ExistingInquiry) -> bool:
+    """Does another reserved-but-unsent inquiry win the tie against ``current``?
+
+    Earliest reservation first, ties by id. Unknown reservation data counts as winning (fail
+    closed): both may then wait, but two of them can never both transmit.
+    """
+    if other_id is None or other_reserved_at is None or current.reserved_at is None:
+        return True
+    return (other_reserved_at, str(other_id)) < (current.reserved_at, str(current.inquiry_id))
+
+
 def evaluate_duplicate_contact(
     identity: InquiryIdentity,
     existing: Sequence[ExistingInquiry],
     related: Sequence[RelatedListingLink] = (),
+    *,
+    current: ExistingInquiry | None = None,
 ) -> DuplicateDecision:
-    """Apply the one-inquiry rule and the unresolved cross-site duplicate hold (spec 37.5)."""
+    """Apply the one-inquiry rule and the unresolved cross-site duplicate hold (spec 37.5).
+
+    Before reservation call it without ``current``: any reserved, queued or (possibly) sent
+    inquiry for the same identity, the same vehicle under another seller identity or a plausibly
+    same vehicle blocks. Immediately before dispatch pass the inquiry being sent as ``current``
+    (it is excluded from ``existing``/``related``): (possibly) transmitted inquiries still block,
+    while competing reserved-but-unsent inquiries block only when they precede ``current``
+    (earliest reservation, then id), so exactly one of two racing reservations may transmit.
+    """
     key = identity.key()
-    same = [e for e in existing if e.identity_key == key]
+    pool = [e for e in existing if current is None or e.inquiry_id != current.inquiry_id]
+
+    def other_wins(other_id: UUID | None, reserved_at: datetime | None) -> bool:
+        return current is None or _precedes(other_id, reserved_at, current)
+
     rank = {"continue_existing": 0, "in_progress": 2, "suppressed": 3, "prior_inquiry": 4}
     worst: DuplicateDecision | None = None
-    for item in same:
-        if item.possibly_transmitted:
+    for item in (e for e in pool if e.identity_key == key):
+        if item.possibly_transmitted or item.state == InquiryState.FAILED_DEFINITE:
             decision = DuplicateDecision(
                 outcome="prior_inquiry", reasons=("PRIOR_INQUIRY",), existing_inquiry_id=item.inquiry_id
             )
@@ -436,31 +491,39 @@ def evaluate_duplicate_contact(
             decision = DuplicateDecision(
                 outcome="suppressed", reasons=("INQUIRY_SUPPRESSED",), existing_inquiry_id=item.inquiry_id
             )
-        elif item.state == InquiryState.FAILED_DEFINITE:
-            decision = DuplicateDecision(
-                outcome="prior_inquiry", reasons=("PRIOR_INQUIRY",), existing_inquiry_id=item.inquiry_id
-            )
-        else:  # reserved / queued
+        elif other_wins(item.inquiry_id, item.reserved_at):  # reserved / queued
             decision = DuplicateDecision(
                 outcome="in_progress", reasons=("INQUIRY_IN_PROGRESS",), existing_inquiry_id=item.inquiry_id
             )
+        else:
+            continue  # a later racing reservation; it is cancelled at its own dispatch
         if worst is None or rank[decision.outcome] > rank[worst.outcome]:
             worst = decision
     if worst is not None and worst.outcome != "continue_existing":
         return worst
 
     reasons: list[str] = []
-    for other in existing:
+    for other in pool:
         if other.identity_key == key or other.state not in _ACTIVE_STATES_FOR_OTHERS:
             continue
-        if other.vehicle == identity.vehicle and other.seller_key != identity.seller_key:
-            reasons.append("SAME_VEHICLE_OTHER_SELLER_IDENTITY")
+        if other.vehicle != identity.vehicle or other.seller_key == identity.seller_key:
+            continue
+        unsent = other.state in _RESERVED_UNSENT and not other.possibly_transmitted
+        if unsent and not other_wins(other.inquiry_id, other.reserved_at):
+            continue
+        reasons.append("SAME_VEHICLE_OTHER_SELLER_IDENTITY")
     for link in related:
         if link.relation == "rejected_not_same" or link.related_inquiry_state is None:
+            continue
+        if current is not None and link.related_inquiry_id == current.inquiry_id:
             continue
         if link.related_inquiry_state in PRE_RESERVATION_STATES:
             continue
         if link.related_inquiry_state == InquiryState.CANCELLED:
+            continue
+        if link.related_inquiry_state in _RESERVED_UNSENT and not other_wins(
+            link.related_inquiry_id, link.related_reserved_at
+        ):
             continue
         if link.relation == "possible_same_unresolved":
             reasons.append("POSSIBLE_SAME_VEHICLE_UNRESOLVED")
@@ -1055,6 +1118,9 @@ class ReadinessCode(StrEnum):
     INQUIRY_IN_PROGRESS = "INQUIRY_IN_PROGRESS"
     INQUIRY_SUPPRESSED = "INQUIRY_SUPPRESSED"
     POSSIBLE_DUPLICATE_CONTACT = "POSSIBLE_DUPLICATE_CONTACT"
+    INQUIRY_IDENTITY_MISSING = "INQUIRY_IDENTITY_MISSING"
+    SELLER_ENTITY_UNLINKED = "SELLER_ENTITY_UNLINKED"
+    INQUIRY_IDENTITY_MISMATCH = "INQUIRY_IDENTITY_MISMATCH"
     RECIPIENT_UNKNOWN = "RECIPIENT_UNKNOWN"
     SELLER_EMAIL_UNAVAILABLE = "SELLER_EMAIL_UNAVAILABLE"
     RECIPIENT_RECHECK_REQUIRED = "RECIPIENT_RECHECK_REQUIRED"
@@ -1315,6 +1381,29 @@ def _check_disqualifiers(i: InquiryReadinessInputs, c: _Collector) -> None:
         )
 
 
+def _check_identity(i: InquiryReadinessInputs, c: _Collector) -> None:
+    """The durable inquiry identity needs a persisted, verified seller entity (spec 37.5/37.8).
+
+    An alias-derived key can change when a further alias is discovered, so it is never used to
+    reserve: linking the seller entity is an automatic persistence step, not an approval.
+    """
+    nf, tr = ReadinessSeverity.NEEDS_FACTS, ReadinessSeverity.NEEDS_TECHNICAL_REVIEW
+    identity = i.identity
+    if identity is None:
+        c.add("INQUIRY_IDENTITY_MISSING", 5, nf, "vehicle/seller inquiry identity not established")
+        return
+    if not identity.seller_key.startswith("seller_entity:"):
+        c.add("SELLER_ENTITY_UNLINKED", 5, nf, "seller aliases are not linked to a seller entity yet")
+    binding = i.recipient.binding if i.recipient is not None else None
+    if (
+        binding is not None
+        and identity.vehicle.kind == "listing_incarnation"
+        and binding.listing_incarnation_id is not None
+        and binding.listing_incarnation_id != identity.vehicle.id
+    ):
+        c.add("INQUIRY_IDENTITY_MISMATCH", 5, tr, "inquiry identity names another listing incarnation")
+
+
 def _check_recipient_language(i: InquiryReadinessInputs, c: _Collector) -> None:
     nf, tr = ReadinessSeverity.NEEDS_FACTS, ReadinessSeverity.NEEDS_TECHNICAL_REVIEW
     r = i.recipient
@@ -1475,6 +1564,7 @@ def evaluate_inquiry_readiness(inputs: InquiryReadinessInputs) -> InquiryReadine
     _check_market(inputs, c)
     incomplete = _check_costs(inputs, c)
     _check_disqualifiers(inputs, c)
+    _check_identity(inputs, c)
     _check_recipient_language(inputs, c)
     next_at = _check_sender(inputs, c)
     questions = _open_questions(inputs)
@@ -1719,6 +1809,9 @@ class ReconciliationEvidence(BaseModel):
     outbox_pending: Tristate = Tristate.UNKNOWN  # local Outlook Outbox still holds the item
     proven_not_submitted: PreSubmissionProof | None = None
     worker_alive: Tristate = Tristate.UNKNOWN
+    #: A seller reply, auto-reply or bounce correlated by In-Reply-To/References to this send's
+    #: stable Message-ID proves that the message was submitted.
+    correlated_inbound: bool = False
 
 
 class ReconcileDecision(BaseModel):
@@ -1733,6 +1826,8 @@ def reconcile_uncertain(evidence: ReconciliationEvidence) -> ReconcileDecision:
     """Resolve ``uncertain`` only on positive evidence; an empty search never releases anything."""
     if evidence.sent_items == "found" or evidence.provider_search == "found":
         return ReconcileDecision(next_state=InquiryState.ACCEPTED, reasons=("SUBMISSION_FOUND",))
+    if evidence.correlated_inbound:
+        return ReconcileDecision(next_state=InquiryState.ACCEPTED, reasons=("CORRELATED_INBOUND_MESSAGE",))
     if (
         evidence.proven_not_submitted is not None
         and evidence.worker_alive == Tristate.NO
@@ -1863,6 +1958,36 @@ class InquiryBinding(BaseModel):
         return sha256_json(self.model_dump(mode="json"))
 
 
+def _sender_binding(sender: SenderStatus) -> SenderBinding | None:
+    """The exact sender binding, or ``None`` while the sender identity is incomplete/invalid."""
+    if (
+        sender.identity_problems()
+        or sender.binding_id is None
+        or sender.binding_version is None
+        or sender.provider is None
+        or not sender.account_id
+        or not sender.from_address
+        or not sender.display_name
+    ):
+        return None
+    try:
+        from_address = canonicalize_address(sender.from_address).canonical
+        reply_to = (
+            canonicalize_address(sender.reply_to_address).canonical if sender.reply_to_address else None
+        )
+    except AddressError:
+        return None
+    return SenderBinding(
+        binding_id=sender.binding_id,
+        binding_version=sender.binding_version,
+        provider=sender.provider,
+        account_id=sender.account_id,
+        from_address=from_address,
+        display_name=sender.display_name,
+        reply_to_address=reply_to,
+    )
+
+
 def bind_inquiry(
     *,
     at: datetime,
@@ -1876,10 +2001,20 @@ def bind_inquiry(
     recipient: RecipientDecision,
     listing: ListingFactsSnapshot,
 ) -> InquiryBinding:
-    """Create the binding stored at reservation. Every cross-reference must agree exactly."""
+    """Create the binding stored at reservation. Every cross-reference must agree exactly.
+
+    Refused (``ValidationFailed`` with problem codes) unless the readiness decision for exactly
+    this identity allows reserving now, the message is the exact rendering of a registered
+    template in the resolved language and passes the scope validator, the sender is usable and the
+    recipient is verified for this listing, seller and URL/reference.
+    """
     problems: list[str] = []
     if readiness.readiness != InquiryReadiness.INQUIRY_READY:
         problems.append("NOT_INQUIRY_READY")
+    elif not readiness.can_reserve_now:
+        problems.append("RESERVATION_ON_HOLD")
+    if readiness.evidence.get("identity_key") != identity.key():
+        problems.append("READINESS_FOR_OTHER_IDENTITY")
     if not language.resolved or language.language is None:
         problems.append("LANGUAGE_NOT_RESOLVED")
     if message.kind != "seller_inquiry":
@@ -1887,11 +2022,13 @@ def bind_inquiry(
     registered = TEMPLATES.get(message.template_id)
     if registered is None or registered.template_hash() != message.template_hash:
         problems.append("TEMPLATE_NOT_REGISTERED")
+    problems.extend(rendering_problems(message))  # exact deterministic rendering, never hand-built
     if language.language is not None and message.language != language.language.value:
         problems.append("MESSAGE_LANGUAGE_MISMATCH")
     if message.scope_hash != SCOPE_HASH or not validate_scope(message).ok:
         problems.append("SCOPE_VALIDATION_FAILED")
-    if sender.identity_problems():
+    sender_binding = _sender_binding(sender)
+    if sender_binding is None:
         problems.append("SENDER_NOT_USABLE")
     if sender.display_name != message.placeholders.sender_display_name:
         problems.append("SENDER_DISPLAY_NAME_MISMATCH")
@@ -1906,12 +2043,16 @@ def bind_inquiry(
             problems.append("RECIPIENT_LISTING_MISMATCH")
         if recipient.binding.seller_identity_key != identity.seller_key:
             problems.append("RECIPIENT_SELLER_MISMATCH")
+    if (
+        identity.vehicle.kind == "listing_incarnation"
+        and listing.listing_incarnation_id is not None
+        and listing.listing_incarnation_id != identity.vehicle.id
+    ):
+        problems.append("LISTING_IDENTITY_MISMATCH")
     if authorization.problems_at(at):
         problems.append("AUTHORIZATION_INACTIVE")
-    if problems or recipient.binding is None or language.language is None:
+    if problems or recipient.binding is None or language.language is None or sender_binding is None:
         raise ValidationFailed("inquiry binding refused", details={"problems": sorted(set(problems))})
-    assert sender.binding_id is not None and sender.binding_version is not None  # identity_problems checked
-    assert sender.provider is not None and sender.account_id and sender.from_address and sender.display_name
     return InquiryBinding(
         inquiry_id=inquiry_id,
         identity_key=identity.key(),
@@ -1924,17 +2065,7 @@ def bind_inquiry(
         language=language.language,
         scope_hash=message.scope_hash,
         body_hash=message.body_hash,
-        sender=SenderBinding(
-            binding_id=sender.binding_id,
-            binding_version=sender.binding_version,
-            provider=sender.provider,
-            account_id=sender.account_id,
-            from_address=canonicalize_address(sender.from_address).canonical,
-            display_name=sender.display_name,
-            reply_to_address=canonicalize_address(sender.reply_to_address).canonical
-            if sender.reply_to_address
-            else None,
-        ),
+        sender=sender_binding,
         recipient=recipient.binding,
         qualified_listing=listing,
         readiness_rationale_hash=readiness.rationale_hash,
@@ -1968,30 +2099,42 @@ class PreflightOutcome(StrEnum):
 
 
 class DispatchFacts(BaseModel):
-    """Current facts re-read under lock immediately before a send attempt is recorded."""
+    """Current facts re-read under lock immediately before a send attempt is recorded.
+
+    Every field without a default must be supplied from the current records: the dispatcher
+    cannot skip the duplicate, disqualifier or suppression re-checks by omitting them.
+    """
 
     model_config = _FROZEN
 
     now: datetime
     state: InquiryState
     binding: InquiryBinding
+    identity: InquiryIdentity  # the inquiry's identity as currently resolved (merges included)
+    reserved_at: datetime  # this inquiry's reservation time (dispatch tie-break)
     authorization: SellerInquiryAuthorization
     workspace_id: UUID
     current_listing: ListingFactsSnapshot
     source: SourceObservationFacts
+    disqualifiers: DisqualifierFacts
     sender: SenderStatus
     recipient_recheck: ContactRecheck
     current_language: LanguageDecision | None = None
     suppressions: tuple[SuppressionRecord, ...] = ()
+    #: Every other inquiry of this workspace for the same identity, vehicle or seller.
+    other_inquiries: tuple[ExistingInquiry, ...]
+    #: Cross-site links of the qualified listing (confirmed or plausibly same vehicles).
+    related_links: tuple[RelatedListingLink, ...]
     rate_caps: RateCapDecision  # evaluated excluding this inquiry's own debit
     quota_debit_present: bool
+    seller_cooldown: timedelta = SELLER_COOLDOWN
     attempts: tuple[SendAttemptEvidence, ...] = ()
     message: RenderedMessage
     envelope: MessageEnvelope
     message_approval_required: bool = False  # only ever requires_message_approval(settings)
     message_approval_recorded: bool = False
 
-    @field_validator("now")
+    @field_validator("now", "reserved_at")
     @classmethod
     def _aware(cls, value: datetime) -> datetime:
         return _utc(value)
@@ -2026,21 +2169,52 @@ def _sender_changed(bound: SenderBinding, current: SenderStatus) -> bool:
     )
 
 
-def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
-    """Revalidate everything immediately before transmission (spec 37.5).
+def _dispatch_cooldown(
+    others: Sequence[ExistingInquiry], current: ExistingInquiry, *, now: datetime, cooldown: timedelta
+) -> tuple[bool, datetime | None]:
+    """Seller cooldown at dispatch: (possibly) sent inquiries to this seller, plus competing live
+    reservations that precede this one. Returns ``(active, until)``; ``until`` is ``None`` when a
+    blocking contact has no known time (fail closed: hold without a retry estimate)."""
+    active = False
+    until: datetime | None = None
+    unknown_time = False
+    for other in others:
+        if other.inquiry_id == current.inquiry_id or other.seller_key != current.seller_key:
+            continue
+        competing = other.state in _HOLDS_CONTACT_SLOT and _precedes(
+            other.inquiry_id, other.reserved_at, current
+        )
+        if not (other.possibly_transmitted or competing):
+            continue
+        moment = other.last_contact_at or other.reserved_at
+        if moment is None:
+            active, unknown_time = True, True
+            continue
+        if now < moment + cooldown:
+            active = True
+            until = moment + cooldown if until is None else max(until, moment + cooldown)
+    return active, None if unknown_time else until
 
-    Precedence: suppression (kill switch, source pause, revoked sender, matching suppression
-    records, revoked authorization) > cancellation of stale work (listing revision/price/
-    availability, sender or recipient change, language change, binding/scope mismatch) > hold
-    (mode not automatic, running prior attempt, stale recipient evidence, sender health, quota,
-    owner-configured approval). Only ``proceed`` may lead to a send attempt.
+
+def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
+    """Revalidate everything immediately before transmission (spec 37.2 check 6, 37.5).
+
+    Precedence: suppression (kill switch, revoked authorization, source pause, revoked sender,
+    seller opt-out, contradictory availability, matching suppression records) > cancellation of
+    stale work (listing revision/price/availability, fraud warning, identity conflict or change,
+    duplicate inquiry, sender or recipient change, language change, message/scope/binding
+    mismatch) > hold (mode not automatic, running or unresolved prior attempt, stale recipient
+    evidence, sender health, possible cross-site duplicate, seller cooldown, quota, owner-configured
+    approval). Only ``proceed`` may lead to a send attempt; no approval is ever inserted unless the
+    owner setting ``requires_message_approval`` asks for it.
     """
     b = facts.binding
     now = facts.now
     suppress: list[tuple[SuppressionReason, str]] = []
     cancel: list[str] = []
     hold: list[str] = []
-    next_at: datetime | None = None
+    next_times: list[datetime] = []
+    unknown_next = False
 
     if facts.state != InquiryState.QUEUED:
         return PreflightDecision(outcome=PreflightOutcome.HOLD, reasons=("NOT_QUEUED",))
@@ -2056,6 +2230,11 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
         suppress.append((SuppressionReason.SOURCE_PAUSED, "SOURCE_NOT_ACTIVE"))
     if facts.sender.credentials_revoked:
         suppress.append((SuppressionReason.SENDER_REVOKED, "SENDER_REVOKED"))
+    d = facts.disqualifiers
+    if d.seller_opted_out:
+        suppress.append((SuppressionReason.SELLER_OPT_OUT, "SELLER_OPTED_OUT"))
+    if d.availability_conflict:
+        suppress.append((SuppressionReason.CONTRADICTORY_AVAILABILITY, "CONTRADICTORY_AVAILABILITY"))
     targets = SuppressionTargets(
         workspace_id=facts.workspace_id,
         seller_key=b.recipient.seller_identity_key,
@@ -2064,7 +2243,8 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
         source_key=b.recipient.source_key,
         sender_binding_id=b.sender.binding_id,
     )
-    for record in matching_suppressions(facts.suppressions, targets, at=now):
+    matched = matching_suppressions((*facts.suppressions, *d.active_suppressions), targets, at=now)
+    for record in matched:
         suppress.append((record.reason, f"SUPPRESSED_{record.reason.value.upper()}"))
 
     # -- stale work ---------------------------------------------------------------------------
@@ -2073,6 +2253,14 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
         or facts.authorization.version != b.authorization_version
     ):
         cancel.append("AUTHORIZATION_CHANGED")
+    identity = facts.identity
+    if (
+        identity.workspace_id != facts.workspace_id
+        or identity.key() != b.identity_key
+        or identity.vehicle.key() != b.vehicle_key
+        or identity.seller_key != b.recipient.seller_identity_key
+    ):
+        cancel.append("INQUIRY_IDENTITY_CHANGED")
     q, cur = b.qualified_listing, facts.current_listing
     if (cur.listing_id, cur.listing_incarnation_id) != (q.listing_id, q.listing_incarnation_id):
         cancel.append("LISTING_IDENTITY_CHANGED")
@@ -2086,6 +2274,25 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
         cancel.append("VEHICLE_UNAVAILABLE")
     if cur.revision_number != q.revision_number or cur.semantic_hash != q.semantic_hash:
         cancel.append("LISTING_REVISION_CHANGED")
+    if d.fraud_warnings:
+        cancel.append("FRAUD_WARNING")
+    if d.identity_conflict_open:
+        cancel.append("IDENTITY_CONFLICT")
+    current = ExistingInquiry(
+        inquiry_id=b.inquiry_id,
+        identity_key=b.identity_key,
+        vehicle=identity.vehicle,
+        seller_key=b.recipient.seller_identity_key,
+        state=facts.state,
+        reserved_at=facts.reserved_at,
+    )
+    duplicate = evaluate_duplicate_contact(
+        identity, facts.other_inquiries, facts.related_links, current=current
+    )
+    if duplicate.outcome in {"prior_inquiry", "in_progress", "suppressed"}:
+        cancel.append("DUPLICATE_INQUIRY")
+    elif duplicate.outcome == "possible_duplicate":
+        hold.append("POSSIBLE_DUPLICATE_CONTACT")
     if _sender_changed(b.sender, facts.sender):
         cancel.append("SENDER_CHANGED")
     if facts.recipient_recheck.material_change:
@@ -2100,8 +2307,12 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
         or msg.template_id != b.template_id
         or msg.scope_hash != b.scope_hash
         or msg.placeholders.listing_url != b.recipient.listing_url
+        or msg.placeholders.listing_reference != b.recipient.listing_reference
+        or msg.placeholders.sender_display_name != b.sender.display_name
     ):
         cancel.append("MESSAGE_BINDING_MISMATCH")
+    if rendering_problems(msg):
+        cancel.append("MESSAGE_NOT_TEMPLATE_RENDERING")
     scope = validate_scope(msg, envelope=facts.envelope)
     if not scope.ok:
         cancel.append("SCOPE_VALIDATION_FAILED")
@@ -2112,7 +2323,8 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
         to, reply_to = [], ["<invalid>"]
     if to != [b.recipient.canonical_address]:
         cancel.append("RECIPIENT_BINDING_MISMATCH")
-    if reply_to and reply_to != [b.sender.reply_to_address]:
+    expected_reply_to = [b.sender.reply_to_address] if b.sender.reply_to_address else []
+    if reply_to != expected_reply_to:
         cancel.append("REPLY_TO_BINDING_MISMATCH")
 
     # -- hold -----------------------------------------------------------------------------------
@@ -2127,11 +2339,23 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
     sender_problems = set(facts.sender.identity_problems()) - {"SENDER_REVOKED"}
     if sender_problems:
         hold.append("SENDER_NOT_USABLE")
+    cooling, cooldown_until = _dispatch_cooldown(
+        facts.other_inquiries, current, now=now, cooldown=facts.seller_cooldown
+    )
+    if cooling:
+        hold.append("SELLER_COOLDOWN")
+        if cooldown_until is None:
+            unknown_next = True
+        else:
+            next_times.append(cooldown_until)
     if not facts.quota_debit_present:
         hold.append("QUOTA_DEBIT_MISSING")
     if not facts.rate_caps.allowed:
         hold.append("RATE_CAP_REACHED")
-        next_at = facts.rate_caps.next_allowed_at
+        if facts.rate_caps.next_allowed_at is None:
+            unknown_next = True
+        else:
+            next_times.append(facts.rate_caps.next_allowed_at)
     if facts.message_approval_required and not facts.message_approval_recorded:
         hold.append("OWNER_CONFIGURED_MESSAGE_APPROVAL")
 
@@ -2150,6 +2374,7 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
             reasons=tuple(dict.fromkeys(cancel + hold)),
         )
     if hold:
+        next_at = None if unknown_next or not next_times else max(next_times)
         return PreflightDecision(
             outcome=PreflightOutcome.HOLD, reasons=tuple(dict.fromkeys(hold)), next_attempt_at=next_at
         )

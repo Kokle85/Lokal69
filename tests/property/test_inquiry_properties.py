@@ -39,6 +39,7 @@ from suv_deals.domain.inquiries import (
     CostEvidence,
     DisqualifierFacts,
     DuplicateDecision,
+    ExistingInquiry,
     InquiryReadinessInputs,
     QuotaDebit,
     RateCapPolicy,
@@ -46,6 +47,7 @@ from suv_deals.domain.inquiries import (
     SourceObservationFacts,
     VehicleIdentification,
     build_inquiry_identity,
+    evaluate_duplicate_contact,
     evaluate_inquiry_readiness,
     evaluate_rate_caps,
     load_seller_inquiry_authorization,
@@ -246,6 +248,53 @@ def test_identity_ignores_alias_order_relay_address_and_site(
         for s in linked
     }
     assert len(keys) == 1
+
+
+racers = st.lists(
+    st.tuples(
+        st.integers(min_value=1, max_value=10_000),  # inquiry id
+        st.one_of(st.none(), st.integers(min_value=0, max_value=5)),  # reservation minute (None = unknown)
+        st.booleans(),  # same identity (True) or same vehicle under another seller key (False)
+    ),
+    min_size=1,
+    max_size=6,
+    unique_by=lambda t: t[0],
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(racers)
+def test_racing_reservations_never_both_transmit(entries: list[tuple[int, int | None, bool]]) -> None:
+    """Concurrent workers / identity merges: at most one racing queued inquiry may proceed, and
+    exactly one when every reservation time is known (spec 37.5, 37.10)."""
+    identity = build_inquiry_identity(
+        WS, vehicle_cluster_id=UUID(int=99), listing_incarnation_id=UUID(int=7), seller=SELLER
+    )
+    identities = {
+        n: identity if same else identity.model_copy(update={"seller_key": f"seller_alias:{n:064x}"})
+        for n, _, same in entries
+    }
+    inquiries = [
+        ExistingInquiry(
+            inquiry_id=UUID(int=n),
+            identity_key=identities[n].key(),
+            vehicle=identities[n].vehicle,
+            seller_key=identities[n].seller_key,
+            state=InquiryState.QUEUED,
+            reserved_at=None if minute is None else NOW + timedelta(minutes=minute),
+        )
+        for n, minute, _ in entries
+    ]
+    proceeding = [
+        current.inquiry_id
+        for current in inquiries
+        if not evaluate_duplicate_contact(
+            identities[current.inquiry_id.int], inquiries, current=current
+        ).blocks
+    ]
+    assert len(proceeding) <= 1
+    if all(minute is not None for _, minute, _ in entries):
+        assert len(proceeding) == 1
 
 
 # ---------------------------------------------------------------------------------------------

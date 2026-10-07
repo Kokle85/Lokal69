@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID
 
 from hypothesis import HealthCheck, assume, given, settings
@@ -19,10 +20,12 @@ from suv_deals.domain.replies import (
     ReplyIngestRequest,
     SourceMessageIdentity,
     StoredReplyIngest,
+    build_mk_summary,
     classify_message,
     correlate_reply,
     decide_ingest,
     extract_reply_claims,
+    format_amount_mk,
     normalize_message_id,
     sanitize_reply_body,
 )
@@ -117,7 +120,18 @@ def request(**overrides: object) -> ReplyIngestRequest:
 @SETTINGS
 @given(
     headers=st.dictionaries(
-        st.sampled_from(["From", "Subject", "Auto-Submitted", "X-Spam-Flag", "Content-Type", "In-Reply-To", "x y"]),
+        st.sampled_from(
+            [
+                "From",
+                "Subject",
+                "Auto-Submitted",
+                "X-Spam-Flag",
+                "Content-Type",
+                "In-Reply-To",
+                "x y",
+                "values",
+            ]
+        ),
         st.one_of(TEXT, st.lists(TEXT, max_size=3), st.integers(), st.none()),
         max_size=7,
     ),
@@ -190,10 +204,11 @@ def test_fingerprint_ignores_locators_and_sync_metadata(
 
 
 @SETTINGS
-@given(body=st.text(min_size=1, max_size=500))
+@given(body=st.one_of(st.text(min_size=1, max_size=500), SENTENCES))
 def test_changed_body_under_same_identity_is_a_conflict(body: str) -> None:
     base = request()
-    changed = request(sanitized_body_text=body.replace("\x00", ""))
+    # The worker only ever uploads sanitised text (raw control characters are rejected).
+    changed = request(sanitized_body_text=sanitize_reply_body(body).text)
     assume(changed.fingerprint() != base.fingerprint())
     stored = StoredReplyIngest(
         reply_id=REPLY,
@@ -224,7 +239,7 @@ def test_subject_or_reference_text_alone_never_matches_and_never_uploads(
 ) -> None:
     headers: dict[str, object] = {
         "From": sender,
-        "Subject": f"Re: Anfrage zu Example Trail – TEST-204 {subject_extra}",
+        "Subject": f"Re: Anfrage zu Example Trail - TEST-204 {subject_extra}",
         "References": " ".join(f"<{r}@unknown.invalid>" for r in refs),
     }
     msg = InboundMessage(
@@ -243,7 +258,9 @@ def test_subject_or_reference_text_alone_never_matches_and_never_uploads(
 
 @SETTINGS
 @given(text=st.one_of(TEXT, SENTENCES), language=st.sampled_from([None, *MessageLanguage]))
-def test_claims_never_raise_and_quotes_are_never_accepted(text: str, language: MessageLanguage | None) -> None:
+def test_claims_never_raise_and_quotes_are_never_accepted(
+    text: str, language: MessageLanguage | None
+) -> None:
     claims = extract_reply_claims(text, language)
     for price in claims.prices:
         assert price.accepted is False
@@ -254,7 +271,14 @@ def test_claims_never_raise_and_quotes_are_never_accepted(text: str, language: M
             assert price.amount is not None and price.amount > 0
     for mention in claims.other_amounts:
         assert mention.amount is None or mention.amount > 0
-    assert claims.availability_summary in {"available", "sold", "reserved", "not_available", "conflicting", "not_stated"}
+    assert claims.availability_summary in {
+        "available",
+        "sold",
+        "reserved",
+        "not_available",
+        "conflicting",
+        "not_stated",
+    }
 
 
 @SETTINGS
@@ -265,3 +289,154 @@ def test_message_id_normalisation_is_idempotent(value: str) -> None:
         assert normalize_message_id(normalized) == normalized
         assert normalized.startswith("<") and normalized.endswith(">")
         assert not any(c.isspace() for c in normalized)
+
+
+@SETTINGS
+@given(
+    body=st.one_of(TEXT, SENTENCES),
+    via=st.sampled_from(["in-reply-to", "references", "both"]),
+    extra_refs=st.lists(st.text(alphabet="abcdef0123456789", min_size=1, max_size=12), max_size=3),
+)
+def test_header_reference_from_verified_seller_is_never_lost(
+    body: str, via: str, extra_refs: list[str]
+) -> None:
+    """A reply that references our outbound Message-ID from the verified seller is always linked
+    to its inquiry: matched, or quarantined for verification - never unmatched/dropped."""
+    refs = " ".join(f"<{r}@unknown.invalid>" for r in extra_refs)
+    headers: dict[str, object] = {"From": SELLER, "Subject": "Re: Anfrage zu Example Trail - TEST-204"}
+    if via in ("in-reply-to", "both"):
+        headers["In-Reply-To"] = OUT_ID
+    if via in ("references", "both"):
+        headers["References"] = f"{refs} {OUT_ID}".strip()
+    msg = InboundMessage(
+        identity=SourceMessageIdentity(
+            mailbox_binding_id=MB,
+            provider=EmailProviderKind.OUTLOOK_LOCAL,
+            internet_message_id="<reply@example.invalid>",
+        ),
+        headers=headers,  # type: ignore[arg-type]
+        body_text=body,
+    )
+    result = correlate_reply(msg, [BINDING])
+    assert result.outcome != CorrelationOutcome.UNMATCHED
+    assert result.inquiry_id == INQ
+    assert result.upload_scope in ("full", "quarantine")
+    if result.outcome == CorrelationOutcome.MATCHED:
+        assert result.sender_verified or result.message_type in (
+            ReplyMessageType.BOUNCE,
+            ReplyMessageType.DELIVERY_NOTICE,
+        )
+
+
+@SETTINGS
+@given(
+    metas=st.lists(
+        st.tuples(
+            st.sampled_from(["coc.pdf", "zb1.jpg", "foto.png", "scan.heic"]),
+            st.sampled_from(["application/pdf", "image/jpeg", "image/png", "image/heic"]),
+            st.integers(min_value=1, max_value=10**6),
+            st.text(alphabet="0123456789abcdef", min_size=64, max_size=64),
+        ),
+        min_size=0,
+        max_size=5,
+    ),
+    data=st.data(),
+)
+def test_fingerprint_is_independent_of_attachment_order(
+    metas: list[tuple[str, str, int, str]], data: st.DataObject
+) -> None:
+    attachments = [
+        {"filename": n, "mime_type": m, "byte_size": b, "sha256": h, "local_ref": f"loc-{i}"}
+        for i, (n, m, b, h) in enumerate(metas)
+    ]
+    shuffled = data.draw(st.permutations(attachments))
+    relabelled = [{**a, "local_ref": f"moved-{i}"} for i, a in enumerate(shuffled)]
+    assert request(attachments=attachments).fingerprint() == request(attachments=relabelled).fingerprint()
+
+
+AMOUNT_TEMPLATES = {
+    MessageLanguage.DE: "Mein letzter Preis ist {amount} {currency}.",
+    MessageLanguage.IT: "Il prezzo finale è {amount} {currency}.",
+    MessageLanguage.FR: "Mon dernier prix est {amount} {currency}.",
+    MessageLanguage.EN: "My lowest price is {amount} {currency}.",
+}
+GROUPING = {
+    MessageLanguage.DE: ".",
+    MessageLanguage.IT: ".",
+    MessageLanguage.FR: " ",
+    MessageLanguage.EN: ",",
+}
+
+
+@SETTINGS
+@given(
+    value=st.integers(min_value=500, max_value=99_999),
+    currency=st.sampled_from(["EUR", "CHF", "€"]),
+    language=st.sampled_from(list(MessageLanguage)),
+)
+def test_mk_summary_preserves_amount_and_currency_in_every_language(
+    value: int, currency: str, language: MessageLanguage
+) -> None:
+    grouped = f"{value:,}".replace(",", GROUPING[language])
+    if currency == "CHF":
+        grouped = f"{value:,}".replace(",", "'")
+    text = AMOUNT_TEMPLATES[language].format(amount=grouped, currency=currency)
+    claims = extract_reply_claims(text, language)
+    (price,) = claims.prices
+    expected_currency = "EUR" if currency == "€" else currency
+    assert price.amount == value and price.currency == expected_currency
+    assert price.accepted is False and price.status == "unaccepted_seller_quote"
+    summary = build_mk_summary(claims, language)
+    rendered = f"{format_amount_mk(Decimal(value))} {expected_currency}"
+    assert rendered in summary.text
+    assert rendered in summary.amounts_preserved
+    assert "НЕ е прифатена" in summary.text  # noqa: RUF001 (Macedonian Cyrillic)
+
+
+NEGATED_SOLD = {
+    MessageLanguage.DE: ["Das Auto ist nicht verkauft", "Noch nicht verkauft", "Er wird verkauft"],
+    MessageLanguage.IT: ["La macchina non è venduta", "Non ancora venduta", "Viene venduta"],
+    MessageLanguage.FR: ["Le véhicule n'est pas vendu", "Pas encore vendue", "Elle sera vendue"],
+    MessageLanguage.EN: ["The car is not sold", "Not sold yet", "It will be sold", "Sold as seen"],
+}
+
+
+@SETTINGS
+@given(
+    language=st.sampled_from(list(MessageLanguage)),
+    data=st.data(),
+    padding=st.lists(
+        st.sampled_from(["Hallo", "Grazie", "Merci", "Thanks", "Preis 2.600 €", "CoC"]), max_size=4
+    ),
+)
+def test_negated_or_future_sale_is_never_reported_sold(
+    language: MessageLanguage, data: st.DataObject, padding: list[str]
+) -> None:
+    sentence = data.draw(st.sampled_from(NEGATED_SOLD[language]))
+    text = ". ".join([*padding, sentence]) + "."
+    claims = extract_reply_claims(text, language)
+    assert all(c.status.value != "sold" for c in claims.availability)
+    assert claims.availability_summary != "sold"
+
+
+@SETTINGS
+@given(
+    language=st.sampled_from(list(MessageLanguage)),
+    data=st.data(),
+)
+def test_quoted_outbound_questions_never_become_claims(
+    language: MessageLanguage, data: st.DataObject
+) -> None:
+    questions = {
+        MessageLanguage.DE: "Ist das Fahrzeug noch verfügbar? Was ist Ihr niedrigster Verkaufspreis?",
+        MessageLanguage.IT: "Il veicolo è ancora disponibile? Qual è il prezzo minimo finale?",
+        MessageLanguage.FR: "Le véhicule est-il toujours disponible ? Quel est votre dernier prix ?",
+        MessageLanguage.EN: "Is the vehicle still available? What is your lowest final selling price?",
+    }[language]
+    quote_style = data.draw(st.sampled_from(["prefix", "header"]))
+    if quote_style == "prefix":
+        quoted = "\n".join(f"> {line}" for line in questions.split("? "))
+    else:
+        quoted = f"-----Original Message-----\nFrom: x\n{questions}"
+    claims = extract_reply_claims(f"Danke.\n{quoted}", language)
+    assert claims.availability == () and claims.prices == ()

@@ -203,9 +203,27 @@ record, not a template edit.
 - no digits outside the bounded label/reference values (`PRICE_OR_NUMBER`), no currencies, no
   phone numbers/e-mail addresses/IBANs/secrets, exactly one URL equal to the verified listing URL,
   no markup or header lines, the signature equals the verified sender display name;
-- with an envelope: exactly one `To`, no CC/BCC, at most one Reply-To, no attachments and only
-  allow-listed extra headers without CR/LF.
+- with an envelope: exactly one valid `To` address, no CC/BCC, at most one valid Reply-To, no
+  attachments and only the allow-listed extra headers (`Message-ID`, `Date`, `MIME-Version`,
+  `Content-Type`, `Content-Transfer-Encoding`), each at most once, ASCII-printable and without
+  CR/LF or Unicode line separators. `Content-Type` must be a single `text/plain` part (charset
+  UTF-8 or US-ASCII): `text/html`, any `multipart/*` container (the carrier of attachments) or extra
+  parameters fail with `MIME_NOT_PLAIN_TEXT`; `MIME-Version` must be `1.0`,
+  `Content-Transfer-Encoding` one of `7bit`, `8bit`, `quoted-printable`, `base64`, and
+  `Message-ID` a single `<id@domain>`.
 
 The validator runs on every rendering, on the Macedonian preview, again when the binding is
 created (`inquiries.bind_inquiry`) and again with the envelope immediately before transmission
 (`inquiries.dispatch_preflight`).
+
+## Exact rendering
+
+`validate_scope` is semantic so that a reviewed wording fix can become a new template version.
+What is actually bound and sent must, however, be the exact deterministic rendering of a
+registered template: `rendering_problems(message)` re-validates every placeholder value with the
+same rules as `render`, re-renders the registered template and requires byte-identical subject and
+body, the registered template id/version/hash/kind/language, the current template set and the
+scope hash. `bind_inquiry` refuses (`NOT_TEMPLATE_RENDERING`, `TEMPLATE_NOT_REGISTERED`, ...) and
+`dispatch_preflight` cancels (`MESSAGE_NOT_TEMPLATE_RENDERING`) any hand-built or edited message,
+even one whose wording would stay inside the scope. A `VehicleLabel` text is always exactly
+`make model [generation]` from its verified parts.

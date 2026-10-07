@@ -1869,3 +1869,188 @@ class TestProcessing:
         assert decision.signal_status == ReplySignalStatus.DOCUMENTS_ATTACHED
         assert not decision.counts_as_real_reply
         assert should_emit_reply_signal(matched())
+
+
+# =============================================================================================
+# Review regressions (resumed package)
+# =============================================================================================
+
+
+class TestReviewRegressions:
+    def test_uncertain_send_resolved_when_its_stable_message_id_is_also_outbound(self) -> None:
+        uncertain = binding(
+            state=InquiryBindingState.UNCERTAIN,
+            outbound_message_ids=(INTENT_ID,),
+            send_intent_message_ids=(INTENT_ID,),
+        )
+        headers = reply_headers(**{"In-Reply-To": INTENT_ID, "References": INTENT_ID})
+        result = correlate_reply(message(headers, "Ja, TEST-204 ist noch da."), [uncertain])
+        assert result.outcome == CorrelationOutcome.MATCHED
+        assert result.resolves_uncertain_send
+        decision = decide_reply_processing(result, extract_reply_claims("Ja, noch da.", "de"))
+        assert decision.resolves_uncertain_send and decision.inquiry_transition == InquiryState.REPLIED
+
+    def test_bounce_of_an_uncertain_send_proves_submission(self) -> None:
+        uncertain = binding(
+            state=InquiryBindingState.UNCERTAIN, outbound_message_ids=(), send_intent_message_ids=(INTENT_ID,)
+        )
+        headers = {
+            "From": "MAILER-DAEMON@mx.example.invalid",
+            "Subject": "Undelivered Mail Returned to Sender",
+            "Content-Type": "multipart/report; report-type=delivery-status",
+        }
+        body = (
+            f"Final-Recipient: rfc822; {SELLER}\nAction: failed\nStatus: 5.1.1\n\nMessage-ID: {INTENT_ID}\n"
+        )
+        result = correlate_reply(message(headers, body), [uncertain])
+        assert result.outcome == CorrelationOutcome.MATCHED and result.resolves_uncertain_send
+        decision = decide_reply_processing(result, bounce=parse_delivery_report(body))
+        assert decision.inquiry_transition == InquiryState.BOUNCED
+        assert decision.suppressions == (SuppressionReason.HARD_BOUNCE,)
+
+    def test_thread_only_link_never_resolves_an_uncertain_send(self) -> None:
+        uncertain = binding(
+            state=InquiryBindingState.UNCERTAIN,
+            outbound_message_ids=(),
+            send_intent_message_ids=(INTENT_ID,),
+            provider_thread_ids=("conv-1",),
+        )
+        result = correlate_reply(
+            message({"From": SELLER, "Subject": "Anfrage TEST-204"}, "Ja", thread="conv-1"), [uncertain]
+        )
+        assert result.outcome == CorrelationOutcome.MATCHED
+        assert not result.resolves_uncertain_send
+        assert CorrelationReason.RESOLVES_UNCERTAIN_SEND not in result.reasons
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "Re: Anfrage zu Example Trail – TEST-204 (absence of rust?)",
+            "AW: Abwesenheit von Mängeln – TEST-204",
+            "R: assenza di ruggine",
+            "RE : absence de rouille",
+            "Re: vacation plans and the car",
+        ],
+    )
+    def test_ordinary_words_after_a_reply_prefix_are_not_an_auto_reply(self, subject: str) -> None:
+        assert classify_message({"From": SELLER, "Subject": subject}, "Ja.") == ReplyMessageType.SELLER_REPLY
+
+    @pytest.mark.parametrize(
+        "subject",
+        ["Abwesend: Anfrage", "Assente: Richiesta", "Absent : Renseignements", "Urlaub: Anfrage zu X"],
+    )
+    def test_ordinary_words_as_subject_prefix_are_an_auto_reply(self, subject: str) -> None:
+        assert classify_message({"From": SELLER, "Subject": subject}, "x") == ReplyMessageType.AUTO_REPLY
+
+    def test_strong_auto_reply_phrase_counts_anywhere(self) -> None:
+        subject = "Re: Anfrage (Automatic reply)"
+        assert classify_message({"From": SELLER, "Subject": subject}, "x") == ReplyMessageType.AUTO_REPLY
+
+    def test_hostile_header_named_values_never_breaks_parsing(self) -> None:
+        msg = message({"values": {"x": 1}, "From": SELLER, "In-Reply-To": OUT_ID}, "Ja TEST-204")
+        assert msg.headers.get("from") == SELLER
+        assert correlate_reply(msg, [binding()]).outcome == CorrelationOutcome.MATCHED
+        only_values = InboundMessage(
+            identity=SourceMessageIdentity(mailbox_binding_id=MB, provider=EmailProviderKind.OUTLOOK_LOCAL),
+            headers={"values": {"subject": 7}},  # type: ignore[arg-type]
+        )
+        assert only_values.headers.values == {}
+
+    def test_headers_built_directly_are_cleaned_and_bounded(self) -> None:
+        headers = MessageHeaders(
+            values={
+                "Subject": ("Re: Anfrage\r\nBcc: victim@example.invalid",),
+                "bad name": ("x",),
+                "X-Many": tuple(str(i) for i in range(200)),
+            }
+        )
+        assert headers.get("subject") == "Re: Anfrage  Bcc: victim@example.invalid"
+        assert "\n" not in (headers.get("subject") or "")
+        assert headers.get("bad name") is None
+        assert len(headers.get_all("x-many")) == 50
+        serialised = InboundMessage(
+            identity=SourceMessageIdentity(mailbox_binding_id=MB, provider=EmailProviderKind.OUTLOOK_LOCAL),
+            headers=headers.model_dump(),  # type: ignore[arg-type]
+        )
+        assert serialised.headers == headers
+
+    def test_money_like_number_next_to_a_stated_price_is_preserved_not_quoted(self) -> None:
+        claims = extract_reply_claims("The car is 2,800 euros, not less than 2,600.", "en")
+        (price,) = claims.prices
+        assert price.amount == Decimal(2800) and price.currency == "EUR"
+        (mention,) = claims.other_amounts
+        assert mention.amount == Decimal(2600) and mention.currency is None
+        assert mention.context == AmountContext.UNLABELLED
+        assert "AMOUNT_WITHOUT_PRICE_CONTEXT" in mention.warnings
+        summary = build_mk_summary(claims, MessageLanguage.EN)
+        assert "2.800 EUR" in summary.text
+        assert "2.600 (валута не е наведена)" in summary.text
+        assert "2.600 (валута не е наведена)" in summary.amounts_preserved
+
+    @pytest.mark.parametrize(
+        ("text", "lang", "amount"),
+        [
+            ("Preis 2.900 €, Baujahr 2012, 150.000 km, 2 Schlüssel.", "de", "2900"),
+            ("Preis ist 2.900, Kilometerstand 150000, 2 Vorbesitzer", "de", "2900"),
+            ("Preis 2600, Kilometerstand: ca. 150.000", "de", "2600"),
+            ("Il prezzo è 2.900, chilometri 150000, 5 porte", "it", "2900"),
+            ("Prix 2900, kilométrage 150000, 2 propriétaires", "fr", "2900"),
+            ("Lowest price 2600, mileage of about 145000, 2 owners", "en", "2600"),
+            ("I have the registration papers and 2600 is my lowest price", "en", "2600"),
+        ],
+    )
+    def test_mileage_years_and_counts_next_to_a_price_word_are_never_quotes(
+        self, text: str, lang: str, amount: str
+    ) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert [p.amount for p in claims.prices] == [Decimal(amount)]
+        assert all(p.accepted is False for p in claims.prices)
+        assert claims.other_amounts == ()
+
+    def test_implausibly_small_bare_number_is_not_a_quote(self) -> None:
+        assert extract_reply_claims("Preis 2,8", "de").prices == ()
+
+    def test_postcode_and_city_after_a_removed_street_are_removed(self) -> None:
+        body = "Bonjour, le véhicule est vendu. Cordialement, Jean, 12 rue de la Paix, 75002 Paris, merci"
+        clean = sanitize_reply_body(body)
+        assert "75002" not in clean.text and "Paris" not in clean.text
+        assert "rue de la Paix" not in clean.text
+        assert "le véhicule est vendu" in clean.text
+        assert sanitize_reply_body(clean.text).text == clean.text
+
+    def test_ingest_request_carries_the_local_classification(self) -> None:
+        headers = reply_headers(
+            Subject="Abwesenheitsnotiz: Anfrage TEST-204", **{"Auto-Submitted": "auto-replied"}
+        )
+        msg = message(headers, "Ich bin nicht im Büro.")
+        corr = correlate_reply(msg, [binding()])
+        req = build_ingest_request(
+            msg,
+            corr,
+            sanitized=sanitize_reply_body(msg.body_text),
+            attachment_decisions=(),
+            detected_language=MessageLanguage.DE,
+            observed_at=NOW,
+        )
+        assert req.message_type == ReplyMessageType.AUTO_REPLY and req.correlation_status == "matched"
+        # The classification is not source content: it never changes the fingerprint.
+        assert (
+            req.fingerprint()
+            == req.model_copy(update={"message_type": ReplyMessageType.SELLER_REPLY}).fingerprint()
+        )
+        assert spec_request().message_type == ReplyMessageType.SELLER_REPLY  # spec shape default
+        with pytest.raises(ValueError, match="quarantined"):
+            spec_request(message_type="spam")
+        assert spec_request(message_type="spam", correlation_status="quarantined").message_type == (
+            ReplyMessageType.SPAM
+        )
+
+    def test_huge_bodies_are_scrubbed_on_a_bounded_prefix_and_marked_truncated(self) -> None:
+        line = "Preis 2.600 € VB, Tel. 0171 1234567, a@b.example.invalid\n"
+        clean = sanitize_reply_body(line * 20_000)  # ~1.1 MB
+        assert clean.truncated and clean.text.endswith("[truncated]")
+        assert len(clean.text.encode("utf-8")) <= MAX_BODY_BYTES
+        assert "1234567" not in clean.text and "@" not in clean.text
+        assert sanitize_reply_body(clean.text).text == clean.text
+        short_after_scrub = sanitize_reply_body("x\n" * 70_000)  # long input, short output
+        assert short_after_scrub.truncated and short_after_scrub.text.endswith("[truncated]")

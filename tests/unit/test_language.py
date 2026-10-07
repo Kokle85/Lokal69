@@ -387,3 +387,64 @@ def test_decision_invariants() -> None:
 def test_fragment_text_is_bounded() -> None:
     with pytest.raises(ValidationError):
         frag("x" * 20_001)
+
+
+BILINGUAL_DE = (
+    "Verkaufe meinen gepflegten Geländewagen. Fahrzeug ist unfallfrei, TÜV neu, Scheckheft gepflegt. "
+    "Nichtraucherfahrzeug mit Anhängerkupplung und Sitzheizung. Zahnriemen und Kupplung wurden bei "
+    "der letzten Inspektion gewechselt. Winterreifen auf Felgen sind dabei. Der Wagen ist sofort fahrbereit."
+)
+
+
+@pytest.mark.parametrize(
+    "second_paragraph",
+    [
+        "Véhicule en très bon état, première main, carnet d'entretien complet. Pneus neufs.",
+        "The car is in very good condition and has a full service history.",
+    ],
+)
+def test_bilingual_swiss_style_ad_is_mixed_even_outside_the_margin(second_paragraph: str) -> None:
+    text = BILINGUAL_DE + " " + second_paragraph
+    result = detect_text_language(text)
+    assert result.language is None
+    assert result.reason == DetectionReason.MIXED_LANGUAGES
+    assert result.scores[0].score >= 2 * result.scores[1].score  # the margin alone would pick German
+    decision = resolve_inquiry_language(None, [frag(text)], "de", "CH")
+    assert decision.status == LanguageStatus.LANGUAGE_UNRESOLVED
+    assert decision.reason == LanguageReason.MIXED_LANGUAGE_TEXT
+    assert decision.language is None  # neither German nor English is chosen as a fallback
+
+
+def test_borrowed_foreign_vocabulary_without_sentences_is_not_mixed() -> None:
+    italian_terms = BILINGUAL_DE + " Vendo in ottime condizioni, tagliandi regolari, unico proprietario."
+    assert detect_text_language(italian_terms).language == "de"
+    english_terms = BILINGUAL_DE + " Leather, alloy wheels, heated seats, warranty, clean."
+    assert detect_text_language(english_terms).language == "de"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # German function words that are also Dutch/English/Portuguese words stay German.
+        (
+            "Er wurde als Zweitwagen gefahren und ist unfallfrei. Was noch? Er will einen neuen Besitzer, "
+            "um 18 Uhr da. Zahnriemen worden gewechselt, Scheckheft gepflegt, Zustand gut.",
+            "de",
+        ),
+        # French "si", "non", "on" are not Italian/English evidence.
+        (
+            "Véhicule non accidenté, très bon état. Si vous êtes intéressé, on peut parler. "
+            "Contrôle technique OK, carnet d'entretien complet.",
+            "fr",
+        ),
+        # Italian "su", "o" are not Spanish/Portuguese evidence.
+        (
+            "Vendo vettura in ottime condizioni, tagliandi su libretto o in concessionaria. "
+            "Unico proprietario, gomme nuove, climatizzatore funzionante.",
+            "it",
+        ),
+    ],
+)
+def test_shared_function_words_do_not_create_a_false_second_language(text: str, expected: str) -> None:
+    result = detect_text_language(text)
+    assert result.language == expected, result.scores[:3]

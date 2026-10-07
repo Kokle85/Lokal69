@@ -36,7 +36,7 @@ Synthetic data
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -428,6 +428,27 @@ def _meets_threshold(candidate: EvaluationCandidate) -> bool | None:
     return conservative >= threshold
 
 
+def _one_per_vehicle(candidates: Iterable[EvaluationCandidate]) -> list[UUID]:
+    """One representative candidate id per physical vehicle (the same car on three sites is one
+    deal): the best conservative contribution, ties broken by candidate id."""
+    best: dict[UUID, EvaluationCandidate] = {}
+    for candidate in candidates:
+        current = best.get(candidate.vehicle_key)
+        if current is None or _economics_key(candidate) > _economics_key(current):
+            best[candidate.vehicle_key] = candidate
+    return sorted((c.candidate_id for c in best.values()), key=str)
+
+
+def _economics_key(candidate: EvaluationCandidate) -> tuple[Decimal, Decimal, str]:
+    conservative = candidate.conservative_contribution
+    base = candidate.base_contribution
+    return (
+        conservative.amount if conservative is not None else Decimal("-Infinity"),
+        base.amount if base is not None else Decimal("-Infinity"),
+        str(candidate.candidate_id),
+    )
+
+
 def _best_economics(candidates: Sequence[EvaluationCandidate]) -> EconomicsSummary | None:
     complete = [
         c
@@ -441,14 +462,7 @@ def _best_economics(candidates: Sequence[EvaluationCandidate]) -> EconomicsSumma
     ]
     if not complete:
         return None
-    best = max(
-        complete,
-        key=lambda c: (
-            c.conservative_contribution.amount if c.conservative_contribution else Decimal(0),
-            c.base_contribution.amount if c.base_contribution else Decimal(0),
-            str(c.candidate_id),
-        ),
-    )
+    best = max(complete, key=_economics_key)
     assert best.valuation_state is not None
     assert best.conservative_contribution is not None and best.base_contribution is not None
     return EconomicsSummary(
@@ -484,19 +498,35 @@ def build_evaluation_report(
     else:
         window_status = "in_progress"
 
-    synthetic = (
-        sum(1 for c in candidates if c.synthetic)
-        + sum(1 for i in inquiries if i.is_canary)
-        + sum(1 for r in replies if r.is_canary)
-        + sum(1 for d in document_resolutions if d.is_canary)
-    )
+    # Synthetic (fixture/canary) records - and anything linked to them - never count.
+    synthetic_candidates = {c.candidate_id for c in candidates if c.synthetic}
+    synthetic_clusters = {
+        c.vehicle_cluster_id for c in candidates if c.synthetic and c.vehicle_cluster_id is not None
+    }
+
+    def synthetic_inquiry(item: EvaluationInquiry) -> bool:
+        return (
+            item.is_canary
+            or (item.candidate_id is not None and item.candidate_id in synthetic_candidates)
+            or (item.vehicle_cluster_id is not None and item.vehicle_cluster_id in synthetic_clusters)
+        )
+
+    canary_inquiries = {i.inquiry_id for i in inquiries if synthetic_inquiry(i)}
+    synthetic_reply = [r for r in replies if r.is_canary or r.inquiry_id in canary_inquiries]
+    synthetic_docs = [
+        d for d in document_resolutions if d.is_canary or d.candidate_id in synthetic_candidates
+    ]
+    synthetic = len(synthetic_candidates) + len(canary_inquiries) + len(synthetic_reply) + len(synthetic_docs)
     real_candidates = [
-        c for c in candidates if not c.synthetic and _in_window(c.first_seen_at, start, end, current)
+        c
+        for c in candidates
+        if not c.synthetic
+        and (c.vehicle_cluster_id is None or c.vehicle_cluster_id not in synthetic_clusters)
+        and _in_window(c.first_seen_at, start, end, current)
     ]
     real_inquiries = [
-        i for i in inquiries if not i.is_canary and _in_window(i.created_at, start, end, current)
+        i for i in inquiries if not synthetic_inquiry(i) and _in_window(i.created_at, start, end, current)
     ]
-    canary_inquiries = {i.inquiry_id for i in inquiries if i.is_canary}
     real_replies = [
         r
         for r in replies
@@ -505,7 +535,11 @@ def build_evaluation_report(
         and _in_window(r.received_at, start, end, current)
     ]
     real_docs = [
-        d for d in document_resolutions if not d.is_canary and _in_window(d.resolved_at, start, end, current)
+        d
+        for d in document_resolutions
+        if not d.is_canary
+        and d.candidate_id not in synthetic_candidates
+        and _in_window(d.resolved_at, start, end, current)
     ]
 
     coverage: tuple[SourceCoverage, ...] = ()
@@ -530,19 +564,14 @@ def build_evaluation_report(
     well = [c for c in real_candidates if c.well_matched]
     incomplete = {c.vehicle_key for c in well if not c.valuation_complete}
     unknown_counter = Counter(u for c in well if not c.valuation_complete for u in dict.fromkeys(c.unknowns))
-    qualifying = sorted(
-        {c.candidate_id for c in well if c.valuation_complete and _meets_threshold(c) is True}, key=str
-    )
-    judgement = sorted(
-        {
-            c.candidate_id
-            for c in well
-            if c.valuation_complete
-            and c.approved_contribution_threshold is None
-            and c.conservative_contribution is not None
-            and c.conservative_contribution.amount > 0
-        },
-        key=str,
+    qualifying = _one_per_vehicle(c for c in well if c.valuation_complete and _meets_threshold(c) is True)
+    judgement = _one_per_vehicle(
+        c
+        for c in well
+        if c.valuation_complete
+        and c.approved_contribution_threshold is None
+        and c.conservative_contribution is not None
+        and c.conservative_contribution.amount > 0
     )
     best = _best_economics(real_candidates)
 

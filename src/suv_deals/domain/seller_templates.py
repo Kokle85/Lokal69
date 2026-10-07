@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from suv_deals.domain.enums import MessageLanguage
 from suv_deals.domain.listings import sha256_json
 from suv_deals.domain.notifications import text_problems
+from suv_deals.domain.seller_contacts import AddressError, canonicalize_address
 from suv_deals.domain.taxonomy import TaxonomyMatch
 from suv_deals.errors import ValidationFailed
 
@@ -380,6 +381,12 @@ class VehicleLabel(BaseModel):
             problems.extend(_label_part_problems(self.generation))
         if problems:
             raise ValueError("unsafe vehicle label: " + ", ".join(sorted(set(problems))))
+        # The text is composed from the verified parts only; nothing else can be smuggled in.
+        expected = " ".join(p for p in (self.make, self.model, self.generation) if p is not None)
+        if self.text != expected:
+            raise ValueError("vehicle label text must be exactly 'make model [generation]'")
+        if self.shortened and self.generation is not None:
+            raise ValueError("a shortened label has dropped its generation")
         return self
 
 
@@ -647,6 +654,48 @@ def render_preview_mk(message: RenderedMessage) -> RenderedMessage:
     )
 
 
+def rendering_problems(message: RenderedMessage) -> tuple[str, ...]:
+    """Why ``message`` is not the exact deterministic rendering of a registered template.
+
+    Empty means: the template id/version/hash/kind/language are registered, every placeholder
+    value passes the same validation as ``render``, subject and body are byte-identical to the
+    template with those placeholders substituted, and the scope validator passes. A hand-built or
+    edited ``RenderedMessage`` (even one whose wording stays inside the scope) is therefore never
+    bound to an inquiry or dispatched; a wording fix must be a new registered template version.
+    """
+    template = TEMPLATES.get(message.template_id)
+    if template is None:
+        return ("TEMPLATE_NOT_REGISTERED",)
+    problems: list[str] = []
+    if (
+        template.template_hash() != message.template_hash
+        or template.version != message.template_version
+        or template.kind != message.kind
+        or template.language != message.language
+    ):
+        problems.append("TEMPLATE_NOT_REGISTERED")
+    if message.template_set_version != TEMPLATE_SET_VERSION:
+        problems.append("TEMPLATE_SET_MISMATCH")
+    if message.scope_hash != SCOPE_HASH:
+        problems.append("SCOPE_HASH_MISMATCH")
+    ph = message.placeholders
+    problems.extend(_reference_problems(ph.listing_reference))
+    problems.extend(_display_name_problems(ph.sender_display_name))
+    problems.extend(listing_url_problems(ph.listing_url))
+    problems.extend(_label_part_problems(ph.vehicle_label))
+    if len(ph.vehicle_label) > MAX_VEHICLE_LABEL_LENGTH:
+        problems.append("VEHICLE_LABEL_TOO_LONG")
+    values = ph.as_template_values()
+    if (
+        _substitute(template.subject, values) != message.subject
+        or _substitute(template.body, values) != message.body
+    ):
+        problems.append("NOT_TEMPLATE_RENDERING")
+    if not validate_scope(message).ok:
+        problems.append("SCOPE_VALIDATION_FAILED")
+    return tuple(sorted(set(problems)))
+
+
 # ---------------------------------------------------------------------------------------------
 # Scope validator
 # ---------------------------------------------------------------------------------------------
@@ -875,6 +924,35 @@ def _normalize_for_scan(text: str) -> str:
     return folded.replace("\u2019", "'").replace("\u2018", "'")
 
 
+#: A single plain-text part only: no HTML alternative, no multipart container (attachments).
+_CONTENT_TYPE_RE: Final = re.compile(r'^text/plain(?:\s*;\s*charset="?(?:utf-8|us-ascii)"?)?$', re.IGNORECASE)
+_TRANSFER_ENCODINGS: Final = frozenset({"7bit", "8bit", "quoted-printable", "base64"})
+_MESSAGE_ID_RE: Final = re.compile(r"^<[^\s<>@\"(),:;\[\]\\]{1,200}@[A-Za-z0-9.-]{1,253}>$")
+_MAX_HEADER_VALUE_LENGTH: Final = 256
+
+
+def _extra_header_problems(name: str, value: str) -> list[str]:
+    problems: list[str] = []
+    if any(c in value or c in name for c in "\r\n\x00\x85\u2028\u2029"):
+        problems.append("HEADER_INJECTION")
+    lowered = name.strip().lower()
+    if lowered not in ALLOWED_EXTRA_HEADERS or name != name.strip():
+        problems.append("HEADER_NOT_ALLOWED")
+    if not value.isascii() or not value.isprintable() or len(value) > _MAX_HEADER_VALUE_LENGTH:
+        problems.append("HEADER_VALUE_INVALID")
+    stripped = value.strip()
+    if lowered == "content-type" and not _CONTENT_TYPE_RE.fullmatch(stripped):
+        problems.append("MIME_NOT_PLAIN_TEXT")  # multipart (attachments) or HTML is never sent
+    valid = {
+        "content-transfer-encoding": stripped.lower() in _TRANSFER_ENCODINGS,
+        "mime-version": stripped == "1.0",
+        "message-id": _MESSAGE_ID_RE.fullmatch(stripped) is not None,
+    }
+    if not valid.get(lowered, True):
+        problems.append("HEADER_VALUE_INVALID")
+    return problems
+
+
 def _envelope_problems(envelope: MessageEnvelope) -> list[str]:
     problems: list[str] = []
     if len(envelope.to) != 1:
@@ -885,14 +963,21 @@ def _envelope_problems(envelope: MessageEnvelope) -> list[str]:
         problems.append("EXTRA_REPLY_TO")
     if envelope.attachments:
         problems.append("ATTACHMENT")
+    seen: set[str] = set()
     for name, value in envelope.extra_headers.items():
-        if name.lower() not in ALLOWED_EXTRA_HEADERS:
-            problems.append("HEADER_NOT_ALLOWED")
-        if any(c in value or c in name for c in "\r\n\x00"):
-            problems.append("HEADER_INJECTION")
+        problems.extend(_extra_header_problems(name, value))
+        lowered = name.strip().lower()
+        if lowered in seen:
+            problems.append("HEADER_DUPLICATED")
+        seen.add(lowered)
     for address in (*envelope.to, *envelope.reply_to):
-        if any(c in address for c in "\r\n\x00,;<>"):
+        if any(c in address for c in "\r\n\x00\x85\u2028\u2029,;<>"):
             problems.append("HEADER_INJECTION")
+            continue
+        try:
+            canonicalize_address(address)
+        except AddressError as exc:
+            problems.append("HEADER_INJECTION" if exc.problem == "HEADER_INJECTION" else "INVALID_ADDRESS")
     return problems
 
 
@@ -1056,6 +1141,7 @@ __all__ = [
     "message_body_hash",
     "render",
     "render_preview_mk",
+    "rendering_problems",
     "require_scope",
     "template_for_language",
     "validate_scope",

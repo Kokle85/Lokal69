@@ -470,6 +470,26 @@ def _without_fragment(url: str) -> str:
     return url.split("#", 1)[0]
 
 
+#: Characters that may continue an address on either side; a match must not be part of a longer
+#: address (``info@dealer.example`` is not shown by ``sales.info@dealer.example``).
+_ADDRESS_LEFT: Final = r"(?<![A-Za-z0-9._%+'@-])"
+_ADDRESS_RIGHT: Final = r"(?![A-Za-z0-9_@-]|\.[A-Za-z0-9])"
+
+
+def _excerpt_shows_address(excerpt: str | None, candidates: tuple[str, ...]) -> bool:
+    """The excerpt shows exactly one of ``candidates`` as a whole address (domain case-insensitive)."""
+    if not excerpt:
+        return False
+    for candidate in candidates:
+        if not candidate or "@" not in candidate:
+            continue
+        local, _, domain = candidate.rpartition("@")
+        pattern = rf"{_ADDRESS_LEFT}{re.escape(local)}@(?i:{re.escape(domain)}){_ADDRESS_RIGHT}"
+        if re.search(pattern, excerpt):
+            return True
+    return False
+
+
 def _decision(
     status: RecipientStatus, *reasons: RecipientReason, binding: RecipientBinding | None = None
 ) -> RecipientDecision:
@@ -535,9 +555,8 @@ def verify_recipient(
     if evidence.branch_count is not None and evidence.branch_count > 1:
         return _decision(RecipientStatus.REJECTED, RecipientReason.MULTIPLE_BRANCHES)
 
-    excerpt = evidence.extraction_excerpt or ""
-    shows_address = address.canonical.lower() in excerpt.lower() or (
-        evidence.address.strip().lower() in excerpt.lower()
+    shows_address = _excerpt_shows_address(
+        evidence.extraction_excerpt, (address.canonical, evidence.address.strip())
     )
 
     if evidence.kind == RecipientEvidenceKind.EMAIL_ON_ADVERTISEMENT:

@@ -232,6 +232,38 @@ class TestDealsAndEconomics:
         )
         assert report.eligible_vehicles == 1 and report.well_matched_vehicles == 1
 
+    def test_same_qualifying_vehicle_on_three_sites_is_one_deal(self) -> None:
+        threshold = Money.of("1500", "EUR")
+        copies = [
+            valued(amount, "2500", vehicle_cluster_id=CLUSTER, approved_contribution_threshold=threshold)
+            for amount in ("1600", "1700", "1650")
+        ]
+        report = build_evaluation_report(
+            now=T0 + timedelta(days=2), activations=ACTIVE, scans=regular_scans(10), candidates=copies
+        )
+        assert report.outcome == EvaluationOutcome.DEAL_FOUND
+        assert report.qualifying_deal_ids == (copies[1].candidate_id,)  # best supported copy
+        judgement = build_evaluation_report(
+            now=T0 + timedelta(days=2),
+            activations=ACTIVE,
+            scans=regular_scans(10),
+            candidates=[valued("900", "1800", vehicle_cluster_id=CLUSTER) for _ in range(3)],
+        )
+        assert len(judgement.owner_judgement_candidate_ids) == 1
+
+    def test_contribution_in_another_currency_than_the_threshold_is_not_a_deal(self) -> None:
+        chf = candidate(
+            valuation_state=ValuationState.ESTIMATED,
+            conservative_contribution=Money.of("5000", "CHF"),
+            base_contribution=Money.of("6000", "CHF"),
+            approved_contribution_threshold=Money.of("1500", "EUR"),
+        )
+        report = build_evaluation_report(
+            now=T0 + timedelta(days=16), activations=ACTIVE, scans=regular_scans(10), candidates=[chf]
+        )
+        assert report.qualifying_deal_ids == ()
+        assert report.outcome == EvaluationOutcome.NO_SUITABLE_DEAL
+
     def test_records_outside_the_window_are_excluded(self) -> None:
         before = candidate(first_seen_at=T0 - timedelta(days=1))
         after = candidate(first_seen_at=T0 + timedelta(days=20))
@@ -277,7 +309,48 @@ class TestCanaryExclusion:
         assert report.seller_replies == 0  # a reply to a canary inquiry is not a real reply either
         assert report.missing_documents_resolved == 0
         assert report.best_supported_economics is None
-        assert report.excluded_synthetic_records == 4
+        # canary + fixture candidate, canary inquiry, the reply to it and the canary document
+        assert report.excluded_synthetic_records == 5
+        assert all("9.000" not in line and "9000" not in line for line in report.summary_lines())
+
+    def test_records_linked_to_a_synthetic_candidate_never_count(self) -> None:
+        canary = valued("9000", "9500", vehicle_cluster_id=CLUSTER, is_canary=True)
+        same_vehicle_real_looking = valued("9000", "9500", vehicle_cluster_id=CLUSTER)
+        inquiry_by_candidate = EvaluationInquiry(
+            inquiry_id=uuid4(),
+            state=InquiryState.ACCEPTED,
+            created_at=T0 + timedelta(hours=2),
+            candidate_id=canary.candidate_id,
+        )
+        inquiry_by_cluster = EvaluationInquiry(
+            inquiry_id=uuid4(),
+            state=InquiryState.REPLIED,
+            created_at=T0 + timedelta(hours=2),
+            vehicle_cluster_id=CLUSTER,
+        )
+        reply = EvaluationReply(
+            reply_id=uuid4(),
+            inquiry_id=inquiry_by_cluster.inquiry_id,
+            message_type=ReplyMessageType.SELLER_REPLY,
+            received_at=T0 + timedelta(hours=3),
+        )
+        doc = DocumentResolution(
+            candidate_id=canary.candidate_id, document="coc", resolved_at=T0 + timedelta(hours=4)
+        )
+        report = build_evaluation_report(
+            now=T0 + timedelta(days=16),
+            activations=ACTIVE,
+            scans=regular_scans(10),
+            candidates=[canary, same_vehicle_real_looking],
+            inquiries=[inquiry_by_candidate, inquiry_by_cluster],
+            replies=[reply],
+            document_resolutions=[doc],
+        )
+        assert report.eligible_vehicles == 0
+        assert report.owner_judgement_candidate_ids == () and report.qualifying_deal_ids == ()
+        assert report.inquiries.attempted == 0 and report.seller_replies == 0
+        assert report.missing_documents_resolved == 0
+        assert report.outcome == EvaluationOutcome.NO_SUITABLE_DEAL
 
 
 class TestInquiriesRepliesDocuments:

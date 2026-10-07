@@ -49,6 +49,10 @@ MIN_EVIDENCE_TOKENS: Final = 3  # distinct exclusive lexicon words for the winni
 MIN_ENGLISH_FUNCTION_WORDS: Final = 3  # distinct exclusive English function words
 MARGIN_RATIO: Final = Decimal(2)  # winner score must be >= 2x the runner-up score
 MIXED_SECOND_EVIDENCE: Final = 3  # runner-up with this much evidence inside the margin = mixed
+#: A runner-up with real sentences (this many distinct exclusive *function* words plus
+#: ``MIXED_SECOND_EVIDENCE`` evidence words) makes the text mixed even outside the margin:
+#: borrowed vocabulary has no function words, a second-language paragraph does.
+MIXED_SECOND_FUNCTION_WORDS: Final = 2
 FULL_EVIDENCE_TOKENS: Final = 6  # evidence count at which coverage stops limiting confidence
 MAX_TEXT_CHARS: Final = 20_000
 MAX_TOKENS: Final = 4_000
@@ -72,17 +76,18 @@ _FUNCTION_WORDS: Final[Mapping[str, str]] = {
         "der die das und ist mit nicht ein eine einen einem einer auf für im dem den des sich auch "
         "wird wurde wurden sind hat haben von zu zum zur bei aus nach noch sehr nur oder aber wie "
         "alle keine kein ohne über unter durch wir ich werden kann können bitte gerne vom beim "
-        "dieses dieser diese neu neuen neuer neues gut guter gutem sowie bereits in es"
+        "dieses dieser diese neu neuen neuer neues gut guter gutem sowie bereits in es an am er als "
+        "worden was will um da"
     ),
     "it": (
         "il lo gli di del della dei delle degli è con per un una uno non che sono molto anche "
         "come più ma solo ancora già nel nella sul sulla al alla dal dalla ha ho questo questa "
-        "tutti tutto senza dopo sempre ed nei sui alle agli ogni la le i e a in si da"
+        "tutti tutto senza dopo sempre ed nei sui alle agli ogni la le i e a in si da su o"
     ),
     "fr": (
         "le la les de des du un une et est avec pour dans sur pas ne que qui au aux ce cette ces "
         "son sa ses très tout tous plus mais ou sans été sont nous vous je il elle à par bon "
-        "bonne bien leur en"
+        "bonne bien leur en on si non"
     ),
     "en": (
         "the and is with for this that of to it on has have been are was very not all from will "
@@ -489,6 +494,13 @@ def detect_text_language(text: str | None) -> TextLanguageDetection:
             else DetectionReason.AMBIGUOUS
         )
         return TextLanguageDetection(language=None, confidence=Decimal(0), reason=reason, **common)
+    if (
+        second.evidence_tokens >= MIXED_SECOND_EVIDENCE
+        and second.function_tokens >= MIXED_SECOND_FUNCTION_WORDS
+    ):
+        return TextLanguageDetection(
+            language=None, confidence=Decimal(0), reason=DetectionReason.MIXED_LANGUAGES, **common
+        )
     if best.language == "en" and best.function_tokens < MIN_ENGLISH_FUNCTION_WORDS:
         return TextLanguageDetection(
             language=None, confidence=Decimal(0), reason=DetectionReason.ENGLISH_EVIDENCE_TOO_WEAK, **common
@@ -620,18 +632,9 @@ def resolve_inquiry_language(
             notes=(*notes, "held for template implementation; never replaced with English"),
             **context,
         )
-    if combined.language is None:
-        return LanguageDecision(
-            language=None,
-            status=LanguageStatus.LANGUAGE_UNRESOLVED,
-            confidence=combined.confidence,
-            evidence_excerpt=None,
-            reason=_DETECTION_TO_REASON[combined.reason],
-            basis="none",
-            notes=tuple(notes),
-            **context,
-        )
-    if fragment_languages - {combined.language}:
+    if len(fragment_languages) > 1 or (
+        combined.language is not None and fragment_languages - {combined.language}
+    ):
         return LanguageDecision(
             language=None,
             status=LanguageStatus.LANGUAGE_UNRESOLVED,
@@ -641,6 +644,17 @@ def resolve_inquiry_language(
             basis="none",
             detected_language=None,
             notes=(*notes, "fragments detected as: " + ", ".join(sorted(fragment_languages))),
+            **context,
+        )
+    if combined.language is None:
+        return LanguageDecision(
+            language=None,
+            status=LanguageStatus.LANGUAGE_UNRESOLVED,
+            confidence=combined.confidence,
+            evidence_excerpt=None,
+            reason=_DETECTION_TO_REASON[combined.reason],
+            basis="none",
+            notes=tuple(notes),
             **context,
         )
     if combined.language not in SUPPORTED_LANGUAGES:

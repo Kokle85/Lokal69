@@ -26,6 +26,7 @@ from suv_deals.domain.seller_templates import (
     SELLER_INITIAL_MK_PREVIEW_V1,
     TEMPLATE_BY_LANGUAGE,
     TEMPLATES,
+    InquiryPlaceholders,
     MessageEnvelope,
     QuestionId,
     RenderedMessage,
@@ -39,6 +40,7 @@ from suv_deals.domain.seller_templates import (
     message_body_hash,
     render,
     render_preview_mk,
+    rendering_problems,
     require_scope,
     template_for_language,
     validate_scope,
@@ -626,3 +628,114 @@ def test_require_scope() -> None:
 
 def test_question_ids_are_stable() -> None:
     assert [q.value for q in QuestionId] == ["availability", "vehicle_documents", "lowest_final_price"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Exact-rendering proof and MIME envelope hardening
+# ---------------------------------------------------------------------------------------------
+
+
+def test_vehicle_label_text_is_composed_from_its_verified_parts() -> None:
+    assert LABEL.text == "BMW X5 E70"
+    with pytest.raises(ValidationError):
+        VehicleLabel(text="BMW X5 cash buyer", make="BMW", model="X5")
+    with pytest.raises(ValidationError):
+        VehicleLabel(text="BMW X5", make="BMW", model="X5", generation="E70")
+    with pytest.raises(ValidationError):
+        VehicleLabel(text="BMW X5 E70", make="BMW", model="X5", generation="E70", shortened=True)
+    assert VehicleLabel(text="BMW X5", make="BMW", model="X5", shortened=True).text == "BMW X5"
+
+
+@pytest.mark.parametrize("template_id", SELLER_IDS)
+def test_rendering_problems_accept_only_exact_registered_renderings(template_id: str) -> None:
+    message = rendered(template_id)
+    assert rendering_problems(message) == ()
+    assert rendering_problems(render_preview_mk(message)) == ()
+    # A wording fix inside the scope passes the scope validator but is not a registered rendering:
+    # it must become a new template version before it can be bound or dispatched.
+    marker = {"de": "Guten Tag,", "it": "Buongiorno,", "fr": "Bonjour,", "en": "Hello,"}[message.language]
+    fixed = variant(message, body=message.body.replace(marker, marker.replace(",", " ,")))
+    assert "NOT_TEMPLATE_RENDERING" in rendering_problems(fixed)
+    unknown = message.model_copy(update={"template_id": "seller_initial_xx_v1"})
+    assert rendering_problems(unknown) == ("TEMPLATE_NOT_REGISTERED",)
+    other_version = message.model_copy(update={"template_version": 2})
+    assert "TEMPLATE_NOT_REGISTERED" in rendering_problems(other_version)
+
+
+def test_rendering_problems_revalidate_placeholders_of_hand_built_messages() -> None:
+    message = rendered("seller_initial_en_v1")
+    bad_values = {
+        "listing_reference": ("REF\r\nBcc: x", "HEADER_INJECTION"),
+        "sender_display_name": ("Vasko <b>K</b>", "RAW_MARKUP"),
+        "listing_url": ("javascript:alert(1)", "LISTING_URL_SCHEME"),
+        "vehicle_label": ("BMW X5 www.cars.example", "URL_NOT_ALLOWED"),
+    }
+    for field, (value, problem) in bad_values.items():
+        placeholders = InquiryPlaceholders(**{**message.placeholders.model_dump(), field: value})
+        template = get_template(message.template_id)
+        values = placeholders.as_template_values()
+        subject = template.subject.replace("{{vehicle_label}}", values["vehicle_label"]).replace(
+            "{{listing_reference}}", values["listing_reference"]
+        )
+        body = template.body.replace("{{listing_url}}", values["listing_url"]).replace(
+            "{{verified_sender_display_name}}", values["verified_sender_display_name"]
+        )
+        forged = RenderedMessage(
+            **{
+                **message.model_dump(),
+                "placeholders": placeholders,
+                "subject": subject,
+                "body": body,
+                "body_hash": message_body_hash(subject, body),
+            }
+        )
+        assert problem in rendering_problems(forged), field
+
+
+@pytest.mark.parametrize(
+    ("headers", "problem"),
+    [
+        ({"Content-Type": "text/html; charset=utf-8"}, "MIME_NOT_PLAIN_TEXT"),
+        ({"Content-Type": "multipart/mixed; boundary=frontier"}, "MIME_NOT_PLAIN_TEXT"),
+        ({"Content-Type": "multipart/alternative"}, "MIME_NOT_PLAIN_TEXT"),
+        ({"Content-Type": "text/plain; name=passport.pdf"}, "MIME_NOT_PLAIN_TEXT"),
+        ({"Content-Transfer-Encoding": "x-uuencode"}, "HEADER_VALUE_INVALID"),
+        ({"MIME-Version": "2.0"}, "HEADER_VALUE_INVALID"),
+        ({"Message-ID": "<two words@example.invalid>"}, "HEADER_VALUE_INVALID"),
+        ({"Message-ID": "no-brackets@example.invalid"}, "HEADER_VALUE_INVALID"),
+        ({"Date": "Mon, 6 Oct 2026 10:00:00 +0000 é"}, "HEADER_VALUE_INVALID"),
+        ({"Message-ID": "<a@example.invalid>", "message-id": "<b@example.invalid>"}, "HEADER_DUPLICATED"),
+        ({"Content-Type ": "text/plain"}, "HEADER_NOT_ALLOWED"),
+        ({"Content-Disposition": "attachment; filename=x.pdf"}, "HEADER_NOT_ALLOWED"),
+        ({"Date": "Mon\u2028Bcc: x@example.invalid"}, "HEADER_INJECTION"),
+    ],
+)
+def test_mime_and_header_injection_in_the_envelope_is_rejected(headers: dict[str, str], problem: str) -> None:
+    msg = rendered("seller_initial_en_v1")
+    envelope = MessageEnvelope(to=("seller@example.invalid",), extra_headers=headers)
+    assert problem in validate_scope(msg, envelope=envelope).problems
+
+
+def test_plain_text_envelope_headers_pass() -> None:
+    msg = rendered("seller_initial_en_v1")
+    envelope = MessageEnvelope(
+        to=("seller@example.invalid",),
+        reply_to=("vasko@example.invalid",),
+        extra_headers={
+            "Content-Type": 'text/plain; charset="utf-8"',
+            "Content-Transfer-Encoding": "8bit",
+            "MIME-Version": "1.0",
+            "Message-ID": "<inq-0001.synthetic@example.invalid>",
+            "Date": "Tue, 06 Oct 2026 10:00:00 +0000",
+        },
+    )
+    assert validate_scope(msg, envelope=envelope).ok
+
+
+def test_envelope_addresses_must_be_valid() -> None:
+    msg = rendered("seller_initial_en_v1")
+    for address in ("not an address", "a@b", "x@example.invalid\u0085Bcc: y@example.invalid"):
+        problems = validate_scope(msg, envelope=MessageEnvelope(to=(address,))).problems
+        assert {"INVALID_ADDRESS", "HEADER_INJECTION"} & set(problems), address
+    reply = MessageEnvelope(to=("seller@example.invalid",), reply_to=("broken@",))
+    assert "INVALID_ADDRESS" in validate_scope(msg, envelope=reply).problems

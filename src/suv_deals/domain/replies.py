@@ -16,10 +16,11 @@ Message types (``classify_message``)
     "Unzustellbar", "Non recapitabile", "Non remis"), ``delivery_notice`` (delayed/delivered DSN
     actions, read receipts/MDNs, "Zugestellt:", "Consegnato:", "Remis :"), ``auto_reply``
     (``Auto-Submitted`` other than ``no``, ``X-Autoreply``/``X-Autorespond``, ``Precedence:
-    auto_reply``, Outlook OOF templates and subjects such as "Out of office", "Abwesenheit",
-    "Fuori sede", "Absence"), ``ambiguous`` (no/several From addresses, unknown report type,
-    non-mail Outlook items, an out-of-office phrase only in the body) and otherwise
-    ``seller_reply``.
+    auto_reply``, Outlook OOF templates and subjects such as "Out of office", "Abwesenheitsnotiz",
+    "Fuori sede", "Réponse automatique"; ordinary words such as "Abwesend", "Assente" or
+    "Absence" only as the subject's leading prefix, never after "Re:"/"AW:"), ``ambiguous``
+    (no/several From addresses, unknown report type, non-mail Outlook items, an out-of-office
+    phrase only in the body) and otherwise ``seller_reply``.
 
 Correlation (``correlate_reply``)
     Only bindings of the message's own mailbox count; the newest binding version per inquiry
@@ -35,8 +36,9 @@ Correlation (``correlate_reply``)
     applied to a vehicle before verification. ``upload_scope`` says what may leave the mailbox:
     ``full`` (matched), ``quarantine`` (exactly one candidate inquiry, uploaded flagged and not
     applied) or ``none`` (unrelated personal mail and multi-candidate ambiguity stay local).
-    A reply that references the send-intent Message-ID of an ``uncertain`` send resolves that
-    send as submitted.
+    A matched message that references (In-Reply-To/References, or the returned original of a
+    DSN) a Message-ID of an ``uncertain`` send - normally its send-intent Message-ID - resolves
+    that send as submitted; a thread-only link or a quarantined possible match never does.
 
 Source fingerprint and ingest dedup (``source_content_fingerprint``, ``decide_ingest``)
     The fingerprint covers the schema-selected immutable content: Internet Message-ID, provider
@@ -56,7 +58,10 @@ Claims (``extract_reply_claims``)
     (deposits, transport/fees, previous prices) kept separately, documents
     (available/attached/refused/not_available/mentioned) and requests (payment, reservation,
     identity document, appointment, commitment, price acceptance, opt-out, complaint). Nothing
-    is invented: an ambiguous number is kept as an unparsed mention, never guessed.
+    is invented: an ambiguous number is kept as an unparsed mention, never guessed. A number
+    without a currency is a quote only next to a price word and when plausible (>= 100); numbers
+    labelled as mileage/year/power/owners/doors/keys are never money, and another money-like
+    number beside a stated price is kept as a currency-less mention, not a quote.
 
 Processing (``decide_reply_processing``)
     Never an automatic response or follow-up. Payment/reservation/identity/appointment/
@@ -217,6 +222,20 @@ class MessageHeaders(BaseModel):
     model_config = _FROZEN
 
     values: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+
+    @field_validator("values")
+    @classmethod
+    def _clean(cls, value: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+        """Same bounds and cleaning as ``from_raw`` whichever way the model is built."""
+        cleaned: dict[str, tuple[str, ...]] = {}
+        for name, items in value.items():
+            if not _HEADER_NAME_RE.fullmatch(name.strip()) or len(cleaned) >= MAX_HEADER_NAMES:
+                continue
+            kept = tuple(_clean_header_value(item) for item in items[:MAX_VALUES_PER_HEADER])
+            if kept:
+                key = name.strip().lower()
+                cleaned[key] = (*cleaned.get(key, ()), *kept)[:MAX_VALUES_PER_HEADER]
+        return cleaned
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | MessageHeaders | None) -> MessageHeaders:
@@ -541,7 +560,14 @@ class InboundMessage(BaseModel):
     def _headers(cls, value: Any) -> Any:
         if value is None or isinstance(value, MessageHeaders):
             return value or MessageHeaders()
-        if isinstance(value, Mapping) and "values" not in value:
+        if isinstance(value, Mapping):
+            # A serialised ``MessageHeaders`` is ``{"values": {name: [..]}}``; anything else
+            # (including a hostile raw header literally named "values") is a raw header mapping.
+            if set(value.keys()) == {"values"} and isinstance(value.get("values"), Mapping):
+                try:
+                    return MessageHeaders.model_validate(value)
+                except ValueError:
+                    pass
             return MessageHeaders.from_raw(value)
         return value
 
@@ -669,6 +695,7 @@ _DELIVERY_SUBJECT_RE: Final = _rx_any(
         r"accus[ée] de (?:lecture|r[ée]ception)",
     )
 )
+# Unambiguous auto-reply phrases count anywhere in the subject.
 _AUTO_REPLY_SUBJECT_RE: Final = _rx_any(
     (
         r"out[ -]of[ -](?:the[ -])?office",
@@ -677,20 +704,22 @@ _AUTO_REPLY_SUBJECT_RE: Final = _rx_any(
         r"\bauto[- ]?response\b",
         r"\bautoresponder\b",
         r"\baway from (?:the )?office\b",
-        r"\babwesenheit",
-        r"\babwesend\b",
+        r"\babwesenheits\w*",
         r"\bautomatische (?:antwort|r[üu]ckantwort)",
         r"\bnicht im b[üu]ro\b",
         r"\bfuori (?:sede|ufficio)\b",
         r"\brisposta automatica\b",
-        r"\bassen(?:te|za)\b",
-        r"\bin ferie\b",
-        r"\babsence\b",
-        r"\babsente?\b",
         r"\br[ée]ponse automatique\b",
-        r"\ben cong[ée]s?\b",
     )
 )
+# Ordinary words ("Abwesenheit", "assente", "absence", "en congé") only count as an auto-reply
+# prefix of the subject, never after a human reply prefix ("Re: ... absence of rust?").
+_AUTO_REPLY_SUBJECT_PREFIX_RE: Final = re.compile(
+    r"^\s*(?:abwesenheit|abwesend|assen(?:te|za)|in ferie|absence|absente?|en cong[ée]s?|vacation"
+    r"|on holiday|on leave|urlaub|ferien|vacances)\b",
+    re.IGNORECASE,
+)
+_REPLY_PREFIX_RE: Final = re.compile(r"^\s*(?:re|aw|r|rif|sv|antw|ri|wg|fwd?|tr|i)\s*:", re.IGNORECASE)
 _AUTO_REPLY_BODY_RE: Final = _rx_any(
     (
         r"\bi am (?:currently )?(?:out of (?:the )?office|away from (?:the|my) (?:office|desk)|on (?:vacation"
@@ -918,7 +947,9 @@ def explain_classification(
         return done(ReplyMessageType.DELIVERY_NOTICE)
 
     signals.extend(_auto_reply_header_signals(hdrs))
-    if _AUTO_REPLY_SUBJECT_RE.search(subject):
+    if _AUTO_REPLY_SUBJECT_RE.search(subject) or (
+        not _REPLY_PREFIX_RE.match(subject) and _AUTO_REPLY_SUBJECT_PREFIX_RE.match(subject)
+    ):
         signals.append(ClassificationSignal.AUTO_REPLY_SUBJECT)
     if signals:
         return done(ReplyMessageType.AUTO_REPLY)
@@ -1319,7 +1350,9 @@ def correlate_reply(
             reference_corroborated=reference_corroborated,
             is_canary=binding.is_canary,
         )
-    resolves = inquiry_id in send_intent_inquiries and binding.state == InquiryBindingState.UNCERTAIN
+    # Any strong link (In-Reply-To/References or the returned original of a DSN) to a Message-ID
+    # of an uncertain send proves that the message was submitted; a thread-only link does not.
+    resolves = binding.state == InquiryBindingState.UNCERTAIN and not thread_only
     if inquiry_id in send_intent_inquiries:
         reasons.append(CorrelationReason.SEND_INTENT_MATCH)
     if resolves:
@@ -1736,10 +1769,13 @@ class IngestHeaders(BaseModel):
 class ReplyIngestRequest(BaseModel):
     """Domain view of the versioned reply ingest request (spec 37.8), with its size limits.
 
-    The three trailing fields are optional domain extensions (defaults keep the spec shape):
+    The four trailing fields are optional domain extensions (defaults keep the spec shape):
+    ``message_type`` carries the worker's local classification (the backend never sees the
+    full headers, so it cannot tell an auto-reply or DSN from a seller reply itself),
     ``correlation_status``/``correlation_reasons`` mark a quarantined possible match that must
     not update a vehicle, and ``withheld_sensitive_attachments`` reports the presence of
-    withheld sensitive attachments without repeating them.
+    withheld sensitive attachments without repeating them. None of them is part of the
+    immutable source fingerprint.
     """
 
     model_config = _FROZEN
@@ -1755,6 +1791,7 @@ class ReplyIngestRequest(BaseModel):
     detected_language: MessageLanguage | None = None
     attachments: tuple[AttachmentMeta, ...] = Field(default=(), max_length=MAX_ATTACHMENTS)
     observed_at: datetime
+    message_type: ReplyMessageType = ReplyMessageType.SELLER_REPLY
     correlation_status: Literal["matched", "quarantined"] = "matched"
     correlation_reasons: tuple[CorrelationReason, ...] = Field(default=(), max_length=30)
     withheld_sensitive_attachments: int = Field(default=0, ge=0, le=200)
@@ -1782,6 +1819,10 @@ class ReplyIngestRequest(BaseModel):
 
     @model_validator(mode="after")
     def _size(self) -> ReplyIngestRequest:
+        if self.message_type in (ReplyMessageType.SPAM, ReplyMessageType.AMBIGUOUS) and (
+            self.correlation_status != "quarantined"
+        ):
+            raise ValueError("spam and ambiguous messages are only ever uploaded as quarantined")
         encoded = canonical_json(self.model_dump(mode="json", by_alias=True)).encode("utf-8")
         if len(encoded) > MAX_REQUEST_BYTES:
             raise ValueError("ingest request exceeds 128 KiB")
@@ -1914,7 +1955,13 @@ _STREET_RE: Final = _rx_any(
 _POSTCODE_CITY_RE: Final = re.compile(
     r"\b(?:[A-Z]{1,2}-)?\d{4,5}\s+[A-ZÄÖÜÀ-Ý][a-zäöüßà-ÿ]+(?:[ -][A-ZÄÖÜÀ-Ý]?[a-zäöüßà-ÿ]+){0,3}\b"
 )
+# Postcode and city directly after a removed street ("[address removed], 75002 Paris") belong to it.
+_ADDRESS_TAIL_RE: Final = re.compile(
+    r"\[address removed\](?:,?[ \t]*(?:[A-Z]{1,2}-)?\d{4,5}[ \t]+[A-ZÄÖÜÀ-Ý][a-zäöüßà-ÿ]+"
+    r"(?:[ -][A-ZÄÖÜÀ-Ý]?[a-zäöüßà-ÿ]+){0,3}\b)+"
+)
 _CONTACT_LINE_PLACEHOLDER: Final = "[line removed: contact data]"
+_SCRUB_INPUT_CHARS: Final = 2 * MAX_BODY_BYTES
 
 
 def strip_quoted_text(text: str) -> tuple[str, bool]:
@@ -2007,6 +2054,7 @@ def _scrub_contacts(body: str, counts: dict[str, int]) -> str:
     body = count_sub(_URL_RE, "links", _link_placeholder, body)
     body = count_sub(_IBAN_RE, "bank_details", "[bank details removed]", body)
     body = count_sub(_STREET_RE, "addresses", "[address removed]", body)
+    body = _ADDRESS_TAIL_RE.sub("[address removed]", body)
     body = _LABELLED_PHONE_RE.sub(_labelled_phone_sub(counts), body)
     body = _PHONE_RE.sub(_phone_sub(counts), body)
 
@@ -2030,6 +2078,17 @@ def _scrub_contacts(body: str, counts: dict[str, int]) -> str:
             line = _CONTACT_LINE_PLACEHOLDER
         final_lines.append(line.rstrip())
     return re.sub(r"\n{3,}", "\n\n", "\n".join(final_lines)).strip()
+
+
+def _scrub_to_fixpoint(body: str, counts: dict[str, int]) -> str:
+    """Removing one value can expose another (a placeholder next to a postcode, a re-joined
+    number): scrub until nothing changes so sanitising sanitised text is a no-op."""
+    for _ in range(4):
+        scrubbed = _scrub_contacts(body, counts)
+        if scrubbed == body:
+            return body
+        body = scrubbed
+    return body
 
 
 def _truncate_utf8(text: str, limit: int) -> str:
@@ -2083,13 +2142,21 @@ def sanitize_reply_body(text: str | None, *, known_outbound_text: str | None = N
             counts["addresses"] += 1
             line = "[address removed]"
         kept.append(line)
-    body = _scrub_contacts("\n".join(kept), counts)
+    body = "\n".join(kept)
+    # The output is capped at 64 KiB anyway: scrub only a bounded prefix (cut at a line break,
+    # so no value is split) to keep hostile megabyte bodies cheap.
+    pre_cut = len(body) > _SCRUB_INPUT_CHARS
+    if pre_cut:
+        head = body[:_SCRUB_INPUT_CHARS]
+        newline = head.rfind("\n")
+        body = head[:newline] if newline > _SCRUB_INPUT_CHARS // 2 else head.rsplit(" ", 1)[0]
+    body = _scrub_to_fixpoint(body, counts)
     truncated = False
     marker = "\n[truncated]"
-    if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+    if pre_cut or len(body.encode("utf-8")) > MAX_BODY_BYTES:
         truncated = True
         limit = MAX_BODY_BYTES - len(marker.encode("utf-8"))
-        body = _scrub_contacts(_truncate_utf8(body, limit), counts)
+        body = _scrub_to_fixpoint(_truncate_utf8(body, limit), counts)
         body = _truncate_utf8(body, limit) + marker
     return SanitizedReplyBody(
         text=body,
@@ -2654,8 +2721,24 @@ _UNIT_AFTER_RE: Final = re.compile(
     r"^\s*(?:km\b|kms\b|kilomet\w*|chilometri\b|kw\b|ps\b|cv\b|hp\b|ccm\b|cm3\b|cm³|%|g/km|l/100|liter\w*"
     r"|litri\b"
     r"|jahre?\b|anni\b|ans\b|years?\b|monate?\b|mesi\b|mois\b|months?\b|tage?\b|giorni\b|jours?\b|days?\b"
-    r"|stunden\b|ore\b|heures?\b|hours?\b|uhr\b|h\b|min\b|tkm\b|tsd\b|mila\b|zoll\b)",
+    r"|stunden\b|ore\b|heures?\b|hours?\b|uhr\b|h\b|min\b|tkm\b|tsd\b|mila\b|zoll\b"
+    # counted things: owners, doors, seats, keys, gears, cylinders
+    r"|(?:vor)?besitzer\b|halter(?:n|in)?\b|t[üu]ren\b|sitze\b|sitzpl[äa]tze\b|schl[üu]ssel\b|g[äa]nge\b"
+    r"|zylinder\b|proprietari\b|porte\b|posti\b|chiavi\b|marce\b|cilindri\b|propri[ée]taires\b"
+    r"|portes\b|places\b|cl[ée]s\b|vitesses\b|cylindres\b|owners?\b|doors\b|seats\b|keys\b|gears\b"
+    r"|cylinders\b|x\b)",
     re.IGNORECASE,
+)
+# A bare number (no currency) right after a non-price label is a mileage, year, power, count or
+# reference - never money, even when the sentence also states a price.
+_NON_PRICE_LABEL_BEFORE_RE: Final = re.compile(
+    r"\b(?:kilometerstand|km-stand|kilometer|laufleistung|tachostand|tacho|baujahr|bj|ez|erstzulassung"
+    r"|modelljahr|hubraum|leistung|vorbesitzer|halter|besitzer|plz|nummer|chilometri|chilometraggio"
+    r"|percorrenza|anno|immatricolazione|cilindrata|potenza|proprietari|cap|numero|kilom[ée]trage"
+    r"|ann[ée]e|mise en circulation|cylindr[ée]e|puissance|propri[ée]taires|num[ée]ro|mileage|odometer"
+    r"|miles|year|registered|registration|engine|power|owners|km|kms|vin|fin|telai?o)\b"
+    r"[ \t:=.-]{0,4}(?:(?:of|di|de|du|von|ca|circa|about|approx|ungef[äa]hr|etwa|environ|ist|is|è|est|ha|hat"
+    r"|has)\.?[ \t:=-]{1,3}){0,2}$"
 )
 _RANGE_JOINER_RE: Final = re.compile(
     r"^\s*(?:€|eur\w*|chf)?\s*(?P<joiner>-|\N{EN DASH}|\N{EM DASH}|bis|to|a|à|und|e|et|and)\s*$",
@@ -2910,11 +2993,15 @@ class _Amount:
     currency: str | None
     warnings: tuple[str, ...]
     standalone: bool  # has a currency, or a price keyword in the sentence (and is not a year)
+    year_like: bool = False
 
 
 def _currency_code(marker: str) -> str | None:
     key = marker.strip().lower()
     return _CURRENCY_CODES.get(key) or _CURRENCY_CODES.get(key.rstrip("."))
+
+
+_MIN_BARE_AMOUNT: Final = Decimal(100)  # a currency-less number below this is never a vehicle price
 
 
 def _amounts_in(text: str, lowered: str, span: _Span, language: MessageLanguage | None) -> list[_Amount]:
@@ -2943,6 +3030,10 @@ def _amounts_in(text: str, lowered: str, span: _Span, language: MessageLanguage 
             continue  # statute numbers, dates, times, phone fragments
         if re.search(r"(?i)\beuro\s*$", before) and len(raw) == 1:
             continue  # "Euro 5" emissions class, not an amount
+        if currency is None and _NON_PRICE_LABEL_BEFORE_RE.search(
+            lowered, max(span.start, start - 40), start
+        ):
+            continue  # "Kilometerstand 150000", "Baujahr: 2012", "mileage of 145000" are not money
         year_like = currency is None and raw.isdigit() and len(raw) == 4 and 1950 <= int(raw) <= 2100
         locale: Locale | None = _NUMBER_LOCALE.get(language) if language else None
         if currency == "CHF":
@@ -2954,8 +3045,10 @@ def _amounts_in(text: str, lowered: str, span: _Span, language: MessageLanguage 
             warnings = (*warnings, "ZERO_AMOUNT")
         if currency is None:
             warnings = (*warnings, "CURRENCY_NOT_STATED")
-        standalone = currency is not None or (has_keyword and not year_like)
-        found.append(_Amount(start, end, raw, value, currency, warnings, standalone))
+        # Without a currency, only a plausible vehicle amount next to a price word is a quote.
+        plausible = value is None or value >= _MIN_BARE_AMOUNT
+        standalone = currency is not None or (has_keyword and not year_like and plausible)
+        found.append(_Amount(start, end, raw, value, currency, warnings, standalone, year_like))
     return found
 
 
@@ -3103,6 +3196,24 @@ def _price_claims(
                     )
                 continue
             if not amount.standalone:
+                # A money-like number next to a stated price ("2.800 EUR, nicht unter 2.600") is
+                # preserved for the owner as a mention - never a quote, never given a currency.
+                if amount.value is not None and amount.value >= _MIN_BARE_AMOUNT and not amount.year_like:
+                    bare_context = _context(lowered, span, amount, prev_end, next_start)
+                    mentions.append(
+                        AmountMention(
+                            context=AmountContext.UNLABELLED
+                            if bare_context == AmountContext.PRICE
+                            else bare_context,
+                            amount=amount.value,
+                            currency=None,
+                            raw=amount.raw[:60],
+                            evidence=EvidenceSpan(
+                                start=amount.start, end=amount.end, excerpt=excerpt, rule="amount_bare"
+                            ),
+                            warnings=(*amount.warnings, "AMOUNT_WITHOUT_PRICE_CONTEXT"),
+                        )
+                    )
                 continue
             context = _context(lowered, span, amount, prev_end, next_start)
             evidence = EvidenceSpan(start=amount.start, end=amount.end, excerpt=excerpt, rule="amount")
@@ -4076,6 +4187,7 @@ def build_ingest_request(
         detected_language=detected_language,
         attachments=tuple(allowed[:MAX_ATTACHMENTS]),
         observed_at=_aware(observed_at),
+        message_type=correlation.message_type,
         correlation_status="matched" if scope == "full" else "quarantined",
         correlation_reasons=correlation.reasons[:30],
         withheld_sensitive_attachments=withheld,

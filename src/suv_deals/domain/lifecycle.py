@@ -699,17 +699,47 @@ def detect_availability_conflicts(
                 detail="one source shows the vehicle active while another shows it sold or removed",
             )
         )
-    statuses = {s.status for s in seller_statements}
-    if len(statuses) > 1:
+    disagreeing = _disagreeing_statements(seller_statements)
+    if disagreeing:
         conflicts.append(
             AvailabilityConflict(
                 kind="seller_statements_disagree",
                 listing_ids=tuple(m.listing_id for m in members),
-                reply_ids=tuple(s.reply_id for s in seller_statements),
-                detail="the seller made different availability statements",
+                reply_ids=tuple(dict.fromkeys(s.reply_id for s in disagreeing)),
+                detail=(
+                    "the seller made contradictory availability statements "
+                    "(different statuses at the same time, or available/reserved after sold)"
+                ),
             )
         )
     return tuple(conflicts)
+
+
+def _disagreeing_statements(
+    statements: Sequence[SellerAvailabilityStatement],
+) -> list[SellerAvailabilityStatement]:
+    """Statements that contradict each other rather than describe a progression.
+
+    available -> reserved -> sold (and reserved -> available after a cancelled reservation) is an
+    ordinary sequence over time. Different statuses with the same statement time, or "available"/
+    "reserved" after the seller said "sold", are contradictions the owner must resolve.
+    """
+    ordered = sorted(statements, key=lambda s: (s.stated_at, str(s.reply_id)))
+    involved: list[SellerAvailabilityStatement] = []
+    by_time: dict[datetime, set[Availability]] = {}
+    for statement in ordered:
+        by_time.setdefault(statement.stated_at, set()).add(statement.status)
+    for statement in ordered:
+        if len(by_time[statement.stated_at]) > 1:
+            involved.append(statement)
+    first_sold = next((s for s in ordered if s.status == Availability.SOLD_CLAIMED), None)
+    if first_sold is not None:
+        reversals = [
+            s for s in ordered if s.stated_at > first_sold.stated_at and s.status != Availability.SOLD_CLAIMED
+        ]
+        if reversals:
+            involved.extend([first_sold, *reversals])
+    return list(dict.fromkeys(involved))
 
 
 class ClusterLifecycle(BaseModel):
@@ -1043,8 +1073,17 @@ def healthy_coverage(
                 raw_intervals[-1] = (min(first, scan.started_at), finished, count + 1)
             else:
                 raw_intervals.append((scan.started_at, finished, 1))
+        # A long scan can start before an earlier chain ended: overlapping chains are one
+        # interval, so healthy time is never counted twice (the ratio stays <= 1).
+        merged: list[tuple[datetime, datetime, int]] = []
+        for first, last, count in sorted(raw_intervals):
+            if merged and first <= merged[-1][1]:
+                m_first, m_last, m_count = merged[-1]
+                merged[-1] = (m_first, max(m_last, last), m_count + count)
+            else:
+                merged.append((first, last, count))
         intervals: list[CoverageInterval] = []
-        for first, last, count in raw_intervals:
+        for first, last, count in merged:
             clipped_start, clipped_end = max(first, start), min(last, end)
             if clipped_end > clipped_start or (clipped_end == clipped_start and start <= first < end):
                 intervals.append(

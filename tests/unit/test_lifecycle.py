@@ -489,15 +489,37 @@ class TestClusters:
         )
         kinds = {c.kind for c in detect_availability_conflicts([badge, active], [available_statement])}
         assert kinds == {"seller_available_vs_source_unavailable", "sources_disagree"}
-        statements = [
+        # Different statuses stated at the same time contradict each other.
+        later = uuid4()
+        simultaneous = [
             SellerAvailabilityStatement(reply_id=REPLY, status=Availability.AVAILABLE, stated_at=T0),
-            SellerAvailabilityStatement(
-                reply_id=uuid4(), status=Availability.RESERVED, stated_at=T0 + timedelta(hours=1)
-            ),
+            SellerAvailabilityStatement(reply_id=later, status=Availability.RESERVED, stated_at=T0),
         ]
-        assert {c.kind for c in detect_availability_conflicts([active], statements)} == {
-            "seller_statements_disagree"
-        }
+        (conflict,) = detect_availability_conflicts([active], simultaneous)
+        assert conflict.kind == "seller_statements_disagree"
+        assert set(conflict.reply_ids) == {REPLY, later}
+
+    def test_seller_progression_is_not_a_contradiction_but_reversal_after_sold_is(self) -> None:
+        active = listing(listing_id=LISTING_B, source_key="b")
+
+        def said(status: Availability, hours: int) -> SellerAvailabilityStatement:
+            return SellerAvailabilityStatement(
+                reply_id=uuid4(), status=status, stated_at=T0 + timedelta(hours=hours)
+            )
+
+        progression = [
+            said(Availability.AVAILABLE, 0),
+            said(Availability.RESERVED, 1),
+            said(Availability.AVAILABLE, 2),  # reservation fell through
+        ]
+        assert detect_availability_conflicts([active], progression) == ()
+        sold_then_available = [said(Availability.SOLD_CLAIMED, 0), said(Availability.AVAILABLE, 5)]
+        kinds = {c.kind for c in detect_availability_conflicts([], sold_then_available)}
+        assert kinds == {"seller_statements_disagree"}
+        statuses = {c.kind: c for c in detect_availability_conflicts([active], sold_then_available)}
+        # The seller's own "sold" is never silently cancelled by an active ad or a later reversal.
+        assert set(statuses) == {"active_listing_vs_seller_sold", "seller_statements_disagree"}
+        assert all(c.stop_outreach for c in statuses.values())
 
     def test_consistent_evidence_has_no_conflict(self) -> None:
         sold = listing(
@@ -650,6 +672,32 @@ class TestCoverage:
         assert report.healthy_seconds == (35 + 20) * 60
         assert report.coverage_ratio == Decimal("0.1528")
         assert report.has_coverage
+
+    def test_overlapping_scans_are_never_double_counted(self) -> None:
+        # A long scan (09:00-11:00 relative) starts before a short chain ends and finishes later.
+        scans = [scan(60, duration=5), scan(0, duration=120)]
+        (report,) = healthy_coverage(
+            scans, window_start=T0, window_end=T0 + timedelta(hours=3), max_gap=timedelta(minutes=30)
+        )
+        assert [(i.start, i.end, i.scans) for i in report.intervals] == [(T0, T0 + timedelta(hours=2), 2)]
+        assert report.healthy_seconds == 2 * 3600
+        assert report.coverage_ratio is not None and report.coverage_ratio <= 1
+        assert [(g.start, g.end) for g in report.gaps] == [(T0 + timedelta(hours=2), T0 + timedelta(hours=3))]
+
+    def test_coverage_ratio_never_exceeds_one(self) -> None:
+        scans = [scan(m, duration=d) for m, d in [(0, 50), (10, 5), (20, 90), (30, 2), (100, 30)]]
+        (report,) = healthy_coverage(
+            scans, window_start=T0, window_end=T0 + timedelta(hours=2), max_gap=timedelta(minutes=10)
+        )
+        assert report.coverage_ratio is not None and Decimal(0) <= report.coverage_ratio <= 1
+        starts = [i.start for i in report.intervals]
+        assert starts == sorted(starts)
+        for first, second in zip(report.intervals, report.intervals[1:], strict=False):
+            assert first.end < second.start
+
+    def test_empty_window_has_no_ratio(self) -> None:
+        (report,) = healthy_coverage([scan(0)], window_start=T0, window_end=T0, max_gap=timedelta(minutes=30))
+        assert report.coverage_ratio is None
 
     def test_no_healthy_scans_is_one_explained_gap(self) -> None:
         (report,) = healthy_coverage(
