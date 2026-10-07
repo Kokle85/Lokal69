@@ -54,7 +54,8 @@ from suv_deals.domain.profiles import SearchProfile
 from suv_deals.errors import AppError, NotFound, SourcePaused, ValidationFailed
 from suv_deals.observability.logging import log_context
 from suv_deals.persistence import config_repo, listings_repo, sources_repo
-from suv_deals.persistence.database import Conn
+from suv_deals.persistence.database import Conn, fetch_all
+from suv_deals.persistence.errors_map import mapped_errors
 from suv_deals.persistence.listings_repo import IngestReport
 from suv_deals.persistence.sources_repo import CrawlRunRecord, RunOutcome, SourceRecord, SourceRoute
 from suv_deals.persistence.transactions import job_unit_of_work, lock_source, retry_transient, unit_of_work
@@ -123,7 +124,7 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
         raise ValidationFailed("a discovery job needs its source and profile")
     partition = job.partition_key or payload.partition_key
     source, profile = await _preflight(ctx, actor, source_id, profile_id)
-    session = ctx.crawl_session(job.workspace_id, source)
+    session = await ctx.open_crawl_session(job.workspace_id, source)
     adapter = session.adapter
     coverage = payload.coverage_mode or adapter.capabilities().coverage_mode
     watermark_from = (
@@ -134,6 +135,7 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
 
     async def open_run() -> CrawlRunRecord:
         async with job_unit_of_work(ctx.db, job) as (conn, _locked):
+            await close_interrupted_runs(conn, actor, job.id, attempt=job.attempts)
             return await sources_repo.start_crawl_run(
                 conn,
                 actor,
@@ -151,13 +153,31 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
     run = await retry_transient(open_run)
     with log_context(run_id=run.id, source_key=source.source_key, adapter_version=adapter.adapter_version):
         traversal = await traverse(
-            ctx, execution, session, source=source, profile=profile, watermark_from=watermark_from
+            ctx,
+            execution,
+            session,
+            source=source,
+            profile=profile,
+            watermark_from=watermark_from,
+            partition_key=partition,
         )
+        health = _health_status(session, source, traversal)
         outcome = await _commit(
-            ctx, execution, session, source=source, run=run, coverage=coverage, traversal=traversal
+            ctx,
+            execution,
+            session,
+            source=source,
+            run=run,
+            coverage=coverage,
+            traversal=traversal,
+            health=health,
         )
-        if traversal.completeness == Completeness.COMPLETE and outcome.state.value == "succeeded":
-            await _mark_absences(ctx, actor, run.id)
+        if traversal.completeness == Completeness.COMPLETE and outcome.state == JobState.SUCCEEDED:
+            if health is None:
+                await _mark_absences(ctx, actor, run.id)
+            else:
+                # Spec 9/25: a suspected parser incident is never evidence about the inventory.
+                logger.warning("absence marking skipped", extra={"parser_health": health.status})
         logger.info(
             "discovery finished",
             extra={"completeness": traversal.completeness.value, "pages": len(traversal.pages)},
@@ -206,14 +226,22 @@ async def traverse(
     source: SourceRecord,
     profile: SearchProfile,
     watermark_from: datetime | None,
+    partition_key: str = DEFAULT_PARTITION,
 ) -> Traversal:
     """Fetch search pages within the per-run page budget (see module docstring)."""
     adapter = session.adapter
     result = Traversal()
     max_pages = source.rate_budget().max_search_pages_per_run
-    request = adapter.build_search(profile, None)
-    if watermark_from is not None:
-        request = request.model_copy(update={"modified_since": watermark_from})
+
+    def build(cursor: str | None) -> SearchRequest:
+        # Every page of the traversal keeps the partition and the watermark filter.
+        built = adapter.build_search(profile, cursor)
+        update: dict[str, Any] = {"partition_key": partition_key}
+        if watermark_from is not None:
+            update["modified_since"] = watermark_from
+        return SearchRequest.model_validate({**built.model_dump(), **update})
+
+    request = build(None)
     while True:
         current = request
         try:
@@ -270,7 +298,7 @@ async def traverse(
             return result
         next_cursor = page.next_url or page.next_cursor
         try:
-            request = adapter.build_search(profile, next_cursor)
+            request = build(next_cursor)
         except ValidationFailed as exc:
             result.completeness = Completeness.PARTIAL
             result.cursor = _cursor(page, current)
@@ -365,10 +393,10 @@ async def _commit(
     run: CrawlRunRecord,
     coverage: CoverageMode,
     traversal: Traversal,
+    health: ParserHealth | None,
 ) -> JobOutcome:
     job = execution.job
     actor = execution.actor
-    health = _health_status(session, source, traversal)
     watermark_to: datetime | None = None
     if coverage == CoverageMode.WATERMARK and traversal.completeness == Completeness.COMPLETE:
         marks = [p.watermark_observed for p in traversal.ok_pages if p.watermark_observed is not None]
@@ -385,7 +413,7 @@ async def _commit(
         error_code=None if traversal.failure is None else traversal.failure.fetch.error_code,
     )
 
-    async def commit() -> tuple[list[IngestReport], Disposition]:
+    async def commit() -> tuple[list[IngestReport], Disposition, JobState]:
         execution.check_lease()
         async with job_unit_of_work(ctx.db, job) as (conn, _locked):
             failure = traversal.failure
@@ -420,19 +448,14 @@ async def _commit(
                 "detail_jobs": sum(len(r.detail_jobs) for r in reports),
             }
             disposition = _disposition(session, source, traversal, job.attempts, result)
-            await apply_disposition(conn, job, disposition)
-        return reports, disposition
+            # The applied state, not the requested kind: an exhausted retry is a dead letter.
+            state = await apply_disposition(conn, job, disposition)
+        return reports, disposition, state
 
-    reports, disposition = await retry_transient(commit)
+    reports, disposition, state = await retry_transient(commit)
     _record_metrics(ctx, source, traversal, reports)
-    state_by_kind = {
-        "complete": "succeeded",
-        "retry": "retry_wait",
-        "blocked": "blocked",
-        "dead_letter": "dead_letter",
-    }
     return JobOutcome(
-        state=JobState(state_by_kind[disposition.kind]),
+        state=state,
         code=disposition.code,
         details={"run_id": str(run.id), "completeness": str(final), "pages": len(traversal.pages)},
     )
@@ -474,6 +497,39 @@ def _record_metrics(
         metrics.record_parser_failure(source.source_key, page_type="search")
 
 
+_INTERRUPTED_RUNS_SQL: Final = (
+    "select id from ops.crawl_runs where workspace_id = %(workspace_id)s and job_id = %(job_id)s"
+    " and outcome = 'running' order by started_at, id limit 20"
+)
+
+
+async def close_interrupted_runs(conn: Conn, actor: ActorContext, job_id: UUID, *, attempt: int) -> int:
+    """Close the runs an earlier attempt of this job opened but never finished (``cancelled``).
+
+    An attempt that lost its lease or failed after opening its run cannot finish it; the next
+    holder of the job lease (the caller holds it, so no other attempt can still be working) closes
+    it with the gap recorded instead of leaving a traversal ``running`` forever. Read-only select
+    with a workspace predicate; the close goes through `sources_repo.finish_crawl_run`.
+    """
+    async with mapped_errors():
+        rows = await fetch_all(
+            conn, _INTERRUPTED_RUNS_SQL, {"workspace_id": actor.workspace_id, "job_id": job_id}
+        )
+    for row in rows:
+        await sources_repo.finish_crawl_run(
+            conn,
+            actor,
+            row["id"],
+            RunOutcome(
+                completeness="cancelled",
+                gap_reasons=(
+                    f"attempt interrupted before the run finished; superseded by attempt {attempt}",
+                ),
+            ),
+        )
+    return len(rows)
+
+
 async def _mark_absences(ctx: RuntimeContext, actor: ActorContext, run_id: UUID) -> None:
     """Complete-scan absence marking in its own short transaction (never removal or sale)."""
     try:
@@ -490,6 +546,7 @@ __all__ = [
     "WATERMARK_OVERLAP",
     "DiscoveryPayload",
     "Traversal",
+    "close_interrupted_runs",
     "handle_discovery",
     "traverse",
 ]

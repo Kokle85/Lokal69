@@ -219,6 +219,14 @@ async def test_dashboard_actions_map_onto_needs_information(data_api: DataHarnes
     refused = await data_api.post(path, reviewer, misuse)
     assert refused.status_code == 422
     assert error_of(refused)["details"]["fields"] == ["outcome", "reason_codes"]
+    # Variant spellings of an action code cannot attach it to another outcome either.
+    for n, variant in enumerate(("NEEDS_INSPECTION", "needs-documents", "Price.Confirmation:Needed")):
+        disguised = submit_body(
+            token, f"submit-variant-{n:02d}", data_api, outcome="shortlisted", reason_codes=[variant]
+        )
+        response = await data_api.post(path, reviewer, disguised)
+        assert response.status_code == 422, variant
+        assert error_of(response)["details"]["fields"] == ["outcome", "reason_codes"]
     missing = submit_body(
         token, "submit-missing-1", data_api, outcome="needs_information", reason_codes=["needs_inspection"]
     )
@@ -397,3 +405,78 @@ async def test_owner_pauses_a_source_with_optimistic_concurrency(data_api: DataH
     assert (await data_api.post(path, owner, body)).json()["data"] == result
     after = (await data_api.get("/api/sources", data_api.users.viewer)).json()["data"]["items"]
     assert next(s for s in after if s["source_id"] == running["source_id"])["state"] == "paused"
+
+
+async def test_claim_expiry_while_editing_then_a_fresh_claim_succeeds(
+    data_api: DataHarness, seed: Seed
+) -> None:
+    reviewer = data_api.users.reviewer
+    case_id = data_api.data.cases["priced"]
+    token = (await claim(data_api, reviewer, "claim-lapse-0001")).json()["data"]["claim_token"]
+    # The reviewer kept the form open past the claim window (database time decides).
+    seed.conn.execute(
+        "update app.review_cases set claimed_at = claimed_at - interval '10 minutes',"
+        " claim_expires_at = clock_timestamp() - interval '1 second' where id = %s",
+        (case_id,),
+    )
+    path = case_path(data_api, "priced", "submit")
+    late = await data_api.post(path, reviewer, submit_body(token, "submit-lapse-001", data_api))
+    assert late.status_code == 409
+    assert error_of(late)["code"] == "CLAIM_EXPIRED"
+    assert token not in late.text
+    regrant = await claim(data_api, reviewer, "claim-lapse-0002", version=2)
+    assert regrant.status_code == 200, regrant.text
+    fresh = regrant.json()["data"]
+    assert fresh["claim_token"] != token and fresh["case_version"] == 3
+    decided = await data_api.post(
+        path,
+        reviewer,
+        submit_body(fresh["claim_token"], "submit-lapse-001", data_api, expected_version=3),
+    )
+    assert decided.status_code == 201, decided.text  # the failed attempt left no idempotency record
+    assert decided.json()["data"]["case_version"] == 3
+
+
+async def test_new_listing_revision_before_submit_is_a_version_conflict(
+    data_api: DataHarness, seed: Seed
+) -> None:
+    reviewer = data_api.users.reviewer
+    ws, listing = data_api.workspace_id, data_api.data.listings["priced"]
+    token = (await claim(data_api, reviewer, "claim-newrev-001")).json()["data"]["claim_token"]
+    _, generation, observation = seed.detail_observation(ws, listing, promoted=True)
+    revision = seed.revision(ws, listing, 3, detail_generation=generation, observation_id=observation)
+    seed.promote(ws, listing, revision, generation, observation)
+    response = await data_api.post(
+        case_path(data_api, "priced", "submit"), reviewer, submit_body(token, "submit-newrev-01", data_api)
+    )
+    assert response.status_code == 409, response.text
+    assert error_of(response)["code"] == "VERSION_CONFLICT"
+    count = seed.scalar(
+        "select count(*) from app.review_decisions where case_id = %s", (data_api.data.cases["priced"],)
+    )
+    assert count == 0
+
+
+async def test_request_bodies_cannot_assign_actor_or_workspace_fields(
+    data_api: DataHarness, seed: Seed
+) -> None:
+    reviewer = data_api.users.reviewer
+    listing = data_api.data.listings["priced"]
+    path = f"/api/listings/{listing}/notes"
+    base = {"note": "SYNTHETIC: mass-assignment probe", "idempotency_key": "note-massasg-001"}
+    for extra in (
+        {"workspace_id": str(data_api.workspace_id)},
+        {"author_principal_id": str(data_api.users.owner)},
+        {"label": "owner"},
+        {"listing_id": str(listing)},
+    ):
+        response = await data_api.post(path, reviewer, {**base, **extra})
+        assert response.status_code == 422, extra
+        assert error_of(response)["details"]["fields"] == list(extra), extra
+    assert (
+        seed.scalar(
+            "select count(*) from app.owner_notes where workspace_id = %s and body like %s",
+            (data_api.workspace_id, "%mass-assignment%"),
+        )
+        == 0
+    )

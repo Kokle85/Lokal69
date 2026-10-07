@@ -25,11 +25,15 @@ from suv_deals.api.auth import (
     MembershipDenied,
     StaticJwks,
     SupabaseJwtVerifier,
+    VerifiedUser,
+    actor_for,
     bearer_token,
     select_membership,
     supabase_issuer,
+    supabase_jwks_client,
 )
-from suv_deals.domain.enums import Role
+from suv_deals.domain.actor import ROLE_SCOPES
+from suv_deals.domain.enums import Role, Scope
 from suv_deals.errors import DependencyUnavailable, ErrorCode, ValidationFailed
 from suv_deals.persistence.workspaces import Membership
 
@@ -235,6 +239,12 @@ async def test_jwks_outage_is_dependency_unavailable_not_401(keys: SigningKeys, 
         await v.verify(tokens.mint(USER))
 
 
+def test_jwks_client_targets_the_project_jwks_document_without_fetching() -> None:
+    client = supabase_jwks_client(ISSUER)
+    assert client.uri == f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+    assert client.jwk_set_cache is not None  # cached JWK set (bounded refresh via the cooldown)
+
+
 def test_verifier_from_settings_uses_the_project_issuer_and_audience() -> None:
     v = SupabaseJwtVerifier.from_settings(make_settings())
     assert v is not None
@@ -338,3 +348,18 @@ def test_inactive_memberships_and_workspaces_never_authorize() -> None:
     with pytest.raises(MembershipDenied):
         select_membership([membership(a, ws_active=False)], str(a))
     assert select_membership([membership(a, active=False), membership(b)], None).workspace_id == b
+
+
+def test_dashboard_actors_never_carry_the_mail_worker_scope() -> None:
+    """``mail:ingest`` belongs to the mailbox-bound worker credential (spec 37.8): a browser
+    session of any role never holds it, while every other scope of the role is kept."""
+    now = datetime.now(UTC)
+    user = VerifiedUser(user_id=USER, issued_at=now, expires_at=now, session_id=None, aal="aal1")
+    for role in Role:
+        actor = actor_for(user, membership(uuid.uuid4(), role=role), "req-synthetic-1")
+        assert actor.principal_kind == "user"
+        assert actor.role == role
+        assert Scope.MAIL_INGEST not in actor.scopes
+        assert actor.scopes == ROLE_SCOPES[role] - {Scope.MAIL_INGEST}
+    owner = actor_for(user, membership(uuid.uuid4(), role=Role.OWNER), "req-synthetic-2")
+    assert {Scope.CONFIG_ADMIN, Scope.SOURCES_PAUSE, Scope.INQUIRIES_PAUSE} <= owner.scopes

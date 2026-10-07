@@ -46,6 +46,7 @@ from suv_deals.domain.enums import JobState, SourceMode
 from suv_deals.domain.taxonomy import VehicleTaxonomy
 from suv_deals.errors import AppError, DependencyUnavailable, ErrorCode, SourcePaused, ValidationFailed
 from suv_deals.netguard import Resolver, system_resolver
+from suv_deals.observability.logging import configure_logging
 from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence import jobs
 from suv_deals.persistence.budgets import DbBudgetGate
@@ -104,10 +105,14 @@ class RuntimeOptions:
     #: Heartbeats run at this interval while a handler works (one third of the lease).
     heartbeat_seconds: float = 100.0
     idle_poll_seconds: float = 5.0
-    #: A budget `Wait` for the minimum delay between navigations is waited out inside the job when
-    #: it is at most this long; longer waits release the job for a later retry (`fail_retry`).
+    #: Short host-spacing budget waits (minimum delay, another worker's navigation) are waited out
+    #: inside the job up to this many seconds in total; longer ones release the job (`fail_retry`).
     max_inline_wait_seconds: float = 90.0
     max_inline_waits: int = 6
+    #: Polling interval while another worker holds the host's navigation lease.
+    inline_poll_seconds: float = 5.0
+    #: After a failed crawler health/contract check, re-check at most this often.
+    crawler_recheck_seconds: float = 300.0
     outbox_lease_seconds: float = 120.0
     outbox_batch: int = 20
     delivery_batch: int = 20
@@ -122,6 +127,8 @@ class RuntimeOptions:
             raise ValueError("heartbeat_seconds must be positive and shorter than the lease")
         if self.max_inline_wait_seconds < 0 or self.max_inline_waits < 0:
             raise ValueError("inline wait limits must not be negative")
+        if self.inline_poll_seconds <= 0:
+            raise ValueError("inline_poll_seconds must be positive")
 
 
 @dataclass(slots=True)
@@ -153,11 +160,50 @@ class RuntimeContext:
     backoff: BackoffPolicy = DEFAULT_BACKOFF
     sleep: Sleep = anyio.sleep
     owns_db: bool = False
+    #: Spec 8 startup check of the crawler service: last result (``None``: not checked yet).
+    crawler_ready: bool | None = None
+    crawler_checked_at: datetime | None = None
+    crawler_problems: tuple[str, ...] = ()
     _closers: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
 
     @property
     def dashboard_base_url(self) -> str:
         return self.settings.app_base_url
+
+    async def ensure_crawler_ready(self) -> None:
+        """Health + contract inspection of the crawler before real fetches (spec 8).
+
+        Runs at the first real fetch and again at most every ``crawler_recheck_seconds`` after a
+        failed check; a failing crawler raises `DependencyUnavailable` (the job retries later with
+        backoff), so no fetch is attempted through a misconfigured or unreachable service. Clients
+        without an ``inspect_contract`` method (test doubles) are not checked.
+        """
+        inspect = getattr(self.network_client, "inspect_contract", None)
+        if inspect is None:
+            return
+        now = ensure_utc(self.clock.now())
+        recheck = timedelta(seconds=self.options.crawler_recheck_seconds)
+        if self.crawler_checked_at is None or (
+            not self.crawler_ready and now - self.crawler_checked_at >= recheck
+        ):
+            try:
+                report = await inspect()
+                problems = tuple(str(p) for p in getattr(report, "problems", ()))
+                ready = bool(getattr(report, "ok", False))
+            except AppError as exc:
+                problems, ready = (exc.code.value,), False
+            self.crawler_ready, self.crawler_problems, self.crawler_checked_at = ready, problems, now
+            log = logger.info if ready else logger.warning
+            log("crawler contract check", extra={"ready": ready, "problems": list(problems)[:10]})
+        if not self.crawler_ready:
+            raise DependencyUnavailable("The crawler failed its health/contract check")
+
+    async def open_crawl_session(self, workspace_id: UUID, source: SourceRecord) -> CrawlSession:
+        """`crawl_session` plus the crawler readiness check for real (non-fixture) sources."""
+        session = self.crawl_session(workspace_id, source)
+        if source.mode != SourceMode.FIXTURE:
+            await self.ensure_crawler_ready()
+        return session
 
     def crawl_session(self, workspace_id: UUID, source: SourceRecord) -> CrawlSession:
         """A fresh policy-enforcing client + budget gate for one job of ``source``.
@@ -226,12 +272,16 @@ async def build_runtime(
     fixture_dirs: Sequence[Path] | None = None,
     metrics: AppMetrics | None = None,
     taxonomy: VehicleTaxonomy | None = None,
+    configure_logs: bool = False,
 ) -> RuntimeContext:
     """Open the database and construct every client from ``settings`` (see module docstring).
 
     ``fixture_dirs=None`` uses the repository's saved fixtures outside production; production gets
-    no fixture data unless directories are passed explicitly.
+    no fixture data unless directories are passed explicitly. Process entry points pass
+    ``configure_logs=True`` (JSON logs with redaction, `observability.logging.configure_logging`).
     """
+    if configure_logs:
+        configure_logging(settings)
     if settings.database_url is None or not settings.database_url.get_secret_value():
         raise ValidationFailed("DATABASE_URL is not configured")
     db = Database(
@@ -393,34 +443,40 @@ def backoff_delay(attempt: int, *, base_seconds: int = 30, max_seconds: int = 36
     return timedelta(seconds=min(max_seconds, base_seconds * (1 << exponent)))
 
 
+_INLINE_WAITS: Final = frozenset({WaitReason.MIN_DELAY, WaitReason.NAVIGATION_IN_FLIGHT})
+
+
 async def call_with_budget[T](
     ctx: RuntimeContext, execution: JobExecution, operation: Callable[[], Awaitable[T]]
 ) -> T:
-    """Run one budgeted fetch; wait out a SHORT minimum-delay `Wait` inside the job.
+    """Run one budgeted fetch; wait out SHORT host-spacing waits inside the job.
 
-    Only `WaitReason.MIN_DELAY` (the per-host spacing between navigations) is waited for, at most
-    ``max_inline_waits`` times and only when the wait fits ``max_inline_wait_seconds``. Every other
-    refusal (Retry-After, backoff, another worker's navigation, circuit, daily budget, access block)
-    propagates as `BudgetRefused` so the job is released with that time (never evaded, never burst).
+    Only `WaitReason.MIN_DELAY` (the per-host spacing between navigations) and
+    `WaitReason.NAVIGATION_IN_FLIGHT` (another worker's navigation on the same host; polled, because
+    it usually ends before its lease) are waited for, at most ``max_inline_waits`` times and at most
+    ``max_inline_wait_seconds`` in total. Every other refusal (Retry-After, backoff, circuit, daily
+    budget, run cap, access block) and any longer wait propagates as `BudgetRefused`, so the job is
+    released with that time (never evaded, never burst).
     """
     waits = 0
+    waited = 0.0
+    options = ctx.options
     while True:
         execution.check_lease()
         try:
             return await operation()
         except BudgetRefused as exc:
             decision = exc.decision
-            if (
-                isinstance(decision, Wait)
-                and decision.reason == WaitReason.MIN_DELAY
-                and waits < ctx.options.max_inline_waits
-            ):
-                delay = max(0.0, (ensure_utc(decision.until) - ensure_utc(ctx.clock.now())).total_seconds())
-                if delay <= ctx.options.max_inline_wait_seconds:
-                    waits += 1
-                    await ctx.sleep(delay + 0.05)
-                    continue
-            raise
+            if not isinstance(decision, Wait) or decision.reason not in _INLINE_WAITS:
+                raise
+            delay = max(0.0, (ensure_utc(decision.until) - ensure_utc(ctx.clock.now())).total_seconds())
+            if decision.reason == WaitReason.NAVIGATION_IN_FLIGHT:
+                delay = min(delay, options.inline_poll_seconds)
+            if waits >= options.max_inline_waits or waited + delay > options.max_inline_wait_seconds:
+                raise
+            waits += 1
+            waited += delay
+            await ctx.sleep(delay + 0.05)
 
 
 def refusal_disposition(exc: BudgetRefused, attempt: int) -> Disposition:

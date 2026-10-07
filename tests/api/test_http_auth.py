@@ -186,8 +186,15 @@ async def test_several_memberships_require_an_explicit_workspace(bare_api: ApiHa
     chosen = await bare_api.get("/api/me", user, headers={"X-Workspace-Id": str(second)})
     assert chosen.json()["data"]["role"] == "owner"
     assert "config:admin" in chosen.json()["data"]["scopes"]
+    assert "mail:ingest" not in chosen.json()["data"]["scopes"]  # mailbox worker credentials only
     as_owner = await bare_api.get("/api/settings", user, headers={"X-Workspace-Id": str(second)})
-    assert as_owner.status_code in (200, 422)  # an empty workspace may have no configuration yet
+    assert as_owner.status_code == 200, as_owner.text  # YAML defaults until a revision is recorded
+    assert as_owner.json()["data"]["can_administer"] is True
+    assert as_owner.json()["data"]["config_revision"] is None
+    as_reviewer = await bare_api.get(
+        "/api/settings", user, headers={"X-Workspace-Id": str(bare_api.workspace_id)}
+    )
+    assert as_reviewer.json()["data"]["can_administer"] is False
 
 
 async def test_viewer_cannot_mutate_and_reviewer_cannot_pause(bare_api: ApiHarness) -> None:
@@ -220,3 +227,23 @@ async def test_viewer_cannot_mutate_and_reviewer_cannot_pause(bare_api: ApiHarne
     assert pause.status_code == 403
     denials = bare_api.metrics.authorization_denials_total.labels(surface="api", reason="insufficient_scope")
     assert denials._value.get() >= 7
+
+
+async def test_oversized_and_parameter_flooded_query_strings_are_refused_quickly(
+    bare_api: ApiHarness,
+) -> None:
+    """A query string is capped at 4 KiB and repeated keys are counted in one linear pass, so an
+    authenticated caller cannot stall the event loop with a huge, many-parameter URL."""
+    viewer = bare_api.users.viewer
+    long_cursor = await bare_api.get("/api/candidates", viewer, params={"cursor": "A" * 5000})
+    assert long_cursor.status_code == 422
+    assert error_of(long_cursor)["details"] == {"fields": ["query"], "limit_bytes": 4096}
+    assert "AAAA" not in long_cursor.text
+    flooded = "&".join(f"k{i}=" for i in range(4_000))  # ~30 KB (httpx caps URLs at 64 KB)
+    response = await bare_api.get(f"/api/candidates?{flooded}", viewer)
+    assert response.status_code == 422
+    assert error_of(response)["details"]["fields"] == ["query"]
+    no_params_route = await bare_api.get(f"/api/overview?{flooded}", viewer)
+    assert no_params_route.status_code == 422
+    repeated = await bare_api.get("/api/candidates?limit=1&country=DE&limit=2", viewer)
+    assert error_of(repeated)["details"]["fields"] == ["limit"]

@@ -19,6 +19,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from suv_deals.crawling.detail import handle_detail
+from suv_deals.crawling.discovery import handle_discovery
+from suv_deals.crawling.valuation_pipeline import handle_valuation
 from suv_deals.domain.enums import JobType
 from suv_deals.errors import NotFound, ValidationFailed
 from suv_deals.workers.runtime import JobHandler
@@ -69,18 +72,15 @@ class HandlerRegistry:
     def job_types(self) -> tuple[JobType, ...]:
         return tuple(sorted(self._specs, key=lambda t: t.value))
 
-    def payload_versions(self, job_types: Iterable[JobType] | None = None) -> Mapping[JobType, frozenset[int]]:
+    def payload_versions(
+        self, job_types: Iterable[JobType] | None = None
+    ) -> Mapping[JobType, frozenset[int]]:
         wanted = self.job_types() if job_types is None else tuple(job_types)
         return {t: self.get(t).payload_versions for t in wanted}
 
 
 def default_registry() -> HandlerRegistry:
     """Discovery, detail/recheck and valuation (recompute) handlers of the core pipeline."""
-    # Imported here: the crawling handlers import the runtime module, never this registry.
-    from suv_deals.crawling.detail import handle_detail
-    from suv_deals.crawling.discovery import handle_discovery
-    from suv_deals.crawling.valuation_pipeline import handle_valuation
-
     registry = HandlerRegistry()
     registry.register(JobType.DISCOVERY, handle_discovery, description="search pages -> observations")
     registry.register(JobType.DETAIL, handle_detail, description="detail page -> revision and screening")

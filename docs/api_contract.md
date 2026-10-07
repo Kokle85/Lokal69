@@ -42,8 +42,11 @@ so existence is never revealed.
 | Role | Scopes |
 |---|---|
 | `viewer` | `deals:read`, `reviews:read` |
-| `reviewer` | viewer + `reviews:write`, `events:subscribe`, `rechecks:request`, `notes:write` |
-| `owner` | every scope, including `sources:pause` and `config:admin` |
+| `reviewer` | viewer + `reviews:write`, `events:subscribe`, `rechecks:request`, `notes:write`, `inquiries:read` |
+| `owner` | every scope except `mail:ingest`, including `sources:pause`, `inquiries:pause` and `config:admin` |
+
+A dashboard session never carries `mail:ingest`, whatever the role: that scope belongs to the
+mailbox-bound local reply worker credential only (spec 37.8), as on the MCP and CLI surfaces.
 
 `config:admin` is reserved for owner-only administration (profile, threshold, binding and gate
 changes); those operations are not part of this route set or the MCP toolset.
@@ -53,19 +56,24 @@ a cross-site request cannot carry the user's credentials; no CSRF token is neede
 cookie authentication without adding CSRF protection.
 
 **CORS.** Only the configured dashboard origins are allowed: `API_ALLOWED_ORIGINS`
-(comma-separated), or the origin of `APP_BASE_URL` when that is empty; invalid entries, wildcards
-and (in production) non-loopback `http` origins are dropped. CORS applies to `/api` paths only (the
-mounted MCP endpoint validates `Origin` itself). No wildcard origins, `Access-Control-Allow-Credentials` is not sent (no cookies), allowed methods are
-`GET`, `POST` and `OPTIONS`, allowed request headers are `Authorization`, `Content-Type`,
-`X-Request-Id` and `X-Workspace-Id`, and preflight results may be cached for 600 seconds.
+(comma-separated), or the origin of `APP_BASE_URL` when that is empty. Entries are serialized as
+a browser sends `Origin` (lower-case host, default port omitted, so `https://x:443` matches
+`https://x`); invalid entries (bad ports, paths, credentials), wildcards and (in production)
+non-loopback `http` origins are dropped. CORS applies to `/api` paths only (the
+mounted MCP endpoint validates `Origin` itself). No wildcard origins,
+`Access-Control-Allow-Credentials` is not sent (no cookies), allowed methods are `GET`, `POST` and
+`OPTIONS`, allowed request headers are `Authorization`, `Content-Type`, `Idempotency-Key`,
+`X-Request-Id` and `X-Workspace-Id`, `X-Request-Id` and `Retry-After` are exposed to the
+dashboard, and preflight results may be cached for 600 seconds.
 
 **Other headers.** Every `/api` response is `Cache-Control: no-store` and
 `Content-Type: application/json`. A client may send `X-Request-Id` (printable ASCII, at most 200
 characters); otherwise the server generates one. It is echoed as `request_id` and as the error
 `correlation_id`. Requests are rate limited per authenticated principal (separate token buckets for
 mutations and reads; in memory per process) with `429 RATE_LIMITED` and `Retry-After`. Request
-bodies are `application/json` only (`415` otherwise) and at most 64 KiB (`413`). Routes without
-query parameters refuse any query parameter (`422`), and repeated parameters are refused.
+bodies are `application/json` only (`415` otherwise) and at most 64 KiB (`413`). Query strings are
+at most 4 KiB (`422`, `details.fields = ["query"]`). Routes without query parameters refuse any
+query parameter (`422`), and repeated parameters are refused.
 
 ## 2. Response envelope and conventions
 
@@ -212,7 +220,9 @@ Route notes:
 
 - **`/healthz`** is process liveness only and never touches dependencies. **`/readyz`** checks the
   database, schema compatibility and critical configuration and returns 503 with
-  `ready: false` when any check fails. Neither is authenticated, so neither returns versions of
+  `ready: false` when any check fails (the result is cached for about a second, and concurrent
+  probes share one database check). Both also answer
+  `HEAD` for load-balancer probes. Neither is authenticated, so neither returns versions of
   dependencies, hostnames, URLs or secrets. Source health is not part of readiness; it is in
   `deals_health` and `/api/overview` (authenticated). Free text in readiness details, gate notes
   and coverage-gap reasons that looks like a credential (credential URLs, connection strings,

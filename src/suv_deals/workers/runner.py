@@ -26,7 +26,6 @@ import signal
 import socket
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from datetime import timedelta
 from uuid import UUID, uuid4
 
 import anyio
@@ -83,8 +82,11 @@ class Worker:
         *,
         worker_id: str | None = None,
         job_types: Collection[JobType] | None = None,
+        workspace_ids: Collection[UUID] | None = None,
     ) -> None:
         self.ctx = ctx
+        #: Optional restriction to some workspaces (still only ACTIVE ones are visited).
+        self.workspace_ids = None if workspace_ids is None else frozenset(workspace_ids)
         self.registry = registry or default_registry()
         self.worker_id = worker_id or default_worker_id()
         wanted = tuple(self.registry.job_types() if job_types is None else job_types)
@@ -100,6 +102,8 @@ class Worker:
     async def claim_next(self) -> ClaimedJob | None:
         """Round-robin over active workspaces; the first due job wins."""
         workspaces = await active_workspace_ids(self.ctx.db)
+        if self.workspace_ids is not None:
+            workspaces = [w for w in workspaces if w in self.workspace_ids]
         if not workspaces:
             return None
         start = self._cursor % len(workspaces)
@@ -199,18 +203,17 @@ class Worker:
         self, execution: JobExecution, outcome: JobOutcome | None, error: BaseException | None
     ) -> JobRunReport:
         job = execution.job
-        base = {"job_id": job.id, "workspace_id": job.workspace_id, "job_type": job.job_type, "attempt": job.attempts}
         if outcome is not None:
             if outcome.state == JobState.DEAD_LETTER:
                 self.ctx.metrics.record_dead_letter(job.job_type)
-            return JobRunReport(**base, state=outcome.state, code=outcome.code, details=dict(outcome.details))
-        if execution.lease_lost or isinstance(error, LeaseLost):
-            return self._lost(base)
-        if error is None:  # cancelled without an error: treat as lost (the reaper recovers it)
-            return self._lost(base)
+            return _report(job, outcome.state, code=outcome.code, details=dict(outcome.details))
+        if execution.lease_lost or error is None or isinstance(error, LeaseLost):
+            # A lost lease (or a cancellation without an error): nothing may be committed; the
+            # reaper recovers the job while attempts remain.
+            return self._lost(job)
         disposition = disposition_for_error(error, job)
         if disposition is None:
-            return self._lost(base)
+            return self._lost(job)
         logger.warning(
             "job failed",
             extra={"job_type": job.job_type.value, "disposition": disposition.kind, "code": disposition.code},
@@ -223,17 +226,35 @@ class Worker:
         try:
             state = await retry_transient(commit)
         except LeaseLost:
-            return self._lost(base)
+            return self._lost(job)
         if state == JobState.DEAD_LETTER:
             self.ctx.metrics.record_dead_letter(job.job_type)
-        return JobRunReport(**base, state=state, code=disposition.code)
+        return _report(job, state, code=disposition.code)
 
-    def _lost(self, base: dict[str, object]) -> JobRunReport:
+    def _lost(self, job: ClaimedJob) -> JobRunReport:
         logger.warning("job lease lost; nothing committed, the reaper recovers it")
-        job_type = base["job_type"]
-        assert isinstance(job_type, JobType)
-        self.ctx.metrics.record_lease_expiration(job_type)
-        return JobRunReport(**base, state=None, lease_lost=True)  # type: ignore[arg-type]
+        self.ctx.metrics.record_lease_expiration(job.job_type)
+        return _report(job, None, lease_lost=True)
+
+
+def _report(
+    job: ClaimedJob,
+    state: JobState | None,
+    *,
+    code: str | None = None,
+    lease_lost: bool = False,
+    details: dict[str, object] | None = None,
+) -> JobRunReport:
+    return JobRunReport(
+        job_id=job.id,
+        workspace_id=job.workspace_id,
+        job_type=job.job_type,
+        attempt=job.attempts,
+        state=state,
+        code=code,
+        lease_lost=lease_lost,
+        details=details or {},
+    )
 
 
 async def run_worker(
@@ -245,7 +266,7 @@ async def run_worker(
     stop: anyio.Event | None = None,
 ) -> None:
     """Process entry point (``suv-deals worker``): build the runtime, run until SIGTERM/SIGINT."""
-    ctx = await build_runtime(settings, application_name="suv-deals-worker")
+    ctx = await build_runtime(settings, application_name="suv-deals-worker", configure_logs=True)
     stop = stop or anyio.Event()
     worker = Worker(ctx, registry, worker_id=worker_id, job_types=job_types)
     try:
@@ -267,7 +288,5 @@ async def run_worker(
     finally:
         await ctx.aclose()
 
-
-LEASE_SAFETY_MARGIN = timedelta(seconds=5)
 
 __all__ = ["JobRunReport", "Worker", "default_worker_id", "run_worker"]

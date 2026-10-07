@@ -4,12 +4,12 @@
   clock, options); ``app.create_app`` stores it on ``app.state.suv_api``.
 - `authenticate` (a FastAPI dependency) reads ONLY ``Authorization: Bearer`` (never cookies,
   query strings or bodies), verifies the Supabase access token, resolves the active membership
-  for ``X-Workspace-Id`` and builds the request's `ActorContext`. It then applies the
-  per-principal rate limit (mutations and reads have separate buckets). Denials are counted with
-  a bounded reason label.
+  for ``X-Workspace-Id`` and builds the request's `ActorContext`. The per-principal rate limit
+  (mutations and reads have separate buckets) is applied right after token verification, before
+  the membership query. Denials are counted with a bounded reason label.
 - Input parsing never trusts FastAPI's implicit coercion: path ids are canonical UUID strings,
-  query strings go through the closed ``api.schemas`` query models (unknown or repeated
-  parameters are refused), and bodies must be ``application/json`` and validate against the
+  query strings (at most 4 KiB) go through the closed ``api.schemas`` query models (unknown or
+  repeated parameters are refused), and bodies must be ``application/json`` and validate against the
   closed mutation models in JSON mode. Every failure is ``VALIDATION_ERROR`` naming fields only.
 - `in_transaction` runs one short workspace-scoped unit of work and re-runs it only after a
   failure that proves a rollback (`transactions.retry_transient`).
@@ -17,12 +17,14 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Annotated, Final, cast
 from uuid import UUID
 
+import anyio
 from fastapi import Depends, Request
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
@@ -51,6 +53,7 @@ from suv_deals.views.operations import ReadinessView
 
 STATE_ATTRIBUTE: Final = "suv_api"
 TRANSACTION_ATTEMPTS: Final = 3
+MAX_QUERY_STRING_BYTES: Final = 4096
 _ID_ADAPTER: Final = TypeAdapter(Id)
 
 
@@ -83,6 +86,8 @@ class ApiState:
     cursor_secret: Callable[[], bytes]
     #: ``(loop time, view)`` of the last readiness probe (see ``routes.readiness_view``).
     readiness_cache: tuple[float, ReadinessView] | None = None
+    #: Serializes readiness refreshes: concurrent probes share one database check.
+    readiness_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
 def api_state(request: Request) -> ApiState:
@@ -123,6 +128,9 @@ async def _authenticate(request: Request, *, allow_default_workspace: bool) -> A
             raise DependencyUnavailable("Dashboard authentication is not configured")
         token = bearer_token(request.headers.getlist("authorization"))
         user = await state.verifier.verify(token)
+        # Rate limit by the verified subject BEFORE the membership query, so a flood from one
+        # signed-in user (member or not) never turns into database load.
+        state.limiter.check(user.user_id, mutation=request.method not in ("GET", "HEAD"))
         principal = await resolve_principal(
             state.db,
             user,
@@ -133,7 +141,6 @@ async def _authenticate(request: Request, *, allow_default_workspace: bool) -> A
     except (AuthFailure, MembershipDenied) as exc:
         state.metrics.record_auth_denial("api", exc.reason)
         raise
-    state.limiter.check(principal.actor.principal_id, mutation=request.method not in ("GET", "HEAD"))
     return AuthContext(principal=principal, request_id=request_id)
 
 
@@ -176,10 +183,27 @@ def path_id(value: str, name: str) -> UUID:
     return parsed if isinstance(parsed, UUID) else UUID(str(parsed))
 
 
+def _check_query_size(request: Request) -> None:
+    """Refuse oversized query strings before parsing them (a cursor is at most 2,048 characters,
+    so 4 KiB is ample; nothing else bounds the URL when uvicorn runs on httptools)."""
+    raw = request.scope.get("query_string", b"")
+    if isinstance(raw, bytes | bytearray) and len(raw) > MAX_QUERY_STRING_BYTES:
+        raise ValidationFailed(
+            "The query string is too long",
+            details={"fields": ["query"], "limit_bytes": MAX_QUERY_STRING_BYTES},
+        )
+
+
 def query_model[M: BaseModel](request: Request, model: type[M]) -> M:
-    """Parse the query string into a closed query model; repeated or unknown keys are refused."""
+    """Parse the query string into a closed query model; repeated or unknown keys are refused.
+
+    Repeated keys are counted in one linear pass (a per-key ``getlist`` is quadratic in the
+    number of parameters, which an authenticated caller could use to stall the event loop).
+    """
+    _check_query_size(request)
     params = request.query_params
-    repeated = sorted({key for key in params if len(params.getlist(key)) > 1})
+    counts = Counter(key for key, _ in params.multi_items())
+    repeated = sorted(key for key, count in counts.items() if count > 1)
     if repeated:
         raise ValidationFailed(
             "Query parameters may appear only once",
@@ -194,6 +218,7 @@ def query_model[M: BaseModel](request: Request, model: type[M]) -> M:
 
 def no_query(request: Request) -> None:
     """Routes without query parameters refuse any (tokens are never accepted in query strings)."""
+    _check_query_size(request)
     keys = sorted(set(request.query_params))
     if keys:
         raise ValidationFailed(
@@ -247,6 +272,7 @@ async def in_transaction[T](state: ApiState, actor: ActorContext, work: Callable
 
 
 __all__ = [
+    "MAX_QUERY_STRING_BYTES",
     "STATE_ATTRIBUTE",
     "ApiOptions",
     "ApiState",

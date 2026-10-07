@@ -27,7 +27,9 @@ never trusted on its own: an unknown or foreign workspace is the same ``403`` as
 so the existence of other workspaces is never revealed. With one membership it is the default;
 with several the header is required (``GET /api/me`` defaults to the first so the client can
 bootstrap). The actor is ``ActorContext(principal_kind="user", role=<membership role>,
-scopes=ROLE_SCOPES[role])``.
+scopes=ROLE_SCOPES[role] - {mail:ingest})``: ``mail:ingest`` belongs to the mailbox-bound local
+reply worker credential only (spec 37.8), so a browser session never carries it, exactly as the
+MCP, CLI and system actors never do (a credential may narrow, never widen, the role).
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from jwt.exceptions import (
 from pydantic import SecretStr
 
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
+from suv_deals.domain.enums import Role, Scope
 from suv_deals.errors import DependencyUnavailable, Forbidden, Unauthenticated, ValidationFailed
 from suv_deals.persistence import workspaces
 from suv_deals.persistence.database import Database
@@ -83,6 +86,8 @@ JWKS_TIMEOUT_SECONDS: Final = 5.0
 MIN_LEGACY_SECRET_BYTES: Final = 32
 WORKSPACE_HEADER: Final = "X-Workspace-Id"
 REQUIRED_CLAIMS: Final = ("exp", "iat", "sub", "aud", "iss", "role")
+#: Scopes a dashboard (browser) session never carries, whatever the member role.
+DASHBOARD_EXCLUDED_SCOPES: Final = frozenset({Scope.MAIL_INGEST})
 
 _COMPACT_JWS: Final = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
 _UUID_RE: Final = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -396,13 +401,18 @@ def select_membership(
     raise MembershipDenied()
 
 
+def dashboard_scopes(role: Role) -> frozenset[Scope]:
+    """The scopes of a dashboard session for ``role``: the role's scopes minus worker-only ones."""
+    return ROLE_SCOPES[Role(role)] - DASHBOARD_EXCLUDED_SCOPES
+
+
 def actor_for(user: VerifiedUser, membership: Membership, request_id: str) -> ActorContext:
     return ActorContext(
         workspace_id=membership.workspace_id,
         principal_id=user.user_id,
         principal_kind="user",
         role=membership.role,
-        scopes=ROLE_SCOPES[membership.role],
+        scopes=dashboard_scopes(membership.role),
         request_id=request_id,
     )
 
@@ -428,6 +438,7 @@ async def resolve_principal(
 
 __all__ = [
     "ASYMMETRIC_ALGORITHMS",
+    "DASHBOARD_EXCLUDED_SCOPES",
     "WORKSPACE_HEADER",
     "AuthDenialReason",
     "AuthFailure",
@@ -439,6 +450,7 @@ __all__ = [
     "VerifiedUser",
     "actor_for",
     "bearer_token",
+    "dashboard_scopes",
     "resolve_principal",
     "select_membership",
     "supabase_issuer",

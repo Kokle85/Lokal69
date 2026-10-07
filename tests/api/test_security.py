@@ -7,6 +7,7 @@ Tests that need PostgreSQL carry the ``db`` marker; the rest run without a datab
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import types
 import uuid
@@ -16,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import APIRouter
+from pydantic import SecretStr
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -35,10 +37,11 @@ from tests.api.conftest import (
 from tests.integration.db.helpers import Seed
 
 from suv_deals.api import app as app_module
+from suv_deals.api import routes
 from suv_deals.api.app import allowed_hosts, allowed_origins, create_metrics_app, load_mcp_app
 from suv_deals.api.deps import ApiOptions
 from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
-from suv_deals.errors import RateLimited
+from suv_deals.errors import DependencyUnavailable, RateLimited
 from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence.database import Database
 from suv_deals.settings import Settings
@@ -75,13 +78,16 @@ async def test_cors_preflight_allows_only_the_dashboard_origin(keys: SigningKeys
             headers={
                 "Origin": DASHBOARD_ORIGIN,
                 "Access-Control-Request-Method": "POST",
-                "Access-Control-Request-Headers": "authorization, content-type, x-workspace-id, x-request-id",
+                "Access-Control-Request-Headers": (
+                    "authorization, content-type, idempotency-key, x-workspace-id, x-request-id"
+                ),
             },
         )
         assert allowed.status_code == 200
         assert allowed.headers["access-control-allow-origin"] == DASHBOARD_ORIGIN
         assert "access-control-allow-credentials" not in allowed.headers
         assert allowed.headers["access-control-max-age"] == "600"
+        assert "cookie" not in allowed.headers["access-control-allow-headers"].lower()
         assert set(allowed.headers["access-control-allow-methods"].replace(" ", "").split(",")) == {
             "GET",
             "POST",
@@ -118,6 +124,8 @@ async def test_cors_preflight_allows_only_the_dashboard_origin(keys: SigningKeys
         assert "access-control-allow-origin" not in api_simple.headers
         api_ok_origin = await client.get("/api/me", headers={"Origin": DASHBOARD_ORIGIN})
         assert api_ok_origin.headers["access-control-allow-origin"] == DASHBOARD_ORIGIN
+        exposed = api_ok_origin.headers["access-control-expose-headers"].lower()
+        assert "x-request-id" in exposed and "retry-after" in exposed
 
 
 def test_origin_and_host_allow_lists() -> None:
@@ -135,6 +143,36 @@ def test_origin_and_host_allow_lists() -> None:
     assert allowed_hosts(make_settings(), ["API.example"]) == ["api.example"]
     with pytest.raises(ValueError):
         allowed_hosts(make_settings(), ["*"])
+
+
+def test_origins_are_serialized_like_browsers_and_bad_entries_never_crash() -> None:
+    """A browser omits the default port from ``Origin``: ``https://x:443`` must match it. An
+    invalid port or a wildcard host is dropped (logged) instead of failing app start-up."""
+    settings = make_settings(
+        api_allowed_origins=(
+            "https://Dash.Example:443, http://127.0.0.1:80, https://dash.example:8443,"
+            " https://bad.example:99999, https://worse.example:abc, https://*.example, http://[::1]:5173"
+        )
+    )
+    assert allowed_origins(settings) == [
+        "https://dash.example",
+        "http://127.0.0.1",
+        "https://dash.example:8443",
+        "http://[::1]:5173",
+    ]
+    assert allowed_origins(make_settings(app_base_url="https://dash.example:443/")) == [
+        "https://dash.example"
+    ]
+
+
+async def test_default_port_origin_configuration_matches_the_browser_origin(keys: SigningKeys) -> None:
+    settings = make_settings(api_allowed_origins="https://dashboard.synthetic.example:443")
+    async with offline_client(keys, settings=settings) as (client, _):
+        preflight = await client.options(
+            "/api/me", headers={"Origin": DASHBOARD_ORIGIN, "Access-Control-Request-Method": "GET"}
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers["access-control-allow-origin"] == DASHBOARD_ORIGIN
 
 
 async def test_security_headers_no_store_and_request_ids(keys: SigningKeys) -> None:
@@ -169,6 +207,13 @@ async def test_unknown_api_paths_and_methods_are_typed_errors(keys: SigningKeys)
         get_on_post = await client.get(f"/api/reviews/{uuid.uuid4()}/claim")
         assert get_on_post.status_code == 405
         assert get_on_post.headers["allow"] == "POST"
+        head_me = await client.head("/api/me")
+        assert head_me.status_code == 405
+        assert head_me.headers["allow"] == "GET"
+        assert (await client.head("/api/not-a-route")).status_code == 404
+        put_me = await client.put("/api/me", json={})
+        assert put_me.status_code == 405
+        assert put_me.headers["allow"] == "GET"
 
 
 async def test_strict_host_check(keys: SigningKeys) -> None:
@@ -195,8 +240,11 @@ async def test_unexpected_errors_are_internal_error_without_details(
         raise RuntimeError("SELECT password FROM secrets WHERE dsn = 'postgresql://u:p@db/x'")
 
     async with offline_client(keys, extra_routers=[boom]) as (client, metrics):
-        response = await client.get("/api/v11/boom")
+        response = await client.get("/api/v11/boom", headers={"Origin": DASHBOARD_ORIGIN})
         assert response.status_code == 500
+        # Rendered inside the CORS layer: the dashboard can read the body and correlation id.
+        assert response.headers["access-control-allow-origin"] == DASHBOARD_ORIGIN
+        assert response.headers["cache-control"] == "no-store"
         error = error_of(response)
         assert error == {
             "code": "INTERNAL_ERROR",
@@ -242,8 +290,13 @@ async def test_oversized_bodies_are_413_and_wrong_media_types_415(keys: SigningK
     options = ApiOptions(api_body_limit=1024)
     path = f"/api/reviews/{uuid.uuid4()}/claim"
     async with offline_client(keys, options=options) as (client, _):
-        declared = await client.post(path, content=b"x" * 4096, headers={"Content-Type": "application/json"})
+        declared = await client.post(
+            path,
+            content=b"x" * 4096,
+            headers={"Content-Type": "application/json", "Origin": DASHBOARD_ORIGIN},
+        )
         assert declared.status_code == 413
+        assert declared.headers["access-control-allow-origin"] == DASHBOARD_ORIGIN
         error = error_of(declared)
         assert error["code"] == "VALIDATION_ERROR"
         assert error["details"] == {"fields": ["body"], "limit_bytes": 1024}
@@ -331,6 +384,52 @@ def test_rate_limiter_refills_over_time() -> None:
         RateLimit(capacity=0, per_seconds=1.0)
 
 
+async def _drive_asgi(app: Any, scope: dict[str, Any]) -> list[dict[str, Any]]:
+    """Run one HTTP request through the ASGI app directly and return the sent messages."""
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
+async def test_non_ascii_content_length_is_413_not_an_internal_error(keys: SigningKeys) -> None:
+    """``"²".isdigit()`` is true but ``int("²")`` fails: such a header is a 413 like any other
+    malformed length (the ASGI app is driven directly; HTTP clients refuse to send it)."""
+    app = build_test_app(
+        make_settings(), keys, Database(UNREACHABLE_DB), metrics=AppMetrics(process_metrics=False)
+    )
+    for raw in ("²".encode("latin-1"), b"\xb9\xb2", b"1 2", b"0x10"):
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "https",
+            "path": f"/api/reviews/{uuid.uuid4()}/claim",
+            "raw_path": b"/api/reviews/x/claim",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"dashboard.synthetic.example"),
+                (b"content-type", b"application/json"),
+                (b"content-length", raw),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("dashboard.synthetic.example", 443),
+        }
+        sent = await _drive_asgi(app, scope)
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        assert start["status"] == 413, raw
+        body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+        assert b'"VALIDATION_ERROR"' in body and b"INTERNAL_ERROR" not in body
+
+
 # --------------------------------------------------------------------------------------------
 # Health, readiness, metrics
 # --------------------------------------------------------------------------------------------
@@ -341,6 +440,11 @@ async def test_liveness_and_readiness_without_a_database(keys: SigningKeys) -> N
         alive = await client.get("/healthz")
         assert alive.status_code == 200
         assert alive.json() == {"status": "alive", "build_id": "synthetic-api.1"}
+        assert (await client.head("/healthz")).status_code == 200
+        assert (await client.head("/readyz")).status_code == 503
+        posted = await client.post("/healthz")
+        assert posted.status_code == 405
+        assert posted.headers["allow"] == "GET, HEAD"
         ready = await client.get("/readyz")
         assert ready.status_code == 503
         body = ready.json()
@@ -352,6 +456,52 @@ async def test_liveness_and_readiness_without_a_database(keys: SigningKeys) -> N
         }
         no_leaks(ready)
         assert "supabase" not in ready.text
+
+
+async def test_concurrent_readiness_probes_share_one_database_check(
+    keys: SigningKeys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/readyz`` is unauthenticated: a burst of probes must not take one pooled connection each."""
+    calls = 0
+    original = routes._database_checks
+
+    async def slow_checks(state: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        return await original(state)
+
+    monkeypatch.setattr(routes, "_database_checks", slow_checks)
+    async with offline_client(keys) as (client, _):
+        responses = await asyncio.gather(*(client.get("/readyz") for _ in range(12)))
+        assert {r.status_code for r in responses} == {503}
+        assert calls == 1
+        assert len({r.text for r in responses}) == 1
+
+
+@pytest.mark.db
+async def test_app_managed_database_uses_the_backend_role_and_closes(
+    db_url: str, seed: Seed, keys: SigningKeys, tokens: TokenFactory
+) -> None:
+    """Without an injected ``db`` the lifespan opens ``Database(DATABASE_URL, set_role=...)``
+    itself (ADR 0001: RLS applies) and closes it on shutdown; a JWK-set document is accepted."""
+    workspace = seed.workspace("API managed database")
+    user = seed.user()
+    seed.membership(workspace, user, "viewer")
+    settings = make_settings(database_url=SecretStr(db_url), database_set_role="suv_backend")
+    app = app_module.create_app(settings, jwks=keys.jwks, metrics=AppMetrics(process_metrics=False))
+    state = app.state.suv_api
+    async with running_client(app) as client:
+        assert (await client.get("/readyz")).status_code == 200
+        me = await client.get("/api/me", headers={"Authorization": f"Bearer {tokens.mint(user)}"})
+        assert me.status_code == 200, me.text
+        assert me.json()["data"]["role"] == "viewer"
+        async with state.db.transaction() as conn:
+            role = await (await conn.execute("select current_user as role")).fetchone()
+        assert role is not None and role["role"] == "suv_backend"
+    with pytest.raises(DependencyUnavailable):
+        async with state.db.transaction():
+            pass  # the pool was closed by the lifespan
 
 
 @pytest.mark.db
@@ -447,6 +597,29 @@ def test_load_mcp_app_tolerates_only_the_absent_package(monkeypatch: pytest.Monk
     monkeypatch.setattr(app_module.importlib, "import_module", lambda name: module)
     assert load_mcp_app(settings, db) is sentinel
     assert built == [(settings, db)]
+
+
+async def test_the_real_mcp_package_mounts_behind_the_api_routes(keys: SigningKeys) -> None:
+    """``load_mcp_app`` builds the in-tree MCP server (``build_mcp(settings, db=db)``); mounted at
+    ``/`` it never shadows ``/api``, ``/healthz`` or the API's typed 404, and its lifespan runs."""
+    settings = make_settings()
+    db = Database(UNREACHABLE_DB)
+    mcp = load_mcp_app(settings, db)
+    assert isinstance(mcp, Starlette)
+    async with offline_client(keys, settings=settings, mcp_asgi=mcp) as (client, _):
+        assert (await client.get("/healthz")).status_code == 200
+        unauthenticated = await client.get("/api/me")
+        assert unauthenticated.status_code == 401
+        assert error_of(unauthenticated)["code"] == "UNAUTHENTICATED"
+        assert error_of(await client.get("/api/not-a-route"))["code"] == "NOT_FOUND"
+        mcp_response = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+        assert mcp_response.status_code != 404
+        assert "schema_version" not in mcp_response.text  # answered by the MCP app, not /api
+        no_leaks(mcp_response)
 
 
 def test_create_app_requires_a_database_url() -> None:

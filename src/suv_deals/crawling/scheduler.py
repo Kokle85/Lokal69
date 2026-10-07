@@ -23,7 +23,9 @@ due and visibly unscanned); fixture sources run offline.
 from __future__ import annotations
 
 import logging
+import signal
 from collections import Counter
+from collections.abc import Collection
 from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID, uuid4
@@ -43,7 +45,7 @@ from suv_deals.persistence.database import Database
 from suv_deals.persistence.sources_repo import ScheduleAdvance, SourceRecord
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
-from suv_deals.workers.runtime import active_workspace_ids
+from suv_deals.workers.runtime import active_workspace_ids, build_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -202,13 +204,20 @@ async def run_scheduler_tick(
     clock: Clock,
     *,
     metrics: AppMetrics | None = None,
+    workspace_ids: Collection[UUID] | None = None,
 ) -> SchedulerTickReport:
-    """Evaluate every due schedule of every active workspace once (stateless, restart-safe)."""
+    """Evaluate every due schedule of every active workspace once (stateless, restart-safe).
+
+    ``workspace_ids`` optionally restricts the tick to some workspaces (still only active ones).
+    """
     started = ensure_utc(clock.now())
     interval = timedelta(seconds=settings.scheduler_interval_seconds)
     planned = _slot_of(started, interval)
     results: list[WorkspaceTick] = []
+    wanted = None if workspace_ids is None else frozenset(workspace_ids)
     for workspace_id in await active_workspace_ids(db):
+        if wanted is not None and workspace_id not in wanted:
+            continue
         try:
             results.append(await tick_workspace(db, settings, workspace_id))
         except AppError as exc:
@@ -249,11 +258,36 @@ async def run_scheduler(
             await stop.wait()
 
 
+async def run_scheduler_process(settings: Settings, *, stop: anyio.Event | None = None) -> None:
+    """Process entry point (``suv-deals scheduler``): build the runtime, tick until SIGTERM/SIGINT."""
+    ctx = await build_runtime(settings, application_name="suv-deals-scheduler", configure_logs=True)
+    stop = stop or anyio.Event()
+    try:
+        async with anyio.create_task_group() as tg:
+
+            async def watch_signals() -> None:
+                with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
+                    async for _signum in signals:
+                        logger.info("shutdown requested; the scheduler stops after the current tick")
+                        stop.set()
+                        return
+
+            async def work() -> None:
+                await run_scheduler(ctx.db, settings, clock=ctx.clock, metrics=ctx.metrics, stop=stop)
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(watch_signals)
+            tg.start_soon(work)
+    finally:
+        await ctx.aclose()
+
+
 __all__ = [
     "SchedulerTickReport",
     "WorkspaceTick",
     "ensure_schedules",
     "run_scheduler",
+    "run_scheduler_process",
     "run_scheduler_tick",
     "tick_workspace",
 ]

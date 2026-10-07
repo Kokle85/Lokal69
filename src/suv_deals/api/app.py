@@ -5,10 +5,11 @@
 - **Lifespan**: opens the ``Database`` (``SET ROLE settings.database_set_role``, ADR 0001) without
   blocking start-up on the database (readiness reports it), runs the mounted MCP app's own
   lifespan (the SDK's session manager must run in the parent lifespan) and closes both.
-- **Middleware** (outermost first): request id + security headers + no-store + metrics + last-
-  resort ``INTERNAL_ERROR``; strict ``Host`` allow-list; request body limits; CORS for ``/api``
-  only (origin allow-list from ``API_ALLOWED_ORIGINS`` or the origin of ``APP_BASE_URL``; no
-  credentials). See ``api.middleware``.
+- **Middleware** (outermost first): request id + security headers + no-store + metrics (+ a
+  backstop ``INTERNAL_ERROR``); strict ``Host`` allow-list; CORS for ``/api`` only (origin
+  allow-list from ``API_ALLOWED_ORIGINS`` or the origin of ``APP_BASE_URL``; no credentials);
+  ``INTERNAL_ERROR`` rendering inside the CORS layer; request body limits. See
+  ``api.middleware``.
 - **Errors**: ``AppError`` -> ``ApiErrorResponse`` with ``errors.HTTP_STATUS``; request
   validation -> ``VALIDATION_ERROR`` with field names only; anything else -> ``INTERNAL_ERROR``
   without traces (``api.errors``).
@@ -30,7 +31,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Final
 from urllib.parse import urlsplit
 
@@ -46,12 +47,13 @@ from starlette.types import ASGIApp
 
 import suv_deals
 from suv_deals.api import routes
-from suv_deals.api.auth import SigningKeyResolver, SupabaseJwtVerifier
+from suv_deals.api.auth import SigningKeyResolver, StaticJwks, SupabaseJwtVerifier
 from suv_deals.api.deps import STATE_ATTRIBUTE, ApiOptions, ApiState
 from suv_deals.api.errors import install_exception_handlers
 from suv_deals.api.middleware import (
     ApiCorsMiddleware,
     BodySizeLimitMiddleware,
+    InternalErrorMiddleware,
     PrincipalRateLimiter,
     RequestContextMiddleware,
 )
@@ -68,6 +70,7 @@ from suv_deals.settings import Settings, get_settings
 logger = logging.getLogger("suv_deals.api")
 
 LOCAL_HOSTS: Final = ("127.0.0.1", "localhost")
+DEFAULT_PORTS: Final = {"http": 80, "https": 443}
 MCP_SERVER_MODULE: Final = "suv_deals.mcp.server"
 
 
@@ -97,10 +100,21 @@ def allowed_hosts(settings: Settings, override: Sequence[str] | None = None) -> 
 
 
 def _origin(value: str, *, production: bool) -> str | None:
-    parts = urlsplit(value.strip())
+    """The serialized origin a browser sends (``scheme://host[:port]``), or ``None`` if invalid.
+
+    The default port is omitted (``https://x:443`` is the origin ``https://x``), an IPv6 host is
+    bracketed, and an invalid port or a wildcard host is invalid rather than a start-up crash.
+    """
+    try:
+        parts = urlsplit(value.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    hostname = parts.hostname
     if (
         parts.scheme not in ("http", "https")
-        or not parts.hostname
+        or not hostname
+        or "*" in hostname
         or parts.username is not None
         or parts.password is not None
         or parts.path not in ("", "/")
@@ -108,10 +122,11 @@ def _origin(value: str, *, production: bool) -> str | None:
         or parts.fragment
     ):
         return None
-    if parts.scheme == "http" and production and parts.hostname not in LOCAL_HOSTS:
+    if parts.scheme == "http" and production and hostname not in LOCAL_HOSTS:
         return None
-    port = f":{parts.port}" if parts.port is not None else ""
-    return f"{parts.scheme}://{parts.hostname}{port}"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    suffix = f":{port}" if port is not None and port != DEFAULT_PORTS[parts.scheme] else ""
+    return f"{parts.scheme}://{host}{suffix}"
 
 
 def allowed_origins(settings: Settings) -> list[str]:
@@ -182,7 +197,7 @@ def create_app(
     settings: Settings,
     *,
     db: Database | None = None,
-    jwks: SigningKeyResolver | None = None,
+    jwks: SigningKeyResolver | Mapping[str, Any] | None = None,
     mcp_asgi: ASGIApp | None = None,
     manage_db: bool | None = None,
     clock: Clock | None = None,
@@ -196,16 +211,19 @@ def create_app(
 
     ``db``: a caller-managed ``Database`` (already open) unless ``manage_db=True``; without it the
     app creates and manages one from ``DATABASE_URL``. ``jwks``: the signing-key resolver for
-    Supabase access tokens (default: the project's JWKS endpoint through ``PyJWKClient``).
+    Supabase access tokens, or a JWK-set document (``{"keys": [...]}``, wrapped in `StaticJwks`;
+    tests and pinned keys); default: the project's JWKS endpoint through ``PyJWKClient``.
     ``legacy_hs256_secret``: only for a project still on the legacy shared secret.
+    ``extra_routers``: extension routers (see module docstring).
     """
     opts = options or ApiOptions()
+    resolver: SigningKeyResolver | None = StaticJwks(jwks) if isinstance(jwks, Mapping) else jwks
     app_clock = clock or SystemClock()
     app_metrics = metrics or get_metrics()
     owns_db = (db is None) if manage_db is None else manage_db
     database = db if db is not None else _database(settings)
     verifier = SupabaseJwtVerifier.from_settings(
-        settings, resolver=jwks, leeway=opts.jwt_leeway, legacy_hs256_secret=legacy_hs256_secret
+        settings, resolver=resolver, leeway=opts.jwt_leeway, legacy_hs256_secret=legacy_hs256_secret
     )
     if verifier is None:
         logger.warning("SUPABASE_URL is not configured: every /api request will be refused")
@@ -247,6 +265,8 @@ def create_app(
             allowed_hosts=allowed_hosts(settings, opts.allowed_hosts),
             www_redirect=False,
         ),
+        Middleware(ApiCorsMiddleware, allow_origins=allowed_origins(settings)),
+        Middleware(InternalErrorMiddleware, metrics=app_metrics, clock=app_clock),
         Middleware(
             BodySizeLimitMiddleware,
             api_limit=opts.api_body_limit,
@@ -255,7 +275,6 @@ def create_app(
             clock=app_clock,
             metrics=app_metrics,
         ),
-        Middleware(ApiCorsMiddleware, allow_origins=allowed_origins(settings)),
     ]
     app = FastAPI(
         title="SUV deals backend",
@@ -294,13 +313,30 @@ def load_mcp_app(settings: Settings, db: Database) -> ASGIApp | None:
     return app
 
 
-def build_app(settings: Settings | None = None) -> FastAPI:
-    """Production factory: logging, database, the optional MCP mount and the API."""
+def build_app(
+    settings: Settings | None = None,
+    *,
+    extra_routers: Sequence[APIRouter] = (),
+    options: ApiOptions | None = None,
+) -> FastAPI:
+    """Production factory: logging, database, the optional MCP mount and the API.
+
+    ``extra_routers``/``options`` are the extension hook for later packages (for example the
+    spec 37.8 mail-worker router with ``ApiOptions(prefix_body_limits={"/v1/mail-workers":
+    128 * 1024})``); a wrapper factory passes them and serves the result with ``--factory``.
+    """
     resolved = settings or get_settings()
     configure_logging(resolved)
     database = _database(resolved)
     mcp_app = load_mcp_app(resolved, database)
-    return create_app(resolved, db=database, mcp_asgi=mcp_app, manage_db=True)
+    return create_app(
+        resolved,
+        db=database,
+        mcp_asgi=mcp_app,
+        manage_db=True,
+        extra_routers=extra_routers,
+        options=options,
+    )
 
 
 #: Route keys this app serves (``api.schemas.ROUTES``); used by the contract tests.

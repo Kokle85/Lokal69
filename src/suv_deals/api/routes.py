@@ -22,8 +22,8 @@ are submitted through ``POST /api/reviews/{case_id}/submit`` as a ``needs_inform
 whose ``reason_codes`` include ``needs_inspection``, ``needs_documents`` or
 ``price_confirmation_needed`` (the ``domain.due_diligence.DashboardAction`` values) and whose
 ``missing_information`` lists the open items. `dashboard_action_request` builds that body. These
-reason codes are refused with any other outcome, so an action can never shortlist, watch or
-reject a case by accident.
+reason codes (in any case or separator spelling) are refused with any other outcome, so an action
+can never shortlist, watch or reject a case by accident.
 
 Recheck (``POST /api/listings/{listing_id}/recheck``) queues a budget-controlled ``recheck`` job
 for a registered listing only (the stored canonical URL; the request carries no URL). A paused,
@@ -124,6 +124,7 @@ DASHBOARD_ACTION_SUMMARIES: Final[dict[DashboardAction, str]] = {
 }
 READINESS_TIMEOUT_SECONDS: Final = 3.0
 _MAX_MEMBERSHIPS: Final = 50
+_CODE_SEPARATORS: Final = re.compile(r"[-.:]")
 
 _WAITING_JOB_SQL: Final = (
     "select id, state, available_at from ops.jobs"
@@ -191,9 +192,12 @@ def _mutation_envelope[T](
 # --------------------------------------------------------------------------------------------
 
 
-@router.get("/healthz")
+PROBE_METHODS: Final = ["GET", "HEAD"]
+
+
+@router.api_route("/healthz", methods=PROBE_METHODS)
 async def get_healthz(request: Request) -> Response:
-    """Process liveness only; never touches dependencies."""
+    """Process liveness only; never touches dependencies (``HEAD`` too, for load balancers)."""
     state = api_state(request)
     return json_response(LivenessView(build_id=build_info(state.settings).build_id), 200)
 
@@ -249,25 +253,37 @@ async def readiness_view(state: ApiState) -> ReadinessView:
     """Database reachable, required schema objects present and critical configuration set.
 
     Cached for ``ApiOptions.readiness_cache_seconds`` so an unauthenticated caller cannot turn the
-    endpoint into database load. No hostnames, URLs, versions or secrets are reported.
+    endpoint into database load; refreshes are serialized, so a burst of concurrent probes shares
+    ONE database check (and at most one pooled connection) instead of one each. No hostnames,
+    URLs, versions or secrets are reported.
     """
-    now = anyio.current_time()
+    cached = _fresh_readiness(state)
+    if cached is not None:
+        return cached
+    async with state.readiness_lock:
+        cached = _fresh_readiness(state)  # another probe refreshed it while this one waited
+        if cached is not None:
+            return cached
+        database, schema = await _database_checks(state)
+        config = _config_check(state)
+        checks = (database, schema, config)
+        view = ReadinessView(
+            ready=all(check.status == "ok" for check in checks),
+            checks=checks,
+            build_id=build_info(state.settings).build_id,
+        )
+        state.readiness_cache = (anyio.current_time(), view)
+        return view
+
+
+def _fresh_readiness(state: ApiState) -> ReadinessView | None:
     cached = state.readiness_cache
-    if cached is not None and now - cached[0] < state.options.readiness_cache_seconds:
+    if cached is not None and anyio.current_time() - cached[0] < state.options.readiness_cache_seconds:
         return cached[1]
-    database, schema = await _database_checks(state)
-    config = _config_check(state)
-    checks = (database, schema, config)
-    view = ReadinessView(
-        ready=all(check.status == "ok" for check in checks),
-        checks=checks,
-        build_id=build_info(state.settings).build_id,
-    )
-    state.readiness_cache = (now, view)
-    return view
+    return None
 
 
-@router.get("/readyz")
+@router.api_route("/readyz", methods=PROBE_METHODS)
 async def get_readyz(request: Request) -> Response:
     view = await readiness_view(api_state(request))
     return json_response(view, 200 if view.ready else 503)
@@ -440,10 +456,19 @@ async def post_release(request: Request, case_id: str, auth: Authenticated) -> R
     return _respond(RELEASE, _mutation_envelope(view, auth, as_of))
 
 
+def _action_code(code: str) -> str:
+    """Reason codes compared as the dashboard action they spell (``NEEDS-DOCUMENTS`` included)."""
+    return _CODE_SEPARATORS.sub("_", code.lower())
+
+
 def check_dashboard_actions(tool: ReviewsSubmitInput) -> None:
-    """Spec 19 dashboard actions are ``needs_information`` decisions only (module docstring)."""
+    """Spec 19 dashboard actions are ``needs_information`` decisions only (module docstring).
+
+    The codes are matched case- and separator-insensitively, so a variant spelling such as
+    ``NEEDS_INSPECTION`` or ``needs-documents`` cannot attach an action to another outcome.
+    """
     if tool.outcome != ReviewOutcome.NEEDS_INFORMATION and any(
-        code in DASHBOARD_ACTION_REASON_CODES for code in tool.reason_codes
+        _action_code(code) in DASHBOARD_ACTION_REASON_CODES for code in tool.reason_codes
     ):
         raise ValidationFailed(
             "Inspection, document and price-confirmation actions are needs_information decisions",
@@ -663,7 +688,7 @@ async def get_outbox(request: Request, auth: Authenticated) -> Response:
 # --------------------------------------------------------------------------------------------
 
 fallback_router = APIRouter()
-_FALLBACK_METHODS: Final = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+_FALLBACK_METHODS: Final = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 _ROUTE_PATTERNS: Final = tuple(
     (re.compile("^" + re.sub(r"\{[^/]+\}", "[^/]+", route.path) + "$"), route.method) for route in ROUTES
 )

@@ -132,7 +132,7 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
         return await _finish(ctx, execution, Disposition.complete({"skipped": CARD_ONLY_SKIP}))
     if source.activation_problems():
         raise SourcePaused(f"source {source.source_key} is gated")
-    session = ctx.crawl_session(job.workspace_id, source)
+    session = await ctx.open_crawl_session(job.workspace_id, source)
     adapter = session.adapter
     with log_context(source_key=source.source_key, adapter_version=adapter.adapter_version):
         identity = adapter.canonicalize(listing.canonical_url)
@@ -152,7 +152,7 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
         stored = await _store_snapshot(ctx, job.workspace_id, document) if disposition is None else None
         observation_id = uuid4()  # fixed per fetch: a re-run commit is idempotent
 
-        async def commit() -> tuple[Disposition | None, IngestDetailResult | None]:
+        async def commit() -> tuple[Disposition | None, JobState, IngestDetailResult | None]:
             execution.check_lease()
             async with job_unit_of_work(ctx.db, job) as (conn, _locked):
                 if disposition is not None and disposition.code == "access_blocked":
@@ -172,8 +172,8 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
                     conn, actor, source, document, job_id=job.id, snapshot_id=snapshot_id
                 )
                 if disposition is not None:
-                    await apply_disposition(conn, job, disposition)
-                    return disposition, None
+                    # The applied state, not the requested kind: an exhausted retry is a dead letter.
+                    return disposition, await apply_disposition(conn, job, disposition), None
                 context = (
                     await listings_repo.load_screening_context(conn, actor, taxonomy=ctx.taxonomy)
                     if ctx.taxonomy is not None
@@ -197,15 +197,10 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
                     screening_context=context,
                     complete_job=True,
                 )
-                return None, result
+                return None, JobState.SUCCEEDED, result
 
-        applied, result = await retry_transient(commit)
+        applied, state, result = await retry_transient(commit)
     if applied is not None:
-        state = {
-            "retry": JobState.RETRY_WAIT,
-            "blocked": JobState.BLOCKED,
-            "dead_letter": JobState.DEAD_LETTER,
-        }.get(applied.kind, JobState.SUCCEEDED)
         return JobOutcome(state=state, code=applied.code, details={"listing_id": str(listing.id)})
     assert result is not None
     return JobOutcome(

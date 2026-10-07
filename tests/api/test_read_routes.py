@@ -122,28 +122,41 @@ async def test_foreign_workspace_ids_are_identical_to_missing_ones(
         assert comparable_error(a) == comparable_error(b), template
         assert str(foreign_id) not in a.text
     writes = {
-        f"/api/reviews/{foreign.cases['priced']}/claim": {
-            "expected_version": 1,
-            "idempotency_key": "foreign-claim-01",
-        },
-        f"/api/listings/{foreign.listings['priced']}/notes": {
-            "note": "probe",
-            "idempotency_key": "foreign-note-001",
-        },
-        f"/api/listings/{foreign.listings['priced']}/recheck": {
-            "reason": "probe recheck",
-            "idempotency_key": "foreign-recheck1",
-        },
+        "/api/reviews/{}/claim": (
+            foreign.cases["priced"],
+            {"expected_version": 1, "idempotency_key": "foreign-claim-01"},
+        ),
+        "/api/reviews/{}/release": (
+            foreign.cases["priced"],
+            {"claim_token": "A" * 43, "idempotency_key": "foreign-release1"},
+        ),
+        "/api/listings/{}/notes": (
+            foreign.listings["priced"],
+            {"note": "probe", "idempotency_key": "foreign-note-001"},
+        ),
+        "/api/listings/{}/recheck": (
+            foreign.listings["priced"],
+            {"reason": "probe recheck", "idempotency_key": "foreign-recheck1"},
+        ),
     }
-    for path, body in writes.items():
-        response = await data_api.post(path, reviewer, body)
-        assert response.status_code == 404, (path, response.text)
+    for template, (foreign_id, body) in writes.items():
+        a = await data_api.post(template.format(foreign_id), reviewer, body)
+        missing_body = {**body, "idempotency_key": body["idempotency_key"] + "-m"}
+        b = await data_api.post(template.format(uuid.uuid4()), reviewer, missing_body)
+        assert a.status_code == b.status_code == 404, (template, a.text)
+        assert comparable_error(a) == comparable_error(b), template
+        assert str(foreign_id) not in a.text
+    pause_body = {"expected_version": 1, "reason": "probe pause", "idempotency_key": "foreign-pause-01"}
     pause = await data_api.post(
-        f"/api/sources/{foreign.sources['running']}/pause",
-        data_api.users.owner,
-        {"expected_version": 1, "reason": "probe pause", "idempotency_key": "foreign-pause-01"},
+        f"/api/sources/{foreign.sources['running']}/pause", data_api.users.owner, pause_body
     )
-    assert pause.status_code == 404
+    missing_pause = await data_api.post(
+        f"/api/sources/{uuid.uuid4()}/pause",
+        data_api.users.owner,
+        {**pause_body, "idempotency_key": "foreign-pause-02"},
+    )
+    assert pause.status_code == missing_pause.status_code == 404
+    assert comparable_error(pause) == comparable_error(missing_pause)
     # The foreign workspace is untouched.
     assert (
         seed.scalar("select count(*) from app.owner_notes where workspace_id = %s", (foreign.workspace_id,))
@@ -212,12 +225,17 @@ async def test_cursors_are_signed_and_bound_to_filters_and_principal(data_api: D
     rest = await data_api.get("/api/outbox", viewer, params={"limit": "2", "cursor": outbox["next_cursor"]})
     assert rest.status_code == 200
     queue = (await data_api.get("/api/reviews?limit=1", viewer)).json()
-    if queue["next_cursor"] is not None:
-        page = await data_api.get(
-            "/api/reviews", viewer, params={"limit": "1", "cursor": queue["next_cursor"]}
-        )
-        assert page.status_code == 200
-        tampered = await data_api.get(
-            "/api/reviews", viewer, params={"limit": "1", "cursor": queue["next_cursor"] + "x"}
-        )
+    snapshot_cursor = queue["next_cursor"]
+    assert isinstance(snapshot_cursor, str)
+    page = await data_api.get("/api/reviews", viewer, params={"limit": "1", "cursor": snapshot_cursor})
+    assert page.status_code == 200
+    assert page.json()["data"]["items"][0]["case_id"] != queue["data"]["items"][0]["case_id"]
+    for value in (snapshot_cursor + "x", "A" + snapshot_cursor[1:]):
+        tampered = await data_api.get("/api/reviews", viewer, params={"limit": "1", "cursor": value})
         assert tampered.status_code == 422
+        assert error_of(tampered)["details"]["cursor"] in {"malformed", "tampered"}
+    foreign_principal = await data_api.get(
+        "/api/reviews", reviewer, params={"limit": "1", "cursor": snapshot_cursor}
+    )
+    assert foreign_principal.status_code == 422
+    assert error_of(foreign_principal)["details"]["cursor"] == "mismatch"

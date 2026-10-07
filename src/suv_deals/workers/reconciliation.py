@@ -1,0 +1,585 @@
+"""Periodic reconciliation: reapers, housekeeping, bounded sweeps (spec 9, 13, 18, 22, 30).
+
+One pass per active workspace (``ops.active_workspace_ids()``, ADR 0001), every step in its own
+short transaction, no network I/O:
+
+1. **Reapers** (spec 13): expired job leases are requeued while attempts remain, otherwise
+   dead-lettered (`jobs.reap_expired`; a crashed worker's job completes once logically through the
+   next lease holder); exhausted waiting jobs become visible dead letters (`jobs.reconcile_exhausted`);
+   expired dispatcher leases on outbox rows become ``uncertain`` when a send had started, otherwise
+   ``retry_wait`` (`outbox.reap_expired_events`); leased MCP Events deliveries whose dispatcher died
+   become ``uncertain`` (`subscriptions_repo.reap_expired_deliveries`), never blindly resent.
+2. **Housekeeping**: expired review claims return to their restore state, expired query snapshots
+   and idempotency records are purged; crawl runs left ``running`` by a discovery job that has
+   ended (dead letter, cancelled, blocked) are closed as ``cancelled`` with the gap recorded (a
+   retried job closes its own earlier run when it starts the next one).
+3. **Stale-detail sweep** (spec 9 "Detail fetch rules"): due watchlist rechecks become bounded
+   ``recheck`` jobs (the watch's next recheck moves one interval ahead); listings with an open review
+   case or an eligible/needs-facts screening whose last detail check is older than the sweep age get a
+   low-priority ``detail`` job -- at most one per listing per sweep age, so a page that keeps failing
+   (dead letter, blocked) is not re-fetched on every pass. Both are capped per source by the source's
+   per-run detail budget, only
+   for sources that may make network requests (enabled, unpaused, unblocked, ``detail_mode=fetch``,
+   and ``SOURCE_NETWORK_ENABLED`` for real sources); the jobs themselves still pass the persistent
+   budget gate before any request. Nothing is fetched here.
+4. **Valuation staleness** (spec 18): valuations past their freshness deadline (FX age, quote expiry,
+   comparable freshness are folded into ``expires_at`` by the valuation assembly) are marked stale and
+   their recomputation is queued (`valuation_repo.mark_stale`); valuations that used an older reference
+   FX observation than the newest stored one, or an older business configuration, are invalidated
+   through reverse invalidation (`valuation_repo.invalidate_dependents`).
+5. **Metrics**: queue depth / oldest due age per job type, lease expirations and dead letters.
+
+``dry_run=True`` reports what a pass WOULD do: transactional steps run and are rolled back, the
+database-level reapers are replaced by read-only counts. Nothing is committed in a dry run.
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any, Final
+from uuid import UUID
+
+import anyio
+
+from suv_deals.clock import ensure_utc
+from suv_deals.domain.actor import ActorContext
+from suv_deals.domain.enums import FxPurpose, JobType, Scope, SourceMode, TechnicalStatus
+from suv_deals.domain.valuation import InvalidationReason
+from suv_deals.errors import AppError, NotFound
+from suv_deals.persistence import (
+    config_repo,
+    idempotency,
+    jobs,
+    listings_repo,
+    notes_repo,
+    outbox,
+    query_snapshots,
+    reviews_repo,
+    sources_repo,
+    subscriptions_repo,
+    valuation_repo,
+)
+from suv_deals.persistence.database import Conn, db_now, fetch_all, fetch_one
+from suv_deals.persistence.errors_map import mapped_errors
+from suv_deals.persistence.sources_repo import SourceRecord
+from suv_deals.persistence.transactions import retry_transient, unit_of_work
+from suv_deals.settings import Settings
+from suv_deals.workers.runtime import RuntimeContext, active_workspace_ids, build_runtime, system_actor
+
+logger = logging.getLogger(__name__)
+
+STALE_DETAIL_REASON: Final = "stale_detail_sweep"
+WATCH_RECHECK_REASON: Final = "watchlist_recheck"
+_NETWORK_BLOCKING: Final = frozenset(
+    {TechnicalStatus.UNTESTED, TechnicalStatus.ACCESS_BLOCKED, TechnicalStatus.PARSER_UNHEALTHY}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileOptions:
+    """Engineering defaults (PROPOSED; not provider- or owner-approved values)."""
+
+    job_retry_delay_seconds: int = 30
+    outbox_retry_delay_seconds: int = 30
+    reap_limit: int = 500
+    housekeeping_limit: int = 1000
+    claim_expiry_limit: int = 100
+    #: A listing's detail page is re-checked at most this often by the sweep (conservative daily).
+    stale_detail_age: timedelta = timedelta(hours=24)
+    stale_detail_candidates: int = 200
+    watch_recheck_limit: int = 100
+    stale_detail_priority: int = -10
+    watch_recheck_priority: int = 10
+    valuation_sweep_limit: int = 200
+    #: Reference FX pairs (EUR/<currency>) checked for newer observations.
+    fx_currencies: tuple[str, ...] = ("CHF", "MKD")
+    interval_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.stale_detail_age < timedelta(hours=1):
+            raise ValueError("stale_detail_age must be at least one hour")
+        if not 0 <= self.job_retry_delay_seconds <= 86_400:
+            raise ValueError("job_retry_delay_seconds must be between 0 and 86400")
+
+
+@dataclass(slots=True)
+class ReconcileReport:
+    """What one pass did (or, with ``dry_run``, would do) in one workspace."""
+
+    workspace_id: UUID
+    dry_run: bool
+    jobs_requeued: int = 0
+    jobs_dead_lettered: int = 0
+    jobs_exhausted: int = 0
+    events_retry: int = 0
+    events_uncertain: int = 0
+    events_dead_lettered: int = 0
+    deliveries_uncertain: int = 0
+    claims_expired: int = 0
+    crawl_runs_closed: int = 0
+    snapshots_deleted: int = 0
+    idempotency_deleted: int = 0
+    watch_rechecks: int = 0
+    stale_detail_jobs: int = 0
+    valuations_expired: int = 0
+    valuations_invalidated: int = 0
+    recompute_jobs: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name not in ("workspace_id", "errors")
+        } | {"workspace_id": str(self.workspace_id), "errors": list(self.errors)}
+
+
+class _DryRunRollback(Exception):
+    """Raised inside a dry-run transaction so everything it did is rolled back."""
+
+
+async def _step[T](
+    ctx: RuntimeContext,
+    actor: ActorContext,
+    operation: Callable[[Conn], Awaitable[T]],
+    *,
+    dry_run: bool,
+) -> T:
+    """One short transaction; rolled back in a dry run (the operation's result is still returned)."""
+    holder: list[T] = []
+
+    async def once() -> None:
+        holder.clear()
+        try:
+            async with unit_of_work(ctx.db, actor) as conn:
+                holder.append(await operation(conn))
+                if dry_run:
+                    raise _DryRunRollback
+        except _DryRunRollback:
+            pass
+
+    await retry_transient(once)
+    return holder[0]
+
+
+# --------------------------------------------------------------------------------------------
+# Read-only selections without a repository equivalent yet (see foundation change requests)
+# --------------------------------------------------------------------------------------------
+
+_STALE_DETAIL_SQL: Final = """
+select l.id, l.source_id
+  from app.listings l
+  join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
+ where l.workspace_id = %(ws)s
+   and s.role = 'acquisition' and s.detail_mode = 'fetch'
+   and not l.quarantined and not l.identity_conflict
+   and l.availability in ('available', 'reserved', 'unknown')
+   and coalesce(l.last_detail_success_at, l.first_seen_at) < now() - %(age)s::interval
+   and (l.eligibility_state in ('eligible_primary', 'eligible_manual_profile', 'needs_facts')
+        or exists (select 1 from app.review_cases c
+                    where c.workspace_id = l.workspace_id and c.listing_id = l.id
+                      and c.state in ('pending', 'claimed', 'needs_information', 'watch', 'shortlisted')))
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = l.workspace_id and j.listing_id = l.id
+                      and j.job_type in ('detail', 'recheck')
+                      and (j.state in ('queued', 'running', 'retry_wait')
+                           -- one refresh attempt per sweep age: a fetch that failed (dead letter,
+                           -- blocked, skipped) is not re-queued on every pass
+                           or j.created_at > now() - %(age)s::interval))
+ order by coalesce(l.last_detail_success_at, l.first_seen_at), l.id
+ limit %(limit)s
+"""
+
+_EXPIRED_VALUATIONS_SQL: Final = """
+select v.id from app.valuations v
+ where v.workspace_id = %(ws)s
+   and v.state in ('incomplete', 'estimated', 'quote_supported')
+   and v.expires_at is not null and v.expires_at <= now()
+ order by v.expires_at, v.id
+ limit %(limit)s
+"""
+
+_ORPHAN_RUNS_SQL: Final = """
+select r.id, j.state
+  from ops.crawl_runs r
+  join ops.jobs j on j.workspace_id = r.workspace_id and j.id = r.job_id
+ where r.workspace_id = %(ws)s
+   and r.outcome = 'running'
+   and j.state in ('succeeded', 'dead_letter', 'cancelled', 'blocked')
+ order by r.started_at, r.id
+ limit %(limit)s
+"""
+
+_EXPIRED_EVENT_LEASES_SQL: Final = """
+select
+  count(*) filter (where state = 'sending' and lease_expires_at <= clock_timestamp()
+                   and send_attempted_at is not null and send_attempted_at >= last_heartbeat_at)
+    as would_be_uncertain,
+  count(*) filter (where state = 'sending' and lease_expires_at <= clock_timestamp()
+                   and not (send_attempted_at is not null and send_attempted_at >= last_heartbeat_at))
+    as would_retry,
+  count(*) filter (where state in ('pending', 'retry_wait') and attempts >= max_attempts)
+    as exhausted
+  from ops.outbox where workspace_id = %(ws)s
+"""
+
+
+async def _stale_detail_candidates(
+    conn: Conn, actor: ActorContext, age: timedelta, limit: int
+) -> list[tuple[UUID, UUID]]:
+    actor.require(Scope.DEALS_READ)
+    async with mapped_errors():
+        rows = await fetch_all(
+            conn, _STALE_DETAIL_SQL, {"ws": actor.workspace_id, "age": age, "limit": limit}
+        )
+    return [(r["id"], r["source_id"]) for r in rows]
+
+
+async def _close_orphan_runs(conn: Conn, actor: ActorContext, limit: int) -> int:
+    """Close runs whose discovery job ended without finishing them (``cancelled``, gap recorded)."""
+    actor.require(Scope.DEALS_READ)
+    async with mapped_errors():
+        rows = await fetch_all(conn, _ORPHAN_RUNS_SQL, {"ws": actor.workspace_id, "limit": limit})
+    for row in rows:
+        await sources_repo.finish_crawl_run(
+            conn,
+            actor,
+            row["id"],
+            sources_repo.RunOutcome(
+                completeness="cancelled",
+                gap_reasons=(f"the discovery job ended ({row['state']}) before the run finished",),
+            ),
+        )
+    return len(rows)
+
+
+async def _expired_valuations(conn: Conn, actor: ActorContext, limit: int) -> list[UUID]:
+    actor.require(Scope.DEALS_READ)
+    async with mapped_errors():
+        rows = await fetch_all(conn, _EXPIRED_VALUATIONS_SQL, {"ws": actor.workspace_id, "limit": limit})
+    return [r["id"] for r in rows]
+
+
+# --------------------------------------------------------------------------------------------
+# Pass
+# --------------------------------------------------------------------------------------------
+
+
+class Reconciler:
+    def __init__(self, ctx: RuntimeContext, options: ReconcileOptions | None = None) -> None:
+        self.ctx = ctx
+        self.options = options or ReconcileOptions()
+
+    async def run_once(self, *, dry_run: bool = False) -> list[ReconcileReport]:
+        reports: list[ReconcileReport] = []
+        for workspace_id in await active_workspace_ids(self.ctx.db):
+            reports.append(await self.reconcile_workspace(workspace_id, dry_run=dry_run))
+        return reports
+
+    async def run(self, stop: anyio.Event) -> None:
+        while not stop.is_set():
+            try:
+                for report in await self.run_once():
+                    logger.info("reconciliation pass finished", extra={"summary": report.as_dict()})
+            except AppError as exc:
+                logger.warning("reconciliation pass failed", extra={"error_code": exc.code.value})
+            with anyio.move_on_after(self.options.interval_seconds):
+                await stop.wait()
+
+    async def reconcile_workspace(self, workspace_id: UUID, *, dry_run: bool = False) -> ReconcileReport:
+        actor = system_actor(workspace_id, "reconcile")
+        report = ReconcileReport(workspace_id=workspace_id, dry_run=dry_run)
+        steps: tuple[tuple[str, Callable[[ActorContext, ReconcileReport], Awaitable[None]]], ...] = (
+            ("reap", self._reap),
+            ("housekeeping", self._housekeeping),
+            ("watch_rechecks", self._watch_rechecks),
+            ("stale_detail", self._stale_detail),
+            ("valuations", self._valuations),
+            ("metrics", self._metrics),
+        )
+        for name, step in steps:
+            try:
+                await step(actor, report)
+            except AppError as exc:
+                # One failing step never stops the others (e.g. a lock timeout on a busy table).
+                report.errors.append(f"{name}:{exc.code.value}")
+                logger.warning(
+                    "reconciliation step failed", extra={"step": name, "error_code": exc.code.value}
+                )
+        return report
+
+    # ------------------------------------------------------------------ 1 reapers
+
+    async def _reap(self, actor: ActorContext, report: ReconcileReport) -> None:
+        db, ws, opts = self.ctx.db, actor.workspace_id, self.options
+        if report.dry_run:
+            async with unit_of_work(db, actor) as conn:
+                stats = await jobs.queue_stats(conn, actor)
+                async with mapped_errors():
+                    row = await fetch_one(conn, _EXPIRED_EVENT_LEASES_SQL, {"ws": ws})
+            assert row is not None
+            report.jobs_requeued = stats.expired_leases  # an upper bound: exhausted ones dead-letter
+            report.jobs_exhausted = stats.exhausted_waiting
+            report.events_uncertain = int(row["would_be_uncertain"])
+            report.events_retry = int(row["would_retry"])
+            report.events_dead_lettered = int(row["exhausted"])
+        else:
+            reaped = await jobs.reap_expired(
+                db, ws, retry_delay_seconds=opts.job_retry_delay_seconds, limit=opts.reap_limit
+            )
+            for job_type, count in reaped.expired_by_type.items():
+                for _ in range(count):
+                    self.ctx.metrics.record_lease_expiration(job_type)
+            for job_type, count in reaped.dead_lettered_by_type.items():
+                for _ in range(count):
+                    self.ctx.metrics.record_dead_letter(job_type)
+            report.jobs_requeued = len(reaped.requeued)
+            report.jobs_dead_lettered = len(reaped.dead_lettered)
+            report.jobs_exhausted = len(await jobs.reconcile_exhausted(db, ws, limit=opts.reap_limit))
+            events = await outbox.reap_expired_events(
+                db, ws, retry_delay_seconds=opts.outbox_retry_delay_seconds, limit=opts.reap_limit
+            )
+            report.events_retry = len(events.retry)
+            report.events_uncertain = len(events.uncertain)
+            report.events_dead_lettered = len(events.dead_letter) + len(events.exhausted)
+        deliveries = await _step(
+            self.ctx,
+            actor,
+            lambda c: subscriptions_repo.reap_expired_deliveries(c, actor, limit=opts.reap_limit),
+            dry_run=report.dry_run,
+        )
+        report.deliveries_uncertain = len(deliveries)
+
+    # ------------------------------------------------------------------ 2 housekeeping
+
+    async def _housekeeping(self, actor: ActorContext, report: ReconcileReport) -> None:
+        opts = self.options
+        claims = await _step(
+            self.ctx,
+            actor,
+            lambda c: reviews_repo.expire_claims(c, actor, limit=opts.claim_expiry_limit),
+            dry_run=report.dry_run,
+        )
+        report.claims_expired = len(claims)
+        report.snapshots_deleted = await _step(
+            self.ctx,
+            actor,
+            lambda c: query_snapshots.delete_expired(c, actor, limit=opts.housekeeping_limit),
+            dry_run=report.dry_run,
+        )
+        report.idempotency_deleted = await _step(
+            self.ctx,
+            actor,
+            lambda c: idempotency.delete_expired(c, actor, limit=opts.housekeeping_limit),
+            dry_run=report.dry_run,
+        )
+        report.crawl_runs_closed = await _step(
+            self.ctx,
+            actor,
+            lambda c: _close_orphan_runs(c, actor, opts.reap_limit),
+            dry_run=report.dry_run,
+        )
+
+    # ------------------------------------------------------------------ 3 stale-detail sweep
+
+    def _network_allowed(self, source: SourceRecord) -> bool:
+        if not source.enabled or source.paused or source.technical_status in _NETWORK_BLOCKING:
+            return False
+        if source.detail_mode != "fetch" or source.activation_problems():
+            return False
+        return source.mode == SourceMode.FIXTURE or self.ctx.settings.source_network_enabled
+
+    async def _sources(self, conn: Conn, actor: ActorContext, ids: set[UUID]) -> dict[UUID, SourceRecord]:
+        found: dict[UUID, SourceRecord] = {}
+        for source_id in sorted(ids, key=str):
+            try:
+                found[source_id] = await sources_repo.get_source_record(conn, actor, source_id)
+            except NotFound:
+                continue
+        return found
+
+    async def _watch_rechecks(self, actor: ActorContext, report: ReconcileReport) -> None:
+        opts = self.options
+
+        async def go(conn: Conn) -> int:
+            due = await notes_repo.due_watch_rechecks(conn, actor, limit=opts.watch_recheck_limit)
+            if not due:
+                return 0
+            listings = {w.listing_id: await listings_repo.get_listing(conn, actor, w.listing_id) for w in due}
+            sources = await self._sources(conn, actor, {listing.source_id for listing in listings.values()})
+            used: dict[UUID, int] = {}
+            queued = 0
+            for watch in due:
+                source = sources.get(listings[watch.listing_id].source_id)
+                if source is None or not self._network_allowed(source):
+                    continue  # stays due: rechecked once the source may make requests again
+                if used.get(source.id, 0) >= source.rate_budget().max_detail_jobs_per_run:
+                    continue  # budget for this pass used; the watch stays due for the next pass
+                ref = await listings_repo.request_detail_refresh(
+                    conn,
+                    actor,
+                    watch.listing_id,
+                    reason=WATCH_RECHECK_REASON,
+                    job_type=JobType.RECHECK,
+                    priority=opts.watch_recheck_priority,
+                )
+                await notes_repo.advance_watch_recheck(conn, actor, watch.id)
+                used[source.id] = used.get(source.id, 0) + 1
+                queued += int(ref is not None and ref.created)
+            return queued
+
+        report.watch_rechecks = await _step(self.ctx, actor, go, dry_run=report.dry_run)
+
+    async def _stale_detail(self, actor: ActorContext, report: ReconcileReport) -> None:
+        opts = self.options
+
+        async def go(conn: Conn) -> int:
+            candidates = await _stale_detail_candidates(
+                conn, actor, opts.stale_detail_age, opts.stale_detail_candidates
+            )
+            if not candidates:
+                return 0
+            sources = await self._sources(conn, actor, {source_id for _, source_id in candidates})
+            used: dict[UUID, int] = {}
+            queued = 0
+            for listing_id, source_id in candidates:
+                source = sources.get(source_id)
+                if source is None or not self._network_allowed(source):
+                    continue
+                if used.get(source_id, 0) >= source.rate_budget().max_detail_jobs_per_run:
+                    continue  # never more than one run's detail budget per source per pass
+                ref = await listings_repo.request_detail_refresh(
+                    conn,
+                    actor,
+                    listing_id,
+                    reason=STALE_DETAIL_REASON,
+                    job_type=JobType.DETAIL,
+                    priority=opts.stale_detail_priority,
+                )
+                if ref is not None and ref.created:
+                    used[source_id] = used.get(source_id, 0) + 1
+                    queued += 1
+            return queued
+
+        report.stale_detail_jobs = await _step(self.ctx, actor, go, dry_run=report.dry_run)
+
+    # ------------------------------------------------------------------ 4 valuation staleness
+
+    async def _valuations(self, actor: ActorContext, report: ReconcileReport) -> None:
+        opts = self.options
+
+        async def expired(conn: Conn) -> tuple[int, int]:
+            marked = jobs_queued = 0
+            for valuation_id in await _expired_valuations(conn, actor, opts.valuation_sweep_limit):
+                change = await valuation_repo.mark_stale(
+                    conn,
+                    actor,
+                    valuation_id,
+                    InvalidationReason.FRESHNESS_DEADLINE,
+                    detail="freshness deadline passed (FX age, quote expiry or comparable freshness)",
+                )
+                marked += int(change.changed)
+                jobs_queued += int(change.recompute_job_id is not None)
+            return marked, jobs_queued
+
+        marked, queued = await _step(self.ctx, actor, expired, dry_run=report.dry_run)
+        report.valuations_expired = marked
+
+        async def dependencies(conn: Conn) -> tuple[int, int]:
+            changes: list[valuation_repo.DependencyChange] = []
+            today = ensure_utc(await db_now(conn)).date()
+            for currency in opts.fx_currencies:
+                for base, quote in (("EUR", currency), (currency, "EUR")):
+                    # Real observations only: a fixture rate never invalidates real valuations.
+                    latest = await valuation_repo.latest_fx_rates(
+                        conn,
+                        actor,
+                        base=base,
+                        quote=quote,
+                        purpose=FxPurpose.REFERENCE,
+                        on_or_before=today,
+                        limit=1,
+                    )
+                    changes += [valuation_repo.DependencyChange.new_fx_rate(rate) for rate in latest]
+            try:
+                record, _config = await config_repo.current_config(conn, actor)
+            except NotFound:
+                record = None
+            if record is not None:
+                changes.append(
+                    valuation_repo.DependencyChange(
+                        reason=InvalidationReason.CONFIG,
+                        current_config_revision_id=record.id,
+                        detail="computed under an older business configuration",
+                    )
+                )
+            stale = created = 0
+            for change in changes:
+                result = await valuation_repo.invalidate_dependents(
+                    conn, actor, change, limit=opts.valuation_sweep_limit
+                )
+                stale += len(result.stale_valuation_ids)
+                created += result.jobs_created
+            return stale, created
+
+        invalidated, created = await _step(self.ctx, actor, dependencies, dry_run=report.dry_run)
+        report.valuations_invalidated = invalidated
+        report.recompute_jobs = queued + created
+
+    # ------------------------------------------------------------------ 5 metrics
+
+    async def _metrics(self, actor: ActorContext, report: ReconcileReport) -> None:
+        del report
+        async with unit_of_work(self.ctx.db, actor) as conn:
+            stats = await jobs.queue_stats(conn, actor)
+        self.ctx.metrics.set_queue_depth({key: count for key, count in stats.depth.items()})
+        for job_type, age in stats.oldest_due_age.items():
+            self.ctx.metrics.set_queue_oldest_age(job_type, age)
+
+
+async def run_reconciliation(
+    ctx: RuntimeContext, *, dry_run: bool = False, options: ReconcileOptions | None = None
+) -> list[ReconcileReport]:
+    """One pass over every active workspace (``suv-deals reconcile [--dry-run]``)."""
+    return await Reconciler(ctx, options).run_once(dry_run=dry_run)
+
+
+async def run_reconciler(
+    settings: Settings, *, stop: anyio.Event | None = None, options: ReconcileOptions | None = None
+) -> None:
+    """Process entry point: a pass every ``interval_seconds`` until SIGTERM/SIGINT."""
+    ctx = await build_runtime(settings, application_name="suv-deals-reconciler", configure_logs=True)
+    stop = stop or anyio.Event()
+    reconciler = Reconciler(ctx, options)
+    try:
+        async with anyio.create_task_group() as tg:
+
+            async def watch_signals() -> None:
+                with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
+                    async for _signum in signals:
+                        stop.set()
+                        return
+
+            async def work() -> None:
+                await reconciler.run(stop)
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(watch_signals)
+            tg.start_soon(work)
+    finally:
+        await ctx.aclose()
+
+
+__all__ = [
+    "STALE_DETAIL_REASON",
+    "WATCH_RECHECK_REASON",
+    "ReconcileOptions",
+    "ReconcileReport",
+    "Reconciler",
+    "run_reconciler",
+    "run_reconciliation",
+]

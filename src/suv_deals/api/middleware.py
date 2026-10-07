@@ -7,15 +7,21 @@ Order (outermost first; ``app.create_app`` builds it):
    at most 200 characters -- or a fresh ``req-<hex>``), echoed as ``X-Request-Id``; security
    headers on every response; ``Cache-Control: no-store`` on ``/api``, ``/healthz`` and ``/readyz``
    (other paths keep their own cache header); request metrics with route *templates* only; one
-   structured log line per request without query strings or headers; and the last-resort handler
-   that turns an unexpected exception into ``INTERNAL_ERROR`` without details.
+   structured log line per request without query strings or headers; and a backstop that turns
+   an exception escaping the outer layers into ``INTERNAL_ERROR`` without details.
 2. Starlette ``TrustedHostMiddleware`` (strict ``Host`` allow-list).
-3. `BodySizeLimitMiddleware`: ``Content-Length`` and streamed bytes are capped per path prefix
-   (``413``); a non-numeric or negative ``Content-Length`` is refused.
-4. `ApiCorsMiddleware`: Starlette ``CORSMiddleware`` for ``/api`` paths only, with the configured
-   origin allow-list (no wildcard), ``GET``/``POST``/``OPTIONS``, the four documented request
-   headers, no credentials (bearer tokens only, no cookies) and a 600 second preflight cache. The
-   mounted MCP endpoint handles its own origin checks.
+3. `ApiCorsMiddleware`: Starlette ``CORSMiddleware`` for ``/api`` paths only, with the configured
+   origin allow-list (no wildcard), ``GET``/``POST``/``OPTIONS``, the documented request headers
+   (``Authorization``, ``Content-Type``, ``Idempotency-Key``, ``X-Request-Id``,
+   ``X-Workspace-Id``), no credentials (bearer tokens only, no cookies), ``X-Request-Id`` and
+   ``Retry-After`` exposed to the dashboard, and a 600 second preflight cache. The mounted MCP
+   endpoint handles its own origin checks. Every layer below renders its errors INSIDE this one,
+   so an allowed dashboard origin can read 413 and 500 bodies (and their correlation ids) too.
+4. `InternalErrorMiddleware`: renders an unexpected exception as ``INTERNAL_ERROR`` without
+   details and logs it server-side (through the redacting JSON logger).
+5. `BodySizeLimitMiddleware`: ``Content-Length`` and streamed bytes are capped per path prefix
+   (``413``); a repeated, non-numeric (ASCII digits only) or negative ``Content-Length`` is
+   refused.
 
 `PrincipalRateLimiter` is an in-memory token bucket per authenticated principal, with separate
 buckets for mutations and reads. It is per process: N replicas allow N times the budget, and a
@@ -51,7 +57,13 @@ REQUEST_ID_HEADER: Final = "X-Request-Id"
 API_PREFIX: Final = "/api"
 OPERATIONAL_PATHS: Final = frozenset({"/healthz", "/readyz", "/metrics"})
 CORS_ALLOWED_METHODS: Final = ("GET", "POST", "OPTIONS")
-CORS_ALLOWED_HEADERS: Final = ("Authorization", "Content-Type", "X-Request-Id", "X-Workspace-Id")
+CORS_ALLOWED_HEADERS: Final = (
+    "Authorization",
+    "Content-Type",
+    "Idempotency-Key",
+    "X-Request-Id",
+    "X-Workspace-Id",
+)
 CORS_EXPOSED_HEADERS: Final = ("X-Request-Id", "Retry-After")
 CORS_MAX_AGE_SECONDS: Final = 600
 DEFAULT_API_BODY_LIMIT: Final = 64 * 1024
@@ -149,6 +161,7 @@ class RequestContextMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         except Exception:
+            # Backstop: normally `InternalErrorMiddleware` (inside the CORS layer) renders these.
             logger.exception("unhandled error while serving the request")
             if response_started[0]:
                 raise
@@ -180,12 +193,56 @@ class RequestContextMiddleware:
 
 
 # --------------------------------------------------------------------------------------------
-# Body size limits
+# Unexpected errors (inside the CORS layer)
 # --------------------------------------------------------------------------------------------
 
 
 class _BodyTooLarge(Exception):
-    pass
+    """Raised from `BodySizeLimitMiddleware`'s receive wrapper once the streamed body is too big."""
+
+
+class InternalErrorMiddleware:
+    """Renders an unexpected exception as ``INTERNAL_ERROR`` (no details, no traces) and logs it.
+
+    It sits inside `ApiCorsMiddleware`, so the dashboard can read the error body. An exception
+    raised after the response started cannot be rendered and propagates (the server closes the
+    connection); ``_BodyTooLarge`` belongs to `BodySizeLimitMiddleware` and is re-raised.
+    """
+
+    def __init__(self, app: ASGIApp, *, metrics: AppMetrics, clock: Clock) -> None:
+        self.app = app
+        self.metrics = metrics
+        self.clock = clock
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = [False]
+
+        async def tracking_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                started[0] = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except _BodyTooLarge:
+            raise
+        except Exception:
+            logger.exception("unhandled error while serving the request")
+            if started[0]:
+                raise
+            request_id = scope.get("state", {}).get("request_id")
+            response = error_response(
+                internal_error(), request_id=request_id, clock=self.clock, metrics=self.metrics
+            )
+            await response(scope, receive, send)
+
+
+# --------------------------------------------------------------------------------------------
+# Body size limits
+# --------------------------------------------------------------------------------------------
 
 
 class BodySizeLimitMiddleware:
@@ -232,7 +289,8 @@ class BodySizeLimitMiddleware:
         lengths = _header(scope, b"content-length")
         if lengths:
             text = lengths[0].decode("latin-1").strip()
-            if len(lengths) > 1 or not text.isdigit() or int(text) > limit:
+            # ASCII digits only: str.isdigit() also accepts e.g. "²", which int() refuses.
+            if len(lengths) > 1 or not (text.isascii() and text.isdigit()) or int(text) > limit:
                 await self._reject(scope, receive, send, limit)
                 return
         received = 0
@@ -370,6 +428,7 @@ __all__ = [
     "REQUEST_ID_HEADER",
     "ApiCorsMiddleware",
     "BodySizeLimitMiddleware",
+    "InternalErrorMiddleware",
     "PrincipalRateLimiter",
     "RateLimit",
     "RequestContextMiddleware",

@@ -1,0 +1,158 @@
+# =============================================================================
+# Production / VPS stack (spec sections 4, 24, 29, 30). Standalone file:
+#
+#   SUV_DEALS_IMAGE=<registry>/suv-deals@sha256:<release digest> \
+#   CRAWL4AI_IMAGE_DIGEST=sha256:<tested crawler digest> \
+#   docker compose -f compose.production.yaml up -d
+#
+# Deploy with every external switch OFF (the defaults below), smoke-test auth, data access and
+# queue processing, then enable only what passed its activation gate by exporting the switch
+# explicitly for that deployment (SOURCE_NETWORK_ENABLED=true, ALLOW_EXTERNAL_NOTIFICATIONS=true,
+# EVENT_BRIDGE_ENABLED=true, ...). An env file alone cannot enable them: "environment" wins.
+#
+# Secrets: each application process reads ONLY its own root-owned 0600 env file under
+# /etc/suv-deals/ (outside the repository; never baked into the image; see docs/runbook.md for
+# which variables each process needs). The crawler token is a Docker secret file, read natively
+# by Crawl4AI from /run/secrets/api_token. The crawler receives no database or Supabase keys.
+#
+# Network: only 127.0.0.1-bound ports; the host's reverse proxy terminates HTTPS for /api and
+# /mcp. The crawler is on an internal network shared only with the worker plus its own egress
+# network; add the host egress firewall rule from docs/runbook.md so the crawler cannot reach the
+# database endpoint or private ranges. No Docker socket, host home or privileged mode.
+# =============================================================================
+name: suv-deals
+
+x-app: &app
+  image: ${SUV_DEALS_IMAGE:?set SUV_DEALS_IMAGE to the released image digest (registry/suv-deals@sha256:...)}
+  environment: &prod-env
+    APP_ENV: production
+    CRAWL4AI_BASE_URL: http://crawl4ai:11235
+    DATABASE_SET_ROLE: suv_backend
+    SOURCE_NETWORK_ENABLED: ${SOURCE_NETWORK_ENABLED:-false}
+    ALLOW_EXTERNAL_NOTIFICATIONS: ${ALLOW_EXTERNAL_NOTIFICATIONS:-false}
+    EVENT_BRIDGE_ENABLED: ${EVENT_BRIDGE_ENABLED:-false}
+    MCP_EVENTS_ENABLED: ${MCP_EVENTS_ENABLED:-false}
+    NOTIFICATION_PROVIDER: ${NOTIFICATION_PROVIDER:-disabled}
+    LLM_EXTRACTION_ENABLED: "false"
+    FX_FETCH_ENABLED: ${FX_FETCH_ENABLED:-false}
+    SELLER_INQUIRY_MODE: ${SELLER_INQUIRY_MODE:-disabled_until_sender_ready}
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 60s
+  networks:
+    - app
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 512m
+        pids: 256
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "10"
+
+x-no-http-healthcheck: &no-http-healthcheck
+  healthcheck:
+    disable: true
+
+services:
+  api:
+    <<: *app
+    env_file:
+      - /etc/suv-deals/api.env
+    command:
+      - suv-deals
+      - api
+      - serve
+      - --host
+      - 0.0.0.0
+      - --allow-non-loopback
+      - --port
+      - "8000"
+      - --forwarded-allow-ips
+      - 172.31.0.1
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/worker.env
+    command: ["suv-deals", "worker", "--queues", "discovery,detail,recheck,valuation"]
+    networks:
+      - app
+      - crawler
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+          pids: 256
+
+  scheduler:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/scheduler.env
+    command: ["suv-deals", "scheduler"]
+
+  reconciler:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/scheduler.env
+    command: ["suv-deals", "reconcile", "--loop"]
+
+  dispatcher:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/dispatcher.env
+    command: ["suv-deals", "dispatcher"]
+
+  crawl4ai:
+    # Tag plus the TESTED digest; never "latest" (spec 4). Compose refuses to start without it.
+    image: unclecode/crawl4ai:0.9.4@${CRAWL4AI_IMAGE_DIGEST:?set CRAWL4AI_IMAGE_DIGEST=sha256:<tested digest>}
+    secrets:
+      - source: crawl4ai_api_token
+        target: api_token
+    shm_size: 1g
+    networks:
+      - crawler
+      - crawler_egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+          pids: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+secrets:
+  crawl4ai_api_token:
+    file: /etc/suv-deals/secrets/crawl4ai_api_token
+
+networks:
+  app:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1
+  crawler:
+    internal: true
+  crawler_egress: {}
