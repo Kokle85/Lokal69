@@ -9,15 +9,19 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
 import anyio
 import pytest
 from tests.integration.pipeline.support import PipelineEnv, run
 
+from suv_deals.crawling.policy_client import BudgetRefused
+from suv_deals.crawling.rate_limits import Deny, DenyReason, Wait, WaitReason
 from suv_deals.domain.enums import JobState, JobType
 from suv_deals.errors import DependencyUnavailable, SourcePaused, ValidationFailed, VersionConflict
 from suv_deals.persistence import jobs
 from suv_deals.persistence.database import Conn
+from suv_deals.persistence.errors_map import LeaseLost
 from suv_deals.persistence.transactions import job_unit_of_work
 from suv_deals.workers.handlers import HandlerRegistry, default_registry
 from suv_deals.workers.runner import Worker
@@ -102,6 +106,92 @@ async def test_escaping_errors_map_to_typed_outcomes(
     row = job_row(env, job_id)
     assert row["state"] == state
     assert (row["blocker_code"] if state == "blocked" else row["last_error_code"]) == code
+
+
+@pytest.mark.parametrize(
+    ("decision", "code"),
+    [
+        (Deny(reason=DenyReason.RUN_CAP_REACHED), "RUN_CAP_REACHED"),
+        (
+            Deny(reason=DenyReason.BUDGET_EXHAUSTED, until=datetime(2099, 1, 1, tzinfo=UTC)),
+            "DAILY_BUDGET_EXHAUSTED",
+        ),
+        (Deny(reason=DenyReason.CIRCUIT_OPEN, until=datetime(2099, 1, 1, tzinfo=UTC)), "CIRCUIT_OPEN"),
+        (
+            Wait(reason=WaitReason.RETRY_AFTER, until=datetime(2099, 1, 1, tzinfo=UTC)),
+            "BUDGET_WAIT_RETRY_AFTER",
+        ),
+    ],
+)
+async def test_budget_refusals_release_the_job_without_consuming_an_attempt(
+    env: PipelineEnv, decision: Deny | Wait, code: str
+) -> None:
+    """Nothing was fetched: the job goes back to ``queued`` with its attempts unchanged, at the
+    gate's time, audited; repeated refusals can never exhaust it into a dead letter."""
+
+    async def refused(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
+        del ctx
+        raise BudgetRefused(decision, now=datetime.now(UTC) - timedelta(seconds=1))
+
+    job_id = await enqueue(env, max_attempts=1)
+    started = datetime.now(UTC)
+    [report] = await worker(env, registry_with(refused)).run_until_idle()
+    assert report.state == JobState.QUEUED and report.code == code
+    [row] = env.rows(
+        "select state, attempts, last_error_code, available_at, lease_token from ops.jobs where id = %s",
+        job_id,
+    )
+    assert row["state"] == "queued" and row["attempts"] == 0 and row["last_error_code"] == code
+    assert row["lease_token"] is None and row["available_at"] >= started
+    audited = env.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s and action = 'job.release'"
+        " and target_id = %s",
+        env.workspace_id,
+        job_id,
+    )
+    assert audited == 1
+    # Another refusal of the same (single-attempt) job still does not dead-letter it.
+    env.seed.conn.execute(
+        "update ops.jobs set available_at = now() - interval '1 second' where id = %s", (job_id,)
+    )
+    [again] = await worker(env, registry_with(refused)).run_until_idle()
+    assert again.state == JobState.QUEUED
+    assert job_row(env, job_id)["attempts"] == 0 and job_row(env, job_id)["state"] == "queued"
+
+
+async def test_an_access_blocked_host_still_blocks_the_job(env: PipelineEnv) -> None:
+    async def blocked(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
+        del ctx
+        raise BudgetRefused(Deny(reason=DenyReason.ACCESS_BLOCKED), now=datetime.now(UTC))
+
+    job_id = await enqueue(env)
+    [report] = await worker(env, registry_with(blocked)).run_until_idle()
+    assert report.state == JobState.BLOCKED and report.code == "host_access_blocked"
+    row = job_row(env, job_id)
+    assert row["state"] == "blocked" and row["blocker_code"] == "host_access_blocked"
+
+
+async def test_release_is_fenced_by_the_lease(env: PipelineEnv) -> None:
+    job_id = await enqueue(env)
+    claimed = await jobs.claim(env.ctx.db, env.workspace_id, "worker-release", [JobType.VALUATION], 30)
+    assert claimed is not None and claimed.id == job_id and claimed.attempts == 1
+    with pytest.raises(ValidationFailed):
+        async with job_unit_of_work(env.ctx.db, claimed) as (conn, _locked):
+            await jobs.release(conn, claimed, available_at=timedelta(seconds=-1), code="SYNTHETIC")
+    stolen = claimed.model_copy(update={"lease_token": uuid.uuid4()})
+    with pytest.raises(LeaseLost):
+        async with job_unit_of_work(env.ctx.db, claimed) as (conn, _locked):
+            await jobs.release(conn, stolen, available_at=timedelta(minutes=5), code="SYNTHETIC_REFUSAL")
+    assert job_row(env, job_id)["state"] == "running"
+    async with job_unit_of_work(env.ctx.db, claimed) as (conn, _locked):
+        released = await jobs.release(
+            conn, claimed, available_at=timedelta(minutes=5), code="SYNTHETIC_REFUSAL"
+        )
+    assert released.state == JobState.QUEUED and released.attempts == 0 and released.lease_token is None
+    row = job_row(env, job_id)
+    assert row["state"] == "queued" and row["attempts"] == 0 and row["last_error_code"] == "SYNTHETIC_REFUSAL"
+    # The released job is a normal waiting job again: due later, claimable with a fresh token.
+    assert await jobs.claim(env.ctx.db, env.workspace_id, "worker-release", [JobType.VALUATION], 30) is None
 
 
 async def test_heartbeat_detects_a_lost_lease_and_cancels_the_handler(env: PipelineEnv) -> None:

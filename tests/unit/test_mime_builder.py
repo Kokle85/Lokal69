@@ -143,7 +143,9 @@ def test_built_message_matches_rendered_template_and_passes_scope(template_id: s
     assert envelope.to == (SELLER,)
     assert envelope.cc == () and envelope.bcc == () and envelope.attachments == ()
     assert envelope.extra_headers["Content-Type"] == CONTENT_TYPE_VALUE
-    assert INQUIRY_REF_HEADER not in envelope.extra_headers  # technical header, validated here
+    # The technical correlation header is part of the validated envelope (allow-listed by
+    # seller_templates with the exact inquiry-<uuid> shape), not a builder-private exception.
+    assert envelope.extra_headers[INQUIRY_REF_HEADER] == inquiry_ref_value(INQUIRY_ID)
 
 
 def test_bytes_are_deterministic_and_hash_identifies_them() -> None:

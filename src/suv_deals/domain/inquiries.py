@@ -1189,6 +1189,7 @@ class ReadinessCode(StrEnum):
     SUPPRESSED_KILL_SWITCH = "SUPPRESSED_KILL_SWITCH"
     SUPPRESSED_CONTRADICTORY_AVAILABILITY = "SUPPRESSED_CONTRADICTORY_AVAILABILITY"
     SUPPRESSED_MANUAL = "SUPPRESSED_MANUAL"
+    SUPPRESSED_AUTHORIZATION_REVOKED = "SUPPRESSED_AUTHORIZATION_REVOKED"
 
 
 class ReadinessReason(BaseModel):
@@ -2334,7 +2335,7 @@ def dispatch_preflight(facts: DispatchFacts) -> PreflightDecision:
     # -- suppression ------------------------------------------------------------------------
     auth_problems = facts.authorization.problems_at(now)
     if "AUTHORIZATION_REVOKED" in auth_problems:
-        suppress.append((SuppressionReason.KILL_SWITCH, "AUTHORIZATION_REVOKED"))
+        suppress.append((SuppressionReason.AUTHORIZATION_REVOKED, "AUTHORIZATION_REVOKED"))
     if facts.sender.kill_switch:
         suppress.append((SuppressionReason.KILL_SWITCH, "KILL_SWITCH_ACTIVE"))
     src = facts.source

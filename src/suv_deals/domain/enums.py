@@ -280,6 +280,15 @@ class JobType(StrEnum):
     COMPARABLES = "comparables"
     STALE_SWEEP = "stale_sweep"
     REPROCESS = "reprocess"
+    # Spec v1.1 section 37 runtime (ops.jobs ``jobs_type_ck``, migration 20261007000100).
+    #: Evaluate inquiry readiness and reserve (quota debit + binding) under the guards.
+    SELLER_INQUIRY_PLAN = "seller_inquiry_plan"
+    #: Server-side provider send, or publication of an ``outlook_local`` send intent.
+    SELLER_INQUIRY_SEND = "seller_inquiry_send"
+    #: Reconcile an uncertain send with positive evidence only (never a blind resend).
+    SELLER_INQUIRY_RECONCILE = "seller_inquiry_reconcile"
+    #: Process a stored reply: claims, evidence, availability events, valuation invalidation.
+    SELLER_REPLY_PROCESS = "seller_reply_process"
 
 
 class OutboxState(StrEnum):
@@ -435,6 +444,8 @@ class SuppressionReason(StrEnum):
     KILL_SWITCH = "kill_switch"
     CONTRADICTORY_AVAILABILITY = "contradictory_availability"
     MANUAL = "manual"
+    #: The owner revoked the standing authorization (spec 37.1); distinct from the kill switch.
+    AUTHORIZATION_REVOKED = "authorization_revoked"
 
 
 class EmailProviderKind(StrEnum):
@@ -467,6 +478,10 @@ class AvailabilityEvidenceKind(StrEnum):
     SOURCE_OBSERVATION = "source_observation"
     SOURCE_SOLD_BADGE = "source_sold_badge"
     SOURCE_REMOVED_PAGE = "source_removed_page"
+    #: An explicit "reserved" badge on the source page -> ``reserved``.
+    SOURCE_RESERVED_BADGE = "source_reserved_badge"
+    #: A 404/not-found detail page from a healthy source -> ``unknown`` (never removed or sold).
+    SOURCE_DETAIL_NOT_FOUND = "source_detail_not_found"
     SELLER_REPORTED_SOLD = "seller_reported_sold"
     SELLER_REPORTED_AVAILABLE = "seller_reported_available"
     SELLER_REPORTED_RESERVED = "seller_reported_reserved"

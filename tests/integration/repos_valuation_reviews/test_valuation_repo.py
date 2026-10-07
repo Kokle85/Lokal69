@@ -19,6 +19,7 @@ from tests.integration.repos_valuation_reviews.builders import (
     add_revision,
     complete_valuation,
     cost_profile,
+    incomplete_valuation,
     make_listing,
     mkd_rate,
     owner,
@@ -547,3 +548,61 @@ async def test_cost_evidence_keeps_hash_and_supersede_invalidates(db: Database, 
             obtained_at=T0,
             scope=CostScope(),
         )
+
+
+async def test_persist_with_the_revision_guard_refuses_a_superseded_revision(
+    db: Database, seed: Seed, world: RealWorld
+) -> None:
+    """``require_current_revision``: a calculation that cites a revision which is no longer the
+    listing's current one returns a typed `SupersededRevision` and stores nothing."""
+    sys_actor = system(world.workspace_id)
+    valuation = incomplete_valuation(world)
+    refs = valuation_repo.ValuationRefs(
+        listing_id=world.listing_id, config_revision_id=world.config_revision_id
+    )
+    inputs = valuation_repo.ValuationInputs()
+    stored = await run(
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(
+            c, sys_actor, valuation, refs, inputs, require_current_revision=True
+        ),
+    )
+    assert isinstance(stored, valuation_repo.StoredValuation)
+    newer = add_revision(seed, world.workspace_id, world.listing_id, 2, make="Example", model="Trail")
+    count = "select count(*) from app.valuations where workspace_id = %s and listing_id = %s"
+    before = seed.scalar(count, (world.workspace_id, world.listing_id))
+    late = await run(
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(
+            c, sys_actor, valuation, refs, inputs, require_current_revision=True
+        ),
+    )
+    assert isinstance(late, valuation_repo.SupersededRevision)
+    assert (late.listing_id, late.cited_revision_id, late.current_revision_id) == (
+        world.listing_id,
+        world.revision_id,
+        newer,
+    )
+    assert seed.scalar(count, (world.workspace_id, world.listing_id)) == before
+    # The lock-and-check helper answers the same question (None: still current).
+    assert (
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.lock_current_revision(c, sys_actor, world.listing_id, newer),
+        )
+        is None
+    )
+    with pytest.raises(NotFound):
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.lock_current_revision(c, sys_actor, uuid.uuid4(), newer),
+        )
+    # Without the guard the repository keeps its old contract (the caller decides).
+    unguarded = await run(
+        db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, valuation, refs, inputs)
+    )
+    assert unguarded.listing_revision_id == world.revision_id

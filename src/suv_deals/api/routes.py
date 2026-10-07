@@ -23,18 +23,19 @@ whose ``reason_codes`` include ``needs_inspection``, ``needs_documents`` or
 ``price_confirmation_needed`` (the ``domain.due_diligence.DashboardAction`` values) and whose
 ``missing_information`` lists the open items. `dashboard_action_request` builds that body. These
 reason codes (in any case or separator spelling) are refused with any other outcome, so an action
-can never shortlist, watch or reject a case by accident.
+can never shortlist, watch or reject a case by accident: the rule is
+``domain.reviews.check_dashboard_action_outcome``, applied here before the transaction and again
+by ``reviews_repo.submit`` on every submit path (MCP included).
 
-Recheck (``POST /api/listings/{listing_id}/recheck``) queues a budget-controlled ``recheck`` job
-for a registered listing only (the stored canonical URL; the request carries no URL). A paused,
-disabled or parser-unhealthy source is ``SOURCE_PAUSED``; an access-blocked source is
-``ACCESS_BLOCKED``; a detail job already waiting for the listing is returned as
-``deduplicated: true``.
+Recheck (``POST /api/listings/{listing_id}/recheck``) is ``listings_repo.request_recheck`` (shared
+with the MCP ``deals_request_recheck`` tool): a budget-controlled ``recheck`` job for a registered
+listing only (the stored canonical URL; the request carries no URL). A paused, disabled or
+parser-unhealthy source is ``SOURCE_PAUSED``; an access-blocked source is ``ACCESS_BLOCKED``; a
+detail job already waiting for the listing is returned as ``deduplicated: true``.
 """
 
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any, Final, cast
@@ -81,23 +82,14 @@ from suv_deals.api.schemas import (
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.due_diligence import DashboardAction
-from suv_deals.domain.enums import JobState, JobType, ReviewOutcome, Scope, TechnicalStatus
-from suv_deals.errors import AccessBlocked, AppError, ErrorCode, SourcePaused, ValidationFailed
-from suv_deals.mcp.schemas import DealsRequestRecheckInput, ReviewsSubmitInput
-from suv_deals.persistence import (
-    audit,
-    idempotency,
-    jobs,
-    listings_repo,
-    notes_repo,
-    queries,
-    reviews_repo,
-    sources_repo,
-)
-from suv_deals.persistence.database import Conn, db_now, fetch_one
+from suv_deals.domain.enums import ReviewOutcome, Scope
+from suv_deals.domain.reviews import DASHBOARD_ACTION_CODES, check_dashboard_action_outcome
+from suv_deals.errors import AppError, ErrorCode
+from suv_deals.mcp.schemas import ReviewsSubmitInput
+from suv_deals.persistence import listings_repo, notes_repo, queries, reviews_repo, sources_repo
+from suv_deals.persistence.database import Conn, db_now
 from suv_deals.persistence.errors_map import mapped_errors
 from suv_deals.persistence.queries.operations import SCHEMA_MARKERS, build_info, schema_markers_present
-from suv_deals.persistence.transactions import lock_source
 from suv_deals.views.common import ResponseEnvelope, ResponseWarning, WarningCode, envelope, warning
 from suv_deals.views.notes import RecheckRequestResult
 from suv_deals.views.operations import (
@@ -111,8 +103,8 @@ from suv_deals.views.operations import (
 
 router = APIRouter()
 
-RECHECK_OPERATION: Final = "deals_request_recheck"
-DASHBOARD_ACTION_REASON_CODES: Final = frozenset(action.value for action in DashboardAction)
+RECHECK_OPERATION: Final = listings_repo.RECHECK_OPERATION
+DASHBOARD_ACTION_REASON_CODES: Final = DASHBOARD_ACTION_CODES
 DASHBOARD_ACTION_SUMMARIES: Final[dict[DashboardAction, str]] = {
     DashboardAction.NEEDS_INSPECTION: (
         "Needs inspection: an independent physical inspection is required before any decision."
@@ -126,14 +118,6 @@ DASHBOARD_ACTION_SUMMARIES: Final[dict[DashboardAction, str]] = {
 }
 READINESS_TIMEOUT_SECONDS: Final = 3.0
 _MAX_MEMBERSHIPS: Final = 50
-_CODE_SEPARATORS: Final = re.compile(r"[-.:]")
-
-_WAITING_JOB_SQL: Final = (
-    "select id, state, available_at from ops.jobs"
-    " where workspace_id = %(ws)s and listing_id = %(listing_id)s"
-    " and job_type in ('detail', 'recheck') and state in ('queued', 'retry_wait')"
-    " order by created_at, id limit 1"
-)
 
 
 def _route(key: str) -> ApiRoute:
@@ -458,24 +442,14 @@ async def post_release(request: Request, case_id: str, auth: Authenticated) -> R
     return _respond(RELEASE, _mutation_envelope(view, auth, as_of))
 
 
-def _action_code(code: str) -> str:
-    """Reason codes compared as the dashboard action they spell (``NEEDS-DOCUMENTS`` included)."""
-    return _CODE_SEPARATORS.sub("_", code.lower())
-
-
 def check_dashboard_actions(tool: ReviewsSubmitInput) -> None:
     """Spec 19 dashboard actions are ``needs_information`` decisions only (module docstring).
 
-    The codes are matched case- and separator-insensitively, so a variant spelling such as
-    ``NEEDS_INSPECTION`` or ``needs-documents`` cannot attach an action to another outcome.
+    Delegates to ``domain.reviews.check_dashboard_action_outcome``: the codes are matched case-
+    and separator-insensitively, so a variant spelling such as ``NEEDS_INSPECTION`` or
+    ``needs-documents`` cannot attach an action to another outcome.
     """
-    if tool.outcome != ReviewOutcome.NEEDS_INFORMATION and any(
-        _action_code(code) in DASHBOARD_ACTION_REASON_CODES for code in tool.reason_codes
-    ):
-        raise ValidationFailed(
-            "Inspection, document and price-confirmation actions are needs_information decisions",
-            details={"fields": ["outcome", "reason_codes"]},
-        )
+    check_dashboard_action_outcome(tool.outcome, tool.reason_codes)
 
 
 def dashboard_action_request(
@@ -550,69 +524,6 @@ async def post_note(request: Request, listing_id: str, auth: Authenticated) -> R
     return _respond(NOTES, _mutation_envelope(view, auth, as_of))
 
 
-async def request_recheck(
-    conn: Conn, actor: ActorContext, tool: DealsRequestRecheckInput
-) -> RecheckRequestResult:
-    """``deals_request_recheck`` in the caller's transaction (see module docstring).
-
-    Lock order: idempotency record -> ``app.sources`` (share) -> ``app.listings`` -> new job row ->
-    audit (insert-only, last).
-    """
-    actor.require(Scope.RECHECKS_REQUEST)
-    request_hash = idempotency.request_hash_for(RECHECK_OPERATION, tool)
-    replay = await reviews_repo.begin_idempotent(
-        conn, actor, RECHECK_OPERATION, tool.idempotency_key, request_hash
-    )
-    if replay is not None:
-        return RecheckRequestResult.model_validate(replay)
-    listing = await listings_repo.get_listing(conn, actor, tool.listing_id)
-    source = await lock_source(conn, actor.workspace_id, listing.source_id, for_network=False)
-    if source.technical_status == TechnicalStatus.ACCESS_BLOCKED:
-        raise AccessBlocked()
-    if not source.enabled or source.paused or source.technical_status == TechnicalStatus.PARSER_UNHEALTHY:
-        raise SourcePaused()
-    ref = await listings_repo.request_detail_refresh(
-        conn, actor, tool.listing_id, reason=f"recheck: {tool.reason}", job_type=JobType.RECHECK
-    )
-    if ref is not None:
-        job = await jobs.get_job(conn, actor, ref.job_id)
-        result = RecheckRequestResult(
-            job_id=job.id,
-            listing_id=tool.listing_id,
-            state=job.state,
-            deduplicated=not ref.created,
-            available_at=job.available_at,
-        )
-    else:
-        async with mapped_errors():
-            waiting = await fetch_one(
-                conn, _WAITING_JOB_SQL, {"ws": actor.workspace_id, "listing_id": tool.listing_id}
-            )
-        if waiting is None:  # pragma: no cover - request_detail_refresh only dedupes a waiting job
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The waiting recheck could not be read", retryable=True)
-        result = RecheckRequestResult(
-            job_id=waiting["id"],
-            listing_id=tool.listing_id,
-            state=JobState(waiting["state"]),
-            deduplicated=True,
-            available_at=ensure_utc(waiting["available_at"]),
-        )
-    async with mapped_errors():
-        await audit.record(
-            conn,
-            actor,
-            "recheck.request",
-            "listing",
-            tool.listing_id,
-            reason=tool.reason,
-            metadata={"job_id": str(result.job_id), "deduplicated": result.deduplicated},
-        )
-    await idempotency.complete(
-        conn, actor, RECHECK_OPERATION, tool.idempotency_key, result.model_dump(mode="json")
-    )
-    return result
-
-
 @router.post("/api/listings/{listing_id}/recheck")
 async def post_recheck(request: Request, listing_id: str, auth: Authenticated) -> Response:
     require_scope(request, auth, RECHECK.scope)
@@ -623,7 +534,7 @@ async def post_recheck(request: Request, listing_id: str, auth: Authenticated) -
     tool = body.to_tool_input(target)
 
     async def work(conn: Conn, actor: ActorContext) -> tuple[RecheckRequestResult, datetime]:
-        result = await request_recheck(conn, actor, tool)
+        result = await listings_repo.request_recheck(conn, actor, tool)
         return result, await _now(conn)
 
     view, as_of = await _read(request, auth, work)
@@ -762,6 +673,5 @@ __all__ = [
     "install_api_fallback",
     "json_response",
     "readiness_view",
-    "request_recheck",
     "router",
 ]

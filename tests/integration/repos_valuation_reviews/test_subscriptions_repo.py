@@ -408,3 +408,48 @@ async def test_revocation_and_workspace_isolation(
     assert same.revoked_at == revoked.revoked_at  # idempotent
     with pytest.raises(VersionConflict):  # a revoked subscription is not re-verified
         await verify(db, actor, box, sub.id, secret)
+
+
+async def test_claims_can_be_restricted_to_events_and_refused_deliveries_are_cancelled_truthfully(
+    db: Database, seed: Seed, world: RealWorld, box: SecretBox
+) -> None:
+    """``claim_due_deliveries(event_ids=...)`` leases only those events' deliveries (the
+    dispatcher's held event), and ``cancel_delivery`` records the guard's own reason, fenced."""
+    actor = member_actor(seed, world.workspace_id)
+    secret = new_secret()
+    sub = (await subscribe(db, actor, box, secret)).record
+    await verify(db, actor, box, sub.id, secret)
+    sys_actor = system(world.workspace_id)
+    events = [await new_event(db, seed, world) for _ in range(3)]
+
+    async def create(conn: Conn) -> None:
+        for event in events:
+            await subs.create_deliveries(conn, sys_actor, event, [sub.id])
+
+    await run(db, sys_actor, create)
+    assert (
+        await run(db, sys_actor, lambda c: subs.claim_due_deliveries(c, sys_actor, "d-1", event_ids=[])) == []
+    )
+    only = await run(
+        db,
+        sys_actor,
+        lambda c: subs.claim_due_deliveries(c, sys_actor, "d-1", event_ids=[events[2]], limit=10),
+    )
+    assert [d.event_id for d in only] == [events[2]]
+    rest = await run(db, sys_actor, lambda c: subs.claim_due_deliveries(c, sys_actor, "d-2", limit=10))
+    assert {d.event_id for d in rest} == {events[0], events[1]}
+    [held] = only
+    stolen = held.model_copy(update={"lease_token": UUID(int=7)})
+    with pytest.raises(LeaseLost):
+        await run(db, sys_actor, lambda c: subs.cancel_delivery(c, sys_actor, stolen, "STALE_CASE_VERSION"))
+    with pytest.raises(ValidationFailed):
+        await run(db, sys_actor, lambda c: subs.cancel_delivery(c, sys_actor, held, "not a code!"))
+    cancelled = await run(
+        db, sys_actor, lambda c: subs.cancel_delivery(c, sys_actor, held, "STALE_CASE_VERSION")
+    )
+    assert cancelled.state == "cancelled" and cancelled.safe_error == "STALE_CASE_VERSION"
+    assert cancelled.lease_token is None and cancelled.attempts == 1
+    with pytest.raises(LeaseLost):  # the lease is gone: a second cancel (or outcome) cannot apply
+        await run(db, sys_actor, lambda c: subs.cancel_delivery(c, sys_actor, held, "NO_ACTIVE_ROUTE"))
+    with pytest.raises(Forbidden):
+        await run(db, actor, lambda c: subs.cancel_delivery(c, actor, rest[0], "NO_ACTIVE_ROUTE"))

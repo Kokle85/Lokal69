@@ -422,7 +422,14 @@ class Reconciler:
         opts = self.options
 
         async def go(conn: Conn) -> int:
-            due = await notes_repo.due_watch_rechecks(conn, actor, limit=opts.watch_recheck_limit)
+            # Only watches on sources this process may fetch from now fill the window: a large
+            # backlog on a paused, blocked or disabled source never starves the others.
+            eligible = await self._sweep_sources(conn, actor)
+            if not eligible:
+                return 0
+            due = await notes_repo.due_watch_rechecks(
+                conn, actor, limit=opts.watch_recheck_limit, source_ids=[s.id for s in eligible]
+            )
             if not due:
                 return 0
             listings = {w.listing_id: await listings_repo.get_listing(conn, actor, w.listing_id) for w in due}

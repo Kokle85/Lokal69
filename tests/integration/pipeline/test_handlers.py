@@ -383,11 +383,11 @@ async def test_a_concurrent_change_before_the_valuation_commit_is_retried_not_dr
     real_persist = valuation_repo.persist_valuation
     conflicts: list[Any] = []
 
-    async def conflicting(conn: Any, actor: Any, valuation: Any, refs: Any, inputs: Any) -> Any:
+    async def conflicting(conn: Any, actor: Any, valuation: Any, refs: Any, inputs: Any, **kw: Any) -> Any:
         if refs.listing_id == eligible and not conflicts:
             conflicts.append(refs.listing_id)
             raise VersionConflict("The cost profile changed since the calculation; recompute")
-        return await real_persist(conn, actor, valuation, refs, inputs)
+        return await real_persist(conn, actor, valuation, refs, inputs, **kw)
 
     monkeypatch.setattr(valuation_repo, "persist_valuation", conflicting)
     first = await worker(env, "worker-value", JobType.VALUATION).run_until_idle()
@@ -399,3 +399,170 @@ async def test_a_concurrent_change_before_the_valuation_commit_is_retried_not_dr
     [again] = await worker(env, "worker-value-2", JobType.VALUATION).run_until_idle()
     assert (again.job_id, again.state, again.attempt) == (conflicted.job_id, JobState.SUCCEEDED, 2)
     assert env.scalar(cases, env.workspace_id, eligible) == 1
+
+
+async def test_budget_refusals_release_discovery_and_detail_jobs_without_consuming_attempts(
+    env: PipelineEnv,
+) -> None:
+    """A host that is in its Retry-After window refuses every request before anything is fetched:
+    discovery and detail jobs go back to ``queued`` at the gate's time with their attempts
+    unchanged (never toward a dead letter), audited as ``job.release``."""
+    await tick(env)
+    [first] = await worker(env, "worker-budget-discovery", JobType.DISCOVERY).run_until_idle()
+    assert first.state == JobState.SUCCEEDED
+    detail_jobs = env.rows(
+        "select id from ops.jobs where workspace_id = %s and job_type = 'detail' and state = 'queued'",
+        env.workspace_id,
+    )
+    assert detail_jobs
+    env.seed.conn.execute(
+        "update ops.host_budgets set retry_after_until = now() + interval '10 minutes'"
+        " where workspace_id = %s and host = 'dealer.example'",
+        (env.workspace_id,),
+    )
+    until = env.scalar(
+        "select retry_after_until from ops.host_budgets where workspace_id = %s and host = 'dealer.example'",
+        env.workspace_id,
+    )
+    reports = await worker(env, "worker-budget-detail", JobType.DETAIL).run_until_idle()
+    assert reports and len(reports) == len(detail_jobs)
+    assert {(r.state, r.code) for r in reports} == {(JobState.QUEUED, "BUDGET_WAIT_RETRY_AFTER")}
+    rows = env.rows(
+        "select state, attempts, last_error_code, available_at from ops.jobs"
+        " where workspace_id = %s and job_type = 'detail'",
+        env.workspace_id,
+    )
+    assert all(r["state"] == "queued" and r["attempts"] == 0 for r in rows)
+    assert all(r["available_at"] >= until for r in rows)  # Retry-After is never shortened
+    profile_id = env.profiles["primary"]
+
+    async def enqueue(conn: Conn) -> None:
+        await jobs.enqueue(
+            conn,
+            env.system,
+            jobs.JobSpec(
+                job_type=JobType.DISCOVERY,
+                dedup_key="discovery:budget-refused",
+                source_id=env.source_id,
+                profile_id=profile_id,
+                partition_key="default",
+                max_attempts=1,
+            ),
+        )
+
+    await run(env.ctx, env.system, enqueue)
+    [refused] = await worker(env, "worker-budget-discovery-2", JobType.DISCOVERY).run_until_idle()
+    assert refused.state == JobState.QUEUED and refused.code == "BUDGET_WAIT_RETRY_AFTER"
+    [job] = env.rows(
+        "select state, attempts, available_at from ops.jobs where workspace_id = %s and dedup_key = %s",
+        env.workspace_id,
+        "discovery:budget-refused",
+    )
+    assert job["state"] == "queued" and job["attempts"] == 0 and job["available_at"] >= until
+    runs = env.rows(
+        "select r.outcome from ops.crawl_runs r join ops.jobs j on j.workspace_id = r.workspace_id"
+        " and j.id = r.job_id where r.workspace_id = %s and j.dedup_key = %s",
+        env.workspace_id,
+        "discovery:budget-refused",
+    )
+    assert runs == [{"outcome": "cancelled"}]  # the refused run is closed with its gap recorded
+    released = env.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s and action = 'job.release'",
+        env.workspace_id,
+    )
+    assert released == len(detail_jobs) + 1
+
+
+async def test_a_payload_page_cap_holds_for_any_worker(env: PipelineEnv) -> None:
+    """``payload.max_pages`` lowers the source budget for whichever worker claims the job."""
+    profile_id = env.profiles["primary"]
+
+    async def enqueue(conn: Conn) -> None:
+        await jobs.enqueue(
+            conn,
+            env.system,
+            jobs.JobSpec(
+                job_type=JobType.DISCOVERY,
+                dedup_key="discovery:capped",
+                source_id=env.source_id,
+                profile_id=profile_id,
+                partition_key="default",
+                payload={"max_pages": 1},
+            ),
+        )
+
+    await run(env.ctx, env.system, enqueue)
+    [report] = await worker(env, "worker-capped", JobType.DISCOVERY).run_until_idle()
+    assert report.state == JobState.SUCCEEDED
+    assert report.details["completeness"] == "budget_limited" and report.details["pages"] == 1
+    # Without the cap the same source traverses more than one page.
+    assert await rerun_discovery(env, "uncapped") == "complete"
+
+    async def invalid(conn: Conn) -> None:
+        await jobs.enqueue(
+            conn,
+            env.system,
+            jobs.JobSpec(
+                job_type=JobType.DISCOVERY,
+                dedup_key="discovery:bad-cap",
+                source_id=env.source_id,
+                profile_id=profile_id,
+                partition_key="default",
+                payload={"max_pages": 0},
+            ),
+        )
+
+    await run(env.ctx, env.system, invalid)
+    [bad] = await worker(env, "worker-bad-cap", JobType.DISCOVERY).run_until_idle()
+    assert bad.state == JobState.DEAD_LETTER and bad.code == "VALIDATION_ERROR"
+
+
+async def test_a_revision_promoted_during_a_valuation_makes_the_job_a_successful_no_op(
+    env: PipelineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Race: the valuation read revision N, then revision N+1 was promoted before the commit. The
+    commit locks the listing, sees N is superseded and completes as a no-op: no valuation row for
+    the outdated revision (nothing "open" that reverse invalidation could no longer find) and no
+    review case built on it; N+1's own valuation job values the new facts."""
+    from tests.integration.repos_valuation_reviews.builders import add_revision  # noqa: PLC0415
+
+    from suv_deals.crawling import valuation_pipeline  # noqa: PLC0415
+
+    await seed_comparables(env)
+    await seed_fx(env)
+    await tick(env)
+    await worker(env, "worker-crawl", JobType.DISCOVERY, JobType.DETAIL).run_until_idle()
+    eligible = by_slid(env)["TEST-204"]["id"]
+    [job] = env.rows(
+        "select id from ops.jobs where workspace_id = %s and job_type = 'valuation' and listing_id = %s",
+        env.workspace_id,
+        eligible,
+    )
+    current = env.scalar(
+        "select r.revision_number from app.listings l join app.listing_revisions r"
+        " on r.workspace_id = l.workspace_id and r.id = l.current_revision_id where l.id = %s",
+        eligible,
+    )
+    real_read = valuation_pipeline._read
+    promoted: list[Any] = []
+
+    async def racing(ctx: RuntimeContext, actor: Any, listing_id: Any) -> Any:
+        reads = await real_read(ctx, actor, listing_id)
+        if listing_id == eligible and not promoted:
+            promoted.append(
+                add_revision(
+                    env.seed, env.workspace_id, listing_id, current + 1, make="Example", model="Trail"
+                )
+            )
+        return reads
+
+    monkeypatch.setattr(valuation_pipeline, "_read", racing)
+    reports = await worker(env, "worker-value", JobType.VALUATION).run_until_idle()
+    [report] = [r for r in reports if r.job_id == job["id"]]
+    assert promoted and report.state == JobState.SUCCEEDED
+    assert report.details == {"skipped": "revision_superseded"}
+    result = env.scalar("select result_reference from ops.jobs where id = %s", job["id"])
+    assert result["skipped"] == "revision_superseded" and result["current_revision_id"] == str(promoted[0])
+    assert env.scalar("select count(*) from app.valuations where listing_id = %s", eligible) == 0
+    assert env.scalar("select count(*) from app.review_cases where listing_id = %s", eligible) == 0
+    assert env.scalar("select count(*) from app.comparable_sets where listing_id = %s", eligible) == 0

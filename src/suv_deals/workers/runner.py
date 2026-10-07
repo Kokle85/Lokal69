@@ -10,7 +10,10 @@
 - **Dispatch** goes through the `HandlerRegistry`. Handlers commit their own outcome together with
   their domain writes; an exception that escapes a handler is mapped by `disposition_for_error` to
   ``retry_wait`` (with backoff / Retry-After), ``blocked`` (typed blocker, no timer) or
-  ``dead_letter`` (visible), in a separate short transaction that again locks the job first.
+  ``dead_letter`` (visible), in a separate short transaction that again locks the job first. A
+  budget-gate refusal (`BudgetRefused`: nothing was fetched) is the exception: the job is released
+  to ``queued`` at the gate's time WITHOUT consuming an attempt (`detail.apply_budget_refusal`), or
+  blocked for an access-blocked host.
 - **Shutdown**: setting the stop event (SIGTERM/SIGINT in `run_worker`) lets the current job finish its
   commit; no new job is claimed. A job interrupted by a crash is recovered by the reaper
   (`workers.reconciliation`), which requeues it while attempts remain.
@@ -31,6 +34,8 @@ from uuid import UUID, uuid4
 import anyio
 
 from suv_deals.clock import ensure_utc
+from suv_deals.crawling.detail import apply_budget_refusal
+from suv_deals.crawling.policy_client import BudgetRefused
 from suv_deals.domain.enums import JobState, JobType
 from suv_deals.errors import AppError
 from suv_deals.observability.logging import log_context
@@ -220,6 +225,8 @@ class Worker:
             # A lost lease (or a cancellation without an error): nothing may be committed; the
             # reaper recovers the job while attempts remain.
             return self._lost(job)
+        if isinstance(error, BudgetRefused):
+            return await self._release_refused(execution, error)
         disposition = disposition_for_error(error, job)
         if disposition is None:
             return self._lost(job)
@@ -239,6 +246,23 @@ class Worker:
         if state == JobState.DEAD_LETTER:
             self.ctx.metrics.record_dead_letter(job.job_type)
         return _report(job, state, code=disposition.code)
+
+    async def _release_refused(self, execution: JobExecution, refused: BudgetRefused) -> JobRunReport:
+        """Nothing was fetched: release without consuming an attempt (or block an access block)."""
+        job = execution.job
+
+        async def commit() -> tuple[JobState, str | None]:
+            async with job_unit_of_work(self.ctx.db, job) as (conn, _locked):
+                return await apply_budget_refusal(conn, job, refused, execution.actor)
+
+        try:
+            state, code = await retry_transient(commit)
+        except LeaseLost:
+            return self._lost(job)
+        logger.info(
+            "job released after a budget refusal", extra={"job_type": job.job_type.value, "code": code}
+        )
+        return _report(job, state, code=code)
 
     def _lost(self, job: ClaimedJob) -> JobRunReport:
         logger.warning("job lease lost; nothing committed, the reaper recovers it")

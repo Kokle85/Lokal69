@@ -2,7 +2,9 @@
 """Export the committed JSON schemas from the typed backend models (spec 6, 21, 34).
 
 Writes ``schemas/listing.schema.json``, ``review.schema.json``, ``valuation.schema.json``,
-``event.schema.json`` and one ``schemas/tools/<tool>.json`` per MCP tool. Output is
+``event.schema.json``, one ``schemas/tools/<tool>.json`` per MCP tool (the twelve served spec
+21 tools and the three prepared spec 37.8 ``V11_TOOLS``) and one ``schemas/api/<route>.json`` per
+spec 37 API route (the mailbox-worker API and the dashboard inquiry routes). Output is
 deterministic (sorted keys, two-space indent, trailing newline), so the files are stable
 snapshots that ``tests/contracts/test_schema_snapshots.py`` compares byte for byte.
 
@@ -11,8 +13,9 @@ Usage::
     uv run python scripts/export_schemas.py            # (re)write the snapshots
     uv run python scripts/export_schemas.py --check    # exit 1 if any snapshot is stale
 
-Stale ``schemas/tools/*.json`` files (tools that no longer exist) are removed when writing and
-reported by ``--check``. Nothing outside ``schemas/`` is touched.
+Stale ``schemas/tools/*.json`` and ``schemas/api/*.json`` files (tools or routes that no longer
+exist) are removed when writing and reported by ``--check``. Nothing outside ``schemas/`` is
+touched.
 """
 
 from __future__ import annotations
@@ -21,23 +24,31 @@ import argparse
 import sys
 from pathlib import Path
 
+from suv_deals.api.schemas import exported_api_schema_documents
 from suv_deals.mcp.schemas import exported_schema_documents, render_schema_document
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "schemas"
 
 
+#: Generated subdirectories: every ``*.json`` inside them must be an expected snapshot.
+GENERATED_DIRS = ("tools", "api")
+
+
 def build() -> dict[str, str]:
     """Relative path -> rendered file content."""
-    return {path: render_schema_document(doc) for path, doc in exported_schema_documents().items()}
+    documents = {**exported_schema_documents(), **exported_api_schema_documents()}
+    return {path: render_schema_document(doc) for path, doc in documents.items()}
 
 
 def stale_tool_files(output: Path, expected: dict[str, str]) -> list[Path]:
-    tools_dir = output / "tools"
-    if not tools_dir.is_dir():
-        return []
     wanted = {output / rel for rel in expected}
-    return sorted(p for p in tools_dir.glob("*.json") if p not in wanted)
+    stale: list[Path] = []
+    for name in GENERATED_DIRS:
+        directory = output / name
+        if directory.is_dir():
+            stale.extend(p for p in directory.glob("*.json") if p not in wanted)
+    return sorted(stale)
 
 
 def check(output: Path) -> list[str]:

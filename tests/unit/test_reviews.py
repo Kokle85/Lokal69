@@ -20,9 +20,11 @@ from suv_deals.domain.enums import (
     Scope,
     ValuationState,
 )
+from suv_deals.domain.due_diligence import DashboardAction
 from suv_deals.domain.reviews import (
     ALLOWED_TRANSITIONS,
     CLAIMABLE_STATES,
+    DASHBOARD_ACTION_CODES,
     IdempotencyOutcome,
     ReviewCaseSnapshot,
     StoredIdempotency,
@@ -31,14 +33,17 @@ from suv_deals.domain.reviews import (
     apply_new_revision,
     can_transition,
     canonical_request_hash,
+    check_dashboard_action_outcome,
     check_idempotency,
     evaluate_claim,
     evaluate_release,
     evaluate_submit,
     expire_claim,
     hash_claim_token,
+    is_dashboard_action_code,
     mark_superseded,
     new_claim_token,
+    normalise_reason_code,
     parse_submit_request,
     require_transition,
     verify_claim_token,
@@ -731,3 +736,72 @@ def test_request_hash_is_stable_for_equivalent_validated_requests() -> None:
     padded = parse_submit_request({**raw, "summary": "  " + raw["summary"] + "  "})
     hashes = {canonical_request_hash("reviews_submit", r) for r in (explicit, omitted, padded)}
     assert len(hashes) == 1
+
+
+# ------------------------------------------------------------------------- spec 19 dashboard actions
+
+
+def test_dashboard_action_codes_are_the_due_diligence_actions() -> None:
+    assert frozenset(a.value for a in DashboardAction) == DASHBOARD_ACTION_CODES
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "needs_inspection",
+        "NEEDS_INSPECTION",
+        "needs-documents",
+        "Needs Documents",
+        "price confirmation needed",
+        "PRICE-CONFIRMATION_needed",
+        "Price.Confirmation:Needed",
+        "  needs__inspection  ",
+        "NeedsInspection",
+        "needs\tdocuments",
+    ],
+)
+def test_dashboard_action_codes_match_in_any_case_or_separator_spelling(code: str) -> None:
+    assert is_dashboard_action_code(code)
+
+
+@pytest.mark.parametrize(
+    "code", ["needs_inspections", "inspection_needed", "PRICE_IN_BAND", "documents", "needs", ""]
+)
+def test_other_reason_codes_are_not_dashboard_actions(code: str) -> None:
+    assert not is_dashboard_action_code(code)
+
+
+def test_normalise_reason_code() -> None:
+    assert normalise_reason_code(" Needs--Documents ") == "needs_documents"
+    assert normalise_reason_code("Price.Confirmation:Needed") == "price_confirmation_needed"
+    assert normalise_reason_code("a b\tc") == "a_b_c"
+
+
+@pytest.mark.parametrize("outcome", [o for o in ReviewOutcome if o != ReviewOutcome.NEEDS_INFORMATION])
+@pytest.mark.parametrize("code", ["needs_inspection", "NEEDS-DOCUMENTS", "price confirmation needed"])
+def test_dashboard_action_codes_are_refused_with_any_other_outcome(outcome: ReviewOutcome, code: str) -> None:
+    with pytest.raises(ValidationFailed) as caught:
+        check_dashboard_action_outcome(outcome, ["SYNTHETIC_OTHER", code])
+    assert caught.value.code == ErrorCode.VALIDATION_ERROR
+    assert caught.value.details == {"fields": ["outcome", "reason_codes"]}
+    assert code not in caught.value.message
+
+
+def test_dashboard_action_codes_are_allowed_for_needs_information() -> None:
+    check_dashboard_action_outcome(ReviewOutcome.NEEDS_INFORMATION, ["NEEDS_INSPECTION", "needs-documents"])
+    check_dashboard_action_outcome(ReviewOutcome.SHORTLISTED, ["PRICE_IN_BAND"])
+
+
+def test_evaluate_submit_refuses_a_dashboard_action_with_another_outcome() -> None:
+    estimated = claimed(ALICE, valuation_state=ValuationState.ESTIMATED)
+    disguised = submit(outcome=ReviewOutcome.SHORTLISTED, reason_codes=("PRICE_IN_BAND", "Needs-Inspection"))
+    with pytest.raises(ValidationFailed) as caught:
+        evaluate_submit(estimated, actor(ALICE), disguised, now=NOW, guard=GOOD_GUARD)
+    assert caught.value.details == {"fields": ["outcome", "reason_codes"]}
+    action = submit(
+        outcome=ReviewOutcome.NEEDS_INFORMATION,
+        reason_codes=("needs_inspection",),
+        missing_information=("SYNTHETIC: independent inspection",),
+    )
+    decision = evaluate_submit(estimated, actor(ALICE), action, now=NOW)
+    assert decision.new_state == ReviewState.NEEDS_INFORMATION

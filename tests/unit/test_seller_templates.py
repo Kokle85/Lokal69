@@ -692,6 +692,9 @@ def test_rendering_problems_revalidate_placeholders_of_hand_built_messages() -> 
         assert problem in rendering_problems(forged), field
 
 
+_INQUIRY_UUID = "12345678-abcd-4def-8abc-123456789abc"
+
+
 @pytest.mark.parametrize(
     ("headers", "problem"),
     [
@@ -708,6 +711,21 @@ def test_rendering_problems_revalidate_placeholders_of_hand_built_messages() -> 
         ({"Content-Type ": "text/plain"}, "HEADER_NOT_ALLOWED"),
         ({"Content-Disposition": "attachment; filename=x.pdf"}, "HEADER_NOT_ALLOWED"),
         ({"Date": "Mon\u2028Bcc: x@example.invalid"}, "HEADER_INJECTION"),
+        # The technical correlation header carries exactly ``inquiry-<lower-case uuid>``.
+        ({"X-SUV-Inquiry-Ref": "inquiry-x"}, "HEADER_VALUE_INVALID"),
+        ({"X-SUV-Inquiry-Ref": f"inquiry-{_INQUIRY_UUID.upper()}"}, "HEADER_VALUE_INVALID"),
+        ({"X-SUV-Inquiry-Ref": f" inquiry-{_INQUIRY_UUID}"}, "HEADER_VALUE_INVALID"),
+        ({"X-SUV-Inquiry-Ref": f"inquiry-{_INQUIRY_UUID} extra"}, "HEADER_VALUE_INVALID"),
+        ({"X-SUV-Inquiry-Ref": f"{_INQUIRY_UUID}"}, "HEADER_VALUE_INVALID"),
+        ({"X-SUV-Inquiry-Ref": f"inquiry-{_INQUIRY_UUID}\r\nBcc: x@example.invalid"}, "HEADER_INJECTION"),
+        (
+            {
+                "X-SUV-Inquiry-Ref": f"inquiry-{_INQUIRY_UUID}",
+                "x-suv-inquiry-ref": f"inquiry-{_INQUIRY_UUID}",
+            },
+            "HEADER_DUPLICATED",
+        ),
+        ({"X-SUV-Other-Ref": f"inquiry-{_INQUIRY_UUID}"}, "HEADER_NOT_ALLOWED"),
     ],
 )
 def test_mime_and_header_injection_in_the_envelope_is_rejected(headers: dict[str, str], problem: str) -> None:
@@ -727,6 +745,7 @@ def test_plain_text_envelope_headers_pass() -> None:
             "MIME-Version": "1.0",
             "Message-ID": "<inq-0001.synthetic@example.invalid>",
             "Date": "Tue, 06 Oct 2026 10:00:00 +0000",
+            "X-SUV-Inquiry-Ref": f"inquiry-{_INQUIRY_UUID}",
         },
     )
     assert validate_scope(msg, envelope=envelope).ok

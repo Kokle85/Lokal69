@@ -11,13 +11,17 @@
 - **Watchlists** (``app.watchlists``, scope ``rechecks:request`` because a watch schedules
   budget-controlled rechecks): one active watch per (listing, member) with an optional recheck
   interval (1 hour to 30 days; ``next_recheck_at`` in database time) and expiry. Adding again
-  updates the active watch (new ``row_version``); removing is idempotent.
+  updates the active watch (new ``row_version``); removing is idempotent. `due_watch_rechecks`
+  returns only watches whose listing's source may make requests now (enabled, unpaused, not
+  access-blocked/parser-unhealthy/untested, ``detail_mode = fetch``; optionally only the caller's
+  network-eligible ``source_ids``), so watches of sources that cannot fetch never fill the limit
+  window and starve the others.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
@@ -332,20 +336,49 @@ async def list_watches(
     return [_watch(r) for r in rows]
 
 
-async def due_watch_rechecks(conn: Conn, actor: ActorContext, *, limit: int = 100) -> list[WatchlistEntry]:
-    """Active, unexpired watches whose recheck is due (database time); system scheduler only."""
+_DUE_WATCHES_SQL: Final = (
+    "select "  # noqa: S608 - fixed column list
+    + ", ".join("w." + c.strip() for c in _WATCH_COLUMNS.split(","))
+    + " from app.watchlists w"
+    " join app.listings l on l.workspace_id = w.workspace_id and l.id = w.listing_id"
+    " join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id"
+    " where w.workspace_id = %(ws)s and w.active"
+    " and w.next_recheck_at <= clock_timestamp()"
+    " and (w.expires_at is null or w.expires_at > clock_timestamp())"
+    # Only sources that may make requests now: the others' watches stay due without filling
+    # the window (they are rechecked once the source may fetch again).
+    " and s.enabled and not s.paused and s.detail_mode = 'fetch'"
+    " and s.technical_status not in ('access_blocked', 'parser_unhealthy', 'untested')"
+    " and (%(source_ids)s::uuid[] is null or l.source_id = any(%(source_ids)s::uuid[]))"
+    " order by w.next_recheck_at, w.id limit %(limit)s"
+)
+
+
+async def due_watch_rechecks(
+    conn: Conn,
+    actor: ActorContext,
+    *,
+    limit: int = 100,
+    source_ids: Collection[UUID] | None = None,
+) -> list[WatchlistEntry]:
+    """Active, unexpired watches whose recheck is due (database time); system scheduler only.
+
+    Only watches whose listing's source may make requests are returned (module docstring);
+    ``source_ids`` further restricts them to the sources the caller may fetch from now (e.g. the
+    network-eligible sources of this process). An empty ``source_ids`` returns nothing.
+    """
     if actor.principal_kind != "system":
         raise Forbidden("Only the scheduler reads due watch rechecks")
     if not 1 <= limit <= 1000:
         raise ValidationFailed("limit must be between 1 and 1000")
+    wanted = None if source_ids is None else sorted(set(source_ids), key=str)
+    if wanted is not None and not wanted:
+        return []
     async with mapped_errors():
         rows = await fetch_all(
             conn,
-            f"select {_WATCH_COLUMNS} from app.watchlists where workspace_id = %(ws)s and active"  # noqa: S608
-            " and next_recheck_at <= clock_timestamp()"
-            " and (expires_at is null or expires_at > clock_timestamp())"
-            " order by next_recheck_at, id limit %(limit)s",
-            {"ws": actor.workspace_id, "limit": limit},
+            _DUE_WATCHES_SQL,
+            {"ws": actor.workspace_id, "limit": limit, "source_ids": wanted},
         )
     return [_watch(r) for r in rows]
 

@@ -383,3 +383,26 @@ async def test_fetch_attempt_is_redacted(db: Database, env: Env, seed: Seed) -> 
     assert row[5] == "captcha_challenge_"
     assert row[6] == {"content-type": "text/html", "retry-after": "120"}  # allow-listed headers only
     assert "secret" not in str(row)
+
+
+async def test_suspected_parser_drift_pauses_new_alerts(db: Database, env: Env) -> None:
+    """Spec 25: on suspected drift (``degraded``) new opportunity alerts pause, as for an unhealthy
+    parser; network work and prior evidence are untouched."""
+    health = ParserHealth(
+        status="degraded",
+        sample_size=40,
+        reasons=("mileage coverage fell",),
+        recommended_actions=("pause_new_alerts",),
+    )
+    async with unit_of_work(db, env.system) as conn:
+        assert await sources_repo.alert_pause_reason(conn, env.system, env.source_id) is None
+        record = await sources_repo.set_technical_status(
+            conn,
+            env.system,
+            env.source_id,
+            TechnicalStatus.DEGRADED,
+            reason="tripwire",
+            parser_health=health,
+        )
+        assert record.technical_status == TechnicalStatus.DEGRADED
+        assert await sources_repo.alert_pause_reason(conn, env.system, env.source_id) == "parser_degraded"

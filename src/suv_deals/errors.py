@@ -26,6 +26,9 @@ class ErrorCode(StrEnum):
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
     DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+    # Spec 37.5: an e-mail send attempt may have reached the provider; it is held for
+    # reconciliation with positive evidence and never resent blindly.
+    EMAIL_DELIVERY_UNCERTAIN = "EMAIL_DELIVERY_UNCERTAIN"
 
 
 _RETRYABLE_BY_DEFAULT = frozenset(
@@ -49,6 +52,7 @@ HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.INSUFFICIENT_DATA: 422,
     ErrorCode.DEPENDENCY_UNAVAILABLE: 503,
     ErrorCode.INTERNAL_ERROR: 500,
+    ErrorCode.EMAIL_DELIVERY_UNCERTAIN: 409,
 }
 
 
@@ -101,13 +105,15 @@ class NotFound(AppError):
 
 
 class Forbidden(AppError):
-    def __init__(self, message: str = "Forbidden") -> None:
-        super().__init__(ErrorCode.FORBIDDEN, message)
+    def __init__(self, message: str = "Forbidden", *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(ErrorCode.FORBIDDEN, message, details=details)
 
 
 class Unauthenticated(AppError):
-    def __init__(self, message: str = "Authentication required") -> None:
-        super().__init__(ErrorCode.UNAUTHENTICATED, message)
+    def __init__(
+        self, message: str = "Authentication required", *, details: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(ErrorCode.UNAUTHENTICATED, message, details=details)
 
 
 class VersionConflict(AppError):
@@ -131,8 +137,10 @@ class IdempotencyConflict(AppError):
 
 
 class SourcePaused(AppError):
-    def __init__(self, message: str = "Source is paused or not enabled") -> None:
-        super().__init__(ErrorCode.SOURCE_PAUSED, message)
+    def __init__(
+        self, message: str = "Source is paused or not enabled", *, details: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(ErrorCode.SOURCE_PAUSED, message, details=details)
 
 
 class AccessBlocked(AppError):
@@ -141,8 +149,16 @@ class AccessBlocked(AppError):
 
 
 class RateLimited(AppError):
-    def __init__(self, message: str = "Rate limited", retry_after_seconds: int | None = None) -> None:
-        super().__init__(ErrorCode.RATE_LIMITED, message, retry_after_seconds=retry_after_seconds)
+    def __init__(
+        self,
+        message: str = "Rate limited",
+        retry_after_seconds: int | None = None,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            ErrorCode.RATE_LIMITED, message, retry_after_seconds=retry_after_seconds, details=details
+        )
 
 
 class InsufficientData(AppError):
@@ -153,3 +169,20 @@ class InsufficientData(AppError):
 class DependencyUnavailable(AppError):
     def __init__(self, message: str = "A required dependency is unavailable") -> None:
         super().__init__(ErrorCode.DEPENDENCY_UNAVAILABLE, message)
+
+
+class EmailDeliveryUncertain(AppError):
+    """A send attempt may have reached the provider (spec 37.5).
+
+    Never retryable: the inquiry keeps its reservation and quota debit, and only positive
+    evidence (Sent Items/provider hit, a Message-ID-linked inbound message, or a documented
+    pre-submission proof) may resolve it. ``details["reason"]`` names the guard.
+    """
+
+    def __init__(
+        self,
+        message: str = "An earlier send attempt may have reached the provider; reconcile it first",
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(ErrorCode.EMAIL_DELIVERY_UNCERTAIN, message, retryable=False, details=details)

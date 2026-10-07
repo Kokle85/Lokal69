@@ -31,17 +31,21 @@ Deliveries
     `claim_due_deliveries` leases due rows with ``FOR UPDATE SKIP LOCKED`` (fresh token,
     ``attempts + 1``) only for active, verified, unexpired subscriptions whose subscriber still
     has access (membership/credential recheck in SQL), cancelling waiting rows of
-    revoked/expired ones. `record_delivery_outcome` is fenced on id + token +
-    owner + unexpired lease (database time); zero rows -> ``LeaseLost``. Outcomes: 2xx ->
-    ``accepted`` (receipt only), 410/413 and other terminal failures -> ``failed``, retryable ->
-    ``retry_wait`` (or ``dead_letter`` when attempts are exhausted), timeout after send ->
-    ``uncertain`` (never blindly resent; `requeue_uncertain` re-sends the SAME event id once).
+    revoked/expired ones; ``event_ids`` restricts the claim to the deliveries of those events
+    (the dispatcher's own event). `record_delivery_outcome` and `cancel_delivery` (nothing is sent:
+    the dispatch guard refused it, with the truthful stale/route reason as ``safe_error``) are
+    fenced on id + token + owner + unexpired lease (database time); zero rows -> ``LeaseLost``.
+    Outcomes: 2xx -> ``accepted`` (receipt only), 410/413 and other terminal failures ->
+    ``failed``, retryable -> ``retry_wait`` (or ``dead_letter`` when attempts are exhausted),
+    timeout after send -> ``uncertain`` (never blindly resent; `requeue_uncertain` re-sends the
+    SAME event id once).
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import re
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final, Literal
@@ -80,6 +84,7 @@ from suv_deals.persistence.database import Conn, db_now, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
 
 UNSUBSCRIBED_REASON: Final = "unsubscribed"
+_REASON_RE: Final = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 ACCESS_REVOKED_REASON: Final = "access_revoked"
 _REQUIRED_SCOPES: Final = frozenset({Scope.REVIEWS_READ, Scope.EVENTS_SUBSCRIBE})
 #: Member roles whose scopes include both required scopes (owner, reviewer).
@@ -843,6 +848,7 @@ with picked as (
      and d.state in ('pending', 'retry_wait')
      and d.next_attempt_at <= now()
      and d.attempts < d.max_attempts
+     and (%(event_ids)s::uuid[] is null or d.event_id = any(%(event_ids)s::uuid[]))
      and s.revoked_at is null and s.verification_state = 'verified'
      and s.expires_at > clock_timestamp()
      and {_ACCESS_PREDICATE}
@@ -866,13 +872,23 @@ async def claim_due_deliveries(
     *,
     lease_seconds: float = 60.0,
     limit: int = 10,
+    event_ids: Collection[UUID] | None = None,
 ) -> list[ClaimedDelivery]:
-    """Lease due deliveries of active subscriptions (``SKIP LOCKED``; fresh token per lease)."""
+    """Lease due deliveries of active subscriptions (``SKIP LOCKED``; fresh token per lease).
+
+    ``event_ids`` (optional) restricts the claim to deliveries of those events (an empty
+    collection claims nothing); ``None`` claims any due delivery in ``next_attempt_at`` order.
+    """
     _require_system(actor)
     if not isinstance(dispatcher_id, str) or not 1 <= len(dispatcher_id) <= 200:
         raise ValidationFailed("dispatcher_id must be 1-200 characters")
     if not 0.05 <= float(lease_seconds) <= 3600 or not 1 <= limit <= 100:
         raise ValidationFailed("invalid lease or limit")
+    wanted = None if event_ids is None else sorted(set(event_ids), key=str)
+    if wanted is not None and not wanted:
+        return []
+    if wanted is not None and len(wanted) > 1000:
+        raise ValidationFailed("at most 1000 event ids per claim")
     params = {
         "ws": actor.workspace_id,
         "owner": dispatcher_id,
@@ -880,6 +896,7 @@ async def claim_due_deliveries(
         "limit": limit,
         "roles": list(_SUBSCRIBER_ROLES),
         "required": sorted(s.value for s in _REQUIRED_SCOPES),
+        "event_ids": wanted,
     }
     async with mapped_errors():
         await conn.execute(_CANCEL_INACTIVE_SQL, params)
@@ -961,6 +978,40 @@ async def record_delivery_outcome(
     return _delivery(row)
 
 
+async def cancel_delivery(
+    conn: Conn, actor: ActorContext, delivery: ClaimedDelivery, reason: str
+) -> DeliveryRecord:
+    """Cancel a LEASED delivery that will not be sent (fenced; nothing reached the subscriber).
+
+    ``reason`` is the dispatch guard's truthful code (``^[A-Za-z0-9_.:-]{1,80}$``), e.g.
+    ``STALE_CASE_VERSION`` for an event that no longer matches the committed facts, or
+    ``DESTINATION_NOT_VERIFIED`` / ``NO_ACTIVE_ROUTE`` for a withdrawn route; it is stored as
+    ``safe_error``. The claim's attempt stays counted. ``LeaseLost`` when the lease is not held.
+    """
+    _require_system(actor)
+    if delivery.workspace_id != actor.workspace_id:
+        raise LeaseLost()
+    if not isinstance(reason, str) or not _REASON_RE.fullmatch(reason):
+        raise ValidationFailed("reason must be a short code", details={"fields": ["reason"]})
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "update ops.event_deliveries set state = 'cancelled', safe_error = %(reason)s,"  # noqa: S608
+            f" lease_owner = null, lease_token = null, lease_expires_at = null{_FENCE}"
+            f" returning {_DELIVERY_COLUMNS}",
+            {
+                "ws": actor.workspace_id,
+                "id": delivery.id,
+                "token": delivery.lease_token,
+                "owner": delivery.lease_owner,
+                "reason": reason,
+            },
+        )
+    if row is None:
+        raise LeaseLost()
+    return _delivery(row)
+
+
 async def reap_expired_deliveries(conn: Conn, actor: ActorContext, *, limit: int = 500) -> list[UUID]:
     """A dispatcher that lost its lease may already have sent the request: ``uncertain``."""
     _require_system(actor)
@@ -1027,6 +1078,7 @@ __all__ = [
     "SubscribeOutcome",
     "SubscriptionRecord",
     "UnsubscribeOutcome",
+    "cancel_delivery",
     "check_subscriber_access",
     "claim_due_deliveries",
     "create_deliveries",

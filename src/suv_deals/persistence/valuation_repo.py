@@ -46,7 +46,12 @@ Valuations (``app.valuations``)
     (cost lines, purchase, proceeds, import line sources) in ``scenarios`` (a versioned
     document), the typed dependency references (FK columns and id arrays, each verified
     against the recorded ``ValuationDependencies``) and the dependency fingerprint. The only
-    later change is `mark_stale`. `invalidate_dependents` is the reverse invalidation of spec
+    later change is `mark_stale`. With ``require_current_revision=True``, `persist_valuation` first
+    locks the listing (``FOR NO KEY UPDATE``, global lock order: listings before valuations) and
+    returns a typed `SupersededRevision` -- inserting nothing -- when the cited revision is no
+    longer the listing's current revision (a newer revision was promoted while the calculation ran;
+    its own valuation job values it). `lock_current_revision` is the same check for callers that
+    must decide before writing anything else. `invalidate_dependents` is the reverse invalidation of spec
     18: valuations that depend on a changed listing revision, comparable set/observation, FX
     rate, cost quote/profile, tax rule set or business configuration are marked stale
     immediately and ONE deduplicated recomputation job is queued per affected listing
@@ -63,7 +68,7 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, overload
 from uuid import UUID
 
 from psycopg import sql
@@ -1164,11 +1169,71 @@ async def _check_cost_evidence(
         raise VersionConflict("Cited cost evidence was superseded since the calculation; recompute")
 
 
+class SupersededRevision(BaseModel):
+    """A calculation cited a listing revision that is no longer current: nothing was stored."""
+
+    model_config = _FROZEN
+
+    listing_id: UUID
+    cited_revision_id: UUID
+    current_revision_id: UUID | None
+    reason: Literal["revision_superseded"] = "revision_superseded"
+
+
+_LOCK_LISTING_REVISION_SQL: Final = (
+    "select current_revision_id from app.listings where workspace_id = %(ws)s and id = %(id)s"
+    " for no key update"
+)
+
+
+async def lock_current_revision(
+    conn: Conn, actor: ActorContext, listing_id: UUID, revision_id: UUID
+) -> SupersededRevision | None:
+    """Lock the listing row (``FOR NO KEY UPDATE``) and check that ``revision_id`` is still its
+    current revision (``None``: current; the lock is held until the transaction ends, so no newer
+    revision can be promoted meanwhile). A missing/foreign listing is `NotFound`."""
+    require_writer(actor)
+    async with mapped_errors():
+        row = await fetch_one(conn, _LOCK_LISTING_REVISION_SQL, {"ws": actor.workspace_id, "id": listing_id})
+    if row is None:
+        raise NotFound("Listing not found")
+    current: UUID | None = row["current_revision_id"]
+    if current == revision_id:
+        return None
+    return SupersededRevision(
+        listing_id=listing_id, cited_revision_id=revision_id, current_revision_id=current
+    )
+
+
 _VALUATION_COLUMNS: Final = (
     "v.id, v.listing_id, v.listing_revision_id, v.comparable_set_id, v.tax_rule_set_id, v.cost_profile_id,"
     " v.config_revision_id, v.fx_rate_ids, v.cost_evidence_ids, v.dependency_fingerprint, v.state,"
     " v.scenarios, v.stale_at, v.stale_reason, v.is_fixture, v.created_at, r.revision_number"
 )
+
+
+@overload
+async def persist_valuation(
+    conn: Conn,
+    actor: ActorContext,
+    valuation: Valuation,
+    refs: ValuationRefs,
+    inputs: ValuationInputs,
+    *,
+    require_current_revision: Literal[False] = False,
+) -> StoredValuation: ...
+
+
+@overload
+async def persist_valuation(
+    conn: Conn,
+    actor: ActorContext,
+    valuation: Valuation,
+    refs: ValuationRefs,
+    inputs: ValuationInputs,
+    *,
+    require_current_revision: bool,
+) -> StoredValuation | SupersededRevision: ...
 
 
 async def persist_valuation(
@@ -1177,9 +1242,21 @@ async def persist_valuation(
     valuation: Valuation,
     refs: ValuationRefs,
     inputs: ValuationInputs,
-) -> StoredValuation:
-    """Insert one reproducible valuation (a recalculation is always a new row)."""
+    *,
+    require_current_revision: bool = False,
+) -> StoredValuation | SupersededRevision:
+    """Insert one reproducible valuation (a recalculation is always a new row).
+
+    ``require_current_revision``: lock the listing first and return a `SupersededRevision` (nothing
+    inserted) when the cited revision is no longer the listing's current one (module docstring).
+    """
     require_writer(actor)
+    if require_current_revision:
+        superseded = await lock_current_revision(
+            conn, actor, refs.listing_id, _uuid_text(valuation.listing_revision_id, "listing_revision_id")
+        )
+        if superseded is not None:
+            return superseded
     if valuation.scenarios is not None:
         if tuple(valuation.scenarios.import_line_sources) != inputs.import_line_sources:
             raise ValidationFailed("import_line_sources differ from the scenarios")
@@ -1679,6 +1756,7 @@ __all__ = [
     "StoredFxRate",
     "StoredRuleSet",
     "StoredValuation",
+    "SupersededRevision",
     "TaxRuleRow",
     "ValuationInputs",
     "ValuationRefs",
@@ -1700,6 +1778,7 @@ __all__ = [
     "load_cost_profile",
     "load_rule_set",
     "load_valuation",
+    "lock_current_revision",
     "mark_stale",
     "persist_valuation",
     "principal_label",

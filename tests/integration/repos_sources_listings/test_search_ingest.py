@@ -235,3 +235,21 @@ async def test_complete_scan_absence_sets_unknown_never_removed(db: Database, en
         assert (
             await listings_repo.mark_complete_scan_absences(conn, env.system, third.id)
         ).marked_unknown == ()
+
+
+async def test_fixture_lineage_is_frozen_on_the_listing_at_ingest(db: Database, env: Env, seed: Seed) -> None:
+    """``app.listings.is_fixture`` records the source's mode when the listing was FIRST stored; a
+    later switch of the source to a real mode never relabels it (the new listings are real)."""
+    first = await ingest(db, env, await start_run(db, env), page(env.source_key, [card(unique("SYN"))]))
+    fixture_listing = first.detail_jobs[0].listing_id
+    assert seed.scalar("select is_fixture from app.listings where id = %s", (fixture_listing,)) is True
+    async with unit_of_work(db, env.system) as conn:
+        record = await listings_repo.get_listing(conn, env.system, fixture_listing)
+    assert record.is_fixture is True
+    seed.conn.execute(
+        "update app.sources set mode = 'public_html', version = version + 1 where id = %s", (env.source_id,)
+    )
+    later_page = await ingest(db, env, await start_run(db, env), page(env.source_key, [card(unique("SYN"))]))
+    real_listing = later_page.detail_jobs[0].listing_id
+    assert seed.scalar("select is_fixture from app.listings where id = %s", (real_listing,)) is False
+    assert seed.scalar("select is_fixture from app.listings where id = %s", (fixture_listing,)) is True

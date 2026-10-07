@@ -27,7 +27,9 @@ Availability events (``derive_availability_event``)
     - an explicit site sold badge -> ``sold_claimed`` + ``source_sold_badge``;
     - a seller statement -> ``sold_claimed`` + ``seller_reported_sold`` (or available/reserved);
     - an explicit removed-listing page -> ``removed`` + ``source_removed_page``;
-    - a 404 detail page from a healthy source -> ``unknown`` (``detail_not_found``), not removed.
+    - an explicit reserved badge -> ``reserved`` + ``source_reserved_badge``;
+    - a 404 detail page from a healthy source -> ``unknown`` + ``source_detail_not_found``
+      (reason ``detail_not_found``), never removed.
 
     None of them establishes a purchase, buyer or transaction price. Older evidence is kept as
     history but never regresses the current status. A source showing the ad active or reserved
@@ -481,7 +483,7 @@ def derive_availability_event(
     elif kind == AvailabilitySignalKind.RESERVED_BADGE:
         target = (
             Availability.RESERVED,
-            AvailabilityEvidenceKind.SOURCE_OBSERVATION,
+            AvailabilityEvidenceKind.SOURCE_RESERVED_BADGE,
             "source_reserved_badge",
             "high",
         )
@@ -499,7 +501,7 @@ def derive_availability_event(
             )
         target = (
             Availability.UNKNOWN,
-            AvailabilityEvidenceKind.SOURCE_OBSERVATION,
+            AvailabilityEvidenceKind.SOURCE_DETAIL_NOT_FOUND,
             "detail_not_found",
             "low",
         )
@@ -533,6 +535,7 @@ def derive_availability_event(
         and evidence_kind
         in (
             AvailabilityEvidenceKind.SOURCE_OBSERVATION,
+            AvailabilityEvidenceKind.SOURCE_RESERVED_BADGE,
             AvailabilityEvidenceKind.SELLER_REPORTED_AVAILABLE,
             AvailabilityEvidenceKind.SELLER_REPORTED_RESERVED,
         )

@@ -15,12 +15,16 @@ Contracts (docs/schema.md section 7):
   fresh UUID token, ``priority desc, available_at, id``, ``attempts < max_attempts``) plus an
   explicit workspace predicate and a job-type filter, always with bound parameters, in its own
   short transaction. Two concurrent workers never receive the same job.
-- Every lease-holder update (`heartbeat`, `complete`, `fail_retry`, `fail_blocked`,
+- Every lease-holder update (`heartbeat`, `complete`, `fail_retry`, `release`, `fail_blocked`,
   `dead_letter`) is fenced: ``id``, ``state = 'running'``, current ``lease_token``, current
   ``lease_owner`` and ``lease_expires_at > clock_timestamp()`` (database time, not the
   transaction start). Zero rows means the lease was lost: `LeaseLost` is raised and the caller
   must roll back the whole transaction (see `transactions.py` for the unit-of-work pattern).
   A late worker therefore cannot overwrite a result committed by a newer lease holder.
+- `release` returns a claimed job to ``queued`` WITHOUT consuming an attempt (the claim's
+  ``attempts + 1`` is undone): for work a budget refused before anything was fetched, so budget
+  refusals never exhaust a job into a dead letter. The code is recorded and logged (audited when
+  an actor is given).
 - The reaper (`reap_expired`) moves expired leases to ``retry_wait`` while attempts remain,
   otherwise to ``dead_letter``; it clears the lease fields, records ``LEASE_EXPIRED`` with the
   previous holder, and never touches ``result_reference``. `reconcile_exhausted` dead-letters
@@ -40,6 +44,7 @@ No function performs network I/O; all timestamps that matter for leases come fro
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Collection, Mapping
 from datetime import datetime, timedelta
@@ -58,6 +63,8 @@ from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import LeaseLost, TransientConflict, mapped_errors
+
+logger = logging.getLogger(__name__)
 
 INCOMPATIBLE_PAYLOAD_VERSION: Final = "incompatible_payload_version"
 LEASE_EXPIRED: Final = "LEASE_EXPIRED"
@@ -605,6 +612,90 @@ async def fail_retry(
     if row is None:
         raise LeaseLost()
     return JobState(row["state"])
+
+
+_RELEASE_SQL: Final = sql.SQL(
+    "update ops.jobs set state = 'queued', attempts = greatest(attempts - 1, 0),"
+    " available_at = greatest(clock_timestamp(),"
+    "   coalesce(%(available_at)s::timestamptz, clock_timestamp() + %(delay)s::interval)),"
+    " lease_owner = null, lease_token = null, lease_expires_at = null,"
+    " last_error_code = %(code)s, last_error_detail = %(detail)s{fence}"
+    " returning attempts, available_at"
+).format(fence=_FENCE)
+
+
+async def release(
+    conn: Conn,
+    job: ClaimedJob,
+    *,
+    available_at: datetime | timedelta | None,
+    code: str,
+    detail: str | None = None,
+    actor: ActorContext | None = None,
+) -> JobRecord:
+    """Return a claimed job to ``queued`` WITHOUT consuming an attempt (fenced by the lease).
+
+    For work that never started because a budget refused it (host spacing, Retry-After, daily
+    budget, circuit, per-run cap): the claim's ``attempts + 1`` is undone, so budget refusals
+    can never exhaust a job into a dead letter. ``available_at`` is an absolute instant, a delay
+    from database time, or ``None`` (due now); it is never earlier than the current database
+    time. ``code`` is recorded as ``last_error_code`` (and in the log); with ``actor`` the release
+    is also audited (``job.release``). Raises `LeaseLost` when the lease is no longer held.
+    """
+    absolute: datetime | None = None
+    delay = timedelta(0)
+    if isinstance(available_at, timedelta):
+        if available_at < timedelta(0):
+            raise ValidationFailed("release delay must not be negative")
+        delay = available_at
+    elif available_at is not None:
+        absolute = _aware(available_at)
+    if actor is not None and actor.workspace_id != job.workspace_id:
+        raise LeaseLost()
+    params = {
+        **_fence(job),
+        "code": _code(code),
+        "detail": _detail(detail),
+        "available_at": absolute,
+        "delay": delay,
+    }
+    async with mapped_errors():
+        row = await fetch_one(conn, _RELEASE_SQL, params)
+        if row is None:
+            raise LeaseLost()
+        released_at = ensure_utc(row["available_at"])
+        if actor is not None:
+            await audit.record(
+                conn,
+                actor,
+                "job.release",
+                "job",
+                job.id,
+                reason="released without consuming an attempt (nothing was fetched)",
+                metadata={
+                    "job_type": job.job_type.value,
+                    "code": params["code"],
+                    "attempts": int(row["attempts"]),
+                    "available_at": released_at.isoformat(),
+                },
+            )
+    logger.info(
+        "job released without consuming an attempt",
+        extra={"job_id": str(job.id), "job_type": job.job_type.value, "code": params["code"]},
+    )
+    return JobRecord.model_validate(
+        {
+            **job.model_dump(),
+            "state": JobState.QUEUED,
+            "attempts": int(row["attempts"]),
+            "available_at": released_at,
+            "lease_owner": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+            "last_error_code": params["code"],
+            "last_error_detail": params["detail"],
+        }
+    )
 
 
 async def fail_blocked(conn: Conn, job: ClaimedJob, blocker_code: str, detail: str | None = None) -> None:

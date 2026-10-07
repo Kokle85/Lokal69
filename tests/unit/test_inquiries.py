@@ -1641,8 +1641,14 @@ def test_rate_cap_policy_is_a_ceiling() -> None:
         Settings(_env_file=None, seller_inquiry_max_per_24h=1, seller_inquiry_max_per_rolling_15d=0)  # type: ignore[call-arg]
     )
     assert (reduced.max_per_24h, reduced.max_per_15d) == (1, 0)
+    # A configured value above the ceiling fails when the settings load (start-up) ...
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, seller_inquiry_max_per_24h=10)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, seller_inquiry_max_per_rolling_15d=6)  # type: ignore[call-arg]
+    # ... and the policy still refuses one that bypassed validation (defence in depth).
     with pytest.raises(ValidationFailed):
-        RateCapPolicy.from_settings(Settings(_env_file=None, seller_inquiry_max_per_24h=10))  # type: ignore[call-arg]
+        RateCapPolicy.from_settings(Settings.model_construct(seller_inquiry_max_per_24h=10))
 
 
 def test_seller_cooldown() -> None:
@@ -1999,6 +2005,8 @@ def test_revoked_authorization_suppresses() -> None:
     )
     decision = dispatch_preflight(_facts(authorization=revoked))
     assert decision.target_state == InquiryState.SUPPRESSED and "AUTHORIZATION_REVOKED" in decision.reasons
+    # A revoked standing authorization is its own suppression reason, never the kill switch.
+    assert decision.suppression_reason == SuppressionReason.AUTHORIZATION_REVOKED
     newer = AUTH.model_copy(update={"version": 2})
     changed = dispatch_preflight(_facts(authorization=newer))
     assert changed.target_state == InquiryState.CANCELLED and "AUTHORIZATION_CHANGED" in changed.reasons

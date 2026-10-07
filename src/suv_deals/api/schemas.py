@@ -10,10 +10,30 @@
   identical on both surfaces.
 - Query models are the lax (string-parsing) counterparts of the MCP list inputs and convert to
   them before use, so the same constraints apply.
+
+Spec v1.1 section 37 contracts (implemented by the API package; NOT in ``ROUTES`` yet, so the
+served app is unchanged):
+
+- ``MAIL_WORKER_ROUTES``: the mailbox-worker API under ``/v1/mail-workers`` used by the Windows
+  desktop worker (``desktop/outlook-bridge``). Authentication is the worker's revocable
+  ``mail:ingest`` bearer credential only; the server derives workspace and mailbox from it (a
+  request can never select either). Bodies and responses are the desktop wire models EXACTLY
+  (``outlook_bridge.wire`` / ``outlook_bridge.api_client``; parity is contract-tested field by
+  field) and are top-level JSON objects with ``schema_version: "1.0"`` (no ``ResponseEnvelope``).
+  Errors are ``ApiErrorResponse`` bodies (``error.code``, ``request_id``, ``retry_after_seconds``).
+  Where ``wire.py`` and spec 37.8 differ, the desktop wire wins (documented in
+  docs/api_contract.md): replies may be acknowledged ``ingest_status: "quarantined"``; the reply
+  body carries the optional worker extensions ``message_type``, ``correlation_status``,
+  ``correlation_reasons`` and ``withheld_sensitive_attachments``; ``detected_language`` is one of
+  de/it/fr/en or null; binding items carry ``state`` (active/suppressed/uncertain/tombstoned) and
+  a binding page carries ``has_more``.
+- ``V11_DASHBOARD_ROUTES``: inquiry/reply read models and the inquiry control (pause via the same
+  rules as the ``seller_inquiries_pause`` MCP tool; resume is owner-only, dashboard-only).
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,10 +41,24 @@ from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from suv_deals.domain.enums import ProfileKey, ReviewOutcome, Scope
+from suv_deals.clock import ensure_utc
+from suv_deals.domain.enums import EmailProviderKind, InquiryState, ProfileKey, ReviewOutcome, Scope
+from suv_deals.domain.replies import (
+    MAX_REQUEST_BYTES,
+    InquiryBinding,
+    InquiryBindingState,
+    ReplyIngestRequest,
+)
 from suv_deals.errors import HTTP_STATUS, AppError, ErrorCode, ValidationFailed
+from suv_deals.integrations.email_providers.outlook_local import (
+    OutlookAccountReport,
+    OutlookHeartbeat,
+    OutlookRefusalReason,
+    OutlookSendIntent,
+    OutlookSendReport,
+)
 from suv_deals.mcp.schemas import (
     AwareDatetime,
     CaseVersion,
@@ -48,6 +82,7 @@ from suv_deals.mcp.schemas import (
     ReviewsListPendingInput,
     ReviewsReleaseInput,
     ReviewsSubmitInput,
+    SellerInquiriesPauseInput,
     SourcesPauseInput,
     SourceVersion,
     SummaryText,
@@ -66,6 +101,16 @@ from suv_deals.views.common import (
     is_valid_request_id,
 )
 from suv_deals.views.comparables import ComparableSetView
+from suv_deals.views.inquiries import (
+    InquiryControlView,
+    InquiryListView,
+    InquiryPauseResult,
+    InquiryResumeResult,
+    InquiryView,
+    ReplyListView,
+    ReplyView,
+)
+from suv_deals.views.jsonschema import model_schema
 from suv_deals.views.notes import NoteView, RecheckRequestResult
 from suv_deals.views.operations import (
     LivenessView,
@@ -96,7 +141,7 @@ def _to_input[InputT: ToolInput](model: type[InputT], data: Mapping[str, Any], n
     try:
         return model.model_validate(dict(data))
     except ValidationError as exc:
-        fields = validation_error_fields(exc, root="request")
+        fields = validation_error_fields(exc, root="request", model=model)
         raise ValidationFailed(f"Invalid {name} request", details={"fields": fields}) from None
 
 
@@ -240,6 +285,332 @@ class PauseSourceRequest(ToolInput):
         return _to_input(SourcesPauseInput, {"source_id": source_id, **self.model_dump()}, "pause")
 
 
+# --------------------------------------------------------------------------- spec 37 dashboard
+
+
+class InquiryListQuery(ApiQuery):
+    """``GET /api/inquiries``: keyset page, optionally one state or only uncertain sends."""
+
+    cursor: Cursor = None
+    limit: _LaxLimit = 25
+    state: InquiryState | None = None
+    uncertain_only: bool = False
+
+    def filters(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"cursor", "limit"}, exclude_none=True)
+
+
+class ReplyListQuery(ApiQuery):
+    """``GET /api/replies``: keyset page, optionally of one inquiry or only quarantined replies."""
+
+    cursor: Cursor = None
+    limit: _LaxLimit = 25
+    inquiry_id: Id | None = None
+    quarantined_only: bool = False
+
+    def filters(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"cursor", "limit"}, exclude_none=True)
+
+
+class InquiryPauseRequest(ToolInput):
+    """Body of ``POST /api/inquiry-control/pause`` (= ``seller_inquiries_pause``)."""
+
+    expected_version: Annotated[int, Field(ge=1, strict=True)]
+    reason: Reason
+    idempotency_key: IdempotencyKey
+
+    def to_tool_input(self) -> SellerInquiriesPauseInput:
+        return _to_input(SellerInquiriesPauseInput, self.model_dump(), "inquiry pause")
+
+
+class InquiryResumeRequest(ToolInput):
+    """Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool)."""
+
+    expected_version: Annotated[int, Field(ge=1, strict=True)]
+    reason: Reason
+    idempotency_key: IdempotencyKey
+
+
+# --------------------------------------------------------------------------- spec 37.8 mail workers
+
+MAIL_WORKER_PREFIX: Final = "/v1/mail-workers"
+MAIL_WORKER_SCHEMA_VERSION: Final = "1.0"
+#: Whole-request ceiling of every mail-worker POST (spec 37.8: 128 KiB); wire it with
+#: ``ApiOptions(prefix_body_limits={MAIL_WORKER_PREFIX: MAIL_WORKER_BODY_LIMIT})``.
+MAIL_WORKER_BODY_LIMIT: Final = MAX_REQUEST_BYTES
+MAIL_WORKER_MAX_BINDINGS_PAGE: Final = 100
+MAIL_WORKER_MAX_INTENTS_PAGE: Final = 50
+IDEMPOTENCY_HEADER: Final = "Idempotency-Key"
+REQUEST_ID_HEADER: Final = "X-Request-Id"
+_WORKER_ID_PATTERN: Final = r"^[A-Za-z0-9._:-]+$"
+_CURSOR_PATTERN: Final = r"^[\x21-\x7e]{1,1024}$"
+_HEX64_PATTERN: Final = r"^[0-9a-f]{64}$"
+_WIRE: Final = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+
+def _utc_or_none(value: datetime | None) -> datetime | None:
+    return None if value is None else ensure_utc(value)
+
+
+class MailWorkerBindingsQuery(ApiQuery):
+    """``GET /v1/mail-workers/inquiry-bindings?cursor=<opaque>&limit=<1..100>``."""
+
+    cursor: Annotated[str, Field(pattern=_CURSOR_PATTERN)] | None = None
+    limit: Annotated[int, Field(ge=1, le=MAIL_WORKER_MAX_BINDINGS_PAGE)] = MAIL_WORKER_MAX_BINDINGS_PAGE
+
+
+class MailWorkerBindingItem(BaseModel):
+    """One binding change (== ``api_client.BindingSyncItem``). A tombstone carries identity,
+    version and state only; any other item satisfies the shared ``InquiryBinding`` rules."""
+
+    model_config = _WIRE
+
+    inquiry_id: UUID
+    binding_version: int = Field(ge=1)
+    mailbox_binding_id: UUID
+    state: InquiryBindingState
+    provider: EmailProviderKind | None = None
+    outbound_message_ids: tuple[str, ...] = ()
+    send_intent_message_ids: tuple[str, ...] = ()
+    provider_message_ids: tuple[str, ...] = ()
+    provider_thread_ids: tuple[str, ...] = ()
+    verified_seller_aliases: tuple[str, ...] = ()
+    listing_references: tuple[str, ...] = ()
+    listing_urls: tuple[str, ...] = ()
+    listing_id: UUID | None = None
+    vehicle_cluster_id: UUID | None = None
+    is_canary: bool = False
+
+    @model_validator(mode="after")
+    def _shape(self) -> MailWorkerBindingItem:
+        if self.state == InquiryBindingState.TOMBSTONED:
+            payload = (
+                self.outbound_message_ids,
+                self.send_intent_message_ids,
+                self.provider_message_ids,
+                self.provider_thread_ids,
+                self.verified_seller_aliases,
+                self.listing_references,
+                self.listing_urls,
+            )
+            if any(payload) or self.listing_id or self.vehicle_cluster_id or self.provider is not None:
+                raise ValueError("a tombstone carries no binding payload")
+        elif self.provider is None:
+            raise ValueError("an active binding names its sending provider")
+        else:
+            InquiryBinding.model_validate(self.model_dump())
+        return self
+
+
+class MailWorkerBindingPage(BaseModel):
+    """Response of ``GET /v1/mail-workers/inquiry-bindings`` (== ``api_client.BindingPage``).
+
+    ``next_cursor`` is the opaque position after this complete page (the worker persists page and
+    cursor atomically); ``has_more`` says whether another page is ready now. Items are at most
+    ``limit`` (<= 100) although the client accepts up to 1000.
+    """
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"]
+    items: tuple[MailWorkerBindingItem, ...] = Field(default=(), max_length=1000)
+    next_cursor: str | None = None
+    has_more: bool = False
+
+    @field_validator("next_cursor")
+    @classmethod
+    def _cursor(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(_CURSOR_PATTERN, value):
+            raise ValueError("cursor must be an opaque printable token")
+        return value
+
+
+class MailWorkerReplyRequest(ReplyIngestRequest):
+    """Body of ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 + the worker's optional
+    extensions; == ``domain.replies.ReplyIngestRequest``, which the desktop worker serialises).
+
+    Headers: ``Idempotency-Key`` (8-128 printable ASCII) is REQUIRED; the server checks it AND the
+    stable source identity (``ReplyIngestRequest.dedup_key``), never one alone. Limits: request
+    <= 128 KiB, ``sanitized_body_text`` <= 64 KiB, ``subject`` <= 512 characters, <= 20 attachment
+    metadata entries (safe filename, MIME type, byte count, SHA-256, opaque local ref; no URLs,
+    paths or bytes).
+    """
+
+
+class MailWorkerReplyAck(BaseModel):
+    """Successful ``POST /v1/mail-workers/replies`` answer (== ``api_client.IngestAck``).
+
+    The same key/message with the same immutable content returns the existing ``reply_id`` with
+    ``duplicate: true`` (also after a folder move); only then may the worker advance its
+    acknowledged checkpoint.
+    """
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"]
+    reply_id: UUID
+    inquiry_id: UUID
+    ingest_status: Literal["stored", "quarantined"]
+    duplicate: bool
+    request_id: str = Field(min_length=1, max_length=200)
+    ingested_at: datetime
+
+    @field_validator("ingested_at")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return ensure_utc(value)
+
+
+class MailWorkerSendIntentsQuery(ApiQuery):
+    """``GET /v1/mail-workers/send-intents?limit=<1..50>``."""
+
+    limit: Annotated[int, Field(ge=1, le=MAIL_WORKER_MAX_INTENTS_PAGE)] = 10
+
+
+class MailWorkerSendIntent(OutlookSendIntent):
+    """One pending ``outlook_local`` send intent (== ``wire.WorkerSendIntent``, including its
+    length limits and ``inquiry_ref == "inquiry-<inquiry_id>"``)."""
+
+    from_address: str = Field(max_length=254)
+    to_address: str = Field(max_length=254)
+    reply_to_address: str | None = Field(default=None, max_length=254)
+    rfc_message_id: str = Field(max_length=998)
+    inquiry_ref: str = Field(max_length=64)
+
+    @model_validator(mode="after")
+    def _ref(self) -> MailWorkerSendIntent:
+        if self.inquiry_ref != f"inquiry-{self.inquiry_id}":
+            raise ValueError("inquiry reference does not belong to this inquiry")
+        return self
+
+
+class MailWorkerSendIntentBatch(BaseModel):
+    """Response of ``GET /v1/mail-workers/send-intents`` (== ``wire.SendIntentBatch``)."""
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"] = MAIL_WORKER_SCHEMA_VERSION
+    intents: tuple[MailWorkerSendIntent, ...] = Field(default=(), max_length=MAIL_WORKER_MAX_INTENTS_PAGE)
+    kill_switch_active: bool
+
+
+class MailWorkerClaimRequest(BaseModel):
+    """Body of ``POST /v1/mail-workers/send-intents/{intent_id}/claim`` (``api_client``).
+
+    Every claim has its own ``claim_attempt_id`` (and ``Idempotency-Key: claim-<intent>-<attempt>``)
+    so an idempotency layer can never replay an earlier ``proceed: true``: a claim is always
+    evaluated fresh (kill switch, suppression, cancellation, binding version)."""
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"]
+    intent_id: UUID
+    claim_attempt_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    mailbox_binding_id: UUID
+    worker_id: str = Field(min_length=1, max_length=128, pattern=_WORKER_ID_PATTERN)
+
+
+class MailWorkerClaimDecision(BaseModel):
+    """Response of the claim (== ``wire.ClaimDecision``)."""
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"] = MAIL_WORKER_SCHEMA_VERSION
+    intent_id: UUID
+    proceed: bool
+    refusal_reason: OutlookRefusalReason | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> MailWorkerClaimDecision:
+        if self.proceed and self.refusal_reason is not None:
+            raise ValueError("a proceeding claim carries no refusal reason")
+        return self
+
+
+class MailWorkerSendReport(OutlookSendReport):
+    """Body of ``POST /v1/mail-workers/send-intents/{intent_id}/report`` (== ``wire.WorkerSendReport``;
+    ``Idempotency-Key: report-<intent>-<state>``)."""
+
+
+class MailWorkerAccepted(BaseModel):
+    """Response of the report and account-report routes."""
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"] = MAIL_WORKER_SCHEMA_VERSION
+    accepted: Literal[True] = True
+
+
+class MailWorkerCheckpointReport(BaseModel):
+    """One mailbox/store/folder checkpoint (hashed identities; == ``wire.CheckpointReport``)."""
+
+    model_config = _WIRE
+
+    store_id_hash: str = Field(pattern=_HEX64_PATTERN)
+    folder_id_hash: str = Field(pattern=_HEX64_PATTERN)
+    folder_role: Literal["inbox", "sent_items", "outbox", "junk", "rule_target", "other"]
+    overlap_watermark: datetime | None = None
+    acknowledged_watermark: datetime | None = None
+    last_complete_scan_at: datetime | None = None
+    last_scan_started_at: datetime | None = None
+    backlog_count: int = Field(default=0, ge=0)
+    backlog_oldest_at: datetime | None = None
+    gap_reasons: tuple[str, ...] = Field(default=(), max_length=30)
+
+
+class MailWorkerGapReport(BaseModel):
+    """A monitored coverage gap (== ``wire.GapReport``); never claimed coverage."""
+
+    model_config = _WIRE
+
+    kind: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
+    started_at: datetime
+    ended_at: datetime | None = None
+
+
+class MailWorkerHeartbeatRequest(BaseModel):
+    """Body of ``POST /v1/mail-workers/heartbeat`` (== ``wire.HeartbeatEnvelope``)."""
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"] = MAIL_WORKER_SCHEMA_VERSION
+    heartbeat: OutlookHeartbeat
+    last_successful_reconciliation_at: datetime | None = None
+    mailbox_last_sync_at: datetime | None = None
+    backlog_count: int = Field(default=0, ge=0)
+    backlog_oldest_age_seconds: int | None = Field(default=None, ge=0)
+    unresolved_matching_gaps: int = Field(default=0, ge=0)
+    checkpoints: tuple[MailWorkerCheckpointReport, ...] = Field(default=(), max_length=20)
+    gaps: tuple[MailWorkerGapReport, ...] = Field(default=(), max_length=50)
+
+
+class MailWorkerHeartbeatAck(BaseModel):
+    """Response of the heartbeat (== ``wire.HeartbeatAck``): ``downstream`` carries Slack/MCP
+    health the worker cannot observe (short codes only, at most 10 entries)."""
+
+    model_config = _WIRE
+
+    schema_version: Literal["1.0"] = MAIL_WORKER_SCHEMA_VERSION
+    received_at: datetime | None = None
+    downstream: dict[str, str] = Field(default_factory=dict, max_length=10)
+
+    @field_validator("downstream")
+    @classmethod
+    def _codes(cls, value: dict[str, str]) -> dict[str, str]:
+        code = r"^[A-Za-z0-9_.:-]{1,32}$"
+        for key, item in value.items():
+            if not (re.fullmatch(code, key) and re.fullmatch(code, item)):
+                raise ValueError("downstream health is short codes only")
+        return value
+
+
+class MailWorkerAccountReport(OutlookAccountReport):
+    """Body of ``POST /v1/mail-workers/account-report`` (== ``wire.WorkerAccountReport``; no
+    credentials; the worker never weakens Outlook security)."""
+
+    security_settings_unchanged: Literal[True] = True
+
+
 # --------------------------------------------------------------------------- errors
 
 
@@ -270,7 +641,7 @@ def api_error(error: AppError, *, request_id: str, as_of: datetime) -> tuple[int
 
 # --------------------------------------------------------------------------- routes
 
-Auth = Literal["none", "user_jwt"]
+Auth = Literal["none", "user_jwt", "mail_worker"]
 RequestLocation = Literal["query", "body"]
 
 COMMON_ERRORS: Final[tuple[ErrorCode, ...]] = (
@@ -520,10 +891,235 @@ ROUTES: Final[tuple[ApiRoute, ...]] = (
 
 ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType({route.key: route for route in ROUTES})
 
+# --------------------------------------------------------------------------- spec 37 route tables
+
+_MW_COMMON: Final[tuple[ErrorCode, ...]] = (
+    ErrorCode.UNAUTHENTICATED,
+    ErrorCode.FORBIDDEN,
+    ErrorCode.VALIDATION_ERROR,
+    ErrorCode.RATE_LIMITED,
+    ErrorCode.DEPENDENCY_UNAVAILABLE,
+    ErrorCode.INTERNAL_ERROR,
+)
+
+
+def _mw(
+    method: Literal["GET", "POST"],
+    path: str,
+    response: type[BaseModel],
+    *,
+    summary: str,
+    request: type[BaseModel] | None = None,
+    location: RequestLocation | None = None,
+    errors: tuple[ErrorCode, ...] = (),
+    paginated: bool = False,
+) -> ApiRoute:
+    return ApiRoute(
+        method=method,
+        path=MAIL_WORKER_PREFIX + path,
+        auth="mail_worker",
+        scope=Scope.MAIL_INGEST,
+        response_model=response,
+        data_model=None,
+        request_model=request,
+        request_location=location,
+        errors=(*_MW_COMMON, *errors),
+        paginated=paginated,
+        summary=summary,
+    )
+
+
+#: The mailbox-worker API (spec 37.8; implemented by the API package). Auth: the worker's
+#: ``mail:ingest`` bearer credential; workspace and mailbox come from the credential only.
+MAIL_WORKER_ROUTES: Final[tuple[ApiRoute, ...]] = (
+    _mw(
+        "GET",
+        "/inquiry-bindings",
+        MailWorkerBindingPage,
+        summary="Binding changes for the worker's own mailbox, tombstones included (opaque cursor).",
+        request=MailWorkerBindingsQuery,
+        location="query",
+        paginated=True,
+    ),
+    _mw(
+        "POST",
+        "/replies",
+        MailWorkerReplyAck,
+        summary="Store one inquiry-correlated reply (Idempotency-Key + stable source identity).",
+        request=MailWorkerReplyRequest,
+        location="body",
+        errors=(ErrorCode.VERSION_CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT),
+    ),
+    _mw(
+        "GET",
+        "/send-intents",
+        MailWorkerSendIntentBatch,
+        summary="Pending outlook_local send intents of the worker's mailbox plus the kill switch state.",
+        request=MailWorkerSendIntentsQuery,
+        location="query",
+    ),
+    _mw(
+        "POST",
+        "/send-intents/{intent_id}/claim",
+        MailWorkerClaimDecision,
+        summary="Fresh server revalidation immediately before .Send (never replayed).",
+        request=MailWorkerClaimRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT),
+    ),
+    _mw(
+        "POST",
+        "/send-intents/{intent_id}/report",
+        MailWorkerAccepted,
+        summary="Submission/evidence report of one intent (uncertain outcomes stay uncertain).",
+        request=MailWorkerSendReport,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT),
+    ),
+    _mw(
+        "POST",
+        "/heartbeat",
+        MailWorkerHeartbeatAck,
+        summary="Worker, Outlook and mailbox health, checkpoints and coverage gaps.",
+        request=MailWorkerHeartbeatRequest,
+        location="body",
+    ),
+    _mw(
+        "POST",
+        "/account-report",
+        MailWorkerAccepted,
+        summary="Classic-Outlook account verification report (no credentials).",
+        request=MailWorkerAccountReport,
+        location="body",
+        errors=(ErrorCode.VERSION_CONFLICT,),
+    ),
+)
+
+#: Dashboard inquiry routes (spec 37.8, 23; implemented by the API package).
+V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
+    _r(
+        "GET",
+        "/api/inquiries",
+        InquiryListView,
+        scope=Scope.INQUIRIES_READ,
+        summary="Seller inquiries with keyset pagination (no message text, no addresses).",
+        request=InquiryListQuery,
+        location="query",
+        paginated=True,
+    ),
+    _r(
+        "GET",
+        "/api/inquiries/{inquiry_id}",
+        InquiryView,
+        scope=Scope.INQUIRIES_READ,
+        summary="One seller inquiry (recipient address only for the owner).",
+        errors=_NF,
+        tool="seller_inquiries_get",
+    ),
+    _r(
+        "GET",
+        "/api/replies",
+        ReplyListView,
+        scope=Scope.INQUIRIES_READ,
+        summary="Seller replies with keyset pagination (no bodies).",
+        request=ReplyListQuery,
+        location="query",
+        paginated=True,
+    ),
+    _r(
+        "GET",
+        "/api/replies/{reply_id}",
+        ReplyView,
+        scope=Scope.INQUIRIES_READ,
+        summary="One seller reply: original text, MK summary, claims, attachment metadata.",
+        errors=_NF,
+        tool="seller_replies_get",
+    ),
+    _r(
+        "GET",
+        "/api/inquiry-control",
+        InquiryControlView,
+        scope=Scope.INQUIRIES_READ,
+        summary="Kill switch, mode, owner-reducible caps and current usage.",
+    ),
+    _r(
+        "POST",
+        "/api/inquiry-control/pause",
+        InquiryPauseResult,
+        scope=Scope.INQUIRIES_PAUSE,
+        summary="Activate the inquiry kill switch against the expected control version.",
+        request=InquiryPauseRequest,
+        location="body",
+        errors=(ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        tool="seller_inquiries_pause",
+    ),
+    _r(
+        "POST",
+        "/api/inquiry-control/resume",
+        InquiryResumeResult,
+        scope=Scope.CONFIG_ADMIN,
+        summary="Owner-only: clear the kill switch against the expected control version.",
+        request=InquiryResumeRequest,
+        location="body",
+        errors=(ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+    ),
+)
+V11_ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType(
+    {route.key: route for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)}
+)
+
+
+def route_slug(route: ApiRoute) -> str:
+    """Stable file name part of a route: ``mail-workers.send-intents.intent_id.claim.post``."""
+    parts = [p.strip("{}") for p in route.path.split("/") if p and p not in ("v1", "api")]
+    return ".".join([*parts, route.method.lower()])
+
+
+def route_schema_document(route: ApiRoute) -> dict[str, Any]:
+    """``schemas/api/<slug>.json``: method, path, auth, scope, request/response schemas, errors."""
+    request = (
+        None
+        if route.request_model is None
+        else model_schema(route.request_model, mode="validation", title=route.request_model.__name__)
+    )
+    return {
+        "method": route.method,
+        "path": route.path,
+        "auth": route.auth,
+        "requiredScope": None if route.scope is None else route.scope.value,
+        "requestLocation": route.request_location,
+        "request": request,
+        "response": model_schema(
+            route.response_model, mode="serialization", title=f"{route_slug(route)}_response"
+        ),
+        "successStatus": route.success_status,
+        "errors": [code.value for code in route.errors],
+        "paginated": route.paginated,
+        "mcpTool": route.mcp_tool,
+        "summary": route.summary,
+    }
+
+
+def exported_api_schema_documents() -> dict[str, dict[str, Any]]:
+    """Spec 37 API contracts as committed schema files (``schemas/api/``), keyed by path."""
+    return {
+        f"api/{route_slug(route)}.json": route_schema_document(route)
+        for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)
+    }
+
+
 __all__ = [
     "COMMON_ERRORS",
+    "IDEMPOTENCY_HEADER",
+    "MAIL_WORKER_BODY_LIMIT",
+    "MAIL_WORKER_PREFIX",
+    "MAIL_WORKER_ROUTES",
+    "MAIL_WORKER_SCHEMA_VERSION",
+    "REQUEST_ID_HEADER",
     "ROUTES",
     "ROUTE_INDEX",
+    "V11_DASHBOARD_ROUTES",
+    "V11_ROUTE_INDEX",
     "AddNoteRequest",
     "ApiErrorResponse",
     "ApiQuery",
@@ -532,13 +1128,37 @@ __all__ = [
     "CandidateListQuery",
     "ClaimRequest",
     "ComparablesQuery",
+    "InquiryListQuery",
+    "InquiryPauseRequest",
+    "InquiryResumeRequest",
+    "MailWorkerAccepted",
+    "MailWorkerAccountReport",
+    "MailWorkerBindingItem",
+    "MailWorkerBindingPage",
+    "MailWorkerBindingsQuery",
+    "MailWorkerCheckpointReport",
+    "MailWorkerClaimDecision",
+    "MailWorkerClaimRequest",
+    "MailWorkerGapReport",
+    "MailWorkerHeartbeatAck",
+    "MailWorkerHeartbeatRequest",
+    "MailWorkerReplyAck",
+    "MailWorkerReplyRequest",
+    "MailWorkerSendIntent",
+    "MailWorkerSendIntentBatch",
+    "MailWorkerSendIntentsQuery",
+    "MailWorkerSendReport",
     "OutboxQuery",
     "PathId",
     "PauseSourceRequest",
     "RecheckRequest",
     "ReleaseRequest",
+    "ReplyListQuery",
     "ResponseEnvelope",
     "ReviewQueueQuery",
     "SubmitReviewRequest",
     "api_error",
+    "exported_api_schema_documents",
+    "route_schema_document",
+    "route_slug",
 ]

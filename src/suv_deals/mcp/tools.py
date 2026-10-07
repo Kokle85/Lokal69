@@ -21,8 +21,9 @@ Results are ``cacheScope: private`` with ``ttlMs: 0`` because the list depends o
    failures that prove a rollback are re-run). Mutations are idempotent per principal and
    operation through their ``idempotency_key`` (same key + same request replays the original
    result; a different request is ``IDEMPOTENCY_CONFLICT``). ``deals_request_recheck`` queues a
-   bounded job for a registered listing only (the shared ``api.routes.request_recheck``); no tool
-   accepts a URL.
+   bounded job for a registered listing only (``listings_repo.request_recheck``, shared with the
+   dashboard API); no tool accepts a URL. ``reviews_submit`` refuses the spec 19 dashboard-action
+   reason codes with any outcome but ``needs_information`` (``reviews_repo.submit``).
 6. Success: ``CallToolResult(structuredContent=<envelope JSON>, content=[TextContent(
    envelope.to_text())])``. Any ``AppError``: ``isError: true`` with the typed ``ToolError``
    payload (same codes as the dashboard API) as structured content and text, with the request's
@@ -52,7 +53,6 @@ from mcp.shared.exceptions import MCPError
 from pydantic import ValidationError
 
 from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
-from suv_deals.api.routes import request_recheck
 from suv_deals.clock import Clock, ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Scope
@@ -82,7 +82,7 @@ from suv_deals.mcp.schemas import (
 )
 from suv_deals.observability.logging import log_context
 from suv_deals.observability.metrics import AppMetrics
-from suv_deals.persistence import notes_repo, queries, reviews_repo, sources_repo
+from suv_deals.persistence import listings_repo, notes_repo, queries, reviews_repo, sources_repo
 from suv_deals.persistence.database import Conn, Database, db_now
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
@@ -270,7 +270,9 @@ async def reviews_submit(call: ToolCall[ReviewsSubmitInput]) -> ResponseEnvelope
 
 
 async def deals_request_recheck(call: ToolCall[DealsRequestRecheckInput]) -> ResponseEnvelope[Any]:
-    view, as_of = await _mutation(call, lambda conn: request_recheck(conn, call.actor, call.arguments))
+    view, as_of = await _mutation(
+        call, lambda conn: listings_repo.request_recheck(conn, call.actor, call.arguments)
+    )
     return envelope(view, request_id=call.request_id, as_of=as_of)
 
 

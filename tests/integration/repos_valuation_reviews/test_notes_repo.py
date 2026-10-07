@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
+from typing import Any
+from uuid import UUID
 
 import pytest
 from tests.integration.db.helpers import Seed
@@ -24,6 +26,27 @@ from suv_deals.persistence import notes_repo
 from suv_deals.persistence.database import Database
 
 pytestmark = pytest.mark.db
+
+# Columns that satisfy ``sources_enable_gate_ck`` (SYNTHETIC host and paths).
+_FETCHABLE: dict[str, Any] = {
+    "adapter_version": "1.0.0",
+    "technical_status": "fixture_tested",
+    "terms_status": "permitted",
+    "terms_decision": "proceed_permitted",
+    "terms_decision_actor": "owner (synthetic)",
+    "allowed_hosts": ["synthetic-dealer.example"],
+    "allowed_search_paths": ["^/search$"],
+    "allowed_detail_paths": ["^/vehicles/[A-Z0-9-]+$"],
+}
+
+
+def _make_fetchable(seed: Seed, ws: UUID, source_id: UUID) -> None:
+    """Enable an existing SYNTHETIC source so it may make requests (every activation gate met)."""
+    sets = ", ".join(f"{column} = %({column})s" for column in _FETCHABLE)
+    seed.conn.execute(
+        f"update app.sources set {sets}, enabled = true where workspace_id = %(ws)s and id = %(id)s",
+        {**_FETCHABLE, "ws": ws, "id": source_id},
+    )
 
 
 async def test_notes_are_labelled_by_the_authenticated_principal(db: Database, world: RealWorld) -> None:
@@ -152,7 +175,9 @@ async def test_watchlist_lifecycle_and_recheck_frequency(db: Database, seed: See
     assert [w.id for w in mine] == [watch.id]
     everyone = await run(db, actor, lambda c: notes_repo.list_watches(c, actor, listing_id=world.listing_id))
     assert len(everyone) == 2
-    # The scheduler sees due watches by database time and advances them.
+    # The scheduler sees due watches by database time and advances them (only on a source that
+    # may make requests: the synthetic source starts disabled).
+    _make_fetchable(seed, ws, world.source_id)
     seed.conn.execute(
         "update app.watchlists set next_recheck_at = clock_timestamp() - interval '1 minute' where id = %s",
         (watch.id,),
@@ -175,6 +200,77 @@ async def test_watchlist_lifecycle_and_recheck_frequency(db: Database, seed: See
         await run(db, reader, lambda c: notes_repo.add_watch(c, reader, world.listing_id, reason="SYNTHETIC"))
     with pytest.raises(Forbidden):
         await run(db, actor, lambda c: notes_repo.due_watch_rechecks(c, actor))
+
+
+async def test_due_watch_rechecks_only_fill_the_window_with_fetchable_sources(
+    db: Database, seed: Seed, world: RealWorld
+) -> None:
+    """More overdue watches on sources that may not fetch than the limit never hide a fetchable one."""
+    ws = world.workspace_id
+    _make_fetchable(seed, ws, world.source_id)
+    blocked: list[dict[str, Any]] = [
+        {},  # registered but disabled
+        {**_FETCHABLE, "enabled": True, "paused": True, "pause_reason": "SYNTHETIC", "paused_at": "now()"},
+        {**_FETCHABLE, "technical_status": "access_blocked"},  # an access-blocked source is never enabled
+        {**_FETCHABLE, "enabled": True, "detail_mode": "card_only"},
+    ]
+    actor = reviewer(ws, kind="user")
+    stuck: list[UUID] = []
+    for cols in blocked:
+        source = seed.source(ws, mode="public_html", adapter="synthetic_adapter", **cols)
+        listing, _ = make_listing(seed, ws, source, eligible=False)
+        watch = await run(
+            db,
+            actor,
+            lambda c, li=listing: notes_repo.add_watch(
+                c, actor, li, reason="SYNTHETIC stuck", recheck_interval=timedelta(hours=6)
+            ),
+        )
+        stuck.append(watch.id)
+    eligible = await run(
+        db,
+        actor,
+        lambda c: notes_repo.add_watch(
+            c, actor, world.listing_id, reason="SYNTHETIC due", recheck_interval=timedelta(hours=6)
+        ),
+    )
+    # The stuck watches are the most overdue: ordered by due time alone they would fill the window.
+    seed.conn.execute(
+        "update app.watchlists set next_recheck_at = clock_timestamp() - interval '2 hours'"
+        " where id = any(%s)",
+        (stuck,),
+    )
+    seed.conn.execute(
+        "update app.watchlists set next_recheck_at = clock_timestamp() - interval '1 minute' where id = %s",
+        (eligible.id,),
+    )
+    sys_actor = system(ws)
+    due = await run(db, sys_actor, lambda c: notes_repo.due_watch_rechecks(c, sys_actor, limit=2))
+    assert [w.id for w in due] == [eligible.id]
+    # ``source_ids`` narrows further to what the caller may fetch from now; empty means nothing.
+    only = await run(
+        db,
+        sys_actor,
+        lambda c: notes_repo.due_watch_rechecks(c, sys_actor, limit=2, source_ids=[world.source_id]),
+    )
+    assert [w.id for w in only] == [eligible.id]
+    assert (
+        await run(db, sys_actor, lambda c: notes_repo.due_watch_rechecks(c, sys_actor, source_ids=[])) == []
+    )
+    assert (
+        await run(
+            db, sys_actor, lambda c: notes_repo.due_watch_rechecks(c, sys_actor, source_ids=[uuid.uuid4()])
+        )
+        == []
+    )
+    # Once the source may fetch again, its watches are due again (none was advanced meanwhile).
+    seed.conn.execute(
+        "update app.sources set paused = false, pause_reason = null, paused_at = null"
+        " where workspace_id = %s and paused",
+        (ws,),
+    )
+    again = await run(db, sys_actor, lambda c: notes_repo.due_watch_rechecks(c, sys_actor, limit=10))
+    assert len(again) == 2 and again[-1].id == eligible.id and again[0].id in stuck
 
 
 async def test_watch_on_a_foreign_listing_is_not_found(

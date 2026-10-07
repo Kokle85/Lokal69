@@ -6,7 +6,8 @@
   blocking start-up on the database (readiness reports it), runs the mounted MCP app's own
   lifespan (the SDK's session manager must run in the parent lifespan) and closes both.
 - **Middleware** (outermost first): request id + security headers + no-store + metrics (+ a
-  backstop ``INTERNAL_ERROR``); strict ``Host`` allow-list; CORS for ``/api`` only (origin
+  backstop ``INTERNAL_ERROR``); strict ``Host`` allow-list (``APP_BASE_URL``/``MCP_PUBLIC_URL``
+  hosts, loopback, plus ``API_ALLOWED_HOSTS``); CORS for ``/api`` only (origin
   allow-list from ``API_ALLOWED_ORIGINS`` or the origin of ``APP_BASE_URL``; no credentials);
   ``INTERNAL_ERROR`` rendering inside the CORS layer; request body limits. See
   ``api.middleware``.
@@ -15,8 +16,14 @@
   without traces (``api.errors``).
 - **Routes**: every route of ``docs/api_contract.md`` (``api.routes``); ``/healthz`` (liveness),
   ``/readyz`` (database, schema markers, critical configuration; 503 when not ready);
-  ``/metrics`` only with ``ApiOptions.expose_metrics`` (prefer `create_metrics_app` on a
-  private bind). OpenAPI/Swagger pages are not served.
+  ``/metrics`` only with ``ApiOptions.expose_metrics`` (prefer the private bind below).
+  OpenAPI/Swagger pages are not served.
+- **Private metrics**: with ``METRICS_ENABLED=true`` the lifespan serves Prometheus metrics on
+  ``METRICS_BIND`` (default ``127.0.0.1:9464``) in a separate daemon-thread server
+  (`start_private_metrics_server`), never on the public API port. A bind failure is logged and
+  the API keeps serving (metrics are optional).
+- **Database**: ``Database.from_settings`` (pool sizes, ``DATABASE_SET_ROLE`` and
+  ``DATABASE_POOL_TIMEOUT_S``, so a database outage answers 503 quickly).
 - **Extension points**: ``extra_routers`` are included after the core routes and before the MCP
   mount (the spec 37.8 mail-worker and inquiry routers plug in here, with their own
   authentication dependency and, through ``ApiOptions.prefix_body_limits``, their own body limit).
@@ -31,12 +38,17 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
+import re
+import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Final
 from urllib.parse import urlsplit
+from wsgiref.simple_server import WSGIServer
 
 import yaml
 from fastapi import APIRouter, FastAPI, Request
+from prometheus_client import start_http_server
 from pydantic import SecretStr
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -70,6 +82,9 @@ from suv_deals.settings import Settings, get_settings
 logger = logging.getLogger("suv_deals.api")
 
 LOCAL_HOSTS: Final = ("127.0.0.1", "localhost")
+_HOST_NAME_RE: Final = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
 DEFAULT_PORTS: Final = {"http": 80, "https": 443}
 MCP_SERVER_MODULE: Final = "suv_deals.mcp.server"
 
@@ -87,14 +102,21 @@ def _hostname(url: str | None) -> str | None:
 
 
 def allowed_hosts(settings: Settings, override: Sequence[str] | None = None) -> list[str]:
-    """``Host`` allow-list: the hosts of ``APP_BASE_URL`` and ``MCP_PUBLIC_URL`` plus loopback names
-    (container health probes), unless ``override`` is given. Never a wildcard."""
+    """``Host`` allow-list: the hosts of ``APP_BASE_URL`` and ``MCP_PUBLIC_URL``, loopback names
+    (container health probes) and ``API_ALLOWED_HOSTS`` (a reverse proxy's internal name, a
+    probe's service DNS name), unless ``override`` is given. Never a wildcard; an extra entry that
+    is not a plain host name or IPv4 address is dropped with a warning."""
     if override is not None:
         hosts = {h.strip().lower() for h in override if h.strip()}
     else:
         hosts = {h for h in (_hostname(settings.app_base_url), _hostname(settings.mcp_public_url)) if h}
         hosts.update(LOCAL_HOSTS)
-    if "*" in hosts or any(h.startswith("*") for h in hosts):
+        for extra in settings.extra_allowed_hosts():
+            if "*" not in extra and _HOST_NAME_RE.fullmatch(extra):
+                hosts.add(extra)
+            elif "*" not in extra:
+                logger.warning("ignoring an invalid API_ALLOWED_HOSTS entry")
+    if "*" in hosts or any("*" in h for h in hosts):
         raise ValueError("wildcard hosts are not allowed")
     return sorted(hosts)
 
@@ -164,13 +186,7 @@ def _fallback_config(settings: Settings) -> BusinessConfig | None:
 def _database(settings: Settings) -> Database:
     if settings.database_url is None or not settings.database_url.get_secret_value():
         raise ValueError("DATABASE_URL is required for the API")
-    return Database(
-        settings.database_url.get_secret_value(),
-        min_size=settings.database_pool_min,
-        max_size=settings.database_pool_max,
-        set_role=settings.database_set_role,
-        application_name="suv-deals-api",
-    )
+    return Database.from_settings(settings, application_name="suv-deals-api")
 
 
 def _metrics_route(metrics: AppMetrics) -> Any:
@@ -186,6 +202,40 @@ def create_metrics_app(metrics: AppMetrics | None = None) -> Starlette:
     target = metrics or get_metrics()
     endpoint = _metrics_route(target)
     return Starlette(routes=[Route("/metrics", endpoint, methods=["GET"])])
+
+
+@dataclass(slots=True)
+class PrivateMetricsServer:
+    """A running private Prometheus endpoint (daemon thread; see `start_private_metrics_server`)."""
+
+    host: str
+    port: int
+    server: WSGIServer
+    thread: threading.Thread
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def start_private_metrics_server(
+    settings: Settings, metrics: AppMetrics | None = None
+) -> PrivateMetricsServer | None:
+    """Serve ``metrics`` on ``METRICS_BIND`` when ``METRICS_ENABLED`` (else ``None``).
+
+    The server runs in a daemon thread (``prometheus_client``'s WSGI server), so it never touches
+    the event loop or uvicorn's signal handling. It exposes only the metrics registry: no request
+    data, ids, URLs or secrets (label cardinality is bounded, ``observability.metrics``). The bind
+    is private by default (``127.0.0.1:9464``); a container may bind ``0.0.0.0`` without
+    publishing the port. Port 0 picks a free port (tests); the result reports the actual port.
+    """
+    if not settings.metrics_enabled:
+        return None
+    host, port = settings.metrics_address
+    target = metrics or get_metrics()
+    server, thread = start_http_server(port, addr=host, registry=target.registry)
+    return PrivateMetricsServer(host=host, port=int(server.server_port), server=server, thread=thread)
 
 
 # --------------------------------------------------------------------------------------------
@@ -242,6 +292,11 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        metrics_server: PrivateMetricsServer | None = None
+        try:
+            metrics_server = start_private_metrics_server(settings, app_metrics)
+        except OSError:
+            logger.error("the private metrics endpoint could not bind METRICS_BIND; serving without it")
         if owns_db:
             await database.open(wait=False)
         try:
@@ -252,6 +307,8 @@ def create_app(
         finally:
             if owns_db:
                 await database.close()
+            if metrics_server is not None:
+                metrics_server.close()
 
     middleware = [
         Middleware(
@@ -344,10 +401,12 @@ SERVED_ROUTE_KEYS: Final = frozenset(route.key for route in ROUTES)
 
 __all__ = [
     "SERVED_ROUTE_KEYS",
+    "PrivateMetricsServer",
     "allowed_hosts",
     "allowed_origins",
     "build_app",
     "create_app",
     "create_metrics_app",
     "load_mcp_app",
+    "start_private_metrics_server",
 ]

@@ -27,12 +27,12 @@ Claims (spec 21 "Claim and optimistic concurrency"):
 - Release: only the caller's current claim, idempotently. Not claimed / held by someone else ->
   no-op. Held by the caller but presented with a stale token -> ``CLAIM_EXPIRED``.
 
-Submission (``evaluate_submit``) checks, in this order: scope, workspace, case id, superseded,
-claim ownership (``ALREADY_CLAIMED`` if another holder is active, else ``CLAIM_EXPIRED``),
-claim expiry, expected case version, listing revision, valuation applicability, outcome rules
-(shortlist needs a current valuation, at least one cited evidence id, and passes the
-eligibility/availability/freshness/fingerprint guard of spec 18; needs_information lists the
-missing items). The decision records the authenticated actor from
+Submission (``evaluate_submit``) checks, in this order: scope, workspace, case id, the spec 19
+dashboard-action rule (below), superseded, claim ownership (``ALREADY_CLAIMED`` if another holder
+is active, else ``CLAIM_EXPIRED``), claim expiry, expected case version, listing revision,
+valuation applicability, outcome rules (shortlist needs a current valuation, at least one cited
+evidence id, and passes the eligibility/availability/freshness/fingerprint guard of spec 18;
+needs_information lists the missing items). The decision records the authenticated actor from
 ``ActorContext`` only; request bodies have no actor fields (``extra="forbid"``), so caller text
 cannot impersonate an owner. The summary is a concise rationale and evidence trail, never
 hidden chain-of-thought.
@@ -40,6 +40,14 @@ hidden chain-of-thought.
 A new material revision during review (``apply_new_revision``) creates a new case version,
 clears the (now stale) valuation reference and returns decided cases to pending; previous
 decisions remain in ``app.review_decisions`` history.
+
+Spec 19 dashboard actions ("needs inspection", "needs documents", "price confirmation needed")
+are ``needs_information`` decisions whose reason codes name the action
+(``DASHBOARD_ACTION_CODES``). `check_dashboard_action_outcome` refuses those codes -- in any
+case, with ``-``, ``_``, ``.``, ``:`` or whitespace separators, or none at all -- with any
+other outcome (``VALIDATION_ERROR`` naming ``outcome`` and ``reason_codes``), so an action can
+never shortlist, watch or reject a case by accident. `evaluate_submit` applies it on every
+submit path (dashboard API and MCP alike).
 """
 
 from __future__ import annotations
@@ -48,7 +56,7 @@ import hashlib
 import hmac
 import re
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Final, Literal
@@ -104,6 +112,12 @@ _CONTROL_RE: Final = re.compile(
 _HIDDEN_REASONING_RE: Final = re.compile(
     r"</?\s*(thinking|scratchpad|reasoning|inner_monologue|chain[_ -]?of[_ -]?thought)\b", re.IGNORECASE
 )
+#: Spec 19 dashboard-action reason codes (the ``domain.due_diligence.DashboardAction`` values).
+DASHBOARD_ACTION_CODES: Final = frozenset(
+    {"needs_inspection", "needs_documents", "price_confirmation_needed"}
+)
+_CODE_SEPARATORS: Final = re.compile(r"[\s_.:-]+")
+_ACTION_KEYS: Final = frozenset(_CODE_SEPARATORS.sub("", code) for code in DASHBOARD_ACTION_CODES)
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
 ALLOWED_TRANSITIONS: Final[dict[ReviewState, frozenset[ReviewState]]] = {
@@ -159,6 +173,37 @@ def require_transition(current: ReviewState, target: ReviewState) -> None:
 
 def outcome_state(outcome: ReviewOutcome) -> ReviewState:
     return _OUTCOME_STATE[outcome]
+
+
+# ---------------------------------------------------------------------------------------------
+# Spec 19 dashboard actions
+# ---------------------------------------------------------------------------------------------
+
+
+def normalise_reason_code(code: str) -> str:
+    """A reason code in canonical form: case-folded, any run of ``-``, ``_``, ``.``, ``:`` or
+    whitespace collapsed to one ``_`` and stripped at the ends (``NEEDS-Documents`` ->
+    ``needs_documents``)."""
+    return "_".join(part for part in _CODE_SEPARATORS.split(code.casefold()) if part)
+
+
+def is_dashboard_action_code(code: str) -> bool:
+    """Whether ``code`` spells a spec 19 dashboard action, whatever its case or separators
+    (including none: ``NeedsInspection``)."""
+    return _CODE_SEPARATORS.sub("", code.casefold()) in _ACTION_KEYS
+
+
+def check_dashboard_action_outcome(outcome: ReviewOutcome, reason_codes: Iterable[str]) -> None:
+    """Spec 19: inspection, document and price-confirmation actions are ``needs_information``
+    decisions only. Any other outcome citing one of those codes is ``VALIDATION_ERROR`` naming
+    ``outcome`` and ``reason_codes`` (never their values)."""
+    if ReviewOutcome(outcome) == ReviewOutcome.NEEDS_INFORMATION:
+        return
+    if any(is_dashboard_action_code(code) for code in reason_codes):
+        raise ValidationFailed(
+            "Inspection, document and price-confirmation actions are needs_information decisions",
+            details={"fields": ["outcome", "reason_codes"]},
+        )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -600,6 +645,7 @@ def evaluate_submit(
     now = _aware(now)
     if request.case_id != case.case_id:
         raise ValidationFailed("case_id does not match the loaded case")
+    check_dashboard_action_outcome(request.outcome, request.reason_codes)
     if case.state == ReviewState.SUPERSEDED:
         raise _superseded(case)
     if case.state != ReviewState.CLAIMED or case.claim_holder != actor.principal_id:

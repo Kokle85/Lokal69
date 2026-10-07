@@ -434,9 +434,10 @@ async def test_approved_quiet_hours_defer_a_pending_retry(env: PipelineEnv) -> N
 
 
 async def test_a_backlog_of_older_deliveries_does_not_burn_the_events_attempts(env: PipelineEnv) -> None:
-    """While the dispatcher holds an event's lease, it claims delivery batches until it reaches that
-    event's delivery (older due deliveries of other events go first), instead of re-queueing the
-    event immediately and consuming its outbox attempts without sending anything."""
+    """While the dispatcher holds an event's lease it claims THAT event's deliveries directly
+    (``claim_due_deliveries(event_ids=...)``), so a backlog of older due deliveries of other events
+    can neither delay it nor consume its outbox attempts; the end-of-cycle sweep then sends the
+    older ones in the same cycle."""
     live = events_env(env)
     await approve_events_route(live)
     await verified_subscriber(live)
@@ -459,7 +460,7 @@ async def test_a_backlog_of_older_deliveries_does_not_burn_the_events_attempts(e
     callback = Callback(200)
     report = await dispatcher(live, callback.client()).run_workspace(live.workspace_id)
     assert [(e.event_id, e.state) for e in report.events] == [(held.event_id, "delivered")]
-    assert len(callback.requests) == 6  # five older deliveries first, then the held event's
+    assert len(callback.requests) == 6  # the held event's delivery, then the five older ones
     row = outbox_row(live, held.event_id)
     assert row["state"] == "delivered" and row["attempts"] == 2  # claimed once per cycle
     assert all(deliveries_of(live, c.event_id)[0]["state"] == "accepted" for c in cases)
@@ -493,5 +494,97 @@ async def test_a_refusal_right_before_sending_settles_the_held_event(
     assert callback.requests == []
     [delivery] = deliveries_of(live, case.event_id)
     assert delivery["state"] == "cancelled"
+    # The truthful guard code is recorded on the delivery (not a generic "invalid occurrence").
+    assert (
+        live.scalar("select safe_error from ops.event_deliveries where event_id = %s", case.event_id)
+        == refusal
+    )
+    assert [(d.kind, d.reason) for d in report.deliveries] == [("cancelled", refusal)]
     row = outbox_row(live, case.event_id)
     assert row["state"] == state and row["send_attempted_at"] is None
+
+
+async def test_suspected_parser_drift_pauses_opportunity_alerts(env: PipelineEnv) -> None:
+    """Spec 25: a ``degraded`` source (suspected parser drift) pauses new alerts like an unhealthy
+    one: the event is visibly blocked with SOURCE_ALERTS_PAUSED and nothing is sent."""
+    live = events_env(env)
+    await approve_events_route(live)
+    await verified_subscriber(live)
+    case = await real_case(live)
+    live.seed.conn.execute(
+        "update app.sources set technical_status = 'degraded', version = version + 1 where id ="
+        " (select source_id from app.listings where id = %s)",
+        (case.listing_id,),
+    )
+    callback = Callback(200)
+    report = await dispatcher(live, callback.client()).run_workspace(live.workspace_id)
+    assert [(e.event_id, e.state, e.code) for e in report.events] == [
+        (case.event_id, "blocked", "SOURCE_ALERTS_PAUSED")
+    ]
+    assert callback.requests == [] and deliveries_of(live, case.event_id) == []
+
+
+async def test_fixture_lineage_is_frozen_at_ingest_for_dispatch(env: PipelineEnv) -> None:
+    """A source switched from fixture to a real mode: events about its earlier fixture listings stay
+    fixture (blocked, never claimed, never delivered), and even a non-fixture event row about a
+    fixture listing (legacy data) is blocked by the dispatch guard, which reads the LISTING's
+    frozen lineage, never the source's current mode."""
+    from tests.integration.repos_valuation_reviews.builders import (  # noqa: PLC0415
+        add_revision,
+        make_listing,
+        primary_profile,
+        screening,
+    )
+
+    from suv_deals.persistence import reviews_repo  # noqa: PLC0415
+
+    live = events_env(env)
+    await approve_events_route(live)
+    await verified_subscriber(live)
+    source = live.seed.source(live.workspace_id)  # mode 'fixture'
+    listing, revision = make_listing(live.seed, live.workspace_id, source)
+
+    async def upsert(revision_id: Any) -> Any:
+        return await run(
+            live.ctx,
+            live.system,
+            lambda c: reviews_repo.upsert_review_case(
+                c,
+                live.system,
+                listing,
+                revision_id,
+                screening(),
+                None,
+                primary_profile(),
+                dashboard_base_url="https://dash.synthetic.example",
+            ),
+        )
+
+    first = await upsert(revision)
+    live.seed.conn.execute(
+        "update app.sources set mode = 'public_html', version = version + 1 where id = %s", (source,)
+    )
+    newer = add_revision(live.seed, live.workspace_id, listing, 2, make="Example", model="Trail")
+    second = await upsert(newer)
+    assert second.case_id == first.case_id and second.event_id is not None
+    events = live.rows(
+        "select event_id, is_fixture, state from ops.outbox where workspace_id = %s and aggregate_id = %s",
+        live.workspace_id,
+        first.case_id,
+    )
+    assert len(events) == 2 and all(e["is_fixture"] and e["state"] == "blocked" for e in events)
+    callback = Callback(200)
+    report = await dispatcher(live, callback.client()).run_workspace(live.workspace_id)
+    assert report.events == [] and report.deliveries == [] and callback.requests == []
+    # Legacy data: a real-looking case/event pair about a listing that was ingested as fixture.
+    case = await real_case(live)
+    live.seed.conn.execute("set session_replication_role = replica")  # bypass the frozen-lineage trigger
+    try:
+        live.seed.conn.execute("update app.listings set is_fixture = true where id = %s", (case.listing_id,))
+    finally:
+        live.seed.conn.execute("set session_replication_role = origin")
+    report = await dispatcher(live, callback.client()).run_workspace(live.workspace_id)
+    assert [(e.event_id, e.state, e.code) for e in report.events] == [
+        (case.event_id, "blocked", "FIXTURE_EVENT")
+    ]
+    assert callback.requests == [] and deliveries_of(live, case.event_id) == []

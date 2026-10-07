@@ -26,9 +26,11 @@ Pause and access blocks
     are written by the budget gate (`persistence.budgets`).
 
 Parser health (spec 25)
-    `set_technical_status` records parser-health incidents. ``parser_unhealthy`` pauses new
-    opportunity alerts for the source (`alert_pause_reason`), and the listing pipeline stores new
-    revisions of that source as quarantined evidence instead of promoting them.
+    `set_technical_status` records parser-health incidents. Suspected parser drift (``degraded``)
+    and ``parser_unhealthy`` both pause new opportunity alerts for the source
+    (`alert_pause_reason`: ``parser_degraded`` / ``parser_unhealthy``); for ``parser_unhealthy`` the
+    listing pipeline also stores new revisions of that source as quarantined evidence instead of
+    promoting them.
 
 Scheduling (spec 9 "Scheduling", one short transaction, no network I/O)
     `advance_schedule`: (1) lock the schedule row; (2) confirm the source is enabled, unpaused,
@@ -1373,7 +1375,11 @@ async def set_technical_status(
 
 
 async def alert_pause_reason(conn: Conn, actor: ActorContext, source_id: UUID) -> str | None:
-    """Why new opportunity alerts from this source must not be sent now (None = alerts allowed)."""
+    """Why new opportunity alerts from this source must not be sent now (None = alerts allowed).
+
+    Spec 25: on suspected parser drift (``degraded``) new opportunity alerts from the adapter pause
+    just like for an unhealthy parser; prior evidence is kept and nothing is removed.
+    """
     actor.require(Scope.DEALS_READ)
     async with mapped_errors():
         source = await _load_source(conn, actor.workspace_id, source_id)
@@ -1381,6 +1387,8 @@ async def alert_pause_reason(conn: Conn, actor: ActorContext, source_id: UUID) -
         return "source_paused"
     if source.technical_status == TechnicalStatus.PARSER_UNHEALTHY:
         return "parser_unhealthy"
+    if source.technical_status == TechnicalStatus.DEGRADED:
+        return "parser_degraded"
     if source.technical_status == TechnicalStatus.ACCESS_BLOCKED:
         return "access_blocked"
     return None

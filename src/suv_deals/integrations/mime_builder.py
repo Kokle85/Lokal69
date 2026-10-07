@@ -448,17 +448,20 @@ class BuiltMessage(BaseModel):
         }
 
     def envelope(self) -> MessageEnvelope:
-        """Transport envelope for ``seller_templates.validate_scope``.
-
-        ``X-SUV-Inquiry-Ref`` is intentionally not passed as an extra header: it is this
-        module's own technical correlation header (validated here to be exactly
-        ``inquiry-<uuid>``), not message content, and the template scope allow-list does not
-        list it.
-        """
+        """Transport envelope for ``seller_templates.validate_scope``: every extra header of the
+        final bytes, including the technical ``X-SUV-Inquiry-Ref`` correlation header (allow-listed
+        by ``seller_templates`` with the exact value shape ``inquiry-<lower-case uuid>``)."""
         values = self.header_values()
         extra = {
             name: values[name]
-            for name in ("Message-ID", "Date", "MIME-Version", "Content-Type", "Content-Transfer-Encoding")
+            for name in (
+                "Message-ID",
+                "Date",
+                INQUIRY_REF_HEADER,
+                "MIME-Version",
+                "Content-Type",
+                "Content-Transfer-Encoding",
+            )
         }
         return MessageEnvelope(
             to=(self.to_address,),

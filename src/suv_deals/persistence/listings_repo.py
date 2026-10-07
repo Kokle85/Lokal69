@@ -78,8 +78,10 @@ from suv_deals.domain.enums import (
     AvailabilityEvidenceKind,
     EligibilityState,
     FxPurpose,
+    JobState,
     JobType,
     Scope,
+    SourceMode,
     TechnicalStatus,
 )
 from suv_deals.domain.filters import ScreeningResult, screen
@@ -100,15 +102,25 @@ from suv_deals.domain.listings import NormalizedListing, sha256_json
 from suv_deals.domain.money import FxRate
 from suv_deals.domain.profiles import BusinessConfig
 from suv_deals.domain.taxonomy import VehicleTaxonomy, default_taxonomy
-from suv_deals.errors import Forbidden, NotFound, ValidationFailed
-from suv_deals.persistence import audit, config_repo, evidence_repo, jobs, sources_repo
+from suv_deals.errors import (
+    AccessBlocked,
+    AppError,
+    ErrorCode,
+    Forbidden,
+    NotFound,
+    SourcePaused,
+    ValidationFailed,
+)
+from suv_deals.persistence import audit, config_repo, evidence_repo, idempotency, jobs, sources_repo
 from suv_deals.persistence.database import Conn, fetch_all, fetch_one
-from suv_deals.persistence.errors_map import mapped_errors
+from suv_deals.persistence.errors_map import TransientConflict, mapped_errors
 from suv_deals.persistence.jobs import ClaimedJob
 from suv_deals.persistence.sources_repo import CrawlRunRecord, SourceRecord
 from suv_deals.persistence.transactions import lock_job, lock_source
+from suv_deals.views.notes import RecheckRequestResult
 
 MAX_MILEAGE_COLUMN: Final = Decimal("99999999.999999")
+RECHECK_OPERATION: Final = "deals_request_recheck"
 FX_LOOKBACK_DAYS: Final = 60
 VALUATION_STATES: Final = frozenset(
     {
@@ -150,6 +162,7 @@ _LISTING_COLUMNS: Final = (
     "screened_at",
     "quarantined",
     "quarantine_reason",
+    "is_fixture",
     "row_version",
     "created_at",
     "updated_at",
@@ -229,6 +242,9 @@ class ListingRecord(BaseModel):
     screened_at: datetime | None = None
     quarantined: bool
     quarantine_reason: str | None = None
+    #: Fixture lineage frozen at ingest (the source's mode when the listing was first stored);
+    #: never derived from the source's CURRENT mode.
+    is_fixture: bool
     row_version: int
     created_at: datetime
     updated_at: datetime
@@ -625,6 +641,143 @@ async def request_detail_refresh(
         )
 
 
+class WaitingDetailJob(BaseModel):
+    """The detail/recheck job already waiting for a listing (what a new request deduplicates to)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    job_id: UUID
+    job_type: JobType
+    state: JobState
+    available_at: datetime
+
+    @field_validator("available_at")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return ensure_utc(value)
+
+
+_WAITING_JOB_SQL: Final = (
+    "select id, job_type, state, available_at from ops.jobs"
+    " where workspace_id = %(workspace_id)s and listing_id = %(listing_id)s"
+    " and job_type in ('detail', 'recheck') and state in ('queued', 'retry_wait')"
+    " order by created_at, id limit 1"
+)
+
+
+async def find_waiting_detail_job(
+    conn: Conn, actor: ActorContext, listing_id: UUID
+) -> WaitingDetailJob | None:
+    """The oldest queued/retry-waiting detail or recheck job of the listing (``None``: none)."""
+    actor.require(Scope.DEALS_READ)
+    async with mapped_errors():
+        row = await fetch_one(
+            conn, _WAITING_JOB_SQL, {"workspace_id": actor.workspace_id, "listing_id": listing_id}
+        )
+    if row is None:
+        return None
+    return WaitingDetailJob(
+        job_id=row["id"],
+        job_type=JobType(row["job_type"]),
+        state=JobState(row["state"]),
+        available_at=row["available_at"],
+    )
+
+
+class RecheckRequest(Protocol):
+    """What `request_recheck` needs (``mcp.schemas.DealsRequestRecheckInput`` satisfies it)."""
+
+    @property
+    def listing_id(self) -> UUID: ...
+
+    @property
+    def reason(self) -> str: ...
+
+    @property
+    def idempotency_key(self) -> str: ...
+
+
+def _replay_error(code: str) -> AppError:
+    try:
+        error_code = ErrorCode(code)
+    except ValueError:
+        error_code = ErrorCode.INTERNAL_ERROR
+    return AppError(error_code, "The original request with this idempotency key failed", retryable=False)
+
+
+async def request_recheck(conn: Conn, actor: ActorContext, request: RecheckRequest) -> RecheckRequestResult:
+    """``deals_request_recheck`` (dashboard ``POST /api/listings/{id}/recheck`` and the MCP tool) in
+    the caller's transaction.
+
+    A budget-controlled ``recheck`` job for a REGISTERED listing only (its stored canonical URL; the
+    request carries no URL). A paused, disabled or parser-unhealthy source is ``SOURCE_PAUSED``; an
+    access-blocked source is ``ACCESS_BLOCKED``; a detail/recheck job already waiting for the
+    listing is returned as ``deduplicated: true``. Idempotent per principal through the request's
+    ``idempotency_key`` (same key and request replays the stored result; another request is
+    ``IDEMPOTENCY_CONFLICT``); audited as ``recheck.request``.
+
+    Lock order: idempotency record -> ``app.sources`` (share) -> ``app.listings`` -> new job row ->
+    audit (insert-only, last).
+    """
+    actor.require(Scope.RECHECKS_REQUEST)
+    reason = request.reason
+    if not isinstance(reason, str) or not 3 <= len(reason.strip()) <= 2000:
+        raise ValidationFailed("reason must be 3-2000 characters", details={"fields": ["reason"]})
+    request_hash = idempotency.request_hash_for(
+        RECHECK_OPERATION, {"listing_id": str(request.listing_id), "reason": reason}
+    )
+    started = await idempotency.begin(conn, actor, RECHECK_OPERATION, request.idempotency_key, request_hash)
+    if isinstance(started, idempotency.Replay):
+        return RecheckRequestResult.model_validate(started.result)
+    if isinstance(started, idempotency.ReplayError):
+        raise _replay_error(started.error_code)
+    if isinstance(started, idempotency.InProgress):
+        raise TransientConflict("The same request is still in progress; retry shortly")
+    listing = await get_listing(conn, actor, request.listing_id)
+    source = await lock_source(conn, actor.workspace_id, listing.source_id, for_network=False)
+    if source.technical_status == TechnicalStatus.ACCESS_BLOCKED:
+        raise AccessBlocked()
+    if not source.enabled or source.paused or source.technical_status == TechnicalStatus.PARSER_UNHEALTHY:
+        raise SourcePaused()
+    ref = await request_detail_refresh(
+        conn, actor, listing.id, reason=f"recheck: {reason}", job_type=JobType.RECHECK
+    )
+    if ref is not None:
+        job = await jobs.get_job(conn, actor, ref.job_id)
+        result = RecheckRequestResult(
+            job_id=job.id,
+            listing_id=listing.id,
+            state=job.state,
+            deduplicated=not ref.created,
+            available_at=job.available_at,
+        )
+    else:
+        waiting = await find_waiting_detail_job(conn, actor, listing.id)
+        if waiting is None:  # pragma: no cover - request_detail_refresh only dedupes a waiting job
+            raise AppError(ErrorCode.INTERNAL_ERROR, "The waiting recheck could not be read", retryable=True)
+        result = RecheckRequestResult(
+            job_id=waiting.job_id,
+            listing_id=listing.id,
+            state=waiting.state,
+            deduplicated=True,
+            available_at=waiting.available_at,
+        )
+    async with mapped_errors():
+        await audit.record(
+            conn,
+            actor,
+            "recheck.request",
+            "listing",
+            listing.id,
+            reason=reason,
+            metadata={"job_id": str(result.job_id), "deduplicated": result.deduplicated},
+        )
+    await idempotency.complete(
+        conn, actor, RECHECK_OPERATION, request.idempotency_key, result.model_dump(mode="json")
+    )
+    return result
+
+
 # --------------------------------------------------------------------------------------------
 # Search pages
 # --------------------------------------------------------------------------------------------
@@ -640,9 +793,13 @@ class _Card:
 
 
 async def _lock_or_create(
-    conn: Conn, workspace_id: UUID, source_id: UUID, identity: CanonicalIdentity, observed_at: datetime
+    conn: Conn, workspace_id: UUID, source: SourceRecord, identity: CanonicalIdentity, observed_at: datetime
 ) -> tuple[ListingRecord | None, bool]:
-    """``(listing, created)``; ``(None, False)`` on an identity-hash collision."""
+    """``(listing, created)``; ``(None, False)`` on an identity-hash collision.
+
+    A new listing freezes its fixture lineage from the source's mode NOW (the source row is
+    share-locked by the caller, and the database trigger re-checks it)."""
+    source_id = source.id
     params = {
         "workspace_id": workspace_id,
         "source_id": source_id,
@@ -654,12 +811,13 @@ async def _lock_or_create(
             conn,
             "insert into app.listings (workspace_id, source_id, source_listing_id, incarnation,"
             " canonical_url, identity_method, identity_material, identity_hash, identity_confidence,"
-            " first_seen_at, last_seen_at)"
+            " first_seen_at, last_seen_at, is_fixture)"
             " values (%(workspace_id)s, %(source_id)s, %(source_listing_id)s, 1, %(url)s, %(method)s,"
-            " %(material)s, %(hash)s, %(confidence)s, %(observed)s, %(observed)s)"
+            " %(material)s, %(hash)s, %(confidence)s, %(observed)s, %(observed)s, %(is_fixture)s)"
             " on conflict do nothing returning id",
             {
                 **params,
+                "is_fixture": source.mode == SourceMode.FIXTURE,
                 "url": identity.canonical_url,
                 "method": identity.identity_method,
                 "material": identity.identity_material,
@@ -778,7 +936,7 @@ async def ingest_search_page(
         collisions: list[str] = []
         # Deterministic lock order across concurrent ingestions of overlapping pages.
         for card in sorted(cards.values(), key=lambda c: (c.identity.source_listing_id, c.key)):
-            listing, created = await _lock_or_create(conn, ws, source.id, card.identity, observed_at)
+            listing, created = await _lock_or_create(conn, ws, source, card.identity, observed_at)
             if listing is None:
                 collisions.append(card.identity.source_listing_id)
                 await _quarantine_collision(conn, actor, source.id, card.identity)
@@ -1718,12 +1876,16 @@ async def _identity_conflict(  # noqa: PLR0917 - private helper
         sql.SQL(
             "insert into app.listings (workspace_id, source_id, source_listing_id, incarnation,"
             " canonical_url, identity_method, identity_material, identity_hash, identity_confidence,"
-            " identity_conflict, first_seen_at, last_seen_at, detail_generation)"
+            " identity_conflict, first_seen_at, last_seen_at, detail_generation, is_fixture)"
             " values (%(workspace_id)s, %(source_id)s, %(slid)s,"
             " (select max(incarnation) + 1 from app.listings where workspace_id = %(workspace_id)s"
             "   and source_id = %(source_id)s and source_listing_id = %(slid)s),"
             " %(url)s, %(method)s, %(material)s, %(hash)s, %(confidence)s, true, %(observed)s,"
-            " %(observed)s, 1)"
+            " %(observed)s, 1,"
+            # A new incarnation is ingested now: its lineage is the source's mode of this moment
+            # (the source row is share-locked by `ingest_detail`).
+            " (select s.mode = 'fixture' from app.sources s"
+            "   where s.workspace_id = %(workspace_id)s and s.id = %(source_id)s))"
             " returning {columns}"
         ).format(columns=_cols(_LISTING_COLUMNS)),
         {

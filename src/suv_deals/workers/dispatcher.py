@@ -16,9 +16,13 @@ Per workspace (``ops.active_workspace_ids()``, ADR 0001) and per claimed event (
 2. **Revalidation immediately before dispatch** (spec 18, one short transaction): the review case
    must still exist in the state and version the event names, the listing's current revision must be
    the case revision, the listing must be available, eligible and not quarantined, the valuation must
-   not be stale/invalid/expired, and the source must not have opportunity alerts paused. A stale event
-   is cancelled with the reason (`outbox.cancel_stale`, audited); an expired valuation is marked stale
-   (which queues its recomputation).
+   not be stale/invalid/expired, and the source must not have opportunity alerts paused (paused,
+   suspected parser drift ``degraded``, parser unhealthy or access blocked;
+   `sources_repo.alert_pause_reason`). Fixture lineage is the LISTING's frozen ``is_fixture`` (set at
+   ingest), never the source's current mode: an event about a fixture listing is blocked even after
+   its source was switched to a real mode. A stale event is cancelled with the reason
+   (`outbox.cancel_stale`, audited); an expired valuation is marked stale (which queues its
+   recomputation).
 3. **Route**: exactly one approved, enabled route for the category (`bindings_repo.selected_route`);
    its provider must be the one selected by the settings, the destination binding must be verified,
    an event bound to an older destination is not re-routed, and approved quiet hours defer delivery.
@@ -38,8 +42,11 @@ Per workspace (``ops.active_workspace_ids()``, ADR 0001) and per claimed event (
      410/413 terminal for that delivery, retryable statuses back off (``Retry-After`` honoured), a
      timeout after the request was sent is ``uncertain``. ``begin_send`` is committed before the
      first request, so a crash leaves the event ``uncertain`` for the reaper instead of a blind
-     resend. While an event's lease is held, delivery batches are claimed until one of ITS
-     deliveries is reached (bounded), so a backlog cannot burn its attempts. The outbox row then
+     resend. While an event's lease is held, ITS due deliveries are claimed directly
+     (`subscriptions_repo.claim_due_deliveries(event_ids=...)`), so a backlog of other events'
+     retries can neither delay it nor burn its attempts; the end-of-cycle sweep then sends the other
+     due deliveries in ``next_attempt_at`` order. A delivery refused by the guard is cancelled with
+     the guard's truthful stale/route code (`subscriptions_repo.cancel_delivery`). The outbox row then
      aggregates its deliveries: any receipt -> ``delivered``; otherwise any uncertain -> ``uncertain``;
      otherwise pending retries -> ``retry_wait``; otherwise -> ``dead_letter`` (visible).
    - ``slack`` (only when it is the selected route): `slack.post_review_message`, refused by the
@@ -173,11 +180,10 @@ class DispatcherOptions:
     delivery_lease_seconds: float = 120.0
     #: Deliveries leased at once; their total request deadline must fit the delivery lease.
     deliveries_per_claim: int = 5
-    #: While an event's lease is held, due deliveries are claimed in up to this many batches until
-    #: one of that event's deliveries is reached (older due deliveries of other events are sent
-    #: first, in order). Without it a backlog would re-queue the event immediately and burn its
-    #: outbox attempts without sending anything. All batches must fit the event lease.
-    owner_delivery_batches: int = 4
+    #: Delivery batches per claim loop: the held event's own deliveries (an event with many
+    #: subscribers) and the end-of-cycle sweep of other due deliveries. The held event's batches
+    #: must fit its lease.
+    delivery_batches: int = 4
     delivery_max_attempts: int = 5
     idle_poll_seconds: float = 10.0
     reconcile_limit: int = 50
@@ -186,10 +192,10 @@ class DispatcherOptions:
         batch_seconds = self.deliveries_per_claim * eb.DEFAULT_RETRY_POLICY.request_timeout_s
         if batch_seconds >= self.delivery_lease_seconds:
             raise ValueError("deliveries_per_claim x request timeout must fit the delivery lease")
-        if self.owner_delivery_batches < 1:
-            raise ValueError("owner_delivery_batches must be at least 1")
-        if self.owner_delivery_batches * batch_seconds >= self.outbox_lease_seconds:
-            raise ValueError("owner_delivery_batches x batch deadline must fit the event lease")
+        if self.delivery_batches < 1:
+            raise ValueError("delivery_batches must be at least 1")
+        if self.delivery_batches * batch_seconds >= self.outbox_lease_seconds:
+            raise ValueError("delivery_batches x batch deadline must fit the event lease")
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +308,9 @@ async def revalidate(
     if case.listing_revision != _payload_int(payload, "listing_revision"):
         raise StaleEvent("STALE_LISTING_REVISION")
     listing = await listings_repo.get_listing(conn, actor, case.listing_id)
+    if listing.is_fixture:
+        # Lineage frozen at ingest: never re-derived from the source's current mode.
+        raise StaleEvent(FIXTURE_CASE)
     if listing.current_revision_id != case.revision_id:
         raise StaleEvent("STALE_LISTING_REVISION")
     if listing.quarantined:
@@ -585,15 +594,14 @@ class Dispatcher:
         selected: eb.ActivationSelection,
     ) -> _OwnerRun:
         """Lease and send due deliveries in ``next_attempt_at`` order (``owner``: the event whose
-        lease this cycle holds; ``None`` for the end-of-cycle sweep).
+        lease this cycle holds -- only ITS deliveries are claimed; ``None`` for the end-of-cycle
+        sweep of every other due delivery). At most ``delivery_batches`` batches either way.
 
-        Every delivery passes `_delivery_gate` immediately before it is sent. With an ``owner``,
-        batches are claimed (at most ``owner_delivery_batches``) until one of its deliveries is
-        reached, so a backlog of older due deliveries cannot re-queue the event again and again.
+        Every delivery passes `_delivery_gate` immediately before it is sent.
         """
         run = _OwnerRun(owner_id=None if owner is None else owner.event_id, lease=owner)
-        batches = 1 if owner is None else self.options.owner_delivery_batches
-        for _ in range(batches):
+        event_ids = None if owner is None else [owner.event_id]
+        for _ in range(self.options.delivery_batches):
             async with unit_of_work(self.ctx.db, actor) as conn:
                 claimed = await subscriptions_repo.claim_due_deliveries(
                     conn,
@@ -601,36 +609,45 @@ class Dispatcher:
                     self.dispatcher_id,
                     lease_seconds=self.options.delivery_lease_seconds,
                     limit=self.options.deliveries_per_claim,
+                    event_ids=event_ids,
                 )
             if not claimed:
                 break
             targets = await self._targets(actor)
             for delivery in claimed:
                 report.deliveries.append(await self._send_delivery(actor, delivery, targets, selected, run))
-            if owner is None or run.reached:
+            if len(claimed) < self.options.deliveries_per_claim:
                 break
         return run
 
-    def _skip(
-        self, delivery: ClaimedDelivery, subscription_id: str, *, retry_at: datetime | None = None
+    def _deferred(
+        self, delivery: ClaimedDelivery, subscription_id: str, retry_at: datetime
     ) -> eb.DeliveryOutcome:
-        """Nothing is sent: cancelled (stale event / refused route), or retried at ``retry_at``."""
-        if retry_at is not None:
-            return eb.DeliveryOutcome(
-                kind=eb.DeliveryOutcomeKind.SKIPPED,
-                subscription_id=subscription_id,
-                webhook_id=None,
-                attempt=delivery.attempts,
-                next_attempt_at=retry_at,
-            )
+        """Nothing is sent now: retried at ``retry_at`` (approved quiet hours)."""
         return eb.DeliveryOutcome(
             kind=eb.DeliveryOutcomeKind.SKIPPED,
             subscription_id=subscription_id,
             webhook_id=None,
             attempt=delivery.attempts,
-            reason=eb.DeliveryFailureReason.INVALID_OCCURRENCE,
-            block_reason=eb.BlockReason.WRONG_EVENT,
+            next_attempt_at=retry_at,
         )
+
+    async def _cancel_delivery(
+        self, actor: ActorContext, delivery: ClaimedDelivery, reason: str
+    ) -> DeliveryResult:
+        """Nothing is sent: the guard refused the delivery (stale event / withdrawn route)."""
+
+        async def once() -> DeliveryRecord:
+            async with unit_of_work(self.ctx.db, actor) as conn:
+                return await subscriptions_repo.cancel_delivery(conn, actor, delivery, reason)
+
+        try:
+            stored = await retry_transient(once)
+        except LeaseLost:
+            logger.warning("delivery lease lost; the reaper marks it uncertain")
+            return DeliveryResult(delivery.id, delivery.event_id, "lease_lost", reason)
+        logger.info("delivery cancelled", extra={"code": reason})
+        return DeliveryResult(delivery.id, delivery.event_id, stored.state, reason)
 
     async def _send_delivery(
         self,
@@ -659,10 +676,10 @@ class Dispatcher:
         if gate.refusal is not None:
             if is_owner:
                 run.refusal = gate.refusal
-            logger.info("delivery not sent", extra={"code": gate.refusal})
-            return await self._record_delivery(actor, delivery, self._skip(delivery, target.subscription_id))
+            return await self._cancel_delivery(actor, delivery, gate.refusal)
         if gate.payload is None:  # deferred by approved quiet hours: nothing is sent now
-            outcome = self._skip(delivery, target.subscription_id, retry_at=gate.defer_until)
+            assert gate.defer_until is not None
+            outcome = self._deferred(delivery, target.subscription_id, gate.defer_until)
             return await self._record_delivery(actor, delivery, outcome)
         try:
             occurrence = eb.build_occurrence(gate.payload)

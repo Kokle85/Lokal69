@@ -25,6 +25,12 @@ Phases (no transaction is open during network I/O):
    - 429 and transient failures release the job at the budget gate's Retry-After-respecting time;
    - our own URL-policy refusal and unparseable/unexpected pages are dead letters that stay visible
      (retrying cannot help; parser-health metrics record them).
+
+A budget-gate or host-budget refusal BEFORE the fetch (Retry-After/backoff window, circuit, daily
+budget, per-run cap, a host-spacing wait longer than the inline limit) fetched nothing: the job is
+released back to ``queued`` at the gate's time WITHOUT consuming an attempt
+(`apply_budget_refusal` -> `jobs.release`, audited with the code), so budget pressure never turns
+a detail job into a dead letter. An access-blocked host still blocks the job.
 """
 
 from __future__ import annotations
@@ -39,12 +45,14 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict
 
 from suv_deals.adapters.base import ParsedListing, RawDocument
+from suv_deals.crawling.policy_client import BudgetRefused
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import AccessState, JobState
 from suv_deals.errors import SourcePaused, ValidationFailed
 from suv_deals.observability.logging import log_context
-from suv_deals.persistence import listings_repo, sources_repo, storage
+from suv_deals.persistence import jobs, listings_repo, sources_repo, storage
 from suv_deals.persistence.database import Conn
+from suv_deals.persistence.jobs import ClaimedJob
 from suv_deals.persistence.listings_repo import DetailSnapshotRef, IngestDetailResult, ListingRecord
 from suv_deals.persistence.sources_repo import SourceRecord, SourceRoute
 from suv_deals.persistence.storage import StoredObject
@@ -58,6 +66,7 @@ from suv_deals.workers.runtime import (
     apply_disposition,
     backoff_delay,
     call_with_budget,
+    refusal_disposition,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +109,24 @@ def _retry_at(
     return backoff_delay(attempt)
 
 
+async def apply_budget_refusal(
+    conn: Conn, job: ClaimedJob, refusal: BudgetRefused, actor: ActorContext
+) -> tuple[JobState, str | None]:
+    """The fenced outcome of a job whose request the budget gate refused (nothing was fetched).
+
+    An access-blocked host blocks the job (``host_access_blocked``, no timer). Every other refusal
+    releases the job to ``queued`` at the gate's time (Retry-After, backoff, circuit, daily budget
+    or the per-run cap window; `workers.runtime.refusal_disposition`) WITHOUT consuming an attempt
+    (`jobs.release`, audited with the code). Run inside the job's unit of work.
+    """
+    disposition = refusal_disposition(refusal, job.attempts)
+    if disposition.kind != "retry":
+        return await apply_disposition(conn, job, disposition), disposition.code
+    code = disposition.code or "BUDGET_REFUSED"
+    await jobs.release(conn, job, available_at=disposition.retry_at, code=code, actor=actor)
+    return JobState.QUEUED, code
+
+
 def classify(
     session: CrawlSession, source: SourceRecord, document: RawDocument, parsed: ParsedListing, attempt: int
 ) -> Disposition | None:
@@ -136,9 +163,12 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
     adapter = session.adapter
     with log_context(source_key=source.source_key, adapter_version=adapter.adapter_version):
         identity = adapter.canonicalize(listing.canonical_url)
-        document = await call_with_budget(
-            ctx, execution, partial(adapter.fetch_detail, identity, session.client)
-        )
+        try:
+            document = await call_with_budget(
+                ctx, execution, partial(adapter.fetch_detail, identity, session.client)
+            )
+        except BudgetRefused as refused:
+            return await _release_refused(ctx, execution, refused, listing.id)
         parsed = adapter.parse_detail(document)
         ctx.metrics.record_fetch(
             source.source_key,
@@ -215,6 +245,21 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
     )
 
 
+async def _release_refused(
+    ctx: RuntimeContext, execution: JobExecution, refused: BudgetRefused, listing_id: UUID
+) -> JobOutcome:
+    """Nothing was fetched: release (or block) the job in its own fenced unit of work."""
+
+    async def commit() -> tuple[JobState, str | None]:
+        execution.check_lease()
+        async with job_unit_of_work(ctx.db, execution.job) as (conn, _locked):
+            return await apply_budget_refusal(conn, execution.job, refused, execution.actor)
+
+    state, code = await retry_transient(commit)
+    logger.info("detail fetch refused by the budget gate", extra={"code": code, "state": state.value})
+    return JobOutcome(state=state, code=code, details={"listing_id": str(listing_id)})
+
+
 async def _preflight(
     ctx: RuntimeContext, actor: ActorContext, listing_id: UUID
 ) -> tuple[ListingRecord, SourceRecord]:
@@ -287,4 +332,4 @@ async def _record_fetch(
         return None
 
 
-__all__ = ["CARD_ONLY_SKIP", "DetailPayload", "classify", "handle_detail"]
+__all__ = ["CARD_ONLY_SKIP", "DetailPayload", "apply_budget_refusal", "classify", "handle_detail"]

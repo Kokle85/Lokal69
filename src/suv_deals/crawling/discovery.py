@@ -11,8 +11,10 @@ Three phases, never holding a transaction across network I/O:
    persisted.
 2. **Network** (no transaction): the adapter fetches page after page through the policy-enforcing
    client (URL policy, `DbBudgetGate`, DNS check, redirect validation), within the source's per-run
-   page budget. A short minimum-delay wait is waited out (`call_with_budget`); any other budget
-   refusal stops the traversal. A non-OK page stops it too.
+   page budget -- or the job payload's optional ``max_pages`` (``suv-deals crawl once``), which can
+   only LOWER it; the cap travels with the job, so it holds for whichever worker claims it. A short
+   minimum-delay wait is waited out (`call_with_budget`); any other budget refusal stops the
+   traversal. A non-OK page stops it too.
 3. **Commit** (one short transaction, re-run only after a proven rollback): the job row is locked
    and revalidated first; an access block is recorded on the source (``access_blocked`` + one
    deduplicated operational review item) BEFORE listing rows are touched (global lock order);
@@ -24,7 +26,10 @@ Three phases, never holding a transaction across network I/O:
    runs back the schedule off); and the job outcome is written by the fenced update. A late worker
    whose lease was lost cannot commit any of it (`LeaseLost` rolls everything back).
 
-Outcomes: access blocked -> job ``blocked`` (``access_blocked``, never retried); 429 on the first page
+Outcomes: access blocked -> job ``blocked`` (``access_blocked``, never retried); a budget-gate or
+host-budget refusal before the first page (nothing fetched) -> the job is released to ``queued`` at the
+gate's time WITHOUT consuming an attempt (`detail.apply_budget_refusal` -> `jobs.release`; an
+access-blocked host blocks it); 429 on the first page
 -> ``retry_wait`` at the gate's Retry-After-respecting time; transient first-page failure ->
 ``retry_wait`` with the gate's backoff; unexpected content / policy refusal -> the job completes with
 a failed traversal (retrying would not help; the schedule backs off and parser health records it);
@@ -43,9 +48,10 @@ from typing import Any, Final, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from suv_deals.adapters.base import DiscoveryPage, ParseOutcome, ParserHealth, SearchRequest
+from suv_deals.crawling.detail import apply_budget_refusal
 from suv_deals.crawling.policy_client import BudgetRefused
 from suv_deals.crawling.rate_limits import Deny, DenyReason
 from suv_deals.domain.actor import ActorContext
@@ -68,7 +74,6 @@ from suv_deals.workers.runtime import (
     apply_disposition,
     backoff_delay,
     call_with_budget,
-    refusal_disposition,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,10 +81,13 @@ logger = logging.getLogger(__name__)
 #: Spec 9 PROPOSED overlap for provider watermarks (engineering default).
 WATERMARK_OVERLAP: Final = timedelta(hours=48)
 DEFAULT_PARTITION: Final = "default"
+#: Upper bound of a payload page cap (the source's per-run budget always applies as well).
+MAX_PAGE_CAP: Final = 1000
 
 
 class DiscoveryPayload(BaseModel):
-    """The payload `sources_repo.advance_schedule` writes (unknown keys are ignored)."""
+    """The payload `sources_repo.advance_schedule` (or ``suv-deals crawl once``) writes; unknown keys
+    are ignored. ``max_pages`` can only LOWER the source's ``max_search_pages_per_run``."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
@@ -90,6 +98,7 @@ class DiscoveryPayload(BaseModel):
     coverage_mode: CoverageMode | None = None
     slot: datetime | None = None
     complete_watermark: datetime | None = None
+    max_pages: int | None = Field(default=None, ge=1, le=MAX_PAGE_CAP)
 
 
 @dataclass(slots=True)
@@ -117,7 +126,10 @@ class Traversal:
 async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
     job = execution.job
     actor = execution.actor
-    payload = DiscoveryPayload.model_validate(job.payload)
+    try:
+        payload = DiscoveryPayload.model_validate(job.payload)
+    except ValidationError:
+        raise ValidationFailed("the discovery job payload is invalid") from None
     source_id = job.source_id or payload.source_id
     profile_id = job.profile_id or payload.profile_id
     if source_id is None or profile_id is None:
@@ -160,6 +172,7 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
             profile=profile,
             watermark_from=watermark_from,
             partition_key=partition,
+            max_pages=payload.max_pages,
         )
         health = _health_status(session, source, traversal)
         outcome = await _commit(
@@ -233,11 +246,16 @@ async def traverse(
     profile: SearchProfile,
     watermark_from: datetime | None,
     partition_key: str = DEFAULT_PARTITION,
+    max_pages: int | None = None,
 ) -> Traversal:
-    """Fetch search pages within the per-run page budget (see module docstring)."""
+    """Fetch search pages within the per-run page budget (see module docstring).
+
+    ``max_pages`` (the job payload's cap) can only lower the source's per-run page budget.
+    """
     adapter = session.adapter
     result = Traversal()
-    max_pages = source.rate_budget().max_search_pages_per_run
+    budget = source.rate_budget().max_search_pages_per_run
+    page_cap = budget if max_pages is None else max(1, min(max_pages, budget))
 
     def build(cursor: str | None) -> SearchRequest:
         # Every page of the traversal keeps the partition and the watermark filter.
@@ -299,10 +317,10 @@ async def traverse(
                     + (f" ({page.access_evidence})" if page.access_evidence else "")
                 )
             return result
-        if len(result.ok_pages) >= max_pages:
+        if len(result.ok_pages) >= page_cap:
             result.completeness = Completeness.BUDGET_LIMITED
             result.cursor = _cursor(page, current)
-            result.gap_reasons.append(f"page budget of {max_pages} search page(s) per run reached")
+            result.gap_reasons.append(f"page budget of {page_cap} search page(s) per run reached")
             return result
         next_cursor = page.next_url or page.next_cursor
         try:
@@ -361,8 +379,7 @@ def _retry_time(
 def _disposition(
     session: CrawlSession, source: SourceRecord, traversal: Traversal, attempt: int, result: dict[str, Any]
 ) -> Disposition:
-    if traversal.refusal is not None:
-        return refusal_disposition(traversal.refusal, attempt)
+    """The outcome of a traversal that fetched something (budget refusals: `apply_budget_refusal`)."""
     failure = traversal.failure
     if failure is not None and failure.access_state == AccessState.ACCESS_BLOCKED:
         return Disposition.blocked(
@@ -430,7 +447,7 @@ async def _commit(
         error_code=None if traversal.failure is None else traversal.failure.fetch.error_code,
     )
 
-    async def commit() -> tuple[list[IngestReport], Disposition, JobState]:
+    async def commit() -> tuple[list[IngestReport], str | None, JobState]:
         execution.check_lease()
         async with job_unit_of_work(ctx.db, job) as (conn, _locked):
             failure = traversal.failure
@@ -464,16 +481,20 @@ async def _commit(
                 "new_listings": sum(r.new_listings for r in reports),
                 "detail_jobs": sum(len(r.detail_jobs) for r in reports),
             }
+            if traversal.refusal is not None:
+                # Nothing was fetched: released without consuming an attempt (or blocked).
+                state, code = await apply_budget_refusal(conn, job, traversal.refusal, actor)
+                return reports, code, state
             disposition = _disposition(session, source, traversal, job.attempts, result)
             # The applied state, not the requested kind: an exhausted retry is a dead letter.
             state = await apply_disposition(conn, job, disposition)
-        return reports, disposition, state
+        return reports, disposition.code, state
 
-    reports, disposition, state = await retry_transient(commit)
+    reports, code, state = await retry_transient(commit)
     _record_metrics(ctx, source, traversal, reports)
     return JobOutcome(
         state=state,
-        code=disposition.code,
+        code=code,
         details={"run_id": str(run.id), "completeness": str(final), "pages": len(traversal.pages)},
     )
 
@@ -560,6 +581,7 @@ async def _mark_absences(ctx: RuntimeContext, actor: ActorContext, run_id: UUID)
 
 
 __all__ = [
+    "MAX_PAGE_CAP",
     "WATERMARK_OVERLAP",
     "DiscoveryPayload",
     "Traversal",

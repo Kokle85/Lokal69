@@ -165,11 +165,13 @@ def test_crawl_once_refuses_an_access_blocked_source(
 
 
 @pytest.mark.db
-def test_crawl_once_cancels_its_job_when_another_job_is_claimed_first(
+def test_crawl_once_page_cap_holds_for_a_job_claimed_by_another_worker(
     run_cli: Cli, db_env: dict[str, str], workspace: UUID, seed: Seed, tmp_path: Path
 ) -> None:
-    """The page cap exists only in-process: a job this command did not run must not stay queued
-    for a background worker, which would run it with the source's full per-run page budget."""
+    """The page cap travels with the job (``payload.max_pages``): when this command does not get
+    its own job, the job stays queued and ANY worker that claims it later (here a plain
+    ``suv-deals worker --drain``) still fetches at most ``--max-pages`` pages, although the source's
+    own per-run budget allows more and more fixture pages exist."""
     env = {**db_env, "CONFIG_DIR": str(_config_with(tmp_path)), "LOG_LEVEL": "WARNING"}
     ws = str(workspace)
     assert run_cli("sources", "sync", "--workspace", ws, "--yes", env=env).exit_code == 0
@@ -179,6 +181,11 @@ def test_crawl_once_cancels_its_job_when_another_job_is_claimed_first(
         "select id from app.sources where workspace_id = %s and source_key = 'fixture_dealer_de'",
         (workspace,),
     )
+    budget = seed.scalar(
+        "select (config -> 'rate_budget' ->> 'max_search_pages_per_run')::int from app.sources where id = %s",
+        (source_id,),
+    )
+    assert budget is not None and budget >= 2  # the source alone would allow more than one page
     profile_id = seed.scalar(
         "select id from app.search_profiles where workspace_id = %s and profile_key = 'primary'", (workspace,)
     )
@@ -199,7 +206,11 @@ def test_crawl_once_cancels_its_job_when_another_job_is_claimed_first(
     )
     assert result.exit_code == 1, result.output
     assert f"another due discovery job ({earlier}) was claimed first" in result.output
-    assert "was cancelled so that no other worker runs it without the page cap" in result.output
+    assert "keeps its cap of 1 page(s)" in result.output
+    cli_job = seed.scalar(
+        "select id from ops.jobs where workspace_id = %s and job_type = 'discovery' and id <> %s",
+        (workspace, earlier),
+    )
     states = dict(
         seed.conn.execute(
             "select case when id = %s then 'earlier' else 'cli' end, state from ops.jobs"
@@ -207,11 +218,20 @@ def test_crawl_once_cancels_its_job_when_another_job_is_claimed_first(
             (earlier, workspace),
         ).fetchall()
     )
-    assert states == {"earlier": "succeeded", "cli": "cancelled"}
-    assert (
-        seed.scalar(
-            "select count(*) from ops.audit_events where workspace_id = %s and action = 'job.cancel'",
-            (workspace,),
-        )
-        == 1
-    )
+    assert states == {"earlier": "succeeded", "cli": "queued"}
+    assert seed.scalar("select (payload ->> 'max_pages')::int from ops.jobs where id = %s", (cli_job,)) == 1
+    # A plain worker (no command-line cap anywhere) claims the left-over job: the cap still holds.
+    drained = run_cli("worker", "--queues", "discovery", "--drain", env=env)
+    assert drained.exit_code == 0, drained.output
+    assert str(cli_job) in drained.output
+    run = seed.conn.execute(
+        "select outcome, pages_fetched from ops.crawl_runs where workspace_id = %s and job_id = %s",
+        (workspace, cli_job),
+    ).fetchall()
+    assert run == [("budget_limited", 1)]
+    earlier_run = seed.conn.execute(
+        "select pages_fetched from ops.crawl_runs where workspace_id = %s and job_id = %s",
+        (workspace, earlier),
+    ).fetchall()
+    assert earlier_run and earlier_run[0][0] >= 2  # the uncapped job used the source's own budget
+    assert seed.scalar("select state from ops.jobs where id = %s", (cli_job,)) == "succeeded"

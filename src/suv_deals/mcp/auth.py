@@ -26,10 +26,12 @@ passed through to Supabase, Slack or any other service. One mode per deployment
 
 ``static_bearer`` (`CredentialVerifier`)
     An opaque ``suvmcp_<64 hex>`` token looked up by its SHA-256 hash in ``ops.api_credentials``
-    (RLS ``credential_lookup`` through the ``app.credential_hash`` GUC): unrevoked, unexpired,
-    of kind ``static_bearer``, with the stored workspace, principal, role and scopes. A user
-    credential never outlives the user's active membership (or role). This is a scoped private
-    credential, **not** OAuth compliance, and no OAuth discovery is advertised for it.
+    (``persistence.credentials_repo.authenticate``; RLS ``credential_lookup`` through the
+    ``app.credential_hash`` GUC): unrevoked, unexpired, of kind ``static_bearer``, with the stored
+    workspace, principal, role and scopes. A user credential never outlives the user's active
+    membership (or role). This is a scoped private credential, **not** OAuth compliance, and no
+    OAuth discovery is advertised for it. Mailbox-worker credentials (``suvmail_``) are never
+    accepted here.
 
 ``dev_local`` (`CredentialVerifier`)
     Like ``static_bearer`` but for ``suvdev_`` credentials of kind ``dev_local``, and only when
@@ -42,19 +44,19 @@ effective on MCP. Every rejection is the same ``401`` (the reason is only a metr
 log field); an unreachable JWKS endpoint or database is ``DependencyUnavailable`` (``503``),
 never a ``401``.
 
-`issue_api_credential` creates a credential for the CLI: it returns the token exactly once and
-stores only its hash. `revoke_api_credential` revokes one immediately.
+`issue_api_credential` creates an MCP credential (``static_bearer``/``dev_local`` only; delegates to
+``persistence.credentials_repo.issue_credential``): it returns the token exactly once and stores
+only its hash. `revoke_api_credential` revokes one immediately. All credential SQL lives in
+``persistence.credentials_repo``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
-import secrets
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -72,16 +74,23 @@ from jwt.exceptions import (
 )
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict
 
 from suv_deals.api.auth import SigningKeyResolver, StaticJwks, supabase_issuer
-from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
 from suv_deals.domain.enums import Role, Scope
-from suv_deals.errors import AppError, DependencyUnavailable, Forbidden, NotFound, ValidationFailed
+from suv_deals.errors import AppError, DependencyUnavailable, ValidationFailed
 from suv_deals.observability.metrics import AppMetrics
-from suv_deals.persistence import audit, workspaces
-from suv_deals.persistence.database import Conn, Database, fetch_one
+from suv_deals.persistence import credentials_repo, workspaces
+from suv_deals.persistence.credentials_repo import (
+    DEFAULT_CREDENTIAL_LIFETIME,
+    MAX_CREDENTIAL_LIFETIME,
+    IssuedCredential,
+    RejectionReason,
+    VerifiedCredential,
+    hash_token,
+)
+from suv_deals.persistence.database import Conn, Database
 from suv_deals.persistence.errors_map import mapped_errors
 from suv_deals.settings import Settings
 
@@ -95,7 +104,7 @@ DenialReason = Literal[
 ]
 
 #: Scopes that can be effective on the MCP surface (config:admin and mail:ingest never are).
-MCP_SCOPES: Final = frozenset(s for s in Scope if s not in (Scope.CONFIG_ADMIN, Scope.MAIL_INGEST))
+MCP_SCOPES: Final = credentials_repo.BEARER_SCOPES
 #: Scopes advertised in protected-resource metadata and challenges (the spec 20 MCP scopes).
 ADVERTISED_SCOPES: Final[tuple[Scope, ...]] = (
     Scope.DEALS_READ,
@@ -116,19 +125,28 @@ JWKS_REFRESH_COOLDOWN_SECONDS: Final = 30
 JWKS_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_WORKSPACE_CLAIM: Final = "workspace_id"
 REQUIRED_JWT_CLAIMS: Final = ("exp", "iat", "iss", "aud", "sub")
-TOKEN_PREFIXES: Final[Mapping[CredentialKind, str]] = {"static_bearer": "suvmcp", "dev_local": "suvdev"}
-DEFAULT_CREDENTIAL_LIFETIME: Final = timedelta(days=90)
-MAX_CREDENTIAL_LIFETIME: Final = timedelta(days=365)
-CREDENTIAL_TOUCH_INTERVAL: Final = timedelta(minutes=1)
+#: The MCP credential kinds and their token prefixes (``mail_worker`` is never an MCP credential).
+TOKEN_PREFIXES: Final[Mapping[CredentialKind, str]] = {
+    "static_bearer": credentials_repo.TOKEN_PREFIXES["static_bearer"],
+    "dev_local": credentials_repo.TOKEN_PREFIXES["dev_local"],
+}
+CREDENTIAL_TOUCH_INTERVAL: Final = credentials_repo.DEFAULT_TOUCH_INTERVAL
 LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _COMPACT_JWS: Final = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
-_CREDENTIAL_TOKEN: Final = re.compile(r"^(suvmcp|suvdev)_([0-9a-f]{64})$")
 _UUID_RE: Final = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _CLIENT_ID_RE: Final = re.compile(r"^[\x21-\x7e]{1,200}$")
-_LABEL_CONTROL_RE: Final = re.compile("[\\x00-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]")
 _ROLE_RANK: Final[Mapping[Role, int]] = {Role.VIEWER: 0, Role.REVIEWER: 1, Role.OWNER: 2}
-_KIND_BY_PREFIX: Final[Mapping[str, CredentialKind]] = {v: k for k, v in TOKEN_PREFIXES.items()}
+#: Repository rejection reasons -> the MCP denial label (every rejection is the same 401).
+_DENIAL_BY_REJECTION: Final[Mapping[RejectionReason, DenialReason]] = {
+    "invalid_token": "invalid_token",
+    "revoked": "revoked",
+    "expired_token": "expired_token",
+    "insufficient_scope": "invalid_token",
+    "wrong_workspace": "invalid_token",
+    "wrong_principal": "invalid_token",
+    "workspace_inactive": "not_member",
+}
 
 
 class McpAuthConfigError(ValueError):
@@ -192,11 +210,6 @@ def current_principal() -> McpPrincipal | None:
     """The verified principal of the current MCP request (``None`` when unauthenticated)."""
     token = get_access_token()
     return token.principal if isinstance(token, McpAccessToken) else None
-
-
-def hash_token(token: str) -> str:
-    """SHA-256 hex of a presented credential (what ``ops.api_credentials.token_hash`` stores)."""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def effective_scopes(granted: Iterable[Scope], *roles: Role) -> frozenset[Scope]:
@@ -535,18 +548,6 @@ class OAuthJwtVerifier:
 # Static bearer and local development credentials
 # --------------------------------------------------------------------------------------------
 
-_CREDENTIAL_SQL: Final = (
-    "select id, workspace_id, principal_id, principal_kind, role, credential_kind, scopes, expires_at,"
-    " revoked_at, last_used_at, clock_timestamp() as now from ops.api_credentials"
-    " where token_hash = %(hash)s"
-)
-_WORKSPACE_ACTIVE_SQL: Final = "select active from app.workspaces where id = %(ws)s"
-_TOUCH_SQL: Final = (
-    "update ops.api_credentials set last_used_at = clock_timestamp()"
-    " where workspace_id = %(ws)s and id = %(id)s"
-    " and (last_used_at is null or last_used_at < clock_timestamp() - %(interval)s::interval)"
-)
-
 
 def _lower_role(a: Role, b: Role) -> Role:
     return a if _ROLE_RANK[a] <= _ROLE_RANK[b] else b
@@ -586,36 +587,27 @@ class CredentialVerifier:
             raise _unavailable(exc) from None
 
     async def _verify(self, token: str) -> McpAccessToken:
-        match = _CREDENTIAL_TOKEN.fullmatch(token) if isinstance(token, str) else None
-        if match is None:
+        kind = credentials_repo.token_kind(token)
+        if kind is None or kind not in self.kinds:
             raise _Rejected("invalid_token")
-        kind = _KIND_BY_PREFIX[match.group(1)]
-        if kind not in self.kinds:
-            raise _Rejected("invalid_token")
-        digest = hash_token(token)
         async with mapped_errors(), self._db.transaction() as conn, mapped_errors():
-            await conn.execute("select set_config('app.credential_hash', %s, true)", (digest,))
-            row = await fetch_one(conn, _CREDENTIAL_SQL, {"hash": digest})
-            if row is None or row["credential_kind"] != kind:
-                raise _Rejected("invalid_token")
-            if row["revoked_at"] is not None:
-                raise _Rejected("revoked")
-            expires_at = ensure_utc(row["expires_at"])
-            if expires_at <= ensure_utc(row["now"]):
-                raise _Rejected("expired_token")
-            ws: UUID = row["workspace_id"]
-            await conn.execute("select set_config('app.workspace_id', %s, true)", (str(ws),))
-            principal = await self._principal(conn, row, kind)
-            await conn.execute(_TOUCH_SQL, {"ws": ws, "id": row["id"], "interval": self._touch_interval})
-        return _token(principal, raw=token, expires_at=int(expires_at.timestamp()), resource=self.resource)
+            try:
+                verified = await credentials_repo.authenticate(conn, token, kinds=self.kinds)
+            except credentials_repo.CredentialRejected as exc:
+                raise _Rejected(_DENIAL_BY_REJECTION[exc.reason]) from None
+            principal = await self._principal(conn, verified)
+            await credentials_repo.touch_last_used(conn, verified, interval=self._touch_interval)
+        return _token(
+            principal, raw=token, expires_at=int(verified.expires_at.timestamp()), resource=self.resource
+        )
 
-    async def _principal(self, conn: Conn, row: Mapping[str, Any], kind: CredentialKind) -> McpPrincipal:
-        ws: UUID = row["workspace_id"]
-        principal_id: UUID = row["principal_id"]
-        credential_role = Role(row["role"])
-        granted = frozenset(Scope(s) for s in row["scopes"] if s in {x.value for x in Scope})
-        mode: AuthMode = "static_bearer" if kind == "static_bearer" else "dev_local"
-        if row["principal_kind"] == "user":
+    async def _principal(self, conn: Conn, verified: VerifiedCredential) -> McpPrincipal:
+        ws = verified.workspace_id
+        principal_id = verified.principal_id
+        credential_role = verified.role
+        granted = verified.scopes
+        mode: AuthMode = "static_bearer" if verified.credential_kind == "static_bearer" else "dev_local"
+        if verified.principal_kind == "user":
             membership = await workspaces.get_membership(conn, ws, principal_id)
             if membership is None or not membership.active or not membership.workspace_active:
                 raise _Rejected("not_member")
@@ -623,9 +615,6 @@ class CredentialVerifier:
             scopes = effective_scopes(granted, credential_role, membership.role)
             principal_kind: McpPrincipalKind = "user"
         else:
-            workspace = await fetch_one(conn, _WORKSPACE_ACTIVE_SQL, {"ws": ws})
-            if workspace is None or not workspace["active"]:
-                raise _Rejected("not_member")
             role = credential_role
             scopes = effective_scopes(granted, credential_role)
             principal_kind = "mcp_client"
@@ -638,8 +627,8 @@ class CredentialVerifier:
             role=role,
             scopes=scopes,
             auth_mode=mode,
-            client_id=f"credential:{row['id']}",
-            credential_id=row["id"],
+            client_id=f"credential:{verified.credential_id}",
+            credential_id=verified.credential_id,
         )
 
 
@@ -663,39 +652,6 @@ def dev_local_problem(settings: Settings) -> str | None:
 # --------------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class IssuedCredential:
-    """A newly created credential. ``token`` is shown exactly once and never stored."""
-
-    credential_id: UUID
-    workspace_id: UUID
-    principal_id: UUID
-    principal_kind: McpPrincipalKind
-    role: Role
-    scopes: tuple[Scope, ...]
-    kind: CredentialKind
-    token_prefix: str
-    expires_at: datetime
-    token: SecretStr
-
-
-def _require_credential_admin(actor: ActorContext) -> None:
-    """Credential administration: the operator CLI (system actor) or a signed-in owner with
-    ``config:admin``; never an MCP client."""
-    if actor.principal_kind == "system":
-        return
-    actor.require(Scope.CONFIG_ADMIN)
-    if actor.principal_kind != "user" or actor.role != Role.OWNER:
-        raise Forbidden("Only the owner may manage API credentials")
-
-
-def _label(label: str) -> str:
-    text = label.strip() if isinstance(label, str) else ""
-    if not 1 <= len(text) <= 120 or _LABEL_CONTROL_RE.search(text):
-        raise ValidationFailed("label must be 1-120 printable characters", details={"fields": ["label"]})
-    return text
-
-
 async def issue_api_credential(
     conn: Conn,
     actor: ActorContext,
@@ -710,94 +666,25 @@ async def issue_api_credential(
 ) -> IssuedCredential:
     """Create one MCP credential in ``actor``'s workspace and return its token ONCE.
 
-    Only the SHA-256 hash is stored. Scopes must be MCP scopes within the role (``mail:ingest``
-    and ``config:admin`` are refused); a user credential needs an active membership whose role
-    allows the scopes. Run inside ``unit_of_work(db, actor)``.
+    Only ``static_bearer``/``dev_local`` (``kind`` otherwise is ``VALIDATION_ERROR``); the rules
+    and the storage are ``persistence.credentials_repo.issue_credential`` (only the SHA-256 hash
+    is stored; scopes must be MCP scopes within the role, ``mail:ingest`` and ``config:admin``
+    are refused; a user credential needs an active membership whose role allows the scopes).
+    Run inside ``unit_of_work(db, actor)``.
     """
-    _require_credential_admin(actor)
-    wanted = frozenset(Scope(s) for s in scopes)
-    role = Role(role)
-    if not wanted or not wanted <= MCP_SCOPES or not wanted <= ROLE_SCOPES[role]:
-        raise ValidationFailed(
-            "scopes must be MCP scopes allowed for the role", details={"fields": ["scopes"]}
-        )
-    if principal_kind not in ("user", "mcp_client"):
-        raise ValidationFailed(
-            "principal_kind must be user or mcp_client", details={"fields": ["principal_kind"]}
-        )
+    credentials_repo.require_credential_admin(actor)
     if kind not in TOKEN_PREFIXES:
-        raise ValidationFailed("unknown credential kind", details={"fields": ["kind"]})
-    if not timedelta(0) < lifetime <= MAX_CREDENTIAL_LIFETIME:
-        raise ValidationFailed(
-            "lifetime must be positive and at most 365 days", details={"fields": ["lifetime"]}
-        )
-    text = _label(label)
-    membership = await workspaces.get_membership(conn, actor.workspace_id, principal_id)
-    if principal_kind == "user":
-        if membership is None or not membership.active or not wanted <= ROLE_SCOPES[membership.role]:
-            raise NotFound("No active membership allows these scopes")
-    elif membership is not None:
-        # A machine credential must never act under a member's identity (claims, idempotency
-        # records, notes and subscriptions are keyed by principal id).
-        raise ValidationFailed(
-            "principal_id of an mcp_client credential must not be a workspace member",
-            details={"fields": ["principal_id"]},
-        )
-    random_part = secrets.token_hex(32)
-    prefix = TOKEN_PREFIXES[kind]
-    token = f"{prefix}_{random_part}"
-    token_prefix = f"{prefix}_{random_part[:6]}"
-    ordered = tuple(s for s in Scope if s in wanted)
-    async with mapped_errors():
-        row = await fetch_one(
-            conn,
-            "insert into ops.api_credentials (workspace_id, principal_id, principal_kind, role,"
-            " credential_kind, token_hash, token_prefix, scopes, label, expires_at, created_by)"
-            " values (%(ws)s, %(principal)s, %(kind)s, %(role)s, %(credential_kind)s, %(hash)s,"
-            " %(prefix)s, %(scopes)s, %(label)s, clock_timestamp() + %(lifetime)s::interval, %(by)s)"
-            " returning id, expires_at",
-            {
-                "ws": actor.workspace_id,
-                "principal": principal_id,
-                "kind": principal_kind,
-                "role": role.value,
-                "credential_kind": kind,
-                "hash": hash_token(token),
-                "prefix": token_prefix,
-                "scopes": [s.value for s in ordered],
-                "label": text,
-                "lifetime": lifetime,
-                "by": actor.principal_id,
-            },
-        )
-        assert row is not None
-        await audit.record(
-            conn,
-            actor,
-            "credential.create",
-            "api_credential",
-            row["id"],
-            None,
-            1,
-            metadata={
-                "credential_kind": kind,
-                "principal_kind": principal_kind,
-                "role": role.value,
-                "scopes": [s.value for s in ordered],
-                "token_prefix": token_prefix,
-            },
-        )
-    return IssuedCredential(
-        credential_id=row["id"],
-        workspace_id=actor.workspace_id,
+        raise ValidationFailed("unknown MCP credential kind", details={"fields": ["kind"]})
+    return await credentials_repo.issue_credential(
+        conn,
+        actor,
         principal_id=principal_id,
         principal_kind=principal_kind,
         role=role,
-        scopes=ordered,
+        scopes=scopes,
+        label=label,
         kind=kind,
-        token_prefix=token_prefix,
-        expires_at=ensure_utc(row["expires_at"]),
-        token=SecretStr(token),
+        lifetime=lifetime,
     )
 
 
@@ -806,28 +693,7 @@ async def revoke_api_credential(conn: Conn, actor: ActorContext, credential_id: 
 
     The next request with that token is ``401``. Unknown or foreign ids are `NotFound`.
     """
-    _require_credential_admin(actor)
-    text = reason.strip() if isinstance(reason, str) else ""
-    if not 3 <= len(text) <= 500 or _LABEL_CONTROL_RE.search(text):
-        raise ValidationFailed("reason must be 3-500 printable characters", details={"fields": ["reason"]})
-    async with mapped_errors():
-        existing = await fetch_one(
-            conn,
-            "select id, revoked_at from ops.api_credentials where workspace_id = %(ws)s and id = %(id)s"
-            " for update",
-            {"ws": actor.workspace_id, "id": credential_id},
-        )
-        if existing is None:
-            raise NotFound("Credential not found")
-        if existing["revoked_at"] is not None:
-            return False
-        await conn.execute(
-            "update ops.api_credentials set revoked_at = clock_timestamp(), revoked_by = %(by)s,"
-            " revoke_reason = %(reason)s where workspace_id = %(ws)s and id = %(id)s",
-            {"ws": actor.workspace_id, "id": credential_id, "by": actor.principal_id, "reason": text},
-        )
-        await audit.record(conn, actor, "credential.revoke", "api_credential", credential_id, reason=text)
-    return True
+    return await credentials_repo.revoke_credential(conn, actor, credential_id, reason=reason)
 
 
 __all__ = [

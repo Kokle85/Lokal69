@@ -5,8 +5,9 @@ and the deduplicated recomputation jobs of reverse invalidation (`valuation_repo
 `invalidate_dependents`). Every job values the listing's CURRENT revision; nothing here performs
 network I/O.
 
-1. **Read** (short transaction): the current revision and its committed screening, the source (a
-   ``mode: fixture`` source makes every result a fixture), the business configuration, MK comparable
+1. **Read** (short transaction): the current revision and its committed screening, the source,
+   the fixture lineage (the listing's frozen ``is_fixture`` from ingest; a source that is CURRENTLY
+   ``mode: fixture`` also makes the result a fixture, fail-safe), the business configuration, MK comparable
    candidates of the same fixture lineage (`market_repo.list_candidate_comparables`, year window
    including the one permitted widening step), ONE latest reference FX observation per currency that
    is needed (comparable currencies, the purchase currency, the tax rule currency), and the ACTIVE tax
@@ -24,8 +25,12 @@ network I/O.
      tax engine's lines; `compute_scenarios` with the asking price as an ESTIMATED purchase and the
      comparable-based proceeds;
    - `assemble_valuation`: state, unknowns, dependency fingerprint and expiry; fixtures stay fixtures.
-3. **Commit** (one short transaction, the job row locked first): the comparable set, the valuation
-   (`persist_valuation` checks every reference against the fingerprint), the transparent ranking, the
+3. **Commit** (one short transaction, the job row locked first, then the listing): when a newer
+   revision was promoted while the calculation ran (`valuation_repo.lock_current_revision`), the job
+   completes as a successful no-op (``skipped: revision_superseded``; that revision's own valuation
+   job values it) and nothing is stored -- no extra open valuation row. Otherwise the comparable
+   set, the valuation (`persist_valuation` with ``require_current_revision`` checks every
+   reference against the fingerprint), the transparent ranking, the
    review case of every enabled profile (`reviews_repo.upsert_review_case`: a qualifying revision
    creates/updates the pending case and writes the ``review.pending`` outbox event in the SAME
    transaction -- blocked fixture events for fixture data; a revision that no longer qualifies
@@ -183,6 +188,8 @@ async def handle_valuation(ctx: RuntimeContext, execution: JobExecution) -> JobO
     stored_profile = await ensure_cost_profile(ctx, actor, profile)
     with log_context(source_key=reads.source.source_key):
         run = await _value_and_commit(ctx, execution, reads, stored_profile)
+    if run.skipped is not None:
+        return JobOutcome(state=JobState.SUCCEEDED, details={"skipped": run.skipped})
     case_ids = [str(c.case_id) for c in run.cases if c.case_id is not None]
     logger.info(
         "valuation recorded",
@@ -228,7 +235,8 @@ async def _read(
             return None, "quarantined"
         normalized = revision.listing()
         source = await sources_repo.get_source_record(conn, actor, listing.source_id)
-        is_fixture = source.mode == SourceMode.FIXTURE
+        # Lineage frozen at ingest; a source that is now fixture also taints new results (fail-safe).
+        is_fixture = listing.is_fixture or source.mode == SourceMode.FIXTURE
         config_record, config = await config_repo.current_config(conn, actor)
         as_of = ensure_utc(await db_now(conn))
         target = ComparableTarget.from_listing(normalized, listing_id=listing.id, is_fixture=is_fixture)
@@ -348,6 +356,16 @@ def _content_sha(profile: CostProfile) -> str:
 # --------------------------------------------------------------------------------------------
 # Compute + commit
 # --------------------------------------------------------------------------------------------
+
+
+def _superseded_result(superseded: valuation_repo.SupersededRevision) -> dict[str, str | None]:
+    return {
+        "skipped": superseded.reason,
+        "cited_revision_id": str(superseded.cited_revision_id),
+        "current_revision_id": None
+        if superseded.current_revision_id is None
+        else str(superseded.current_revision_id),
+    }
 
 
 def _purchase(screening: ScreeningResult, revision_id: UUID) -> PurchaseInput:
@@ -491,6 +509,13 @@ async def _value_and_commit(
     async def commit() -> ValuationRun:
         execution.check_lease()
         async with job_unit_of_work(ctx.db, job) as (conn, _locked):
+            # Lock order: job -> listing. A revision promoted while we computed makes this a no-op.
+            superseded = await valuation_repo.lock_current_revision(
+                conn, actor, reads.listing.id, revision.id
+            )
+            if superseded is not None:
+                await apply_disposition(conn, job, Disposition.complete(_superseded_result(superseded)))
+                return ValuationRun(valuation_id=None, state=None, cases=(), skipped=superseded.reason)
             stored_set = (
                 None
                 if rejected
@@ -551,7 +576,12 @@ async def _value_and_commit(
                     import_line_sources=scenarios.import_line_sources,
                 )
             )
-            stored = await valuation_repo.persist_valuation(conn, actor, valuation, refs, inputs)
+            persisted = await valuation_repo.persist_valuation(
+                conn, actor, valuation, refs, inputs, require_current_revision=True
+            )
+            if isinstance(persisted, valuation_repo.SupersededRevision):  # pragma: no cover - locked above
+                raise VersionConflict("The listing has a newer revision; recompute")
+            stored = persisted
             rank = None if rejected else _rank(reads, result, valuation)
             cases = []
             for key, search_profile in sorted(reads.config.profiles.items(), key=lambda kv: kv[0].value):
@@ -584,6 +614,9 @@ async def _value_and_commit(
         return ValuationRun(valuation_id=stored.id, state=valuation.state, cases=tuple(cases))
 
     run = await retry_transient(commit)
+    if run.skipped is not None:
+        logger.info("valuation skipped", extra={"reason": run.skipped})
+        return run
     if screening.profile is not None and not rejected:
         ctx.metrics.record_comparables(
             screening.profile, sample_size=len(result.selected), quality=_COMPARABLE_METRIC[result.status]

@@ -95,6 +95,7 @@ from suv_deals.domain.reviews import (
     SubmitGuard,
     SubmitRequest,
     apply_new_revision,
+    check_dashboard_action_outcome,
     evaluate_claim,
     evaluate_release,
     evaluate_submit,
@@ -399,11 +400,13 @@ async def _emit_pending(
     )
 
 
+# Fixture lineage is the listing's own frozen ``is_fixture`` (set at ingest from the source mode
+# of that time), never the source's CURRENT mode: switching a source from fixture to a real mode
+# never turns earlier fixture data into deliverable events.
 _LISTING_FOR_CASE_SQL: Final = """
-select l.id, l.current_revision_id, cr.revision_number as current_revision_number, s.mode as source_mode,
+select l.id, l.current_revision_id, cr.revision_number as current_revision_number, l.is_fixture,
        l.eligibility_state, l.eligibility_profile
   from app.listings l
-  join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
   left join app.listing_revisions cr on cr.workspace_id = l.workspace_id and cr.id = l.current_revision_id
  where l.workspace_id = %(ws)s and l.id = %(listing_id)s
  for no key update of l
@@ -469,7 +472,7 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
             valuation_created = ensure_utc(valuation["created_at"])
             valuation_fixture = bool(valuation["is_fixture"])
             document = valuation["scenarios"]
-        is_fixture = listing["source_mode"] == "fixture"
+        is_fixture = bool(listing["is_fixture"])
         if valuation_fixture and not is_fixture:
             # Fixtures never leak into reality (spec 18): a real listing's case never cites one.
             raise ValidationFailed("a real listing's review case cannot cite a fixture valuation")
@@ -971,6 +974,8 @@ async def submit(
 ) -> ReviewDecisionView:
     """``reviews_submit`` in ONE transaction (see module docstring)."""
     actor.require(Scope.REVIEWS_WRITE)
+    # Spec 19: refused before anything is read or recorded, on every path (API and MCP).
+    check_dashboard_action_outcome(request.outcome, request.reason_codes)
     key = request.idempotency_key
     replay = await begin_idempotent(
         conn, actor, "reviews_submit", key, idempotency.request_hash_for("reviews_submit", request)
@@ -1651,6 +1656,72 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
     )
 
 
+class ReviewCaseSummary(BaseModel):
+    """One line of `list_cases_by_state` (operator listings; never claim tokens or hashes)."""
+
+    model_config = _FROZEN
+
+    case_id: UUID
+    listing_id: UUID
+    state: ReviewState
+    profile_key: ProfileKey
+    queue_label: str
+    readiness: str
+    priority: int
+    is_fixture: bool
+    source_key: str
+    created_at: datetime
+    claim_expires_at: datetime | None
+
+
+_CASES_BY_STATE_SQL: Final = """
+select c.id as case_id, c.listing_id, c.state, c.profile_key, c.queue_label, c.readiness, c.priority,
+       c.is_fixture, s.source_key, c.created_at, c.claim_expires_at
+  from app.review_cases c
+  join app.listings l on l.workspace_id = c.workspace_id and l.id = c.listing_id
+  join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
+ where c.workspace_id = %(ws)s and c.state = any(%(states)s::text[])
+ order by c.priority desc, c.created_at, c.id
+ limit %(limit)s
+"""
+
+
+async def list_cases_by_state(
+    conn: Conn, actor: ActorContext, states: Sequence[ReviewState], *, limit: int = 50
+) -> list[ReviewCaseSummary]:
+    """Read-only list of the workspace's review cases in ``states`` (priority first, then age).
+
+    For operator tooling (``suv-deals reviews list``); decisions are made through the claim and
+    submit operations only. Fixture cases are labelled (``is_fixture``).
+    """
+    actor.require(Scope.REVIEWS_READ)
+    wanted = sorted({ReviewState(s).value for s in states})
+    if not wanted:
+        raise ValidationFailed("at least one review state is required", details={"fields": ["states"]})
+    if not 1 <= limit <= 500:
+        raise ValidationFailed("limit must be between 1 and 500", details={"fields": ["limit"]})
+    async with mapped_errors():
+        rows = await fetch_all(
+            conn, _CASES_BY_STATE_SQL, {"ws": actor.workspace_id, "states": wanted, "limit": limit}
+        )
+    return [
+        ReviewCaseSummary(
+            case_id=r["case_id"],
+            listing_id=r["listing_id"],
+            state=ReviewState(r["state"]),
+            profile_key=ProfileKey(r["profile_key"]),
+            queue_label=r["queue_label"],
+            readiness=r["readiness"],
+            priority=r["priority"],
+            is_fixture=r["is_fixture"],
+            source_key=r["source_key"],
+            created_at=ensure_utc(r["created_at"]),
+            claim_expires_at=None if r["claim_expires_at"] is None else ensure_utc(r["claim_expires_at"]),
+        )
+        for r in rows
+    ]
+
+
 def _decision_from_row(row: Mapping[str, Any]) -> ReviewDecisionView:
     outcome = ReviewOutcome(row["outcome"])
     return ReviewDecisionView(
@@ -1690,12 +1761,14 @@ __all__ = [
     "QUEUE_QUERY_NAME",
     "SHORTLIST_EVENT_TYPE",
     "CaseUpsertResult",
+    "ReviewCaseSummary",
     "ReviewQueueFilters",
     "ReviewQueueResult",
     "begin_idempotent",
     "claim",
     "expire_claims",
     "get_case",
+    "list_cases_by_state",
     "list_pending_queue",
     "release",
     "submit",

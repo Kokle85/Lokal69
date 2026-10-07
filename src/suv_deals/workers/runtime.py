@@ -294,13 +294,8 @@ async def build_runtime(
         configure_logging(settings)
     if settings.database_url is None or not settings.database_url.get_secret_value():
         raise ValidationFailed("DATABASE_URL is not configured")
-    db = Database(
-        settings.database_url.get_secret_value(),
-        min_size=settings.database_pool_min,
-        max_size=settings.database_pool_max,
-        set_role=settings.database_set_role,
-        application_name=application_name,
-    )
+    # Pool sizes, DATABASE_SET_ROLE and DATABASE_POOL_TIMEOUT_S (fail fast while the DB is down).
+    db = Database.from_settings(settings, application_name=application_name)
     await db.open()
     resolved_clock = clock or SystemClock()
     ctx = RuntimeContext(

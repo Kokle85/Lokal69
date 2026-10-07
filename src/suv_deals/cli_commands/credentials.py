@@ -1,10 +1,11 @@
 """``suv-deals credentials create-mcp|revoke|list`` (spec 20, 24, 28; owner operations).
 
 ``create-mcp`` mints one scoped MCP credential (``static_bearer``, or ``dev_local`` in
-development/test) through `mcp.auth.issue_api_credential`: only the SHA-256 hash is stored, the
-token is printed exactly ONCE and cannot be shown again. Scopes narrow the role and never include
-``config:admin`` or ``mail:ingest``. A static bearer credential is a scoped private credential,
-not OAuth compliance. Nothing is created without ``--yes``.
+development/test) through ``persistence.credentials_repo.issue_credential``: only the SHA-256 hash
+is stored, the token is printed exactly ONCE and cannot be shown again. ``list`` and ``revoke`` use
+the same repository (``list_credentials`` never returns tokens or hashes). Scopes narrow the role
+and never include ``config:admin`` or ``mail:ingest``. A static bearer credential is a scoped
+private credential, not OAuth compliance. Nothing is created without ``--yes``.
 """
 
 # ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import re
 from datetime import timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import click
@@ -124,14 +126,14 @@ def create_mcp(
     async def body() -> int:
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
         from suv_deals.domain.enums import Role
-        from suv_deals.mcp.auth import issue_api_credential
+        from suv_deals.persistence.credentials_repo import issue_credential
         from suv_deals.persistence.transactions import unit_of_work
 
         async with open_database(settings, application_name="suv-deals-cli") as db:
             workspace_id = await resolve_workspace(db, workspace)
             actor = operator_actor(workspace_id, "credential-create")
             async with unit_of_work(db, actor) as conn:
-                issued = await issue_api_credential(
+                issued = await issue_credential(
                     conn,
                     actor,
                     principal_id=principal,
@@ -166,28 +168,18 @@ def revoke(cli: CliContext, credential_id: UUID, workspace: UUID | None, reason:
 
     async def body() -> int:
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
-        from suv_deals.mcp.auth import revoke_api_credential
+        from suv_deals.persistence.credentials_repo import revoke_credential
         from suv_deals.persistence.transactions import unit_of_work
 
         async with open_database(settings, application_name="suv-deals-cli") as db:
             workspace_id = await resolve_workspace(db, workspace)
             actor = operator_actor(workspace_id, "credential-revoke")
             async with unit_of_work(db, actor) as conn:
-                changed = await revoke_api_credential(conn, actor, credential_id, reason=reason)
+                changed = await revoke_credential(conn, actor, credential_id, reason=reason)
         echo("Revoked." if changed else "Already revoked; nothing changed.")
         return 0
 
     run_async(body)
-
-
-_LIST_SQL = """
-select id, label, principal_kind, role, credential_kind, token_prefix, scopes, expires_at, revoked_at,
-       last_used_at, created_at
-  from ops.api_credentials
- where workspace_id = %(ws)s and (%(all)s or (revoked_at is null and expires_at > clock_timestamp()))
- order by created_at desc, id
- limit 200
-"""
 
 
 @credentials_group.command("list")
@@ -201,15 +193,30 @@ def list_credentials(cli: CliContext, workspace: UUID | None, show_all: bool, as
 
     async def body() -> int:
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
-        from suv_deals.persistence.database import fetch_all
-        from suv_deals.persistence.errors_map import mapped_errors
+        from suv_deals.persistence.credentials_repo import list_credentials
         from suv_deals.persistence.transactions import unit_of_work
 
         async with open_database(settings, application_name="suv-deals-cli") as db:
             workspace_id = await resolve_workspace(db, workspace)
             actor = operator_actor(workspace_id, "credential-list")
-            async with unit_of_work(db, actor) as conn, mapped_errors():
-                rows = await fetch_all(conn, _LIST_SQL, {"ws": workspace_id, "all": show_all})
+            async with unit_of_work(db, actor) as conn:
+                records = await list_credentials(conn, actor, include_inactive=show_all)
+        rows: list[dict[str, Any]] = [
+            {
+                "id": r.credential_id,
+                "label": r.label,
+                "principal_kind": r.principal_kind,
+                "role": r.role.value,
+                "credential_kind": r.credential_kind,
+                "token_prefix": r.token_prefix,
+                "scopes": list(r.scopes),
+                "expires_at": r.expires_at,
+                "revoked_at": r.revoked_at,
+                "last_used_at": r.last_used_at,
+                "created_at": r.created_at,
+            }
+            for r in records
+        ]
         if as_json:
             emit_json(rows)
             return 0

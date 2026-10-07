@@ -9,6 +9,9 @@ the official SDK client round trip and the extension hook. SYNTHETIC data only.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 import uuid
 from typing import Any
 
@@ -479,6 +482,67 @@ async def test_claim_submit_flow_with_idempotent_replay_and_conflicts(data_mcp: 
         (data.workspace_id, data.cases["priced"]),
     )
     assert count == 1
+
+
+async def test_dashboard_action_codes_cannot_shortlist_through_mcp(data_mcp: DataHarness) -> None:
+    """Spec 19 rule on the MCP path (``reviews_repo.submit``): an inspection/document/price action
+    code with any outcome but ``needs_information`` is ``VALIDATION_ERROR`` and records nothing."""
+    client, data = data_mcp.client, data_mcp.data
+    reviewer = data_mcp.reviewer
+    case_id = str(data.cases["priced"])
+    claim_args = {"case_id": case_id, "expected_version": 1, "idempotency_key": "claim-action-mcp1"}
+    token = (await client.ok("reviews_claim", claim_args, token=reviewer))["data"]["claim_token"]
+    for n, (outcome, code) in enumerate(
+        [
+            ("shortlisted", "needs_inspection"),
+            ("watch", "NEEDS-DOCUMENTS"),
+            ("rejected", "Price.Confirmation:Needed"),
+        ]
+    ):
+        refused = await client.fails(
+            "reviews_submit",
+            submit_args(
+                data_mcp,
+                token,
+                f"submit-action-mcp{n}",
+                outcome=outcome,
+                reason_codes=["SYNTHETIC_PRICE_WATCH", code],
+                evidence_ids=[str(uuid.uuid4())],
+            ),
+            token=reviewer,
+            code="VALIDATION_ERROR",
+        )
+        assert refused["details"]["fields"] == ["outcome", "reason_codes"], refused
+        assert code not in json.dumps(refused)
+    decisions = data_mcp.seed.scalar(
+        "select count(*) from app.review_decisions where workspace_id = %s and case_id = %s",
+        (data.workspace_id, data.cases["priced"]),
+    )
+    assert decisions == 0
+    # The action itself (needs_information + the missing items) is accepted.
+    decided = await client.ok(
+        "reviews_submit",
+        submit_args(
+            data_mcp,
+            token,
+            "submit-action-mcp9",
+            outcome="needs_information",
+            reason_codes=["needs_inspection"],
+            missing_information=["SYNTHETIC: independent inspection of the AWD coupling"],
+        ),
+        token=reviewer,
+    )
+    assert decided["data"]["outcome"] == "needs_information"
+
+
+def test_mcp_tools_do_not_import_the_fastapi_routes_module() -> None:
+    """The MCP surface shares persistence operations, never the dashboard's route module."""
+    code = (
+        "import sys, suv_deals.mcp.tools, suv_deals.mcp.server;"
+        " sys.exit(1 if 'suv_deals.api.routes' in sys.modules else 0)"
+    )
+    done = subprocess.run([sys.executable, "-c", code], check=False, capture_output=True, timeout=120)
+    assert done.returncode == 0, done.stderr.decode(errors="replace")[-2000:]
 
 
 async def test_release_is_idempotent_and_only_affects_the_callers_claim(data_mcp: DataHarness) -> None:

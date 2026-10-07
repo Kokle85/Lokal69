@@ -266,6 +266,9 @@ class TestAvailabilityEvents:
             ),
         ).event
         assert reserved is not None and reserved.new_status == Availability.RESERVED
+        # A dedicated evidence kind (not a plain observation with a reason label).
+        assert reserved.evidence_kind == AvailabilityEvidenceKind.SOURCE_RESERVED_BADGE
+        assert reserved.reason == "source_reserved_badge"
 
     def test_seller_statement_is_seller_reported_sold_only(self) -> None:
         signal = AvailabilitySignal(
@@ -287,6 +290,7 @@ class TestAvailabilityEvents:
         ).event
         assert missing is not None
         assert missing.new_status == Availability.UNKNOWN and missing.reason == "detail_not_found"
+        assert missing.evidence_kind == AvailabilityEvidenceKind.SOURCE_DETAIL_NOT_FOUND
         assert missing.confidence == "low"
         inaccessible = derive_availability_event(
             listing(), AvailabilitySignal(kind=AvailabilitySignalKind.DETAIL_INACCESSIBLE, observed_at=T0)
@@ -1038,3 +1042,20 @@ class TestThirdReviewRegressions:
         )
         event = derive_availability_event(sold_later, older).event
         assert event is not None and event.historical_only and not event.conflicts_with_current
+
+
+def test_reserved_badge_after_seller_sold_is_a_preserved_conflict() -> None:
+    """The site's reserved badge after the seller said "sold" is a contradiction (spec 37.9),
+    recorded without overriding the seller's statement - also with the dedicated evidence kind."""
+    sold_by_seller = listing(
+        availability=Availability.SOLD_CLAIMED,
+        availability_evidence_kind=AvailabilityEvidenceKind.SELLER_REPORTED_SOLD,
+        availability_effective_at=T0,
+    )
+    event = derive_availability_event(
+        sold_by_seller,
+        AvailabilitySignal(kind=AvailabilitySignalKind.RESERVED_BADGE, observed_at=T0 + timedelta(hours=2)),
+    ).event
+    assert event is not None
+    assert event.evidence_kind == AvailabilityEvidenceKind.SOURCE_RESERVED_BADGE
+    assert event.conflicts_with_current and not event.promote_current

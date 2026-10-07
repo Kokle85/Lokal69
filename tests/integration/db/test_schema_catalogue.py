@@ -77,6 +77,24 @@ EXTRA_TABLES = {
     "ops.host_budgets",
     "ops.robots_revisions",
     "ops.api_credentials",
+    # Spec v1.1 section 37.8 (migration 20261006001000_seller_inquiries).
+    "app.seller_entities",
+    "app.seller_entity_aliases",
+    "app.seller_contacts",
+    "app.seller_inquiry_authorizations",
+    "app.seller_inquiry_controls",
+    "app.seller_inquiries",
+    "app.seller_replies",
+    "app.seller_reply_locators",
+    "app.availability_events",
+    "ops.email_sender_bindings",
+    "ops.email_delivery_attempts",
+    "ops.email_suppressions",
+    "ops.inquiry_quota_ledger",
+    "ops.mail_worker_bindings",
+    "ops.mail_worker_checkpoints",
+    "ops.mail_ingest_dedup",
+    "ops.mail_binding_sync",
 }
 ALL_TABLES = SPEC_TABLES | EXTRA_TABLES
 
@@ -221,6 +239,12 @@ def test_listing_revisions_allow_semantic_reversion(db_conn: psycopg.Connection)
         ("app.review_queue_idx", ["(workspace_id, state, priority DESC, created_at, id)"]),
         ("app.review_cases_open_uidx", ["UNIQUE", "(workspace_id, listing_id, profile_key)", "superseded"]),
         ("app.listing_recent_idx", ["(workspace_id, last_seen_at DESC, id)"]),
+        # Migration 20261007000100 (EXPLAIN-verified read paths).
+        ("app.listings_created_idx", ["(workspace_id, created_at DESC, id DESC)"]),
+        (
+            "ops.outbox_attention_created_idx",
+            ["(workspace_id, event_created_at, id)", "'uncertain'", "'blocked'", "'dead_letter'", "'retry_wait'"],
+        ),
         ("app.memberships_user_idx", ["(user_id, workspace_id)", "WHERE active"]),
         (
             "app.market_observations_comparable_idx",

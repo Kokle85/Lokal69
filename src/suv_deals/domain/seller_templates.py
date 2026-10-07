@@ -911,8 +911,17 @@ class MessageEnvelope(BaseModel):
     extra_headers: Mapping[str, str] = Field(default_factory=dict)
 
 
+#: Technical correlation header carrying only the inquiry id (no secret, no personal data).
+INQUIRY_REF_HEADER_NAME: Final = "x-suv-inquiry-ref"
 ALLOWED_EXTRA_HEADERS: Final = frozenset(
-    {"message-id", "date", "mime-version", "content-type", "content-transfer-encoding"}
+    {
+        "message-id",
+        "date",
+        "mime-version",
+        "content-type",
+        "content-transfer-encoding",
+        INQUIRY_REF_HEADER_NAME,
+    }
 )
 
 
@@ -935,6 +944,8 @@ def _normalize_for_scan(text: str) -> str:
 _CONTENT_TYPE_RE: Final = re.compile(r'^text/plain(?:\s*;\s*charset="?(?:utf-8|us-ascii)"?)?$', re.IGNORECASE)
 _TRANSFER_ENCODINGS: Final = frozenset({"7bit", "8bit", "quoted-printable", "base64"})
 _MESSAGE_ID_RE: Final = re.compile(r"^<[^\s<>@\"(),:;\[\]\\]{1,200}@[A-Za-z0-9.-]{1,253}>$")
+#: ``inquiry-<lower-case canonical UUID>`` (exactly what ``mime_builder.inquiry_ref_value`` emits).
+_INQUIRY_REF_RE: Final = re.compile(r"^inquiry-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _MAX_HEADER_VALUE_LENGTH: Final = 256
 
 
@@ -954,6 +965,8 @@ def _extra_header_problems(name: str, value: str) -> list[str]:
         "content-transfer-encoding": stripped.lower() in _TRANSFER_ENCODINGS,
         "mime-version": stripped == "1.0",
         "message-id": _MESSAGE_ID_RE.fullmatch(stripped) is not None,
+        # Exact value only (no surrounding whitespace): it is matched verbatim by correlation.
+        INQUIRY_REF_HEADER_NAME: _INQUIRY_REF_RE.fullmatch(value) is not None,
     }
     if not valid.get(lowered, True):
         problems.append("HEADER_VALUE_INVALID")
@@ -1118,6 +1131,7 @@ __all__ = [
     "ALLOWED_OUTGOING_DATA_CATEGORIES",
     "EXCLUDED_DATA_CATEGORIES",
     "INQUIRY_PURPOSE",
+    "INQUIRY_REF_HEADER_NAME",
     "MAX_LISTING_URL_LENGTH",
     "MAX_VEHICLE_LABEL_LENGTH",
     "MK_PREVIEW_TEMPLATE_ID",
