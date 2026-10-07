@@ -94,7 +94,7 @@ SELLER_ENTITY_MERGED: Final = "SELLER_ENTITY_MERGED"
 IDENTITY_MERGE_DUPLICATE: Final = "IDENTITY_MERGE_DUPLICATE"
 _STATUS_PREFIX: Final = "recipient_status:"
 _LANGUAGE_REASON_PREFIX: Final = "language_reason:"
-_CONTROL_RE: Final = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+_CONTROL_RE: Final = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _URL_RE: Final = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _FROZEN = ConfigDict(frozen=True, extra="ignore")
 
@@ -150,7 +150,10 @@ class SellerEntityRecord(BaseModel):
     row_version: int
     created_at: datetime
 
-    _aware = field_validator("verified_at", "merged_at", "created_at")(_utc)
+    @field_validator("verified_at", "merged_at", "created_at")
+    @classmethod
+    def _aware(cls, value: datetime | None) -> datetime | None:
+        return _utc(value)
 
     @property
     def seller_key(self) -> str:
@@ -171,7 +174,10 @@ class SellerAliasRecord(BaseModel):
     observed_at: datetime
     unlinked_at: datetime | None = None
 
-    _aware = field_validator("observed_at", "unlinked_at")(_utc)
+    @field_validator("observed_at", "unlinked_at")
+    @classmethod
+    def _aware(cls, value: datetime | None) -> datetime | None:
+        return _utc(value)
 
 
 class MergeOutcome(BaseModel):
@@ -243,9 +249,10 @@ class SellerContactRecord(BaseModel):
     superseded_by_id: UUID | None = None
     created_at: datetime
 
-    _aware = field_validator(
-        "observed_at", "verified_at", "last_rechecked_at", "changed_at", "created_at"
-    )(_utc)
+    @field_validator("observed_at", "verified_at", "last_rechecked_at", "changed_at", "created_at")
+    @classmethod
+    def _aware(cls, value: datetime | None) -> datetime | None:
+        return _utc(value)
 
     @property
     def seller_key(self) -> str:
@@ -294,9 +301,9 @@ async def lock_controls(conn: Conn, workspace_id: UUID) -> Mapping[str, Any] | N
         )
 
 
-_ENTITY_COLUMNS: Final = (
-    "id, seller_type, display_name, verified_at, merged_into_id, merged_at, merge_reason,"
-    " row_version, created_at"
+_GET_ENTITY_SQL: Final = (
+    "select id, seller_type, display_name, verified_at, merged_into_id, merged_at, merge_reason,"
+    " row_version, created_at from app.seller_entities where workspace_id = %(ws)s and id = %(id)s"
 )
 
 
@@ -305,8 +312,7 @@ async def get_seller_entity(conn: Conn, actor: ActorContext, entity_id: UUID) ->
     async with mapped_errors():
         row = await fetch_one(
             conn,
-            f"select {_ENTITY_COLUMNS} from app.seller_entities"  # noqa: S608 - fixed columns
-            " where workspace_id = %(ws)s and id = %(id)s",
+            _GET_ENTITY_SQL,
             {"ws": actor.workspace_id, "id": entity_id},
         )
     if row is None:
@@ -434,7 +440,9 @@ async def cancel_untransmitted(
 # =============================================================================================
 
 
-async def _family_inquiries(conn: Conn, workspace_id: UUID, entity_ids: Sequence[UUID]) -> list[dict[str, Any]]:
+async def _family_inquiries(
+    conn: Conn, workspace_id: UUID, entity_ids: Sequence[UUID]
+) -> list[dict[str, Any]]:
     """Inquiries of the entities (and entities merged into them), locked in id order."""
     rows = await fetch_all(
         conn,
@@ -551,8 +559,12 @@ async def _merge(
         decision = reconcile_identity_merge([_existing(r, key) for r in group])
         by_id = {r["id"]: r for r in group}
         for inquiry_id in decision.cancel:
-            row = by_id[inquiry_id]
-            if row["state"] in cancellable and row["send_attempted_at"] is None and not int(row["attempts"]):
+            item = by_id[inquiry_id]
+            if (
+                item["state"] in cancellable
+                and item["send_attempted_at"] is None
+                and not int(item["attempts"])
+            ):
                 to_cancel.add(inquiry_id)
         duplicates.extend(decision.transmitted_duplicates)
         conflict = conflict or decision.conflict
@@ -615,9 +627,7 @@ async def link_seller(
     await lock_controls(conn, ws)
     async with mapped_errors():
         sources = await _source_ids(conn, ws, (a.source_key for a in identity.aliases if a.source_key))
-    missing = sorted(
-        {a.source_key for a in identity.aliases if a.source_key and a.source_key not in sources}
-    )
+    missing = sorted({a.source_key for a in identity.aliases if a.source_key and a.source_key not in sources})
     if missing:
         raise ValidationFailed("an alias names a source that is not configured", details={"sources": missing})
     by_hash = {alias_key_hash(a): a for a in identity.aliases}
@@ -697,15 +707,15 @@ async def link_seller(
             continue
         # Linked concurrently to another entity between the read and the insert: merge.
         async with mapped_errors():
-            other = await fetch_one(
+            linked = await fetch_one(
                 conn,
                 "select coalesce(e.merged_into_id, e.id) as root from app.seller_entity_aliases a"
                 " join app.seller_entities e on e.workspace_id = a.workspace_id and e.id = a.seller_entity_id"
                 " where a.workspace_id = %(ws)s and a.alias_key_hash = %(hash)s and a.unlinked_at is null",
                 {"ws": ws, "hash": key_hash},
             )
-        if other is not None and other["root"] != target:
-            outcome = await _merge(conn, actor, target, other["root"], text)
+        if linked is not None and linked["root"] != target:
+            outcome = await _merge(conn, actor, target, linked["root"], text)
             merges.append(outcome)
             target = outcome.survivor_id
     if identity.seller_type != SellerType.UNKNOWN:
@@ -747,8 +757,7 @@ async def get_contact(conn: Conn, actor: ActorContext, contact_id: UUID) -> Sell
     async with mapped_errors():
         row = await fetch_one(
             conn,
-            f"select {_CONTACT_COLUMNS}{_CONTACT_FROM}"  # noqa: S608 - fixed columns
-            " where c.workspace_id = %(ws)s and c.id = %(id)s",
+            f"select {_CONTACT_COLUMNS}{_CONTACT_FROM} where c.workspace_id = %(ws)s and c.id = %(id)s",
             {"ws": actor.workspace_id, "id": contact_id},
         )
     if row is None:
@@ -762,7 +771,7 @@ async def current_contact(conn: Conn, actor: ActorContext, listing_id: UUID) -> 
     async with mapped_errors():
         row = await fetch_one(
             conn,
-            f"select {_CONTACT_COLUMNS}{_CONTACT_FROM}"  # noqa: S608 - fixed columns
+            f"select {_CONTACT_COLUMNS}{_CONTACT_FROM}"
             " where c.workspace_id = %(ws)s and c.listing_id = %(listing)s and c.status <> 'changed'"
             " order by (c.status = 'verified') desc, c.created_at desc, c.id desc limit 1",
             {"ws": actor.workspace_id, "listing": listing_id},
@@ -774,7 +783,9 @@ def _confidence(value: Decimal) -> Decimal:
     return max(Decimal(0), min(Decimal(1), value)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 
-def _status_for(decision: RecipientDecision, evidence: RecipientEvidence, address: str | None) -> ContactStatus:
+def _status_for(
+    decision: RecipientDecision, evidence: RecipientEvidence, address: str | None
+) -> ContactStatus:
     if decision.status == RecipientStatus.VERIFIED:
         return "verified"
     if (
@@ -786,7 +797,9 @@ def _status_for(decision: RecipientDecision, evidence: RecipientEvidence, addres
     return "unverified"
 
 
-def _material(row: SellerContactRecord, new: Mapping[str, Any]) -> tuple[object, ...]:
+def _material(
+    row: SellerContactRecord, new: Mapping[str, Any]
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
     return (
         row.address,
         row.contact_kind,
@@ -837,7 +850,7 @@ async def record_contact(
     ws = actor.workspace_id
     root = await seller_root(conn, actor, seller_entity_id)
     if evidence.listing_incarnation_id not in (None, evidence.listing_id):
-        raise ValidationFailed("one listing row is one incarnation: listing_incarnation_id must be the listing id")
+        raise ValidationFailed("one listing row is one incarnation: use the listing id as incarnation id")
     if decision.binding is not None and (
         decision.binding.seller_identity_key != f"seller_entity:{root}"
         or decision.binding.listing_id != evidence.listing_id
@@ -883,12 +896,14 @@ async def record_contact(
             lang_code is None or lang_code in {m.value for m in MessageLanguage}
         ):
             lang_status = LanguageStatus.LANGUAGE_UNRESOLVED
-        lang_basis = language.basis if lang_status == LanguageStatus.RESOLVED else language.basis
+        lang_basis = language.basis
         lang_conf = _confidence(language.confidence)
         lang_excerpt = _clean_text(language.evidence_excerpt, 500)
         lang_rules = _clean_text(language.rules_version, 80)
         reasons.append(f"{_LANGUAGE_REASON_PREFIX}{language.reason.value}")
     contact_kind = _CONTACT_KIND.get(evidence.kind)
+    if contact_kind == "marketplace_relay" and not evidence.relay_listing_reference:
+        raise ValidationFailed("relay evidence is recorded only with the listing reference it is bound to")
     new: dict[str, Any] = {
         "ws": ws,
         "source": listing["source_id"],
@@ -921,18 +936,21 @@ async def record_contact(
         current = None
     if status == "verified" and current is not None:
         old, fresh = _material(current, new)
-        if old == fresh and current.verified_at is not None:
-            if evidence.verified_at <= current.verified_at + RECIPIENT_EVIDENCE_MAX_AGE and (
-                evidence.verified_at >= current.verified_at
-            ):
-                async with mapped_errors():
-                    await conn.execute(
-                        "update app.seller_contacts set last_rechecked_at = greatest("
-                        " coalesce(last_rechecked_at, %(at)s), %(at)s)"
-                        " where workspace_id = %(ws)s and id = %(id)s",
-                        {"ws": ws, "id": current.id, "at": evidence.verified_at},
-                    )
-                return await get_contact(conn, actor, current.id)
+        if (
+            old == fresh
+            and current.verified_at is not None
+            and current.verified_at
+            <= evidence.verified_at
+            <= current.verified_at + RECIPIENT_EVIDENCE_MAX_AGE
+        ):
+            async with mapped_errors():
+                await conn.execute(
+                    "update app.seller_contacts set last_rechecked_at = greatest("
+                    " coalesce(last_rechecked_at, %(at)s), %(at)s)"
+                    " where workspace_id = %(ws)s and id = %(id)s",
+                    {"ws": ws, "id": current.id, "at": evidence.verified_at},
+                )
+            return await get_contact(conn, actor, current.id)
     supersede = current is not None and (
         status == "verified"
         or decision.status
@@ -1078,8 +1096,10 @@ def language_decision(contact: SellerContactRecord | None) -> LanguageDecision |
         ),
         None,
     )
-    if stored is None and contact.language_status == LanguageStatus.LANGUAGE_UNRESOLVED and (
-        contact.language_code is None and contact.language_basis == "none"
+    if (
+        stored is None
+        and contact.language_status == LanguageStatus.LANGUAGE_UNRESOLVED
+        and (contact.language_code is None and contact.language_basis == "none")
     ):
         return None  # no language evaluation was recorded for this evidence
     reason = (
