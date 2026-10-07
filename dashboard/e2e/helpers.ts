@@ -69,10 +69,22 @@ export async function expectNoXss(page: Page): Promise<void> {
   expect(scriptHrefs).toBe(0)
 }
 
-/** No horizontal page scroll at the current viewport. */
+/**
+ * No horizontal page scroll at the current viewport, and no content that only "fits" because it is
+ * clipped: the document, the body and the main content area must all be as wide as the viewport.
+ */
 export async function expectNoHorizontalScroll(page: Page): Promise<void> {
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
-  expect(overflow).toBeLessThanOrEqual(0)
+  const widths = await page.evaluate(() => {
+    const viewport = document.documentElement.clientWidth
+    const main = document.querySelector('main')
+    return {
+      document: document.documentElement.scrollWidth - viewport,
+      body: document.body.scrollWidth - viewport,
+      main: main ? main.scrollWidth - main.clientWidth : 0,
+      clipped: getComputedStyle(document.body).overflowX !== 'visible' || getComputedStyle(document.documentElement).overflowX !== 'visible',
+    }
+  })
+  expect(widths).toEqual({ document: 0, body: 0, main: 0, clipped: false })
 }
 
 export async function claimCase(page: Page): Promise<void> {

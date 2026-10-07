@@ -79,7 +79,9 @@ function contentSecurityPolicy(supabaseOrigin: string | null): Plugin {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_')
   guardEnvironment(env)
-  const apiTarget = process.env.DASHBOARD_API_TARGET ?? 'http://127.0.0.1:8000'
+  // Node-side only (never in the bundle: Vite exposes VITE_ variables only). Read from the process
+  // environment or from the .env files, as .env.example documents.
+  const apiTarget = loadEnv(mode, process.cwd(), 'DASHBOARD_').DASHBOARD_API_TARGET || 'http://127.0.0.1:8000'
   const proxy = { '/api': { target: apiTarget, changeOrigin: false, secure: true } }
   const securityHeaders = {
     'X-Content-Type-Options': 'nosniff',

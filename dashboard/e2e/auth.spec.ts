@@ -70,10 +70,15 @@ test.describe('sign-in and session', () => {
 
   test('a cancelled or expired magic link shows an inert error and does not sign in', async ({ page }) => {
     const { problems } = guard(page)
-    await page.goto('/auth/callback?error=access_denied&error_code=otp_expired&error_description=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E')
+    await page.goto(
+      '/auth/callback?error=access_denied&error_code=otp_expired&error_description=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E%20Call%20%2B1%20555%200100',
+    )
     await expect(page.getByRole('heading', { name: 'Sign-in not completed' })).toBeVisible()
-    await expect(page.getByText('<img src=x onerror=alert(1)>')).toBeVisible()
+    await expect(page.getByRole('alert')).toContainText('Error code otp_expired.')
+    // The attacker-controllable description is never shown (no HTML, no spoofed text).
     await expect(page.locator('img')).toHaveCount(0)
+    await expect(page.locator('body')).not.toContainText('onerror')
+    await expect(page.locator('body')).not.toContainText('555 0100')
     expect(page.url()).not.toContain('error_description')
     await page.getByRole('link', { name: 'Back to sign in' }).click()
     await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible()

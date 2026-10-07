@@ -5,6 +5,7 @@
  *                   -> rejected             (server refused, e.g. a conflict: nothing was saved)
  *                   -> unconfirmed          (network loss / 5xx after sending: outcome unknown)
  *   unconfirmed -> pending (retry)          (SAME idempotency key and SAME body)
+ *   retry refused before evaluation         (401/403/429: stays unconfirmed, see NOT_EVALUATED_CODES)
  *
  * Guarantees:
  * - at most one request is in flight (a second click while pending is ignored, guarded by a ref so
@@ -57,6 +58,19 @@ function toApiError(error: unknown): ApiError {
     : new ApiError({ code: 'BAD_RESPONSE', message: String(error), status: null, retryable: true, outcomeUnknown: true })
 }
 
+/**
+ * Refusals that happen BEFORE the server looks at the request (authentication, membership/scope,
+ * rate limiting, a cancelled send). On the first send they are definitive (nothing was applied),
+ * but on a RETRY of an unconfirmed attempt they say nothing about whether the ORIGINAL send was
+ * applied: the attempt stays unconfirmed, so it can only be retried with the same key (never
+ * replaced by a new attempt with a new key, which could apply the change twice).
+ */
+const NOT_EVALUATED_CODES = new Set<ApiError['code']>(['UNAUTHENTICATED', 'FORBIDDEN', 'RATE_LIMITED', 'ABORTED'])
+
+function stillUnknown(error: ApiError, viaRetry: boolean): boolean {
+  return error.outcomeUnknown || (viaRetry && NOT_EVALUATED_CODES.has(error.code))
+}
+
 export function useIdempotentMutation<B extends { idempotency_key: string }, R>(
   operation: string,
   send: (body: B) => Promise<ApiResponse<R>>,
@@ -89,7 +103,7 @@ export function useIdempotentMutation<B extends { idempotency_key: string }, R>(
         hooksRef.current.settled?.(attempt, { envelope })
       } catch (error) {
         const apiError = toApiError(error)
-        if (apiError.outcomeUnknown) {
+        if (stillUnknown(apiError, viaRetry)) {
           setPhase({ kind: 'unconfirmed', attempt, error: apiError })
         } else {
           setPhase({ kind: 'rejected', attempt, error: apiError })

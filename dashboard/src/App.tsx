@@ -1,4 +1,4 @@
-import type { RouteObject } from 'react-router'
+import { useParams, type RouteObject } from 'react-router'
 import { useAuth } from './auth/AuthProvider'
 import { AuthCallbackScreen, LoginScreen, RequireAuth } from './auth/screens'
 import { Layout } from './components/Layout'
@@ -23,6 +23,20 @@ function UserScope() {
   )
 }
 
+/**
+ * Per-object screens are remounted when their id changes (e.g. back/forward between two cases), so
+ * a draft, an unconfirmed mutation or a reload marker of one case can never carry over to another.
+ */
+function ReviewCaseRoute() {
+  const { caseId = '' } = useParams()
+  return <ReviewCaseScreen key={caseId} />
+}
+
+function CandidateDetailRoute() {
+  const { listingId = '' } = useParams()
+  return <CandidateDetailScreen key={listingId} />
+}
+
 export const routes: RouteObject[] = [
   { path: '/login', element: <LoginScreen /> },
   { path: '/auth/callback', element: <AuthCallbackScreen /> },
@@ -36,11 +50,11 @@ export const routes: RouteObject[] = [
     children: [
       { index: true, element: <OverviewScreen /> },
       { path: 'candidates', element: <CandidatesScreen /> },
-      { path: 'candidates/:listingId', element: <CandidateDetailScreen /> },
+      { path: 'candidates/:listingId', element: <CandidateDetailRoute /> },
       { path: 'candidates/:listingId/economics', element: <EconomicsScreen /> },
       { path: 'valuations/:valuationId', element: <EconomicsScreen /> },
       { path: 'reviews', element: <ReviewQueueScreen /> },
-      { path: 'reviews/:caseId', element: <ReviewCaseScreen /> },
+      { path: 'reviews/:caseId', element: <ReviewCaseRoute /> },
       { path: 'sources', element: <SourcesScreen /> },
       { path: 'settings', element: <SettingsScreen /> },
       { path: 'inquiries', element: <InquiriesPlaceholder /> },

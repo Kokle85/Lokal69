@@ -15,8 +15,7 @@
     "lint": "oxlint --deny-warnings src e2e && node scripts/check-security.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "e2e": "playwright test",
-    "e2e:build": "node scripts/e2e-build.mjs"
+    "e2e": "playwright test"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.117.3",

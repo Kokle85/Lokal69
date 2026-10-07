@@ -183,8 +183,33 @@ function PauseControl({ source, onChanged }: { source: SourceStatusView; onChang
     },
   )
   if (!can('sources:pause')) return null
+  const status = (
+    <MutationStatus
+      phase={mutation.phase}
+      onRetry={() => void mutation.retry()}
+      onDiscard={() => {
+        mutation.reset()
+        onChanged()
+      }}
+      pendingText="Pausing…"
+      confirmed={(result) => (result.already_paused ? 'The source was already paused.' : 'Source paused.')}
+      extraOnRejected={
+        mutation.phase.kind === 'rejected' && mutation.phase.error.code === 'VERSION_CONFLICT' ? (
+          <button type="button" className="button secondary" onClick={onChanged}>
+            Reload sources
+          </button>
+        ) : null
+      }
+    />
+  )
   if (source.paused) {
-    return <p className="muted">Resuming is not available from the dashboard (the owner resumes sources deliberately elsewhere).</p>
+    // The confirmation stays visible after the reload that shows the source as paused.
+    return (
+      <div className="pause-form">
+        {status}
+        <p className="muted">Resuming is not available from the dashboard (the owner resumes sources deliberately elsewhere).</p>
+      </div>
+    )
   }
   const locked = mutation.phase.kind === 'pending' || mutation.phase.kind === 'unconfirmed'
   const valid = reason.trim().length >= LIMITS.reasonMin
@@ -211,23 +236,7 @@ function PauseControl({ source, onChanged }: { source: SourceStatusView; onChang
           Pause this source
         </button>
       </div>
-      <MutationStatus
-        phase={mutation.phase}
-        onRetry={() => void mutation.retry()}
-        onDiscard={() => {
-          mutation.reset()
-          onChanged()
-        }}
-        pendingText="Pausing…"
-        confirmed={(result) => (result.already_paused ? 'The source was already paused.' : 'Source paused.')}
-        extraOnRejected={
-          mutation.phase.kind === 'rejected' && mutation.phase.error.code === 'VERSION_CONFLICT' ? (
-            <button type="button" className="button secondary" onClick={onChanged}>
-              Reload sources
-            </button>
-          ) : null
-        }
-      />
+      {status}
     </form>
   )
 }

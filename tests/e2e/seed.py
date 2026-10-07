@@ -13,7 +13,8 @@
   ``alpha``    eligible_primary, two revisions (price drop), INCOMPLETE valuation with UNKNOWN cost
                lines (transport, customs broker, all import taxes: no approved rule set), MK
                comparables, field evidence, a note, availability events and a PENDING review case;
-  ``bravo``, ``charlie``, ``delta``  eligible_primary with pending cases (one per mutating E2E test);
+  ``bravo``, ``charlie``, ``delta``, ``echo``, ``foxtrot``  eligible_primary with pending cases (one
+               per mutating E2E test);
   ``xss``      eligible_primary whose title, description, fault list and provenance text are XSS /
                prompt-injection payloads (must render inert), pending case;
   ``rejected`` 200,000 km: rejected by screening (MILEAGE_TOO_HIGH) and by a reviewer decision;
@@ -92,6 +93,8 @@ TITLES = {
     "bravo": "SYNTHETIC E2E Bravo Trail 2.0 TDI",
     "charlie": "SYNTHETIC E2E Charlie Trail 2.0 TDI",
     "delta": "SYNTHETIC E2E Delta Trail 2.0 TDI",
+    "echo": "SYNTHETIC E2E Echo Trail 2.0 TDI",
+    "foxtrot": "SYNTHETIC E2E Foxtrot Trail 2.0 TDI",
     "xss": XSS_TITLE,
     "rejected": "SYNTHETIC E2E Rejected Trail 200,000 km",
     "net_only": "SYNTHETIC E2E Net-only Trail (price excl. VAT)",
@@ -385,7 +388,15 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
     def created(minutes: int) -> datetime:
         return now - timedelta(days=2) + timedelta(minutes=minutes)
 
-    eligible = {"alpha": 2750, "bravo": 2800, "charlie": 2850, "delta": 2900, "xss": 2700}
+    eligible = {
+        "alpha": 2750,
+        "bravo": 2800,
+        "charlie": 2850,
+        "delta": 2900,
+        "echo": 2600,
+        "foxtrot": 2650,
+        "xss": 2700,
+    }
     for offset, (key, eur) in enumerate(eligible.items()):
         prices = ((290000, "EUR"), (eur * 100, "EUR")) if key == "alpha" else ((eur * 100, "EUR"),)
         listing, revisions = _listing(
@@ -467,7 +478,7 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
     data.valuations["alpha"] = valuation_id
 
     data.cases["alpha"] = _case(seed, ws, alpha, alpha_rev, valuation_id=valuation_id, priority=50)
-    for key in ("bravo", "charlie", "delta", "xss"):
+    for key in ("bravo", "charlie", "delta", "echo", "foxtrot", "xss"):
         data.cases[key] = _case(seed, ws, data.listings[key], data.revisions[key][-1], priority=40)
 
     for key, outcome, reasons, summary in (

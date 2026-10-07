@@ -98,6 +98,24 @@ describe('economics', () => {
   })
 })
 
+describe('economics hardening', () => {
+  it('renders an unknown cost line as "unknown" even if the response carried zero bounds', async () => {
+    const valuation = incompleteValuation()
+    const [transport, ...rest] = valuation.cost_lines
+    valuation.cost_lines = [{ ...transport!, low: '0.00', base: '0.00', high: '0.00' }, ...rest]
+    const api = fakeApi({
+      'GET /api/me': () => ok(me()),
+      'GET /api/candidates/:id': () => ok(candidateDetail()),
+      'GET /api/valuations/:id': () => ok(valuation),
+    })
+    renderApp(`/candidates/${LISTING_ID}/economics`, { api })
+    const costTable = await screen.findByRole('table', { name: 'Cost lines' })
+    const transportRow = within(costTable).getByText('SYNTHETIC transport').closest('tr')!
+    expect(within(transportRow).getAllByText('unknown')).toHaveLength(4)
+    expect(transportRow.textContent).not.toMatch(/0\.00/)
+  })
+})
+
 describe('mobile navigation', () => {
   it('toggles the menu with an accessible button and closes it after navigating', async () => {
     const api = fakeApi({

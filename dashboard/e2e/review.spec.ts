@@ -48,6 +48,69 @@ test.describe('review workflow', () => {
     }
   })
 
+  test('a second tab of the same reviewer re-claims: the first tab gets CLAIM_EXPIRED with a reload path and saves nothing', async ({ context }) => {
+    const data = manifest()
+    const tabA = await context.newPage()
+    const guardA = guard(tabA)
+    await signIn(tabA, 'reviewer')
+    await tabA.goto(`/reviews/${data.cases.foxtrot}`)
+    await claimCase(tabA)
+    await fillWatchDecision(tabA, 'SYNTHETIC E2E: written in the first of two tabs.')
+    // Same browser context = same Supabase session (supabase-js storage), a second tab.
+    const tabB = await context.newPage()
+    const guardB = guard(tabB)
+    await tabB.goto(`/reviews/${data.cases.foxtrot}`)
+    await expect(tabB.getByTestId('claim-state')).toContainText('its one-time handle is not available here')
+    await claimCase(tabB) // "Claim again": the server rotates the handle
+    const refused = tabA.waitForResponse((response) => response.url().endsWith('/submit'))
+    await tabA.getByRole('button', { name: 'Submit decision' }).click()
+    expect((await refused).status()).toBe(409)
+    await expect(tabA.getByText('Your claim expired or is no longer current')).toBeVisible()
+    await expect(tabA.getByTestId('correlation-id').first()).not.toBeEmpty()
+    await expect(tabA.getByTestId('decision-saved')).toHaveCount(0)
+    await expect(tabA.getByLabel(/^Summary/)).toHaveValue('SYNTHETIC E2E: written in the first of two tabs.')
+    await expect(tabA.getByRole('button', { name: 'Submit decision' })).toBeDisabled()
+    // The second tab holds the current handle and can decide.
+    await fillWatchDecision(tabB, 'SYNTHETIC E2E: decided in the second tab.')
+    await tabB.getByRole('button', { name: 'Submit decision' }).click()
+    await expect(tabB.getByTestId('decision-saved')).toContainText('Decision saved: watch')
+    await tabA.getByRole('button', { name: 'Reload the case' }).click()
+    await expect(tabA.getByTestId('decision-entry')).toHaveCount(1)
+    expect(guardA.problems).toEqual([])
+    expect(guardB.problems).toEqual([])
+  })
+
+  test('claim, release and re-claim; then a double-clicked submit sends exactly one request and one decision', async ({ page }) => {
+    const data = manifest()
+    const { problems } = guard(page)
+    const posts: Request[] = []
+    page.on('request', (request) => {
+      if (request.url().endsWith('/submit') && request.method() === 'POST') posts.push(request)
+    })
+    await signIn(page, 'reviewer')
+    await page.goto(`/reviews/${data.cases.echo}`)
+    // Claim and release (real server), then claim again for the decision.
+    await claimCase(page)
+    await page.getByRole('button', { name: 'Release claim' }).click()
+    await expect(page.getByText('Claim released.')).toBeVisible()
+    await expect(page.getByTestId('claim-state')).toContainText('Not claimed')
+    await expect(page.getByRole('button', { name: 'Submit decision' })).toBeDisabled()
+    await claimCase(page)
+    await expect(page.getByText('Claim released.')).toHaveCount(0)
+    await fillWatchDecision(page, 'SYNTHETIC E2E: the submit button was double-clicked.')
+    // Keep the (real) answer back for a moment so the second click lands while the first is in flight.
+    await page.route(SUBMIT, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      await route.continue()
+    })
+    await page.getByRole('button', { name: 'Submit decision' }).dblclick()
+    await expect(page.getByTestId('decision-saved')).toContainText('Decision saved: watch')
+    await page.waitForTimeout(500)
+    expect(posts).toHaveLength(1)
+    await expect(page.getByTestId('decision-entry')).toHaveCount(1)
+    expect(problems).toEqual([])
+  })
+
   test('token expiry mid-review: the backend refuses the stale token, the client refreshes and retries the same request', async ({ page }) => {
     const data = manifest()
     const { problems } = guard(page)

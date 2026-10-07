@@ -285,8 +285,16 @@ function StatusLabel({ status }: { status: string }) {
 
 function CostLineRow({ line, timeZone }: { line: CostLineView; timeZone: string }) {
   const notApplicable = line.status === 'not_applicable'
+  // An unknown line is "unknown" whatever its bounds say: it is never shown as an amount (or 0.00).
+  const unknown = line.status === 'unknown'
   const cell = (value: string | null) =>
-    notApplicable ? <span className="muted">not applicable</span> : value === null ? <span className="amount amount-unknown">unknown</span> : decimalText(value, line.currency)
+    notApplicable ? (
+      <span className="muted">not applicable</span>
+    ) : unknown || value === null ? (
+      <span className="amount amount-unknown">unknown</span>
+    ) : (
+      decimalText(value, line.currency)
+    )
   return (
     <tr>
       <td data-label="Item">

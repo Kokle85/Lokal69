@@ -7,6 +7,7 @@ import { validateConfig } from '../config'
 import { amountText, decimalText, groupDecimal, kmText, localInputToRfc3339, safeHttpUrl, safeNextPath } from '../format'
 import { buildSubmission, draftForAction, EMPTY_DRAFT } from '../review/decisionDraft'
 import { readPendingSubmission, resolvePendingSubmission, writePendingSubmission } from '../review/pendingMarker'
+import { TEST_USER_ID as USER } from './fakeAuth'
 import { candidateDetail, CASE_ID, CLAIM_TOKEN, decision, EVIDENCE_ID, reviewCase } from './fixtures'
 
 describe('money formatting', () => {
@@ -155,7 +156,7 @@ describe('decision draft', () => {
   it('needs a claim, valid codes, UUID evidence and plain text', () => {
     expect(buildSubmission({ ...EMPTY_DRAFT, outcome: 'watch', reasonCodes: ['a'], summary: 'SYNTHETIC long enough' }, null).body).toBeNull()
     const bad = buildSubmission(
-      { ...EMPTY_DRAFT, outcome: 'watch', extraReasonCodes: '<script>', summary: 'bad‮text here', extraEvidenceIds: 'not-a-uuid' },
+      { ...EMPTY_DRAFT, outcome: 'watch', extraReasonCodes: '<script>', summary: 'bad\u202etext here', extraEvidenceIds: 'not-a-uuid' },
       handle,
     )
     expect(bad.problems.map((p) => p.field)).toEqual(expect.arrayContaining(['extraReasonCodes', 'summary', 'extraEvidenceIds']))
@@ -164,11 +165,11 @@ describe('decision draft', () => {
 
 describe('pending submission marker', () => {
   it('stores no token and resolves against the server state', () => {
-    writePendingSubmission({ caseId: CASE_ID, idempotencyKey: 'review-submit:k-1', outcome: 'watch', expectedVersion: 2, startedAt: new Date().toISOString() })
+    writePendingSubmission({ caseId: CASE_ID, userId: USER, idempotencyKey: 'review-submit:k-1', outcome: 'watch', expectedVersion: 2, startedAt: new Date().toISOString() })
     const raw = sessionStorage.getItem(`suvdash:pending-submit:${CASE_ID}`) ?? ''
     expect(raw).not.toContain(CLAIM_TOKEN)
     expect(raw).not.toMatch(/access|refresh|Bearer/i)
-    const marker = readPendingSubmission(CASE_ID)!
+    const marker = readPendingSubmission(CASE_ID, USER)!
     expect(resolvePendingSubmission(marker, reviewCase({ case_version: 2 })).kind).toBe('not_recorded')
     expect(resolvePendingSubmission(marker, reviewCase({ case_version: 3, decisions: [decision({ case_version: 2 })] })).kind).toBe('recorded')
     expect(resolvePendingSubmission(marker, reviewCase({ case_version: 5, decisions: [] })).kind).toBe('superseded')
@@ -176,9 +177,17 @@ describe('pending submission marker', () => {
 
   it('drops malformed or old markers', () => {
     sessionStorage.setItem(`suvdash:pending-submit:${CASE_ID}`, '{"caseId":"other"}')
-    expect(readPendingSubmission(CASE_ID)).toBeNull()
-    writePendingSubmission({ caseId: CASE_ID, idempotencyKey: 'k-12345678', outcome: 'watch', expectedVersion: 2, startedAt: '2020-01-01T00:00:00Z' })
-    expect(readPendingSubmission(CASE_ID)).toBeNull()
+    expect(readPendingSubmission(CASE_ID, USER)).toBeNull()
+    writePendingSubmission({ caseId: CASE_ID, userId: USER, idempotencyKey: 'k-12345678', outcome: 'watch', expectedVersion: 2, startedAt: '2020-01-01T00:00:00Z' })
+    expect(readPendingSubmission(CASE_ID, USER)).toBeNull()
+  })
+
+  it("never shows (or removes) another user's marker in the same tab", () => {
+    const other = '22222222-2222-4222-8222-222222222222'
+    writePendingSubmission({ caseId: CASE_ID, userId: other, idempotencyKey: 'review-submit:k-2', outcome: 'rejected', expectedVersion: 4, startedAt: new Date().toISOString() })
+    expect(readPendingSubmission(CASE_ID, USER)).toBeNull()
+    expect(readPendingSubmission(CASE_ID, null)).toBeNull()
+    expect(readPendingSubmission(CASE_ID, other)?.outcome).toBe('rejected')
   })
 })
 

@@ -2,7 +2,7 @@
 
 Everything here is test-only: the ``.invalid`` addresses cannot receive mail, the password is a
 published test value (never a real credential) and the user ids exist only in throwaway databases.
-The Playwright specs mirror these values in ``dashboard/e2e/fixtures.ts``.
+The Playwright specs read them from the seed manifest (``dashboard/e2e/helpers.ts``).
 """
 
 from __future__ import annotations

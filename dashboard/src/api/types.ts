@@ -1595,7 +1595,8 @@ export const LIMITS = {
 
 /**
  * Control and bidirectional-override characters refused by the backend in free text
- * (C0 except tab/newline/CR, DEL, zero-width and bidi override/isolate characters).
+ * (C0 except tab/newline/CR, DEL, zero-width and bidi override/isolate characters). Written with
+ * escapes only: no invisible characters in the source (same set as `domain/reviews.py`).
  */
 // eslint-disable-next-line no-control-regex
-export const FORBIDDEN_TEXT_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f​-‏‪-‮⁦-⁩]/
+export const FORBIDDEN_TEXT_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/

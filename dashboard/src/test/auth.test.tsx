@@ -110,14 +110,30 @@ describe('auth gating', () => {
     expect(call?.options?.emailRedirectTo).toMatch(new RegExp(`^${window.location.origin}/auth/callback`))
   })
 
+  it('answers an unknown address like a known one, but reports a rate limit that applies to everybody', async () => {
+    const auth = new FakeAuth(false)
+    auth.signInWithOtp.mockResolvedValueOnce({ error: { message: 'Signups not allowed for otp', status: 422, code: 'otp_disabled' } } as never)
+    renderApp('/login', { auth, api: baseApi() })
+    const user = userEvent.setup()
+    await user.type(await screen.findByLabelText('Email'), 'nobody@e2e.invalid')
+    await user.click(screen.getByRole('button', { name: 'Email me a sign-in link' }))
+    expect(await screen.findByText(/If this address belongs to a dashboard user, a sign-in link is on its way/)).toBeInTheDocument()
+    auth.signInWithOtp.mockResolvedValueOnce({ error: { message: 'email rate limit exceeded', status: 429, code: 'over_email_send_rate_limit' } } as never)
+    await user.click(screen.getByRole('button', { name: 'Email me a sign-in link' }))
+    expect(await screen.findByText(/Too many sign-in link requests/)).toBeInTheDocument()
+  })
+
   it('shows a cancelled or failed magic-link callback as inert text', async () => {
-    renderApp('/auth/callback?error=access_denied&error_description=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E', {
-      auth: new FakeAuth(false),
-      api: baseApi(),
-    })
+    renderApp(
+      '/auth/callback?error=access_denied&error_code=otp_expired&error_description=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E%20Call%20%2B1%20555%200100',
+      { auth: new FakeAuth(false), api: baseApi() },
+    )
     expect(await screen.findByRole('heading', { name: 'Sign-in not completed' })).toBeInTheDocument()
-    expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Error code otp_expired.')
+    // The attacker-controllable description is neither rendered as HTML nor shown as text.
     expect(document.querySelector('img')).toBeNull()
+    expect(document.body.textContent).not.toContain('onerror')
+    expect(document.body.textContent).not.toContain('555')
   })
 
   it('signs out and returns to the sign-in page', async () => {

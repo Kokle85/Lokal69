@@ -61,11 +61,13 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  overflow-x: hidden;
 }
 
+/* No overflow-x: hidden here: it would only clip (hide) content that does not fit a phone screen.
+   Long unbroken tokens (codes, ids, URLs, seller text) wrap instead. */
 body {
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 a {
@@ -335,7 +337,8 @@ code {
   background: var(--muted-bg);
   color: var(--text);
   margin-right: 0.25rem;
-  white-space: nowrap;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .badge-ok {

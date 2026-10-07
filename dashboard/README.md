@@ -98,7 +98,18 @@ reason; claim + `watch` decision with a second reviewer seeing `ALREADY_CLAIMED`
 `VERSION_CONFLICT`; token expiry mid-review (401 -> refresh -> identical retry with the same
 idempotency key); network loss after the write (not confirmed -> same-key retry -> exactly one
 decision); page reload while a decision is in flight (server state reported, nothing resent);
-phone viewport (375x812) navigation without horizontal scroll; skip link and visible focus.
+a double-clicked submit (exactly one request); a second tab of the same reviewer re-claiming (the
+first tab's stale handle gets `CLAIM_EXPIRED` with a reload path, nothing saved); phone viewport
+(375x812) navigation with no horizontal scroll and no clipped content (`overflow-x: hidden` is not
+used to hide overflow); skip link and visible focus; the real backend refusing forged (foreign key
+with the mock's `kid`), tampered, unsigned and misplaced tokens; no tokens in URLs or in web storage
+outside supabase-js' own key.
+
+`tests/e2e/test_mock_auth.py` (run by `make e2e` first) checks that the backend's real
+`SupabaseJwtVerifier`, fed with the mock's JWKS, accepts the mock's tokens and refuses everything
+Supabase would not issue (foreign issuer or audience, `anon`/`service_role` roles, anonymous users,
+expired / future / not-yet-valid tokens, non-UUID or missing subjects, foreign signatures, HS256
+algorithm confusion, `alg: none`, edited payloads), and that the JWKS publishes only the public key.
 
 Playwright is pinned to **1.56.1** because the sandbox ships chromium build 1194
 (`PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers`). Do not run `playwright install`.
@@ -135,12 +146,15 @@ Recommended response headers from the static host (the build already contains a 
   `401` triggers one `refreshSession()` and one identical retry; a second `401` signs out locally.
 - **Claim tokens** (review claims) are kept in memory only and forgotten on reload or sign-out;
   after a reload the reviewer claims again (the server rotates the token). A reload during a
-  submission leaves only a non-secret marker (case id, idempotency key, outcome, version) in
-  `sessionStorage` so the page can report what the server recorded; nothing is resent.
+  submission leaves only a non-secret marker (case id, user id, idempotency key, outcome, version)
+  in `sessionStorage` so the page can report what the server recorded; nothing is resent. The
+  marker is shown only to the user who sent it.
 - **Idempotency.** Each logical mutation gets one key (`<operation>:<uuid>`), reused verbatim for
   retries of the identical body; a second click while a request is pending is ignored; while an
-  outcome is unknown the form is locked, so an unknown outcome can never become two writes. "Saved"
-  is only shown after a server 2xx (or an idempotent retry's 2xx).
+  outcome is unknown the form is locked, so an unknown outcome can never become two writes. A
+  retry that is refused before the server evaluates it (`401`, `403`, `429`) leaves the attempt
+  unconfirmed (it says nothing about the first send), so it can only be retried with the same key.
+  "Saved" is only shown after a server 2xx (or an idempotent retry's 2xx).
 - **Untrusted text.** Seller text, provenance excerpts and all other API strings are rendered as
   React text (escaped). There is no `dangerouslySetInnerHTML`, `innerHTML`, `eval` or
   `new Function` anywhere (oxlint + `scripts/check-security.mjs` + a unit test enforce it). Links

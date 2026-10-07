@@ -2,12 +2,15 @@
  * A NON-SECRET marker that a review submission was sent but not yet confirmed. It survives a page
  * reload (sessionStorage, this tab only) so the reloaded page can tell the reviewer what happened,
  * WITHOUT resending anything. It never contains the claim token or any auth token; the claim token
- * is only in memory, so a reloaded page cannot resubmit on its own.
+ * is only in memory, so a reloaded page cannot resubmit on its own. A marker belongs to the user
+ * who sent it: another user signed in later in the same tab never sees it.
  */
 import type { ReviewCaseView, ReviewDecisionView, ReviewOutcome } from '../api/types'
 
 export interface PendingSubmission {
   caseId: string
+  /** The signed-in user (Supabase `sub`) who sent the submission. */
+  userId: string
   idempotencyKey: string
   outcome: ReviewOutcome
   /** The case version the decision was submitted against. */
@@ -34,13 +37,17 @@ export function clearPendingSubmission(caseId: string): void {
   }
 }
 
-export function readPendingSubmission(caseId: string): PendingSubmission | null {
+export function readPendingSubmission(caseId: string, userId: string | null): PendingSubmission | null {
+  if (!userId) return null
   try {
     const raw = window.sessionStorage.getItem(PREFIX + caseId)
     if (!raw) return null
     const value = JSON.parse(raw) as Partial<PendingSubmission>
+    // Another user's marker is neither shown nor removed.
+    if (typeof value.userId === 'string' && value.userId !== userId) return null
     if (
       value.caseId !== caseId ||
+      value.userId !== userId ||
       typeof value.idempotencyKey !== 'string' ||
       typeof value.outcome !== 'string' ||
       typeof value.expectedVersion !== 'number' ||

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Link, useParams } from 'react-router'
 import type { ApiError } from '../api/errors'
+import { useAuth } from '../auth/AuthProvider'
 import type {
   CandidateDetail,
   ClaimRequest,
@@ -47,9 +48,10 @@ export function ReviewCaseScreen() {
     (client, signal) => (listingId ? client.candidate(listingId, null, { signal }) : Promise.reject(new Error('waiting for the case'))),
     [listingId],
   )
+  const { userId } = useAuth()
   const [draft, setDraft] = useState<DecisionDraft>(EMPTY_DRAFT)
   // The marker of an unconfirmed submission from BEFORE a page reload (read once on mount).
-  const [earlier] = useState<PendingSubmission | null>(() => readPendingSubmission(caseId))
+  const [earlier] = useState<PendingSubmission | null>(() => readPendingSubmission(caseId, userId))
   const canWrite = can('reviews:write')
 
   if (caseQuery.status === 'loading') return <LoadingState label="Loading review case" />
@@ -128,6 +130,7 @@ export function ReviewCaseScreen() {
           setDraft={setDraft}
           reload={caseQuery.reload}
           timeZone={timezone}
+          userId={userId ?? ''}
         />
       ) : (
         <Notice tone="info">
@@ -188,6 +191,7 @@ function ReviewActions({
   setDraft,
   reload,
   timeZone,
+  userId,
 }: {
   reviewCase: ReviewCaseView
   candidate: CandidateDetail | null
@@ -195,6 +199,7 @@ function ReviewActions({
   setDraft: (draft: DecisionDraft | ((previous: DecisionDraft) => DecisionDraft)) => void
   reload: () => void
   timeZone: string
+  userId: string
 }) {
   const { client } = useWorkspace()
   const claims = useClaimStore()
@@ -208,7 +213,10 @@ function ReviewActions({
     settled: (_attempt, outcome) => {
       if ('envelope' in outcome) {
         const result = outcome.envelope.data
-        if (result.claim_token) claims.remember({ ...result, claim_token: result.claim_token })
+        if (result.claim_token) {
+          claims.remember({ ...result, claim_token: result.claim_token })
+          releaseReset.current() // an earlier "Claim released." no longer describes the claim
+        }
         reload()
       }
     },
@@ -217,6 +225,7 @@ function ReviewActions({
     settled: (_attempt, outcome) => {
       if ('envelope' in outcome || outcome.error.code === 'CLAIM_EXPIRED') {
         claims.forget(caseId)
+        claimReset.current()
         reload()
       }
     },
@@ -228,6 +237,7 @@ function ReviewActions({
       beforeSend: (attempt) =>
         writePendingSubmission({
           caseId,
+          userId,
           idempotencyKey: attempt.key,
           outcome: attempt.body.outcome,
           expectedVersion: attempt.body.expected_version,
@@ -237,15 +247,25 @@ function ReviewActions({
         clearPendingSubmission(caseId)
         if ('envelope' in outcome) {
           claims.forget(caseId)
+          claimReset.current() // the server cleared the claim with the decision
           setDraft(EMPTY_DRAFT)
           setShowProblems(false)
           reload()
         } else if (outcome.error.code === 'CLAIM_EXPIRED') {
+          // The handle is no longer current: drop it AND the old "Claimed until ..." confirmation.
           claims.forget(caseId)
+          claimReset.current()
         }
       },
     },
   )
+
+  const claimReset = useRef(claim.reset)
+  const releaseReset = useRef(release.reset)
+  useEffect(() => {
+    claimReset.current = claim.reset
+    releaseReset.current = release.reset
+  })
 
   // An idempotent replay of a claim does not repeat the one-time token: claim once more (same
   // principal) to rotate it. Done at most once per replayed attempt.
@@ -314,9 +334,13 @@ function ReviewActions({
           }}
           pendingText="Claiming…"
           confirmed={(result) =>
-            result.claim_token
-              ? `Claimed until ${new Date(result.expires_at).toLocaleTimeString()} (case version ${result.case_version}).`
-              : 'The claim was recorded earlier; fetching a fresh claim handle…'
+            result.claim_token ? (
+              <>
+                Claimed until <Timestamp value={result.expires_at} timeZone={timeZone} /> (case version {result.case_version}).
+              </>
+            ) : (
+              'The claim was recorded earlier; fetching a fresh claim handle…'
+            )
           }
           extraOnRejected={
             claim.phase.kind === 'rejected' ? (

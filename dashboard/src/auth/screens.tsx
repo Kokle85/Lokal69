@@ -91,14 +91,17 @@ export function LoginScreen() {
         options: { emailRedirectTo: redirect.toString(), shouldCreateUser: false },
       })
       if (mine !== attempt.current) return
-      // The same wording whether or not the address has an account (no account enumeration).
+      // The same wording whether or not the address has an account (no account enumeration); only
+      // failures that apply to every address (rate limit, outage) are reported as failures.
       setMessage(
-        error && error.status !== undefined && error.status >= 500
-          ? { tone: 'error', text: 'The sign-in link could not be sent right now. Try again later.' }
-          : {
-              tone: 'ok',
-              text: 'If this address belongs to a dashboard user, a sign-in link is on its way. Open it in this browser.',
-            },
+        error && error.status === 429
+          ? { tone: 'error', text: 'Too many sign-in link requests. Wait a minute, then try again.' }
+          : error && error.status !== undefined && error.status >= 500
+            ? { tone: 'error', text: 'The sign-in link could not be sent right now. Try again later.' }
+            : {
+                tone: 'ok',
+                text: 'If this address belongs to a dashboard user, a sign-in link is on its way. Open it in this browser.',
+              },
       )
     } catch {
       if (mine === attempt.current) setMessage({ tone: 'error', text: 'The authentication service could not be reached.' })
@@ -157,11 +160,19 @@ export function LoginScreen() {
   )
 }
 
-function urlErrorParams(location: { search: string; hash: string }): { error: string; description: string | null } | null {
+/**
+ * The error of a failed or cancelled magic-link sign-in. Only a short machine code is kept: the
+ * free-text `error_description` is attacker-controllable (anyone can craft a link to this page)
+ * and is never shown, so the page cannot be used to display arbitrary text on this origin.
+ */
+function urlErrorParams(location: { search: string; hash: string }): { code: string | null } | null {
   const sources = [new URLSearchParams(location.search), new URLSearchParams(location.hash.replace(/^#/, ''))]
   for (const params of sources) {
-    const error = params.get('error') ?? params.get('error_code')
-    if (error) return { error, description: params.get('error_description') }
+    const error = params.get('error') ?? params.get('error_code') ?? params.get('error_description')
+    if (error) {
+      const code = params.get('error_code') ?? params.get('error')
+      return { code: code && /^[a-z0-9_]{1,64}$/i.test(code) ? code : null }
+    }
   }
   return null
 }
@@ -192,10 +203,10 @@ export function AuthCallbackScreen() {
         <h1>Sign-in not completed</h1>
         <p role="alert">
           The sign-in was cancelled or the link is invalid or expired. You are not signed in.
-          {failure.description ? (
+          {failure.code ? (
             <>
               {' '}
-              Details: <span className="untrusted">{failure.description}</span>
+              Error code <code>{failure.code}</code>.
             </>
           ) : null}
         </p>

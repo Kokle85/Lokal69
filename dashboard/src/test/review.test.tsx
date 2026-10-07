@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import type { ReviewCaseView, Role } from '../api/types'
 import { writePendingSubmission } from '../review/pendingMarker'
 import { apiError, deferred, fakeApi, ok, type FakeApi } from './fakeApi'
+import { TEST_USER_ID } from './fakeAuth'
 import { candidateDetail, CASE_ID, CLAIM_TOKEN, claimResult, decision, LISTING_ID, me, reviewCase } from './fixtures'
 import { renderApp } from './renderApp'
 
@@ -69,6 +70,8 @@ describe('review submission', () => {
     gate.release()
     expect(await screen.findByTestId('decision-saved')).toHaveTextContent('Decision saved: watch')
     expect(world.api.callsTo('POST /api/reviews/:id/submit')).toHaveLength(1)
+    // The (now disabled) submit button does not swallow keyboard focus: it moves to the result.
+    await waitFor(() => expect(screen.getByTestId('decision-saved').closest('.mutation-status')).toHaveFocus())
     await waitFor(() => expect(screen.getAllByTestId('decision-entry')).toHaveLength(1))
   })
 
@@ -105,6 +108,40 @@ describe('review submission', () => {
     expect(sessionStorage.getItem(`suvdash:pending-submit:${CASE_ID}`)).toBeNull()
   })
 
+  it('keeps an unconfirmed note unconfirmed when the retry is refused before evaluation (429), so no second key can duplicate it', async () => {
+    let attempts = 0
+    const api = fakeApi({
+      'GET /api/me': () => ok(me('reviewer')),
+      'GET /api/candidates/:id': () => ok(candidateDetail()),
+      'POST /api/listings/:id/notes': (call) => {
+        attempts += 1
+        if (attempts === 1) throw new TypeError('network connection lost') // committed; the answer never arrived
+        if (attempts === 2) {
+          return apiError(429, 'RATE_LIMITED', 'Too many requests', { retryable: true, correlation: 'req-rate-limited-1' })
+        }
+        const body = call.body as { note: string }
+        return ok({ note_id: '99999999-9999-4999-8999-999999999999', listing_id: LISTING_ID, label: 'reviewer', body: body.note, created_at: '2026-10-07T10:00:00Z', replayed: true }, 201)
+      },
+    })
+    renderApp(`/candidates/${LISTING_ID}`, { api })
+    const user = userEvent.setup()
+    await user.type(await screen.findByLabelText('Add a private note'), 'SYNTHETIC note sent over a flaky connection.')
+    await user.click(screen.getByRole('button', { name: 'Add note' }))
+    let unconfirmed = await screen.findByTestId('mutation-unconfirmed')
+    await user.click(within(unconfirmed).getByRole('button', { name: 'Retry the same request' }))
+    // The 429 refused the RETRY before the server looked at it: the first send is still unknown.
+    unconfirmed = await screen.findByTestId('mutation-unconfirmed')
+    expect(unconfirmed).toHaveTextContent('refused before the server looked at it')
+    expect(screen.queryByTestId('mutation-rejected')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Add note' })).toBeDisabled()
+    await user.click(within(unconfirmed).getByRole('button', { name: 'Retry the same request' }))
+    expect(await screen.findByTestId('mutation-confirmed')).toHaveTextContent('Note saved.')
+    const sends = api.callsTo('POST /api/listings/:id/notes')
+    expect(sends).toHaveLength(3)
+    expect(new Set(sends.map((call) => call.headers.get('Idempotency-Key'))).size).toBe(1)
+    expect(new Set(sends.map((call) => call.rawBody)).size).toBe(1)
+  })
+
   it('shows ALREADY_CLAIMED with a reload path and the correlation id', async () => {
     const world = reviewWorld()
     world.current.value = reviewCase({ claim: { claimed: true, held_by_caller: false, expires_at: new Date(Date.now() + 60_000).toISOString() } })
@@ -133,6 +170,9 @@ describe('review submission', () => {
     expect(screen.getByLabelText(/^Summary/)).toHaveValue('SYNTHETIC: price in band; watch for a drop.')
     expect(screen.queryByTestId('decision-saved')).toBeNull()
     expect(screen.getByRole('button', { name: 'Submit decision' })).toBeDisabled()
+    // The claim's earlier "Claimed until ..." confirmation is gone with the stale handle.
+    expect(screen.queryByText(/Claimed until/)).toBeNull()
+    expect(screen.getByTestId('claim-state')).not.toHaveTextContent('You hold the claim until')
   })
 
   it('shows VERSION_CONFLICT for a newer listing revision with a reload path', async () => {
@@ -214,6 +254,7 @@ describe('review submission', () => {
     world.current.value = reviewCase({ case_version: 3, state: 'watch', decisions: [saved], latest_decision_id: saved.decision_id })
     writePendingSubmission({
       caseId: CASE_ID,
+      userId: TEST_USER_ID,
       idempotencyKey: 'review-submit:k-earlier-attempt',
       outcome: 'watch',
       expectedVersion: 2,
@@ -231,6 +272,7 @@ describe('review submission', () => {
     world.current.value = reviewCase({ case_version: 2, state: 'claimed', claim: { claimed: true, held_by_caller: true, expires_at: new Date(Date.now() + 60_000).toISOString() } })
     writePendingSubmission({
       caseId: CASE_ID,
+      userId: TEST_USER_ID,
       idempotencyKey: 'review-submit:k-earlier-attempt',
       outcome: 'watch',
       expectedVersion: 2,
@@ -258,6 +300,20 @@ describe('review submission', () => {
     expect(await screen.findByText(/You hold the claim until/)).toBeInTheDocument()
     expect(screen.getByLabelText(/^Summary/)).toHaveValue('SYNTHETIC draft written while the claim lapsed.')
     expect(screen.getByRole('button', { name: 'Submit decision' })).toBeEnabled()
+  })
+
+  it('does not carry a draft or a mutation state over to another case (back/forward between cases)', async () => {
+    const world = reviewWorld()
+    const { router } = renderApp(`/reviews/${CASE_ID}`, { api: world.api })
+    const user = userEvent.setup()
+    await claimAndFill(user)
+    const other = '00000000-0000-4000-8000-0000000000c2'
+    await act(async () => {
+      await router.navigate(`/reviews/${other}`)
+    })
+    await waitFor(() => expect(world.api.calls.some((call) => call.path === `/api/reviews/${other}`)).toBe(true))
+    expect(await screen.findByLabelText(/^Summary/)).toHaveValue('')
+    expect(screen.queryByText(/Claimed until/)).toBeNull()
   })
 
   it('links the candidate of the case', async () => {

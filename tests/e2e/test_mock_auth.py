@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import json
 import time
 from datetime import timedelta
 from urllib.parse import parse_qs, urlsplit
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from suv_deals.api.auth import AuthFailure, StaticJwks, SupabaseJwtVerifier
@@ -168,3 +173,105 @@ def test_unknown_email_gets_the_same_otp_answer_and_foreign_redirects_are_ignore
     )
     link = client.get(f"/__e2e/magic-link?email={USERS['viewer'].email}").json()["url"]
     assert "evil.example" not in parse_qs(urlsplit(link).query)["redirect_to"][0]
+
+
+def _signed(
+    client: TestClient, overrides: dict[str, object], *, key: object | None = None, alg: str = "ES256"
+) -> str:
+    """A token from the mock's own key (or ``key``) with some claims overridden (``None`` drops one)."""
+    state = client.app.state.auth  # type: ignore[attr-defined]
+    now = int(time.time())
+    claims: dict[str, object] = {
+        "iss": state.issuer,
+        "aud": "authenticated",
+        "sub": str(USERS["reviewer"].user_id),
+        "role": "authenticated",
+        "iat": now,
+        "exp": now + 600,
+        "session_id": "synthetic-session",
+    }
+    for name, value in overrides.items():
+        if value is None:
+            claims.pop(name, None)
+        else:
+            claims[name] = value
+    return jwt.encode(claims, key or state.private_key, algorithm=alg, headers={"kid": state.kid})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("label", "overrides"),
+    [
+        ("foreign issuer", {"iss": "https://evil.example/auth/v1"}),
+        ("wrong audience", {"aud": "anon"}),
+        ("anon role", {"role": "anon"}),
+        ("service role", {"role": "service_role"}),
+        ("anonymous user", {"is_anonymous": True}),
+        ("expired", {"exp": int(time.time()) - 5, "iat": int(time.time()) - 60}),
+        ("issued in the future", {"iat": int(time.time()) + 3600, "exp": int(time.time()) + 7200}),
+        ("not yet valid", {"nbf": int(time.time()) + 3600}),
+        ("non-UUID subject", {"sub": "admin"}),
+        ("missing subject", {"sub": None}),
+        ("missing expiry", {"exp": None}),
+    ],
+)
+async def test_backend_verifier_refuses_tokens_the_mock_never_issues(
+    client: TestClient, label: str, overrides: dict[str, object]
+) -> None:
+    """The mock's JWKS must not make the REAL verifier accept anything Supabase would not issue."""
+    verifier = SupabaseJwtVerifier(
+        issuer=f"{BASE}/auth/v1",
+        audience="authenticated",
+        resolver=StaticJwks(client.get("/auth/v1/.well-known/jwks.json").json()),
+        leeway=timedelta(0),
+    )
+    with pytest.raises(AuthFailure):
+        await verifier.verify(_signed(client, overrides))
+    assert label
+
+
+async def test_backend_verifier_refuses_forged_signatures_and_algorithm_confusion(client: TestClient) -> None:
+    jwks = client.get("/auth/v1/.well-known/jwks.json").json()
+    verifier = SupabaseJwtVerifier(
+        issuer=f"{BASE}/auth/v1", audience="authenticated", resolver=StaticJwks(jwks)
+    )
+    state = client.app.state.auth  # type: ignore[attr-defined]
+    # A different P-256 key claiming the mock's kid.
+    forged = _signed(client, {}, key=ec.generate_private_key(ec.SECP256R1()))
+    # HS256 "signed" with the public key (classic RS/ES -> HS confusion) and an unsigned token.
+    public_pem = state.private_key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT","kid":"' + state.kid.encode() + b'"}')
+    body = _signed(client, {}).split(".")[1].encode()
+    signing_input = header.rstrip(b"=") + b"." + body
+    confused = (
+        signing_input
+        + b"."
+        + base64.urlsafe_b64encode(hmac.new(public_pem, signing_input, hashlib.sha256).digest()).rstrip(b"=")
+    ).decode()
+    unsigned = (
+        base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b"=") + b"." + body + b"."
+    ).decode()
+    # A genuine token whose payload was edited after signing (another user's id).
+    genuine = str(_password(client)["access_token"])
+    head, payload, signature = genuine.split(".")
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    claims["sub"] = str(USERS["owner"].user_id)
+    tampered_payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+    tampered = f"{head}.{tampered_payload}.{signature}"
+    for token in (forged, confused, unsigned, tampered):
+        with pytest.raises(AuthFailure):
+            await verifier.verify(token)
+    # The genuine token still verifies (the refusals above are not a broken verifier).
+    assert (await verifier.verify(genuine)).user_id == USERS["reviewer"].user_id
+
+
+def test_jwks_publishes_only_the_public_signing_key(client: TestClient) -> None:
+    keys = client.get("/auth/v1/.well-known/jwks.json").json()["keys"]
+    assert len(keys) == 1
+    (key,) = keys
+    assert key["kty"] == "EC"
+    assert key["crv"] == "P-256"
+    assert key["alg"] == "ES256"
+    assert "d" not in key  # never the private scalar
+    assert set(key) <= {"kty", "crv", "x", "y", "kid", "alg", "use", "key_ops"}
