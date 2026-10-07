@@ -1,7 +1,10 @@
 """API credentials: issue, authenticate, list and revoke (``ops.api_credentials``; spec 20, 24, 37.8).
 
-Every SQL statement against ``ops.api_credentials`` lives here (the MCP verifier in
-``mcp/auth.py`` and the ``suv-deals credentials`` commands call these functions).
+Every statement that issues, authenticates, lists or revokes ``ops.api_credentials`` rows lives
+here (the MCP verifier in ``mcp/auth.py`` and the ``suv-deals credentials`` commands call these
+functions). The only other reader is ``subscriptions_repo``, whose dispatch-time access recheck
+(read-only, also embedded in its delivery-claim SQL) requires the subscribing credential to be
+unrevoked, unexpired and still scoped.
 
 Kinds and tokens
     ``static_bearer`` (``suvmcp_<64 hex>``) and ``dev_local`` (``suvdev_<64 hex>``) are MCP

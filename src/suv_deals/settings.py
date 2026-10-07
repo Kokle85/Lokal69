@@ -260,11 +260,10 @@ class Settings(BaseSettings):
                 self.migrations_dir = home / "supabase" / "migrations"
             if "snapshot_local_dir" not in explicit:
                 self.snapshot_local_dir = home / "var" / "snapshots"
-        # Informational only: the directory actually in use (None when absent or not a directory).
-        secrets = self.suv_deals_secrets_dir
-        self.suv_deals_secrets_dir = (
-            secrets.expanduser() if secrets is not None and secrets.expanduser().is_dir() else None
-        )
+        # Informational only: the directory actually in use. Like `settings_customise_sources` it
+        # is read from the PROCESS environment only, so a value in `.env` (which cannot enable the
+        # secrets source) is never reported as if secret files were loaded.
+        self.suv_deals_secrets_dir = secrets_dir_from_env()
         return self
 
     @property

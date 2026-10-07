@@ -10,6 +10,7 @@ worker credential, revocation and the metadata listing (never hashes). SYNTHETIC
 from __future__ import annotations
 
 import hashlib
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -201,7 +202,7 @@ async def test_authenticate_checks_kind_revocation_expiry_scopes_workspace_and_p
         lambda c: credentials_repo.revoke_credential(c, actor, issued.credential_id, reason="again"),
     )
     assert await rejected(token) == "revoked"
-    expired = "suvmcp_" + "e" * 64
+    expired = "suvmcp_" + secrets.token_hex(32)  # unique: the test database outlives one run
     seed.insert(
         "ops.api_credentials",
         workspace_id=workspace,
@@ -286,3 +287,32 @@ async def test_listing_shows_metadata_only_and_administration_is_owner_only(db: 
     )
     listed = await run(db, signed_in_owner, lambda c: credentials_repo.list_credentials(c, signed_in_owner))
     assert [r.credential_id for r in listed] == [viewer_client.credential_id]
+    # A signed-in owner revokes through RLS (tenant policy + column grants), audited as the owner;
+    # another workspace's credential is NotFound for them (no existence leak).
+    other = seed.workspace("Credentials listing other")
+    foreign = await issue(db, other, role=Role.VIEWER, scopes=[Scope.DEALS_READ], kind="static_bearer")
+    with pytest.raises(NotFound):
+        await run(
+            db,
+            signed_in_owner,
+            lambda c: credentials_repo.revoke_credential(
+                c, signed_in_owner, foreign.credential_id, reason="SYNTHETIC foreign"
+            ),
+        )
+    assert await run(
+        db,
+        signed_in_owner,
+        lambda c: credentials_repo.revoke_credential(
+            c, signed_in_owner, viewer_client.credential_id, reason="SYNTHETIC owner revoke"
+        ),
+    )
+    assert (
+        seed.scalar(
+            "select revoked_by from ops.api_credentials where id = %s", (viewer_client.credential_id,)
+        )
+        == owner
+    )
+    assert (
+        seed.scalar("select revoked_at from ops.api_credentials where id = %s", (foreign.credential_id,))
+        is None
+    )

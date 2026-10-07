@@ -11,9 +11,10 @@
   their domain writes; an exception that escapes a handler is mapped by `disposition_for_error` to
   ``retry_wait`` (with backoff / Retry-After), ``blocked`` (typed blocker, no timer) or
   ``dead_letter`` (visible), in a separate short transaction that again locks the job first. A
-  budget-gate refusal (`BudgetRefused`: nothing was fetched) is the exception: the job is released
-  to ``queued`` at the gate's time WITHOUT consuming an attempt (`detail.apply_budget_refusal`), or
-  blocked for an access-blocked host.
+  budget-gate refusal (`BudgetRefused`: nothing was fetched) that lifts on its own is the
+  exception: the job is released to ``queued`` at the gate's time WITHOUT consuming an attempt
+  (`detail.apply_budget_refusal`); an access-blocked host blocks it and a refusal without a known
+  end (configuration, e.g. a zero per-run cap) is retried with the attempt counted.
 - **Shutdown**: setting the stop event (SIGTERM/SIGINT in `run_worker`) lets the current job finish its
   commit; no new job is claimed. A job interrupted by a crash is recovered by the reaper
   (`workers.reconciliation`), which requeues it while attempts remain.
@@ -248,7 +249,7 @@ class Worker:
         return _report(job, state, code=disposition.code)
 
     async def _release_refused(self, execution: JobExecution, refused: BudgetRefused) -> JobRunReport:
-        """Nothing was fetched: release without consuming an attempt (or block an access block)."""
+        """Nothing was fetched: `detail.apply_budget_refusal` (release, retry or block)."""
         job = execution.job
 
         async def commit() -> tuple[JobState, str | None]:

@@ -43,7 +43,10 @@ from suv_deals.views.inquiries import (
     InquiryPauseResult,
     InquiryView,
     RecipientView,
+    ReplySenderView,
+    ReplySummaryView,
     ReplyView,
+    SendAttemptSummary,
     address_domain,
     recipient_address_visible,
 )
@@ -344,3 +347,137 @@ def test_recipient_address_is_owner_only() -> None:
     assert shown.address == "seller@dealer.example.invalid" and not shown.address_redacted
     with pytest.raises(ValidationError):
         RecipientView.model_validate({**hidden.model_dump(), "address": "seller@dealer.example.invalid"})
+
+
+# ---------------------------------------------------------------------------------------------
+# Review regressions: read models accept every value the database accepts; tag stripping never
+# eats a real nested field name
+# ---------------------------------------------------------------------------------------------
+
+_NOW = "2026-10-06T18:00:00Z"
+_VEHICLE: dict[str, Any] = {
+    "vehicle_kind": "listing_incarnation",
+    "vehicle_cluster_id": None,
+    "listing_id": UID,
+    "source_key": None,
+    "listing_reference": None,
+    "listing_url": None,
+}
+
+
+@pytest.mark.parametrize("code", ["LEASE_EXPIRED", "_lease", ".x", "-x", ":x", "a" * 80])
+def test_attempt_error_codes_follow_the_database_check(code: str) -> None:
+    """``ops.email_delivery_attempts_error_ck`` is ``^[A-Za-z0-9_.:-]{1,80}$``; a stricter view
+    pattern turned a valid stored attempt into a read failure (500)."""
+    attempt = SendAttemptSummary.model_validate(
+        {
+            "attempt_number": 1,
+            "provider": "outlook_local",
+            "outcome": "uncertain",
+            "send_intent_committed_at": _NOW,
+            "finished_at": _NOW,
+            "reconciled_outcome": None,
+            "reconciled_at": None,
+            "submission_uncertain": True,
+            "error_code": code,
+        }
+    )
+    assert attempt.error_code == code
+    for bad in ("", "a" * 81, "has space", "x/y"):
+        with pytest.raises(ValidationError):
+            SendAttemptSummary.model_validate({**attempt.model_dump(mode="json"), "error_code": bad})
+
+
+def test_reply_language_is_any_stored_iso_code() -> None:
+    """``seller_replies.detected_language`` and ``seller_contacts.language_code`` are
+    ``^[a-z]{2}$``: a Dutch reply or an unsupported contact language must stay readable."""
+    summary = ReplySummaryView.model_validate(
+        {
+            "reply_id": UID,
+            "inquiry_id": UID,
+            "vehicle": _VEHICLE,
+            "message_type": "seller_reply",
+            "original_language": "nl",
+            "availability": None,
+            "quarantined": False,
+            "processing_state": "stored",
+            "received_at": _NOW,
+            "ingested_at": _NOW,
+        }
+    )
+    assert summary.original_language == "nl"
+    held = RecipientView.build(
+        address=None,
+        show_address=False,
+        contact_id=None,
+        verification_status="verified",
+        contact_kind="ad_email",
+        language="nl",
+        language_status="unsupported_language",
+        verified_at=None,
+    )
+    assert held.language == "nl"
+    for bad in ("NL", "nld", "n", ""):
+        with pytest.raises(ValidationError):
+            ReplySummaryView.model_validate({**summary.model_dump(mode="json"), "original_language": bad})
+    schema = tool_output_schema("seller_replies_get")["properties"]["data"]["properties"]
+    assert schema["original_language"]["pattern"] == "^[a-z]{2}$"
+    # The inquiry itself is only ever sent in one of the four template languages.
+    inquiry = tool_output_schema("seller_inquiries_get")["properties"]["data"]["properties"]
+    assert inquiry["language"]["enum"] == ["de", "it", "fr", "en", None]
+    assert inquiry["recipient"]["properties"]["language"]["pattern"] == "^[a-z]{2}$"
+
+
+class _Inner(BaseModel):
+    model: int
+    url: int
+    date: int
+    none: int
+
+
+class _Outer(BaseModel):
+    vehicle: _Inner
+    choice: int | str
+    nested: _Inner | int
+
+
+@pytest.mark.parametrize("with_model", [True, False])
+def test_real_nested_field_names_are_never_taken_for_union_tags(with_model: bool) -> None:
+    data = {
+        "vehicle": {"model": "x", "url": "y", "date": "z", "none": "w"},
+        "choice": [],
+        "nested": {"model": "x", "url": 1, "date": 1, "none": 1},
+    }
+    assert _fields(_Outer, data, with_model=with_model) == [
+        "choice",
+        "nested",
+        "nested.model",
+        "vehicle.date",
+        "vehicle.model",
+        "vehicle.none",
+        "vehicle.url",
+    ]
+
+
+def test_reply_sender_address_is_owner_only() -> None:
+    common: dict[str, Any] = {
+        "matches_verified_recipient": True,
+        "correlation_status": "matched",
+        "correlation_reasons": ("IN_REPLY_TO_MATCH",),
+        "header_linked": True,
+        "thread_linked": False,
+    }
+    hidden = ReplySenderView.build(
+        address="seller@dealer.example.invalid",
+        show_address=recipient_address_visible(ROLE_SCOPES[Role.REVIEWER]),
+        **common,
+    )
+    assert hidden.address is None and hidden.address_redacted
+    assert hidden.address_domain == "dealer.example.invalid"
+    assert "seller@" not in hidden.model_dump_json()
+    shown = ReplySenderView.build(
+        address="seller@dealer.example.invalid",
+        show_address=recipient_address_visible(ROLE_SCOPES[Role.OWNER]),
+        **common,
+    )
+    assert shown.address == "seller@dealer.example.invalid" and not shown.address_redacted

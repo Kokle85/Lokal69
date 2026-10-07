@@ -111,7 +111,6 @@ async def test_escaping_errors_map_to_typed_outcomes(
 @pytest.mark.parametrize(
     ("decision", "code"),
     [
-        (Deny(reason=DenyReason.RUN_CAP_REACHED), "RUN_CAP_REACHED"),
         (
             Deny(reason=DenyReason.BUDGET_EXHAUSTED, until=datetime(2099, 1, 1, tzinfo=UTC)),
             "DAILY_BUDGET_EXHAUSTED",
@@ -157,6 +156,38 @@ async def test_budget_refusals_release_the_job_without_consuming_an_attempt(
     [again] = await worker(env, registry_with(refused)).run_until_idle()
     assert again.state == JobState.QUEUED
     assert job_row(env, job_id)["attempts"] == 0 and job_row(env, job_id)["state"] == "queued"
+
+
+@pytest.mark.parametrize(
+    ("decision", "code"),
+    [
+        (Deny(reason=DenyReason.RUN_CAP_REACHED), "RUN_CAP_REACHED"),  # e.g. max_detail_jobs_per_run: 0
+        (Deny(reason=DenyReason.BUDGET_EXHAUSTED), "DAILY_BUDGET_EXHAUSTED"),  # no budget at all
+    ],
+)
+async def test_refusals_without_a_known_end_consume_the_attempt(
+    env: PipelineEnv, decision: Deny, code: str
+) -> None:
+    """A refusal that never lifts with time is configuration, not budget pressure: releasing it for
+    free would cycle the job forever. It is retried with the attempt counted, so a single-attempt
+    job becomes a visible dead letter; nothing is audited as a release."""
+
+    async def refused(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
+        del ctx
+        raise BudgetRefused(decision, now=datetime.now(UTC))
+
+    job_id = await enqueue(env, max_attempts=1)
+    [report] = await worker(env, registry_with(refused)).run_until_idle()
+    assert report.state == JobState.DEAD_LETTER and report.code == code
+    row = job_row(env, job_id)
+    assert row["state"] == "dead_letter" and row["attempts"] == 1 and row["last_error_code"] == code
+    released = env.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s and action = 'job.release'"
+        " and target_id = %s",
+        env.workspace_id,
+        job_id,
+    )
+    assert released == 0
 
 
 async def test_an_access_blocked_host_still_blocks_the_job(env: PipelineEnv) -> None:

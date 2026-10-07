@@ -12,6 +12,7 @@ response must parse in the worker. Synthetic ``example.invalid`` data only; noth
 from __future__ import annotations
 
 import json
+import re
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -193,6 +194,8 @@ class ContractServer:
 
     def __init__(self) -> None:
         self.seen: list[tuple[str, str]] = []
+        #: Route key (``METHOD /path/{param}``) -> whether the request carried an Idempotency-Key.
+        self.idempotency: dict[str, bool] = {}
         self.intent = MailWorkerSendIntent.model_validate_json(
             make_intent(
                 inquiry_id=INQUIRY, mailbox_binding_id=MAILBOX, from_address=OWNER, created_at=NOW
@@ -206,6 +209,8 @@ class ContractServer:
         path = request.url.path
         self.seen.append((request.method, path))
         assert request.headers["Authorization"] == f"Bearer {TOKEN}"
+        template = re.sub(r"/send-intents/[0-9a-f-]{36}/", "/send-intents/{intent_id}/", path)
+        self.idempotency[f"{request.method} {template}"] = IDEMPOTENCY_HEADER in request.headers
 
         def body[M: BaseModel](model: type[M]) -> M:
             return model.model_validate_json(request.content)
@@ -352,6 +357,12 @@ def test_the_desktop_client_round_trips_every_route(
         )
     )
     assert [method for method, _ in server.seen] == ["GET", "POST", "GET", "POST", "POST", "POST", "POST"]
+    # The Idempotency-Key header rule of every route is exactly what the desktop client sends:
+    # required on replies/claim/report, absent on heartbeat/account-report and the GET routes
+    # (a server that required it there would refuse the worker's health reports).
+    assert server.idempotency == {
+        route.key: route.idempotency_header == "required" for route in MAIL_WORKER_ROUTES
+    }
 
 
 def test_reply_extensions_and_limits_are_accepted_exactly_like_the_domain() -> None:
@@ -440,3 +451,19 @@ def test_backend_models_refuse_what_the_worker_refuses() -> None:
         )
     with pytest.raises(ValueError, match="short codes"):
         MailWorkerHeartbeatAck(downstream={"slack": "has space"})
+
+
+def test_schema_version_is_present_exactly_where_the_wire_has_it() -> None:
+    """Every top-level request/response carries ``schema_version: "1.0"`` except the
+    account-report body (the desktop ``WorkerAccountReport`` has none, so a server that required
+    it would refuse every account verification)."""
+    without = {
+        route.key
+        for route in MAIL_WORKER_ROUTES
+        for model in (route.request_model, route.response_model)
+        if model is not None
+        and model not in (MailWorkerBindingsQuery, MailWorkerSendIntentsQuery)
+        and "schema_version" not in model.model_fields
+    }
+    assert without == {"POST /v1/mail-workers/account-report"}
+    assert "schema_version" not in wire.WorkerAccountReport.model_fields

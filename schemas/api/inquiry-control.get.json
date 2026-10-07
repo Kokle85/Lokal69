@@ -1,0 +1,206 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/inquiry-control",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "Workspace inquiry controls (``GET /api/inquiry-control``): kill switch, mode, caps.",
+        "properties": {
+          "approval_required": {
+            "const": false,
+            "default": false,
+            "type": "boolean"
+          },
+          "ceiling_per_15d": {
+            "const": 5,
+            "default": 5,
+            "type": "integer"
+          },
+          "ceiling_per_24h": {
+            "const": 2,
+            "default": 2,
+            "type": "integer"
+          },
+          "kill_switch": {
+            "type": "boolean"
+          },
+          "kill_switch_reason": {
+            "maxLength": 2000,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kill_switch_set_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_per_15d": {
+            "maximum": 5,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_per_24h": {
+            "maximum": 2,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "disabled_until_sender_ready",
+              "automatic",
+              "paused"
+            ],
+            "type": "string"
+          },
+          "seller_cooldown_seconds": {
+            "maximum": 31536000,
+            "minimum": 86400,
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "used_15d": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_24h": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "description": "Send as expected_version to pause or resume.",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "mode",
+          "kill_switch",
+          "kill_switch_reason",
+          "kill_switch_set_at",
+          "max_per_24h",
+          "max_per_15d",
+          "ceiling_per_24h",
+          "ceiling_per_15d",
+          "seller_cooldown_seconds",
+          "used_24h",
+          "used_15d",
+          "updated_at",
+          "approval_required"
+        ],
+        "title": "InquiryControlView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "inquiry-control.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Kill switch, mode, owner-reducible caps and current usage."
+}

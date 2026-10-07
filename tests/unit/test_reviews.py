@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from suv_deals.domain.actor import ActorContext
+from suv_deals.domain.due_diligence import DashboardAction
 from suv_deals.domain.enums import (
     Availability,
     EligibilityState,
@@ -20,7 +21,6 @@ from suv_deals.domain.enums import (
     Scope,
     ValuationState,
 )
-from suv_deals.domain.due_diligence import DashboardAction
 from suv_deals.domain.reviews import (
     ALLOWED_TRANSITIONS,
     CLAIMABLE_STATES,

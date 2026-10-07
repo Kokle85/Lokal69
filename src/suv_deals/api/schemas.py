@@ -19,7 +19,8 @@ served app is unchanged):
   ``mail:ingest`` bearer credential only; the server derives workspace and mailbox from it (a
   request can never select either). Bodies and responses are the desktop wire models EXACTLY
   (``outlook_bridge.wire`` / ``outlook_bridge.api_client``; parity is contract-tested field by
-  field) and are top-level JSON objects with ``schema_version: "1.0"`` (no ``ResponseEnvelope``).
+  field) and are top-level JSON objects with ``schema_version: "1.0"`` (no ``ResponseEnvelope``),
+  except the account-report body, which has no ``schema_version`` (as on the wire).
   Errors are ``ApiErrorResponse`` bodies (``error.code``, ``request_id``, ``retry_after_seconds``).
   Where ``wire.py`` and spec 37.8 differ, the desktop wire wins (documented in
   docs/api_contract.md): replies may be acknowledged ``ingest_status: "quarantined"``; the reply
@@ -643,6 +644,9 @@ def api_error(error: AppError, *, request_id: str, as_of: datetime) -> tuple[int
 
 Auth = Literal["none", "user_jwt", "mail_worker"]
 RequestLocation = Literal["query", "body"]
+#: ``Idempotency-Key`` request header: ``required`` (missing -> 400), ``optional`` (when sent it
+#: must equal the body's ``idempotency_key``), ``None`` (not used by the route).
+IdempotencyHeader = Literal["required", "optional"]
 
 COMMON_ERRORS: Final[tuple[ErrorCode, ...]] = (
     ErrorCode.UNAUTHENTICATED,
@@ -669,6 +673,7 @@ class ApiRoute:
     paginated: bool = False
     mcp_tool: str | None = None
     summary: str = ""
+    idempotency_header: IdempotencyHeader | None = None
 
     @property
     def key(self) -> str:
@@ -694,6 +699,7 @@ def _r(
     errors: tuple[ErrorCode, ...] = (),
     paginated: bool = False,
     tool: str | None = None,
+    idempotency_header: IdempotencyHeader | None = None,
 ) -> ApiRoute:
     return ApiRoute(
         method=method,
@@ -709,6 +715,7 @@ def _r(
         paginated=paginated,
         mcp_tool=tool,
         summary=summary,
+        idempotency_header=idempotency_header,
     )
 
 
@@ -913,6 +920,7 @@ def _mw(
     location: RequestLocation | None = None,
     errors: tuple[ErrorCode, ...] = (),
     paginated: bool = False,
+    idempotency_header: IdempotencyHeader | None = None,
 ) -> ApiRoute:
     return ApiRoute(
         method=method,
@@ -926,6 +934,7 @@ def _mw(
         errors=(*_MW_COMMON, *errors),
         paginated=paginated,
         summary=summary,
+        idempotency_header=idempotency_header,
     )
 
 
@@ -949,6 +958,7 @@ MAIL_WORKER_ROUTES: Final[tuple[ApiRoute, ...]] = (
         request=MailWorkerReplyRequest,
         location="body",
         errors=(ErrorCode.VERSION_CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT),
+        idempotency_header="required",
     ),
     _mw(
         "GET",
@@ -966,6 +976,7 @@ MAIL_WORKER_ROUTES: Final[tuple[ApiRoute, ...]] = (
         request=MailWorkerClaimRequest,
         location="body",
         errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="required",
     ),
     _mw(
         "POST",
@@ -975,6 +986,7 @@ MAIL_WORKER_ROUTES: Final[tuple[ApiRoute, ...]] = (
         request=MailWorkerSendReport,
         location="body",
         errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT),
+        idempotency_header="required",
     ),
     _mw(
         "POST",
@@ -1052,6 +1064,7 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         location="body",
         errors=(ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
         tool="seller_inquiries_pause",
+        idempotency_header="optional",
     ),
     _r(
         "POST",
@@ -1062,6 +1075,7 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         request=InquiryResumeRequest,
         location="body",
         errors=(ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="optional",
     ),
 )
 V11_ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType(
@@ -1076,7 +1090,8 @@ def route_slug(route: ApiRoute) -> str:
 
 
 def route_schema_document(route: ApiRoute) -> dict[str, Any]:
-    """``schemas/api/<slug>.json``: method, path, auth, scope, request/response schemas, errors."""
+    """``schemas/api/<slug>.json``: method, path, auth, scope, request/response schemas, errors and
+    the ``Idempotency-Key`` header rule."""
     request = (
         None
         if route.request_model is None
@@ -1097,6 +1112,7 @@ def route_schema_document(route: ApiRoute) -> dict[str, Any]:
         "paginated": route.paginated,
         "mcpTool": route.mcp_tool,
         "summary": route.summary,
+        "idempotencyKeyHeader": route.idempotency_header,
     }
 
 
@@ -1128,6 +1144,7 @@ __all__ = [
     "CandidateListQuery",
     "ClaimRequest",
     "ComparablesQuery",
+    "IdempotencyHeader",
     "InquiryListQuery",
     "InquiryPauseRequest",
     "InquiryResumeRequest",

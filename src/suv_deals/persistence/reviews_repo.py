@@ -36,8 +36,16 @@ I/O. Lock order (docs/schema.md section 4): idempotency record -> ``app.listings
   the materiality policy allows it, the audit row and the idempotency completion. A timeout
   retry with the same key replays the stored decision; a second decision for the same case
   version is impossible (unique ``(case_id, case_version)`` and the cleared claim).
+- **Dashboard actions** (spec 19): before anything is written, `submit` refuses
+  ``needs_inspection`` / ``needs_documents`` / ``price_confirmation_needed`` reason codes (in any
+  case or separator spelling) with any outcome other than ``needs_information``
+  (``domain.reviews.check_dashboard_action_outcome``), so the API and MCP enforce the same rule.
+- **Fixture label**: a case's ``is_fixture`` comes from the listing's lineage frozen at ingest
+  (``app.listings.is_fixture``), never from the source's current mode.
 - **Queue** (`list_pending_queue`): pages come from a frozen ``ops.query_snapshots``
   projection bound to principal, workspace and filter hash; claim/submit always revalidate.
+- **Operator listing** (`list_cases_by_state`): a read-only list of cases by state for CLI
+  tooling (``reviews:read``); it never returns claim tokens or hashes.
 
 Failures are not recorded in ``ops.idempotency_records``: a failing request rolls back
 entirely (including its in-progress record), so a retry re-evaluates the current state.

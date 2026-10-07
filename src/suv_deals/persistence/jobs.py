@@ -635,9 +635,10 @@ async def release(
 ) -> JobRecord:
     """Return a claimed job to ``queued`` WITHOUT consuming an attempt (fenced by the lease).
 
-    For work that never started because a budget refused it (host spacing, Retry-After, daily
-    budget, circuit, per-run cap): the claim's ``attempts + 1`` is undone, so budget refusals
-    can never exhaust a job into a dead letter. ``available_at`` is an absolute instant, a delay
+    For work that never started because a budget refused it until a known time (host spacing,
+    Retry-After, daily budget, circuit; `crawling.detail.apply_budget_refusal` decides): the
+    claim's ``attempts + 1`` is undone, so budget pressure can never exhaust a job into a dead
+    letter. ``available_at`` is an absolute instant, a delay
     from database time, or ``None`` (due now); it is never earlier than the current database
     time. ``code`` is recorded as ``last_error_code`` (and in the log); with ``actor`` the release
     is also audited (``job.release``). Raises `LeaseLost` when the lease is no longer held.

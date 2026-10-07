@@ -254,3 +254,78 @@ async def test_create_workspace_bootstrap(db: Database, admin_db: Database, seed
     with pytest.raises(ValidationFailed):
         async with admin_db.transaction() as conn:
             await workspaces.create_workspace(conn, name="  ", owner_user_id=user, request_id="x")
+
+
+async def test_privileged_owner_bootstrap_of_an_existing_workspace(
+    db: Database, admin_db: Database, seed: Seed
+) -> None:
+    """No signed-in owner: add, reactivate or confirm an owner membership on the maintenance role."""
+    ws = seed.workspace(unique("Synthetic owner bootstrap"))
+    user = seed.user()
+    email = seed.scalar("select email from auth.users where id = %s", (user,))
+    async with admin_db.transaction() as conn:
+        assert await workspaces.find_auth_users(conn, user_id=user) == [user]
+        assert await workspaces.find_auth_users(conn, email=f"  {email.upper()} ") == [user]
+        assert await workspaces.find_auth_users(conn, user_id=uuid.uuid4()) == []
+        for bad in ({}, {"user_id": user, "email": email}, {"email": "not-an-address"}):
+            with pytest.raises(ValidationFailed):
+                await workspaces.find_auth_users(conn, **bad)
+        info = await workspaces.get_workspace(conn, ws)
+        assert info is not None and info.id == ws and info.active
+        assert await workspaces.get_workspace(conn, uuid.uuid4()) is None
+        added = await workspaces.bootstrap_owner_membership(
+            conn, workspace_id=ws, owner_user_id=user, request_id="setup-test"
+        )
+    assert added.outcome == "added" and added.prior_role is None and added.prior_active is None
+    assert added.membership.role == Role.OWNER and added.membership.active
+    async with admin_db.transaction() as conn:
+        assert await workspaces.find_owned_workspace(conn, owner_user_id=user, name=info.name) == ws
+        assert await workspaces.find_owned_workspace(conn, owner_user_id=seed.user(), name=info.name) is None
+    # A lost owner membership (deactivated, demoted) is restored without a signed-in owner.
+    seed.conn.execute(
+        "update app.memberships set active = false, role = 'viewer' where workspace_id = %s and user_id = %s",
+        (ws, user),
+    )
+    async with admin_db.transaction() as conn:
+        assert await workspaces.find_owned_workspace(conn, owner_user_id=user, name=info.name) is None
+        restored = await workspaces.bootstrap_owner_membership(
+            conn, workspace_id=ws, owner_user_id=user, request_id="setup-test"
+        )
+    assert restored.outcome == "reactivated" and restored.prior_role == Role.VIEWER
+    assert restored.prior_active is False and restored.membership.active
+    async with admin_db.transaction() as conn:
+        confirmed = await workspaces.bootstrap_owner_membership(
+            conn, workspace_id=ws, owner_user_id=user, request_id="setup-test"
+        )
+    assert confirmed.outcome == "confirmed" and confirmed.prior_role == Role.OWNER
+    audited = seed.conn.execute(
+        "select metadata ->> 'prior_role', metadata ->> 'prior_active', actor_kind from ops.audit_events"
+        " where workspace_id = %s and action = 'membership.bootstrap_owner' and target_id = %s"
+        " order by created_at, id",
+        (ws, user),
+    ).fetchall()
+    assert [(r[0], r[1]) for r in audited] == [(None, None), ("viewer", "false"), ("owner", "true")]
+    assert {r[2] for r in audited} == {"system"}
+    assert [m.workspace_id for m in await workspaces.resolve_memberships_for_user(db, user)] == [ws]
+    # Unknown users and unknown or inactive workspaces are refused; nothing is written.
+    async with admin_db.transaction() as conn:
+        with pytest.raises(NotFound):
+            await workspaces.bootstrap_owner_membership(
+                conn, workspace_id=ws, owner_user_id=uuid.uuid4(), request_id="setup-test"
+            )
+    seed.conn.execute("update app.workspaces set active = false where id = %s", (ws,))
+    other = seed.user()
+    for target in (ws, uuid.uuid4()):
+        async with admin_db.transaction() as conn:
+            with pytest.raises(NotFound):
+                await workspaces.bootstrap_owner_membership(
+                    conn, workspace_id=target, owner_user_id=other, request_id="setup-test"
+                )
+    assert seed.scalar("select count(*) from app.memberships where user_id = %s", (other,)) == 0
+    # The restricted backend role cannot run the privileged bootstrap.
+    seed.conn.execute("update app.workspaces set active = true where id = %s", (ws,))
+    async with db.transaction(user_id=other) as conn:
+        with pytest.raises((Forbidden, NotFound)):
+            await workspaces.bootstrap_owner_membership(
+                conn, workspace_id=ws, owner_user_id=other, request_id="setup-test"
+            )

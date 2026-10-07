@@ -718,11 +718,11 @@ async def test_submit_refuses_dashboard_action_codes_with_other_outcomes(
         )
         == 0
     )
-    action = submit_request(
-        grant, outcome=ReviewOutcome.NEEDS_INFORMATION, reason_codes=("needs_documents",)
-    )
+    action = submit_request(grant, outcome=ReviewOutcome.NEEDS_INFORMATION, reason_codes=("needs_documents",))
     decision = await run(db, actor, lambda c: reviews_repo.submit(c, actor, action))
-    assert decision.outcome == ReviewOutcome.NEEDS_INFORMATION and decision.reason_codes == ("needs_documents",)
+    assert decision.outcome == ReviewOutcome.NEEDS_INFORMATION and decision.reason_codes == (
+        "needs_documents",
+    )
 
 
 async def test_list_cases_by_state_is_read_only_and_labels_fixtures(
@@ -734,7 +734,9 @@ async def test_list_cases_by_state_is_read_only_and_labels_fixtures(
     listing, rev = make_listing(seed, world.workspace_id, fixture_source)
     fixture_case = await open_case(db, world, listing_id=listing, revision_id=rev)
     actor = viewer(world.workspace_id)
-    before = seed.scalar("select count(*) from ops.audit_events where workspace_id = %s", (world.workspace_id,))
+    before = seed.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s", (world.workspace_id,)
+    )
     pending = await run(
         db, actor, lambda c: reviews_repo.list_cases_by_state(c, actor, [ReviewState.PENDING], limit=10)
     )
@@ -745,12 +747,16 @@ async def test_list_cases_by_state_is_read_only_and_labels_fixtures(
     assert (
         await run(db, actor, lambda c: reviews_repo.list_cases_by_state(c, actor, [ReviewState.WATCH]))
     ) == []
-    after = seed.scalar("select count(*) from ops.audit_events where workspace_id = %s", (world.workspace_id,))
+    after = seed.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s", (world.workspace_id,)
+    )
     assert after == before
     with pytest.raises(ValidationFailed):
         await run(db, actor, lambda c: reviews_repo.list_cases_by_state(c, actor, []))
     with pytest.raises(ValidationFailed):
-        await run(db, actor, lambda c: reviews_repo.list_cases_by_state(c, actor, [ReviewState.PENDING], limit=0))
+        await run(
+            db, actor, lambda c: reviews_repo.list_cases_by_state(c, actor, [ReviewState.PENDING], limit=0)
+        )
     outsider = system(world.workspace_id)
     no_scope = type(outsider)(
         workspace_id=outsider.workspace_id,
@@ -761,7 +767,9 @@ async def test_list_cases_by_state_is_read_only_and_labels_fixtures(
         request_id="req-synthetic-noscope",
     )
     with pytest.raises(Forbidden):
-        await run(db, no_scope, lambda c: reviews_repo.list_cases_by_state(c, no_scope, [ReviewState.PENDING]))
+        await run(
+            db, no_scope, lambda c: reviews_repo.list_cases_by_state(c, no_scope, [ReviewState.PENDING])
+        )
 
 
 async def test_fixture_lineage_is_frozen_at_ingest_not_read_from_the_current_source_mode(
@@ -788,18 +796,18 @@ async def test_fixture_lineage_is_frozen_at_ingest_not_read_from_the_current_sou
     updated = await open_case(db, world, listing_id=old_listing, revision_id=rev2)
     assert updated.action == "updated" and updated.case_id == first.case_id
     assert case_row(seed, first.case_id)["is_fixture"] is True  # type: ignore[arg-type]
-    events = [e for e in outbox_rows(seed, world.workspace_id) if e["payload"]["case_id"] == str(first.case_id)]
+    events = [
+        e for e in outbox_rows(seed, world.workspace_id) if e["payload"]["case_id"] == str(first.case_id)
+    ]
     assert len(events) == 2
     assert all(e["is_fixture"] and e["state"] == "blocked" for e in events)
     # The lineage is immutable, and a listing stored after the switch is real.
-    with pytest.raises(Exception, match="frozen at ingest"):
-        with seed.conn.transaction():
-            seed.conn.execute("update app.listings set is_fixture = false where id = %s", (old_listing,))
+    with pytest.raises(Exception, match="frozen at ingest"), seed.conn.transaction():
+        seed.conn.execute("update app.listings set is_fixture = false where id = %s", (old_listing,))
     new_listing, new_rev = make_listing(seed, world.workspace_id, source)
     assert seed.scalar("select is_fixture from app.listings where id = %s", (new_listing,)) is False
     real = await open_case(db, world, listing_id=new_listing, revision_id=new_rev)
     assert case_row(seed, real.case_id)["is_fixture"] is False  # type: ignore[arg-type]
     # An explicit lineage that contradicts the source's mode at ingest is refused.
-    with pytest.raises(Exception, match="fixture lineage must match"):
-        with seed.conn.transaction():
-            seed.listing(world.workspace_id, source, is_fixture=True)
+    with pytest.raises(Exception, match="fixture lineage must match"), seed.conn.transaction():
+        seed.listing(world.workspace_id, source, is_fixture=True)

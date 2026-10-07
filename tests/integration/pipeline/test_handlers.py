@@ -566,3 +566,35 @@ async def test_a_revision_promoted_during_a_valuation_makes_the_job_a_successful
     assert env.scalar("select count(*) from app.valuations where listing_id = %s", eligible) == 0
     assert env.scalar("select count(*) from app.review_cases where listing_id = %s", eligible) == 0
     assert env.scalar("select count(*) from app.comparable_sets where listing_id = %s", eligible) == 0
+
+
+async def test_a_zero_detail_cap_is_configuration_not_budget_pressure(env: PipelineEnv) -> None:
+    """``max_detail_jobs_per_run: 0`` refuses every detail fetch of a fresh run (RUN_CAP_REACHED
+    before anything is fetched). That never passes with time, so it is NOT released for free (a
+    perpetual 15-minute loop that never dead-letters): each refusal consumes an attempt and an
+    exhausted job ends as a visible dead letter."""
+    await tick(env)
+    [first] = await worker(env, "worker-cap-discovery", JobType.DISCOVERY).run_until_idle()
+    assert first.state == JobState.SUCCEEDED
+    detail_jobs = env.rows(
+        "select id, max_attempts from ops.jobs where workspace_id = %s and job_type = 'detail'"
+        " and state = 'queued'",
+        env.workspace_id,
+    )
+    assert detail_jobs
+    set_source_config(env, "rate_budget,max_detail_jobs_per_run", "0")
+    reports = await worker(env, "worker-cap-detail", JobType.DETAIL).run_until_idle()
+    assert reports and {r.code for r in reports} == {"RUN_CAP_REACHED"}
+    assert all(r.state in (JobState.RETRY_WAIT, JobState.DEAD_LETTER) for r in reports)
+    rows = env.rows(
+        "select state, attempts, last_error_code from ops.jobs"
+        " where workspace_id = %s and job_type = 'detail'",
+        env.workspace_id,
+    )
+    assert all(r["attempts"] >= 1 and r["last_error_code"] == "RUN_CAP_REACHED" for r in rows)
+    assert all(r["state"] in ("retry_wait", "dead_letter") for r in rows)
+    released = env.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s and action = 'job.release'",
+        env.workspace_id,
+    )
+    assert released == 0

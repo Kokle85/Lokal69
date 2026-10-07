@@ -1,0 +1,272 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/heartbeat",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/heartbeat`` (== ``wire.HeartbeatEnvelope``).",
+    "properties": {
+      "backlog_count": {
+        "default": 0,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "backlog_oldest_age_seconds": {
+        "default": null,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "checkpoints": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "description": "One mailbox/store/folder checkpoint (hashed identities; == ``wire.CheckpointReport``).",
+          "properties": {
+            "acknowledged_watermark": {
+              "default": null,
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "backlog_count": {
+              "default": 0,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "backlog_oldest_at": {
+              "default": null,
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "folder_id_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "folder_role": {
+              "enum": [
+                "inbox",
+                "sent_items",
+                "outbox",
+                "junk",
+                "rule_target",
+                "other"
+              ],
+              "type": "string"
+            },
+            "gap_reasons": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 30,
+              "type": "array"
+            },
+            "last_complete_scan_at": {
+              "default": null,
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_scan_started_at": {
+              "default": null,
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "overlap_watermark": {
+              "default": null,
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "store_id_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "store_id_hash",
+            "folder_id_hash",
+            "folder_role"
+          ],
+          "title": "MailWorkerCheckpointReport",
+          "type": "object"
+        },
+        "maxItems": 20,
+        "type": "array"
+      },
+      "gaps": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "description": "A monitored coverage gap (== ``wire.GapReport``); never claimed coverage.",
+          "properties": {
+            "ended_at": {
+              "default": null,
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z0-9_]+$",
+              "type": "string"
+            },
+            "started_at": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "started_at"
+          ],
+          "title": "MailWorkerGapReport",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      },
+      "heartbeat": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "mailbox_binding_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "mailbox_connected": {
+            "type": "boolean"
+          },
+          "outlook_running": {
+            "type": "boolean"
+          },
+          "pending_intents": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sync_lag_seconds": {
+            "default": null,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "worker_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mailbox_binding_id",
+          "worker_id",
+          "at",
+          "outlook_running",
+          "mailbox_connected"
+        ],
+        "title": "OutlookHeartbeat",
+        "type": "object"
+      },
+      "last_successful_reconciliation_at": {
+        "default": null,
+        "format": "date-time",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mailbox_last_sync_at": {
+        "default": null,
+        "format": "date-time",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "unresolved_matching_gaps": {
+        "default": 0,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "heartbeat"
+    ],
+    "title": "MailWorkerHeartbeatRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of the heartbeat (== ``wire.HeartbeatAck``): ``downstream`` carries Slack/MCP\nhealth the worker cannot observe (short codes only, at most 10 entries).",
+    "properties": {
+      "downstream": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "maxProperties": 10,
+        "type": "object"
+      },
+      "received_at": {
+        "default": null,
+        "format": "date-time",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "title": "mail-workers.heartbeat.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Worker, Outlook and mailbox health, checkpoints and coverage gaps."
+}

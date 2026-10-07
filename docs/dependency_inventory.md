@@ -85,7 +85,7 @@ typing-inspection 0.4.4, tzdata 2026.5, pywin32 312 (Windows only).
 | Component | State |
 |---|---|
 | Dashboard (`dashboard/`, work in progress in a parallel package; re-record when it lands) | `package-lock.json` lockfileVersion 3, exact pins in `package.json`; Node `>=22.22.0` (tested with Node 22.22.0, npm 10.9.4). Runtime: `@supabase/supabase-js` 2.117.3, `react` / `react-dom` 19.3.0, `react-router` 8.4.0. Development: `vite` 8.3.3, `@vitejs/plugin-react` 6.1.2, `typescript` 6.0.3, `vitest` 5.0.3, `jsdom` 29.1.1, `@testing-library/react` 16.3.3, `@testing-library/dom` 10.4.2, `@testing-library/jest-dom` 7.0.1, `@testing-library/user-event` 14.6.7, `@playwright/test` 1.56.1, `oxlint` 1.87.0, `@types/node` 22.20.5, `@types/react` / `@types/react-dom` 19.3.0. `make dashboard-install` runs `npm ci` (lockfile only). Research pins: docs/research/frontend_and_supabase.md section 2. |
-| Local Outlook reply worker (`desktop/outlook-bridge/requirements-windows.txt`) | pydantic 2.13.5, httpx 0.28.1, PyYAML 6.0.3 match `uv.lock`; it pins `pywin32==311` while `uv.lock` resolves `pywin32` 312 (Windows-only, lazily imported) — re-verify at activation. |
+| Local Outlook reply worker (`desktop/outlook-bridge/requirements-windows.txt`) | pydantic 2.13.5, httpx 0.28.1, PyYAML 6.0.3 and `pywin32==312` (Windows-only, lazily imported) match `uv.lock` — re-verify pywin32 at activation. |
 
 ## 7. How to refresh
 

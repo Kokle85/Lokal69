@@ -51,6 +51,17 @@ Availability (spec 9, 37.9)
     ``listing.availability`` audit event and, once migration ``20261006001000`` has created
     ``app.availability_events`` (spec 37.8), the evidence row there (`TableAvailabilitySink`).
 
+Fixture lineage (spec 7, 13)
+    ``app.listings.is_fixture`` is frozen at ingest from the source's mode at that moment (the
+    insert and every new incarnation set it; a database trigger refuses a mismatch and any later
+    change). Switching a source between fixture and real mode never relabels its listings, so
+    review cases and alerts derive the fixture label from the listing, not the current source.
+
+Rechecks (`request_recheck`)
+    The one recheck path for the API and MCP (``deals_request_recheck``): idempotent per key and
+    principal, refused for paused / access-blocked sources, reusing a waiting detail job
+    (`find_waiting_detail_job`) instead of queueing another, and audited (``recheck.request``).
+
 Scopes: ingestion is system work (system principals or ``config:admin``); detail refreshes need
 ``rechecks:request`` for rechecks; reads need ``deals:read``.
 """
@@ -2148,6 +2159,7 @@ async def current_revision(conn: Conn, actor: ActorContext, listing_id: UUID) ->
 
 __all__ = [
     "DEFAULT_AVAILABILITY_SINK",
+    "RECHECK_OPERATION",
     "AbsenceReport",
     "AuditAvailabilitySink",
     "AvailabilityEventSink",
@@ -2158,13 +2170,16 @@ __all__ = [
     "IngestDetailResult",
     "IngestReport",
     "ListingRecord",
+    "RecheckRequest",
     "RevisionRecord",
     "ScreeningContext",
     "TableAvailabilitySink",
+    "WaitingDetailJob",
     "allocate_detail_generation",
     "availability_events_available",
     "current_revision",
     "find_listing",
+    "find_waiting_detail_job",
     "get_listing",
     "ingest_detail",
     "ingest_search_page",
@@ -2172,4 +2187,5 @@ __all__ = [
     "load_screening_context",
     "mark_complete_scan_absences",
     "request_detail_refresh",
+    "request_recheck",
 ]

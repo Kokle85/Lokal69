@@ -19,8 +19,11 @@ import pytest
 
 from suv_deals.api.schemas import (
     COMMON_ERRORS,
+    MAIL_WORKER_ROUTES,
     ROUTE_INDEX,
     ROUTES,
+    V11_DASHBOARD_ROUTES,
+    V11_ROUTE_INDEX,
     AddNoteRequest,
     ApiErrorResponse,
     CandidateDetailQuery,
@@ -34,12 +37,16 @@ from suv_deals.api.schemas import (
     ReviewQueueQuery,
     SubmitReviewRequest,
     api_error,
+    exported_api_schema_documents,
+    route_slug,
 )
 from suv_deals.domain.enums import Scope
 from suv_deals.errors import HTTP_STATUS, ErrorCode, NotFound, RateLimited, ValidationFailed, VersionConflict
 from suv_deals.mcp.schemas import (
     TOOL_NAMES,
     TOOLS,
+    V11_TOOL_NAMES,
+    V11_TOOLS,
     DealsListCandidatesInput,
     ReviewsSubmitInput,
     exported_schema_documents,
@@ -60,13 +67,19 @@ EXPECTED_FILES = {
     "review.schema.json",
     "valuation.schema.json",
     "event.schema.json",
-    *(f"tools/{name}.json" for name in TOOL_NAMES),
+    *(f"tools/{name}.json" for name in (*TOOL_NAMES, *V11_TOOL_NAMES)),
+    *(f"api/{route_slug(route)}.json" for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)),
 }
+ALL_TOOLS = {**TOOLS, **V11_TOOLS}
+
+
+def _all_documents() -> dict[str, dict[str, Any]]:
+    return {**exported_schema_documents(), **exported_api_schema_documents()}
 
 
 @pytest.fixture(scope="module")
 def generated() -> dict[str, str]:
-    return {path: render_schema_document(doc) for path, doc in exported_schema_documents().items()}
+    return {path: render_schema_document(doc) for path, doc in _all_documents().items()}
 
 
 # =========================================================================== snapshots
@@ -84,13 +97,13 @@ def test_snapshot_matches_generated(path: str, generated: dict[str, str]) -> Non
 
 
 def test_no_stale_tool_snapshots() -> None:
-    committed = {f"tools/{p.name}" for p in (SCHEMAS / "tools").glob("*.json")}
+    committed = {f"{d}/{p.name}" for d in ("tools", "api") for p in (SCHEMAS / d).glob("*.json")}
     stale = committed - EXPECTED_FILES
-    assert not stale, f"stale tool schemas {sorted(stale)}. {REGENERATE}"
+    assert not stale, f"stale tool/route schemas {sorted(stale)}. {REGENERATE}"
 
 
 def test_rendering_is_deterministic(generated: dict[str, str]) -> None:
-    again = {path: render_schema_document(doc) for path, doc in exported_schema_documents().items()}
+    again = {path: render_schema_document(doc) for path, doc in _all_documents().items()}
     assert again == generated
     for path, text in generated.items():
         assert text.endswith("}\n"), path
@@ -120,15 +133,55 @@ def test_document_schemas_are_self_contained(path: str, generated: dict[str, str
         assert not open_maps
 
 
-@pytest.mark.parametrize("name", TOOL_NAMES)
+@pytest.mark.parametrize("name", (*TOOL_NAMES, *V11_TOOL_NAMES))
 def test_tool_snapshot_content(name: str, generated: dict[str, str]) -> None:
     doc = json.loads(generated[f"tools/{name}.json"])
     assert doc["name"] == name
-    assert doc["requiredScope"] == TOOLS[name].scope.value
+    assert doc["requiredScope"] == ALL_TOOLS[name].scope.value
     assert doc["inputSchema"]["additionalProperties"] is False
     assert not open_objects(doc["inputSchema"]) and not find_refs(doc["inputSchema"])
     assert not open_objects(doc["outputSchema"]) and not find_refs(doc["outputSchema"])
     assert doc["errorSchema"]["title"] == "ToolError"
+
+
+@pytest.mark.parametrize("route", (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES), ids=lambda r: r.key)
+def test_route_snapshot_content(route: Any, generated: dict[str, str]) -> None:
+    text = generated[f"api/{route_slug(route)}.json"]
+    doc = json.loads(text)
+    assert (doc["method"], doc["path"]) == (route.method, route.path)
+    assert doc["auth"] == route.auth and doc["requiredScope"] == route.scope.value
+    assert doc["errors"] == [code.value for code in route.errors]
+    assert doc["successStatus"] == route.success_status and doc["mcpTool"] == route.mcp_tool
+    assert doc["idempotencyKeyHeader"] == route.idempotency_header
+    if route.method == "GET":
+        assert route.idempotency_header is None
+    elif route.auth == "user_jwt":
+        # Dashboard mutations carry the key in the body; a header, when sent, must equal it.
+        assert route.idempotency_header == "optional"
+    for part in ("request", "response"):
+        schema = doc[part]
+        if schema is None:
+            assert part == "request" and route.request_model is None
+            continue
+        opened = open_objects(schema)
+        if route.path.endswith("/heartbeat") and part == "response":
+            # ``downstream`` is the only map: bounded short-code health entries.
+            downstream = {"additionalProperties": {"type": "string"}, "maxProperties": 10, "type": "object"}
+            assert opened == [downstream]
+        else:
+            assert not opened, (part, route.key)
+        assert not find_refs(schema), (part, route.key)
+    assert '"number"' not in text, "no floats on the wire"
+    assert "$defs" not in text
+
+
+def test_route_slugs_are_unique_and_stable() -> None:
+    slugs = [route_slug(r) for r in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)]
+    assert len(set(slugs)) == len(slugs)
+    assert route_slug(V11_ROUTE_INDEX["POST /v1/mail-workers/send-intents/{intent_id}/claim"]) == (
+        "mail-workers.send-intents.intent_id.claim.post"
+    )
+    assert route_slug(V11_ROUTE_INDEX["GET /api/inquiry-control"]) == "inquiry-control.get"
 
 
 def test_export_script_check_mode(tmp_path: Path) -> None:
@@ -143,8 +196,9 @@ def test_export_script_check_mode(tmp_path: Path) -> None:
     assert written.returncode == 0, written.stderr
     produced = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.json")}
     assert produced == EXPECTED_FILES
-    # A stale tool file and a modified snapshot are both reported.
+    # A stale tool or route file and a modified snapshot are all reported.
     (tmp_path / "tools" / "crawl_url.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "api" / "send-email.post.json").write_text("{}\n", encoding="utf-8")
     (tmp_path / "event.schema.json").write_text("{}\n", encoding="utf-8")
     stale = subprocess.run(
         [sys.executable, str(SCRIPT), "--check", "--output", str(tmp_path)],
@@ -154,6 +208,7 @@ def test_export_script_check_mode(tmp_path: Path) -> None:
     )
     assert stale.returncode == 1
     assert "stale: tools/crawl_url.json" in stale.stderr and "out of date: event.schema.json" in stale.stderr
+    assert "stale: api/send-email.post.json" in stale.stderr
     assert "scripts/export_schemas.py" in stale.stderr
 
 
@@ -340,6 +395,15 @@ def test_contract_doc_lists_every_route_scope_model_and_error() -> None:
     for name, spec in TOOLS.items():
         assert f"| `{name}` | `{spec.scope.value}` |" in doc, name
         assert f"`{spec.output_model.__name__}`" in doc
+    for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES):
+        assert f"`{route.key}`" in doc, f"{route.key} is not documented in docs/api_contract.md"
+        assert f"`{route.response_model.__name__}`" in doc or f"`{route.data_model.__name__}`" in doc
+        if route.request_model is not None:
+            assert f"`{route.request_model.__name__}`" in doc, route.request_model.__name__
+    for name, spec in V11_TOOLS.items():
+        assert f"| `{name}` | `{spec.scope.value}` |" in doc, name
+        assert f"`{spec.output_model.__name__}`" in doc
+    assert "to be implemented by the API package" in doc
     for phrase in (
         "Bearer",
         "CSRF",

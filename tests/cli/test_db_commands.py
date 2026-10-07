@@ -571,3 +571,39 @@ def test_owner_recovery_actions_never_enable_a_source(
     )
     assert resumed.exit_code == 0, resumed.output
     assert "paused=false, enabled=false" in resumed.output
+
+
+def test_reviews_list_reads_cases_through_the_repository(
+    run_cli: Cli, db_env: dict[str, str], workspace: UUID, seed: Seed
+) -> None:
+    import json  # noqa: PLC0415
+
+    seed.profile(workspace, "primary")
+    source = seed.source(workspace)
+    listing = seed.listing(workspace, source)
+    revision = add_revision(seed, workspace, listing, 1)
+    case = seed.review_case(workspace, listing, revision, priority=7)
+    ws = str(workspace)
+    listed = run_cli("reviews", "list", "--workspace", ws, "--json", env=db_env)
+    assert listed.exit_code == 0, listed.output
+    [row] = json.loads(listed.output)
+    assert row["id"] == str(case) and row["workspace_id"] == ws
+    assert row["state"] == "pending" and row["profile_key"] == "primary" and row["priority"] == 7
+    assert row["is_fixture"] is True and row["claim_expires_at"] is None
+    assert set(row) == {
+        "workspace_id",
+        "id",
+        "state",
+        "profile_key",
+        "queue_label",
+        "readiness",
+        "priority",
+        "is_fixture",
+        "created_at",
+        "claim_expires_at",
+        "source_key",
+    }
+    table = run_cli("reviews", "list", "--workspace", ws, env=db_env)
+    assert table.exit_code == 0 and str(case) in table.output and "1 case(s)" in table.output
+    empty = run_cli("reviews", "list", "--status", "watch", "--workspace", ws, env=db_env)
+    assert "No review cases in state(s): watch." in empty.output

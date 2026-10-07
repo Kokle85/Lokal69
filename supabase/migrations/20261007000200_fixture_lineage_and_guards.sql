@@ -59,7 +59,10 @@ begin
      where s.workspace_id = new.workspace_id
        and s.id = new.source_id;
     if v_mode is null then
-      -- The composite foreign key reports the missing source; nothing to derive.
+      -- Unknown or foreign source: let the composite foreign key report it
+      -- (NOT NULL is checked before the end-of-statement FK check, so a
+      -- placeholder keeps the error the foreign-key violation).
+      new.is_fixture := coalesce(new.is_fixture, false);
       return new;
     end if;
     if new.is_fixture is null then

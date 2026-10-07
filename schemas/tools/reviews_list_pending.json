@@ -27,7 +27,8 @@
           "RATE_LIMITED",
           "INSUFFICIENT_DATA",
           "DEPENDENCY_UNAVAILABLE",
-          "INTERNAL_ERROR"
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
         ],
         "type": "string"
       },

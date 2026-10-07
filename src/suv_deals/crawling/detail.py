@@ -26,11 +26,15 @@ Phases (no transaction is open during network I/O):
    - our own URL-policy refusal and unparseable/unexpected pages are dead letters that stay visible
      (retrying cannot help; parser-health metrics record them).
 
-A budget-gate or host-budget refusal BEFORE the fetch (Retry-After/backoff window, circuit, daily
-budget, per-run cap, a host-spacing wait longer than the inline limit) fetched nothing: the job is
-released back to ``queued`` at the gate's time WITHOUT consuming an attempt
-(`apply_budget_refusal` -> `jobs.release`, audited with the code), so budget pressure never turns
-a detail job into a dead letter. An access-blocked host still blocks the job.
+A budget-gate or host-budget refusal BEFORE the fetch that lifts on its own (Retry-After/backoff
+window, open circuit, exhausted daily budget, a host-spacing wait longer than the inline limit)
+fetched nothing: the job is released back to ``queued`` at the gate's time WITHOUT consuming an
+attempt (`apply_budget_refusal` -> `jobs.release`, audited with the code), so budget pressure never
+turns a detail job into a dead letter. A refusal that never lifts with time (the gate's ``until`` is
+unknown: e.g. ``max_detail_jobs_per_run: 0`` refuses the first fetch of every run with
+``RUN_CAP_REACHED``) is configuration, not pressure: it consumes an attempt like any retry, so the
+job ends as a visible dead letter instead of cycling forever. An access-blocked host still blocks
+the job.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from pydantic import BaseModel, ConfigDict
 
 from suv_deals.adapters.base import ParsedListing, RawDocument
 from suv_deals.crawling.policy_client import BudgetRefused
+from suv_deals.crawling.rate_limits import Deny, DenyReason, Wait
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import AccessState, JobState
 from suv_deals.errors import SourcePaused, ValidationFailed
@@ -109,18 +114,35 @@ def _retry_at(
     return backoff_delay(attempt)
 
 
+def lifts_on_its_own(refusal: BudgetRefused) -> bool:
+    """Whether the gate's refusal ends by itself at a known time (``Wait`` always has ``until``; a
+    ``Deny`` only for an open circuit or an exhausted daily budget, never for an access block)."""
+    decision = refusal.decision
+    if isinstance(decision, Wait):
+        return True
+    return (
+        isinstance(decision, Deny)
+        and decision.until is not None
+        and decision.reason in (DenyReason.CIRCUIT_OPEN, DenyReason.BUDGET_EXHAUSTED)
+    )
+
+
 async def apply_budget_refusal(
     conn: Conn, job: ClaimedJob, refusal: BudgetRefused, actor: ActorContext
 ) -> tuple[JobState, str | None]:
     """The fenced outcome of a job whose request the budget gate refused (nothing was fetched).
 
-    An access-blocked host blocks the job (``host_access_blocked``, no timer). Every other refusal
-    releases the job to ``queued`` at the gate's time (Retry-After, backoff, circuit, daily budget
-    or the per-run cap window; `workers.runtime.refusal_disposition`) WITHOUT consuming an attempt
-    (`jobs.release`, audited with the code). Run inside the job's unit of work.
+    An access-blocked host blocks the job (``host_access_blocked``, no timer). A refusal that lifts
+    on its own (`lifts_on_its_own`: a wait, an open circuit or an exhausted daily budget with the
+    gate's ``until``) releases the job to ``queued`` at the gate's time
+    (`workers.runtime.refusal_disposition`) WITHOUT consuming an attempt (`jobs.release`, audited
+    with the code). Any other refusal (no ``until``: e.g. a zero per-run cap, which refuses the
+    first request of every run) is configuration, not budget pressure: it is retried like any
+    failure and consumes the attempt, so an exhausted job becomes a visible dead letter instead of
+    cycling forever. Run inside the job's unit of work.
     """
     disposition = refusal_disposition(refusal, job.attempts)
-    if disposition.kind != "retry":
+    if disposition.kind != "retry" or not lifts_on_its_own(refusal):
         return await apply_disposition(conn, job, disposition), disposition.code
     code = disposition.code or "BUDGET_REFUSED"
     await jobs.release(conn, job, available_at=disposition.retry_at, code=code, actor=actor)
@@ -332,4 +354,11 @@ async def _record_fetch(
         return None
 
 
-__all__ = ["CARD_ONLY_SKIP", "DetailPayload", "apply_budget_refusal", "classify", "handle_detail"]
+__all__ = [
+    "CARD_ONLY_SKIP",
+    "DetailPayload",
+    "apply_budget_refusal",
+    "classify",
+    "handle_detail",
+    "lifts_on_its_own",
+]

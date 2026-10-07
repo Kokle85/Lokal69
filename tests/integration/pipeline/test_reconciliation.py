@@ -231,6 +231,56 @@ async def test_due_watch_recheck_becomes_a_recheck_job(env: PipelineEnv) -> None
     ]
 
 
+async def test_watches_on_a_paused_source_never_starve_due_watch_rechecks(env: PipelineEnv) -> None:
+    """More overdue watches on a source that may not fetch than the window never hide a fetchable one."""
+    from tests.integration.repos_valuation_reviews.builders import make_listing  # noqa: PLC0415
+
+    await run_pipeline(env)
+    listing_id = by_slid(env)["TEST-204"]["id"]
+    user = env.seed.user()
+    env.seed.membership(env.workspace_id, user, "reviewer")
+    reviewer = user_actor(env.workspace_id, user, Role.REVIEWER)
+    paused = env.seed.source(
+        env.workspace_id, source_key=f"synthetic_paused_{uuid.uuid4().hex[:8]}", detail_mode="fetch"
+    )
+    env.seed.conn.execute(
+        "update app.sources set paused = true, pause_reason = 'SYNTHETIC pause', paused_at = now()"
+        " where id = %s",
+        (paused,),
+    )
+    stuck: list[uuid.UUID] = []
+    for _ in range(3):
+        other, _rev = make_listing(env.seed, env.workspace_id, paused)
+        watch = await run(
+            env.ctx,
+            reviewer,
+            lambda c, li=other: notes_repo.add_watch(c, reviewer, li, reason="SYNTHETIC stuck"),
+        )
+        stuck.append(watch.id)
+    due = await run(
+        env.ctx,
+        reviewer,
+        lambda c: notes_repo.add_watch(
+            c, reviewer, listing_id, reason="SYNTHETIC watch", recheck_interval=timedelta(hours=6)
+        ),
+    )
+    env.seed.conn.execute(
+        "update app.watchlists set next_recheck_at = now() - interval '2 hours' where id = any(%s)", (stuck,)
+    )
+    env.seed.conn.execute(
+        "update app.watchlists set next_recheck_at = now() - interval '1 minute' where id = %s", (due.id,)
+    )
+    report = await reconciler(env, watch_recheck_limit=2).reconcile_workspace(env.workspace_id)
+    assert report.errors == [] and report.watch_rechecks == 1
+    [recheck] = jobs_of(env, JobType.RECHECK)
+    assert recheck["listing_id"] == listing_id
+    # The paused source's watches stay due (never advanced) until that source may fetch again.
+    still_due = env.scalar(
+        "select count(*) from app.watchlists where id = any(%s) and next_recheck_at <= now()", stuck
+    )
+    assert still_due == 3
+
+
 async def test_expired_valuation_is_marked_stale_and_recomputed(env: PipelineEnv) -> None:
     await run_pipeline(env)
     listing_id = by_slid(env)["TEST-204"]["id"]

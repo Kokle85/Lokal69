@@ -22,7 +22,11 @@
 # (spec section 29). Rollback policy: scripts/rollback.sh (forward fixes only).
 #
 # Usage: DATABASE_URL=... scripts/migrate.sh [--dry-run] [--yes]
-# Note: psql receives the URL as an argument; run only on a trusted host.
+# The password never appears in a command line (visible to every local user
+# through ps / /proc): DATABASE_URL (a postgresql:// URL or a key=value
+# connection string) is split into a password-free connection string, which is
+# what psql receives as its argument, and the password, which psql receives in
+# the PGPASSWORD environment variable only (as scripts/backup.sh does).
 # =============================================================================
 set -euo pipefail
 
@@ -63,13 +67,118 @@ if ! command -v psql >/dev/null 2>&1; then
   echo "migrate.sh: psql is required." >&2
   exit 2
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "migrate.sh: python3 is required (to keep the password out of psql's arguments)." >&2
+  exit 2
+fi
+
+# Split the connection string into a password-free connection string and the password, written
+# as two NUL-terminated fields (a password may contain any character but NUL). Handles URLs
+# (password in the userinfo or a ?password= parameter) and libpq key=value strings (quoted or
+# unquoted values with backslash escapes). Nothing is written when the string cannot be parsed --
+# and a string that could still carry a password into psql's arguments is refused rather than
+# guessed at: a URL whose password has unencoded '/', '?' or '#' (it would spill into the host,
+# path or query), a URL scheme that libpq does not recognise (e.g. upper case), a "password" key
+# in another letter case, or a bare string with '@' or '://'. python3 runs isolated (-I): nothing
+# is imported from the current directory or PYTHON* variables.
+split_password() {
+  SUV_PG_URL="$1" python3 -I - <<'EOF'
+import os
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+dsn = os.environ["SUV_PG_URL"].strip()
+password = None
+_HOST = re.compile(r"(\[[0-9A-Za-z:.%]*\]|[^\[\]:@/?#]*)(:[0-9]*)?")
+
+
+def refuse(reason: str) -> None:
+    sys.exit(reason)  # the reason never contains the connection string
+
+
+def unescape(value: str) -> str:
+    if value.startswith("'"):
+        value = value[1:-1]
+    return re.sub(r"\\(.)", r"\1", value, flags=re.S)
+
+
+def is_password_key(key: str) -> bool:
+    if key.lower() == "password" and key != "password":
+        refuse("a password key in another letter case")
+    return key == "password"
+
+
+if re.match(r"^postgres(ql)?://", dsn):
+    parts = urlsplit(dsn)
+    netloc = parts.netloc
+    if "#" in dsn:
+        refuse("a URL fragment (an unencoded '#' in the password?)")
+    hosts = netloc
+    if "@" in netloc:
+        userinfo, _, hosts = netloc.rpartition("@")
+        user, sep, secret = userinfo.partition(":")
+        if sep:
+            password = unquote(secret)
+        netloc = f"{user}@{hosts}" if user else hosts
+    elif "@" in parts.path or "@" in parts.query:
+        refuse("user info cut short (an unencoded '/' or '?' in the password?)")
+    if not all(_HOST.fullmatch(host) for host in hosts.split(",")):
+        refuse("an authority that is not host[:port] (an unencoded character in the password?)")
+    kept = []
+    for item in parts.query.split("&") if parts.query else []:
+        key, _, value = item.partition("=")
+        if is_password_key(unquote(key)):
+            password = unquote(value)
+        else:
+            kept.append(item)
+    # Rebuilt by hand: urlunsplit would turn "postgresql:///db" (no authority) into "postgresql:/db".
+    query = "&".join(kept)
+    conninfo = f"{parts.scheme}://{netloc}{parts.path}" + (f"?{query}" if query else "")
+elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", dsn):
+    token = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('(?:[^'\\]|\\.)*'|(?:[^\s'\\]|\\.)*)", re.S)
+    pos, kept = 0, []
+    while dsn[pos:].strip():
+        match = token.match(dsn, pos)
+        if match is None or match.end() == pos:
+            refuse("unparseable key=value connection string")
+        key, value = match.group(1), match.group(2)
+        if is_password_key(key):
+            password = unescape(value)
+        else:
+            kept.append(f"{key}={value}")
+        pos = match.end()
+    conninfo = " ".join(kept)
+elif "://" in dsn or "@" in dsn or "=" in dsn:
+    refuse("not a postgresql:// URL, a key=value string or a database name")
+else:
+    conninfo = dsn  # a bare database name carries no password
+if not conninfo or "\0" in conninfo or (password is not None and "\0" in password):
+    refuse("unusable connection string")
+sys.stdout.write(conninfo + "\0" + (password or "") + "\0")
+EOF
+}
+
+fields=()
+mapfile -d '' -t fields < <(split_password "$DATABASE_URL" 2>/dev/null || true)
+if [ "${#fields[@]}" -ne 2 ]; then
+  echo "migrate.sh: DATABASE_URL cannot be parsed (expected a postgresql:// URL or key=value string)." >&2
+  exit 2
+fi
+conninfo="${fields[0]}"
+if [ -n "${fields[1]}" ]; then
+  export PGPASSWORD="${fields[1]}"
+fi
+fields=()
+# Children never need the full URL either.
+export -n DATABASE_URL
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 migrations_dir="$repo_root/supabase/migrations"
 
 # Fail fast instead of queueing behind long locks; no idle open transactions.
 export PGOPTIONS="${PGOPTIONS:-} -c lock_timeout=10s -c idle_in_transaction_session_timeout=120s -c client_min_messages=warning"
-psql_base=(psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1)
+psql_base=(psql "$conninfo" -X -q -v ON_ERROR_STOP=1)
 
 target="$("${psql_base[@]}" -At -F '|' -c \
   "select current_database(), coalesce(host(inet_server_addr()), 'local socket'),

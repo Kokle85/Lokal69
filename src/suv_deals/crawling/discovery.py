@@ -27,9 +27,10 @@ Three phases, never holding a transaction across network I/O:
    whose lease was lost cannot commit any of it (`LeaseLost` rolls everything back).
 
 Outcomes: access blocked -> job ``blocked`` (``access_blocked``, never retried); a budget-gate or
-host-budget refusal before the first page (nothing fetched) -> the job is released to ``queued`` at the
-gate's time WITHOUT consuming an attempt (`detail.apply_budget_refusal` -> `jobs.release`; an
-access-blocked host blocks it); 429 on the first page
+host-budget refusal before the first page (nothing fetched) that lifts on its own -> the job is
+released to ``queued`` at the gate's time WITHOUT consuming an attempt (`detail.apply_budget_refusal`
+-> `jobs.release`; an access-blocked host blocks it, a refusal without a known end consumes the
+attempt like any retry); 429 on the first page
 -> ``retry_wait`` at the gate's Retry-After-respecting time; transient first-page failure ->
 ``retry_wait`` with the gate's backoff; unexpected content / policy refusal -> the job completes with
 a failed traversal (retrying would not help; the schedule backs off and parser health records it);
@@ -482,7 +483,8 @@ async def _commit(
                 "detail_jobs": sum(len(r.detail_jobs) for r in reports),
             }
             if traversal.refusal is not None:
-                # Nothing was fetched: released without consuming an attempt (or blocked).
+                # Nothing was fetched: released without consuming an attempt when the refusal
+                # lifts on its own (otherwise retried with the attempt counted, or blocked).
                 state, code = await apply_budget_refusal(conn, job, traversal.refusal, actor)
                 return reports, code, state
             disposition = _disposition(session, source, traversal, job.attempts, result)

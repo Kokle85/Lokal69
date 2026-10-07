@@ -4,7 +4,11 @@ Links an EXISTING Supabase Auth user (by id or e-mail) to a workspace as its own
 
 - ``--workspace-name NAME`` creates a new workspace with that user as its first owner
   (`persistence.workspaces.create_workspace`), or
-- ``--workspace ID`` adds/reactivates the owner membership in an existing active workspace.
+- ``--workspace ID`` adds/reactivates the owner membership in an existing active workspace
+  (`persistence.workspaces.bootstrap_owner_membership`).
+
+The Auth-user and workspace lookups are `persistence.workspaces` helpers too; this module holds no
+SQL of its own.
 
 It never creates, invites or changes an Auth user, password or key: a missing user is an error
 ("create or invite the user in Supabase Auth first"). ``suv_backend`` cannot create workspaces, so
@@ -19,7 +23,6 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any
 from uuid import UUID, uuid4
 
 import click
@@ -92,9 +95,8 @@ def owner(
         import psycopg
         from psycopg.rows import dict_row
 
-        from suv_deals.domain.actor import ActorContext
-        from suv_deals.persistence import audit, workspaces
-        from suv_deals.persistence.errors_map import mapped_errors
+        from suv_deals.errors import NotFound
+        from suv_deals.persistence import workspaces
 
         try:
             conn = await psycopg.AsyncConnection.connect(
@@ -107,14 +109,9 @@ def owner(
         except (psycopg.Error, OSError):
             fail("the maintenance database is not reachable", 4)
         async with conn:
-            if user_id is not None:
-                cur = await conn.execute("select id from auth.users where id = %s", (user_id,))
-            else:
-                assert email is not None
-                cur = await conn.execute(
-                    "select id from auth.users where lower(email) = lower(%s) limit 2", (email.strip(),)
-                )
-            users: list[dict[str, Any]] = await cur.fetchall()
+            users = await workspaces.find_auth_users(
+                conn, user_id=user_id, email=None if email is None else email.strip()
+            )
             if not users:
                 fail(
                     "no such Supabase Auth user; create or invite the user in Supabase Auth first "
@@ -122,29 +119,22 @@ def owner(
                 )
             if len(users) > 1:
                 fail("the e-mail matches several Auth users; pass --user-id")
-            owner_id: UUID = users[0]["id"]
+            owner_id = users[0]
             echo(f"Auth user found  : {owner_id}")
             if workspace is not None:
-                cur = await conn.execute(
-                    "select name, active from app.workspaces where id = %s", (workspace,)
-                )
-                found = await cur.fetchone()
-                if found is None or not found["active"]:
+                found = await workspaces.get_workspace(conn, workspace)
+                if found is None or not found.active:
                     fail("the workspace is unknown or inactive")
                 echo(f"Workspace        : {workspace} (existing)")
             else:
                 # Re-running the same bootstrap must not silently create a second workspace (later
                 # commands would then need --workspace everywhere and data would split).
-                cur = await conn.execute(
-                    "select w.id from app.workspaces w join app.memberships m"
-                    " on m.workspace_id = w.id and m.user_id = %s and m.role = 'owner' and m.active"
-                    " where w.active and w.name = %s order by w.created_at limit 1",
-                    (owner_id, (workspace_name or "").strip()),
+                existing = await workspaces.find_owned_workspace(
+                    conn, owner_user_id=owner_id, name=workspace_name or ""
                 )
-                existing = await cur.fetchone()
                 if existing is not None:
                     fail(
-                        f"this user already owns the active workspace {existing['id']} with that name; "
+                        f"this user already owns the active workspace {existing} with that name; "
                         "pass --workspace to (re)confirm ownership instead of creating another one"
                     )
                 echo(f"Workspace        : new, named {workspace_name!r}")
@@ -162,33 +152,12 @@ def owner(
                 target_workspace = created.workspace_id
             else:
                 assert workspace is not None
-                async with mapped_errors(), conn.transaction():
-                    await conn.execute("select set_config('app.workspace_id', %s, true)", (str(workspace),))
-                    cur = await conn.execute(
-                        "select role, active from app.memberships where workspace_id = %s and user_id = %s"
-                        " for update",
-                        (workspace, owner_id),
+                try:
+                    await workspaces.bootstrap_owner_membership(
+                        conn, workspace_id=workspace, owner_user_id=owner_id, request_id=request_id
                     )
-                    prior = await cur.fetchone()
-                    await conn.execute(
-                        "insert into app.memberships (workspace_id, user_id, role, active)"
-                        " values (%s, %s, 'owner', true)"
-                        " on conflict (workspace_id, user_id) do update set role = 'owner', active = true",
-                        (workspace, owner_id),
-                    )
-                    await audit.record(
-                        conn,
-                        ActorContext.system(workspace, request_id=request_id),
-                        "membership.bootstrap_owner",
-                        "membership",
-                        owner_id,
-                        reason="operator bootstrap of the workspace owner",
-                        metadata={
-                            "role": "owner",
-                            "prior_role": None if prior is None else prior["role"],
-                            "prior_active": None if prior is None else bool(prior["active"]),
-                        },
-                    )
+                except NotFound:
+                    fail("the workspace is unknown or inactive")
                 echo(f"User {owner_id} is now an active owner of workspace {workspace}.")
                 target_workspace = workspace
         echo(

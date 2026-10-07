@@ -1,0 +1,122 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/account-report",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/account-report`` (== ``wire.WorkerAccountReport``; no\ncredentials; the worker never weakens Outlook security).",
+    "properties": {
+      "account_display_name": {
+        "default": null,
+        "maxLength": 256,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_smtp_address": {
+        "maxLength": 254,
+        "type": "string"
+      },
+      "account_type": {
+        "default": "unknown",
+        "enum": [
+          "exchange",
+          "imap",
+          "pop3",
+          "http",
+          "other",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "mailbox_binding_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "outlook_flavour": {
+        "enum": [
+          "classic",
+          "new",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "outlook_version": {
+        "default": null,
+        "maxLength": 64,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "reported_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "security_settings_unchanged": {
+        "const": true,
+        "default": true,
+        "type": "boolean"
+      },
+      "stable_account_key": {
+        "maxLength": 128,
+        "minLength": 8,
+        "pattern": "^[A-Za-z0-9._:=-]+$",
+        "type": "string"
+      },
+      "worker_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._:-]+$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "mailbox_binding_id",
+      "worker_id",
+      "reported_at",
+      "outlook_flavour",
+      "stable_account_key",
+      "account_smtp_address"
+    ],
+    "title": "MailWorkerAccountReport",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of the report and account-report routes.",
+    "properties": {
+      "accepted": {
+        "const": true,
+        "default": true,
+        "type": "boolean"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "title": "mail-workers.account-report.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Classic-Outlook account verification report (no credentials)."
+}

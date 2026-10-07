@@ -370,9 +370,15 @@ def _loc_path(loc: tuple[int | str, ...]) -> str:
 #: Pydantic's tags for the members of a union (``country.none``, ``changed_since.function-after[..]``)
 #: when the failing model is not known. Real field names never contain ``-``, ``[``, ``(``, quotes.
 _UNION_TAG_RE: Final = re.compile(r"[^A-Za-z0-9_]")
-_SIMPLE_UNION_TAGS: Final = frozenset(
-    {"none", "str", "int", "float", "bool", "bytes", "uuid", "datetime", "date", "time", "decimal",
-     "list", "tuple", "dict", "set", "frozenset", "url", "json", "any", "enum", "literal", "model"}
+#: A model member of a union is tagged with its class name; field names are snake_case.
+_MODEL_TAG_RE: Final = re.compile(r"^_*[A-Z][A-Za-z0-9_]*$")
+#: Bare scalar tags and the error-type prefix pydantic reports for that member. Without the model
+#: a bare word is only a tag when it is the LAST segment and the error came from that member type,
+#: so a real nested field such as ``vehicle.model``, ``listing.url`` or ``slot.date`` is kept.
+_SIMPLE_UNION_TAGS: Final[Mapping[str, str]] = MappingProxyType(
+    {"none": "none_", "str": "string_", "int": "int_", "float": "float_", "bool": "bool_",
+     "bytes": "bytes_", "uuid": "uuid_", "datetime": "datetime_", "date": "date_", "time": "time_",
+     "decimal": "decimal_"}
 )  # fmt: skip
 
 
@@ -393,12 +399,22 @@ def _model_field(model: type[BaseModel], name: str) -> Any:
     return None
 
 
-def _strip_union_tags(loc: tuple[int | str, ...], model: type[BaseModel] | None) -> list[int | str]:
+def _is_heuristic_tag(part: str, *, last: bool, error_type: str) -> bool:
+    """Whether a location segment (not the first) is a union-member tag, judged by its form."""
+    if _UNION_TAG_RE.search(part) or _MODEL_TAG_RE.fullmatch(part):
+        return True
+    prefix = _SIMPLE_UNION_TAGS.get(part)
+    return last and prefix is not None and error_type.startswith(prefix)
+
+
+def _strip_union_tags(
+    loc: tuple[int | str, ...], model: type[BaseModel] | None, *, error_type: str = ""
+) -> list[int | str]:
     """The field path of an error location without pydantic's union-member tags.
 
     With the model, the path is walked through its annotations (nested models, sequences,
     mappings), so a tag is only dropped where a union really is; without it, tag-shaped segments
-    after the first one (never a field name) are dropped heuristically.
+    after the first one are dropped heuristically (`_is_heuristic_tag`).
     """
     if model is None:
         return [
@@ -406,7 +422,7 @@ def _strip_union_tags(loc: tuple[int | str, ...], model: type[BaseModel] | None)
             for index, part in enumerate(loc)
             if index == 0
             or isinstance(part, int)
-            or not (_UNION_TAG_RE.search(part) or part in _SIMPLE_UNION_TAGS)
+            or not _is_heuristic_tag(part, last=index == len(loc) - 1, error_type=error_type)
         ]
     path: list[int | str] = []
     current: Any = model
@@ -464,10 +480,11 @@ def validation_error_fields(
     fields: set[str] = set()
     for err in exc.errors():
         loc = tuple(err["loc"])
-        if err.get("type") == "extra_forbidden" and loc:
+        error_type = str(err.get("type", ""))
+        if error_type == "extra_forbidden" and loc:
             stripped = [*_strip_union_tags(loc[:-1], model), loc[-1]]
         else:
-            stripped = _strip_union_tags(loc, model)
+            stripped = _strip_union_tags(loc, model, error_type=error_type)
         path = _loc_path(tuple(stripped))
         cause = (err.get("ctx") or {}).get("error")
         candidates = list(cause.fields) if not path and isinstance(cause, SubmitRuleError) else [path or root]

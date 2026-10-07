@@ -297,16 +297,19 @@ def create_app(
             metrics_server = start_private_metrics_server(settings, app_metrics)
         except OSError:
             logger.error("the private metrics endpoint could not bind METRICS_BIND; serving without it")
-        if owns_db:
-            await database.open(wait=False)
         try:
-            async with contextlib.AsyncExitStack() as stack:
-                if isinstance(mcp_asgi, Starlette):
-                    await stack.enter_async_context(mcp_asgi.router.lifespan_context(mcp_asgi))
-                yield
-        finally:
             if owns_db:
-                await database.close()
+                await database.open(wait=False)
+            try:
+                async with contextlib.AsyncExitStack() as stack:
+                    if isinstance(mcp_asgi, Starlette):
+                        await stack.enter_async_context(mcp_asgi.router.lifespan_context(mcp_asgi))
+                    yield
+            finally:
+                if owns_db:
+                    await database.close()
+        finally:
+            # Also when start-up failed: never leave the listener thread and its port behind.
             if metrics_server is not None:
                 metrics_server.close()
 

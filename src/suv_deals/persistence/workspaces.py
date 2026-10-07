@@ -13,6 +13,11 @@
   ``app.workspaces`` (workspaces are provisioned by the owner role), so it must run on a
   privileged maintenance connection; it creates the workspace, the owner membership and an audit
   event in one transaction.
+- `bootstrap_owner_membership` is its counterpart for an EXISTING workspace (``suv-deals bootstrap
+  owner --workspace``): on the same privileged connection, with no signed-in owner, it adds or
+  reactivates an owner membership and records ``membership.bootstrap_owner`` (prior role and
+  activity) in one transaction. `find_auth_users`, `get_workspace` and `find_owned_workspace`
+  are the read-only privileged lookups the bootstrap needs (it never creates or changes Auth users).
 
 Lock order: membership writes lock the workspace's membership rows (``FOR UPDATE``, ordered by
 user id) and write the audit event last; no other chain table is touched.
@@ -22,7 +27,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from psycopg import sql
@@ -254,12 +259,180 @@ async def create_workspace(
     )
 
 
+# --------------------------------------------------------------------------------------------
+# Privileged bootstrap helpers (maintenance connection, no signed-in owner)
+# --------------------------------------------------------------------------------------------
+
+_EMAIL_RE: Final = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}$")
+BOOTSTRAP_OWNER_REASON: Final = "operator bootstrap of the workspace owner"
+
+
+class WorkspaceInfo(BaseModel):
+    """A workspace as seen by the privileged bootstrap (no member data)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: UUID
+    name: str
+    display_timezone: str
+    active: bool
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return ensure_utc(value)
+
+
+class OwnerBootstrap(BaseModel):
+    """Result of `bootstrap_owner_membership`: the owner membership and what it was before."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    membership: Membership
+    prior_role: Role | None
+    prior_active: bool | None
+    outcome: Literal["added", "reactivated", "promoted", "confirmed"]
+
+
+async def find_auth_users(
+    conn: Conn, *, user_id: UUID | None = None, email: str | None = None, limit: int = 2
+) -> list[UUID]:
+    """PRIVILEGED: ids of existing Supabase Auth users by id or (case-insensitive) e-mail.
+
+    Exactly one of ``user_id`` / ``email`` is required. At most ``limit`` ids are returned so a
+    caller can detect an ambiguous e-mail without listing users. Read-only; never creates users.
+    """
+    if (user_id is None) == (email is None):
+        raise ValidationFailed(
+            "pass exactly one of user_id or email", details={"fields": ["user_id", "email"]}
+        )
+    if not 1 <= limit <= 10:
+        raise ValidationFailed("limit must be between 1 and 10", details={"fields": ["limit"]})
+    async with mapped_errors():
+        if user_id is not None:
+            rows = await fetch_all(conn, "select id from auth.users where id = %(id)s", {"id": user_id})
+        else:
+            clean = (email or "").strip()
+            if not _EMAIL_RE.fullmatch(clean):
+                raise ValidationFailed("email is not an e-mail address", details={"fields": ["email"]})
+            rows = await fetch_all(
+                conn,
+                "select id from auth.users where lower(email) = lower(%(email)s) order by id limit %(limit)s",
+                {"email": clean, "limit": limit},
+            )
+    return [r["id"] for r in rows]
+
+
+async def get_workspace(conn: Conn, workspace_id: UUID) -> WorkspaceInfo | None:
+    """PRIVILEGED: one workspace (active or not) by id, or ``None``."""
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select id, name, display_timezone, active, created_at from app.workspaces where id = %(id)s",
+            {"id": workspace_id},
+        )
+    return None if row is None else WorkspaceInfo.model_validate(row)
+
+
+async def find_owned_workspace(conn: Conn, *, owner_user_id: UUID, name: str) -> UUID | None:
+    """PRIVILEGED: the oldest ACTIVE workspace called ``name`` that ``owner_user_id`` actively owns.
+
+    Lets a re-run of the bootstrap refuse to create a second workspace with the same name.
+    """
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select w.id from app.workspaces w join app.memberships m"
+            " on m.workspace_id = w.id and m.user_id = %(user_id)s and m.role = 'owner' and m.active"
+            " where w.active and w.name = %(name)s order by w.created_at, w.id limit 1",
+            {"user_id": owner_user_id, "name": name.strip() if isinstance(name, str) else ""},
+        )
+    return None if row is None else row["id"]
+
+
+async def bootstrap_owner_membership(
+    conn: Conn,
+    *,
+    workspace_id: UUID,
+    owner_user_id: UUID,
+    request_id: str,
+    reason: str = BOOTSTRAP_OWNER_REASON,
+) -> OwnerBootstrap:
+    """PRIVILEGED: add or reactivate ``owner_user_id`` as an owner of an EXISTING active workspace.
+
+    Mirrors `create_workspace` for a workspace that already exists and has no signed-in owner to
+    call `add_membership` (lost or never-created owner membership). Runs in its own transaction (a
+    savepoint inside one): the workspace row is locked (`NotFound` when unknown or inactive), then
+    the membership rows (same order as `add_membership`), the membership is upserted as an active
+    owner, and ``membership.bootstrap_owner`` is audited (every call, also a confirmation) with
+    the prior role/activity. ``owner_user_id`` must exist in ``auth.users`` (otherwise `NotFound`).
+    """
+    clean_reason = reason.strip() if isinstance(reason, str) else ""
+    if not 1 <= len(clean_reason) <= 500:
+        raise ValidationFailed("reason must be 1-500 characters", details={"fields": ["reason"]})
+    params = {"workspace_id": workspace_id, "user_id": owner_user_id}
+    async with mapped_errors(), conn.transaction():
+        workspace = await fetch_one(
+            conn,
+            "select active from app.workspaces where id = %(workspace_id)s for no key update",
+            params,
+        )
+        if workspace is None or not workspace["active"]:
+            raise NotFound("The workspace is unknown or inactive")
+        await conn.execute("select set_config('app.workspace_id', %s, true)", (str(workspace_id),))
+        members = await fetch_all(conn, _LOCK_MEMBERS_SQL, params)
+        prior = next((m for m in members if m["user_id"] == owner_user_id), None)
+        await conn.execute(
+            "insert into app.memberships (workspace_id, user_id, role, active)"
+            " values (%(workspace_id)s, %(user_id)s, 'owner', true)"
+            " on conflict (workspace_id, user_id) do update set role = 'owner', active = true",
+            params,
+        )
+        membership = await get_membership(conn, workspace_id, owner_user_id)
+        assert membership is not None
+        await audit.record(
+            conn,
+            ActorContext.system(workspace_id, request_id=request_id),
+            "membership.bootstrap_owner",
+            "membership",
+            owner_user_id,
+            reason=clean_reason,
+            metadata={
+                "role": Role.OWNER.value,
+                "prior_role": None if prior is None else prior["role"],
+                "prior_active": None if prior is None else bool(prior["active"]),
+            },
+        )
+    if prior is None:
+        outcome: Literal["added", "reactivated", "promoted", "confirmed"] = "added"
+    elif not prior["active"]:
+        outcome = "reactivated"
+    elif prior["role"] != Role.OWNER.value:
+        outcome = "promoted"
+    else:
+        outcome = "confirmed"
+    return OwnerBootstrap(
+        membership=membership,
+        prior_role=None if prior is None else Role(prior["role"]),
+        prior_active=None if prior is None else bool(prior["active"]),
+        outcome=outcome,
+    )
+
+
 __all__ = [
+    "BOOTSTRAP_OWNER_REASON",
     "Membership",
+    "OwnerBootstrap",
     "WorkspaceBootstrap",
+    "WorkspaceInfo",
     "add_membership",
+    "bootstrap_owner_membership",
     "create_workspace",
     "deactivate_membership",
+    "find_auth_users",
+    "find_owned_workspace",
     "get_membership",
+    "get_workspace",
     "resolve_memberships_for_user",
 ]

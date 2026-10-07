@@ -1,0 +1,365 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": true,
+  "path": "/api/inquiries",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /api/inquiries``: keyset page, optionally one state or only uncertain sends.",
+    "properties": {
+      "cursor": {
+        "default": null,
+        "description": "Opaque next_cursor from the previous page; omit for the first page.",
+        "maxLength": 2048,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": 25,
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "state": {
+        "default": null,
+        "description": "Seller inquiry lifecycle (spec 37.5). `accepted` = provider accepted, not delivered/read.",
+        "enum": [
+          "candidate",
+          "qualifying",
+          "reserved",
+          "queued",
+          "sending",
+          "accepted",
+          "held_facts",
+          "uncertain",
+          "suppressed",
+          "failed_definite",
+          "cancelled",
+          "replied",
+          "bounced",
+          "seller_opted_out",
+          "no_reply_yet",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "uncertain_only": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "title": "InquiryListQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One row of the inquiry list (no message text, no addresses).",
+              "properties": {
+                "accepted_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "delivery_uncertain": {
+                  "type": "boolean"
+                },
+                "inquiry_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "language": {
+                  "description": "Supported inquiry template languages. English only with positive evidence (spec 37.3).",
+                  "enum": [
+                    "de",
+                    "it",
+                    "fr",
+                    "en",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "recipient_status": {
+                  "enum": [
+                    "verified",
+                    "unverified",
+                    "unavailable",
+                    "changed",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "reply_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "reserved_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "row_version": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "seller_entity_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "send_attempted_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "description": "Seller inquiry lifecycle (spec 37.5). `accepted` = provider accepted, not delivered/read.",
+                  "enum": [
+                    "candidate",
+                    "qualifying",
+                    "reserved",
+                    "queued",
+                    "sending",
+                    "accepted",
+                    "held_facts",
+                    "uncertain",
+                    "suppressed",
+                    "failed_definite",
+                    "cancelled",
+                    "replied",
+                    "bounced",
+                    "seller_opted_out",
+                    "no_reply_yet"
+                  ],
+                  "type": "string"
+                },
+                "state_changed_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "suppression_reason": {
+                  "enum": [
+                    "hard_bounce",
+                    "complaint",
+                    "seller_opt_out",
+                    "source_paused",
+                    "sender_revoked",
+                    "unresolved_send_outcome",
+                    "kill_switch",
+                    "contradictory_availability",
+                    "manual",
+                    "authorization_revoked",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "vehicle": {
+                  "additionalProperties": false,
+                  "description": "The canonical vehicle of an inquiry: a confirmed cluster or one listing incarnation.",
+                  "properties": {
+                    "listing_id": {
+                      "description": "The qualifying listing (source advertisement).",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "listing_reference": {
+                      "maxLength": 200,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "listing_url": {
+                      "maxLength": 2048,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "source_key": {
+                      "maxLength": 80,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "vehicle_cluster_id": {
+                      "format": "uuid",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "vehicle_kind": {
+                      "enum": [
+                        "vehicle_cluster",
+                        "listing_incarnation"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "vehicle_kind",
+                    "vehicle_cluster_id",
+                    "listing_id",
+                    "source_key",
+                    "listing_reference",
+                    "listing_url"
+                  ],
+                  "title": "InquiryVehicleRef",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "inquiry_id",
+                "seller_entity_id",
+                "vehicle",
+                "state",
+                "language",
+                "recipient_status",
+                "delivery_uncertain",
+                "suppression_reason",
+                "reply_count",
+                "state_changed_at",
+                "reserved_at",
+                "send_attempted_at",
+                "accepted_at",
+                "row_version"
+              ],
+              "title": "InquirySummaryView",
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "InquiryListView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "inquiries.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Seller inquiries with keyset pagination (no message text, no addresses)."
+}

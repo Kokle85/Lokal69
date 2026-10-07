@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 from uuid import UUID
 
 from pydantic import Field, model_validator
@@ -68,8 +68,16 @@ MAX_REPLY_ATTACHMENTS: Final = 20
 MAX_LIST_ITEMS: Final = 100
 
 _ADDRESS_DOMAIN_PATTERN: Final = r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
-_REASON_CODE_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$"
+#: Exactly ``ops.email_delivery_attempts_error_ck`` (a stricter view pattern would turn a valid
+#: stored attempt into a read failure).
+_ERROR_CODE_PATTERN: Final = r"^[A-Za-z0-9_.:-]{1,80}$"
 _TEMPLATE_ID_PATTERN: Final = r"^seller_initial_(de|it|fr|en)_v[1-9][0-9]*$"
+
+#: An ISO 639-1 code as stored for seller contacts and replies (``^[a-z]{2}$`` in the database).
+#: Unlike ``MessageLanguage`` (the four template languages an inquiry may be SENT in) it also
+#: covers an unsupported contact language (held, never replaced by English) and the detected
+#: language of a reply written in another language.
+LanguageCode = Annotated[str, Field(pattern=r"^[a-z]{2}$")]
 
 VehicleKind = Literal["vehicle_cluster", "listing_incarnation"]
 ContactStatus = Literal["verified", "unverified", "unavailable", "changed", "unknown"]
@@ -127,7 +135,9 @@ class RecipientView(ViewModel):
     address: str | None = Field(max_length=320)
     address_domain: str | None = Field(max_length=253, pattern=_ADDRESS_DOMAIN_PATTERN)
     address_redacted: bool
-    language: MessageLanguage | None
+    language: LanguageCode | None = Field(
+        description="The contact's evidenced language; an unsupported one holds the inquiry."
+    )
     language_status: LanguageStatus
     verified_at: UtcDatetime | None
 
@@ -146,7 +156,7 @@ class RecipientView(ViewModel):
         contact_id: UUID | None,
         verification_status: ContactStatus,
         contact_kind: ContactKind | None,
-        language: MessageLanguage | None,
+        language: str | None,
         language_status: LanguageStatus,
         verified_at: UtcDatetime | None,
     ) -> RecipientView:
@@ -222,7 +232,7 @@ class SendAttemptSummary(ViewModel):
     reconciled_outcome: ReconciledOutcome | None
     reconciled_at: UtcDatetime | None
     submission_uncertain: bool
-    error_code: str | None = Field(max_length=80, pattern=_REASON_CODE_PATTERN)
+    error_code: str | None = Field(max_length=80, pattern=_ERROR_CODE_PATTERN)
 
 
 class SendAttemptsView(ViewModel):
@@ -328,6 +338,30 @@ class ReplySenderView(ViewModel):
             raise ValueError("a redacted sender carries no address")
         return self
 
+    @classmethod
+    def build(
+        cls,
+        *,
+        address: str,
+        show_address: bool,
+        matches_verified_recipient: bool,
+        correlation_status: CorrelationStatus,
+        correlation_reasons: tuple[ReasonCode, ...],
+        header_linked: bool,
+        thread_linked: bool,
+    ) -> ReplySenderView:
+        """Apply the owner-only address rule (`recipient_address_visible`) to a reply's From."""
+        return cls(
+            address=address if show_address else None,
+            address_domain=address_domain(address),
+            address_redacted=not show_address,
+            matches_verified_recipient=matches_verified_recipient,
+            correlation_status=correlation_status,
+            correlation_reasons=correlation_reasons,
+            header_linked=header_linked,
+            thread_linked=thread_linked,
+        )
+
 
 class ReplyAttachmentView(ViewModel):
     """Attachment metadata only: no bytes, local locator, path or URL."""
@@ -417,7 +451,7 @@ class ReplyView(ViewModel):
     seller_entity_id: UUID
     vehicle: InquiryVehicleRef
     message_type: ReplyMessageType
-    original_language: MessageLanguage | None
+    original_language: LanguageCode | None
     subject: str = Field(max_length=512)
     sanitized_body: str = Field(max_length=65536, description="Sanitized original text; untrusted data.")
     mk_summary: str | None = Field(max_length=32768)
@@ -444,7 +478,7 @@ class ReplySummaryView(ViewModel):
     inquiry_id: UUID
     vehicle: InquiryVehicleRef
     message_type: ReplyMessageType
-    original_language: MessageLanguage | None
+    original_language: LanguageCode | None
     availability: AvailabilitySummary | None
     quarantined: bool
     processing_state: ProcessingState
@@ -460,7 +494,7 @@ class ReplyListView(ViewModel):
 
 
 class InquiryControlView(ViewModel):
-    """Workspace inquiry controls (``GET /api/inquiries/control``): kill switch, mode, caps."""
+    """Workspace inquiry controls (``GET /api/inquiry-control``): kill switch, mode, caps."""
 
     version: int = Field(ge=1, description="Send as expected_version to pause or resume.")
     mode: InquiryMode
@@ -483,7 +517,7 @@ class InquiryControlView(ViewModel):
 
 
 class InquiryPauseResult(ViewModel):
-    """``seller_inquiries_pause`` / ``POST /api/inquiries/control/pause`` result.
+    """``seller_inquiries_pause`` / ``POST /api/inquiry-control/pause`` result.
 
     Pausing activates the kill switch: untransmitted work stops at the next guard. It never
     implies a resume, which is a separate owner action on the dashboard only.
@@ -498,7 +532,7 @@ class InquiryPauseResult(ViewModel):
 
 
 class InquiryResumeResult(ViewModel):
-    """``POST /api/inquiries/control/resume`` (owner, dashboard only) result."""
+    """``POST /api/inquiry-control/resume`` (owner, dashboard only) result."""
 
     version: int = Field(ge=1, description="The new control version.")
     kill_switch: Literal[False] = False
@@ -523,6 +557,7 @@ __all__ = [
     "InquiryTimestamps",
     "InquiryVehicleRef",
     "InquiryView",
+    "LanguageCode",
     "PriceQuoteView",
     "RecipientView",
     "ReplyAttachmentView",

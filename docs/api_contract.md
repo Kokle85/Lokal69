@@ -1,14 +1,17 @@
 # Dashboard API and MCP tool contract
 
 This is the contract of the backend-for-frontend (BFF) used by the private dashboard and of the
-twelve MCP tools. Both surfaces share one set of typed models:
+twelve MCP tools, plus the spec v1.1 (section 37) seller-inquiry contracts in section 10: the
+mailbox-worker API, the dashboard inquiry routes and three prepared MCP tools. All surfaces share
+one set of typed models:
 
 | Module | Contents |
 |---|---|
-| `src/suv_deals/views/` | Read models (views), `ResponseEnvelope`, `AmountView`, `ErrorPayload`, JSON-schema helpers |
-| `src/suv_deals/mcp/schemas.py` | MCP tool input models, the `TOOLS` registry, `ToolError`, resolved schemas, schema export |
-| `src/suv_deals/api/schemas.py` | Dashboard request bodies/queries, `ApiErrorResponse`, the `ROUTES` table |
-| `schemas/*.json`, `schemas/tools/*.json` | Generated snapshots (do not edit by hand) |
+| `src/suv_deals/views/` | Read models (views), `ResponseEnvelope`, `AmountView`, `ErrorPayload`, JSON-schema helpers; `views/inquiries.py` holds the v1.1 inquiry/reply read models |
+| `src/suv_deals/mcp/schemas.py` | MCP tool input models, the `TOOLS` registry (served), the `V11_TOOLS` registry (prepared), `ToolError`, resolved schemas, schema export |
+| `src/suv_deals/api/schemas.py` | Dashboard request bodies/queries, `ApiErrorResponse`, the `ROUTES` table (served), the `MAIL_WORKER_ROUTES` and `V11_DASHBOARD_ROUTES` tables (contracts for the API package) |
+| `src/suv_deals/persistence/errors_map.py` | Database guard refusals (`SV00x`) to typed errors with a stable `details.reason` |
+| `schemas/*.json`, `schemas/tools/*.json`, `schemas/api/*.json` | Generated snapshots (do not edit by hand) |
 
 Product contract: `docs/spec/suv-deal-system-build-spec.md` (spec §20-23). Access model:
 `docs/decisions/0001-bff-only-data-access.md`. The browser never reads `app`/`ops` tables; every
@@ -162,6 +165,7 @@ presented); every invalid token gets the same message.
 | `INSUFFICIENT_DATA` | 422 | no | Not enough data to answer (e.g. insufficient comparables) |
 | `DEPENDENCY_UNAVAILABLE` | 503 | yes | Database or another dependency is unavailable |
 | `INTERNAL_ERROR` | 500 | yes | Unexpected failure (details logged server-side only) |
+| `EMAIL_DELIVERY_UNCERTAIN` | 409 | no | A seller e-mail send attempt may have reached the provider; it is held for reconciliation with positive evidence and never resent blindly (spec 37.5) |
 
 ## 4. Pagination
 
@@ -307,6 +311,9 @@ The MCP endpoint exposes exactly the tools in `mcp.schemas.TOOLS` (spec §21). T
 
 Mutations are idempotent through `idempotency_key`. `deals_request_recheck` is open-world because
 the queued job later contacts the registered source (within its budget and access decision).
+The three spec 37.8 seller-inquiry tools live in the separate `mcp.schemas.V11_TOOLS` registry
+(section 10.4); they are not in `TOOLS` and are not served until the inquiry package registers
+their handlers through `build_mcp(extra_tools=...)`.
 
 Input schemas (`tool_input_schema`) are the spec §21 schema map, resolved: no `$ref`,
 `additionalProperties: false` on every object, JSON Schema 2020-12. They add only narrowing
@@ -339,8 +346,197 @@ text from `ResponseEnvelope.to_text()`.
 (`ListingRevisionDocument`), `schemas/review.schema.json` (`ReviewCaseView`),
 `schemas/valuation.schema.json` (`ValuationView`), `schemas/event.schema.json` and
 `schemas/tools/<tool>.json` (MCP `Tool` object with `inputSchema`, `outputSchema`,
-`annotations`, `requiredScope`, `paginated`, `idempotencyOperation` and `errorSchema`).
+`annotations`, `requiredScope`, `paginated`, `idempotencyOperation` and `errorSchema`; the twelve
+`TOOLS` plus the three prepared `V11_TOOLS`) and `schemas/api/<route>.json` (one file per spec 37
+route of section 10: `method`, `path`, `auth`, `requiredScope`, `requestLocation`, the `request`
+validation schema, the `response` serialization schema, `successStatus`, `errors`, `paginated`,
+`mcpTool`, `summary` and `idempotencyKeyHeader` (`required`, `optional` or `null`); the file
+name is the path without `/v1`/`/api`, dots for slashes, plus
+the lower-case method, e.g. `mail-workers.send-intents.intent_id.claim.post.json`).
 `--check` verifies the snapshots without writing. `tests/contracts/test_schema_snapshots.py`
 fails when a model change is not re-exported. Output documents use serialization schemas (what
 the server emits); the event schema and tool inputs use validation schemas (what a producer or
 client must send).
+
+## 10. Spec v1.1 seller-inquiry contracts (spec §37)
+
+The models and route tables below are the contract; the routes are **to be implemented by the API
+package** (they are not in `ROUTES`, so the served app is unchanged) and the tools are registered
+by the inquiry package. Owner decisions in force: one automatic initial inquiry per verified
+vehicle/seller pair, no per-message approval, hard caps of 2 inquiries per rolling 24 hours and 5
+per rolling 15 days (`SELLER_INQUIRY_MAX_PER_24H` / `SELLER_INQUIRY_MAX_PER_ROLLING_15D` can only
+lower them), default send path `outlook_local`, optional `gmail_api`. No route or tool accepts a
+recipient, an e-mail body or a sender account; the pipeline sends from validated domain records.
+
+### 10.1 Mailbox-worker API (`/v1/mail-workers`)
+
+Used only by the Windows desktop worker (`desktop/outlook-bridge`). Table:
+`api.schemas.MAIL_WORKER_ROUTES`.
+
+- **Authentication**: `Authorization: Bearer <worker credential>`, a revocable, narrow
+  `mail:ingest` credential bound to one workspace and one mailbox binding, kept in the operating
+  system's protected credential store after activation. It is never a dashboard user token, a
+  Supabase service-role key or a database credential. A revoked or expired credential is `401`
+  (the worker stops transmitting and keeps its backlog).
+- **Server-derived scope**: the server derives workspace and mailbox from the credential only.
+  No request selects a workspace, mailbox or account; ids in a body (`mailbox_binding_id`,
+  `inquiry_id`, `intent_id`) are checked against the credential's mailbox and a mismatch is
+  `403 FORBIDDEN` (`details.reason = "mailbox_binding_mismatch"`), never a silent reassignment.
+- **Idempotency**: `POST /replies`, `POST /send-intents/{intent_id}/claim` and
+  `POST /send-intents/{intent_id}/report` REQUIRE an `Idempotency-Key` header (8-128 printable
+  ASCII; missing -> `400`). `POST /heartbeat` and `POST /account-report` carry none (the desktop
+  client sends none; both are latest-state reports) and must not require one. The rule is
+  `ApiRoute.idempotency_header` (`idempotencyKeyHeader` in `schemas/api/*.json`). For
+  `POST /replies` the server checks the key **and** the stable source identity
+  (`ReplyIngestRequest.dedup_key`: internet message id, provider id or local store/entry
+  locator) and never trusts one alone: the same key/message with the same immutable source
+  content returns the existing `reply_id` with `duplicate: true` (also after a folder move; the
+  changed locator goes to locator history), while different content under the same identity is
+  `409 IDEMPOTENCY_CONFLICT` and is quarantined, never overwritten. The worker uses
+  `claim-<intent>-<claim_attempt_id>` for claims (so a stored `proceed: true` can never be
+  replayed) and `report-<intent>-<state>` for reports; the same key with a different body is
+  `409 IDEMPOTENCY_CONFLICT`. The `{intent_id}` path segment must equal the body's `intent_id`
+  (`400 VALIDATION_ERROR` otherwise).
+- **Bodies and responses** are top-level JSON objects with `schema_version: "1.0"` (no
+  `ResponseEnvelope`), except the account-report body, which carries no `schema_version` (exactly
+  like the desktop `WorkerAccountReport`; a server must not require one); they are closed
+  (unknown fields are `400/422`), and are the desktop wire models
+  exactly; `tests/contracts/test_mail_worker_contract.py` compares every pair field by field and
+  drives the real desktop client against them.
+- **Limits**: every request body <= 128 KiB (`MAIL_WORKER_BODY_LIMIT`, `413` above it);
+  `sanitized_body_text` <= 64 KiB, `subject` <= 512 characters, <= 20 attachment metadata
+  entries (safe filename, MIME type, byte count, SHA-256, opaque local reference; no URLs, paths
+  or bytes); binding pages <= 100 items, send-intent batches <= 50.
+- **Errors**: `ApiErrorResponse` bodies with typed codes: `400`/`422 VALIDATION_ERROR`, `401
+  UNAUTHENTICATED`, `403 FORBIDDEN`, `404 NOT_FOUND` (unknown intent of this mailbox), `409`
+  (`VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT`), `413`, `429 RATE_LIMITED` (with `Retry-After`)
+  and `503 DEPENDENCY_UNAVAILABLE`. Database guard refusals carry a stable `details.reason`
+  (section 10.5). The worker keeps its local queue on `429`/`5xx`/transport failures.
+
+| Route | Request | Response | Success | Extra errors |
+|---|---|---|---|---|
+| `GET /v1/mail-workers/inquiry-bindings` | query `MailWorkerBindingsQuery` (`cursor`, `limit` 1-100) | `MailWorkerBindingPage` of `MailWorkerBindingItem` | 200 | - |
+| `POST /v1/mail-workers/replies` | body `MailWorkerReplyRequest` | `MailWorkerReplyAck` | 200 | `VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT` |
+| `GET /v1/mail-workers/send-intents` | query `MailWorkerSendIntentsQuery` (`limit` 1-50) | `MailWorkerSendIntentBatch` of `MailWorkerSendIntent` | 200 | - |
+| `POST /v1/mail-workers/send-intents/{intent_id}/claim` | body `MailWorkerClaimRequest` | `MailWorkerClaimDecision` | 200 | `NOT_FOUND`, `VERSION_CONFLICT` |
+| `POST /v1/mail-workers/send-intents/{intent_id}/report` | body `MailWorkerSendReport` | `MailWorkerAccepted` | 200 | `NOT_FOUND`, `VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT` |
+| `POST /v1/mail-workers/heartbeat` | body `MailWorkerHeartbeatRequest` (`MailWorkerCheckpointReport`, `MailWorkerGapReport`) | `MailWorkerHeartbeatAck` | 200 | - |
+| `POST /v1/mail-workers/account-report` | body `MailWorkerAccountReport` | `MailWorkerAccepted` | 200 | `VERSION_CONFLICT` |
+
+Every route also lists `UNAUTHENTICATED`, `FORBIDDEN`, `VALIDATION_ERROR`, `RATE_LIMITED`,
+`DEPENDENCY_UNAVAILABLE` and `INTERNAL_ERROR`. Route notes:
+
+- **Bindings** return changes of the worker's own mailbox, including uncertain sends with their
+  send-intent message ids and tombstones/revocations (a tombstone carries identity, version and
+  state only). `next_cursor` is returned only after a complete page; the worker persists page and
+  cursor atomically.
+- **Replies** are stored only for a valid, published, non-tombstoned binding of the worker's
+  mailbox whose references corroborate the message; the backend inserts reply, ingest-dedup
+  record and processing event atomically, and only then may the worker advance its acknowledged
+  checkpoint.
+- **Send intents** carry the composed message of an already authorized inquiry plus
+  `kill_switch_active`; **claim** is a fresh server revalidation (kill switch, suppression,
+  cancellation, binding version) immediately before `.Send` and answers `proceed: false` with a
+  `refusal_reason` instead of an error for a business refusal; **report** records the submission
+  evidence, and an uncertain outcome stays uncertain (`EMAIL_DELIVERY_UNCERTAIN` is never
+  converted into a resend).
+- **Heartbeat** records worker/Outlook/mailbox health, hashed store/folder checkpoints, backlog
+  and coverage gaps (never claimed coverage); the acknowledgement may carry downstream health as
+  short codes. **Account report** is the classic-Outlook account verification (no credentials;
+  `security_settings_unchanged` is always `true`).
+
+Where the desktop wire contract (`outlook_bridge/wire.py`, `outlook_bridge/api_client.py`) and
+the spec 37.8 prose differ, the wire contract wins:
+
+1. `MailWorkerReplyAck.ingest_status` is `stored` **or `quarantined`** (spec names `stored`
+   only); a quarantined reply is acknowledged so the worker does not resend it.
+2. The reply body accepts the worker's optional extensions `message_type`,
+   `correlation_status`, `correlation_reasons` and `withheld_sensitive_attachments`;
+   `detected_language` is `de`, `it`, `fr`, `en` or `null`.
+3. Binding items carry `state` (`active`, `suppressed`, `uncertain`, `tombstoned`) instead of an
+   active/suppressed flag, and a binding page carries `has_more`; the desktop client accepts up
+   to 1000 items per page while the server sends at most `limit` (<= 100).
+4. Send intents, claims, reports, heartbeats and account reports are not described in the spec
+   JSON; their shapes are the wire models (`intent_id`, `claim_attempt_id` (32 lower-case hex),
+   `mailbox_binding_id`, `worker_id` in the claim body; length limits 254/998/64 and
+   `inquiry_ref == "inquiry-<inquiry_id>"` on intents).
+5. The server models are closed (`extra="forbid"`) while the desktop models ignore unknown
+   fields, so the backend can never send or accept a field the worker does not know.
+
+### 10.2 Dashboard inquiry routes
+
+User-JWT routes like section 6, enveloped, with the same error conventions. Table:
+`api.schemas.V11_DASHBOARD_ROUTES` (**to be implemented by the API package**).
+
+| Route | Scope | Request | Response `data` | Success | Extra errors | MCP tool |
+|---|---|---|---|---|---|---|
+| `GET /api/inquiries` | `inquiries:read` | query `InquiryListQuery` (`cursor`, `limit`, `state`, `uncertain_only`) | `InquiryListView` of `InquirySummaryView` | 200 | - | - |
+| `GET /api/inquiries/{inquiry_id}` | `inquiries:read` | - | `InquiryView` | 200 | `NOT_FOUND` | `seller_inquiries_get` |
+| `GET /api/replies` | `inquiries:read` | query `ReplyListQuery` (`cursor`, `limit`, `inquiry_id`, `quarantined_only`) | `ReplyListView` of `ReplySummaryView` | 200 | - | - |
+| `GET /api/replies/{reply_id}` | `inquiries:read` | - | `ReplyView` | 200 | `NOT_FOUND` | `seller_replies_get` |
+| `GET /api/inquiry-control` | `inquiries:read` | - | `InquiryControlView` | 200 | - | - |
+| `POST /api/inquiry-control/pause` | `inquiries:pause` | body `InquiryPauseRequest` | `InquiryPauseResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | `seller_inquiries_pause` |
+| `POST /api/inquiry-control/resume` | `config:admin` | body `InquiryResumeRequest` | `InquiryResumeResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
+
+Pause and resume take their `idempotency_key` in the body; an optional `Idempotency-Key` header must
+equal it (`idempotency_header="optional"`, as on the other dashboard mutations).
+
+- Inquiry views show state, qualification, authorization/template versions, the sender as a
+  provider/binding reference (never an address or account id) and send-attempt summaries;
+  `approval_required` is always `false` (no per-message approval). The recipient address is shown
+  only to `config:admin` holders (`views.inquiries.recipient_address_visible`); others see its
+  domain and verification evidence. Lists never contain message text.
+- Languages: an inquiry's `language` is one of the four template languages (`de`, `it`, `fr`,
+  `en`); a recipient contact's `language` and a reply's `original_language` are any ISO 639-1
+  code (`^[a-z]{2}$`, as stored), because a contact may be in an unsupported language (the
+  inquiry is held, never sent in English instead) and a seller may reply in another language.
+- Reply views carry inquiry/vehicle ids, the original language and sanitized body, the
+  Macedonian summary, the verified sender identity, received/ingested times, extracted claims
+  (a price quote is an `unaccepted_seller_quote`, never accepted), safe attachment metadata
+  (no local reference) and the current valuation status. Lists never contain bodies.
+- **Pause** activates the inquiry kill switch against the control `expected_version` with a
+  reason (same rules as the MCP tool; pausing an already paused control answers
+  `already_paused: true`). **Resume** is owner-only and dashboard-only; it is never an MCP tool.
+
+### 10.3 Configuration
+
+`SELLER_INQUIRY_MAX_PER_24H` (0-2) and `SELLER_INQUIRY_MAX_PER_ROLLING_15D` (0-5) can only lower
+the owner caps. `API_ALLOWED_HOSTS` (comma separated host names, no wildcard) extends the API
+host check; `METRICS_ENABLED`/`METRICS_BIND` (default off, `127.0.0.1:9464`) start a private
+Prometheus listener separate from the API port; `DATABASE_POOL_TIMEOUT_S` (default 5) bounds the
+wait for a pooled connection (`503 DEPENDENCY_UNAVAILABLE` after it).
+
+### 10.4 MCP tools (`V11_TOOLS`)
+
+| Tool | Scope | Annotations (read-only / destructive / idempotent / open-world) | Result `data` |
+|---|---|---|---|
+| `seller_inquiries_get` | `inquiries:read` | yes / no / yes / no | `InquiryView` |
+| `seller_replies_get` | `inquiries:read` | yes / no / yes / no | `ReplyView` |
+| `seller_inquiries_pause` | `inquiries:pause` | no / no / yes / no | `InquiryPauseResult` |
+
+Input schemas are exactly the spec 37.8 JSON (`seller_inquiries_get`: `inquiry_id`;
+`seller_replies_get`: `reply_id`; `seller_inquiries_pause`: `expected_version` >= 1, `reason`
+3-2000 characters, `idempotency_key` 8-128 characters), plus the printable-character `pattern`
+every idempotency key already has. Results return only the caller's workspace records and never a
+secret, an unrelated thread message or a signed external access credential.
+
+### 10.5 Database guard refusals
+
+The seller-inquiry migration refuses unsafe writes in triggers (`SV002` immediately, `SV003` at
+statement end or at `COMMIT` for deferred checks). `persistence.errors_map.map_db_error` turns
+each refusal into a typed error with a stable machine reason in `details.reason` (plus safe
+extras such as `phase`, `window`, `limit` or `evidence`), and `Database.transaction` raises the
+typed error also when the refusal happens at `COMMIT`. Messages stay generic; no row data is
+returned.
+
+| Code | `details.reason` values |
+|---|---|
+| `VERSION_CONFLICT` | `inquiry_kill_switch`, `inquiry_mode_not_automatic` (+`mode`), `inquiry_controls_missing`, `inquiry_vehicle_seller_conflict` (one inquiry per vehicle/seller pair), `inquiry_suppressed` (+`suppressions`), `inquiry_listing_stale`, `inquiry_availability_stale`, `inquiry_qualification_mismatch`, `inquiry_listing_quarantined`, `inquiry_vehicle_unavailable`, `inquiry_profile_out_of_scope`, `inquiry_authorization_changed`, `inquiry_authorization_not_effective`, `inquiry_language_not_authorized`, `inquiry_language_unresolved`, `recipient_not_dealer`, `recipient_unverified`, `recipient_changed`, `sender_binding_not_ready`, `sender_binding_changed`, `sender_binding_mismatch`, `binding_version_unpublished`, `inquiry_binding_tombstoned` (re-publish), `inquiry_transition_not_permitted` (+`from_state`, `to_state`), `inquiry_initial_state_invalid`, `inquiry_requalification_refused`, `inquiry_requalification_audit_missing`, `inquiry_quota_debit_missing`, `quota_debit_invalid`, `quota_release_refused`, `send_intent_invalid`, `send_attempts_exhausted`, `message_id_mismatch`, `inquiry_identity_not_canonical`, `inquiry_not_transmitted`, `seller_entity_merged`, `seller_contact_superseded`, `reply_release_invalid`, `reply_quarantine_release_refused` |
+| `RATE_LIMITED` | `inquiry_cap_reached` (+`phase` `reserve`/`dispatch`, `window` `24h`/`15d`, `limit`), `seller_cooldown` (+`phase`) |
+| `SOURCE_PAUSED` | `inquiry_source_paused` |
+| `FORBIDDEN` | `inquiry_authorization_revoked`, `sender_binding_revoked`, `mailbox_binding_revoked`, `mailbox_binding_mismatch` (cross-mailbox), `mail_worker_credential_mismatch`, `inquiry_binding_tombstoned` |
+| `UNAUTHENTICATED` | `mail_worker_credential_revoked` (revoked or expired worker credential) |
+| `EMAIL_DELIVERY_UNCERTAIN` | `send_attempt_unresolved`, `send_attempt_lease_expired`, `retry_without_proof` |
+| `VALIDATION_ERROR` | `inquiry_evidence_missing` (+`evidence`: `quota_debit`, `quota_release`, `send_intent`, `running_attempt`, `uncertain_attempt`, `non_submission_proof`, `acceptance`, `seller_reply`), `availability_evidence_invalid`, `mail_worker_credential_invalid`, `seller_merge_invalid`, `suppression_removal_audit_missing` |
+
+`persistence.errors_map.guard_reason(error)` returns the reason of a mapped error.

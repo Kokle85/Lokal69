@@ -50,8 +50,8 @@ OWNER = "owner@example.invalid"
 SELLER = "seller@dealer.example.invalid"
 SELLER_RELAY = "relay-4711@marketplace.example.invalid"
 # Synthetic worker credentials for the fake backend only (never real secrets).
-TOKEN = "mw_test_ingest_credential_0123456789abcdef"  # noqa: S105
-TOKEN_2 = "mw_test_ingest_credential_rotated_fedcba9876"  # noqa: S105
+TOKEN = "mw_test_ingest_credential_0123456789abcdef"
+TOKEN_2 = "mw_test_ingest_credential_rotated_fedcba9876"
 LISTING_REF = "REF-1234"
 LISTING_URL = "https://listing.example.invalid/ad/1234"
 START = datetime(2026, 10, 6, 18, 0, tzinfo=UTC)

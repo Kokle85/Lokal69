@@ -243,7 +243,13 @@ def test_listing_revisions_allow_semantic_reversion(db_conn: psycopg.Connection)
         ("app.listings_created_idx", ["(workspace_id, created_at DESC, id DESC)"]),
         (
             "ops.outbox_attention_created_idx",
-            ["(workspace_id, event_created_at, id)", "'uncertain'", "'blocked'", "'dead_letter'", "'retry_wait'"],
+            [
+                "(workspace_id, event_created_at, id)",
+                "'uncertain'",
+                "'blocked'",
+                "'dead_letter'",
+                "'retry_wait'",
+            ],
         ),
         ("app.memberships_user_idx", ["(user_id, workspace_id)", "WHERE active"]),
         (

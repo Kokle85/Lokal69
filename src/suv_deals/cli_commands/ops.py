@@ -112,17 +112,6 @@ def outbox_inspect(cli: CliContext, workspace: UUID | None, limit: int, as_json:
 # reviews list
 # --------------------------------------------------------------------------------------------
 
-_REVIEWS_SQL: Final = """
-select c.id, c.state, c.profile_key, c.queue_label, c.readiness, c.priority, c.is_fixture,
-       c.created_at, c.claim_expires_at, s.source_key
-  from app.review_cases c
-  join app.listings l on l.workspace_id = c.workspace_id and l.id = c.listing_id
-  join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
- where c.workspace_id = %(ws)s and c.state = any(%(states)s::text[])
- order by c.priority desc, c.created_at, c.id
- limit %(limit)s
-"""
-
 
 @click.group("reviews")
 def reviews_group() -> None:
@@ -154,22 +143,32 @@ def reviews_list(cli: CliContext, status_csv: str, workspace: UUID | None, limit
 
     async def body() -> int:
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspaces
-        from suv_deals.domain.enums import Scope
-        from suv_deals.persistence.database import fetch_all
-        from suv_deals.persistence.errors_map import mapped_errors
+        from suv_deals.persistence import reviews_repo
         from suv_deals.persistence.transactions import unit_of_work
 
+        wanted = [ReviewState(s) for s in states]
         rows: list[dict[str, Any]] = []
         async with open_database(settings, application_name="suv-deals-cli") as db:
             for workspace_id in await resolve_workspaces(db, workspace):
                 actor = operator_actor(workspace_id, "reviews-list")
-                actor.require(Scope.REVIEWS_READ)
-                async with unit_of_work(db, actor) as conn, mapped_errors():
-                    found = await fetch_all(
-                        conn, _REVIEWS_SQL, {"ws": workspace_id, "states": states, "limit": limit}
-                    )
-                for row in found:
-                    rows.append({"workspace_id": workspace_id, **row})
+                async with unit_of_work(db, actor) as conn:
+                    found = await reviews_repo.list_cases_by_state(conn, actor, wanted, limit=limit)
+                rows.extend(
+                    {
+                        "workspace_id": workspace_id,
+                        "id": case.case_id,
+                        "state": case.state.value,
+                        "profile_key": case.profile_key.value,
+                        "queue_label": case.queue_label,
+                        "readiness": case.readiness,
+                        "priority": case.priority,
+                        "is_fixture": case.is_fixture,
+                        "created_at": case.created_at,
+                        "claim_expires_at": case.claim_expires_at,
+                        "source_key": case.source_key,
+                    }
+                    for case in found
+                )
         if as_json:
             emit_json(rows)
             return 0

@@ -222,9 +222,9 @@ def test_header_block_parser_is_bounded_and_decodes() -> None:
 
 
 def test_com_time_conversions() -> None:
-    naive_utc = datetime(2026, 10, 6, 17, 59)  # noqa: DTZ001 - PT_SYSTIME values arrive naive (UTC fields)
+    naive_utc = datetime(2026, 10, 6, 17, 59)  # PT_SYSTIME values arrive naive (UTC fields)
     assert com_time_as_utc(naive_utc) == datetime(2026, 10, 6, 17, 59, tzinfo=UTC)
-    assert com_time_as_utc(datetime(4501, 1, 1)) is None  # noqa: DTZ001 - Outlook's "no date"
+    assert com_time_as_utc(datetime(4501, 1, 1)) is None  # Outlook's "no date"
     assert com_time_as_utc("2026-10-06") is None
     aware = datetime(2026, 10, 6, 19, 59, tzinfo=UTC)
     assert com_time_local(aware) == aware
