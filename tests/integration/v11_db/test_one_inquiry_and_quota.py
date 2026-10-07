@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import threading
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -32,8 +31,10 @@ from tests.integration.v11_db.support import (
     identity_key,
     insert_inquiry,
     queue,
+    race,
     reserve,
     seller_entity,
+    single_success,
     state_of,
     update_inquiry,
     vehicle,
@@ -160,44 +161,12 @@ def test_price_change_relisting_or_sender_change_does_not_reset_the_rule(
 # ---------------------------------------------------------------------------------------------
 
 
-def _race(db_url: str, *jobs: Callable[[psycopg.Connection], object]) -> list[BaseException | None]:
-    """Run each job on its own connection, released together; return the error of each (or None)."""
-    barrier = threading.Barrier(len(jobs))
-    results: list[BaseException | None] = [None] * len(jobs)
-
-    def run(index: int, job: Callable[[psycopg.Connection], object]) -> None:
-        try:
-            with psycopg.connect(db_url, autocommit=True) as conn:
-                conn.execute("set lock_timeout = '20s'")
-                barrier.wait(timeout=30)
-                job(conn)
-        except BaseException as exc:
-            results[index] = exc
-
-    threads = [threading.Thread(target=run, args=(i, job)) for i, job in enumerate(jobs)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=60)
-    assert not any(thread.is_alive() for thread in threads)
-    return results
-
-
-def _single_success(results: list[BaseException | None], sqlstate: str) -> None:
-    assert sum(r is None for r in results) == 1, results
-    errors = [r for r in results if r is not None]
-    assert len(errors) == len(results) - 1
-    for error in errors:
-        assert isinstance(error, psycopg.Error), error
-        assert error.sqlstate == sqlstate, (error.sqlstate, str(error))
-
-
 def test_concurrent_identity_reservations_exactly_one_succeeds(db_url: str, iw: InquiryWorld) -> None:
     def job(conn: psycopg.Connection) -> None:
         inquiry = insert_inquiry(conn, iw)
         reserve(conn, iw, inquiry)
 
-    _single_success(_race(db_url, job, job), "23505")
+    single_success(race(db_url, job, job), "23505")
 
 
 def test_concurrent_reservations_cannot_both_take_the_last_quota_slot(
@@ -213,8 +182,8 @@ def test_concurrent_reservations_cannot_both_take_the_last_quota_slot(
     def job_for(world: InquiryWorld, inquiry: uuid.UUID) -> Callable[[psycopg.Connection], object]:
         return lambda conn: reserve(conn, world, inquiry)
 
-    results = _race(db_url, *(job_for(w, i) for w, i in zip(racers, inquiries, strict=True)))
-    _single_success(results, SV_TRANSITION)
+    results = race(db_url, *(job_for(w, i) for w, i in zip(racers, inquiries, strict=True)))
+    single_success(results, SV_TRANSITION)
     assert "cap reached" in str(next(r for r in results if r is not None))
     reserved = db_conn.execute(
         "select count(*) from app.seller_inquiries where workspace_id = %s and state = 'reserved'",
@@ -229,12 +198,12 @@ def test_concurrent_reservations_to_one_seller_respect_the_cooldown(
     second = with_vehicle(iw)  # same seller entity, another car
     first_inquiry = insert_inquiry(db_conn, iw)
     second_inquiry = insert_inquiry(db_conn, second)
-    results = _race(
+    results = race(
         db_url,
         lambda conn: reserve(conn, iw, first_inquiry),
         lambda conn: reserve(conn, second, second_inquiry),
     )
-    _single_success(results, SV_TRANSITION)
+    single_success(results, SV_TRANSITION)
     assert "seller cooldown" in str(next(r for r in results if r is not None))
 
 
@@ -248,7 +217,7 @@ def test_concurrent_dispatch_of_one_inquiry_sends_once(
     def job(conn: psycopg.Connection) -> None:
         dispatch(conn, iw, inquiry)
 
-    results = _race(db_url, job, job)
+    results = race(db_url, job, job)
     assert sum(r is None for r in results) == 1, results
     attempts = db_conn.execute(
         "select count(*) from ops.email_delivery_attempts where inquiry_id = %s", (inquiry,)
@@ -259,7 +228,7 @@ def test_concurrent_dispatch_of_one_inquiry_sends_once(
 def test_pause_racing_a_dispatch_is_serialised(
     db_url: str, db_conn: psycopg.Connection, iw: InquiryWorld
 ) -> None:
-    """A dispatch holds the control row FOR SHARE: a concurrent pause waits or is seen."""
+    """A dispatch holds the control row FOR UPDATE: a concurrent pause waits or is seen."""
     inquiry = insert_inquiry(db_conn, iw)
     reserve(db_conn, iw, inquiry)
     queue(db_conn, iw, inquiry)
@@ -274,7 +243,7 @@ def test_pause_racing_a_dispatch_is_serialised(
                 (uuid.uuid4(), iw.workspace_id),
             )
 
-    results = _race(db_url, lambda conn: dispatch(conn, iw, inquiry), pause)
+    results = race(db_url, lambda conn: dispatch(conn, iw, inquiry), pause)
     assert results[1] is None
     state = state_of(db_conn, inquiry)
     if results[0] is None:

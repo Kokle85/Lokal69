@@ -61,6 +61,7 @@ from suv_deals.domain.inquiries import (
     BINDING_IMMUTABLE_STATES,
     DEFAULT_AUTHORIZATION_PATH,
     EMAIL_DELIVERY_UNCERTAIN,
+    MAX_READINESS_AGE,
     MAX_SEND_ATTEMPTS,
     POSSIBLY_TRANSMITTED_STATES,
     PRE_RESERVATION_STATES,
@@ -79,6 +80,7 @@ from suv_deals.domain.inquiries import (
     InquiryReadinessDecision,
     InquiryReadinessInputs,
     ListingFactsSnapshot,
+    PreflightDecision,
     PreflightOutcome,
     QuotaDebit,
     RateCapPolicy,
@@ -131,6 +133,7 @@ from suv_deals.domain.money import Money
 from suv_deals.domain.profiles import ContributionThreshold, load_business_config
 from suv_deals.domain.provenance import FieldProvenance
 from suv_deals.domain.seller_contacts import (
+    RECIPIENT_EVIDENCE_MAX_AGE,
     ContactRecheck,
     ExtractionLocation,
     RecipientEvidence,
@@ -315,6 +318,7 @@ def _recipient_evidence(**overrides: Any) -> RecipientEvidence:
         "evidence_url": URL,
         "extraction_location": ExtractionLocation.LISTING_CONTACT_BLOCK,
         "extraction_excerpt": f"E-Mail: {SELLER_ADDRESS}",
+        "distinct_addresses_on_page": 1,
         "seller": SELLER,
         "observed_at": NOW - timedelta(hours=2),
         "verified_at": NOW - timedelta(hours=1),
@@ -336,6 +340,17 @@ def _fragment(text: str) -> AdTextFragment:
 
 
 LANGUAGE_DE = resolve_inquiry_language(None, [_fragment(DE_TEXT)], "de", "DE")
+
+SNAPSHOT = ListingFactsSnapshot(
+    listing_id=LISTING,
+    listing_incarnation_id=INCARNATION,
+    revision_id=REVISION,
+    revision_number=1,
+    semantic_hash=LISTING_OBJ.semantic_hash(),
+    price_amount_minor=275000,
+    price_currency="EUR",
+    availability=Availability.AVAILABLE,
+)
 
 
 def sender(**overrides: Any) -> SenderStatus:
@@ -360,6 +375,7 @@ def inputs(**overrides: Any) -> InquiryReadinessInputs:
     data: dict[str, Any] = {
         "as_of": NOW,
         "listing_id": LISTING,
+        "listing_facts": SNAPSHOT,
         "authorization": AUTH,
         "identity": IDENTITY,
         "screening": SCREENING,
@@ -1728,16 +1744,6 @@ def test_suppression_lifecycle() -> None:
 
 LABEL = build_vehicle_label("Volkswagen", "Tiguan", "5N")
 MESSAGE = render("seller_initial_de_v1", LABEL, REF, URL, "Vasko K.", verified_listing_url=URL)
-SNAPSHOT = ListingFactsSnapshot(
-    listing_id=LISTING,
-    listing_incarnation_id=INCARNATION,
-    revision_id=REVISION,
-    revision_number=1,
-    semantic_hash=LISTING_OBJ.semantic_hash(),
-    price_amount_minor=275000,
-    price_currency="EUR",
-    availability=Availability.AVAILABLE,
-)
 
 
 def _bind(**overrides: Any) -> InquiryBinding:
@@ -1865,8 +1871,12 @@ def _facts(**overrides: Any) -> DispatchFacts:
         "related_links": (),
         "sender": sender(),
         "recipient_recheck": ContactRecheck(material_change=False, recheck_required=False, changes=()),
+        "current_language": LANGUAGE_DE,
+        "suppressions": (),
+        "attempts": (),
         "rate_caps": evaluate_rate_caps([], now=NOW, policy=RateCapPolicy()),
         "quota_debit_present": True,
+        "message_approval_required": False,
         "message": MESSAGE,
         "envelope": MessageEnvelope(to=(SELLER_ADDRESS,), reply_to=("vasko@example.invalid",)),
     }
@@ -2478,7 +2488,226 @@ def test_only_the_exact_template_rendering_is_dispatched() -> None:
 def test_dispatch_facts_require_the_rechecks() -> None:
     data = _facts().model_dump()
     assert DispatchFacts(**data) == _facts()
-    for field in ("identity", "reserved_at", "disqualifiers", "other_inquiries", "related_links"):
+    for field in (
+        "identity",
+        "reserved_at",
+        "disqualifiers",
+        "other_inquiries",
+        "related_links",
+        "current_language",
+        "suppressions",
+        "attempts",
+        "message_approval_required",
+    ):
         partial = {k: v for k, v in data.items() if k != field}
         with pytest.raises(ValidationError):
             DispatchFacts(**partial)
+
+
+# ---------------------------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------------------------
+
+
+def test_quota_debit_counts_at_its_send_attempt() -> None:
+    reserved = QuotaDebit(inquiry_id=UUID(int=1), at=NOW - timedelta(days=3))
+    assert reserved.counted_at == reserved.at
+    sent = reserved.model_copy(update={"send_attempted_at": NOW - timedelta(hours=1)})
+    assert sent.counted_at == NOW - timedelta(hours=1)
+    # A held reservation debited days ago occupies the 24 h window again once it is sent.
+    assert evaluate_rate_caps([reserved], now=NOW, policy=RateCapPolicy()).count_24h == 0
+    assert evaluate_rate_caps([sent], now=NOW, policy=RateCapPolicy()).count_24h == 1
+    with pytest.raises(ValidationError):
+        QuotaDebit(inquiry_id=UUID(int=1), at=NOW, send_attempted_at=datetime(2026, 10, 6))  # naive
+
+
+def test_queued_backlog_cannot_leave_in_one_burst() -> None:
+    """Five reservations taken while the sender was offline must not all go out at once."""
+    t0 = NOW - timedelta(days=6)
+    reserved = [t0, t0 + timedelta(minutes=5), t0 + timedelta(days=1), t0 + timedelta(days=1, minutes=5)]
+    reserved.append(t0 + timedelta(days=2))
+    debits = {
+        UUID(int=9000 + i): QuotaDebit(inquiry_id=UUID(int=9000 + i), at=t) for i, t in enumerate(reserved)
+    }
+    sent: list[datetime] = []
+    for minute, inquiry_id in enumerate(sorted(debits)):
+        now = NOW + timedelta(minutes=minute)
+        decision = evaluate_rate_caps(
+            list(debits.values()), now=now, policy=RateCapPolicy(), exclude_inquiry_id=inquiry_id
+        )
+        if decision.allowed:
+            debits[inquiry_id] = debits[inquiry_id].model_copy(update={"send_attempted_at": now})
+            sent.append(now)
+        else:
+            assert decision.reasons == ("RATE_CAP_24H_REACHED",)
+            assert decision.next_allowed_at == NOW + WINDOW_24H
+    assert len(sent) == 2  # the ceiling, not five within minutes
+    later = evaluate_rate_caps(
+        list(debits.values()),
+        now=NOW + WINDOW_24H,
+        policy=RateCapPolicy(),
+        exclude_inquiry_id=sorted(debits)[2],
+    )
+    assert later.allowed
+
+
+def test_retry_is_denied_after_an_unresolved_prior_attempt() -> None:
+    uncertain = _attempt(attempt_id=UUID(int=3301))
+    proven = _attempt(
+        attempt_id=UUID(int=3302),
+        outcome=SendAttemptOutcome.PRE_SUBMISSION_FAILURE,
+        pre_submission_proof="connection_refused_before_submit",
+    )
+    decision = should_retry(proven, now=NOW, other_attempts=[uncertain])
+    assert not decision.retry and decision.reasons == ("PRIOR_ATTEMPT_UNRESOLVED",)
+    # Documented provider idempotency covers the retry only with the very same key.
+    keyed = {"provider_idempotency_documented": True, "provider_idempotency_key": "idem-synthetic-1"}
+    first = _attempt(attempt_id=UUID(int=3303), **keyed)
+    second = _attempt(attempt_id=UUID(int=3304), **keyed)
+    assert should_retry(second, now=NOW, other_attempts=[first]).retry
+    other_key = _attempt(
+        attempt_id=UUID(int=3305), provider_idempotency_documented=True, provider_idempotency_key="idem-2"
+    )
+    assert should_retry(second, now=NOW, other_attempts=[other_key]).reasons == ("PRIOR_ATTEMPT_UNRESOLVED",)
+    assert should_retry(second, now=NOW, other_attempts=[uncertain]).reasons == ("PRIOR_ATTEMPT_UNRESOLVED",)
+    # A definite earlier failure is resolved and does not block a proven retry.
+    rejected = _attempt(attempt_id=UUID(int=3306), outcome=SendAttemptOutcome.DEFINITE_REJECTION)
+    assert should_retry(proven, now=NOW, other_attempts=[rejected]).retry
+
+
+def test_retry_is_denied_when_attempts_span_accounts() -> None:
+    proven = _attempt(
+        outcome=SendAttemptOutcome.PRE_SUBMISSION_FAILURE,
+        pre_submission_proof="connection_refused_before_submit",
+    )
+    elsewhere = proven.model_copy(update={"attempt_id": UUID(int=3401), "sender_binding_id": UUID(int=999)})
+    decision = should_retry(proven, now=NOW, other_attempts=[elsewhere])
+    assert not decision.retry and decision.reasons == ("DIFFERENT_ACCOUNT_FORBIDDEN",)
+    assert decision.sender_binding_id == SENDER_BINDING
+
+
+def test_queued_to_sending_needs_a_proceed_preflight() -> None:
+    with pytest.raises(ValidationFailed) as exc:
+        require_transition(InquiryState.QUEUED, InquiryState.SENDING)
+    assert exc.value.details["problem"] == "PREFLIGHT_PROCEED_REQUIRED"
+    for decision in (
+        PreflightDecision(outcome=PreflightOutcome.HOLD, reasons=("RATE_CAP_REACHED",)),
+        PreflightDecision(outcome=PreflightOutcome.CANCEL_STALE, target_state=InquiryState.CANCELLED),
+    ):
+        with pytest.raises(ValidationFailed):
+            require_transition(
+                InquiryState.QUEUED, InquiryState.SENDING, TransitionContext(preflight=decision)
+            )
+    proceed = dispatch_preflight(_facts())
+    require_transition(InquiryState.QUEUED, InquiryState.SENDING, TransitionContext(preflight=proceed))
+    # Leaving the queue without sending needs no preflight.
+    require_transition(InquiryState.QUEUED, InquiryState.CANCELLED)
+
+
+def test_language_must_be_rechecked_at_dispatch() -> None:
+    held = dispatch_preflight(_facts(current_language=None))
+    assert held.outcome == PreflightOutcome.HOLD and held.reasons == ("LANGUAGE_NOT_RECHECKED",)
+    unresolved = dispatch_preflight(_facts(current_language=resolve_inquiry_language(None, [])))
+    assert unresolved.target_state == InquiryState.CANCELLED and "LANGUAGE_CHANGED" in unresolved.reasons
+
+
+def test_suppression_recorded_under_the_merged_identity_suppresses() -> None:
+    merged_seller = "seller_entity:" + str(UUID(int=2222))
+    merged = IDENTITY.model_copy(update={"seller_key": merged_seller})
+    opt_out = SuppressionRecord(
+        scope="seller",
+        key=merged_seller,
+        reason=SuppressionReason.SELLER_OPT_OUT,
+        effective_at=NOW - timedelta(minutes=5),
+    )
+    decision = dispatch_preflight(_facts(identity=merged, suppressions=(opt_out,)))
+    assert decision.target_state == InquiryState.SUPPRESSED
+    assert decision.suppression_reason == SuppressionReason.SELLER_OPT_OUT
+    assert {"SUPPRESSED_SELLER_OPT_OUT", "INQUIRY_IDENTITY_CHANGED"} <= set(decision.reasons)
+    cluster_key = VehicleIdentityRef(kind="vehicle_cluster", id=CLUSTER).key()
+    in_cluster = IDENTITY.model_copy(
+        update={"vehicle": VehicleIdentityRef(kind="vehicle_cluster", id=CLUSTER)}
+    )
+    vehicle_hold = SuppressionRecord(
+        scope="vehicle",
+        key=cluster_key,
+        reason=SuppressionReason.CONTRADICTORY_AVAILABILITY,
+        effective_at=NOW - timedelta(minutes=5),
+    )
+    by_vehicle = dispatch_preflight(_facts(identity=in_cluster, suppressions=(vehicle_hold,)))
+    assert by_vehicle.target_state == InquiryState.SUPPRESSED
+    # The same suppression recorded twice is reported once.
+    twice = dispatch_preflight(_facts(suppressions=(opt_out, opt_out), identity=merged))
+    assert twice.reasons.count("SUPPRESSED_SELLER_OPT_OUT") == 1
+
+
+def test_binding_requires_a_fresh_readiness_for_the_same_listing_facts() -> None:
+    repriced = SNAPSHOT.model_copy(update={"price_amount_minor": 290000, "revision_number": 2})
+    with pytest.raises(ValidationFailed) as exc:
+        _bind(listing=repriced)
+    assert "READINESS_FOR_OTHER_LISTING_FACTS" in exc.value.details["problems"]
+    assert _bind(listing=repriced, readiness=readiness(listing_facts=repriced)).qualified_listing == repriced
+    with pytest.raises(ValidationFailed) as exc:
+        _bind(at=NOW + MAX_READINESS_AGE + timedelta(seconds=1))
+    assert exc.value.details["problems"] == ["READINESS_STALE"]
+    assert _bind(at=NOW + MAX_READINESS_AGE).binding_hash()
+    with pytest.raises(ValidationFailed) as exc:
+        _bind(at=NOW - timedelta(seconds=1))
+    assert exc.value.details["problems"] == ["READINESS_FROM_FUTURE"]
+
+
+def test_binding_rejects_a_recipient_verified_on_another_incarnation() -> None:
+    other = verify_recipient(_recipient_evidence(listing_incarnation_id=UUID(int=4040)), now=NOW)
+    assert other.verified
+    with pytest.raises(ValidationFailed) as exc:
+        _bind(recipient=other)
+    assert "RECIPIENT_LISTING_MISMATCH" in exc.value.details["problems"]
+    decision = readiness(recipient=other)
+    assert "RECIPIENT_NOT_FOR_THIS_LISTING" in decision.codes()
+    assert decision.readiness == InquiryReadiness.NEEDS_TECHNICAL_REVIEW
+
+
+def test_a_stored_recipient_decision_goes_stale() -> None:
+    then = NOW - RECIPIENT_EVIDENCE_MAX_AGE - timedelta(hours=2)
+    old = verify_recipient(
+        _recipient_evidence(observed_at=then - timedelta(hours=1), verified_at=then),
+        now=then + timedelta(hours=1),
+    )
+    assert old.verified  # fresh when it was decided
+    decision = readiness(recipient=old)
+    assert decision.readiness == InquiryReadiness.NEEDS_FACTS
+    assert severity_of(decision, "RECIPIENT_RECHECK_REQUIRED") == ReadinessSeverity.NEEDS_FACTS
+    assert readiness().readiness == InquiryReadiness.INQUIRY_READY
+
+
+def test_readiness_records_and_checks_the_listing_facts() -> None:
+    decision = readiness()
+    assert decision.as_of == NOW
+    assert decision.evidence["listing"] == SNAPSHOT.model_dump(mode="json")
+    sold = readiness(listing_facts=SNAPSHOT.model_copy(update={"availability": Availability.SOLD_CLAIMED}))
+    assert sold.readiness == InquiryReadiness.NOT_ELIGIBLE and "VEHICLE_UNAVAILABLE" in sold.codes()
+    reserved = readiness(listing_facts=SNAPSHOT.model_copy(update={"availability": Availability.RESERVED}))
+    assert "VEHICLE_RESERVED" in reserved.codes()
+    with pytest.raises(ValidationError):
+        inputs(listing_facts=SNAPSHOT.model_copy(update={"listing_id": UUID(int=404)}))
+
+
+def test_identity_merge_never_cancels_a_definite_failure() -> None:
+    failed = _existing(InquiryState.FAILED_DEFINITE, inquiry_id=UUID(int=1101), reserved_at=NOW)
+    queued = _existing(InquiryState.QUEUED, inquiry_id=UUID(int=1102), reserved_at=NOW - timedelta(hours=1))
+    result = reconcile_identity_merge([queued, failed])
+    assert result.keep == failed.inquiry_id and result.cancel == (queued.inquiry_id,)
+    assert not can_transition(InquiryState.FAILED_DEFINITE, InquiryState.CANCELLED)
+    accepted = _existing(InquiryState.ACCEPTED, inquiry_id=UUID(int=1103), attempts=1, reserved_at=NOW)
+    with_sent = reconcile_identity_merge([failed, accepted, queued])
+    assert with_sent.keep == accepted.inquiry_id
+    assert failed.inquiry_id not in with_sent.cancel and not with_sent.conflict
+    assert with_sent.transmitted_duplicates == ()
+
+
+def test_an_edited_authorization_record_cancels_queued_work() -> None:
+    narrowed = AUTH.model_copy(update={"languages": (MessageLanguage.DE,)})
+    assert narrowed.version == AUTH.version and narrowed.fingerprint() != AUTH.fingerprint()
+    decision = dispatch_preflight(_facts(authorization=narrowed))
+    assert decision.target_state == InquiryState.CANCELLED
+    assert decision.reasons == ("AUTHORIZATION_CHANGED",)

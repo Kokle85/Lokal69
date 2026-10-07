@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import importlib
 import json
@@ -24,9 +25,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol
 
-from suv_deals.clock import ensure_utc
-
 from outlook_bridge.errors import CredentialMissing, CredentialUnusable, ForbiddenCredentialKind
+from suv_deals.clock import ensure_utc
 
 MIN_TOKEN_CHARS: Final = 24
 MAX_TOKEN_CHARS: Final = 4096
@@ -41,7 +41,9 @@ _FORBIDDEN_PREFIXES: Final = (
     "sbp_",
     "service_role",
 )
-_FORBIDDEN_JWT_ROLES: Final = frozenset({"service_role", "supabase_admin", "postgres", "anon", "authenticated"})
+_FORBIDDEN_JWT_ROLES: Final = frozenset(
+    {"service_role", "supabase_admin", "postgres", "anon", "authenticated"}
+)
 
 
 class CredentialState(StrEnum):
@@ -61,10 +63,15 @@ class WorkerCredential:
     @property
     def fingerprint(self) -> str:
         """Non-reversible short identifier for diagnostics and rejection tracking."""
-        return hashlib.sha256(("worker-credential\x00" + self.token).encode("utf-8")).hexdigest()[:16]
+        return credential_fingerprint(self.token)
 
     def __repr__(self) -> str:
         return f"WorkerCredential(fingerprint={self.fingerprint}, expires_at={self.expires_at})"
+
+
+def credential_fingerprint(token: str) -> str:
+    """Non-reversible short identifier of a token (never the token itself)."""
+    return hashlib.sha256(("worker-credential\x00" + token).encode("utf-8")).hexdigest()[:16]
 
 
 def _jwt_payload(token: str) -> dict[str, Any] | None:
@@ -164,10 +171,8 @@ class WindowsCredentialManagerStore:  # pragma: no cover - requires Windows/pywi
         )
 
     def delete(self) -> None:
-        try:
+        with contextlib.suppress(Exception):  # deleting an absent credential is a no-op
             self._win32cred.CredDelete(self._target, CRED_TYPE_GENERIC)
-        except Exception:  # noqa: S110 - deleting an absent credential is a no-op
-            pass
 
 
 class RejectionMemory(Protocol):
@@ -213,10 +218,18 @@ class CredentialManager:
     def token(self, now: datetime) -> str:
         return self.require(now).token
 
-    def mark_rejected(self) -> None:
+    def mark_rejected(self, fingerprint: str | None = None) -> bool:
+        """Remember that the server rejected the stored credential (transmission stops).
+
+        ``fingerprint`` names the credential the rejected request actually used; when the stored
+        credential has been replaced meanwhile, the new one is not marked. Returns whether the
+        stored credential is now marked as rejected.
+        """
         credential = self._store.load()
-        if credential is not None:
-            self._memory.set_runtime(_REJECTED_KEY, credential.fingerprint)
+        if credential is None or (fingerprint is not None and fingerprint != credential.fingerprint):
+            return False
+        self._memory.set_runtime(_REJECTED_KEY, credential.fingerprint)
+        return True
 
     def replace(self, credential: WorkerCredential) -> None:
         validate_worker_token(credential.token)
@@ -234,5 +247,6 @@ __all__ = [
     "RejectionMemory",
     "WindowsCredentialManagerStore",
     "WorkerCredential",
+    "credential_fingerprint",
     "validate_worker_token",
 ]

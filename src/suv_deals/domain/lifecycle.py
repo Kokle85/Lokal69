@@ -37,8 +37,10 @@ Availability events (``derive_availability_event``)
 
 Contradictions (``detect_availability_conflicts``)
     An active duplicate elsewhere does not cancel a seller's "sold" statement (and a seller's
-    "available" does not cancel a site's sold badge/removal): the conflict is preserved and stops
-    outreach (``SuppressionReason.CONTRADICTORY_AVAILABILITY``) until resolved.
+    "available" does not cancel a site's sold badge/removal that already existed): the conflict is
+    preserved and stops outreach (``SuppressionReason.CONTRADICTORY_AVAILABILITY``) until
+    resolved. A badge or removal that appears only after the seller's "available", and any
+    evidence older than the current status, is an ordinary progression, not a contradiction.
 
 Lags (``source_scan_lag``, ``detection_delay``, ``detail_freshness``, ``mail_reply_detection_lag``,
 ``notification_processing_lag``)
@@ -523,9 +525,9 @@ def derive_availability_event(
         state.availability == Availability.SOLD_CLAIMED
         and state.availability_evidence_kind == AvailabilityEvidenceKind.SELLER_REPORTED_SOLD
     )
-    conflict = (
-        # The ad still showing active or "reserved", or the seller later saying available or
-        # reserved, does not silently cancel the seller's "sold": the contradiction is kept.
+    # The ad still showing active or "reserved", or the seller later saying available or
+    # reserved, does not silently cancel the seller's "sold": the contradiction is kept.
+    contradicts_seller_sold = (
         seller_sold
         and new_status in (Availability.AVAILABLE, Availability.RESERVED)
         and evidence_kind
@@ -534,13 +536,18 @@ def derive_availability_event(
             AvailabilityEvidenceKind.SELLER_REPORTED_AVAILABLE,
             AvailabilityEvidenceKind.SELLER_REPORTED_RESERVED,
         )
-    ) or (
+    )
+    # A seller's "available" after a site's sold badge or removal page is a contradiction too.
+    contradicts_source_unavailable = (
         new_status == Availability.AVAILABLE
         and evidence_kind == AvailabilityEvidenceKind.SELLER_REPORTED_AVAILABLE
         and state.availability in _STRONG_UNAVAILABLE
         and state.availability_evidence_kind
         in (AvailabilityEvidenceKind.SOURCE_SOLD_BADGE, AvailabilityEvidenceKind.SOURCE_REMOVED_PAGE)
     )
+    # Older evidence (the ad seen active, or the seller's "available", *before* the current status
+    # took effect) is history - an ordinary progression, never a contradiction.
+    conflict = not historical and (contradicts_seller_sold or contradicts_source_unavailable)
     return AvailabilityDecision(
         event=AvailabilityEventDraft(
             listing_id=state.listing_id,
@@ -701,19 +708,25 @@ def detect_availability_conflicts(
             )
         )
     active = [m for m in members if m.availability == Availability.AVAILABLE]
-    if (
-        latest_statement is not None
-        and latest_statement.status == Availability.AVAILABLE
-        and source_unavailable
-    ):
-        conflicts.append(
-            AvailabilityConflict(
-                kind="seller_available_vs_source_unavailable",
-                listing_ids=tuple(m.listing_id for m in source_unavailable),
-                reply_ids=(latest_statement.reply_id,),
-                detail="seller says available while a source shows a sold badge or removal",
+    if latest_statement is not None and latest_statement.status == Availability.AVAILABLE:
+        # A sold badge or removal that appeared only *after* the seller said "available" is an
+        # ordinary progression (the car sold later); one that already existed (or whose time is
+        # unknown) contradicts the statement.
+        contradicted = [
+            m
+            for m in source_unavailable
+            if m.availability_effective_at is None
+            or m.availability_effective_at <= latest_statement.stated_at
+        ]
+        if contradicted:
+            conflicts.append(
+                AvailabilityConflict(
+                    kind="seller_available_vs_source_unavailable",
+                    listing_ids=tuple(m.listing_id for m in contradicted),
+                    reply_ids=(latest_statement.reply_id,),
+                    detail="seller says available while a source shows a sold badge or removal",
+                )
             )
-        )
     if active and source_unavailable:
         conflicts.append(
             AvailabilityConflict(

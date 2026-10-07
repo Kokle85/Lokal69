@@ -21,7 +21,13 @@ from outlook_bridge.config import BridgeConfig
 from outlook_bridge.credentials import CredentialState
 from outlook_bridge.local_queue import IntentState, LocalStore, Outcome
 from outlook_bridge.outlook_adapter import ConnectionState
-from outlook_bridge.wire import CheckpointReport, FolderRoleWire, GapReport, HeartbeatEnvelope, WorkerHeartbeat
+from outlook_bridge.wire import (
+    CheckpointReport,
+    FolderRoleWire,
+    GapReport,
+    HeartbeatEnvelope,
+    WorkerHeartbeat,
+)
 
 GAP_WORKER_OFFLINE: Final = "worker_offline"
 GAP_WORKER_SUSPENDED: Final = "worker_suspended"
@@ -36,10 +42,21 @@ GAP_PENDING_CAPACITY: Final = "pending_capacity_exceeded"
 GAP_CROSS_MAILBOX: Final = "cross_mailbox_binding_rejected"
 GAP_EVENT_OVERFLOW: Final = "new_mail_event_overflow"
 GAP_UPLOAD_BUILD_FAILED: Final = "upload_build_failed"
+GAP_ACCOUNT_CHANGED: Final = "account_binding_mismatch"
+GAP_BINDING_SYNC_INCOMPLETE: Final = "binding_sync_incomplete"
+GAP_FOLDER_SCOPE: Final = "folder_scope_invalid"
+GAP_ITEM_UNREADABLE: Final = "item_unreadable"
 
 #: Gaps during which new mail may not have been seen; they hold back scan watermarks.
 DETECTION_GAP_KINDS: Final = frozenset(
-    {GAP_WORKER_OFFLINE, GAP_WORKER_SUSPENDED, GAP_OUTLOOK_NOT_RUNNING, GAP_OUTLOOK_DISCONNECTED}
+    {
+        GAP_WORKER_OFFLINE,
+        GAP_WORKER_SUSPENDED,
+        GAP_OUTLOOK_NOT_RUNNING,
+        GAP_OUTLOOK_DISCONNECTED,
+        GAP_FOLDER_SCOPE,
+        GAP_ACCOUNT_CHANGED,
+    }
 )
 COVERAGE_STATEMENT: Final = (
     "Local reply detection runs only while this computer is awake, the worker is running and classic "
@@ -228,7 +245,9 @@ def build_health(
     gap_window: timedelta = timedelta(days=15),
 ) -> HealthSnapshot:
     last_alive = store.get_runtime_time(_LAST_ALIVE)
-    worker_status: Status = "ok" if last_alive is not None and now - last_alive < timedelta(minutes=5) else "down"
+    worker_status: Status = (
+        "ok" if last_alive is not None and now - last_alive < timedelta(minutes=5) else "down"
+    )
     if connection is None:
         outlook_status: Status = "unknown"
     elif not connection.outlook_running:
@@ -410,12 +429,16 @@ def heartbeat_envelope(
 __all__ = [
     "COVERAGE_STATEMENT",
     "DETECTION_GAP_KINDS",
+    "GAP_ACCOUNT_CHANGED",
     "GAP_AMBIGUOUS_MATCH",
     "GAP_BACKEND_UNREACHABLE",
+    "GAP_BINDING_SYNC_INCOMPLETE",
     "GAP_CATCHUP_EXCEEDED",
     "GAP_CREDENTIAL_UNUSABLE",
     "GAP_CROSS_MAILBOX",
     "GAP_EVENT_OVERFLOW",
+    "GAP_FOLDER_SCOPE",
+    "GAP_ITEM_UNREADABLE",
     "GAP_OUTLOOK_DISCONNECTED",
     "GAP_OUTLOOK_NOT_RUNNING",
     "GAP_PENDING_CAPACITY",

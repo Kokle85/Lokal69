@@ -51,7 +51,7 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from suv_deals.clock import Clock, SystemClock
+from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.domain.enums import EmailProviderKind, Tristate
 from suv_deals.domain.inquiries import SenderBinding
 from suv_deals.domain.replies import (
@@ -264,6 +264,10 @@ class GraphMailProvider:
         self._clock = clock or SystemClock()
         self._settings = settings or GraphSettings()
         self._me = f"{self._settings.api_root}/me"
+        #: The mailbox owner's own addresses: a message from them is never a seller reply.
+        self._own_addresses = tuple(
+            dict.fromkeys(a for a in (binding.from_address, binding.reply_to_address) if a)
+        )
 
     @property
     def kind(self) -> EmailProviderKind:
@@ -460,9 +464,22 @@ class GraphMailProvider:
                 reason=SendFailureReason.CREDENTIALS_REVOKED
                 if exc.revoked
                 else SendFailureReason.CREDENTIALS_UNAVAILABLE,
-                retryable=not exc.revoked,
+                # Nothing was sent and nothing about the message is wrong: retryable, so the
+                # domain retry/preflight path suppresses the inquiry while access is revoked
+                # (spec 37.5) instead of failing it permanently.
+                retryable=True,
                 proof="credentials_rejected_before_submit",
                 provider_error=exc.code,
+            )
+        except Exception:  # the credential store failed before any provider request was made
+            return self._failure(
+                message,
+                inquiry_id,
+                attempt_id,
+                reason=SendFailureReason.CREDENTIALS_UNAVAILABLE,
+                retryable=True,
+                proof="credentials_rejected_before_submit",
+                provider_error="token_provider_error",
             )
         if token.scopes and "mail.send" not in normalize_permissions(token.scopes):
             return self._failure(
@@ -719,7 +736,9 @@ class GraphMailProvider:
             )
         checkpoint = _parse_graph_datetime(cursor) if cursor else None
         # With a checkpoint, re-read an overlap before it (ingest de-duplicates); else use since.
-        start = checkpoint - REPLY_OVERLAP if checkpoint is not None else since
+        # Always UTC: the filter literal carries a "Z" suffix, so a +02:00 value printed as wall
+        # time would start the window two hours late and silently skip replies.
+        start = ensure_utc(checkpoint - REPLY_OVERLAP if checkpoint is not None else since)
         own = [b for b in bindings if b.mailbox_binding_id == mailbox_binding_id]
         url: str | None = f"{self._me}/mailFolders/inbox/messages"
         params: Mapping[str, str | int] | None = {
@@ -732,7 +751,7 @@ class GraphMailProvider:
         problems: list[str] = []
         scanned = skipped = 0
         complete = True
-        last_seen: str | None = cursor
+        last_seen: str | None = cursor if checkpoint is not None else None  # drop an unusable cursor
         for _page in range(self._settings.max_list_pages):
             if url is None:
                 break
@@ -851,7 +870,7 @@ class GraphMailProvider:
             headers=full_headers,
             body_text="" if html_only else text[: 256 * 1024],
         )
-        correlation = correlate_reply(inbound, bindings)
+        correlation = correlate_reply(inbound, bindings, own_addresses=self._own_addresses)
         if correlation.upload_scope == "none":
             return "skip"
         return CorrelatedReply(

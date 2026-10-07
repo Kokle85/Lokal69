@@ -27,9 +27,17 @@ pessimistic:
 
 ``reconcile`` returns ``found_sent`` (positive evidence), ``not_found_yet`` (searched, nothing
 found - explicitly *not* proof of non-submission: search indexes and Sent Items lag, the
-message may sit in Drafts/Outbox, an old worker may still complete its request) or
-``provider_unavailable``. ``reconciliation_evidence`` converts it into the domain's
+message may sit in Drafts/Outbox, an old worker may still complete its request),
+``provider_unavailable`` or - only on the local worker route - ``proven_not_submitted``: every
+send intent of the inquiry was definitively refused by the mailbox-bound worker before
+``.Send`` (for example because it expired while the laptop was off), so no handed-over copy can
+ever be transmitted. ``reconciliation_evidence`` converts it into the domain's
 ``ReconciliationEvidence`` so ``inquiries.reconcile_uncertain`` makes the decision.
+
+Before any I/O every ``send`` re-checks the final bytes (``built_message_problems``) *and* the
+bounded scope (``mime_builder.inquiry_scope_problems``): only the exact rendering of a registered
+seller template, addressed to exactly one recipient without Cc/Bcc or attachments, is ever handed
+to a provider.
 
 ``fetch_correlated_replies`` is the provider-API alternative to the local Outlook reply
 worker: it reads candidate *metadata* first, fetches a body only for messages that reference
@@ -73,7 +81,11 @@ from suv_deals.domain.replies import (
     safe_filename,
 )
 from suv_deals.domain.seller_contacts import AddressError, canonicalize_address
-from suv_deals.integrations.mime_builder import BuiltMessage, built_message_problems
+from suv_deals.integrations.mime_builder import (
+    BuiltMessage,
+    built_message_problems,
+    inquiry_scope_problems,
+)
 
 PROVIDER_CONTRACT_VERSION: Final = "sender-provider/1"
 MAX_RECONCILE_WINDOW: Final = timedelta(days=60)
@@ -437,17 +449,50 @@ class ReconcileProviderUnavailable(BaseModel):
     retry_after_seconds: int | None = Field(default=None, ge=0, le=MAX_RETRY_AFTER_SECONDS)
 
 
-ReconcileResult = Annotated[
-    ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable,
-    Field(discriminator="status"),
-]
+class ReconcileProvenNotSubmitted(BaseModel):
+    """Positive proof that no handed-over copy of the inquiry can ever be transmitted.
+
+    Only the local worker route produces it: every send intent stored for the inquiry (and every
+    searched Message-ID belongs to one of them) carries a definitive ``refused_before_send``
+    report from its mailbox-bound worker, which never calls ``.Send`` for a refused or already
+    attempted intent. A direct-API provider can never prove non-submission by searching.
+    """
+
+    model_config = _FROZEN
+
+    status: Literal["proven_not_submitted"] = "proven_not_submitted"
+    provider: EmailProviderKind
+    inquiry_id: UUID
+    proof: PreSubmissionProof
+    refused_intent_ids: tuple[UUID, ...] = Field(min_length=1, max_length=MAX_RECONCILE_MESSAGE_IDS)
+    refusal_reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _local_only(self) -> ReconcileProvenNotSubmitted:
+        if self.provider != EmailProviderKind.OUTLOOK_LOCAL:
+            raise ValueError("only the local worker route can prove that nothing was submitted")
+        return self
 
 
-def reconciliation_evidence(
-    result: ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable,
-) -> ReconciliationEvidence:
-    """Domain evidence for ``inquiries.reconcile_uncertain``; never claims non-submission."""
+ReconcileOutcome = (
+    ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable | ReconcileProvenNotSubmitted
+)
+ReconcileResult = Annotated[ReconcileOutcome, Field(discriminator="status")]
+
+
+def reconciliation_evidence(result: ReconcileOutcome) -> ReconciliationEvidence:
+    """Domain evidence for ``inquiries.reconcile_uncertain``.
+
+    A search that found nothing never claims non-submission; only ``proven_not_submitted`` (the
+    local worker's definitive refusal of every intent) does.
+    """
     local = result.provider == EmailProviderKind.OUTLOOK_LOCAL
+    if isinstance(result, ReconcileProvenNotSubmitted):
+        return ReconciliationEvidence(
+            outbox_pending=Tristate.NO,
+            proven_not_submitted=result.proof,
+            worker_alive=Tristate.NO,  # the worker has finished with every refused intent
+        )
     if isinstance(result, ReconcileFoundSent):
         if local:
             return ReconciliationEvidence(sent_items="found", outbox_pending=Tristate.NO)
@@ -532,8 +577,10 @@ class ReplyFetchResult(BaseModel):
     provider: EmailProviderKind
     retrieval_mode: Literal["provider_pull", "local_worker_push"]
     replies: tuple[CorrelatedReply, ...] = ()
-    #: Provider message ids of unmatched messages that reference unknown Message-IDs: re-read
-    #: after the next binding sync (reply-before-binding race). Locators only, never content.
+    #: Provider message ids to re-inspect later (``recheck_locators``): unmatched messages that
+    #: reference one of this system's Message-ID shapes not yet in the synced bindings
+    #: (reply-before-binding race), and messages a window pull listed but could not inspect in
+    #: this pull (budget or transient failure). Locators only, never content.
     pending_retry_locators: tuple[str, ...] = ()
     next_cursor: str | None = Field(default=None, max_length=512)
     complete: bool = True
@@ -618,7 +665,7 @@ class SenderProvider(Protocol):
         rfc_message_ids: Sequence[str],
         window: ReconcileWindow,
         provider_message_ids: Sequence[str] = (),
-    ) -> ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable: ...
+    ) -> ReconcileOutcome: ...
 
     async def fetch_correlated_replies(
         self,
@@ -684,8 +731,14 @@ def send_precondition_problems(
     inquiry_id: UUID,
     idempotency_key: str,
 ) -> list[str]:
-    """Local checks before any I/O: a failure here is a proven pre-submission refusal."""
+    """Local checks before any I/O: a failure here is a proven pre-submission refusal.
+
+    Covers the final bytes (exact allowed header set, one recipient, no Cc/Bcc/attachment), the
+    bounded inquiry scope (exact registered-template rendering, ``validate_scope`` with the real
+    envelope) and the exact sender binding. There is no approval check: none exists.
+    """
     problems = [f"MIME:{p}" for p in built_message_problems(message)]
+    problems.extend(f"SCOPE:{p}" for p in inquiry_scope_problems(message))
     if binding.provider != provider:
         problems.append("PROVIDER_MISMATCH")
     if message.inquiry_id != inquiry_id:
@@ -938,6 +991,8 @@ __all__ = [
     "ProviderReceipt",
     "ReconcileFoundSent",
     "ReconcileNotFoundYet",
+    "ReconcileOutcome",
+    "ReconcileProvenNotSubmitted",
     "ReconcileProviderUnavailable",
     "ReconcileResult",
     "ReconcileWindow",

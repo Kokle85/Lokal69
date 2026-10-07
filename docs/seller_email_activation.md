@@ -31,8 +31,11 @@ name and address), `To` (one address, no display name), optional `Reply-To`, `Su
 (RFC 2047 encoded when non-ASCII), `Date`, `Message-ID`
 `<inquiry-<inquiry uuid>.<attempt>@<sender domain>>`, `X-SUV-Inquiry-Ref: inquiry-<uuid>`
 (the inquiry id only, no secret), `MIME-Version`, `Content-Type: text/plain; charset="utf-8"`
-and `Content-Transfer-Encoding` (quoted-printable or base64). The final bytes are re-parsed and
-verified before every submission. The client Message-ID is a correlation/search key; reusing it
+and `Content-Transfer-Encoding` (quoted-printable or base64). Only the exact rendering of a
+registered seller template (`seller_templates.rendering_problems`) can be built, and every
+provider re-checks the final bytes and that template scope (`mime_builder.inquiry_scope_problems`)
+before any I/O: free-text or edited wording, the Macedonian preview, a Reply-To equal to the
+seller, extra recipients, Cc/Bcc or attachments never reach a provider. The client Message-ID is a correlation/search key; reusing it
 is **not** a universal de-duplication guarantee (providers may rewrite it or accept duplicates),
 so uncertain sends are reconciled, never resent on that assumption.
 
@@ -51,13 +54,16 @@ All values live in the runtime `.env`/secret store, never in source control or c
 | `SELLER_EMAIL_FROM` | the verified From address (the account's primary address or a provider-verified alias) |
 | `SELLER_EMAIL_REPLY_TO` | optional; must be a verified alias of the **same** account so replies reach the watched mailbox |
 | `SELLER_EMAIL_OAUTH_SECRET_REFERENCE` | API providers only: a *reference* such as `secretbox:ops.email_sender_bindings/<id>`; values that look like tokens (`ya29.`, `1//`, JWTs, `Bearer ...`) are refused |
-| `SELLER_REPLY_INGEST_MODE` | `local_classic_outlook` (chosen route) or `provider_api` |
+| `SELLER_REPLY_INGEST_MODE` | `local_classic_outlook` (chosen route) or `provider_api`; Gmail/Graph reply retrieval through the provider API runs **only** with `provider_api` (otherwise the backend never reads the mailbox through the API, so there is no second consumer) |
 
 `seller_email.build_sender_provider` refuses to construct a sending provider unless the mode is
 `automatic`, the kill switch is off, the binding is verified (provider, stable account id, From,
 display name, alias status, healthy, not revoked) and exactly matches these settings. That is a
-technical prerequisite, not an approval. A live kill-switch probe is re-read immediately before
-every transmission and fails closed.
+technical prerequisite, not an approval. A live kill-switch probe must be supplied
+(`KILL_SWITCH_PROBE_MISSING` otherwise); it is re-read immediately before every transmission and
+fails closed. A kill-switch refusal is a proven pre-submission failure marked retryable: it stops
+that transmission only, and the domain retry policy plus the dispatch preflight (which suppresses
+while the switch is on) decide what happens to the inquiry - it is never failed permanently.
 
 ## 3. Route A (default): classic Outlook on the owner's Windows machine
 
@@ -84,6 +90,17 @@ Outcome semantics: until the worker reports, a send is `uncertain` (`local_worke
 `sent_items_confirmed` is `accepted` (no provider id or SMTP receipt exists and none is invented);
 a worker refusal before `.Send` is a proven pre-submission failure. While the laptop or Outlook is
 offline, inquiries wait in the backend queue and the offline time is reported as a coverage gap.
+
+Because a hand-over is `uncertain`, the inquiry leaves `uncertain` again only on evidence:
+`reconcile` returns `found_sent` on Sent Items evidence, and `proven_not_submitted` only when every
+stored intent of the inquiry (covering every searched Message-ID) carries a definitive
+`refused_before_send` report from its own mailbox-bound worker and no report suggests `.Send` was
+called or a copy sits in the Outbox. The common case is an intent that expired (default TTL 6 h)
+while the laptop was off: the worker refuses it when it comes back, the inquiry becomes
+`failed_definite` through reconciliation, and the guarded retry sends a *new* intent from the same
+account after the dispatch preflight. A `duplicate_intent` refusal, a missing report or an
+unknown intent never counts as proof. The persistence gateway therefore implements
+`intents_for(inquiry_id)` besides `publish_intent`, `reports_for` and the heartbeat/account reads.
 
 ## 4. Route B (optional): Gmail API
 
@@ -113,8 +130,19 @@ Send semantics: 2xx is accepted (Gmail `id`/`threadId` recorded only as returned
 Message-ID is read back because Gmail may rewrite it); 400/401/403 (non-rate-limit)/404/413 are
 definite and nothing was sent (401 is retryable after a token refresh); connection failures
 before any request byte are retryable pre-submission failures; 429, rate-limit 403s, 5xx,
-redirects, read timeouts, write interruptions and connection resets are `uncertain`. An inquiry
-always starts a new Gmail thread (no `threadId`, no `In-Reply-To`/`References`).
+redirects, read timeouts, write interruptions and connection resets are `uncertain`. Revoked or
+unavailable credentials (including a failing secret store) are retryable pre-submission failures,
+so the preflight suppresses the inquiry while access stays revoked instead of failing it for good.
+An inquiry always starts a new Gmail thread (no `threadId`, no `In-Reply-To`/`References`).
+
+Reply retrieval (`provider_api` only) never skips a message: a history pull that stops early
+(message or page budget, transient read failure) returns the id of the last fully processed
+history record as the next cursor (UNVERIFIED offline that Gmail accepts a record id as
+`startHistoryId`; if it ever answers 404 the window re-sync runs with an explicit gap); a window
+pull (first run or after a gap) moves to the `historyId` read before listing and hands every
+listed but uninspected message back in `pending_retry_locators` for `recheck_locators`; a listing
+beyond the page budget is an explicit `WINDOW_TRUNCATED` gap. Messages from the owner's own
+addresses are never treated as seller replies.
 
 ## 5. Route C (optional skeleton): Microsoft Graph (Outlook.com / Microsoft 365)
 
@@ -164,8 +192,9 @@ monitoring or sending is claimed.
 * Pause everything: `SELLER_INQUIRY_KILL_SWITCH=true` or the MCP `seller_inquiries_pause` tool
   (scope `inquiries:pause`). Untransmitted work stops at once; reconciliation keeps running.
 * Revoke access: remove the OAuth grant at the provider (the next token refresh reports
-  `CREDENTIALS_REVOKED`, health turns `credentials_revoked`, sending stops) or remove the Outlook
-  account; never switch to another account.
+  `CREDENTIALS_REVOKED`, health turns `credentials_revoked`, sending stops and pending inquiries
+  are suppressed with `sender_revoked` at the next preflight) or remove the Outlook account; never
+  switch to another account.
 * Uncertain sends: the inquiry stays `uncertain`, keeps its reservation and quota debit, and is
   reconciled by Message-ID. Only positive evidence (found in Sent Items/provider, or a correlated
   reply/bounce) resolves it; `not_found_yet` never releases anything. An automatic retry happens

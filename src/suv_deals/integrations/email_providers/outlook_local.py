@@ -27,6 +27,14 @@ A report naming another sending account than the intent is ``uncertain`` with
 backend view - and the inquiry keeps its reservation and quota debit. Inquiries wait in the
 backend queue while the laptop/Outlook is offline; that time is a reported coverage gap.
 
+Leaving ``uncertain`` again: ``reconcile_from_reports`` returns ``found_sent`` on Sent Items
+evidence and ``proven_not_submitted`` only when *every* stored intent of the inquiry (covering
+every searched Message-ID) has a definitive ``refused_before_send`` report from its own
+mailbox-bound worker and no report suggesting ``.Send`` was called (an intent that expired while
+the laptop was off is the common case). Retryable refusals (expired intent, Outlook not classic,
+mailbox unavailable, kill switch) then go through the domain's guarded retry with a *new* intent
+from the same account; the refused intent itself is never sent by the worker.
+
 ``IntentNotStored`` is the only gateway error that proves the intent was not stored (so the
 worker can never pick it up); every other publish error is treated as an uncertain hand-over.
 """
@@ -47,6 +55,7 @@ from suv_deals.domain.inquiries import SenderBinding
 from suv_deals.domain.replies import InquiryBinding, normalize_message_id
 from suv_deals.errors import ValidationFailed
 from suv_deals.integrations.email_providers.base import (
+    MAX_RECONCILE_MESSAGE_IDS,
     USABLE_ALIAS_STATUSES,
     AliasStatus,
     ProviderCapabilities,
@@ -55,6 +64,8 @@ from suv_deals.integrations.email_providers.base import (
     ProviderReceipt,
     ReconcileFoundSent,
     ReconcileNotFoundYet,
+    ReconcileOutcome,
+    ReconcileProvenNotSubmitted,
     ReconcileProviderUnavailable,
     ReconcileWindow,
     ReplyFetchResult,
@@ -261,11 +272,15 @@ class OutlookRefusalReason(StrEnum):
     DUPLICATE_INTENT = "duplicate_intent"  # already attempted earlier: that result stands
 
 
+#: Refusals that say nothing against a later attempt of the same message from the same account
+#: (the domain retry policy and dispatch preflight decide whether and when). A kill-switch refusal
+#: stops this transmission only; it must not permanently fail the inquiry.
 _RETRYABLE_REFUSALS: Final = frozenset(
     {
         OutlookRefusalReason.INTENT_EXPIRED,
         OutlookRefusalReason.OUTLOOK_NOT_CLASSIC,
         OutlookRefusalReason.MAILBOX_UNAVAILABLE,
+        OutlookRefusalReason.KILL_SWITCH,
     }
 )
 
@@ -415,14 +430,43 @@ def map_outlook_report(
     )
 
 
+def _definitive_refusal(intent: OutlookSendIntent, reports: Sequence[OutlookSendReport]) -> str | None:
+    """The refusal reason when the intent's own worker definitively refused it before ``.Send``.
+
+    ``None`` unless at least one report from the intent's mailbox binding is a non-duplicate
+    ``refused_before_send`` and no report for the intent (from any mailbox) indicates that
+    ``.Send`` may have been called or that a copy may sit in the Outbox. A ``duplicate_intent``
+    refusal only says that an *earlier* attempt of this intent exists, whose result is unknown.
+    """
+    own = [r for r in reports if r.intent_id == intent.intent_id and r.inquiry_id == intent.inquiry_id]
+    if any(
+        r.state != OutlookSubmissionState.REFUSED_BEFORE_SEND
+        or r.refusal_reason == OutlookRefusalReason.DUPLICATE_INTENT
+        or r.outbox_pending == Tristate.YES
+        for r in own
+    ):
+        return None
+    refusals = [r for r in own if r.mailbox_binding_id == intent.mailbox_binding_id]
+    if not refusals or refusals[-1].refusal_reason is None:
+        return None
+    return refusals[-1].refusal_reason.value
+
+
 def reconcile_from_reports(
     inquiry_id: UUID,
     rfc_message_ids: Sequence[str],
     reports: Sequence[OutlookSendReport],
     *,
     worker_online: bool,
-) -> ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable:
-    """Sent Items evidence from worker reports; an absent report never proves anything."""
+    intents: Sequence[OutlookSendIntent] = (),
+) -> ReconcileOutcome:
+    """Sent Items evidence or proven refusal from worker reports; absence never proves anything.
+
+    ``intents`` are every send intent stored for the inquiry (all attempts). Non-submission is
+    proven only when each of them was definitively refused by its own worker and every searched
+    Message-ID belongs to one of them (an attempt whose intent may or may not have been stored
+    is never assumed unsent).
+    """
     ids = normalize_search_ids(rfc_message_ids)
     relevant = [r for r in reports if r.inquiry_id == inquiry_id]
     for report in relevant:
@@ -437,6 +481,18 @@ def reconcile_from_reports(
                     rfc_message_id=observed,
                     sent_at=report.sent_at,
                 ),
+            )
+    own_intents = list({i.intent_id: i for i in intents if i.inquiry_id == inquiry_id}.values())
+    covered = {normalize_message_id(i.rfc_message_id) for i in own_intents}
+    if own_intents and len(own_intents) <= MAX_RECONCILE_MESSAGE_IDS and set(ids) <= covered:
+        reasons = [_definitive_refusal(intent, relevant) for intent in own_intents]
+        if all(reason is not None for reason in reasons):
+            return ReconcileProvenNotSubmitted(
+                provider=EmailProviderKind.OUTLOOK_LOCAL,
+                inquiry_id=inquiry_id,
+                proof="local_validation_failed_before_submit",
+                refused_intent_ids=tuple(dict.fromkeys(i.intent_id for i in own_intents)),
+                refusal_reasons=tuple(r for r in reasons if r is not None),
             )
     if not worker_online:
         return ReconcileProviderUnavailable(
@@ -471,6 +527,10 @@ class OutlookWorkerGateway(Protocol):
     async def latest_heartbeat(self, mailbox_binding_id: UUID) -> OutlookHeartbeat | None: ...
 
     async def reports_for(self, inquiry_id: UUID) -> Sequence[OutlookSendReport]: ...
+
+    async def intents_for(self, inquiry_id: UUID) -> Sequence[OutlookSendIntent]:
+        """Every intent ever stored for the inquiry (all attempts, any state)."""
+        ...
 
 
 class OutlookLocalProvider:
@@ -512,8 +572,8 @@ class OutlookLocalProvider:
 
     async def _worker_online(self) -> tuple[bool, OutlookHeartbeat | None]:
         heartbeat = await self._gateway.latest_heartbeat(self._mailbox_binding_id)
-        if heartbeat is None:
-            return False, None
+        if heartbeat is None or heartbeat.mailbox_binding_id != self._mailbox_binding_id:
+            return False, None  # another mailbox's worker never vouches for this one
         fresh = self._clock.now() - heartbeat.at <= HEARTBEAT_STALE_AFTER
         return fresh and heartbeat.outlook_running and heartbeat.mailbox_connected, heartbeat
 
@@ -536,6 +596,8 @@ class OutlookLocalProvider:
             )
         problems: list[str] = []
         warnings: list[str] = []
+        if report.mailbox_binding_id != self._mailbox_binding_id:
+            problems.append("MAILBOX_BINDING_MISMATCH")
         if now - report.reported_at > MAX_ACCOUNT_REPORT_AGE:
             problems.append("WORKER_REPORT_STALE")
         if report.outlook_flavour != "classic":
@@ -599,15 +661,24 @@ class OutlookLocalProvider:
                 attempt_id=attempt_id,
                 problems=problems,
             )
-        intent = build_send_intent(
-            message,
-            attempt_id=attempt_id,
-            idempotency_key=idempotency_key,
-            mailbox_binding_id=self._mailbox_binding_id,
-            binding=self._binding,
-            created_at=self._clock.now(),
-            ttl=self._ttl,
-        )
+        try:
+            intent = build_send_intent(
+                message,
+                attempt_id=attempt_id,
+                idempotency_key=idempotency_key,
+                mailbox_binding_id=self._mailbox_binding_id,
+                binding=self._binding,
+                created_at=self._clock.now(),
+                ttl=self._ttl,
+            )
+        except (ValueError, ValidationFailed):  # refused locally: nothing was handed over
+            return local_refusal(
+                message,
+                provider=EmailProviderKind.OUTLOOK_LOCAL,
+                inquiry_id=inquiry_id,
+                attempt_id=attempt_id,
+                problems=("INTENT_INVALID",),
+            )
         common = {
             "provider": EmailProviderKind.OUTLOOK_LOCAL,
             "inquiry_id": inquiry_id,
@@ -644,15 +715,18 @@ class OutlookLocalProvider:
         rfc_message_ids: Sequence[str],
         window: ReconcileWindow,
         provider_message_ids: Sequence[str] = (),
-    ) -> ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable:
+    ) -> ReconcileOutcome:
         try:
             normalize_search_ids(rfc_message_ids)
         except ValueError as exc:
             raise ValidationFailed("invalid reconciliation Message-IDs") from exc
         del window, provider_message_ids
         reports = await self._gateway.reports_for(inquiry_id)
+        intents = await self._gateway.intents_for(inquiry_id)
         online, _heartbeat = await self._worker_online()
-        return reconcile_from_reports(inquiry_id, rfc_message_ids, reports, worker_online=online)
+        return reconcile_from_reports(
+            inquiry_id, rfc_message_ids, reports, worker_online=online, intents=intents
+        )
 
     async def fetch_correlated_replies(
         self,

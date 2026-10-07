@@ -19,6 +19,7 @@ Output is JSON without mail content.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import signal
@@ -31,9 +32,9 @@ from pathlib import Path
 from typing import Any, Final, TextIO
 
 import httpx
-from suv_deals.clock import Clock, SystemClock, ensure_utc
 
 from outlook_bridge import WORKER_SOFTWARE
+from outlook_bridge.api_client import BridgeApiClient, ClientIdentity
 from outlook_bridge.compatibility import (
     CompatibilityReport,
     ProcessProbe,
@@ -41,7 +42,13 @@ from outlook_bridge.compatibility import (
     check_compatibility,
     running_process_names,
 )
-from outlook_bridge.config import CONFIG_FILENAME, BridgeConfig, default_data_dir, ensure_private_dir, load_config
+from outlook_bridge.config import (
+    CONFIG_FILENAME,
+    BridgeConfig,
+    default_data_dir,
+    ensure_private_dir,
+    load_config,
+)
 from outlook_bridge.credentials import (
     CredentialManager,
     CredentialState,
@@ -50,10 +57,26 @@ from outlook_bridge.credentials import (
     WorkerCredential,
 )
 from outlook_bridge.errors import BridgeError, ConfigError, CredentialError, NonInteractiveSession, StaError
+from outlook_bridge.health import build_health
 from outlook_bridge.local_queue import LocalStore
 from outlook_bridge.log import configure_logging
-from outlook_bridge.outlook_adapter import MailboxAdapter
-from outlook_bridge.sta_runtime import SessionContext, probe_session_context, session_refusal_reasons
+from outlook_bridge.matching import semantics_versions
+from outlook_bridge.outlook_adapter import (
+    MailboxAdapter,
+    OutlookComSession,
+    StaMailbox,
+    private_temp_dir,
+    real_com_bindings,
+)
+from outlook_bridge.sta_runtime import (
+    PythonComApi,
+    SessionContext,
+    StaExecutor,
+    probe_session_context,
+    session_refusal_reasons,
+)
+from outlook_bridge.worker import BridgeWorker
+from suv_deals.clock import Clock, SystemClock, ensure_utc
 
 EXIT_OK: Final = 0
 EXIT_CONFIG: Final = 2
@@ -67,9 +90,6 @@ MailboxFactory = Callable[[BridgeConfig, SessionContext, Clock], tuple[MailboxAd
 def _default_mailbox_factory(
     config: BridgeConfig, session: SessionContext, clock: Clock
 ) -> tuple[MailboxAdapter, Callable[[], None]]:  # pragma: no cover - requires Windows/pywin32
-    from outlook_bridge.outlook_adapter import OutlookComSession, StaMailbox, private_temp_dir, real_com_bindings
-    from outlook_bridge.sta_runtime import PythonComApi, StaExecutor
-
     executor = StaExecutor(PythonComApi(), session)  # refuses SYSTEM/service/non-interactive sessions
     executor.start()
     attach, bind_events = real_com_bindings(start_if_not_running=config.start_outlook_if_not_running)
@@ -153,10 +173,7 @@ def _compat(deps: CliDeps, now: datetime) -> CompatibilityReport:
 
 
 def _semantics() -> dict[str, Any]:
-    try:
-        from outlook_bridge.matching import semantics_versions
-    except ImportError:
-        return {"available": False, "problem": "REPLY_SEMANTICS_UNAVAILABLE"}
+    """Versions of the shared reply semantics in use (they are a hard dependency)."""
     return {"available": True, **semantics_versions()}
 
 
@@ -209,10 +226,7 @@ def _check(args: argparse.Namespace, deps: CliDeps) -> int:
     report["session"] = {"interactive_user": not reasons, "refusal_reasons": list(reasons)}
     if code == EXIT_OK and (not compat.supported or reasons):
         code = EXIT_UNSUPPORTED
-    semantics = _semantics()
-    report["reply_semantics"] = semantics
-    if code == EXIT_OK and not semantics["available"]:
-        code = EXIT_RUNTIME
+    report["reply_semantics"] = _semantics()
     if config is not None:
         try:
             manager = CredentialManager(deps.credential_store(config), _MemoryRuntime())
@@ -236,8 +250,6 @@ def _open_store(config: BridgeConfig, *, dry_run: bool) -> LocalStore:
 
 
 def _status(config: BridgeConfig, deps: CliDeps) -> int:
-    from outlook_bridge.health import build_health
-
     now = deps.clock.now()
     if not config.store_path().exists():
         _print(deps, {"status": "no local state yet", "monitoring_24h_claimed": False})
@@ -287,9 +299,6 @@ def _credential(config: BridgeConfig, deps: CliDeps, action: str, expires_at: st
 
 
 def _run(config: BridgeConfig, deps: CliDeps, *, once: bool, dry_run: bool) -> int:
-    from outlook_bridge.api_client import BridgeApiClient, ClientIdentity
-    from outlook_bridge.worker import BridgeWorker
-
     now = deps.clock.now()
     if deps.configure_logs:
         configure_logging(None if dry_run else config.resolved_data_dir() / "logs")
@@ -302,9 +311,6 @@ def _run(config: BridgeConfig, deps: CliDeps, *, once: bool, dry_run: bool) -> i
     reasons = session_refusal_reasons(session)
     if reasons:
         raise NonInteractiveSession(reasons)
-    if not _semantics()["available"]:
-        deps.err.write("shared reply semantics (suv_deals.domain) are not installed\n")
-        return EXIT_RUNTIME
     store = _open_store(config, dry_run=dry_run)
     closers: list[Callable[[], None]] = [store.close]
     try:
@@ -364,10 +370,8 @@ def _run(config: BridgeConfig, deps: CliDeps, *, once: bool, dry_run: bool) -> i
         return EXIT_OK
     finally:
         for close in reversed(closers):
-            try:
+            with contextlib.suppress(Exception):  # best-effort shutdown
                 close()
-            except Exception:  # noqa: S110 - best-effort shutdown
-                pass
 
 
 __all__ = [

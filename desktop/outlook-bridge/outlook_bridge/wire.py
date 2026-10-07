@@ -21,9 +21,18 @@ from typing import Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.listings import sha256_json
 from suv_deals.domain.replies import canonical_address, normalize_message_id
+from suv_deals.domain.seller_templates import (
+    SCOPE_HASH,
+    TEMPLATES,
+    InquiryPlaceholders,
+    RenderedMessage,
+    SellerTemplate,
+    rendering_problems,
+)
 
 WIRE_SCHEMA_VERSION: Final = "1.0"
 MAX_INTENT_SUBJECT_CHARS: Final = 200  # mime_builder.MAX_SUBJECT_CHARS
@@ -127,9 +136,79 @@ class WorkerSendIntent(BaseModel):
         return _aware(now) >= self.not_after
 
 
-_CONTROL_RE: Final = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x85  ]")
-_SUBJECT_FORBIDDEN_RE: Final = re.compile(r"[\x00-\x1f\x7f\x85  ]")
+_CONTROL_RE: Final = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f\x85\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]"
+)
+_SUBJECT_FORBIDDEN_RE: Final = re.compile(
+    r"[\x00-\x1f\x7f\x85\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]"
+)
 _MARKUP_RE: Final = re.compile(r"<\s*/?\s*[A-Za-z][^>]*>")
+
+
+_TEMPLATE_GROUPS: Final[dict[str, str]] = {
+    "vehicle_label": r"(?P<vehicle_label>[^\n]+?)",
+    "listing_reference": r"(?P<listing_reference>[^\n]+?)",
+    "listing_url": r"(?P<listing_url>\S+)",
+    "verified_sender_display_name": r"(?P<verified_sender_display_name>[^\n]+?)",
+}
+_TEMPLATE_PLACEHOLDER_RE: Final = re.compile(r"\\\{\\\{([a-z_]+)\\\}\\\}")
+
+
+def _template_pattern(text: str) -> re.Pattern[str]:
+    """``text`` with every ``{{placeholder}}`` turned into a named capture group."""
+    return re.compile(_TEMPLATE_PLACEHOLDER_RE.sub(lambda m: _TEMPLATE_GROUPS[m.group(1)], re.escape(text)))
+
+
+_SELLER_TEMPLATE_PATTERNS: Final[tuple[tuple[SellerTemplate, re.Pattern[str], re.Pattern[str]], ...]] = tuple(
+    (template, _template_pattern(template.subject), _template_pattern(template.body))
+    for template in TEMPLATES.values()
+    if template.kind == "seller_inquiry"
+)
+
+
+def template_scope_problems(subject: str, body: str, *, from_display_name: str) -> tuple[str, ...]:
+    """Prove locally that ``subject``/``body`` are an exact registered seller-inquiry rendering.
+
+    The worker never sends free text: the message must be byte-for-byte one of the versioned
+    spec 37.4 templates (DE/IT/FR/EN) with placeholder values that pass the shared domain
+    validation and the bounded three-question scope validator (``seller_templates``), and its
+    signature must be the verified sender display name of the intent. An intent that adds an
+    offer, a commitment, a follow-up, extra questions or personal data is refused before
+    ``.Send`` even if the backend (or anything between it and this machine) produced it.
+    """
+    canonical = canonical_message(subject, body)
+    for template, subject_re, body_re in _SELLER_TEMPLATE_PATTERNS:
+        subject_match = subject_re.fullmatch(canonical["subject"])
+        body_match = body_re.fullmatch(canonical["body"])
+        if subject_match is None or body_match is None:
+            continue
+        try:
+            placeholders = InquiryPlaceholders(
+                vehicle_label=subject_match.group("vehicle_label"),
+                listing_reference=subject_match.group("listing_reference"),
+                listing_url=body_match.group("listing_url"),
+                sender_display_name=body_match.group("verified_sender_display_name"),
+            )
+            rendered = RenderedMessage(
+                template_id=template.template_id,
+                template_version=template.version,
+                template_hash=template.template_hash(),
+                kind=template.kind,
+                language=template.language,
+                subject=canonical["subject"],
+                body=canonical["body"],
+                placeholders=placeholders,
+                body_hash=message_body_hash(subject, body),
+                scope_hash=SCOPE_HASH,
+            )
+        except ValueError:  # pydantic ValidationError is a ValueError
+            continue
+        if rendering_problems(rendered):
+            continue
+        if placeholders.sender_display_name != from_display_name:
+            return ("SENDER_DISPLAY_NAME_MISMATCH",)
+        return ()
+    return ("NOT_TEMPLATE_RENDERING",)
 
 
 def intent_integrity_problems(intent: WorkerSendIntent) -> tuple[str, ...]:
@@ -137,11 +216,16 @@ def intent_integrity_problems(intent: WorkerSendIntent) -> tuple[str, ...]:
 
     The backend already validated the bounded inquiry scope; the worker re-checks that the
     intent is still exactly one plain-text message to one canonical recipient whose body hash
-    matches, so a corrupted or altered intent is refused before submission.
+    matches and whose subject/body are an exact registered seller-template rendering inside the
+    three-question scope (``template_scope_problems``), so a corrupted, altered or out-of-scope
+    intent is refused before submission.
     """
     problems: list[str] = []
     if message_body_hash(intent.subject, intent.body_text) != intent.body_hash:
         problems.append("BODY_HASH_MISMATCH")
+    problems.extend(
+        template_scope_problems(intent.subject, intent.body_text, from_display_name=intent.from_display_name)
+    )
     if _SUBJECT_FORBIDDEN_RE.search(intent.subject) or _SUBJECT_FORBIDDEN_RE.search(intent.from_display_name):
         problems.append("HEADER_INJECTION")
     if "\r" in intent.body_text or _CONTROL_RE.search(intent.body_text):
@@ -371,8 +455,7 @@ class HeartbeatAck(BaseModel):
     @classmethod
     def _bounded(cls, value: dict[str, str]) -> dict[str, str]:
         return {
-            safe_code(k, 32) or "unknown": safe_code(v, 32) or "unknown"
-            for k, v in list(value.items())[:10]
+            safe_code(k, 32) or "unknown": safe_code(v, 32) or "unknown" for k, v in list(value.items())[:10]
         }
 
 
@@ -401,4 +484,5 @@ __all__ = [
     "message_body_hash",
     "parse_inquiry_message_id",
     "safe_code",
+    "template_scope_problems",
 ]

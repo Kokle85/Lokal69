@@ -108,7 +108,9 @@ class TestWindow:
         ]
         scans = [scan(0), scan(65), scan(310, source="later_source")]
         start = evaluation_window_start(activations, scans)
-        assert start == T0 + timedelta(minutes=70)
+        # The start of the first complete healthy scan after activation (it finished at +70 min):
+        # the vehicles that scan discovers are inside the window.
+        assert start == T0 + timedelta(minutes=65)
         report = build_evaluation_report(now=T0 + timedelta(days=3), activations=activations, scans=scans)
         assert report.window_start == start
         assert report.window_end == start + EVALUATION_WINDOW
@@ -431,7 +433,7 @@ class TestInquiriesRepliesDocuments:
 
     def test_summary_lines_pass_the_owner_wording_guard(self) -> None:
         report = build_evaluation_report(
-            now=T0 + timedelta(days=2),
+            now=T0 + timedelta(days=1, hours=23),
             activations=ACTIVE,
             scans=[*regular_scans(3), scan(400, ok=False)],
             candidates=[valued("900", "1800")],
@@ -455,3 +457,56 @@ class TestIndependentReviewRegressions:
         assert any("could not be compared with the owner-approved threshold" in r for r in report.reasons)
         assert all(r != "no candidate met the quality criteria" for r in report.reasons)
         report.summary_lines()  # passes the owner-wording guard
+
+
+class TestThirdReviewRegressions:
+    def test_vehicles_found_by_the_activating_scan_are_inside_the_window(self) -> None:
+        # The first complete healthy scan runs 08:00-08:05 and finds a qualifying vehicle at 08:03.
+        # A window opening only at the scan's finish dropped it and reported "no vehicle passed".
+        found_during_first_scan = valued(
+            "2000",
+            "2600",
+            first_seen_at=T0 + timedelta(minutes=3),
+            approved_contribution_threshold=Money.of("1500", "EUR"),
+        )
+        report = build_evaluation_report(
+            now=T0 + timedelta(days=2),
+            activations=ACTIVE,
+            scans=[scan(0)],
+            candidates=[found_during_first_scan],
+        )
+        assert report.window_start == T0
+        assert report.eligible_vehicles == 1 and report.well_matched_vehicles == 1
+        assert report.outcome == EvaluationOutcome.DEAL_FOUND
+        assert report.qualifying_deal_ids == (found_during_first_scan.candidate_id,)
+        # The window never opens before the activation, even for a scan that started earlier.
+        late_activation = [SourceActivation(source_key=SOURCE, activated_at=T0 + timedelta(minutes=2))]
+        assert evaluation_window_start(late_activation, [scan(0)]) == T0 + timedelta(minutes=2)
+        # A scan that finished before the activation does not open it at all.
+        after_scan = [SourceActivation(source_key=SOURCE, activated_at=T0 + timedelta(minutes=6))]
+        assert evaluation_window_start(after_scan, [scan(0)]) is None
+
+    def test_real_listing_clustered_with_a_canary_is_excluded_and_counted(self) -> None:
+        canary = valued("5000", "6000", vehicle_cluster_id=CLUSTER, is_canary=True)
+        same_vehicle = valued("5000", "6000", vehicle_cluster_id=CLUSTER)
+        inquiry = EvaluationInquiry(
+            inquiry_id=uuid4(),
+            state=InquiryState.ACCEPTED,
+            created_at=T0 + timedelta(hours=2),
+            candidate_id=same_vehicle.candidate_id,
+        )
+        document = DocumentResolution(
+            candidate_id=same_vehicle.candidate_id, document="CoC", resolved_at=T0 + timedelta(hours=3)
+        )
+        report = build_evaluation_report(
+            now=T0 + timedelta(days=1),
+            activations=ACTIVE,
+            scans=regular_scans(3),
+            candidates=[canary, same_vehicle],
+            inquiries=[inquiry],
+            document_resolutions=[document],
+        )
+        assert report.eligible_vehicles == 0 and report.qualifying_deal_ids == ()
+        assert report.inquiries.attempted == 0 and report.missing_documents_resolved == 0
+        # canary + clustered listing + its inquiry + its document resolution
+        assert report.excluded_synthetic_records == 4

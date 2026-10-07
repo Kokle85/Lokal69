@@ -37,11 +37,10 @@ from uuid import UUID, uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-from suv_deals.clock import ensure_utc
-from suv_deals.domain.enums import EmailProviderKind
-from suv_deals.domain.replies import MAX_REQUEST_BYTES, InquiryBinding, InquiryBindingState
 
 from outlook_bridge import WORKER_SOFTWARE
+from outlook_bridge.credentials import credential_fingerprint
+from outlook_bridge.errors import MailboxMismatch
 from outlook_bridge.local_queue import BindingRecord
 from outlook_bridge.wire import (
     ClaimDecision,
@@ -51,6 +50,9 @@ from outlook_bridge.wire import (
     WorkerAccountReport,
     WorkerSendReport,
 )
+from suv_deals.clock import ensure_utc
+from suv_deals.domain.enums import EmailProviderKind
+from suv_deals.domain.replies import MAX_REQUEST_BYTES, InquiryBinding, InquiryBindingState
 
 BINDINGS_PATH: Final = "/v1/mail-workers/inquiry-bindings"
 REPLIES_PATH: Final = "/v1/mail-workers/replies"
@@ -61,6 +63,7 @@ MAX_RESPONSE_BYTES: Final = 2 * 1024 * 1024
 MAX_RETRY_AFTER_SECONDS: Final = 3600
 _CURSOR_RE: Final = re.compile(r"^[\x21-\x7e]{1,1024}$")
 _REQUEST_ID_RE: Final = re.compile(r"^[\x21-\x7e]{1,200}$")
+_IDEMPOTENCY_KEY_RE: Final = re.compile(r"^[\x21-\x7e]{8,128}$")
 
 
 class ApiErrorKind(StrEnum):
@@ -94,6 +97,7 @@ class BridgeApiError(Exception):
         code: str | None = None,
         retry_after_seconds: int | None = None,
         request_id: str | None = None,
+        credential_fingerprint: str | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -101,6 +105,8 @@ class BridgeApiError(Exception):
         self.code = code
         self.retry_after_seconds = retry_after_seconds
         self.request_id = request_id
+        #: Fingerprint (never the token) of the credential the failed request used.
+        self.credential_fingerprint = credential_fingerprint
 
     @property
     def transient(self) -> bool:
@@ -253,6 +259,7 @@ class BridgeApiClient:
         idempotency_key: str | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         token = self._token_provider()  # raises when the credential is missing/unusable
+        fingerprint = credential_fingerprint(token)
         request_id = f"mw-{uuid4().hex}"
         headers = {"Authorization": f"Bearer {token}", "X-Request-Id": request_id}
         if body is not None:
@@ -278,7 +285,9 @@ class BridgeApiClient:
             )
         data = self._json(raw, status, request_id)
         if status >= 400:
-            raise self._error(status, data, retry_after_header, request_id)
+            error = self._error(status, data, retry_after_header, request_id)
+            error.credential_fingerprint = fingerprint
+            raise error
         return data, request_id
 
     @staticmethod
@@ -305,7 +314,9 @@ class BridgeApiClient:
                 ApiErrorKind.PROTOCOL, "response is not JSON", status=status, request_id=request_id
             ) from None
         if not isinstance(data, dict):
-            raise BridgeApiError(ApiErrorKind.PROTOCOL, "response is not an object", status=status, request_id=request_id)
+            raise BridgeApiError(
+                ApiErrorKind.PROTOCOL, "response is not an object", status=status, request_id=request_id
+            )
         return data
 
     @staticmethod
@@ -320,13 +331,19 @@ class BridgeApiClient:
                 return max(1, min(seconds, MAX_RETRY_AFTER_SECONDS))
         return None
 
-    def _error(self, status: int, data: Mapping[str, Any], retry_after: str | None, request_id: str) -> BridgeApiError:
+    def _error(
+        self, status: int, data: Mapping[str, Any], retry_after: str | None, request_id: str
+    ) -> BridgeApiError:
         error = data.get("error") if isinstance(data.get("error"), dict) else {}
         assert isinstance(error, dict)
         code = error.get("code") if isinstance(error.get("code"), str) else None
         code = code[:64] if code else None
         server_request = data.get("request_id")
-        rid = server_request if isinstance(server_request, str) and _REQUEST_ID_RE.fullmatch(server_request) else request_id
+        rid = (
+            server_request
+            if isinstance(server_request, str) and _REQUEST_ID_RE.fullmatch(server_request)
+            else request_id
+        )
         if status in (400, 422):
             kind = ApiErrorKind.VALIDATION
         elif status == 401:
@@ -336,7 +353,9 @@ class BridgeApiClient:
         elif status == 404:
             kind = ApiErrorKind.NOT_FOUND
         elif status == 409:
-            kind = ApiErrorKind.IDEMPOTENCY_CONFLICT if code == "IDEMPOTENCY_CONFLICT" else ApiErrorKind.CONFLICT
+            kind = (
+                ApiErrorKind.IDEMPOTENCY_CONFLICT if code == "IDEMPOTENCY_CONFLICT" else ApiErrorKind.CONFLICT
+            )
         elif status == 413:
             kind = ApiErrorKind.REQUEST_TOO_LARGE
         elif status == 429:
@@ -350,7 +369,9 @@ class BridgeApiClient:
             f"mail-worker API answered {status}",
             status=status,
             code=code,
-            retry_after_seconds=self._retry_after(retry_after, error) if kind == ApiErrorKind.RATE_LIMITED else None,
+            retry_after_seconds=self._retry_after(retry_after, error)
+            if kind == ApiErrorKind.RATE_LIMITED
+            else None,
             request_id=rid,
         )
 
@@ -375,39 +396,84 @@ class BridgeApiClient:
     # ------------------------------------------------------------------ replies
 
     def post_reply(self, body: bytes, *, idempotency_key: str, expected_inquiry_id: UUID) -> IngestAck:
+        """Upload one correlated reply (spec 37.8 v1.0 JSON) with its ``Idempotency-Key``.
+
+        Client-side guards before any byte leaves the machine: <= 128 KiB, a well-formed
+        idempotency key, and a body that names exactly this worker's mailbox binding and the
+        expected inquiry (``MailboxMismatch`` otherwise: cross-mailbox injection is refused here,
+        not only by the server).
+        """
         if len(body) > MAX_REQUEST_BYTES:
             raise BridgeApiError(ApiErrorKind.REQUEST_TOO_LARGE, "reply upload exceeds 128 KiB")
+        if not _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+            raise BridgeApiError(
+                ApiErrorKind.VALIDATION, "idempotency key must be 8-128 printable characters"
+            )
+        self._check_reply_body(body, expected_inquiry_id)
         data, request_id = self._request("POST", REPLIES_PATH, body=body, idempotency_key=idempotency_key)
         ack = self._parse(IngestAck, data, request_id)
         if ack.inquiry_id != expected_inquiry_id:
-            raise BridgeApiError(ApiErrorKind.PROTOCOL, "acknowledgement names another inquiry", request_id=request_id)
+            raise BridgeApiError(
+                ApiErrorKind.PROTOCOL, "acknowledgement names another inquiry", request_id=request_id
+            )
         return ack
+
+    def _check_reply_body(self, body: bytes, expected_inquiry_id: UUID) -> None:
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise BridgeApiError(ApiErrorKind.VALIDATION, "reply upload is not UTF-8 JSON") from None
+        if not isinstance(data, dict) or data.get("schema_version") != "1.0":
+            raise BridgeApiError(ApiErrorKind.VALIDATION, "reply upload is not a v1.0 object")
+        if data.get("mailbox_binding_id") != str(self._identity.mailbox_binding_id):
+            raise MailboxMismatch("reply upload names another mailbox binding; refused locally")
+        if data.get("inquiry_id") != str(expected_inquiry_id):
+            raise MailboxMismatch(
+                "reply upload names another inquiry than its backlog entry; refused locally"
+            )
 
     # ------------------------------------------------------------------ send intents
 
     def fetch_send_intents(self, *, limit: int = 10) -> SendIntentBatch:
-        data, request_id = self._request("GET", SEND_INTENTS_PATH, params={"limit": str(max(1, min(limit, 50)))})
+        data, request_id = self._request(
+            "GET", SEND_INTENTS_PATH, params={"limit": str(max(1, min(limit, 50)))}
+        )
         batch = self._parse(SendIntentBatch, data, request_id)
         for intent in batch.intents:
             if intent.mailbox_binding_id != self._identity.mailbox_binding_id:
-                raise BridgeApiError(ApiErrorKind.PROTOCOL, "send intent for another mailbox", request_id=request_id)
+                raise BridgeApiError(
+                    ApiErrorKind.PROTOCOL, "send intent for another mailbox", request_id=request_id
+                )
         return batch
 
     def claim_send_intent(self, intent_id: UUID) -> ClaimDecision:
+        """Server revalidation immediately before ``.Send`` - always evaluated *fresh*.
+
+        Every claim carries its own ``claim_attempt_id`` (and an Idempotency-Key derived from
+        it), so a backend idempotency layer can never replay an earlier ``proceed=true`` after
+        the kill switch, a suppression or a cancellation changed the answer. A lost claim answer
+        means nothing is sent now; the next poll claims again with a new attempt id.
+        """
         path = f"{SEND_INTENTS_PATH}/{quote(str(intent_id))}/claim"
+        attempt = uuid4().hex
         body = json.dumps(
             {
                 "schema_version": "1.0",
                 "intent_id": str(intent_id),
+                "claim_attempt_id": attempt,
                 "mailbox_binding_id": str(self._identity.mailbox_binding_id),
                 "worker_id": self._identity.worker_id,
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        data, request_id = self._request("POST", path, body=body, idempotency_key=f"claim-{intent_id}")
+        data, request_id = self._request(
+            "POST", path, body=body, idempotency_key=f"claim-{intent_id}-{attempt}"
+        )
         decision = self._parse(ClaimDecision, data, request_id)
         if decision.intent_id != intent_id:
-            raise BridgeApiError(ApiErrorKind.PROTOCOL, "claim answer names another intent", request_id=request_id)
+            raise BridgeApiError(
+                ApiErrorKind.PROTOCOL, "claim answer names another intent", request_id=request_id
+            )
         return decision
 
     def post_send_report(self, report: WorkerSendReport) -> None:
@@ -419,7 +485,9 @@ class BridgeApiClient:
     # ------------------------------------------------------------------ health
 
     def post_heartbeat(self, envelope: HeartbeatEnvelope) -> HeartbeatAck:
-        data, request_id = self._request("POST", HEARTBEAT_PATH, body=envelope.model_dump_json().encode("utf-8"))
+        data, request_id = self._request(
+            "POST", HEARTBEAT_PATH, body=envelope.model_dump_json().encode("utf-8")
+        )
         return self._parse(HeartbeatAck, data, request_id)
 
     def post_account_report(self, report: WorkerAccountReport) -> None:

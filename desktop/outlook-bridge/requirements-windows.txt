@@ -1,0 +1,18 @@
+# Runtime requirements of the classic-Outlook reply worker on the owner's Windows PC.
+#
+# Install into a dedicated virtual environment (see README.md):
+#   py -3.13 -m venv %LOCALAPPDATA%\SUVDeals\OutlookBridge\venv
+#   %LOCALAPPDATA%\SUVDeals\OutlookBridge\venv\Scripts\pip install -r requirements-windows.txt
+#   %LOCALAPPDATA%\SUVDeals\OutlookBridge\venv\Scripts\pip install --no-deps <repository root>
+#
+# The last step installs only the pure shared domain package ``suv_deals`` (no server
+# dependencies are needed by the worker; --no-deps keeps them off the desktop). The worker never
+# needs Supabase, PostgreSQL or any database driver.
+#
+# Versions match the repository lock file (uv.lock), pywin32 included (312 is the build uv.lock
+# resolves for win32). pywin32 is Windows-only and imported lazily; re-verify it at activation.
+
+pywin32==312 ; sys_platform == "win32"
+pydantic==2.13.5
+httpx==0.28.1
+PyYAML==6.0.3

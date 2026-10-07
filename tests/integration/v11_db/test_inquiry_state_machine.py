@@ -22,6 +22,7 @@ from psycopg.types.json import Jsonb
 from tests.integration.db.helpers import T0, Seed, backend, sha
 from tests.integration.v11_db.support import (
     ALL_STATES,
+    PROVEN_NOT_SUBMITTED,
     SV_APPEND_ONLY,
     SV_FROZEN,
     SV_MONOTONIC,
@@ -316,8 +317,8 @@ def test_proven_non_submission_allows_one_guarded_retry_on_the_same_account(
     with backend(db_conn, iw.workspace_id):
         db_conn.execute(
             "update ops.email_delivery_attempts set reconciled_outcome = 'proven_not_submitted',"
-            " reconciled_at = now() where id = %s",
-            (attempt,),
+            " reconciled_at = now(), reconciliation_evidence = %s where id = %s",
+            (Jsonb(PROVEN_NOT_SUBMITTED), attempt),
         )
         update_inquiry(db_conn, inquiry, state="failed_definite")
     queue(db_conn, iw, inquiry)

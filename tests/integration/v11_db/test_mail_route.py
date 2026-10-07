@@ -378,6 +378,37 @@ def test_revoked_mailbox_cannot_ingest(db_conn: psycopg.Connection, seed: Seed, 
         insert_reply(db_conn, reply_values(iw, inquiry, box))
 
 
+def test_revoked_or_expired_worker_credential_stops_ingest(
+    db_conn: psycopg.Connection, seed: Seed, iw: InquiryWorld
+) -> None:
+    """The backlog waits locally until the binding is rotated to a live credential."""
+    inquiry, box = _sent_with_mailbox(db_conn, seed, iw)
+    with backend(db_conn, iw.workspace_id):
+        reply = insert_reply(db_conn, reply_values(iw, inquiry, box))
+    row = db_conn.execute(
+        "select credential_id from ops.mail_worker_bindings where id = %s", (box,)
+    ).fetchone()
+    assert row is not None
+    db_conn.execute(
+        "update ops.api_credentials set revoked_at = now(), revoked_by = %s,"
+        " revoke_reason = 'synthetic laptop lost' where id = %s",
+        (uuid.uuid4(), row[0]),
+    )
+    with expect_sqlstate(SV_TRANSITION, "revoked or expired"), backend(db_conn, iw.workspace_id):
+        insert_reply(db_conn, reply_values(iw, inquiry, box))
+    with expect_sqlstate(SV_TRANSITION, "revoked or expired"), backend(db_conn, iw.workspace_id):
+        insert_row(db_conn, "ops.mail_ingest_dedup", _dedup(iw, box, row[0], inquiry, reply))
+    # Rotation to a live mail:ingest-only credential resumes ingest (same mailbox identity).
+    rotated = mail_credential(seed, iw.workspace_id)
+    with backend(db_conn, iw.workspace_id):
+        db_conn.execute(
+            "update ops.mail_worker_bindings set credential_id = %s, version = version + 1 where id = %s",
+            (rotated, box),
+        )
+        insert_reply(db_conn, reply_values(iw, inquiry, box))
+        insert_row(db_conn, "ops.mail_ingest_dedup", _dedup(iw, box, rotated, inquiry, reply))
+
+
 def test_reply_dedup_unique_keys(db_conn: psycopg.Connection, seed: Seed, iw: InquiryWorld) -> None:
     inquiry, box = _sent_with_mailbox(db_conn, seed, iw)
     imid = "<dedup-1@synthetic-dealer.example>"

@@ -863,3 +863,80 @@ def test_quota_debit_needs_a_reserving_inquiry(db_conn: psycopg.Connection, iw: 
         backend(db_conn, iw.workspace_id),
     ):
         debit(db_conn, iw, inquiry)
+
+
+# ---------------------------------------------------------------------------------------------
+# The bound snapshot is the listing's current revision; recipient kinds fit the seller
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"qualified_price_minor": 199000},  # a cheaper price than the revision shows
+        {"qualified_currency": "CHF"},
+        {"qualified_semantic_hash": sha("other facts")},
+        {"qualification_revision_number": 7},
+    ],
+)
+def test_reservation_snapshot_must_be_the_bound_revision(
+    db_conn: psycopg.Connection, iw: InquiryWorld, overrides: dict[str, Any]
+) -> None:
+    inquiry = insert_inquiry(db_conn, iw)
+    with expect_sqlstate(SV_REFERENCE, "qualification snapshot"):
+        reserve(db_conn, iw, inquiry, **overrides)
+
+
+def test_reservation_of_a_stale_revision_is_refused(
+    db_conn: psycopg.Connection, seed: Seed, iw: InquiryWorld
+) -> None:
+    inquiry = insert_inquiry(db_conn, iw)
+    _, gen, obs = seed.detail_observation(iw.workspace_id, iw.listing_id, promoted=True)
+    newer = seed.revision(iw.workspace_id, iw.listing_id, 2, detail_generation=gen, observation_id=obs)
+    seed.promote(iw.workspace_id, iw.listing_id, newer, gen, obs)
+    with expect_sqlstate(SV_TRANSITION, "listing changed since qualification"):
+        reserve(db_conn, iw, inquiry)
+
+
+def test_listing_reserved_for_someone_else_is_not_reserved(
+    db_conn: psycopg.Connection, iw: InquiryWorld
+) -> None:
+    db_conn.execute(
+        "update app.listings set availability = 'reserved', row_version = row_version + 1 where id = %s",
+        (iw.listing_id,),
+    )
+    inquiry = insert_inquiry(db_conn, iw)
+    with expect_sqlstate(SV_TRANSITION, "availability changed"):
+        reserve(db_conn, iw, inquiry, qualified_availability="reserved")
+
+
+def test_official_dealer_contact_needs_a_dealer_seller(db_conn: psycopg.Connection, seed: Seed) -> None:
+    iw = inquiry_world(seed, "V11 dealer contact")
+    private = seller_entity(seed, iw.workspace_id, seller_type="private")
+    other = vehicle(seed, iw.workspace_id)
+    contact_id, address = contact(
+        seed, iw.workspace_id, other, private, evidence_kind="official_dealer_contact_via_listing"
+    )
+    world = InquiryWorld(
+        iw.workspace_id,
+        seed,
+        other,
+        private,
+        contact_id,
+        address,
+        iw.authorization_id,
+        iw.sender_binding_id,
+        iw.controls_id,
+    )
+    inquiry = insert_inquiry(db_conn, world)
+    with expect_sqlstate(SV_TRANSITION, "only for a dealer seller"):
+        reserve(db_conn, world, inquiry)
+
+
+def test_recipient_is_never_our_own_reply_to_address(db_conn: psycopg.Connection, iw: InquiryWorld) -> None:
+    inquiry = insert_inquiry(db_conn, iw)
+    with (
+        expect_sqlstate("23514", "seller_inquiries_recipient_not_sender_ck"),
+        backend(db_conn, iw.workspace_id),
+    ):
+        update_inquiry(db_conn, inquiry, **binding_values(iw, sender_reply_to_address=iw.contact_address))

@@ -67,7 +67,17 @@ Claims (``extract_reply_claims``)
     is invented: an ambiguous number is kept as an unparsed mention, never guessed. A number
     without a currency is a quote only next to a price word and when plausible (>= 100); numbers
     labelled as mileage/year/power/owners/doors/keys are never money, and another money-like
-    number beside a stated price is kept as a currency-less mention, not a quote.
+    number beside a stated price is kept as a currency-less mention, not a quote. An amount the
+    seller directly negates ("nicht 2.500 €, sondern 2.800 €") is a ``negated`` mention, never a
+    quote. "Your mail was in my spam folder" is not a complaint, "do not contact me by phone" is
+    not an opt-out and "das Auto abmelden" (deregister the car) is neither.
+
+Unicode hygiene
+    Everything analysed, stored or surfaced is NFKC-normalised without format characters (bidi
+    overrides/isolates that could make "2.800" display as "008.2", zero-width characters, soft
+    hyphens), C0/C1 controls (except newline and tab) and lone surrogates (repaired to U+FFFD, so a
+    malformed message is never a poison message). Subjects, header values and attachment names
+    additionally carry no line or paragraph separator - the same characters the database rejects.
 
 Processing (``decide_reply_processing``)
     Never an automatic response or follow-up. Payment/reservation/identity/appointment/
@@ -124,7 +134,7 @@ from suv_deals.errors import Forbidden, IdempotencyConflict, ValidationFailed
 
 REPLY_SCHEMA_VERSION: Final = "1.0"
 FINGERPRINT_VERSION: Final = "reply-source-fingerprint/2"
-SANITIZER_VERSION: Final = "reply-sanitizer/1"
+SANITIZER_VERSION: Final = "reply-sanitizer/2"
 CLAIMS_VERSION: Final = "reply-claims/1"
 MK_SUMMARY_VERSION: Final = "reply-mk-summary/1"
 CORRELATION_VERSION: Final = "reply-correlation/1"
@@ -154,13 +164,43 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 # Text helpers
 # =============================================================================================
 
-_ZERO_WIDTH_RE: Final = re.compile(
-    r"[\N{ZERO WIDTH SPACE}\N{ZERO WIDTH NON-JOINER}\N{ZERO WIDTH JOINER}"
-    r"\N{WORD JOINER}\N{ZERO WIDTH NO-BREAK SPACE}]"
-)
-_CONTROL_EXCEPT_NL_TAB_RE: Final = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-_HEADER_CONTROL_RE: Final = re.compile(r"[\x00-\x1f\x7f]")
+
+def _format_char_class() -> str:
+    """Regex class body of every Unicode format character (category ``Cf``): bidi overrides and
+    isolates, zero-width characters, soft hyphen, BOM, tag characters. They are invisible, can
+    reorder what the owner sees (``\\u202e`` turns "2.800" into "008.2") and carry no meaning in a
+    seller reply, so they are removed from everything that is analysed, stored or surfaced."""
+    points = [
+        cp
+        for block in (range(0x20000), range(0xE0000, 0xE1000))
+        for cp in block
+        if unicodedata.category(chr(cp)) == "Cf"
+    ]
+    ranges: list[list[int]] = []
+    for cp in points:
+        if ranges and cp == ranges[-1][1] + 1:
+            ranges[-1][1] = cp
+        else:
+            ranges.append([cp, cp])
+    return "".join(
+        f"\\U{first:08x}" if first == last else f"\\U{first:08x}-\\U{last:08x}" for first, last in ranges
+    )
+
+
+_FORMAT_CHARS: Final = _format_char_class()
+_FORMAT_CHARS_RE: Final = re.compile(f"[{_FORMAT_CHARS}]")
+# Lone UTF-16 surrogates (malformed mail decoded through Outlook/COM) cannot be encoded as UTF-8:
+# they are replaced, never allowed to crash sanitising, hashing or the upload.
+_SURROGATE_RE: Final = re.compile("[\ud800-\udfff]")
+# NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR are line breaks for many renderers.
+_UNICODE_LINE_BREAK_RE: Final = re.compile("[\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
+# C0 (except newline and tab), DEL and C1 controls (``\x9b`` is a terminal CSI escape).
+_CONTROL_EXCEPT_NL_TAB_RE: Final = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Header values and the uploaded subject: no line break of any kind and no control character
+# (the same set the database rejects: ``[[:cntrl:]]``, NEL, LS and PS).
+_HEADER_CONTROL_RE: Final = re.compile("[\x00-\x1f\x7f-\x9f\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
 _FOLDING_RE: Final = re.compile(r"\r?\n[ \t]+")
+_REPLACEMENT_CHAR: Final = "\N{REPLACEMENT CHARACTER}"
 
 
 def _bounded(text: str | None, limit: int = MAX_RAW_BODY_CHARS) -> str:
@@ -169,16 +209,30 @@ def _bounded(text: str | None, limit: int = MAX_RAW_BODY_CHARS) -> str:
     return text[:limit]
 
 
+def _replace_surrogates(value: str) -> str:
+    return _SURROGATE_RE.sub(_REPLACEMENT_CHAR, value)
+
+
 def _normalize_text(text: str | None) -> str:
-    """NFKC, LF newlines, no zero-width or control characters except newline and tab."""
+    """NFKC, LF newlines, no format characters (bidi controls, zero-width characters, soft
+    hyphen), no lone surrogates and no control characters except newline and tab."""
     if not text:
         return ""
-    value = unicodedata.normalize("NFKC", _bounded(text))
+    value = unicodedata.normalize("NFKC", _replace_surrogates(_bounded(text)))
     value = value.replace("\r\n", "\n").replace("\r", "\n")
-    value = _ZERO_WIDTH_RE.sub("", value)
+    value = _UNICODE_LINE_BREAK_RE.sub("\n", value)
+    value = _FORMAT_CHARS_RE.sub("", value)
     value = _CONTROL_EXCEPT_NL_TAB_RE.sub(" ", value)
     return value.replace("\N{RIGHT SINGLE QUOTATION MARK}", "'").replace(
         "\N{LEFT SINGLE QUOTATION MARK}", "'"
+    )
+
+
+def _opaque_identifier_ok(value: str) -> bool:
+    """Provider ids and Outlook locators: no whitespace, control, format or separator character
+    (the database's ``[[:space:][:cntrl:]]`` check) and no lone surrogate."""
+    return not any(
+        ch.isspace() or unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp", "Zs"} for ch in value
     )
 
 
@@ -219,7 +273,8 @@ _HEADER_NAME_RE: Final = re.compile(r"^[!-9;-~]{1,76}$")
 
 
 def _clean_header_value(value: str) -> str:
-    unfolded = _FOLDING_RE.sub(" ", value)
+    unfolded = _FOLDING_RE.sub(" ", _replace_surrogates(value[: MAX_HEADER_VALUE_CHARS * 2]))
+    unfolded = _FORMAT_CHARS_RE.sub("", unfolded)
     return _HEADER_CONTROL_RE.sub(" ", unfolded).strip()[:MAX_HEADER_VALUE_CHARS]
 
 
@@ -433,7 +488,11 @@ def is_processable_item(message_class: str | None) -> bool:
 _SAFE_REF_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:=-]{0,255}$")
 _MIME_RE: Final = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$")
 _HEX64_RE: Final = re.compile(r"^[0-9a-f]{64}$")
-_FILENAME_FORBIDDEN_RE: Final = re.compile(r"[\x00-\x1f\x7f/\\]")
+# Paths, controls (C0, DEL, C1), line/paragraph separators, format characters (an RTL override
+# makes "x\N{RIGHT-TO-LEFT OVERRIDE}fdp.exe" display as "xexe.pdf") and lone surrogates.
+_FILENAME_FORBIDDEN_RE: Final = re.compile(
+    "[\x00-\x1f\x7f-\x9f/\\\\\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}\ud800-\udfff" + _FORMAT_CHARS + "]"
+)
 
 
 def safe_filename(raw: str | None, *, default: str = "attachment") -> str:
@@ -545,7 +604,7 @@ class SourceMessageIdentity(BaseModel):
     def _opaque(cls, value: str | None) -> str | None:
         if value is None or not value.strip():
             return None
-        if any(ord(c) < 33 or ord(c) == 127 for c in value):
+        if not _opaque_identifier_ok(value):
             raise ValueError("provider identifiers must not contain whitespace or control characters")
         return value
 
@@ -566,6 +625,12 @@ class InboundMessage(BaseModel):
     attachments: tuple[AttachmentMeta, ...] = Field(default=(), max_length=200)
     in_junk_folder: bool = False
     message_class: str | None = Field(default=None, max_length=255)
+
+    @field_validator("body_text", mode="before")
+    @classmethod
+    def _body(cls, value: Any) -> Any:
+        """A malformed (lone-surrogate) body is repaired, never a poison message."""
+        return _replace_surrogates(value) if isinstance(value, str) else value
 
     @field_validator("headers", mode="before")
     @classmethod
@@ -1580,6 +1645,11 @@ class ReplySourceContent(BaseModel):
     body_text: str = ""
     attachments: tuple[AttachmentMeta, ...] = ()
 
+    @field_validator("subject", "body_text", mode="before")
+    @classmethod
+    def _text(cls, value: Any) -> Any:
+        return _replace_surrogates(value) if isinstance(value, str) else value
+
     def material(self) -> dict[str, Any]:
         return {
             "version": FINGERPRINT_VERSION,
@@ -1786,7 +1856,7 @@ class IngestSourceMessage(BaseModel):
     @field_validator("provider_message_id", "outlook_entry_id", "outlook_store_id")
     @classmethod
     def _opaque(cls, value: str | None) -> str | None:
-        if value is not None and (not value or any(ord(c) < 33 or ord(c) == 127 for c in value)):
+        if value is not None and (not value or not _opaque_identifier_ok(value)):
             raise ValueError("identifiers must not contain whitespace or control characters")
         return value
 
@@ -1866,17 +1936,22 @@ class ReplyIngestRequest(BaseModel):
     @field_validator("subject")
     @classmethod
     def _subject(cls, value: str) -> str:
-        if _HEADER_CONTROL_RE.search(value):
-            raise ValueError("subject must not contain control characters or line breaks")
+        if _HEADER_CONTROL_RE.search(value) or _FORMAT_CHARS_RE.search(value) or _SURROGATE_RE.search(value):
+            raise ValueError("subject must not contain control/format characters or line breaks")
         return value
 
     @field_validator("sanitized_body_text")
     @classmethod
     def _body(cls, value: str) -> str:
+        if (
+            _CONTROL_EXCEPT_NL_TAB_RE.search(value)
+            or _UNICODE_LINE_BREAK_RE.search(value)
+            or _FORMAT_CHARS_RE.search(value)
+            or _SURROGATE_RE.search(value)
+        ):
+            raise ValueError("sanitized body contains control or format characters")
         if len(value.encode("utf-8")) > MAX_BODY_BYTES:
             raise ValueError("sanitized body exceeds 64 KiB")
-        if _CONTROL_EXCEPT_NL_TAB_RE.search(value):
-            raise ValueError("sanitized body contains control characters")
         return value
 
     @field_validator("observed_at")
@@ -1989,6 +2064,16 @@ _DEVICE_FOOTER_RE: Final = re.compile(
 )
 _EMAIL_RE: Final = re.compile(
     r"(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b"
+)
+# Obfuscated addresses: "max (at) example (dot) com", "max[at]example.com", "max at example dot com".
+_OBFUSCATED_EMAIL_RE: Final = re.compile(
+    r"(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}"
+    r"(?:[ \t]*[\[(<{][ \t]*(?:at|@|ät|chiocciola|arobase)[ \t]*[\])>}][ \t]*"
+    r"[A-Za-z0-9-]{1,63}"
+    r"(?:[ \t]*(?:[\[(<{][ \t]*(?:dot|punkt|punto|point)[ \t]*[\])>}]|\.)[ \t]*[A-Za-z0-9-]{1,63}){1,8}"
+    r"|[ \t]+at[ \t]+[A-Za-z0-9-]{1,63}(?:[ \t]+(?:dot|punkt|punto|point)[ \t]+[A-Za-z0-9-]{1,63}){1,8})"
+    r"(?![\w-])",
+    re.IGNORECASE,
 )
 _IBAN_RE: Final = re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")
 # Any-case IBAN candidates; removed only when the ISO 13616 mod-97 checksum holds, so ordinary
@@ -2154,6 +2239,7 @@ def _scrub_contacts(body: str, counts: dict[str, int]) -> str:
         return result
 
     body = count_sub(_EMAIL_RE, "emails", "[email removed]", body)
+    body = count_sub(_OBFUSCATED_EMAIL_RE, "emails", "[email removed]", body)
     body = count_sub(_URL_RE, "links", _link_placeholder, body)
     body = count_sub(_IBAN_RE, "bank_details", "[bank details removed]", body)
 
@@ -2348,6 +2434,7 @@ class AmountContext(StrEnum):
     DEPOSIT_OR_PAYMENT = "deposit_or_payment"
     OTHER_COST = "other_cost"
     PREVIOUS_PRICE = "previous_price"
+    NEGATED = "negated"  # "nicht 2.500, sondern 2.800": the seller rules this amount out
 
 
 class EvidenceSpan(BaseModel):
@@ -2533,7 +2620,7 @@ _ABBREVIATIONS: Final = frozenset(
         "ca", "inkl", "zzgl", "exkl", "excl", "incl", "nr", "bzw", "evtl", "ggf", "usw", "etc", "z", "b",
         "d", "h", "u", "mfg", "str", "tel", "approx", "pag", "sig",
         "dott", "ing", "rag", "mr", "mrs", "ms", "dr", "st", "av", "bd", "env", "tsd",
-        "abs", "art", "geb", "mod", "ff", "vs", "co", "pp",
+        "abs", "art", "geb", "mod", "ff", "vs", "co", "pp", "ref", "rif", "réf",
     }
 )  # fmt: skip
 _BOUNDARY_RE: Final = re.compile(r"\n|[!?;]+|\.+(?=\s|$)")
@@ -2751,6 +2838,12 @@ _MINIMUM_BEFORE: Final = re.compile(
     r"\b(?:(?:nicht|non|pas|not)\s+(?:unter|weniger als|sotto|meno di|en[ -]dessous de|moins de|below|under"
     r"|less than)|mindestens|almeno|au moins|at least|minimum)\s*(?:€|eur\w*|chf)?\s*$"
 )
+# A negation directly before an amount ("nicht 2.500 €, sondern 2.800 €", "non 2.500 ma 2.800",
+# "pas 2 500 € mais 2 800 €", "not 2,500 but 2,800") rules that amount out: it is never a quote.
+_NEGATED_AMOUNT_BEFORE: Final = re.compile(
+    r"\b(?:nicht|kein(?:e[nmrs]?)?|nie|non(?:\s+(?:[èe]|e'|sono|costa|vale))?|pas|jamais|not|never)\s*"
+    r"(?:€|eur\w*|chf|sfr\.?|fr\.)?\s*$"
+)
 _CONDITION_RULES: Final[tuple[tuple[PriceCondition, re.Pattern[str]], ...]] = (
     (
         PriceCondition.FIXED,
@@ -2849,7 +2942,10 @@ _NON_PRICE_LABEL_BEFORE_RE: Final = re.compile(
     r"|modelljahr|hubraum|leistung|vorbesitzer|halter|besitzer|plz|nummer|chilometri|chilometraggio"
     r"|percorrenza|anno|immatricolazione|cilindrata|potenza|proprietari|cap|numero|kilom[ée]trage"
     r"|ann[ée]e|mise en circulation|cylindr[ée]e|puissance|propri[ée]taires|num[ée]ro|mileage|odometer"
-    r"|miles|year|registered|registration|engine|power|owners|km|kms|vin|fin|telai?o)\b"
+    r"|miles|year|registered|registration|engine|power|owners|km|kms|vin|fin|telai?o"
+    # listing and reference numbers
+    r"|inserat|inseratsnummer|anzeige|anzeigennummer|annuncio|annonce|listing|referenz|ref|rif|riferimento"
+    r"|r[ée]f[ée]rence|reference|id|nr|art-nr|artikelnummer|fahrzeugnummer|bestellnummer)\b"
     r"[ \t:=.-]{0,4}(?:(?:of|di|de|du|von|ca|circa|about|approx|ungef[äa]hr|etwa|environ|ist|is|è|est|ha|hat"
     r"|has)\.?[ \t:=-]{1,3}){0,2}$"
 )
@@ -3011,19 +3107,41 @@ _REQUEST_RULES: Final[dict[RequestKind, re.Pattern[str]]] = {
         r"|\bacceptez\b|\b[çc]a vous va\b|\bdo you accept\b|\bis that ok\b|\bagreed\s*\?)"
     ),
     RequestKind.OPT_OUT: re.compile(
-        r"(?:\bkeine (?:weiteren )?(?:anfragen|nachrichten|e-?mails|mails)\b|\bnicht mehr (?:kontaktieren"
-        r"|anschreiben"
-        r"|schreiben)\b|\bkontaktieren sie mich nicht\b|\babmelden\b|\bnon (?:mi )?(?:contatt"
-        r"|scriv)\w*(?: pi[ùu])?\b"
-        r"|\bnon contattatemi\b|\bcancellatemi\b|\bne (?:me )?contactez plus\b|\bne plus me contacter\b"
+        # Deliberately narrow: "keine Nachrichten bekommen", "das Auto abmelden" (deregister the
+        # car) and "non scrivo il prezzo" are not opt-outs.
+        r"(?:\bkeine weiteren (?:anfragen|nachrichten|e-?mails|mails)\b"
+        r"|\bkeine (?:anfragen|nachrichten|e-?mails|mails) mehr\b"
+        r"|\bbitte keine (?:anfragen|nachrichten|e-?mails|mails)\b"
+        r"|\bnicht mehr (?:kontaktieren|anschreiben|schreiben)\b|\bkontaktieren sie (?:mich|uns) nicht\b"
+        r"|\b(?:mich|uns) (?:bitte )?(?:aus \w+ |von \w+ )?(?:austragen|abmelden)\b"
+        r"|\bmelden sie (?:mich|uns) ab\b"
+        r"|\bnon mi (?:contatt|scriv)\w*|\bnon (?:contatt|scriv)\w*(?:mi|ci)\b"
+        r"|\bnon (?:contatt|scriv)\w* pi[ùu]\b"
+        r"|\bcancellatemi\b|\bne (?:me )?contactez plus\b|\bne plus me contacter\b"
         r"|\bne m'[ée]crivez plus\b|\bd[ée]sinscri\w*|\bdo not contact\b|\bdon't contact\b"
-        r"|\bstop (?:contacting"
-        r"|emailing|writing)\b|\bunsubscribe\b|\bremove me\b|\bno more (?:emails|messages)\b)"
+        r"|\bstop (?:contacting|emailing|writing)\b|\bunsubscribe\b|\bremove me\b"
+        r"|\bno more (?:emails|messages)\b)"
     ),
     RequestKind.COMPLAINT: re.compile(r"\b(?:spam|bel[äa]stig\w*|molest\w*|harc[èe]l\w*|harass\w*|abuse)\b"),
 }
 _REQUEST_NEGATION_EXEMPT: Final = frozenset(
     {RequestKind.OPT_OUT, RequestKind.COMPLAINT, RequestKind.PRICE_ACCEPTANCE}
+)
+# "Your mail was in my spam folder" / "im Spam-Ordner gelandet" / "era nello spam" reports where
+# the inquiry landed; it is not a complaint and must not suppress the seller or end the inquiry.
+_SPAM_FOLDER_RE: Final = re.compile(
+    r"\b(?:spam|junk)s?(?:[ -]?(?:ordner|folder|filter|box|verzeichnis|mails?|e-?mails?|cartella|dossier))\b"
+    r"|\b(?:im|ins|in|nel|nello|nella|nei|negli|dans(?: les| le| mes| mon| vos| votre| ma)?"
+    r"|in(?:to)? (?:the|my|your|our))\s+(?:spam|junk)s?\b"
+    r"|\b(?:cartella|dossier|ordner|folder|posta)\s+(?:(?:dello|della|des|de|du|di)\s+)?(?:spam|junk|indesiderata)s?\b"
+    r"|\b(?:spam|junk)s?\b(?=[^.!?\n]{0,40}\b(?:gelandet|gefunden|finito|finita|trovat\w*|trouv\w*|found"
+    r"|landed|ended up|went))"
+)
+# "Do not contact me by phone, e-mail only" restricts a channel; it is not an opt-out.
+_CHANNEL_RESTRICTION_RE: Final = re.compile(
+    r"^\W{0,3}(?:(?:me|mich|uns|us|mi|moi|ci|nous)\s+)?(?:(?:per|über|ueber|via|by|on|su|al|sul|tramite|par|au"
+    r"|sur)\s+)?(?:telefon\w*|phone|telefono"
+    r"|t[ée]l[ée]phone|whatsapp|sms|handy|cellulare|mobile|portable|anruf\w*)\b"
 )
 
 
@@ -3205,6 +3323,7 @@ def _currency_code(marker: str) -> str | None:
 
 
 _MIN_BARE_AMOUNT: Final = Decimal(100)  # a currency-less number below this is never a vehicle price
+_MAX_BARE_AMOUNT: Final = Decimal(1_000_000)  # nor above this (references, phone fragments)
 
 
 def _amounts_in(text: str, lowered: str, span: _Span, language: MessageLanguage | None) -> list[_Amount]:
@@ -3225,8 +3344,8 @@ def _amounts_in(text: str, lowered: str, span: _Span, language: MessageLanguage 
             currency = _currency_code(cur_before.group(1))
         if re.match(r"[^\W\d_]", after) and not cur_after:
             continue  # glued to letters: "4x4", "6d", "X5"
-        if re.search(r"[^\W\d_]$", before) and not cur_before:
-            continue
+        if re.search(r"[^\W\d_]-?$", before) and not cur_before:
+            continue  # "X5", and listing references such as "TEST-204" or "AB-12345"
         if _UNIT_AFTER_RE.match(after) and not cur_after:
             continue
         if before.rstrip().endswith(("§", "#", "+", "/")) or after.startswith(("/", ":")):
@@ -3249,7 +3368,7 @@ def _amounts_in(text: str, lowered: str, span: _Span, language: MessageLanguage 
         if currency is None:
             warnings = (*warnings, "CURRENCY_NOT_STATED")
         # Without a currency, only a plausible vehicle amount next to a price word is a quote.
-        plausible = value is None or value >= _MIN_BARE_AMOUNT
+        plausible = value is None or _MIN_BARE_AMOUNT <= value <= _MAX_BARE_AMOUNT
         standalone = currency is not None or (has_keyword and not year_like and plausible)
         found.append(_Amount(start, end, raw, value, currency, warnings, standalone, year_like))
     return found
@@ -3443,6 +3562,22 @@ def _price_claims(
             minimum = bool(
                 _MINIMUM_BEFORE.search(lowered[max(span.start, prev_end, amount.start - 30) : amount.start])
             )
+            if not minimum and _NEGATED_AMOUNT_BEFORE.search(
+                lowered[max(span.start, prev_end, amount.start - 20) : amount.start]
+            ):
+                mentions.append(
+                    AmountMention(
+                        context=AmountContext.NEGATED,
+                        amount=amount.value,
+                        currency=amount.currency,
+                        raw=amount.raw[:60],
+                        evidence=EvidenceSpan(
+                            start=amount.start, end=amount.end, excerpt=excerpt, rule="amount_negated"
+                        ),
+                        warnings=(*amount.warnings, "AMOUNT_NEGATED_NOT_A_QUOTE"),
+                    )
+                )
+                continue
             claim_warnings = list(dict.fromkeys((*cond_warnings, *amount.warnings)))
             if not has_keyword:
                 claim_warnings.append("PRICE_CONTEXT_UNLABELLED")
@@ -3563,11 +3698,17 @@ def _request_flags(
 ) -> list[RequestFlag]:
     flags: list[RequestFlag] = []
     langs = _languages(language)
+    complaint_text = _blank_ranges(lowered, (m.span() for m in _SPAM_FOLDER_RE.finditer(lowered)))
     for span in spans:
         for kind, pattern in _REQUEST_RULES.items():
-            for match in pattern.finditer(lowered, span.start, span.end):
+            haystack = complaint_text if kind == RequestKind.COMPLAINT else lowered
+            for match in pattern.finditer(haystack, span.start, span.end):
                 if kind not in _REQUEST_NEGATION_EXEMPT and _negated(
                     lowered, span.start, match.start(), langs, count=2
+                ):
+                    continue
+                if kind == RequestKind.OPT_OUT and _CHANNEL_RESTRICTION_RE.match(
+                    lowered[match.end() : min(span.end, match.end() + 40)]
                 ):
                     continue
                 flags.append(
@@ -3613,7 +3754,8 @@ def extract_reply_claims(
     unquoted, _removed = strip_quoted_text(normalized)
     unquoted = _claims_region(unquoted[:MAX_BODY_BYTES])
     lowered = _lower_same_length(unquoted)
-    spans = _sentences(lowered)
+    # Original case: a full stop after a number ends the sentence only before a capital letter.
+    spans = _sentences(unquoted)
     quoted = None if quoted_at is None else _aware(quoted_at)
     langs = _languages(lang)
     availability = _availability_claims(unquoted, lowered, spans, langs, declared=lang is not None)
@@ -3880,6 +4022,7 @@ _MK_CONTEXT: Final[dict[AmountContext, str]] = {
     AmountContext.PREVIOUS_PRICE: "претходна цена",
     AmountContext.UNLABELLED: "износ без јасен контекст",
     AmountContext.PRICE: "цена",
+    AmountContext.NEGATED: "износ што продавачот го исклучува (не е понуда)",
 }
 _MK_QUESTION: Final[dict[InquiryQuestion, str]] = {
     InquiryQuestion.AVAILABILITY: "достапност",
@@ -4398,8 +4541,9 @@ def _sanitize_subject(subject: str) -> str:
     Deterministic (it is part of the source fingerprint). Unlabelled digit runs are kept: the
     inquiry subject carries the listing reference, which is often a long number.
     """
-    single = _HEADER_CONTROL_RE.sub(" ", _normalize_text(subject))
+    single = " ".join(_HEADER_CONTROL_RE.sub(" ", _normalize_text(subject)).split())
     single = _EMAIL_RE.sub("[email removed]", single)
+    single = _OBFUSCATED_EMAIL_RE.sub("[email removed]", single)
     single = _LABELLED_PHONE_RE.sub(
         lambda m: f"{m.group(1)}[phone removed]" if sum(c.isdigit() for c in m.group(2)) >= 6 else m.group(0),
         single,

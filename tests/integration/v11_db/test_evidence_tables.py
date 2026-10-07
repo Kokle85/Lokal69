@@ -13,6 +13,7 @@ events (spec 37.1, 37.3, 37.8, 37.9).
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -46,6 +47,8 @@ from tests.integration.v11_db.support import (
     sent_inquiry,
     vehicle,
 )
+
+from suv_deals.integrations.secret_box import SecretBox
 
 pytestmark = pytest.mark.db
 
@@ -114,6 +117,42 @@ def test_contact_kind_must_match_its_evidence(db_conn: psycopg.Connection, iw: I
             seller,
             status="unverified",
             listing_url="javascript:alert(1)",
+        )
+
+
+@pytest.mark.parametrize(
+    ("evidence_kind", "cols"),
+    [
+        # An address from the dealer profile is not "an e-mail shown on the advertisement".
+        ("email_on_advertisement", {"extraction_location": "marketplace_dealer_profile"}),
+        ("email_on_advertisement", {"extraction_location": "other"}),
+        # A relay bound to ANOTHER listing reference is not this listing's relay.
+        ("marketplace_relay_for_listing", {"relay_listing_reference": "SYN-OTHER-LISTING"}),
+        ("marketplace_relay_for_listing", {"extraction_location": "listing_contact_block"}),
+        ("official_dealer_contact_via_listing", {"extraction_location": "listing_description"}),
+    ],
+)
+def test_verified_recipient_location_fits_its_kind(
+    db_conn: psycopg.Connection, seed: Seed, evidence_kind: str, cols: dict[str, Any]
+) -> None:
+    iw = inquiry_world(seed, "V11 recipient location")
+    other = vehicle(seed, iw.workspace_id)
+    with expect_sqlstate("23514", "seller_contacts_verified_location_ck"):
+        contact(seed, iw.workspace_id, other, iw.seller_entity_id, evidence_kind=evidence_kind, **cols)
+    # The same evidence may be recorded unverified (for review), never as the recipient.
+    contact_id, _ = contact(
+        seed,
+        iw.workspace_id,
+        other,
+        iw.seller_entity_id,
+        evidence_kind=evidence_kind,
+        status="unverified",
+        **cols,
+    )
+    with expect_sqlstate("23514", "seller_contacts_verified_location_ck"), backend(db_conn, iw.workspace_id):
+        db_conn.execute(
+            "update app.seller_contacts set status = 'verified', verified_at = now() where id = %s",
+            (contact_id,),
         )
 
 
@@ -292,6 +331,10 @@ def test_authorization_versions_are_append_only(db_conn: psycopg.Connection, iw:
         {"secret_reference": "wincred:suv/sender with space"},
         {"secret_reference": "vault:user:password@host"},
         {"secret_envelope": b"short"},
+        # A raw token stored as bytes is not a secret-box envelope (version 0x01 + key id).
+        {"secret_envelope": b"ya29.a0AfH6SMBsyntheticRawAccessTokenBytes"},
+        {"secret_envelope": b"\x02\x01" + b"\x00" * 40},
+        {"secret_envelope": b"\x01\x00" + b"\x00" * 40},
         {"secret_envelope": b"x" * 32, "secret_reference": "wincred:suv-deals/seller-sender"},
         {"display_name": "Sender\r\nBcc: victim@example.invalid"},
         {"from_address": "Inquiries@Synthetic-Mail.EXAMPLE"},
@@ -311,7 +354,9 @@ def test_sender_binding_never_stores_raw_credentials(
 def test_sender_binding_accepts_sealed_or_referenced_secrets(db_conn: psycopg.Connection, seed: Seed) -> None:
     ws = seed.workspace("V11 sender secrets ok")
     sender_binding(seed, ws, secret_reference="wincred:suv-deals/seller-sender")
-    sender_binding(seed, ws, from_address="second@synthetic-mail.example", secret_envelope=b"\x01" * 64)
+    box = SecretBox({7: os.urandom(32)}, 7)
+    envelope = box.seal(b"synthetic-oauth-refresh-token", aad=b"ops.email_sender_bindings/synthetic")
+    sender_binding(seed, ws, from_address="second@synthetic-mail.example", secret_envelope=envelope)
     with expect_sqlstate("23505", "email_sender_bindings_active_from_uidx"):
         sender_binding(seed, ws, from_address="SECOND@synthetic-mail.example")
 
@@ -528,6 +573,26 @@ def test_availability_events_are_append_only(db_conn: psycopg.Connection, iw: In
             db_conn.execute(statement, (event,))
         with expect_sqlstate(SV_APPEND_ONLY):
             db_conn.execute(statement, (event,))
+
+
+def test_absence_label_needs_complete_scan_evidence(
+    db_conn: psycopg.Connection, seed: Seed, iw: InquiryWorld
+) -> None:
+    """A lone missing result is never recorded as 'not seen in a complete scan'."""
+    with expect_sqlstate("23514", "availability_events_absence_reason_ck"), backend(db_conn, iw.workspace_id):
+        insert_row(db_conn, "app.availability_events", _event(iw, reason="not_seen_in_complete_scan"))
+    with backend(db_conn, iw.workspace_id):
+        insert_row(
+            db_conn,
+            "app.availability_events",
+            _event(
+                iw,
+                evidence_kind="complete_scan_absence",
+                reason="not_seen_in_complete_scan",
+                crawl_run_id=_run(seed, iw, "complete"),
+                source_reference=None,
+            ),
+        )
 
 
 def test_reason_is_a_label_not_free_text(db_conn: psycopg.Connection, iw: InquiryWorld) -> None:

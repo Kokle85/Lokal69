@@ -970,3 +970,71 @@ class TestIndependentReviewRegressions:
         degraded = scan(180, health=SourceHealth.DEGRADED, completeness=Completeness.PARTIAL)
         assert apply_scan_result(state, degraded).source_health == SourceHealth.DEGRADED
         assert apply_scan_result(state, degraded).last_complete_scan_at == newer.finished_at
+
+
+# =============================================================================================
+# Independent review, third round: each test pins a defect found and fixed in review
+# =============================================================================================
+
+
+class TestThirdReviewRegressions:
+    def test_older_evidence_is_history_not_a_contradiction(self) -> None:
+        # The ad was seen active (or the seller said "available") *before* the seller's "sold"
+        # took effect: an ordinary progression, recorded as history, never as a conflict.
+        seller_sold = listing(
+            availability=Availability.SOLD_CLAIMED,
+            availability_evidence_kind=AvailabilityEvidenceKind.SELLER_REPORTED_SOLD,
+            availability_effective_at=T0 + timedelta(hours=5),
+        )
+        earlier_sighting = AvailabilitySignal(
+            kind=AvailabilitySignalKind.SEEN_IN_SEARCH,
+            observed_at=T0 + timedelta(hours=6),
+            effective_at=T0 + timedelta(hours=1),
+            scan=scan(55),
+        )
+        event = derive_availability_event(seller_sold, earlier_sighting).event
+        assert event is not None and event.historical_only
+        assert not event.conflicts_with_current and not event.promote_current
+        earlier_statement = AvailabilitySignal(
+            kind=AvailabilitySignalKind.SELLER_STATEMENT,
+            observed_at=T0 + timedelta(hours=6),
+            effective_at=T0 + timedelta(hours=1),
+            seller_status=Availability.AVAILABLE,
+            reply_id=REPLY,
+        )
+        statement_event = derive_availability_event(seller_sold, earlier_statement).event
+        assert statement_event is not None and statement_event.historical_only
+        assert not statement_event.conflicts_with_current
+        # The same signals *after* the seller's "sold" are still contradictions.
+        later = earlier_statement.model_copy(update={"effective_at": T0 + timedelta(hours=7)})
+        later_event = derive_availability_event(seller_sold, later).event
+        assert later_event is not None and later_event.conflicts_with_current
+
+    def test_badge_after_a_seller_available_is_a_progression_not_a_conflict(self) -> None:
+        sold_later = listing(
+            availability=Availability.SOLD_CLAIMED,
+            availability_evidence_kind=AvailabilityEvidenceKind.SOURCE_SOLD_BADGE,
+            availability_effective_at=T0 + timedelta(days=3),
+        )
+        said_available = SellerAvailabilityStatement(
+            reply_id=REPLY, status=Availability.AVAILABLE, stated_at=T0
+        )
+        assert detect_availability_conflicts([sold_later], [said_available]) == ()
+        # A badge that already existed (or whose time is unknown) still contradicts "available".
+        sold_before = sold_later.model_copy(update={"availability_effective_at": T0 - timedelta(hours=1)})
+        (conflict,) = detect_availability_conflicts([sold_before], [said_available])
+        assert conflict.kind == "seller_available_vs_source_unavailable" and conflict.stop_outreach
+        unknown_time = sold_later.model_copy(update={"availability_effective_at": None})
+        (unknown,) = detect_availability_conflicts([unknown_time], [said_available])
+        assert unknown.kind == "seller_available_vs_source_unavailable"
+        assert unknown.listing_ids == (LISTING,)
+        # Listing-level view agrees: a seller "available" older than the badge is history only.
+        older = AvailabilitySignal(
+            kind=AvailabilitySignalKind.SELLER_STATEMENT,
+            observed_at=T0 + timedelta(days=4),
+            effective_at=T0,
+            seller_status=Availability.AVAILABLE,
+            reply_id=REPLY,
+        )
+        event = derive_availability_event(sold_later, older).event
+        assert event is not None and event.historical_only and not event.conflicts_with_current

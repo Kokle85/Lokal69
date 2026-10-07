@@ -34,15 +34,8 @@ from uuid import UUID
 
 import httpx
 from pydantic import ValidationError
-from suv_deals.domain.replies import (
-    InquiryBindingState,
-    ReplyIngestRequest,
-    StoredReplyIngest,
-    decide_ingest,
-)
 
 from outlook_bridge.outlook_adapter import (
-    INQUIRY_REF_PROPERTY,
     OL_FOLDER_INBOX,
     OL_FOLDER_JUNK,
     OL_FOLDER_OUTBOX,
@@ -59,6 +52,13 @@ from outlook_bridge.outlook_adapter import (
 )
 from outlook_bridge.sta_runtime import SessionContext
 from outlook_bridge.wire import WorkerSendIntent, message_body_hash
+from suv_deals.domain.replies import (
+    InquiryBindingState,
+    ReplyIngestRequest,
+    StoredReplyIngest,
+    decide_ingest,
+)
+from suv_deals.domain.seller_templates import build_vehicle_label, render
 
 INTERACTIVE_SESSION: Final = SessionContext(
     platform="win32",
@@ -127,6 +127,8 @@ class _Root:
         self.exchange_mode = 0
         self.send_mode = "ok"  # ok | raise | raise_after_queue
         self.message_id_settable = True
+        #: Address-book resolution: a recipient string added to a new item resolves to this address.
+        self.resolve_overrides: dict[str, str] = {}
         self.send_calls: list[str] = []  # subjects of every .Send() call
         self.item_reads: list[str] = []  # EntryIDs whose Body was read
         self.handlers: list[Any] = []
@@ -160,6 +162,8 @@ class _Root:
 class _FakeCom:
     """Base: every public attribute access is checked against the STA thread."""
 
+    _root: _Root
+
     def __init__(self, root: _Root) -> None:
         object.__setattr__(self, "_root", root)
 
@@ -180,10 +184,10 @@ class FakeCollection(_FakeCom):
         self._items = items
 
     @property
-    def Count(self) -> int:  # noqa: N802 - COM name
+    def Count(self) -> int:
         return len(self._items)
 
-    def Item(self, index: int) -> Any:  # noqa: N802 - COM name
+    def Item(self, index: int) -> Any:
         if not 1 <= index <= len(self._items):
             raise FakeComError("index out of range")
         return self._items[index - 1]
@@ -197,12 +201,12 @@ class FakePropertyAccessor(_FakeCom):
         super().__init__(root)
         self._props = props
 
-    def GetProperty(self, tag: str) -> Any:  # noqa: N802 - COM name
+    def GetProperty(self, tag: str) -> Any:
         if tag not in self._props:
             raise FakeComError("property not found")
         return self._props[tag]
 
-    def SetProperty(self, tag: str, value: Any) -> None:  # noqa: N802 - COM name
+    def SetProperty(self, tag: str, value: Any) -> None:
         if tag == PR_INTERNET_MESSAGE_ID and not self._root.message_id_settable:
             raise FakeComError("property is read-only")
         self._props[tag] = value
@@ -232,7 +236,7 @@ class FakeAttachment(_FakeCom):
         self.Size = len(spec.content) + 120  # Outlook's Size includes MAPI overhead
         self.Type = spec.kind
 
-    def SaveAsFile(self, path: str) -> None:  # noqa: N802 - COM name
+    def SaveAsFile(self, path: str) -> None:
         with open(path, "wb") as handle:
             handle.write(self._spec.content)
 
@@ -244,13 +248,13 @@ class FakeRecipient(_FakeCom):
         self.Type = 1
         self.PropertyAccessor = FakePropertyAccessor(root, {PR_SMTP_ADDRESS: address})
 
-    def Resolve(self) -> bool:  # noqa: N802 - COM name
+    def Resolve(self) -> bool:
         return "@" in self.Address and " " not in self.Address
 
 
 class FakeRecipients(FakeCollection):
-    def Add(self, address: str) -> FakeRecipient:  # noqa: N802 - COM name
-        recipient = FakeRecipient(self._root, address)
+    def Add(self, address: str) -> FakeRecipient:
+        recipient = FakeRecipient(self._root, self._root.resolve_overrides.get(address, address))
         self._items.append(recipient)
         return recipient
 
@@ -267,7 +271,7 @@ class FakeAddressEntry(_FakeCom):
         self._smtp = smtp
         self.PropertyAccessor = FakePropertyAccessor(root, {PR_SMTP_ADDRESS: smtp} if smtp else {})
 
-    def GetExchangeUser(self) -> FakeExchangeUser | None:  # noqa: N802 - COM name
+    def GetExchangeUser(self) -> FakeExchangeUser | None:
         return FakeExchangeUser(self._root, self._smtp) if self._smtp else None
 
 
@@ -296,21 +300,21 @@ class FakeMailItem(_FakeCom):
         root.items[self.EntryID] = self
 
     @property
-    def Body(self) -> str:  # noqa: N802 - COM name
+    def Body(self) -> str:
         self._root.item_reads.append(self.EntryID)
         return self._body
 
     @Body.setter
-    def Body(self, value: str) -> None:  # noqa: N802 - COM name
+    def Body(self, value: str) -> None:
         self._body = value
 
     @property
-    def Parent(self) -> FakeFolder:  # noqa: N802 - COM name
+    def Parent(self) -> FakeFolder:
         if self._folder is None:
             raise FakeComError("item has no parent")
         return self._folder
 
-    def Send(self) -> None:  # noqa: N802 - COM name
+    def Send(self) -> None:
         root = self._root
         root.send_calls.append(self.Subject)
         if root.send_mode == "raise":
@@ -326,7 +330,7 @@ class FakeMailItem(_FakeCom):
         if root.send_mode == "raise_after_queue":
             raise FakeComError("simulated Send failure after queueing")
 
-    def Close(self, mode: int) -> None:  # noqa: N802 - COM name
+    def Close(self, mode: int) -> None:
         self._discarded = True
 
 
@@ -340,34 +344,34 @@ class FakeItems(_FakeCom):
         self._cursor = 0
 
     @property
-    def Count(self) -> int:  # noqa: N802 - COM name
+    def Count(self) -> int:
         return len(self._folder._items)
 
-    def Item(self, index: int) -> FakeMailItem:  # noqa: N802 - COM name
+    def Item(self, index: int) -> FakeMailItem:
         return self._folder._items[index - 1]
 
-    def Sort(self, prop: str, descending: bool = False) -> None:  # noqa: N802 - COM name
+    def Sort(self, prop: str, descending: bool = False) -> None:
         def key(item: FakeMailItem) -> datetime:
             if prop == "[SentOn]":
                 value = item._props.get(PR_CLIENT_SUBMIT_TIME)
             else:
                 value = item._props.get(PR_MESSAGE_DELIVERY_TIME)
-            return value if isinstance(value, datetime) else datetime.min
+            return value if isinstance(value, datetime) else datetime(1601, 1, 1)  # noqa: DTZ001
 
         self._order = sorted(self._folder._items, key=key, reverse=descending)
 
-    def GetFirst(self) -> FakeMailItem | None:  # noqa: N802 - COM name
+    def GetFirst(self) -> FakeMailItem | None:
         self._cursor = 0
         return self.GetNext()
 
-    def GetNext(self) -> FakeMailItem | None:  # noqa: N802 - COM name
+    def GetNext(self) -> FakeMailItem | None:
         if self._cursor >= len(self._order):
             return None
         item = self._order[self._cursor]
         self._cursor += 1
         return item
 
-    def Find(self, query: str) -> FakeMailItem | None:  # noqa: N802 - COM name
+    def Find(self, query: str) -> FakeMailItem | None:
         match = self._FIND_RE.fullmatch(query)
         if match is None:
             raise FakeComError("unsupported filter")
@@ -387,15 +391,15 @@ class FakeFolder(_FakeCom):
         self.EntryID = root.new_entry_id()
         self.StoreID = store.StoreID
         self.Name = name
-        self.FolderPath = (parent.FolderPath if parent else "\\\\" + store._display) + "\\" + name
+        self.FolderPath: str = (parent.FolderPath if parent else "\\\\" + store._display) + "\\" + name
         store._folders[self.EntryID] = self
 
     @property
-    def Folders(self) -> FakeCollection:  # noqa: N802 - COM name
+    def Folders(self) -> FakeCollection:
         return FakeCollection(self._root, self._children)
 
     @property
-    def Items(self) -> FakeItems:  # noqa: N802 - COM name
+    def Items(self) -> FakeItems:
         return FakeItems(self._root, self)
 
     def _attach(self, item: FakeMailItem) -> None:
@@ -423,12 +427,12 @@ class FakeStore(_FakeCom):
             self._root_folder._children.append(folder)
             self._defaults[number] = folder
 
-    def GetDefaultFolder(self, number: int) -> FakeFolder:  # noqa: N802 - COM name
+    def GetDefaultFolder(self, number: int) -> FakeFolder:
         if number not in self._defaults:
             raise FakeComError("no such default folder")
         return self._defaults[number]
 
-    def GetRootFolder(self) -> FakeFolder:  # noqa: N802 - COM name
+    def GetRootFolder(self) -> FakeFolder:
         return self._root_folder
 
 
@@ -453,15 +457,15 @@ class FakeNamespace(_FakeCom):
         self.SyncObjects = FakeCollection(root, [FakeSyncObject(root)])
 
     @property
-    def Accounts(self) -> FakeCollection:  # noqa: N802 - COM name
+    def Accounts(self) -> FakeCollection:
         return FakeCollection(self._root, self._accounts)
 
     @property
-    def Offline(self) -> bool:  # noqa: N802 - COM name
+    def Offline(self) -> bool:
         return self._root.offline
 
     @property
-    def ExchangeConnectionMode(self) -> int:  # noqa: N802 - COM name
+    def ExchangeConnectionMode(self) -> int:
         return self._root.exchange_mode
 
     def _store(self, store_id: str) -> FakeStore:
@@ -470,7 +474,7 @@ class FakeNamespace(_FakeCom):
                 return account._store
         raise FakeComError("store not found")
 
-    def GetItemFromID(self, entry_id: str, store_id: str | None = None) -> FakeMailItem:  # noqa: N802 - COM name
+    def GetItemFromID(self, entry_id: str, store_id: str | None = None) -> FakeMailItem:
         item = self._root.items.get(entry_id)
         if item is None or item._folder is None:
             raise FakeComError("item not found")
@@ -478,7 +482,7 @@ class FakeNamespace(_FakeCom):
             raise FakeComError("item not found in store")
         return item
 
-    def GetFolderFromID(self, entry_id: str, store_id: str) -> FakeFolder:  # noqa: N802 - COM name
+    def GetFolderFromID(self, entry_id: str, store_id: str) -> FakeFolder:
         folder = self._store(store_id)._folders.get(entry_id)
         if folder is None:
             raise FakeComError("folder not found")
@@ -492,12 +496,12 @@ class FakeOutlookApp(_FakeCom):
         self._namespace = namespace
 
     @property
-    def Session(self) -> FakeNamespace:  # noqa: N802 - COM name
+    def Session(self) -> FakeNamespace:
         if not self._root.running:
             raise FakeComError("RPC server unavailable")
         return self._namespace
 
-    def CreateItem(self, kind: int) -> FakeMailItem:  # noqa: N802 - COM name
+    def CreateItem(self, kind: int) -> FakeMailItem:
         if kind != 0:
             raise FakeComError("only mail items are supported")
         return FakeMailItem(self._root, None)
@@ -533,13 +537,20 @@ class FakeOutlook:
 
     # ------------------------------------------------------------------ scenario helpers
 
-    def add_account(self, smtp: str, *, display_name: str = "Synthetic Sender", account_type: int = 1) -> FakeAccount:
+    def add_account(
+        self, smtp: str, *, display_name: str = "Synthetic Sender", account_type: int = 1
+    ) -> FakeAccount:
         account = FakeAccount(self.root, smtp, display_name, account_type)
         self._accounts.append(account)
         return account
 
     def folder(self, account: FakeAccount, role: str) -> FakeFolder:
-        numbers = {"inbox": OL_FOLDER_INBOX, "junk": OL_FOLDER_JUNK, "sent": OL_FOLDER_SENT_MAIL, "outbox": OL_FOLDER_OUTBOX}
+        numbers = {
+            "inbox": OL_FOLDER_INBOX,
+            "junk": OL_FOLDER_JUNK,
+            "sent": OL_FOLDER_SENT_MAIL,
+            "outbox": OL_FOLDER_OUTBOX,
+        }
         return account._store._defaults[numbers[role]]
 
     def create_folder(self, parent: FakeFolder, name: str) -> FakeFolder:
@@ -594,7 +605,9 @@ class FakeOutlook:
                 props[PR_IN_REPLY_TO_ID] = in_reply_to
             if references:
                 props[PR_INTERNET_REFERENCES] = " ".join(references)
-        object.__setattr__(item, "Attachments", FakeCollection(root, [FakeAttachment(root, a) for a in attachments]))
+        object.__setattr__(
+            item, "Attachments", FakeCollection(root, [FakeAttachment(root, a) for a in attachments])
+        )
         folder._attach(item)
         if fire_event:
             self.fire_new_mail((item.EntryID,))
@@ -817,8 +830,12 @@ class FakeBackend:
                 refusal = "intent_invalid"
             return httpx.Response(
                 200,
-                json={"schema_version": "1.0", "intent_id": str(intent_id), "proceed": refusal is None,
-                      "refusal_reason": refusal},
+                json={
+                    "schema_version": "1.0",
+                    "intent_id": str(intent_id),
+                    "proceed": refusal is None,
+                    "refusal_reason": refusal,
+                },
             )
         if request.method == "POST" and path.endswith("/report"):
             report = json.loads(request.content)
@@ -906,7 +923,9 @@ class FakeBackend:
             reply_id = decision.reply_id
             if decision.locator_changed and decision.record_locator is not None:
                 existing = self.by_dedup[dedup]
-                updated = existing.model_copy(update={"locators": (*existing.locators, decision.record_locator)})
+                updated = existing.model_copy(
+                    update={"locators": (*existing.locators, decision.record_locator)}
+                )
                 self.by_dedup[dedup] = updated
                 self.by_idempotency[existing.idempotency_key] = updated
                 self.locator_history.append((reply_id, decision.record_locator.outlook_entry_id))
@@ -936,6 +955,31 @@ def inquiry_message_id(inquiry_id: UUID, attempt: int = 1, domain: str = "sender
     return f"<inquiry-{inquiry_id}.{attempt}@{domain}>"
 
 
+SYNTHETIC_LISTING_URL: Final = "https://listing.example.invalid/ad/1234"
+SYNTHETIC_SENDER_NAME: Final = "Synthetic Sender"
+
+
+def rendered_inquiry(
+    template_id: str = "seller_initial_de_v1",
+    *,
+    make: str = "Synthetic",
+    model: str = "SUV",
+    listing_reference: str = "REF-1234",
+    listing_url: str = SYNTHETIC_LISTING_URL,
+    sender_display_name: str = SYNTHETIC_SENDER_NAME,
+) -> tuple[str, str]:
+    """``(subject, body)`` of an exact spec 37.4 template rendering (shared domain renderer)."""
+    message = render(
+        template_id,
+        build_vehicle_label(make, model),
+        listing_reference,
+        listing_url,
+        sender_display_name,
+        verified_listing_url=listing_url,
+    )
+    return message.subject, message.body
+
+
 def make_intent(
     *,
     inquiry_id: UUID,
@@ -944,19 +988,17 @@ def make_intent(
     to_address: str = "seller@dealer.example.invalid",
     created_at: datetime,
     ttl: timedelta = timedelta(hours=6),
-    subject: str = "Anfrage zu Synthetic SUV – REF-1234",
-    body: str = (
-        "Guten Tag,\n\nich schreibe wegen dieses Fahrzeugs: https://listing.example.invalid/ad/1234\n\n"
-        "Ist das Fahrzeug noch verfügbar?\n"
-        "Könnten Sie mir die vorhandenen Fahrzeugunterlagen zusenden, insbesondere die Zulassungsunterlagen "
-        "und das CoC, falls vorhanden? Bitte schwärzen Sie persönliche Daten.\n"
-        "Was ist Ihr niedrigster Verkaufspreis für das Fahrzeug?\n\n"
-        "Es handelt sich zunächst um eine unverbindliche Anfrage.\n\nFreundliche Grüße\nSynthetic Sender"
-    ),
+    subject: str | None = None,
+    body: str | None = None,
+    from_display_name: str = SYNTHETIC_SENDER_NAME,
     attempt_number: int = 1,
     intent_id: UUID | None = None,
     body_hash: str | None = None,
 ) -> WorkerSendIntent:
+    """A synthetic send intent; subject/body default to the exact German template rendering."""
+    default_subject, default_body = rendered_inquiry()
+    subject = default_subject if subject is None else subject
+    body = default_body if body is None else body
     return WorkerSendIntent(
         intent_id=intent_id or uuid.uuid4(),
         inquiry_id=inquiry_id,
@@ -967,7 +1009,7 @@ def make_intent(
         binding_version=1,
         account_id=from_address,
         from_address=from_address,
-        from_display_name="Synthetic Sender",
+        from_display_name=from_display_name,
         to_address=to_address,
         subject=subject,
         body_text=body,
@@ -982,6 +1024,8 @@ def make_intent(
 
 __all__ = [
     "INTERACTIVE_SESSION",
+    "SYNTHETIC_LISTING_URL",
+    "SYNTHETIC_SENDER_NAME",
     "AttachmentSpec",
     "FakeAccount",
     "FakeBackend",
@@ -992,4 +1036,5 @@ __all__ = [
     "FakeOutlook",
     "inquiry_message_id",
     "make_intent",
+    "rendered_inquiry",
 ]

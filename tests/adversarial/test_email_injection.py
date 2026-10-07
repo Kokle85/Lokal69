@@ -307,7 +307,8 @@ def test_tampered_template_body_fails_hash_or_scope() -> None:
             reply_to_address=None,
             date=WHEN,
         )
-    assert "BODY_HASH_MISMATCH" in exc.value.problems
+    # Not the exact rendering of a registered template (and outside the scope): never sendable.
+    assert "NOT_TEMPLATE_RENDERING" in exc.value.problems
 
 
 # ---------------------------------------------------------------------------- tampered final bytes

@@ -51,7 +51,9 @@ class FolderSpec(BaseModel):
     def _path_rules(self) -> FolderSpec:
         if self.role == "rule_target":
             if not self.path:
-                raise ValueError("a rule_target folder needs its path below the store root, e.g. 'Inbox/Cars'")
+                raise ValueError(
+                    "a rule_target folder needs its path below the store root, e.g. 'Inbox/Cars'"
+                )
             segments = self.path.split("/")
             if any(not s.strip() or s != s.strip() or _FOLDER_SEGMENT_FORBIDDEN.search(s) for s in segments):
                 raise ValueError("folder path segments must be non-empty plain names separated by '/'")
@@ -80,7 +82,9 @@ class BridgeConfig(BaseModel):
     mailbox_binding_id: UUID
     worker_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,128}$")
     account_smtp_address: str = Field(min_length=3, max_length=254)
-    folders: tuple[FolderSpec, ...] = Field(default_factory=_default_folders, min_length=1, max_length=MAX_FOLDERS)
+    folders: tuple[FolderSpec, ...] = Field(
+        default_factory=_default_folders, min_length=1, max_length=MAX_FOLDERS
+    )
     reconcile_interval_seconds: int = Field(default=120, ge=30, le=3600)
     tick_seconds: float = Field(default=2.0, ge=0.2, le=30.0)
     overlap_minutes: int = Field(default=30, ge=5, le=1440)
@@ -121,7 +125,9 @@ class BridgeConfig(BaseModel):
     @model_validator(mode="after")
     def _rules(self) -> BridgeConfig:
         parts = urlsplit(self.api_base_url)
-        if parts.scheme == "http" and not (self.allow_insecure_loopback and _is_loopback(parts.hostname or "")):
+        if parts.scheme == "http" and not (
+            self.allow_insecure_loopback and _is_loopback(parts.hostname or "")
+        ):
             raise ValueError("plain http is allowed only for a loopback development backend")
         seen: set[tuple[str, str | None]] = set()
         roles: dict[str, int] = {}

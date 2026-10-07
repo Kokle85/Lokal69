@@ -600,21 +600,21 @@ first-template approval; `seller_inquiry_authorizations.approval_mode` can only 
 |---|---|---|
 | `app.seller_entities` | Seller across sites: `seller_type` (SellerType), untrusted `display_name`, `evidence`, `verified_at`; merge `merged_into_id/at/reason` | a merge is permanent, targets an unmerged root, and an entity that absorbed others cannot be merged (one level, no chains) |
 | `app.seller_entity_aliases` | Evidenced alias: `alias_kind` (marketplace_seller_id needs `source_id`; vat/legal ids upper-case without separators; bare website domain), `reference`, `alias_key_hash` (sha256 of `SellerAlias.alias_key()`), `evidence_kind`, excerpt, URL; unlink keeps the row | `seller_entity_aliases_active_uidx (workspace_id, alias_key_hash) WHERE unlinked_at IS NULL`; frozen except unlink; no delete |
-| `app.seller_contacts` | Exact-listing recipient evidence (spec §37.3): listing + revision (+ number), seller entity, canonical `address` (local part as shown, lower-case domain; NULL = no e-mail), generated `address_domain`, `contact_kind` (ad_email, marketplace_relay, official_dealer_contact), `evidence_kind` (all `RecipientEvidenceKind` values), relay reference, listing reference/URL, extraction location/excerpt, language code/status/basis/confidence/excerpt, `status` verified/unverified/unavailable/changed, `status_reasons[]` | `seller_contacts_verified_uidx`: ONE verified recipient per listing; contact kind must match the accepted evidence kind; a resolved language is de/it/fr/en with an evidence basis; `unavailable` has no address; evidence immutable, `verified_at` set once, `changed` terminal; `unique (workspace_id, listing_id, id)` and `(workspace_id, seller_entity_id, id)` for the inquiry FKs |
+| `app.seller_contacts` | Exact-listing recipient evidence (spec §37.3): listing + revision (+ number), seller entity, canonical `address` (local part as shown, lower-case domain; NULL = no e-mail), generated `address_domain`, `contact_kind` (ad_email, marketplace_relay, official_dealer_contact), `evidence_kind` (all `RecipientEvidenceKind` values), relay reference, listing reference/URL, extraction location/excerpt, language code/status/basis/confidence/excerpt, `status` verified/unverified/unavailable/changed, `status_reasons[]` | `seller_contacts_verified_uidx`: ONE verified recipient per listing; contact kind must match the accepted evidence kind; a resolved language is de/it/fr/en with an evidence basis; a verified address was found where its kind says (`seller_contacts_verified_location_ck`: ad e-mail in the listing contact block/description, relay in the listing relay contact AND bound to exactly this `listing_reference`, official dealer contact on a dealer page/profile reached through the listing; never `other`); `unavailable` has no address; evidence immutable, `verified_at` set once, `changed` terminal; `unique (workspace_id, listing_id, id)` and `(workspace_id, seller_entity_id, id)` for the inquiry FKs |
 | `app.seller_inquiry_authorizations` | Versioned standing-authorization audit record mirroring `SellerInquiryAuthorization`: owner, effective/recorded date, source, purpose, exact three questions, recipient class, 1 per pair, languages, allowed/excluded data categories, no attachments/CC/BCC/extra recipients/follow-ups, `not_authorized[]`, `profiles_in_scope[]`, revocation, full `record` + `record_hash` | `unique (workspace_id, version)`; append-only (a change or revocation is a new version) |
 | `app.seller_inquiry_controls` | One row per workspace: `mode` (disabled_until_sender_ready/automatic/paused), kill switch (+ reason/at/by), owner-reducible ceilings `max_per_24h` 0..2 and `max_per_15d` 0..5, `seller_cooldown` (default 7 days, 1-365 days), optimistic `version` | `unique (workspace_id)`; every change advances `version` by exactly one (`SV005`), so `seller_inquiries_pause` is `UPDATE ... WHERE version = :expected_version` |
-| `app.seller_inquiries` | One record per identity (below): vehicle (`vehicle_kind` + cluster or listing; generated `vehicle_key`), seller entity (generated `seller_key`), qualification snapshot (listing, revision + number, semantic hash, price, availability), readiness (+ reasons, rationale hash, rules version, time), authorization id/version/fingerprint, template id/version/hash/set, language, scope/body/binding hashes, original subject/body, MK preview subject/body/hash, sender binding snapshot (id, version, provider, account, From, display name, Reply-To), recipient contact/address/binding hash, `state` (15 InquiryState values), `state_reasons[]`, `suppression_reason`, `requalification_audit_id`, set-once provider references (`rfc_message_id`, provider message/thread id, receipt), `reserved_at`/`queued_at`/`send_attempted_at`/`accepted_at`/`replied_at`/`state_changed_at`, `row_version` | see 10.2-10.4 |
-| `ops.email_sender_bindings` | Owner-authorized sending identity: provider (EmailProviderKind), `account_id`, `from_address`, display name, Reply-To, alias verification, `secret_envelope` (secret-box ciphertext, 16..8192 bytes) **or** `secret_reference` (`scheme:path`, never a raw token), health, verification, revocation, `version` | provider/account/From frozen (a new account is a new row, never a silent switch); revocation permanent; any binding-relevant change advances `version`; one active binding per From address (case-insensitive) |
-| `ops.email_delivery_attempts` | One row per transmission attempt: attempt id (globally unique), number 1..3, outbox/job link, the bound sender id/version/provider, stable Message-ID, `fencing_token`, lease owner/token/expiry, `send_intent_committed_at`, `outcome` (running, accepted, pre_submission_failure, definite_rejection, uncertain), proof of non-submission, provider idempotency key, provider ids/response, `receipt` (only when accepted; never fabricated), reconciliation (`reconciled_outcome` accepted/proven_not_submitted, time, evidence), generated `submission_uncertain` | one running attempt per inquiry; append-only except the one-time outcome finalisation and the one-time reconciliation of an uncertain outcome; no delete |
-| `ops.inquiry_quota_ledger` | One debit per reserved inquiry (`debited_at`), release only for a never-transmitted cancellation | one unreleased debit per inquiry; window index `(workspace_id, debited_at) WHERE released_at IS NULL`; caps enforced on insert (10.5) |
+| `app.seller_inquiries` | One record per identity (below): vehicle (`vehicle_kind` + cluster or listing; generated `vehicle_key`), seller entity (generated `seller_key`), qualification snapshot (listing, revision + number, semantic hash, price, availability), readiness (+ reasons, rationale hash, rules version, time), authorization id/version/fingerprint, template id/version/hash/set, language, scope/body/binding hashes, original subject/body, MK preview subject/body/hash, sender binding snapshot (id, version, provider, account, From, display name, Reply-To), recipient contact/address/binding hash, `state` (15 InquiryState values), `state_reasons[]`, `suppression_reason`, `requalification_audit_id`, set-once provider references (`rfc_message_id`, provider message/thread id, receipt), database-owned `reserved_at`/`queued_at`/`send_attempted_at`/`state_changed_at` and transition-only `accepted_at`/`replied_at`, `row_version` | see 10.2-10.4; the recipient is never our From or Reply-To address |
+| `ops.email_sender_bindings` | Owner-authorized sending identity: provider (EmailProviderKind), `account_id`, `from_address`, display name, Reply-To, alias verification, `secret_envelope` (an `integrations.secret_box` envelope: format byte 0x01, key id 1..255, >= 31 bytes; a raw token stored as bytes is refused) **or** `secret_reference` (`scheme:path`, never a raw token), health, verification, revocation, `version` | provider/account/From frozen (a new account is a new row, never a silent switch); revocation permanent; any binding-relevant change advances `version`; one active binding per From address (case-insensitive) |
+| `ops.email_delivery_attempts` | One row per transmission attempt: attempt id (globally unique), number 1..3, outbox/job link, the bound sender id/version/provider, stable Message-ID, `fencing_token`, lease owner/token/expiry, `send_intent_committed_at`, `outcome` (running, accepted, pre_submission_failure, definite_rejection, uncertain), proof of non-submission, provider idempotency key, provider ids/response, `receipt` (only when accepted; never fabricated), reconciliation (`reconciled_outcome` accepted/proven_not_submitted, time, evidence), generated `submission_uncertain` | one running attempt per inquiry; a send intent needs a live lease; after the lease expired an attempt is never finalised as `pre_submission_failure` (only `uncertain` or positive provider evidence); `email_delivery_attempts_reconciliation_proof_ck`: reconciliation evidence has the shape of `domain.inquiries.ReconciliationEvidence` and is positive (accepted: Sent Items/provider `found` or `correlated_inbound`; proven_not_submitted: a `PreSubmissionProof`, `worker_alive = no`, `outbox_pending = no`, no hit), so an empty search is never proof; append-only except the one-time outcome finalisation and the one-time reconciliation of an uncertain outcome; no delete |
+| `ops.inquiry_quota_ledger` | One debit per reserved inquiry (`debited_at`), release only for a never-transmitted cancellation | one unreleased debit per inquiry; window index `(workspace_id, debited_at) WHERE released_at IS NULL`; caps enforced on insert AND before every transmission (10.5) |
 | `ops.mail_worker_bindings` | Mailbox-bound worker identity; `id` is the stable `mailbox_binding_id` of dedup keys: sender mailbox, live `mail:ingest`-only credential, reader provider, account address, Outlook store hash, folder-scope hashes, state active/revoked, `sync_sequence` allocator, `version` | one active consumer per sender mailbox and one mailbox per credential; mailbox identity frozen ("never silently reassigned"); credential rotation in place advances `version`; revocation permanent |
-| `app.seller_replies` | Inquiry-correlated replies only: inquiry, mailbox binding + binding version, Internet Message-ID, provider message/thread id, From, In-Reply-To, `reference_ids[]`, subject (<= 512, no CR/LF), `sanitized_body` (<= 64 KiB), sanitizer/fingerprint versions, `source_fingerprint`, received/observed/ingested times, `message_type` (ReplyMessageType), correlation status/reasons, detected language, `attachments` metadata (<= 20 entries; filename/MIME/size/sha256/opaque local ref/decision only), MK summary, `claims`, processing state, quarantine (+ release audit), `conflict_of_reply_id` | dedup: `(workspace_id, mailbox_binding_id, internet_message_id)`, else provider message id, else `source_fingerprint`; also `(workspace_id, inquiry_id, internet_message_id)`; conflict rows are kept quarantined beside the original (`unique (conflict_of_reply_id, source_fingerprint)`); source content immutable; no delete |
+| `app.seller_replies` | Inquiry-correlated replies only: inquiry, mailbox binding + binding version, Internet Message-ID, provider message/thread id, From, In-Reply-To, `reference_ids[]`, `returned_message_ids[]` (a bounce's returned original), trigger-computed `header_linked`/`thread_linked`, subject (<= 512, no CR/LF), `sanitized_body` (<= 64 KiB), sanitizer/fingerprint versions, `source_fingerprint`, received/observed/ingested times, `message_type` (ReplyMessageType), correlation status/reasons, detected language, `attachments` metadata (<= 20 entries; filename/MIME/size/sha256/opaque local ref/decision only), MK summary, `claims`, processing state, quarantine (+ release audit), `conflict_of_reply_id` | dedup: `(workspace_id, mailbox_binding_id, internet_message_id)`, else provider message id, else `source_fingerprint`; also `(workspace_id, inquiry_id, internet_message_id)`; `seller_replies_link_ck`: an unquarantined automatic match references a Message-ID this system sent/published for the inquiry or is in its own provider thread (never subject-only); `verified_match` only through a recorded release; ingest needs the mailbox's live (unrevoked, unexpired) credential; conflict rows are kept quarantined beside the original (`unique (conflict_of_reply_id, source_fingerprint)`); source content immutable; no delete |
 | `app.seller_reply_locators` | Outlook EntryID/StoreID/folder seen at a time (mutable locators never enter dedup keys or fingerprints) | append-only; one row per distinct locator per reply; FK pins the reply's own mailbox |
-| `ops.mail_ingest_dedup` | Stable `dedup_key` (`<mailbox>:<kind>:<value>`, `ReplyDedupKey.as_string()`), request idempotency key, fingerprint (+ version), inquiry/reply, ingest result, replay and conflict counters | unique dedup key and unique idempotency key per mailbox; recorded only with the mailbox's current credential; identity frozen; counters monotonic |
+| `ops.mail_ingest_dedup` | Stable `dedup_key` (`<mailbox>:<kind>:<value>`, `ReplyDedupKey.as_string()`), request idempotency key, fingerprint (+ version), inquiry/reply, ingest result, replay and conflict counters | unique dedup key and unique idempotency key per mailbox; recorded only with the mailbox's current, live credential; identity frozen; counters monotonic |
 | `ops.mail_worker_checkpoints` | Per mailbox/store/folder: role, cursor, overlap watermark, last complete scan, heartbeat, backlog, Outlook/sync health, gap reasons | location frozen; `last_complete_scan_at` never moves backwards; writes only through an active mailbox binding |
 | `ops.mail_binding_sync` | Per-mailbox change log for `GET /v1/mail-workers/inquiry-bindings`: `sequence`, inquiry, `binding_version`, state active/suppressed/uncertain/tombstoned, payload (<= 16 KiB; empty for a tombstone) | the sequence is allocated by the insert trigger from the mailbox row (locked until commit, so commit order = sequence order and a cursor never skips a change); versions grow; a tombstone is final; only the inquiry's own sender mailbox; append-only |
 | `ops.email_suppressions` | `scope` workspace/seller/address/vehicle/source/sender + `scope_key` (generated case-insensitive `match_key` for addresses), `reason` (SuppressionReason), `effective_at`, evidence, optional inquiry/reply link, creator kind, removal (`removed_at/by/by_kind`, `removal_reason`, `removal_audit_id`) | one active suppression per (scope, key, reason); removal never automatic (remover kind user/mcp_client) and needs an `ops.audit_events` row whose target is this suppression; content and removed rows frozen; no delete |
-| `app.availability_events` | Listing (+ source, optional cluster), old/new canonical availability, `evidence_kind` (AvailabilityEvidenceKind), `reason` label, crawl run / card / detail observation / seller reply / manual principal / source reference, effective/observed time, confidence, promote/historical/conflict flags | canonical `listings.availability` values only; the evidence kind fixes the value (`complete_scan_absence` -> `unknown`, sold badge or seller "sold" -> `sold_claimed`, removed page -> `removed`); absence needs a finished complete run of the listing's own source; a seller statement needs a non-quarantined `seller_reply` about this vehicle (its listing or a member of its cluster); append-only |
+| `app.availability_events` | Listing (+ source, optional cluster), old/new canonical availability, `evidence_kind` (AvailabilityEvidenceKind), `reason` label, crawl run / card / detail observation / seller reply / manual principal / source reference, effective/observed time, confidence, promote/historical/conflict flags | canonical `listings.availability` values only; the evidence kind fixes the value (`complete_scan_absence` -> `unknown`, sold badge or seller "sold" -> `sold_claimed`, removed page -> `removed`); absence needs a finished complete run of the listing's own source and the label `not_seen_in_complete_scan` is reserved for it; a seller statement needs a non-quarantined `seller_reply` about this vehicle (its listing or a member of its cluster); append-only |
 
 ### 10.2 Identity and the one-inquiry rule
 
@@ -633,6 +633,15 @@ first-template approval; `seller_inquiry_authorizations.approval_mode` can only 
   car on three sites, with three relay addresses, gets one inquiry.
 - The seller must be an unmerged entity (`SV003`); entities merged into it count for its cooldown
   and its suppressions.
+- One initial inquiry per ACTUAL vehicle/seller pair, also across identity and seller merges
+  (`app.seller_inquiry_vehicle_conflict`, `SV002` at reservation and at dispatch): another inquiry
+  of the seller or of an entity merged into it, about the qualifying listing, any active member
+  of the inquiry's cluster, or any active member of a confirmed OR unreviewed cluster containing
+  the listing, blocks the reservation while it is reserved/queued/(possibly) transmitted and the
+  dispatch while it is (possibly) transmitted. So a listing-identity send before the cluster was
+  confirmed, a seller merge, or a plausible-but-unresolved cross-site duplicate never yields a
+  second e-mail; a rejected cluster or an unlinked member is not the same car. A seller merge
+  locks the surviving entity's row, so it serialises with that seller's reservations/dispatches.
 
 ### 10.3 State machine (`SV002`) and immutable binding (`SV004`)
 
@@ -658,43 +667,56 @@ MK preview text, sender snapshot, recipient) are frozen. Identity columns are al
 preview must hash to `body_hash` / `mk_preview_hash` (`app.message_body_hash()` equals
 `domain.seller_templates.message_body_hash()`), be NFC, without CR or control characters; the
 template language must equal `language`; display names are header-safe; the recipient is never
-the sender. The trigger maintains `reserved_at`, `queued_at`, `send_attempted_at`,
-`accepted_at`, `replied_at` and `state_changed_at`.
+the sender's From or Reply-To. The lifecycle timestamps are evidence (cooldown, rolling caps,
+"possibly transmitted"): `reserved_at`, `queued_at`, `send_attempted_at` and `state_changed_at`
+are set only by the trigger (no UPDATE grant; `SV004` for anyone else, also on insert);
+`accepted_at`/`replied_at` may carry the provider/receipt time, but only in the transition into
+`accepted`/`replied`, once.
 
 ### 10.4 Preflight (reservation and dispatch)
 
 `app.seller_inquiry_preflight(row, phase)` runs inside the transition (`SV002` refusals,
 `SV003` inconsistent references). Phase `reserve` and `dispatch` both check:
 
-1. `app.seller_inquiry_controls` exists, kill switch off, mode `automatic` (row locked: `FOR
-   UPDATE` to reserve, `FOR SHARE` to dispatch, so a concurrent pause either waits or is seen).
+1. `app.seller_inquiry_controls` exists, kill switch off, mode `automatic` (row locked `FOR
+   UPDATE` in every phase, so a concurrent pause either waits or is seen, and reservations,
+   dispatches and ledger inserts of a workspace are serialised without lock upgrades).
 2. The bound authorization is the workspace's latest version, effective (UTC date), not revoked,
    covers the language, and the listing's `eligibility_profile` is in `profiles_in_scope` with an
    eligible `eligibility_state` (a newly enabled research profile never silently broadens outreach).
-3. Canonical identity and unmerged seller (10.2).
+3. The seller entity row is locked `FOR UPDATE` (reserve and dispatch), then canonical identity,
+   unmerged seller and one inquiry per actual vehicle/seller pair (10.2).
 4. The listing is not quarantined, has no identity conflict, is not `sold_claimed`/`removed`; its
-   source is enabled and not paused. At dispatch also: `current_revision_id` is still the
-   qualification revision and availability is unchanged and not `reserved` (a changed price or
-   availability cancels the stale queued message).
+   source is enabled and not paused; `current_revision_id` is still the qualification revision
+   and availability is unchanged and not `reserved` (a changed price or availability cancels the
+   stale work); the snapshot (revision number, semantic hash, price/currency) is exactly the
+   bound, non-quarantined revision (`SV003`).
 5. The sender binding is the exact bound version, not revoked, alias-verified, verified,
    `healthy`, and identical to the snapshot (never a silent account switch).
 6. The recipient contact is still `verified`, has the bound address, and its language is
-   positively `resolved` to the inquiry language (English only with evidence; never a fallback).
+   positively `resolved` to the inquiry language (English only with evidence; never a fallback);
+   an official dealer contact needs a `dealer` seller entity.
 7. No active suppression (removal not yet recorded) matches: workspace, the seller or entities
    merged into it, the address (case-insensitive), the vehicle (identity key, qualifying listing
    incarnation, every member of its cluster, any confirmed cluster containing the listing), the
    source key or the sender binding.
 
-`reserve` additionally locks the seller entity row and refuses while another inquiry to this
-seller (or an entity merged into it) is reserved, queued, failed-definite or (possibly)
-transmitted within `seller_cooldown`. `dispatch` additionally requires the unreleased quota debit
-and that no earlier attempt is running, accepted or unresolved.
+`reserve` additionally refuses while another inquiry to this seller (or an entity merged into
+it) is reserved, queued, failed-definite or (possibly) transmitted within `seller_cooldown`.
+`dispatch` additionally requires the unreleased quota debit, re-checks the rolling caps (10.5)
+and the seller cooldown against (possibly) transmitted inquiries, and requires that no earlier
+attempt is running, accepted or unresolved.
 
 ### 10.5 Rate caps
 
-`ops.inquiry_quota_ledger` insert (trigger, under `app.seller_inquiry_controls FOR UPDATE`):
-counts unreleased debits in the rolling windows `(now - 24 h, ...)` and `(now - 15 days, ...)`
-(future-dated debits count) against `max_per_24h` / `max_per_15d`; the debit's inquiry must be
+`ops.inquiry_quota_usage(workspace, exclude_inquiry)` counts unreleased debits in the rolling
+windows `(now - 24 h, ...)` and `(now - 15 days, ...)`, each at the later of its reservation and
+its inquiry's send attempt (`domain.inquiries.QuotaDebit.counted_at`; future-dated debits count).
+It is checked against `max_per_24h` / `max_per_15d` under `app.seller_inquiry_controls FOR
+UPDATE` on every ledger insert AND before every transmission (`queued -> sending`, excluding the
+inquiry's own debit): the caps limit e-mails, so a backlog reserved while the sender was offline
+leaves at most two per rolling 24 hours, and two racing dispatches never both take the last slot
+(tested). On insert: the debit's inquiry must be
 `qualifying` or `reserved`; a debit cannot be backdated by more than 5 minutes (only the
 documented owner maintenance GUC can arrange history). Release is allowed only for a
 `cancelled`/`suppressed` inquiry that was never transmitted; uncertain or sent inquiries keep
@@ -712,8 +734,12 @@ the order of statements inside the transaction does not matter:
 - `uncertain` has an unresolved uncertain last attempt;
 - `failed_definite` has proof of non-submission (pre-submission failure with proof, definite
   rejection, or reconciled `proven_not_submitted`);
-- `accepted` and later states have an accepted/reconciled-accepted attempt or a correlated,
-  non-quarantined inbound message; `replied` has a non-quarantined `seller_reply`.
+- `accepted` and later states have an accepted attempt, an uncertain attempt reconciled by a
+  Sent Items/provider hit, or a non-quarantined inbound message linked by Message-ID
+  (`header_linked`: In-Reply-To/References or a bounce's returned original). A thread-only or
+  quarantined possible match never proves submission (`domain.replies.correlate_reply`), and a
+  reconciliation that only cites `correlated_inbound` counts through that message alone;
+  `replied` has a non-quarantined `seller_reply`.
 
 ### 10.7 Repository recipes (bound parameters, `suv_backend`, workspace GUC)
 
@@ -744,8 +770,15 @@ deadlock two reservations of the same seller (one is aborted with `40P01`, retry
   all removal columns in one update.
 - **Publish a binding**: `insert into ops.mail_binding_sync (...)` without `sequence` (allocated).
   A cursor page is `where mailbox_binding_id = :box and sequence > :cursor order by sequence`.
+- **Reconcile an uncertain attempt**: store `ReconciliationEvidence.model_dump(mode="json")` as
+  `reconciliation_evidence` with `reconciled_outcome` = the `reconcile_uncertain` decision.
 - **Ingest a reply**: insert the reply (published binding version, active mailbox of the
-  inquiry's sender), the dedup row (mailbox's current credential), the locator, the outbox signal;
+  inquiry's sender, live credential; In-Reply-To/References as received and, for a bounce or
+  delivery notice, the returned original's Message-IDs in `returned_message_ids`; the links are
+  computed against the inquiry's and its send intents' Message-IDs/threads and the ids published
+  in that binding version's payload keys `outbound_message_ids`, `send_intent_message_ids`,
+  `provider_thread_ids`; an unlinked possible match is stored `quarantined`), the dedup row
+  (mailbox's current credential), the locator, the outbox signal;
   a duplicate updates `last_seen_at`/`duplicate_count` (+ new locator row); a conflict inserts a
   quarantined `idempotency_conflict` row with `conflict_of_reply_id` and bumps `conflict_count`.
 
@@ -763,8 +796,8 @@ credentials use `principal_kind 'mcp_client'` and `credential_kind 'static_beare
 | Privilege | Tables |
 |---|---|
 | SELECT, INSERT (append-only, `SV001` trigger) | `app.seller_inquiry_authorizations`, `app.seller_reply_locators`, `app.availability_events`, `ops.mail_binding_sync` |
-| SELECT, INSERT, column UPDATE | `app.seller_entities`, `app.seller_entity_aliases` (unlink), `app.seller_contacts` (status/recheck/change), `app.seller_inquiry_controls`, `app.seller_inquiries` (all but identity), `app.seller_replies` (processing/quarantine), `ops.email_sender_bindings` (all but provider/account/From), `ops.email_delivery_attempts` (finalisation/reconciliation), `ops.inquiry_quota_ledger` (release), `ops.mail_worker_bindings` (credential/state/sequence/version), `ops.mail_worker_checkpoints` (progress), `ops.mail_ingest_dedup` (counters), `ops.email_suppressions` (removal) |
-| EXECUTE | the CHECK helpers `app.email_address_ok`, `app.rfc_message_id_ok`, `app.rfc_message_id_array_ok`, `app.opaque_ref_ok`, `app.hex64_array_ok`, `app.sender_display_name_ok`, `app.seller_inquiry_identity_key`, `app.message_body_hash`, `app.reply_attachments_ok`, and the trigger helpers `ops.seller_inquiry_active_suppressions`, `app.seller_inquiry_assert_identity`, `app.seller_inquiry_preflight`, `app.seller_inquiry_assert_evidence` (all `search_path = ''`, none `SECURITY DEFINER`) |
+| SELECT, INSERT, column UPDATE | `app.seller_entities`, `app.seller_entity_aliases` (unlink), `app.seller_contacts` (status/recheck/change), `app.seller_inquiry_controls`, `app.seller_inquiries` (all but identity and the database-owned `reserved_at`/`queued_at`/`send_attempted_at`/`state_changed_at`), `app.seller_replies` (processing/quarantine), `ops.email_sender_bindings` (all but provider/account/From), `ops.email_delivery_attempts` (finalisation/reconciliation), `ops.inquiry_quota_ledger` (release), `ops.mail_worker_bindings` (credential/state/sequence/version), `ops.mail_worker_checkpoints` (progress), `ops.mail_ingest_dedup` (counters), `ops.email_suppressions` (removal) |
+| EXECUTE | the CHECK helpers `app.email_address_ok`, `app.rfc_message_id_ok`, `app.rfc_message_id_array_ok`, `app.opaque_ref_ok`, `app.hex64_array_ok`, `app.sender_display_name_ok`, `app.seller_inquiry_identity_key`, `app.message_body_hash`, `app.reply_attachments_ok`, and the trigger helpers `ops.seller_inquiry_active_suppressions`, `ops.inquiry_quota_usage`, `app.seller_inquiry_vehicle_conflict`, `app.seller_inquiry_assert_identity`, `app.seller_inquiry_preflight`, `app.seller_inquiry_assert_evidence` (all `search_path = ''`, none `SECURITY DEFINER`) |
 
 Deletes of inquiries, attempts, replies, contacts, aliases, sender/worker bindings, dedup rows,
 ledger rows and suppressions are additionally refused for every role by
@@ -785,3 +818,6 @@ ledger rows and suppressions are additionally refused for every role by
   seller); they need their own representation and must not use the quota ledger.
 - Generic `ops.outbox`/`ops.jobs` reapers are not changed: the inquiry and attempt guards make a
   second transmission impossible whatever those queues do.
+- The database verifies that the stored subject/body hash to `body_hash` and are header-safe, but
+  not that they are the registered template rendering (no template texts in SQL); the scope
+  validator and `dispatch_preflight` of `domain.seller_templates`/`domain.inquiries` own that.

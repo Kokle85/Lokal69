@@ -9,7 +9,8 @@ technical prerequisites hold:
   name, verified alias status, healthy and not revoked (``SenderStatus.identity_problems``),
   and it is exactly the binding the settings configure;
 * API providers have a server-side secret *reference* (never a raw token) and a token provider;
-  the local Outlook route has its worker gateway.
+  the local Outlook route has its worker gateway;
+* a live kill-switch probe is supplied (``ProviderDependencies.kill_switch_probe``).
 
 These are technical/safety prerequisites, NOT an approval gate. Vasko's bounded standing
 authorization (spec 37.1) means there is no per-message, first-message or first-template
@@ -20,6 +21,13 @@ this module never implements an approval queue.
 
 ``GatedSenderProvider`` additionally re-reads the live kill switch immediately before every
 transmission (failing closed when the probe errors) - a pause stops untransmitted work at once.
+That refusal is a proven pre-submission failure marked retryable: it stops this transmission
+only, and the domain retry policy plus the dispatch preflight (which suppresses while the switch
+is on) decide what happens to the inquiry; it never fails the inquiry permanently.
+
+Provider-API reply retrieval (``fetch_correlated_replies``) is enabled only when
+``SELLER_REPLY_INGEST_MODE=provider_api``: with the chosen local Outlook reply route the backend
+never reads the mailbox through the provider API (no second consumer, no extra mailbox access).
 
 ``build_account_verifier`` gives the one-time setup/health flow a verify-only facade (no send
 method) so the binding can be verified before automatic mode is enabled.
@@ -44,9 +52,7 @@ from suv_deals.errors import ValidationFailed
 from suv_deals.integrations.email_providers.base import (
     ProviderCapabilities,
     ProviderHealth,
-    ReconcileFoundSent,
-    ReconcileNotFoundYet,
-    ReconcileProviderUnavailable,
+    ReconcileOutcome,
     ReconcileWindow,
     ReplyFetchResult,
     SendAccepted,
@@ -187,6 +193,9 @@ def sending_prerequisite_problems(
             problems.append("OUTLOOK_GATEWAY_MISSING")
         if deps.mailbox_binding_id is None:
             problems.append("MAILBOX_BINDING_MISSING")
+    if deps is not None and deps.kill_switch_probe is None:
+        # Without a live probe a pause issued after construction could not stop a transmission.
+        problems.append("KILL_SWITCH_PROBE_MISSING")
     return tuple(dict.fromkeys(problems))
 
 
@@ -229,7 +238,24 @@ def sender_binding_from_status(sender: SenderStatus) -> SenderBinding:
     )
 
 
-def _construct(binding: SenderBinding, deps: ProviderDependencies) -> SenderProvider:
+def provider_reply_retrieval_allowed(settings: Settings) -> bool:
+    """Provider-API reply ingestion is used only when the owner selected it (spec 37.6)."""
+    return settings.seller_reply_ingest_mode == "provider_api"
+
+
+def _gmail_settings(settings: Settings, deps: ProviderDependencies) -> GmailApiSettings:
+    given = deps.gmail_settings
+    enabled = provider_reply_retrieval_allowed(settings) and (given is None or given.reply_retrieval_enabled)
+    return (given or GmailApiSettings()).model_copy(update={"reply_retrieval_enabled": enabled})
+
+
+def _graph_settings(settings: Settings, deps: ProviderDependencies) -> GraphSettings:
+    given = deps.graph_settings
+    enabled = provider_reply_retrieval_allowed(settings) and (given is None or given.reply_retrieval_enabled)
+    return (given or GraphSettings()).model_copy(update={"reply_retrieval_enabled": enabled})
+
+
+def _construct(binding: SenderBinding, deps: ProviderDependencies, settings: Settings) -> SenderProvider:
     clock = deps.clock or SystemClock()
     if binding.provider == EmailProviderKind.GMAIL_API:
         if deps.token_provider is None or deps.http_client is None:
@@ -239,7 +265,7 @@ def _construct(binding: SenderBinding, deps: ProviderDependencies) -> SenderProv
             token_provider=deps.token_provider,
             http=deps.http_client,
             clock=clock,
-            settings=deps.gmail_settings,
+            settings=_gmail_settings(settings, deps),
         )
     if binding.provider == EmailProviderKind.MICROSOFT_GRAPH:
         if deps.token_provider is None or deps.http_client is None:
@@ -249,7 +275,7 @@ def _construct(binding: SenderBinding, deps: ProviderDependencies) -> SenderProv
             token_provider=deps.token_provider,
             http=deps.http_client,
             clock=clock,
-            settings=deps.graph_settings,
+            settings=_graph_settings(settings, deps),
         )
     if deps.outlook_gateway is None or deps.mailbox_binding_id is None:
         raise SenderSetupError("Outlook worker dependencies missing", ["OUTLOOK_GATEWAY_MISSING"])
@@ -262,9 +288,11 @@ def _construct(binding: SenderBinding, deps: ProviderDependencies) -> SenderProv
     )
 
 
-def _construct_checked(binding: SenderBinding, deps: ProviderDependencies) -> SenderProvider:
+def _construct_checked(
+    binding: SenderBinding, deps: ProviderDependencies, settings: Settings
+) -> SenderProvider:
     try:
-        return _construct(binding, deps)
+        return _construct(binding, deps, settings)
     except SenderSetupError:
         raise
     except ValidationFailed as exc:  # e.g. a Gmail account id that is not an e-mail address
@@ -313,6 +341,9 @@ class GatedSenderProvider:
         self, message: BuiltMessage, *, inquiry_id: UUID, attempt_id: UUID, idempotency_key: str
     ) -> SendAccepted | SendDefiniteFailure | SendUncertain:
         if await self._kill_switch_active():
+            # Proven pre-submission (nothing was handed to the provider). Retryable: the pause
+            # stops this transmission only; the domain retry policy and the dispatch preflight
+            # (which suppresses while the switch is on) decide what happens to the inquiry.
             return SendDefiniteFailure(
                 provider=self._inner.kind,
                 inquiry_id=inquiry_id,
@@ -321,7 +352,7 @@ class GatedSenderProvider:
                 raw_sha256=message.raw_sha256,
                 pre_submission=True,
                 reason=SendFailureReason.KILL_SWITCH_ACTIVE,
-                retryable=False,
+                retryable=True,
                 proof="local_validation_failed_before_submit",
             )
         return await self._inner.send(
@@ -335,7 +366,7 @@ class GatedSenderProvider:
         rfc_message_ids: Sequence[str],
         window: ReconcileWindow,
         provider_message_ids: Sequence[str] = (),
-    ) -> ReconcileFoundSent | ReconcileNotFoundYet | ReconcileProviderUnavailable:
+    ) -> ReconcileOutcome:
         # Reconciliation only reads; it stays available while the kill switch is on.
         return await self._inner.reconcile(
             inquiry_id=inquiry_id,
@@ -373,7 +404,9 @@ def build_sender_provider(
     if problems:
         raise SenderSetupError("automatic seller email sending is not available", problems)
     binding = sender_binding_from_status(sender)
-    return GatedSenderProvider(_construct_checked(binding, deps), kill_switch_probe=deps.kill_switch_probe)
+    return GatedSenderProvider(
+        _construct_checked(binding, deps, settings), kill_switch_probe=deps.kill_switch_probe
+    )
 
 
 class AccountVerifier:
@@ -451,7 +484,7 @@ def build_account_verifier(
         problems.extend(secret_reference_problems(settings.seller_email_oauth_secret_reference))
     if problems:
         raise SenderSetupError("verification binding does not match the configuration", problems)
-    return AccountVerifier(_construct_checked(binding, deps))
+    return AccountVerifier(_construct_checked(binding, deps, settings))
 
 
 def sender_status_from_verification(
@@ -460,7 +493,25 @@ def sender_status_from_verification(
     *,
     binding: SenderBinding,
 ) -> SenderStatus:
-    """``SenderStatus`` for the dispatcher/readiness checks from a verification result."""
+    """``SenderStatus`` for the dispatcher/readiness checks from a verification result.
+
+    Refused (``SenderSetupError``) unless the verification was made for exactly this binding
+    (provider, account id, From, Reply-To and display name): a verification of one identity can
+    never mark another one as verified.
+    """
+    problems: list[str] = []
+    if verification.provider != binding.provider:
+        problems.append("PROVIDER_MISMATCH")
+    if verification.configured_account_id != binding.account_id:
+        problems.append("ACCOUNT_MISMATCH")
+    if canonical_or_none(verification.configured_from) != binding.from_address:
+        problems.append("FROM_MISMATCH")
+    if canonical_or_none(verification.configured_reply_to) != binding.reply_to_address:
+        problems.append("REPLY_TO_MISMATCH")
+    if verification.configured_display_name != binding.display_name:
+        problems.append("DISPLAY_NAME_MISMATCH")
+    if problems:
+        raise SenderSetupError("the verification belongs to another sender binding", problems)
     return SenderStatus.from_settings(
         settings,
         binding_id=binding.binding_id,
@@ -486,6 +537,7 @@ __all__ = [
     "candidate_binding_from_settings",
     "configured_binding_problems",
     "default_http_client",
+    "provider_reply_retrieval_allowed",
     "secret_reference_problems",
     "sender_binding_from_status",
     "sender_status_from_verification",

@@ -2510,3 +2510,233 @@ class TestIndependentReviewRegressions:
         assert extract_reply_claims("Bitte senden Sie mir eine Ausweiskopie.", "de").escalation_kinds == (
             RequestKind.IDENTITY_DOCUMENT,
         )
+
+
+# =============================================================================================
+# Independent review (third round): each test pins a defect found and fixed in review
+# =============================================================================================
+
+
+class TestThirdReviewRegressions:
+    # --- Unicode hygiene: hostile/malformed characters never crash or reach storage -------------
+
+    def test_lone_surrogates_are_repaired_never_a_poison_message(self) -> None:
+        body = "Ja, noch verfügbar \ud800 TEST-204. Preis 2.800 €"
+        clean = sanitize_reply_body(body)  # used to raise UnicodeEncodeError
+        assert "\ud800" not in clean.text and "\N{REPLACEMENT CHARACTER}" in clean.text
+        msg = message(reply_headers(Subject="Re: Anfrage \udc00 TEST-204"), body)
+        result = correlate_reply(msg, [binding()])
+        assert result.outcome == CorrelationOutcome.MATCHED
+        req = build_ingest_request(
+            msg,
+            result,
+            sanitized=clean,
+            attachment_decisions=(),
+            detected_language=MessageLanguage.DE,
+            observed_at=NOW,
+        )
+        assert req.fingerprint() == source_content_fingerprint(req.source_content())
+        assert [p.amount for p in extract_reply_claims(body, "de").prices] == [Decimal(2800)]
+        assert source_content_fingerprint(ReplySourceContent(body_text="a\ud800")) == (
+            source_content_fingerprint(ReplySourceContent(body_text="a\N{REPLACEMENT CHARACTER}"))
+        )
+
+    def test_bidi_and_c1_controls_never_reach_the_stored_or_analysed_text(self) -> None:
+        # An RTL override makes "2.800" display as "008.2"; CSI (\x9b) is a terminal escape.
+        body = "Preis \N{RIGHT-TO-LEFT OVERRIDE}2.800\N{POP DIRECTIONAL FORMATTING} € \x9b31m ok\x85Gruß"
+        clean = sanitize_reply_body(body)
+        assert clean.text == "Preis 2.800 €  31m ok\nGruß"
+        assert [p.amount for p in extract_reply_claims(body, "de").prices] == [Decimal(2800)]
+        for bad in ("\N{RIGHT-TO-LEFT OVERRIDE}", "\x9b", "\x85", "\N{LINE SEPARATOR}", "\N{SOFT HYPHEN}"):
+            with pytest.raises(ValueError):
+                spec_request(sanitized_body_text=f"Synthetic {bad} body")
+
+    @pytest.mark.parametrize(
+        "bad", ["\x85", "\x9b", "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}", "\N{RIGHT-TO-LEFT OVERRIDE}"]
+    )
+    def test_subject_never_carries_characters_the_database_rejects(self, bad: str) -> None:
+        # app.seller_replies rejects [[:cntrl:]] (C0 and C1), NEL, LS and PS in the subject.
+        headers = reply_headers(Subject=f"Re: Anfrage {bad}  zu  TEST-204")
+        msg = message(headers, "Ja")
+        req = build_ingest_request(
+            msg,
+            correlate_reply(msg, [binding()]),
+            sanitized=sanitize_reply_body("Ja"),
+            attachment_decisions=(),
+            detected_language=MessageLanguage.DE,
+            observed_at=NOW,
+        )
+        assert req.subject == "Re: Anfrage zu TEST-204"
+        with pytest.raises(ValueError):
+            spec_request(subject=f"Synthetic {bad} subject")
+
+    @pytest.mark.parametrize("bad", ["\x85", "\x9b", "\N{LINE SEPARATOR}", "\N{RIGHT-TO-LEFT OVERRIDE}"])
+    def test_attachment_names_with_controls_or_bidi_overrides_are_rejected_and_made_safe(
+        self, bad: str
+    ) -> None:
+        with pytest.raises(ValueError):
+            attachment(f"invoice{bad}fdp.exe")
+        safe = safe_filename(f"Fahrzeugschein{bad}.pdf")
+        assert bad not in safe and safe.endswith(".pdf")
+        assert attachment(safe).filename == safe
+
+    @pytest.mark.parametrize("bad", ["\N{NO-BREAK SPACE}", "\N{EM SPACE}", "\x85", "\N{ZERO WIDTH SPACE}"])
+    def test_provider_identifiers_reject_unicode_whitespace_and_controls(self, bad: str) -> None:
+        # The database's opaque_ref_ok rejects [[:space:][:cntrl:]].
+        with pytest.raises(ValueError):
+            SourceMessageIdentity(
+                mailbox_binding_id=MB, provider=EmailProviderKind.GMAIL_API, provider_message_id=f"id{bad}1"
+            )
+        with pytest.raises(ValueError):
+            spec_request(source_message={"outlook_entry_id": f"entry{bad}1"})
+
+    # --- claims: complaint/opt-out false positives -------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Ihre Mail war im Spam-Ordner. Das Auto ist noch verfügbar.", "de"),
+            ("Ihre Nachricht ist im Spam gelandet, das Auto ist noch verfügbar.", "de"),
+            ("Your email went to my spam folder, the car is still available.", "en"),
+            ("Found your message in spam - it is still available.", "en"),
+            ("La sua mail era nello spam. È ancora disponibile.", "it"),
+            ("Votre message était dans le dossier spam. Toujours disponible.", "fr"),
+        ],
+    )
+    def test_spam_folder_report_is_not_a_complaint(self, text: str, lang: str) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert not claims.complaint and claims.requests == ()
+        decision = decide_reply_processing(
+            correlate_reply(message(reply_headers(), text), [binding()]), claims
+        )
+        assert decision.inquiry_transition == InquiryState.REPLIED
+        assert decision.suppressions == ()
+
+    def test_real_complaints_still_suppress(self) -> None:
+        for text, lang in (("Das ist Spam!", "de"), ("Stop this spam.", "en"), ("Questo è spam.", "it")):
+            assert extract_reply_claims(text, lang).complaint, text
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Non scrivo il prezzo per email.", "it"),
+            ("Non contattarmi su WhatsApp, solo email. È ancora disponibile.", "it"),
+            ("Please do not contact me by phone, e-mail only.", "en"),
+            ("Ich habe keine Nachrichten von Ihnen bekommen.", "de"),
+            ("Wir können das Auto vor dem Export für Sie abmelden.", "de"),
+            ("Ne me contactez plus par téléphone, seulement par e-mail.", "fr"),
+        ],
+    )
+    def test_channel_preferences_and_lookalikes_are_not_opt_outs(self, text: str, lang: str) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert not claims.opted_out
+        decision = decide_reply_processing(
+            correlate_reply(message(reply_headers(), text), [binding()]), claims
+        )
+        assert SuppressionReason.SELLER_OPT_OUT not in decision.suppressions
+        assert decision.inquiry_transition == InquiryState.REPLIED
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Non contattatemi più.", "it"),
+            ("Non mi scriva più, grazie.", "it"),
+            ("Non scriveteci più.", "it"),
+            ("Bitte keine weiteren Anfragen.", "de"),
+            ("Bitte melden Sie mich ab.", "de"),
+            ("Bitte keine E-Mails mehr.", "de"),
+            ("Please do not contact me again.", "en"),
+            ("Ne me contactez plus.", "fr"),
+        ],
+    )
+    def test_genuine_opt_outs_are_still_honoured(self, text: str, lang: str) -> None:
+        assert extract_reply_claims(text, lang).opted_out, text
+
+    # --- claims: negated amounts are never quotes ---------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Der Preis ist nicht 2.500 €, sondern 2.800 €.", "de"),
+            ("Il prezzo non è 2.500 € ma 2.800 €.", "it"),
+            ("Prezzo: non 2.500 € ma 2.800 €.", "it"),
+            ("Ce n'est pas 2 500 € mais 2 800 €.", "fr"),
+            ("The price is not 2,500 EUR but 2,800 EUR.", "en"),
+        ],
+    )
+    def test_negated_amount_is_kept_as_a_negated_mention_not_a_quote(self, text: str, lang: str) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert [(p.amount, p.currency) for p in claims.prices] == [(Decimal(2800), "EUR")]
+        negated = [m for m in claims.other_amounts if m.context == AmountContext.NEGATED]
+        assert [(m.amount, m.currency) for m in negated] == [(Decimal(2500), "EUR")]
+        summary = build_mk_summary(claims, MessageLanguage(lang))
+        assert "2.800 EUR" in summary.text
+
+    def test_negated_mention_is_preserved_in_the_mk_summary(self) -> None:
+        claims = extract_reply_claims("Nicht 2.500 €, sondern 2.800 €.", "de")
+        (negated,) = claims.other_amounts
+        assert negated.context == AmountContext.NEGATED and negated.amount == Decimal(2500)
+        summary = build_mk_summary(claims, MessageLanguage.DE)
+        assert "2.500 EUR" in summary.text and "не е понуда" in summary.text
+        assert "2.500 EUR" in summary.amounts_preserved
+        # "nicht unter" stays a minimum, never a negation.
+        (minimum,) = extract_reply_claims("Nicht unter 2.700 €.", "de").prices
+        assert minimum.kind == "minimum" and minimum.amount == Decimal(2700)
+
+    # --- sanitising: obfuscated e-mail addresses -----------------------------------------------
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Schreiben Sie an max (at) example (dot) invalid",
+            "mail: max[at]example.invalid",
+            "max {at} example [punkt] invalid",
+            "scrivete a mario (chiocciola) example (punto) invalid",
+            "max at example dot invalid",
+        ],
+    )
+    def test_obfuscated_email_addresses_are_removed(self, text: str) -> None:
+        clean = sanitize_reply_body(text)
+        assert "example" not in clean.text and "[email removed]" in clean.text
+        assert clean.removed.emails == 1
+        headers = reply_headers(Subject=f"Re: TEST-204 {text}")
+        msg = message(headers, "Ja")
+        req = build_ingest_request(
+            msg,
+            correlate_reply(msg, [binding()]),
+            sanitized=sanitize_reply_body("Ja"),
+            attachment_decisions=(),
+            detected_language=MessageLanguage.DE,
+            observed_at=NOW,
+        )
+        assert "example" not in req.subject and "TEST-204" in req.subject
+
+    def test_ordinary_text_with_at_is_kept(self) -> None:
+        text = "Look at the car at 10:00. Preis (ab) 2.800 €"
+        assert sanitize_reply_body(text).text == text
+
+    # --- claims: listing references and sentence ends are never prices --------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Ja, noch verfügbar TEST-204. Preis 2.800 €", "de"),  # sentence ending in a number
+            ("Ja, noch verfügbar. Preis 2.800 €, Inserat TEST-204", "de"),
+            ("Inserat 412345678 kostet 2.800 €", "de"),
+            ("Ref. 55123, Preis 2.800 €", "de"),
+            ("Rif. 55123 - prezzo 2.800 €", "it"),
+            ("Annonce AB-77812 : prix 2 800 €", "fr"),
+            ("Listing 99231 is still available, price 2,800 EUR", "en"),
+        ],
+    )
+    def test_listing_reference_digits_are_never_a_quote(self, text: str, lang: str) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert [(p.amount, p.currency) for p in claims.prices] == [(Decimal(2800), "EUR")]
+        assert "MULTIPLE_PRICE_STATEMENTS" not in claims.warnings
+
+    def test_full_stop_after_a_number_ends_the_sentence_before_a_capital(self) -> None:
+        claims = extract_reply_claims("Der Preis ist 2.900. Das Auto hat 150.000 km. Baujahr 2012.", "de")
+        assert [p.amount for p in claims.prices] == [Decimal(2900)]
+        assert claims.other_amounts == ()
+        # A currency-less number far beyond any vehicle price is not a quote either.
+        assert extract_reply_claims("Preis 412345678", "de").prices == ()

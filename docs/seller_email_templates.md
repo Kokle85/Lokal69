@@ -128,7 +128,8 @@ Kind regards,
 ```
 
 Macedonian informational preview for Vasko `seller_initial_mk_preview_v1` (never sent to a
-seller; rendered with exactly the same placeholder values as the message it mirrors):
+seller; rendered with exactly the same placeholder values as the message it mirrors, and only from
+an exact rendering of a registered seller template, so it always translates what can be sent):
 
 ```text
 Предмет: Прашање за {{vehicle_label}} – {{listing_reference}}

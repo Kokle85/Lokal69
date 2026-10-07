@@ -21,7 +21,14 @@ from uuid import UUID
 
 LOGGER_ROOT: Final = "outlook_bridge"
 _SAFE_STRING_RE: Final = re.compile(r"^[A-Za-z0-9._:/=+-]{0,128}$")
-_BEARER_RE: Final = re.compile(r"(?i)\b(bearer|token|authorization)(\s*[:=]?\s*)[^\s,;]+")
+#: ``Authorization: Bearer <x>``, ``bearer <x>``, ``token=<x>``, ``api_key: <x>``: the value (after an
+#: optional auth scheme) is masked, never only the scheme word.
+_BEARER_RE: Final = re.compile(
+    r"(?i)\b(authorization|bearer|token|api[_-]?key|credential|secret|password)\b"
+    r"(\s*[:=]\s*|\s+)"
+    r"(?:\"[^\"]*\"|'[^']*'|(?:(?:bearer|basic|token)\s+)?[^\s,;\"']+)"
+)
+_JWT_RE: Final = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
 _EMAIL_RE: Final = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,}")
 REDACTED: Final = "<redacted>"
 
@@ -34,7 +41,8 @@ def get_logger(name: str) -> logging.Logger:
 
 def safe_text(text: str) -> str:
     """Mask bearer tokens and e-mail addresses in free text (exception messages)."""
-    masked = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
+    masked = _JWT_RE.sub(REDACTED, text[:4000])  # bounded input; output is capped below
+    masked = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", masked)
     return _EMAIL_RE.sub(REDACTED, masked)[:500]
 
 

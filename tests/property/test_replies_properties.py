@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -20,6 +21,7 @@ from suv_deals.domain.replies import (
     ReplyIngestRequest,
     SourceMessageIdentity,
     StoredReplyIngest,
+    build_ingest_request,
     build_mk_summary,
     classify_message,
     correlate_reply,
@@ -27,6 +29,7 @@ from suv_deals.domain.replies import (
     extract_reply_claims,
     format_amount_mk,
     normalize_message_id,
+    safe_filename,
     sanitize_reply_body,
     strip_quoted_text,
 )
@@ -520,3 +523,42 @@ def test_verified_sender_without_thread_or_reference_never_uploads(text: str, su
     result = correlate_reply(msg, [BINDING])
     assert result.upload_scope == "none"
     assert result.outcome == CorrelationOutcome.UNMATCHED
+
+
+# Every code point, including lone surrogates, C0/C1 controls, separators and bidi overrides.
+HOSTILE_TEXT = st.text(alphabet=st.characters(min_codepoint=0, max_codepoint=0x10FFFF), max_size=300)
+_FORBIDDEN_STORED = {"Cc", "Cf", "Cs", "Zl", "Zp"}
+
+
+@SETTINGS
+@given(body=HOSTILE_TEXT, subject=HOSTILE_TEXT, name=HOSTILE_TEXT)
+def test_hostile_unicode_never_crashes_and_never_reaches_storage(body: str, subject: str, name: str) -> None:
+    clean = sanitize_reply_body(body)
+    assert not any(unicodedata.category(c) in _FORBIDDEN_STORED and c not in "\n\t" for c in clean.text)
+    extract_reply_claims(body, None)
+    msg = InboundMessage(
+        identity=SourceMessageIdentity(
+            mailbox_binding_id=MB,
+            provider=EmailProviderKind.OUTLOOK_LOCAL,
+            internet_message_id="<reply-1@example.invalid>",
+            received_at=datetime(2026, 10, 6, 18, 0, tzinfo=UTC),
+        ),
+        headers={"From": SELLER, "In-Reply-To": OUT_ID, "Subject": subject},
+        body_text=body,
+    )
+    result = correlate_reply(msg, [BINDING])
+    assert result.inquiry_id == INQ
+    req = build_ingest_request(
+        msg,
+        result,
+        sanitized=clean,
+        attachment_decisions=(),
+        detected_language=None,
+        observed_at=datetime(2026, 10, 6, 18, 0, 2, tzinfo=UTC),
+    )
+    # The validated request is exactly what the database accepts for subject and body.
+    assert not any(unicodedata.category(c) in _FORBIDDEN_STORED for c in req.subject)
+    assert len(req.fingerprint()) == 64
+    filename = safe_filename(name)
+    assert not any(unicodedata.category(c) in _FORBIDDEN_STORED for c in filename)
+    assert "/" not in filename and "\\" not in filename

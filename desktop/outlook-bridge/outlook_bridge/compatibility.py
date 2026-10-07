@@ -23,6 +23,7 @@ re-verified on the actual machine during activation (``check`` reports what it f
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
@@ -210,8 +211,6 @@ def check_compatibility(
 
 def running_process_names() -> frozenset[str] | None:  # pragma: no cover - requires Windows
     """Running executable names via ``tasklist`` (read-only); ``None`` when unavailable."""
-    import subprocess
-
     try:
         output = subprocess.run(
             ["tasklist", "/fo", "csv", "/nh"],  # noqa: S607 - fixed system tool, no shell

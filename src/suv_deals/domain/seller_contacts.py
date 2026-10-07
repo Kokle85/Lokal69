@@ -13,8 +13,10 @@ Pure functions, no I/O. Business rules:
   form, a login/contact-reveal restriction or no e-mail at all yields ``seller_email_unavailable``;
   the restriction is never bypassed and the form is never submitted.
 - Canonicalisation is conservative: the domain is lower-cased and IDNA-encoded; the local part is
-  kept byte-for-byte (no Gmail dot/plus folding for any provider). Two different canonical
-  addresses are equivalent only with explicit evidence for exactly that pair.
+  kept byte-for-byte (no Gmail dot/plus folding for any provider). A non-ASCII domain label whose
+  IDNA encoding would map it to another name (IDNA 2003 ``ß`` -> ``ss``, final sigma, compatibility
+  forms) is rejected rather than rewritten. Two different canonical addresses are equivalent only
+  with explicit evidence for exactly that pair.
 - A verified recipient is bound to source URL, listing revision, seller identity, extraction
   location and verification time. ``detect_contact_change`` flags material seller/contact changes
   (cancel the stale queued inquiry) and stale evidence (recheck before dispatch).
@@ -107,11 +109,24 @@ def canonicalize_address(raw: str) -> CanonicalAddress:
     if not local or len(local) > MAX_LOCAL_PART_LENGTH or not _LOCAL_RE.fullmatch(local):
         raise AddressError("INVALID_ADDRESS")
     domain = domain.rstrip(".") if domain.endswith(".") and not domain.endswith("..") else domain
-    try:
-        ascii_domain = domain.encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
-        raise AddressError("INVALID_ADDRESS") from exc
-    labels = ascii_domain.split(".")
+    ascii_labels: list[str] = []
+    for label in domain.split("."):
+        if label.isascii():
+            ascii_labels.append(label.lower())
+            continue
+        try:
+            encoded = label.encode("idna").decode("ascii").lower()
+            round_trip = encoded.encode("ascii").decode("idna")
+        except UnicodeError as exc:
+            raise AddressError("INVALID_ADDRESS") from exc
+        # Python's codec is IDNA 2003: its nameprep mapping silently turns e.g. "straße" into
+        # "strasse", a different IDNA 2008 domain, and folds compatibility forms. A label whose
+        # encoding does not round-trip to itself would address another domain: never guessed.
+        if round_trip != label.lower():
+            raise AddressError("INVALID_ADDRESS")
+        ascii_labels.append(encoded)
+    ascii_domain = ".".join(ascii_labels)
+    labels = ascii_labels
     if (
         len(ascii_domain) > MAX_DOMAIN_LENGTH
         or len(labels) < 2
@@ -346,7 +361,9 @@ class RecipientEvidence(BaseModel):
     seller: SellerIdentity
     relay_listing_reference: str | None = Field(default=None, max_length=200)
     dealer_match: DealerMatchEvidence | None = None
-    distinct_addresses_on_page: int = Field(default=1, ge=0, le=1000)
+    #: How many distinct e-mail addresses the extractor saw on the evidence page. Required (no
+    #: optimistic default): an extractor that did not count cannot claim a single seller address.
+    distinct_addresses_on_page: int = Field(ge=0, le=1000)
     branch_count: int | None = Field(default=None, ge=0, le=10000)
     observed_at: datetime
     verified_at: datetime
@@ -686,7 +703,11 @@ def detect_contact_change(
     changes: list[ContactChange] = []
     latest = bound
     if current is not None:
-        if current.binding is None:
+        if current.status == RecipientStatus.RECHECK_REQUIRED:
+            # The same kind of evidence still holds but is too old: refresh it before dispatch
+            # (hold). A changed address or seller is detected once the fresh decision exists.
+            changes.append(ContactChange.EVIDENCE_STALE)
+        elif current.binding is None:
             changes.append(ContactChange.RECIPIENT_NO_LONGER_VERIFIED)
         else:
             latest = current.binding
@@ -705,7 +726,7 @@ def detect_contact_change(
                 changes.append(ContactChange.EVIDENCE_KIND_CHANGED)
             if latest.listing_revision_number != bound.listing_revision_number:
                 changes.append(ContactChange.REVISION_CHANGED)
-    if now - latest.verified_at > max_evidence_age:
+    if now - latest.verified_at > max_evidence_age and ContactChange.EVIDENCE_STALE not in changes:
         changes.append(ContactChange.EVIDENCE_STALE)
     material = any(c in _MATERIAL for c in changes)
     return ContactRecheck(

@@ -31,10 +31,12 @@ Scope and privacy rules:
 
 from __future__ import annotations
 
+import contextlib
 import email.header
 import email.parser
 import email.policy
 import hashlib
+import importlib
 import mimetypes
 import os
 from collections.abc import Callable, Sequence
@@ -91,7 +93,14 @@ _NO_DATE_YEAR: Final = 4500  # Outlook encodes "none" dates as 4501-01-01
 
 FolderRole = Literal["inbox", "junk", "rule_target", "sent_items", "outbox"]
 AttachmentKind = Literal["file", "embedded_message", "ole", "link", "other"]
-_ACCOUNT_TYPES: Final[dict[int, AccountType]] = {0: "exchange", 1: "imap", 2: "pop3", 3: "http", 4: "other", 5: "other"}
+_ACCOUNT_TYPES: Final[dict[int, AccountType]] = {
+    0: "exchange",
+    1: "imap",
+    2: "pop3",
+    3: "http",
+    4: "other",
+    5: "other",
+}
 _ATTACHMENT_KINDS: Final[dict[int, AttachmentKind]] = {
     OL_BY_VALUE: "file",
     OL_BY_REFERENCE: "link",
@@ -319,7 +328,14 @@ def com_time_as_utc(value: Any) -> datetime | None:
     if not isinstance(value, datetime) or value.year >= _NO_DATE_YEAR:
         return None
     return datetime(
-        value.year, value.month, value.day, value.hour, value.minute, value.second, value.microsecond, tzinfo=UTC
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=UTC,
     )
 
 
@@ -376,7 +392,7 @@ class NewMailEventHandler:
 
     _bridge_sink: Callable[[tuple[str, ...]], None] | None = None
 
-    def OnNewMailEx(self, received_items_ids: object) -> None:  # noqa: N802 - COM event name
+    def OnNewMailEx(self, received_items_ids: object) -> None:
         sink = self._bridge_sink
         if sink is None:
             return
@@ -391,7 +407,7 @@ class SyncEventHandler:
 
     _bridge_on_end: Callable[[], None] | None = None
 
-    def OnSyncEnd(self) -> None:  # noqa: N802 - COM event name
+    def OnSyncEnd(self) -> None:
         callback = self._bridge_on_end
         if callback is not None:
             callback()
@@ -475,7 +491,9 @@ class OutlookComSession:
             self._reset()
             raise OutlookUnavailable("cannot enumerate Outlook accounts") from None
         if len(found) != 1:
-            raise OutlookUnavailable("the configured account is not (uniquely) present in the Outlook profile")
+            raise OutlookUnavailable(
+                "the configured account is not (uniquely) present in the Outlook profile"
+            )
         account = found[0]
         store = _get(account, "DeliveryStore")
         store_id = _str(_get(store, "StoreID"), 16384)
@@ -503,6 +521,11 @@ class OutlookComSession:
         return store
 
     def _subscribe_sync(self, namespace: Any) -> None:
+        """(Re)subscribe ``SyncEnd``; sinks of an earlier ``connect`` are released first, so
+        repeated reconnects (Outlook restarts, refused account changes) never pile up sinks."""
+        for old in [h for h in self._state.events if isinstance(h, SyncEventHandler)]:
+            self._release_handler(old)
+            self._state.events.remove(old)
         try:
             sync_objects = namespace.SyncObjects
             count = _int(sync_objects.Count) or 0
@@ -689,7 +712,9 @@ class OutlookComSession:
     def _snapshot(self, item: Any, ref: ItemRef) -> MailSnapshot:
         accessor = _get(item, "PropertyAccessor")
         internet_message_id = _str(_prop(accessor, PR_INTERNET_MESSAGE_ID), 998)
-        headers = parse_header_block(_str(_prop(accessor, PR_TRANSPORT_MESSAGE_HEADERS), MAX_HEADER_BLOCK_CHARS))
+        headers = parse_header_block(
+            _str(_prop(accessor, PR_TRANSPORT_MESSAGE_HEADERS), MAX_HEADER_BLOCK_CHARS)
+        )
         subject = _str(_get(item, "Subject"), 4096)
         sender = self._sender_smtp(item)
         if subject is not None:
@@ -807,15 +832,17 @@ class OutlookComSession:
             except Exception:  # noqa: S112 - no digest means the attachment is not uploaded
                 continue
             finally:
-                try:
+                with contextlib.suppress(OSError):
                     path.unlink(missing_ok=True)
-                except OSError:
-                    pass
         return result
 
     # ------------------------------------------------------------------ events and health
 
     def subscribe_new_mail(self, sink: Callable[[tuple[str, ...]], None]) -> None:
+        """(Re)subscribe ``NewMailEx``; a previous sink is disconnected first (no duplicates)."""
+        for old in [h for h in self._state.events if isinstance(h, NewMailEventHandler)]:
+            self._release_handler(old)
+            self._state.events.remove(old)
         handler = self._bind_events(self._application(), NewMailEventHandler)
         handler._bridge_sink = sink
         self._state.events.append(handler)
@@ -858,7 +885,9 @@ class OutlookComSession:
         try:
             item = self._application().CreateItem(OL_MAIL_ITEM)
         except Exception:
-            return SubmitResult(outcome="refused", refusal="mailbox_unavailable", error_code="CREATE_ITEM_FAILED")
+            return SubmitResult(
+                outcome="refused", refusal="mailbox_unavailable", error_code="CREATE_ITEM_FAILED"
+            )
         used: str | None = None
         message_id_set = False
         try:
@@ -867,7 +896,10 @@ class OutlookComSession:
             if used is None or used.casefold() != mail.from_address.casefold():
                 self._discard(item)
                 return SubmitResult(
-                    outcome="refused", refusal="account_mismatch", error_code="SEND_ACCOUNT_NOT_SET", account_used=used
+                    outcome="refused",
+                    refusal="account_mismatch",
+                    error_code="SEND_ACCOUNT_NOT_SET",
+                    account_used=used,
                 )
             recipient = item.Recipients.Add(mail.to_address)
             recipient.Type = OL_TO
@@ -877,6 +909,7 @@ class OutlookComSession:
             item.Subject = mail.subject
             item.BodyFormat = OL_FORMAT_PLAIN
             item.Body = mail.body_text.replace("\r\n", "\n").replace("\n", "\r\n")
+            self._clear_tracking(item)
             accessor = item.PropertyAccessor
             accessor.SetProperty(INQUIRY_REF_PROPERTY, mail.inquiry_ref)
             try:
@@ -919,31 +952,78 @@ class OutlookComSession:
         item._oleobj_.Invoke(DISPID_SEND_USING_ACCOUNT, 0, DISPATCH_PROPERTYPUTREF, False, account)
 
     @staticmethod
-    def _envelope_problems(item: Any, mail: OutgoingMail, *, resolved: bool) -> tuple[str, ...]:
+    def _clear_tracking(item: Any) -> None:
+        """No read/delivery receipt requests on the inquiry (item level only; Outlook's own
+        options are never changed). Whatever cannot be cleared is caught by the envelope check."""
+        for name in ("ReadReceiptRequested", "OriginatorDeliveryReportRequested"):
+            with contextlib.suppress(Exception):
+                setattr(item, name, False)
+
+    @staticmethod
+    def _recipient_smtp(recipient: Any) -> str | None:
+        """The SMTP address a recipient actually resolved to (address book entries included)."""
+        address = _str(_prop(_get(recipient, "PropertyAccessor"), PR_SMTP_ADDRESS), 320)
+        if address:
+            return address
+        entry = _get(recipient, "AddressEntry")
+        try:
+            user = entry.GetExchangeUser() if entry is not None else None
+        except Exception:
+            user = None
+        address = _str(_get(user, "PrimarySmtpAddress"), 320)
+        return address or _str(_get(recipient, "Address"), 320)
+
+    @classmethod
+    def _single_address(cls, recipients: Any) -> str | None:
+        try:
+            return cls._recipient_smtp(recipients.Item(1))
+        except Exception:
+            return None
+
+    @classmethod
+    def _envelope_problems(cls, item: Any, mail: OutgoingMail, *, resolved: bool) -> tuple[str, ...]:
         problems: list[str] = []
         if not resolved:
             problems.append("RECIPIENT_UNRESOLVED")
-        if (_int(_get(_get(item, "Recipients"), "Count")) or 0) != 1:
+        recipients = _get(item, "Recipients")
+        if (_int(_get(recipients, "Count")) or 0) != 1:
             problems.append("EXTRA_RECIPIENT")
+        else:
+            # Outlook resolves the string through the address book; the message must still go to
+            # exactly the verified seller address of the intent (never a contact's other address).
+            actual = cls._single_address(recipients)
+            if actual is None or actual.casefold() != mail.to_address.casefold():
+                problems.append("RECIPIENT_MISMATCH")
         if _str(_get(item, "CC")) or _str(_get(item, "BCC")):
             problems.append("CC_BCC")
+        reply_recipients = _get(item, "ReplyRecipients")
         expected_reply = 1 if mail.reply_to_address is not None else 0
-        if (_int(_get(_get(item, "ReplyRecipients"), "Count")) or 0) != expected_reply:
+        if (_int(_get(reply_recipients, "Count")) or 0) != expected_reply:
             problems.append("EXTRA_REPLY_TO")
+        elif mail.reply_to_address is not None:
+            actual_reply = cls._single_address(reply_recipients)
+            if actual_reply is None or actual_reply.casefold() != mail.reply_to_address.casefold():
+                problems.append("REPLY_TO_MISMATCH")
+        if _str(_get(item, "SentOnBehalfOfName")):
+            problems.append("SEND_ON_BEHALF")
         if (_int(_get(_get(item, "Attachments"), "Count")) or 0) != 0:
             problems.append("ATTACHMENT")
         if _get(item, "Subject") != mail.subject:
             problems.append("SUBJECT_CHANGED")
         if _int(_get(item, "BodyFormat")) != OL_FORMAT_PLAIN:
             problems.append("NOT_PLAIN_TEXT")
+        if (
+            _get(item, "ReadReceiptRequested") is True
+            or _get(item, "OriginatorDeliveryReportRequested") is True
+        ):
+            problems.append("TRACKING_REQUESTED")
         return tuple(problems)
 
     @staticmethod
     def _discard(item: Any) -> None:
-        try:
+        # An unsaved item that cannot be closed is simply dropped (it was never sent).
+        with contextlib.suppress(Exception):
             item.Close(OL_DISCARD)
-        except Exception:  # noqa: S110 - an unsaved item that cannot be closed is simply dropped
-            pass
 
     def lookup_sent(self, mail: OutgoingMail, *, since: datetime) -> SentLookup:
         """Sent Items (then Outbox) evidence for an intent; never inferred from absence."""
@@ -1009,16 +1089,19 @@ class OutlookComSession:
 
     # ------------------------------------------------------------------ shutdown
 
+    @staticmethod
+    def _release_handler(handler: Any) -> None:
+        """Disconnect one event sink; failures must not block shutdown or re-subscription."""
+        close = getattr(handler, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+        handler._bridge_sink = None
+        handler._bridge_on_end = None
+
     def close(self) -> None:
         for handler in self._state.events:
-            close = getattr(handler, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: S110 - disconnecting event sinks must not block shutdown
-                    pass
-            handler._bridge_sink = None
-            handler._bridge_on_end = None
+            self._release_handler(handler)
         self._state = _SessionState()
 
 
@@ -1048,7 +1131,9 @@ class StaMailbox:
         )
 
     def locate_item(self, entry_id: str, store_id: str | None) -> ItemRef | None:
-        return self._executor.call(lambda: self._session.locate_item(entry_id, store_id), timeout=self._timeout)
+        return self._executor.call(
+            lambda: self._session.locate_item(entry_id, store_id), timeout=self._timeout
+        )
 
     def read_item(self, ref: ItemRef) -> MailSnapshot | None:
         return self._executor.call(lambda: self._session.read_item(ref), timeout=self._timeout)
@@ -1060,7 +1145,9 @@ class StaMailbox:
 
     def attachment_digests(self, ref: ItemRef, indices: Sequence[int]) -> dict[int, AttachmentDigest]:
         wanted = tuple(indices)
-        return self._executor.call(lambda: self._session.attachment_digests(ref, wanted), timeout=self._timeout)
+        return self._executor.call(
+            lambda: self._session.attachment_digests(ref, wanted), timeout=self._timeout
+        )
 
     def subscribe_new_mail(self, sink: Callable[[tuple[str, ...]], None]) -> None:
         self._executor.call(lambda: self._session.subscribe_new_mail(sink), timeout=self._timeout)
@@ -1072,7 +1159,9 @@ class StaMailbox:
         return self._executor.call(lambda: self._session.submit(mail), timeout=self._timeout)
 
     def lookup_sent(self, mail: OutgoingMail, *, since: datetime) -> SentLookup:
-        return self._executor.call(lambda: self._session.lookup_sent(mail, since=since), timeout=self._timeout)
+        return self._executor.call(
+            lambda: self._session.lookup_sent(mail, since=since), timeout=self._timeout
+        )
 
     def close(self) -> None:
         if self._executor.running:
@@ -1087,19 +1176,15 @@ def real_com_bindings(*, start_if_not_running: bool) -> tuple[Callable[[], Any],
     """
 
     def attach() -> Any:  # pragma: no cover - requires Windows
-        import importlib
-
         client = importlib.import_module("win32com.client")
         try:
-            return client.Dispatch(client.GetActiveObject("Outlook.Application"))
+            return client.GetActiveObject("Outlook.Application")
         except Exception:
             if not start_if_not_running:
                 raise
             return client.Dispatch("Outlook.Application")
 
     def bind_events(obj: Any, handler: type) -> Any:  # pragma: no cover - requires Windows
-        import importlib
-
         client = importlib.import_module("win32com.client")
         return client.WithEvents(obj, handler)
 

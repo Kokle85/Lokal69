@@ -646,9 +646,16 @@ def _render_with(
 
 
 def render_preview_mk(message: RenderedMessage) -> RenderedMessage:
-    """Macedonian informational preview with identical placeholders. Never an approval draft."""
+    """Macedonian informational preview with identical placeholders. Never an approval draft.
+
+    The preview mirrors only an exact rendering of a registered seller template, so Vasko always
+    sees a translation of what can actually be sent (never of a hand-built or edited message).
+    """
     if message.kind != "seller_inquiry":
         raise TemplateRenderError("a preview mirrors a seller inquiry", ["NOT_A_SELLER_MESSAGE"])
+    problems = rendering_problems(message)
+    if problems:
+        raise TemplateRenderError("a preview mirrors only an exact template rendering", problems)
     return _render_with(
         SELLER_INITIAL_MK_PREVIEW_V1, message.placeholders, source_body_hash=message.body_hash
     )

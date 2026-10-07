@@ -1,0 +1,58 @@
+# Outlook bridge configuration (copy to %LOCALAPPDATA%\SUVDeals\OutlookBridge\config.toml).
+#
+# This file never contains a secret. The narrow mail-worker credential is stored in Windows
+# Credential Manager with `python -m outlook_bridge credential set` (input is read hidden).
+# All values below are synthetic placeholders; replace them during activation.
+
+schema_version = 1
+
+# Backend base URL (HTTPS only). The worker never selects a workspace or another mailbox: the
+# server derives both from the credential.
+api_base_url = "https://api.example.invalid"
+
+# The mailbox binding issued for this worker during activation (ops mailbox binding id).
+mailbox_binding_id = "77777777-7777-4777-8777-777777777777"
+
+# A stable, non-secret name for this computer/worker.
+worker_id = "vasko-laptop-1"
+
+# The SMTP address of the ONE Outlook account this worker may use. Other accounts and stores in
+# the Outlook profile are never enumerated or read.
+account_smtp_address = "owner@example.invalid"
+
+# Proposed two-minute reconciliation interval while the worker is healthy (a configurable
+# application setting, not an end-to-end latency guarantee).
+reconcile_interval_seconds = 120
+
+# Overlap re-read before the last watermark and the settle time for late Outlook synchronisation.
+overlap_minutes = 30
+sync_settle_minutes = 10
+
+# First run looks back this far; older checkpoints are bounded by max_catchup_days and reported
+# as an explicit coverage gap instead of a silent skip.
+initial_lookback_days = 15
+max_catchup_days = 30
+
+# Reply-before-binding-sync race: how long a bounded metadata locator is kept for re-reading.
+unmatched_retry_hours = 24
+
+# Execute backend send intents for SELLER_EMAIL_PROVIDER=outlook_local (bounded inquiry only).
+send_intents_enabled = true
+
+# The worker attaches to classic Outlook already running in the signed-in session. Set to true
+# only if it may start Outlook itself.
+start_outlook_if_not_running = false
+
+# Folders of that account's store that reconciliation may scan (TOML tables must come last).
+# Inbox is required; Junk is optional; add every folder that a mailbox rule moves mail into as a
+# `rule_target` path below the store root. Sent Items/Outbox are used only as send evidence for
+# outlook_local intents.
+[[folders]]
+role = "inbox"
+
+[[folders]]
+role = "junk"
+
+# [[folders]]
+# role = "rule_target"
+# path = "Inbox/Cars"

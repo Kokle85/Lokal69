@@ -11,8 +11,9 @@ as the repository layer does (`backend()` from the M2 helpers).
 
 from __future__ import annotations
 
+import threading
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -271,7 +272,10 @@ def contact(
         "evidence_kind": evidence_kind,
         "listing_reference": veh.reference,
         "listing_url": veh.url,
-        "extraction_location": "listing_contact_block",
+        "extraction_location": {
+            "marketplace_relay_for_listing": "listing_relay_contact",
+            "official_dealer_contact_via_listing": "dealer_page_linked_from_listing",
+        }.get(evidence_kind, "listing_contact_block"),
         "extraction_excerpt": "E-Mail: (synthetic fixture excerpt)",
         "language_code": language,
         "language_status": language_status,
@@ -482,12 +486,30 @@ def queue(conn: psycopg.Connection, world: InquiryWorld, inquiry_id: UUID) -> No
         assert update_inquiry(conn, inquiry_id, state="queued") == 1
 
 
+#: ``domain.inquiries.ReconciliationEvidence`` that proves non-submission (a documented
+#: pre-submission proof, no live worker, nothing pending in the Outbox, no positive hit).
+PROVEN_NOT_SUBMITTED: dict[str, Any] = {
+    "sent_items": "not_found",
+    "provider_search": "unsupported",
+    "outbox_pending": "no",
+    "proven_not_submitted": "credentials_rejected_before_submit",
+    "worker_alive": "no",
+    "correlated_inbound": False,
+}
+
+
+def outbound_message_id(inquiry_id: UUID) -> str:
+    """The synthetic stable Message-ID of an inquiry's send intent (replies reference it)."""
+    return f"<inquiry-{inquiry_id}@synthetic-mail.example>"
+
+
 def attempt_values(world: InquiryWorld, inquiry_id: UUID, number: int = 1, **cols: Any) -> dict[str, Any]:
     values: dict[str, Any] = {
         "workspace_id": world.workspace_id,
         "inquiry_id": inquiry_id,
         "attempt_id": uuid.uuid4(),
         "attempt_number": number,
+        "rfc_message_id": outbound_message_id(inquiry_id),
         "sender_binding_id": world.sender_binding_id,
         "sender_binding_version": 1,
         "provider": "outlook_local",
@@ -660,8 +682,9 @@ def reply_values(world: InquiryWorld, inquiry_id: UUID, mailbox_id: UUID, **cols
         "binding_version": 1,
         "internet_message_id": f"<{unique('reply')}@synthetic-dealer.example>",
         "from_address": world.contact_address,
-        "in_reply_to": "<synthetic-inquiry@synthetic-mail.example>",
-        "reference_ids": ["<synthetic-inquiry@synthetic-mail.example>"],
+        # Linked by Message-ID to the inquiry's send intent (never by subject).
+        "in_reply_to": outbound_message_id(inquiry_id),
+        "reference_ids": [outbound_message_id(inquiry_id)],
         "subject": "AW: Anfrage (synthetic fixture)",
         "sanitized_body": "Synthetic fixture only: the vehicle is available.",
         "body_sanitizer_version": "reply-sanitizer/1",
@@ -701,3 +724,62 @@ def insert_row(conn: psycopg.Connection, table: str, values: Mapping[str, Any]) 
 
 def today_utc() -> date:
     return datetime.now(UTC).date()
+
+
+# --- arranged history and concurrency ------------------------------------------------------
+
+
+def arrange_inquiry_history(conn: psycopg.Connection, inquiry_id: UUID, **cols: Any) -> None:
+    """Rewrite lifecycle timestamps to simulate elapsed time (TEST ARRANGEMENT ONLY).
+
+    Triggers are bypassed for this one statement as the superuser test role; neither
+    ``suv_backend`` nor any repository can do this (the columns are database-owned)."""
+    with conn.transaction():
+        conn.execute("set local session_replication_role = replica")
+        assert update_inquiry(conn, inquiry_id, **cols) == 1
+
+
+def reserve_with_debit_at(
+    conn: psycopg.Connection, world: InquiryWorld, inquiry_id: UUID, debited_at: datetime
+) -> None:
+    """Reserve with a historical quota debit (the documented owner maintenance path)."""
+    with conn.transaction():
+        conn.execute("select set_config('app.history_maintenance', 'on', true)")
+        conn.execute(
+            "insert into ops.inquiry_quota_ledger (workspace_id, inquiry_id, debited_at) values (%s, %s, %s)",
+            (world.workspace_id, inquiry_id, debited_at),
+        )
+        assert update_inquiry(conn, inquiry_id, state="reserved", **binding_values(world)) == 1
+
+
+def race(db_url: str, *jobs: Callable[[psycopg.Connection], object]) -> list[BaseException | None]:
+    """Run each job on its own connection, released together; return the error of each (or None)."""
+    barrier = threading.Barrier(len(jobs))
+    results: list[BaseException | None] = [None] * len(jobs)
+
+    def run(index: int, job: Callable[[psycopg.Connection], object]) -> None:
+        try:
+            with psycopg.connect(db_url, autocommit=True) as conn:
+                conn.execute("set lock_timeout = '20s'")
+                barrier.wait(timeout=30)
+                job(conn)
+        except BaseException as exc:
+            results[index] = exc
+
+    threads = [threading.Thread(target=run, args=(i, job)) for i, job in enumerate(jobs)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads)
+    return results
+
+
+def single_success(results: list[BaseException | None], sqlstate: str) -> None:
+    """Exactly one job succeeded; every other one failed with ``sqlstate``."""
+    assert sum(r is None for r in results) == 1, results
+    errors = [r for r in results if r is not None]
+    assert len(errors) == len(results) - 1
+    for error in errors:
+        assert isinstance(error, psycopg.Error), error
+        assert error.sqlstate == sqlstate, (error.sqlstate, str(error))

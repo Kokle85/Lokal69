@@ -8,7 +8,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator, Iterator, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -39,11 +39,13 @@ from suv_deals.integrations.email_providers.base import (
     ProviderHealthStatus,
     ReconcileFoundSent,
     ReconcileNotFoundYet,
+    ReconcileProvenNotSubmitted,
     ReconcileProviderUnavailable,
     ReconcileWindow,
     SendAccepted,
     SendDefiniteFailure,
     SenderProvider,
+    SenderVerification,
     SendFailureReason,
     SendUncertain,
     TokenUnavailable,
@@ -78,7 +80,13 @@ from suv_deals.integrations.email_providers.outlook_local import (
     map_outlook_report,
     reconcile_from_reports,
 )
-from suv_deals.integrations.mime_builder import BuiltMessage, build_inquiry_message, mailbox
+from suv_deals.integrations.mime_builder import (
+    BuiltMessage,
+    OutboundInquiryMessage,
+    build_inquiry_message,
+    build_message,
+    mailbox,
+)
 from suv_deals.settings import Settings
 
 WHEN = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
@@ -105,7 +113,7 @@ class FakeTokens:
         self,
         scopes: Sequence[str] = (SCOPE_GMAIL_SEND, SCOPE_GMAIL_READONLY),
         *,
-        fail: TokenUnavailable | None = None,
+        fail: Exception | None = None,
     ) -> None:
         self.scopes = frozenset(scopes)
         self.fail = fail
@@ -186,6 +194,8 @@ def router() -> Iterator[respx.MockRouter]:
 
 
 def gmail(http: httpx.AsyncClient, tokens: FakeTokens | None = None, **kwargs: Any) -> GmailApiProvider:
+    # Reply retrieval is off by default (SELLER_REPLY_INGEST_MODE=provider_api only): on for unit tests.
+    kwargs.setdefault("settings", GmailApiSettings(reply_retrieval_enabled=True))
     return GmailApiProvider(
         binding=kwargs.pop("binding_", binding(reply_to=kwargs.pop("reply_to", None))),
         token_provider=tokens or FakeTokens(),
@@ -528,14 +538,17 @@ async def test_gmail_precheck_401_is_credentials_rejected(
 @pytest.mark.parametrize(
     ("fail", "reason", "retryable"),
     [
-        (TokenUnavailable(revoked=True, code="invalid_grant"), SendFailureReason.CREDENTIALS_REVOKED, False),
+        # Revoked access is retryable on purpose: the domain retry + dispatch preflight then
+        # suppresses the inquiry while access stays revoked (spec 37.5), never failing it for good.
+        (TokenUnavailable(revoked=True, code="invalid_grant"), SendFailureReason.CREDENTIALS_REVOKED, True),
         (TokenUnavailable(revoked=False, code="store_down"), SendFailureReason.CREDENTIALS_UNAVAILABLE, True),
+        (RuntimeError("secret store exploded"), SendFailureReason.CREDENTIALS_UNAVAILABLE, True),
     ],
 )
 async def test_gmail_token_unavailable_is_pre_submission(
     http: httpx.AsyncClient,
     router: respx.MockRouter,
-    fail: TokenUnavailable,
+    fail: Exception,
     reason: SendFailureReason,
     retryable: bool,
 ) -> None:
@@ -546,6 +559,13 @@ async def test_gmail_token_unavailable_is_pre_submission(
     assert outcome.reason == reason and outcome.retryable is retryable
     assert outcome.proof == "credentials_rejected_before_submit"
     assert router.calls.call_count == 0
+    graph_outcome = await graph(http, FakeTokens(fail=fail)).send(
+        message(), inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY
+    )
+    assert isinstance(graph_outcome, SendDefiniteFailure)
+    assert graph_outcome.reason == reason and graph_outcome.retryable is retryable
+    assert router.calls.call_count == 0
+    assert attempt_outcome(outcome).outcome == SendAttemptOutcome.PRE_SUBMISSION_FAILURE
 
 
 async def test_gmail_token_without_send_scope_is_refused_locally(
@@ -1547,6 +1567,9 @@ class FakeGateway:
     async def reports_for(self, inquiry_id: UUID) -> Sequence[OutlookSendReport]:
         return self.reports
 
+    async def intents_for(self, inquiry_id: UUID) -> Sequence[OutlookSendIntent]:
+        return [i for i in self.intents if i.inquiry_id == inquiry_id]
+
 
 def outlook(gateway: FakeGateway, **kwargs: Any) -> OutlookLocalProvider:
     return OutlookLocalProvider(
@@ -1685,7 +1708,7 @@ def test_outlook_report_mapping_distinguishes_local_submission_from_sent_items()
         (OutlookRefusalReason.INTENT_EXPIRED, SendFailureReason.LOCAL_WORKER_REFUSED, True),
         (OutlookRefusalReason.MAILBOX_UNAVAILABLE, SendFailureReason.LOCAL_WORKER_REFUSED, True),
         (OutlookRefusalReason.OUTLOOK_NOT_CLASSIC, SendFailureReason.LOCAL_WORKER_REFUSED, True),
-        (OutlookRefusalReason.KILL_SWITCH, SendFailureReason.KILL_SWITCH_ACTIVE, False),
+        (OutlookRefusalReason.KILL_SWITCH, SendFailureReason.KILL_SWITCH_ACTIVE, True),
         (OutlookRefusalReason.ACCOUNT_MISMATCH, SendFailureReason.ACCOUNT_MISMATCH, False),
         (OutlookRefusalReason.BINDING_MISMATCH, SendFailureReason.LOCAL_WORKER_REFUSED, False),
         (OutlookRefusalReason.INTENT_INVALID, SendFailureReason.LOCAL_WORKER_REFUSED, False),
@@ -1952,8 +1975,17 @@ def sender_status(cfg: Settings, **overrides: Any) -> SenderStatus:
     return SenderStatus.from_settings(cfg, **values)
 
 
+async def kill_switch_off() -> bool:
+    return False
+
+
 def deps(http: httpx.AsyncClient, **overrides: Any) -> seller_email.ProviderDependencies:
-    values: dict[str, Any] = {"token_provider": FakeTokens(), "http_client": http, "clock": FrozenClock(WHEN)}
+    values: dict[str, Any] = {
+        "token_provider": FakeTokens(),
+        "http_client": http,
+        "clock": FrozenClock(WHEN),
+        "kill_switch_probe": kill_switch_off,
+    }
     values.update(overrides)
     return seller_email.ProviderDependencies(**values)
 
@@ -2034,7 +2066,9 @@ def test_registry_requires_dependencies(http: httpx.AsyncClient) -> None:
         seller_email.build_sender_provider(
             cfg, sender=sender_status(cfg), deps=seller_email.ProviderDependencies()
         )
-    assert {"TOKEN_PROVIDER_MISSING", "HTTP_CLIENT_MISSING"} <= set(exc.value.problems)
+    assert {"TOKEN_PROVIDER_MISSING", "HTTP_CLIENT_MISSING", "KILL_SWITCH_PROBE_MISSING"} <= set(
+        exc.value.problems
+    )
     local = settings(seller_email_provider="outlook_local", seller_email_oauth_secret_reference=None)
     with pytest.raises(seller_email.SenderSetupError) as exc:
         seller_email.build_sender_provider(
@@ -2044,7 +2078,9 @@ def test_registry_requires_dependencies(http: httpx.AsyncClient) -> None:
     built = seller_email.build_sender_provider(
         local,
         sender=sender_status(local),
-        deps=seller_email.ProviderDependencies(outlook_gateway=FakeGateway(), mailbox_binding_id=MAILBOX_ID),
+        deps=seller_email.ProviderDependencies(
+            outlook_gateway=FakeGateway(), mailbox_binding_id=MAILBOX_ID, kill_switch_probe=kill_switch_off
+        ),
     )
     assert built.kind == EmailProviderKind.OUTLOOK_LOCAL
     graph_cfg = settings(seller_email_provider="microsoft_graph", seller_email_account_id=GRAPH_ID)
@@ -2135,8 +2171,11 @@ async def test_live_kill_switch_stops_untransmitted_work() -> None:
             message(), inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY
         )
         assert isinstance(outcome, SendDefiniteFailure)
-        assert outcome.reason == SendFailureReason.KILL_SWITCH_ACTIVE and not outcome.retryable
-        assert outcome.pre_submission
+        assert outcome.reason == SendFailureReason.KILL_SWITCH_ACTIVE
+        # Proven pre-submission and retryable: the pause stops this transmission only and never
+        # fails the inquiry permanently (the preflight suppresses while the switch is on).
+        assert outcome.pre_submission and outcome.retryable
+        assert attempt_outcome(outcome).outcome == SendAttemptOutcome.PRE_SUBMISSION_FAILURE
     assert inner.sent == []
 
     async def inactive() -> bool:
@@ -2334,7 +2373,9 @@ async def test_gmail_oversized_reply_is_correlated_on_headers_instead_of_blockin
     routes["reply_full"].mock(
         return_value=httpx.Response(200, content=b'{"id": "m-reply", "payload": ' + b"x" * 70_000)
     )
-    provider = gmail(http, settings=GmailApiSettings(max_full_message_bytes=64 * 1024))
+    provider = gmail(
+        http, settings=GmailApiSettings(max_full_message_bytes=64 * 1024, reply_retrieval_enabled=True)
+    )
     result = await provider.fetch_correlated_replies(
         mailbox_binding_id=MAILBOX_ID, bindings=[reply_binding(outbound)], since=WHEN, cursor="1000"
     )
@@ -2425,3 +2466,561 @@ async def test_graph_oversized_candidate_is_correlated_on_listed_headers(
     assert result.complete and len(result.replies) == 1
     assert result.replies[0].body_truncated
     assert result.replies[0].correlation.outcome == CorrelationOutcome.MATCHED
+
+
+# ============================================================================== review regressions
+
+
+def free_text_message() -> BuiltMessage:
+    """Well-formed MIME that is NOT a template rendering (an offer the scope forbids)."""
+    return build_message(
+        OutboundInquiryMessage(
+            inquiry_id=INQUIRY_ID,
+            attempt_number=1,
+            sender=mailbox(ACCOUNT, SENDER_NAME),
+            recipient=mailbox(SELLER),
+            subject="Offer for your Toyota RAV4",
+            body=f"I will pay 3000 EUR cash today.\n\n{SENDER_NAME}",
+            date=WHEN,
+        )
+    )
+
+
+async def test_every_provider_refuses_messages_outside_the_template_scope_without_io(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    hostile = free_text_message()
+    tokens = FakeTokens(scopes=(SCOPE_GMAIL_SEND, SCOPE_GMAIL_READONLY, "Mail.Send", "User.Read"))
+    gateway = FakeGateway()
+    providers: list[SenderProvider] = [
+        gmail(http, tokens),
+        graph(http, tokens),
+        outlook(gateway),
+    ]
+    for provider in providers:
+        outcome = await provider.send(
+            hostile, inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY
+        )
+        assert isinstance(outcome, SendDefiniteFailure), provider
+        assert outcome.pre_submission and not outcome.retryable
+        assert "SCOPE:NOT_A_TEMPLATE_INQUIRY" in outcome.problems
+    assert router.calls.call_count == 0 and tokens.calls == 0 and gateway.intents == []
+    swapped = message().model_copy(update={"subject": "Offer", "body": "I will pay 3000 EUR.\n"})
+    outcome = await gmail(http, tokens).send(
+        swapped, inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY
+    )
+    assert isinstance(outcome, SendDefiniteFailure) and "SCOPE:BODY_HASH_MISMATCH" in outcome.problems
+    assert router.calls.call_count == 0
+
+
+async def test_kill_switch_refusal_never_fails_the_inquiry_permanently() -> None:
+    async def active() -> bool:
+        return True
+
+    inner = RecordingProvider()
+    gated = seller_email.GatedSenderProvider(inner, kill_switch_probe=active)  # type: ignore[arg-type]
+    refused = await gated.send(message(), inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY)
+    assert inner.sent == []
+    decision = should_retry(attempt_evidence(refused), now=WHEN)
+    assert decision.retry and decision.reasons == ("PROVEN_PRE_SUBMISSION_FAILURE",)
+    assert decision.sender_binding_id == BINDING_ID  # only through the same account
+    intent = intent_for()
+    worker = map_outlook_report(
+        intent,
+        report(
+            intent,
+            OutlookSubmissionState.REFUSED_BEFORE_SEND,
+            refusal_reason=OutlookRefusalReason.KILL_SWITCH,
+        ),
+        observed_at=WHEN,
+    )
+    assert should_retry(attempt_evidence(worker), now=WHEN).retry
+
+
+# ---------------------------------------------------------------------------- Gmail pull progress
+
+
+def gmail_mailbox_handler(
+    total: int, *, failing: frozenset[str] = frozenset(), page_size: int = 500
+) -> tuple[Any, list[str]]:
+    """A synthetic Gmail mailbox: message ``m<i>`` is added by history record ``1001 + i``."""
+    inspected: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/history"):
+            start = int(request.url.params["startHistoryId"])
+            offset = int(request.url.params.get("pageToken", "0"))
+            pending = [i for i in range(total) if 1001 + i > start]
+            page = pending[offset : offset + page_size]
+            body: dict[str, Any] = {
+                "history": [
+                    {
+                        "id": str(1001 + i),
+                        "messagesAdded": [{"message": {"id": f"m{i}", "labelIds": ["INBOX"]}}],
+                    }
+                    for i in page
+                ],
+                "historyId": str(1000 + total),
+            }
+            if offset + page_size < len(pending):
+                body["nextPageToken"] = str(offset + page_size)
+            return httpx.Response(200, json=body)
+        if "/messages/" in path:
+            mid = path.rsplit("/", 1)[1]
+            if mid in failing:
+                return httpx.Response(503)
+            inspected.append(mid)
+            return httpx.Response(
+                200,
+                json={
+                    "id": mid,
+                    "labelIds": ["INBOX"],
+                    "payload": {"headers": [{"name": "From", "value": "news@shop.example"}]},
+                },
+            )
+        return httpx.Response(404)
+
+    return handler, inspected
+
+
+async def test_gmail_history_backlog_beyond_the_message_budget_makes_progress() -> None:
+    handler, inspected = gmail_mailbox_handler(300)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = gmail(client)
+        first = await provider.fetch_correlated_replies(
+            mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, cursor="1000"
+        )
+        assert not first.complete and first.scanned == 200
+        assert first.next_cursor == "1200"  # the last fully processed history record
+        second = await provider.fetch_correlated_replies(
+            mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, cursor=first.next_cursor
+        )
+    assert second.complete and second.scanned == 100 and second.next_cursor == "1300"
+    assert inspected == [f"m{i}" for i in range(300)]  # every message exactly once, none skipped
+
+
+async def test_gmail_history_transient_failure_checkpoints_before_the_failed_record() -> None:
+    handler, inspected = gmail_mailbox_handler(10, failing=frozenset({"m5"}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await gmail(client).fetch_correlated_replies(
+            mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, cursor="1000"
+        )
+    assert not result.complete and result.next_cursor == "1005"  # m0..m4 done, m5 is re-read
+    assert inspected == [f"m{i}" for i in range(5)]
+
+
+async def test_gmail_history_beyond_the_page_budget_continues_from_the_last_record() -> None:
+    handler, inspected = gmail_mailbox_handler(30, page_size=10)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = gmail(client, settings=GmailApiSettings(max_history_pages=1, reply_retrieval_enabled=True))
+        cursor: str | None = "1000"
+        cursors = []
+        for _ in range(3):
+            result = await provider.fetch_correlated_replies(
+                mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, cursor=cursor
+            )
+            cursor = result.next_cursor
+            cursors.append((cursor, result.complete))
+    assert cursors == [("1010", False), ("1020", False), ("1030", True)]
+    assert inspected == [f"m{i}" for i in range(30)]
+
+
+async def test_gmail_window_pull_hands_back_uninspected_messages_and_moves_to_history(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    router.get(f"{GMAIL_ROOT}/profile").mock(return_value=httpx.Response(200, json={"historyId": "5000"}))
+    router.get(f"{GMAIL_ROOT}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": f"w{i}"} for i in range(30)]})
+    )
+    meta = router.get(url__regex=rf"{GMAIL_ROOT}/messages/w\d+").mock(
+        return_value=httpx.Response(
+            200, json={"payload": {"headers": [{"name": "From", "value": "a@b.example"}]}}
+        )
+    )
+    result = await gmail(http).fetch_correlated_replies(
+        mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, max_messages=10
+    )
+    assert result.scanned == 10 and meta.call_count == 10
+    assert result.pending_retry_locators == tuple(f"w{i}" for i in range(10, 30))
+    assert result.next_cursor == "5000" and not result.complete and not result.gap_detected
+    rechecked = await gmail(http).recheck_locators(
+        mailbox_binding_id=MAILBOX_ID, bindings=[], locators=result.pending_retry_locators
+    )
+    assert rechecked.complete and rechecked.skipped_unrelated == 20 and rechecked.pending_retry_locators == ()
+
+
+async def test_gmail_window_listing_beyond_the_page_budget_is_an_explicit_gap(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    router.get(f"{GMAIL_ROOT}/profile").mock(return_value=httpx.Response(200, json={"historyId": "5000"}))
+    router.get(f"{GMAIL_ROOT}/messages").mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            json={
+                "messages": [{"id": f"p{request.url.params.get('pageToken', '0')}x{i}"} for i in range(2)],
+                "nextPageToken": str(int(request.url.params.get("pageToken", "0")) + 1),
+            },
+        )
+    )
+    router.get(url__regex=rf"{GMAIL_ROOT}/messages/p\d+x\d+").mock(
+        return_value=httpx.Response(200, json={"payload": {"headers": []}})
+    )
+    provider = gmail(http, settings=GmailApiSettings(max_list_pages=2, reply_retrieval_enabled=True))
+    result = await provider.fetch_correlated_replies(mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN)
+    assert result.gap_detected and not result.complete and result.problems == ("WINDOW_TRUNCATED",)
+    assert result.next_cursor == "5000" and result.scanned == 4
+
+
+async def test_gmail_recheck_keeps_locators_beyond_its_budget() -> None:
+    handler, inspected = gmail_mailbox_handler(0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await gmail(client).recheck_locators(
+            mailbox_binding_id=MAILBOX_ID, bindings=[], locators=[f"x{i}" for i in range(520)]
+        )
+    assert len(inspected) == 500 and not result.complete
+    assert result.pending_retry_locators == tuple(f"x{i}" for i in range(500, 520))
+
+
+async def test_gmail_naive_since_is_refused(http: httpx.AsyncClient, router: respx.MockRouter) -> None:
+    with pytest.raises(ValueError, match="naive"):
+        await gmail(http).fetch_correlated_replies(
+            mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN.replace(tzinfo=None)
+        )
+    assert router.calls.call_count == 0
+
+
+async def test_gmail_message_from_the_owner_never_leaves_the_mailbox(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    outbound = message().rfc_message_id
+    router.get(f"{GMAIL_ROOT}/history").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "history": [{"id": "1001", "messagesAdded": [{"message": {"id": "m-own"}}]}],
+                "historyId": "1001",
+            },
+        )
+    )
+    headers = gmail_headers(From=f"{SENDER_NAME} <{ACCOUNT}>", In_Reply_To=outbound, Subject="Re: Enquiry")
+    router.get(f"{GMAIL_ROOT}/messages/m-own", params={"format": "metadata"}).mock(
+        return_value=httpx.Response(
+            200, json={"id": "m-own", "labelIds": ["INBOX"], "payload": {"headers": headers}}
+        )
+    )
+    router.get(f"{GMAIL_ROOT}/messages/m-own", params={"format": "full"}).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "m-own",
+                "labelIds": ["INBOX"],
+                "payload": {
+                    "headers": headers,
+                    "mimeType": "text/plain",
+                    "body": {"data": b64url("private note")},
+                },
+            },
+        )
+    )
+    result = await gmail(http).fetch_correlated_replies(
+        mailbox_binding_id=MAILBOX_ID, bindings=[reply_binding(outbound)], since=WHEN, cursor="1000"
+    )
+    assert result.replies == () and result.skipped_unrelated == 1 and result.complete
+
+
+# ---------------------------------------------------------------------------- reply retrieval gate
+
+
+async def test_gmail_reply_retrieval_is_off_unless_provider_api_ingest_is_selected(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    tokens = FakeTokens()
+    default = GmailApiProvider(binding=binding(), token_provider=tokens, http=http, clock=FrozenClock(WHEN))
+    pulled = await default.fetch_correlated_replies(
+        mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, cursor="1000"
+    )
+    rechecked = await default.recheck_locators(mailbox_binding_id=MAILBOX_ID, bindings=[], locators=["m1"])
+    assert pulled.problems == ("REPLY_RETRIEVAL_DISABLED",) and pulled.next_cursor == "1000"
+    assert rechecked.problems == ("REPLY_RETRIEVAL_DISABLED",) and rechecked.pending_retry_locators == ("m1",)
+    assert router.calls.call_count == 0 and tokens.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "account", "probe_url"),
+    [
+        ("gmail_api", ACCOUNT, f"{GMAIL_ROOT}/history"),
+        ("microsoft_graph", GRAPH_ID, f"{GRAPH_ME}/mailFolders/inbox/messages"),
+    ],
+)
+async def test_registry_enables_api_reply_retrieval_only_for_provider_api_ingest(
+    http: httpx.AsyncClient, router: respx.MockRouter, provider_kind: str, account: str, probe_url: str
+) -> None:
+    route = router.get(probe_url).mock(return_value=httpx.Response(503))
+    explicit = deps(
+        http,
+        gmail_settings=GmailApiSettings(reply_retrieval_enabled=True),
+        graph_settings=GraphSettings(reply_retrieval_enabled=True),
+        token_provider=FakeTokens(scopes=(SCOPE_GMAIL_SEND, SCOPE_GMAIL_READONLY, "Mail.Send", "User.Read")),
+    )
+    for mode, enabled in (("local_classic_outlook", False), ("disabled", False), ("provider_api", True)):
+        cfg = settings(
+            seller_email_provider=provider_kind,
+            seller_email_account_id=account,
+            seller_reply_ingest_mode=mode,
+        )
+        for dependencies in (deps(http), explicit):
+            provider = seller_email.build_sender_provider(cfg, sender=sender_status(cfg), deps=dependencies)
+            before = route.call_count
+            result = await provider.fetch_correlated_replies(
+                mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN, cursor="1000"
+            )
+            assert (route.call_count > before) is enabled, (mode, dependencies)
+            assert ("REPLY_RETRIEVAL_DISABLED" in result.problems) is not enabled
+    off = deps(http, gmail_settings=GmailApiSettings(), graph_settings=GraphSettings())
+    cfg = settings(
+        seller_email_provider=provider_kind,
+        seller_email_account_id=account,
+        seller_reply_ingest_mode="provider_api",
+    )
+    provider = seller_email.build_sender_provider(cfg, sender=sender_status(cfg), deps=off)
+    result = await provider.fetch_correlated_replies(mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN)
+    assert result.problems == ("REPLY_RETRIEVAL_DISABLED",)  # an explicit "off" is never overridden
+
+
+# ---------------------------------------------------------------------------- Graph window
+
+
+async def test_graph_reply_window_is_always_expressed_in_utc(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    listing = router.get(f"{GRAPH_ME}/mailFolders/inbox/messages").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    provider = graph(
+        http,
+        FakeTokens(scopes=("Mail.Send", "User.Read", "Mail.Read")),
+        settings=GraphSettings(reply_retrieval_enabled=True),
+    )
+    skopje = datetime(2026, 10, 6, 12, 0, tzinfo=timezone(timedelta(hours=2)))
+    result = await provider.fetch_correlated_replies(mailbox_binding_id=MAILBOX_ID, bindings=[], since=skopje)
+    assert listing.calls.last.request.url.params["$filter"] == "receivedDateTime ge 2026-10-06T10:00:00Z"
+    assert result.complete and result.next_cursor is None
+    garbage = await provider.fetch_correlated_replies(
+        mailbox_binding_id=MAILBOX_ID, bindings=[], since=skopje, cursor="not-a-timestamp"
+    )
+    assert listing.calls.last.request.url.params["$filter"] == "receivedDateTime ge 2026-10-06T10:00:00Z"
+    assert garbage.next_cursor is None  # an unusable cursor is dropped, never echoed forever
+    with pytest.raises(ValueError, match="naive"):
+        await provider.fetch_correlated_replies(
+            mailbox_binding_id=MAILBOX_ID, bindings=[], since=WHEN.replace(tzinfo=None)
+        )
+
+
+# ---------------------------------------------------------------------------- Outlook proof of non-submission
+
+
+def refused(intent: OutlookSendIntent, reason: OutlookRefusalReason, **overrides: Any) -> OutlookSendReport:
+    return report(intent, OutlookSubmissionState.REFUSED_BEFORE_SEND, refusal_reason=reason, **overrides)
+
+
+def second_intent() -> OutlookSendIntent:
+    return build_send_intent(
+        message(attempt=2),
+        attempt_id=uuid4(),
+        idempotency_key="inquiry-66666666:attempt-2",
+        mailbox_binding_id=MAILBOX_ID,
+        binding=binding(EmailProviderKind.OUTLOOK_LOCAL),
+        created_at=WHEN,
+    )
+
+
+def test_outlook_worker_refusal_of_every_intent_resolves_the_uncertain_inquiry() -> None:
+    intent = intent_for()
+    expired = refused(intent, OutlookRefusalReason.INTENT_EXPIRED)
+    result = reconcile_from_reports(
+        INQUIRY_ID, [intent.rfc_message_id], [expired], worker_online=False, intents=[intent]
+    )
+    assert isinstance(result, ReconcileProvenNotSubmitted)
+    assert result.refused_intent_ids == (intent.intent_id,) and result.refusal_reasons == ("intent_expired",)
+    decision = reconcile_uncertain(reconciliation_evidence(result))
+    assert decision.next_state == InquiryState.FAILED_DEFINITE and decision.release_reservation is False
+    attempt = attempt_evidence(map_outlook_report(intent, expired, observed_at=WHEN))
+    assert should_retry(attempt, now=WHEN).retry  # a new intent, same account, after the preflight
+    with pytest.raises(ValidationError):  # a direct-API search can never prove non-submission
+        ReconcileProvenNotSubmitted(
+            provider=EmailProviderKind.GMAIL_API,
+            inquiry_id=INQUIRY_ID,
+            proof="local_validation_failed_before_submit",
+            refused_intent_ids=(intent.intent_id,),
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no_intents_known",
+        "duplicate_intent",
+        "second_intent_unreported",
+        "searched_id_not_an_intent",
+        "refused_by_another_mailbox",
+        "contradicting_report",
+        "outbox_pending",
+    ],
+)
+def test_outlook_non_submission_is_never_assumed_without_complete_proof(case: str) -> None:
+    intent = intent_for()
+    ids = [intent.rfc_message_id]
+    intents: list[OutlookSendIntent] = [intent]
+    reports = [refused(intent, OutlookRefusalReason.MAILBOX_UNAVAILABLE)]
+    if case == "no_intents_known":
+        intents = []
+    elif case == "duplicate_intent":
+        reports = [refused(intent, OutlookRefusalReason.DUPLICATE_INTENT)]
+    elif case == "second_intent_unreported":
+        intents.append(second_intent())
+    elif case == "searched_id_not_an_intent":
+        ids.append(message(attempt=3).rfc_message_id)
+    elif case == "refused_by_another_mailbox":
+        reports = [refused(intent, OutlookRefusalReason.MAILBOX_UNAVAILABLE, mailbox_binding_id=uuid4())]
+    elif case == "contradicting_report":
+        reports.append(report(intent, OutlookSubmissionState.SEND_CALL_FAILED))
+    elif case == "outbox_pending":
+        reports = [refused(intent, OutlookRefusalReason.MAILBOX_UNAVAILABLE, outbox_pending=Tristate.YES)]
+    result = reconcile_from_reports(INQUIRY_ID, ids, reports, worker_online=True, intents=intents)
+    assert isinstance(result, ReconcileNotFoundYet), case
+    assert reconcile_uncertain(reconciliation_evidence(result)).next_state is None
+
+
+async def test_outlook_provider_reconcile_proves_refusal_of_its_own_intents() -> None:
+    gateway = FakeGateway()
+    provider = outlook(gateway)
+    built = message()
+    handed_over = await provider.send(
+        built, inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY
+    )
+    assert isinstance(handed_over, SendUncertain)
+    intent = gateway.intents[0]
+    gateway.reports = [refused(intent, OutlookRefusalReason.INTENT_EXPIRED)]
+    result = await provider.reconcile(
+        inquiry_id=INQUIRY_ID, rfc_message_ids=[built.rfc_message_id], window=WINDOW
+    )
+    assert isinstance(result, ReconcileProvenNotSubmitted)
+    gateway.reports.append(report(intent, OutlookSubmissionState.SUBMITTED_TO_OUTBOX))
+    gateway.heartbeat = heartbeat()
+    pending = await provider.reconcile(
+        inquiry_id=INQUIRY_ID, rfc_message_ids=[built.rfc_message_id], window=WINDOW
+    )
+    assert isinstance(pending, ReconcileNotFoundYet) and pending.pending_in_drafts_or_outbox == Tristate.YES
+
+
+async def test_outlook_reports_of_another_mailbox_never_vouch_for_this_one() -> None:
+    gateway = FakeGateway()
+    other = uuid4()
+    gateway.account = account_report(mailbox_binding_id=other)
+    gateway.heartbeat = heartbeat().model_copy(update={"mailbox_binding_id": other})
+    verification = await outlook(gateway).verify_account()
+    assert "MAILBOX_BINDING_MISMATCH" in verification.problems and not verification.verified
+    assert "WORKER_OFFLINE" in verification.problems
+    assert (await outlook(gateway).health()).status == ProviderHealthStatus.UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------- registry
+
+
+def test_verification_of_another_binding_never_marks_this_one_verified(http: httpx.AsyncClient) -> None:
+    cfg = settings()
+    candidate = seller_email.candidate_binding_from_settings(
+        cfg, binding_id=BINDING_ID, binding_version=1, display_name=SENDER_NAME
+    )
+    verification = SenderVerification(
+        provider=EmailProviderKind.GMAIL_API,
+        checked_at=WHEN,
+        configured_account_id="other.sender@example.com",
+        configured_from="other.sender@example.com",
+        configured_reply_to=None,
+        configured_display_name="Someone Else",
+        from_status=AliasStatus.PRIMARY,
+        capabilities=gmail(http).capabilities,
+        health=ProviderHealthStatus.OK,
+    )
+    assert verification.verified
+    with pytest.raises(seller_email.SenderSetupError) as exc:
+        seller_email.sender_status_from_verification(cfg, verification, binding=candidate)
+    assert {"ACCOUNT_MISMATCH", "FROM_MISMATCH", "DISPLAY_NAME_MISMATCH"} <= set(exc.value.problems)
+
+
+async def test_outlook_intent_that_cannot_be_built_is_a_local_refusal_never_an_exception() -> None:
+    gateway = FakeGateway()
+    oversized = binding(EmailProviderKind.OUTLOOK_LOCAL, account_id="a" * 321)  # beyond the wire limit
+    outcome = await outlook(gateway, binding_=oversized).send(
+        message(), inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY
+    )
+    assert isinstance(outcome, SendDefiniteFailure)
+    assert outcome.pre_submission and outcome.problems == ("INTENT_INVALID",)
+    assert gateway.intents == []
+
+
+async def test_subject_only_match_never_fetches_or_returns_a_body(
+    http: httpx.AsyncClient, router: respx.MockRouter
+) -> None:
+    """Spec 37.7/37.10: a matching subject alone never correlates (Gmail and Graph pre-filters)."""
+    outbound = message().rfc_message_id
+    subject = "Re: Enquiry about Toyota RAV4 \u2013 ABC-123"
+    router.get(f"{GMAIL_ROOT}/history").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "history": [{"id": "1001", "messagesAdded": [{"message": {"id": "m-subj"}}]}],
+                "historyId": "1001",
+            },
+        )
+    )
+    router.get(f"{GMAIL_ROOT}/messages/m-subj", params={"format": "metadata"}).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "m-subj",
+                "threadId": "t-other",
+                "labelIds": ["INBOX"],
+                "payload": {"headers": gmail_headers(From="stranger@private.example", Subject=subject)},
+            },
+        )
+    )
+    gmail_full = router.get(f"{GMAIL_ROOT}/messages/m-subj", params={"format": "full"}).mock(
+        return_value=httpx.Response(200, json={})
+    )
+    pulled = await gmail(http).fetch_correlated_replies(
+        mailbox_binding_id=MAILBOX_ID, bindings=[reply_binding(outbound)], since=WHEN, cursor="1000"
+    )
+    assert pulled.replies == () and pulled.pending_retry_locators == () and not gmail_full.called
+    graph_binding = reply_binding(outbound).model_copy(
+        update={"provider": EmailProviderKind.MICROSOFT_GRAPH, "provider_thread_ids": ()}
+    )
+    router.get(f"{GRAPH_ME}/mailFolders/inbox/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "value": [
+                    {
+                        "id": "g-subj",
+                        "receivedDateTime": "2026-10-06T11:00:00Z",
+                        "internetMessageHeaders": [
+                            {"name": "From", "value": "stranger@private.example"},
+                            {"name": "Subject", "value": subject},
+                        ],
+                    }
+                ]
+            },
+        )
+    )
+    graph_full = router.get(f"{GRAPH_ME}/messages/g-subj").mock(return_value=httpx.Response(200, json={}))
+    provider = graph(
+        http,
+        FakeTokens(scopes=("Mail.Send", "User.Read", "Mail.Read")),
+        settings=GraphSettings(reply_retrieval_enabled=True),
+    )
+    listed = await provider.fetch_correlated_replies(
+        mailbox_binding_id=MAILBOX_ID, bindings=[graph_binding], since=WHEN
+    )
+    assert listed.replies == () and listed.skipped_unrelated == 1 and not graph_full.called

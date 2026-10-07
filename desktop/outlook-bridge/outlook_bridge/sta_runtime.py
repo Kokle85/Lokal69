@@ -19,6 +19,7 @@ pywin32 is imported lazily; ``ComApi``/``SessionProbe`` are injectable so tests 
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
 import os
@@ -182,7 +183,20 @@ class PythonComApi:  # pragma: no cover - requires pywin32 on Windows
 # Plain-data guard
 # =============================================================================================
 
-_PLAIN_SCALARS: Final = (type(None), bool, int, float, str, bytes, datetime, date, Decimal, UUID, Enum, PurePath)
+_PLAIN_SCALARS: Final = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    datetime,
+    date,
+    Decimal,
+    UUID,
+    Enum,
+    PurePath,
+)
 _COM_MODULE_PREFIXES: Final = ("win32com", "pythoncom", "pywintypes", "win32")
 
 
@@ -190,9 +204,10 @@ def ensure_plain(value: object, *, _depth: int = 0) -> None:
     """Raise ``ComObjectLeak`` unless ``value`` is plain, thread-safe data."""
     if _depth > _MAX_PLAIN_DEPTH:
         raise ComObjectLeak("result nesting too deep to verify")
-    if isinstance(value, _PLAIN_SCALARS):
-        if isinstance(value, datetime | date) or not type(value).__module__.startswith(_COM_MODULE_PREFIXES):
-            return
+    if isinstance(value, _PLAIN_SCALARS) and (
+        isinstance(value, datetime | date) or not type(value).__module__.startswith(_COM_MODULE_PREFIXES)
+    ):
+        return
     if isinstance(value, list | tuple | set | frozenset):
         for item in value:
             ensure_plain(item, _depth=_depth + 1)
@@ -296,24 +311,35 @@ class StaExecutor:
     # ------------------------------------------------------------------ calls
 
     def submit(self, fn: Callable[[], T]) -> Future[T]:
+        """Queue ``fn`` for the STA thread; its result is verified as plain data *there*.
+
+        The check runs on the STA thread before the result is handed to the future, so a COM
+        object returned by mistake never reaches another thread (``ComObjectLeak`` instead).
+        """
         if not self.running or self._stop.is_set():
             raise StaNotRunning("STA thread is not running")
+
+        def verified() -> T:
+            result = fn()
+            ensure_plain(result)
+            return result
+
         future: Future[T] = Future()
-        self._tasks.put(_Task(fn, future))
+        self._tasks.put(_Task(verified, future))
         return future
 
     def call(self, fn: Callable[[], T], *, timeout: float = 120.0) -> T:
         """Run ``fn`` on the STA thread and return its (verified plain) result."""
         if self.on_sta_thread():
             result = fn()
-        else:
-            future = self.submit(fn)
-            try:
-                result = future.result(timeout)
-            except FutureTimeout:
-                raise StaTimeout("Outlook call timed out on the STA thread") from None
-        ensure_plain(result)
-        return result
+            ensure_plain(result)
+            return result
+        future = self.submit(fn)
+        try:
+            return future.result(timeout)
+        except FutureTimeout:
+            future.cancel()  # not started yet: it never runs; already running: result discarded
+            raise StaTimeout("Outlook call timed out on the STA thread") from None
 
     # ------------------------------------------------------------------ thread body
 
@@ -344,10 +370,9 @@ class StaExecutor:
         finally:
             self._drain_pending()
             for hook in self._shutdown_hooks:
-                try:
+                # Releasing COM references must not block shutdown.
+                with contextlib.suppress(Exception):
                     hook()
-                except Exception:  # noqa: S110 - releasing COM references must not block shutdown
-                    pass
             self._com.co_uninitialize()
 
     def _drain_pending(self) -> None:

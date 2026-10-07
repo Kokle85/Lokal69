@@ -15,8 +15,10 @@ from pydantic import ValidationError
 from suv_deals.domain.seller_templates import (
     RenderedMessage,
     build_vehicle_label,
+    message_body_hash,
     render,
     render_preview_mk,
+    rendering_problems,
     validate_scope,
 )
 from suv_deals.integrations.mime_builder import (
@@ -33,6 +35,7 @@ from suv_deals.integrations.mime_builder import (
     built_message_problems,
     inquiry_message_id,
     inquiry_ref_value,
+    inquiry_scope_problems,
     mailbox,
     parse_inquiry_message_id,
     parse_inquiry_ref,
@@ -452,3 +455,74 @@ def test_header_values_report_unfolded_values() -> None:
     assert values["Message-ID"] == f"<inquiry-{INQUIRY_ID}.1@example.com>"
     assert values["Content-Transfer-Encoding"] == "quoted-printable"
     assert "Reply-To" not in values
+
+
+# ------------------------------------------------------------------------------ review regressions
+
+
+def test_hand_built_in_scope_wording_is_never_buildable() -> None:
+    """Only the exact rendering of a registered template is sendable, even inside the scope."""
+    source = rendered("seller_initial_en_v1")
+    body = source.body.replace("Hello,", "Good day,")
+    edited = source.model_copy(update={"body": body, "body_hash": message_body_hash(source.subject, body)})
+    assert validate_scope(edited).ok  # the wording alone would pass the scope validator ...
+    assert "NOT_TEMPLATE_RENDERING" in rendering_problems(edited)  # ... but it is not a template
+    with pytest.raises(MimeBuildError) as exc:
+        build_inquiry_message(
+            edited,
+            inquiry_id=INQUIRY_ID,
+            attempt_number=1,
+            sender=mailbox(SENDER, SENDER_NAME),
+            recipient_address=SELLER,
+            reply_to_address=None,
+            date=WHEN,
+        )
+    assert "NOT_TEMPLATE_RENDERING" in exc.value.problems
+
+
+@pytest.mark.parametrize("template_id", TEMPLATES)
+def test_inquiry_carries_its_exact_rendering_and_passes_the_scope_recheck(template_id: str) -> None:
+    message = built(template_id, reply_to="replies@example.com")
+    assert message.rendered == rendered(template_id)
+    assert inquiry_scope_problems(message) == ()
+    restored = BuiltMessage.model_validate(message.model_dump())
+    assert restored == message and inquiry_scope_problems(restored) == ()
+
+
+def test_scope_recheck_refuses_free_text_and_swapped_renderings() -> None:
+    free_text = build_message(
+        OutboundInquiryMessage(
+            inquiry_id=INQUIRY_ID,
+            attempt_number=1,
+            sender=mailbox(SENDER, "Vasko K"),
+            recipient=mailbox(SELLER),
+            subject="Offer for your Toyota RAV4",
+            body="I will pay 3000 EUR cash today.\n\nVasko K",
+            date=WHEN,
+        )
+    )
+    assert free_text.rendered is None
+    assert inquiry_scope_problems(free_text) == ("NOT_A_TEMPLATE_INQUIRY",)
+    genuine = built("seller_initial_de_v1")
+    other = rendered("seller_initial_it_v1")
+    swapped = genuine.model_copy(update={"rendered": other})  # bypasses validation on purpose
+    problems = inquiry_scope_problems(swapped)
+    assert "BODY_HASH_MISMATCH" in problems
+    with pytest.raises(ValidationError):
+        BuiltMessage.model_validate({**genuine.model_dump(), "rendered": other.model_dump()})
+    preview = render_preview_mk(rendered())
+    with pytest.raises(ValidationError):
+        BuiltMessage.model_validate({**genuine.model_dump(), "rendered": preview.model_dump()})
+
+
+def test_reply_to_can_never_be_the_seller() -> None:
+    with pytest.raises(ValidationError):
+        built(reply_to=SELLER)
+    with pytest.raises(ValidationError):
+        built(reply_to=SELLER.upper().replace("AUTOHAUS-EXAMPLE.DE", "autohaus-example.de"))
+
+
+@pytest.mark.parametrize("address", ["victim%other.example@relay.example", "a!b@example.com"])
+def test_source_route_hacks_in_addresses_are_rejected(address: str) -> None:
+    with pytest.raises(MimeBuildError):
+        mailbox(address)

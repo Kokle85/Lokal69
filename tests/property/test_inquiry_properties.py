@@ -5,6 +5,7 @@ All generated listings, sellers, addresses and texts are SYNTHETIC.
 
 from __future__ import annotations
 
+import heapq
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -41,6 +42,7 @@ from suv_deals.domain.inquiries import (
     DuplicateDecision,
     ExistingInquiry,
     InquiryReadinessInputs,
+    ListingFactsSnapshot,
     QuotaDebit,
     RateCapPolicy,
     SenderStatus,
@@ -207,6 +209,51 @@ def test_rate_caps_are_exact_rolling_ceilings(seconds: list[int], cap24: int, ca
     assert not evaluate_rate_caps(debits, now=nxt - timedelta(microseconds=1), policy=policy).allowed
 
 
+reservations = st.lists(
+    st.tuples(
+        st.integers(min_value=0, max_value=20 * 24 * 60),  # reservation attempt (minutes)
+        st.integers(min_value=0, max_value=10 * 24 * 60),  # dispatch delay (offline/pause/hold)
+    ),
+    max_size=14,
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(reservations)
+def test_transmissions_never_exceed_the_rolling_ceilings(attempts: list[tuple[int, int]]) -> None:
+    """Reservation-time caps plus the dispatch-time re-check (own debit excluded, every debit
+    counted at its send attempt) keep *sent* inquiries within 2 per 24 h and 5 per 15 days, however
+    long reservations wait in the queue (spec 37.5)."""
+    policy = RateCapPolicy()
+    debits: dict[UUID, QuotaDebit] = {}
+    events: list[tuple[datetime, int, UUID, int]] = []  # (time, kind 0=reserve 1=dispatch, id, delay)
+    for n, (minute, delay) in enumerate(attempts):
+        events.append((NOW + timedelta(minutes=minute), 0, UUID(int=n + 1), delay))
+    heapq.heapify(events)
+    sent: list[datetime] = []
+    steps = 0
+    while events and steps < 500:
+        steps += 1
+        when, kind, inquiry_id, delay = heapq.heappop(events)
+        if kind == 0:
+            if evaluate_rate_caps(list(debits.values()), now=when, policy=policy).allowed:
+                debits[inquiry_id] = QuotaDebit(inquiry_id=inquiry_id, at=when)
+                heapq.heappush(events, (when + timedelta(minutes=delay), 1, inquiry_id, 0))
+            continue
+        decision = evaluate_rate_caps(
+            list(debits.values()), now=when, policy=policy, exclude_inquiry_id=inquiry_id
+        )
+        if decision.allowed:
+            debits[inquiry_id] = debits[inquiry_id].model_copy(update={"send_attempted_at": when})
+            sent.append(when)
+        else:
+            assert decision.next_allowed_at is not None and decision.next_allowed_at > when
+            heapq.heappush(events, (decision.next_allowed_at, 1, inquiry_id, 0))
+    for moment in sent:
+        assert sum(1 for t in sent if moment - WINDOW_24H < t <= moment) <= policy.max_per_24h
+        assert sum(1 for t in sent if moment - WINDOW_15D < t <= moment) <= policy.max_per_15d
+
+
 # ---------------------------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------------------------
@@ -354,6 +401,7 @@ RECIPIENT = verify_recipient(
         evidence_url=URL,
         extraction_location=ExtractionLocation.LISTING_CONTACT_BLOCK,
         extraction_excerpt="verkauf@autohaus-example.invalid",
+        distinct_addresses_on_page=1,
         seller=SELLER,
         observed_at=NOW - timedelta(hours=2),
         verified_at=NOW - timedelta(hours=1),
@@ -365,6 +413,14 @@ LANGUAGE = resolve_inquiry_language(None, [_fragment("de", True, False)])
 BASE: dict[str, Any] = {
     "as_of": NOW,
     "listing_id": LISTING,
+    "listing_facts": ListingFactsSnapshot(
+        listing_id=LISTING,
+        revision_number=1,
+        semantic_hash="a" * 64,
+        price_amount_minor=275000,
+        price_currency="EUR",
+        availability=Availability.AVAILABLE,
+    ),
     "authorization": AUTH,
     "identity": IDENTITY,
     "screening": ScreeningResult(

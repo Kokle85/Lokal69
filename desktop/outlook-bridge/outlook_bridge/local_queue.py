@@ -7,8 +7,9 @@ binding; opening it for another mailbox fails (``MailboxMismatch``).
 Durability rules (spec 37.6/37.8):
 
 - A binding page and its sync cursor are committed atomically; a binding for another mailbox
-  rolls the whole page back. Versions only grow, a tombstone is final, and two different payloads
-  under one version fail closed (tombstoned) until the server publishes a newer version.
+  rolls the whole page back. Versions only grow and a server tombstone is final. Two different
+  payloads under one version fail closed: the binding is tombstoned locally (a *conflict*
+  tombstone) until the server publishes a strictly newer version, which then replaces it.
 - An item's processing outcome and its upload-backlog entry (or bounded pending locator) are
   committed in one transaction. Folder scan watermarks advance only after the scan's items are
   committed; the *acknowledged* watermark never passes an item that the server has not yet
@@ -17,11 +18,15 @@ Durability rules (spec 37.6/37.8):
   sender or header. Pending reply-before-binding locators keep EntryID/StoreID, the Internet
   Message-ID and *hashes* of the referenced Message-IDs, nothing else, for a bounded window.
 - Send intents are recorded before any claim/transmission and an ``attempting`` row is
-  committed before ``MailItem.Send``; an intent id is never attempted twice.
+  committed before ``MailItem.Send``; an intent id is never attempted twice. The ``attempting``
+  commit re-checks, in the same write transaction, that no other intent of the inquiry was
+  attempted and that the local ceilings still hold, and intent states only move forward
+  (an attempted intent can never be reported as "refused before send").
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -36,11 +41,10 @@ from pathlib import Path
 from typing import Any, Final
 from uuid import UUID
 
+from outlook_bridge.errors import LocalStoreError, MailboxMismatch
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.enums import EmailProviderKind
-from suv_deals.domain.replies import InquiryBinding, InquiryBindingState
-
-from outlook_bridge.errors import LocalStoreError, MailboxMismatch
+from suv_deals.domain.replies import InquiryBinding, InquiryBindingState, normalize_message_id
 
 SCHEMA_VERSION: Final = 1
 _BUSY_TIMEOUT_MS: Final = 10_000
@@ -213,6 +217,20 @@ class IntentState(StrEnum):
 ATTEMPTED_INTENT_STATES: Final = frozenset(
     {IntentState.ATTEMPTING, IntentState.SEND_FAILED, IntentState.SUBMITTED, IntentState.CONFIRMED}
 )
+_ATTEMPTED_SQL: Final = "('attempting', 'confirmed', 'send_failed', 'submitted')"
+#: Allowed ``finish_intent`` transitions: forward only. ``refused`` (proof that ``.Send`` was never
+#: called) is reachable only from ``received`` or from ``attempting`` when Outlook refused the item
+#: before ``.Send``; nothing that may have been submitted can ever be re-labelled as refused.
+_INTENT_TRANSITIONS: Final[dict[IntentState, frozenset[IntentState]]] = {
+    IntentState.RECEIVED: frozenset({IntentState.REFUSED}),
+    IntentState.ATTEMPTING: frozenset(
+        {IntentState.REFUSED, IntentState.SEND_FAILED, IntentState.SUBMITTED, IntentState.CONFIRMED}
+    ),
+    IntentState.SEND_FAILED: frozenset({IntentState.SUBMITTED, IntentState.CONFIRMED}),
+    IntentState.SUBMITTED: frozenset({IntentState.CONFIRMED}),
+    IntentState.REFUSED: frozenset(),
+    IntentState.CONFIRMED: frozenset(),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,7 +453,8 @@ class LocalStore:
     def set_runtime(self, key: str, value: str) -> None:
         with self._tx() as db:
             db.execute(
-                "insert into runtime (key, value) values (?, ?) on conflict (key) do update set value = excluded.value",
+                "insert into runtime (key, value) values (?, ?) on conflict (key) do update set value ="
+                " excluded.value",
                 (key, value),
             )
 
@@ -457,7 +476,8 @@ class LocalStore:
 
     def binding_sync_status(self) -> dict[str, Any]:
         row = self._db.execute(
-            "select cursor is not null, last_page_at, last_complete_at, pages, anomalies from binding_sync where id = 1"
+            "select cursor is not null, last_page_at, last_complete_at, pages, anomalies from binding_sync"
+            " where id = 1"
         ).fetchone()
         counts = dict(self._db.execute("select state, count(*) from bindings group by state").fetchall())
         return {
@@ -495,20 +515,24 @@ class LocalStore:
                 if row is not None:
                     version, state, payload = int(row[0]), str(row[1]), row[2]
                     if state == InquiryBindingState.TOMBSTONED:
-                        stale += 1
-                        continue  # a tombstone is final
-                    previous = InquiryBinding.model_validate_json(payload)
-                    if record.binding_version < version:
-                        stale += 1
-                        continue
-                    if record.binding_version == version:
-                        if record.binding is not None and _binding_payload(record.binding) == payload:
+                        # A server tombstone is final; a local *conflict* tombstone yields to a
+                        # strictly newer server version (which is then applied like a new binding).
+                        if not (record.binding_version > version and self._conflict_tombstone(db, key)):
+                            stale += 1
                             continue
-                        conflicts += 1
-                        self._tombstone(db, record.inquiry_id, version, previous, now)
-                        tombstoned.append(record.inquiry_id)
-                        db.execute("update binding_sync set anomalies = anomalies + 1 where id = 1")
-                        continue
+                    else:
+                        previous = InquiryBinding.model_validate_json(payload)
+                        if record.binding_version < version:
+                            stale += 1
+                            continue
+                        if record.binding_version == version:
+                            if record.binding is not None and _binding_payload(record.binding) == payload:
+                                continue
+                            conflicts += 1
+                            self._tombstone(db, record.inquiry_id, version, previous, now, conflict=True)
+                            tombstoned.append(record.inquiry_id)
+                            db.execute("update binding_sync set anomalies = anomalies + 1 where id = 1")
+                            continue
                 if record.state == InquiryBindingState.TOMBSTONED or record.binding is None:
                     self._tombstone(db, record.inquiry_id, record.binding_version, previous, now)
                     tombstoned.append(record.inquiry_id)
@@ -522,13 +546,20 @@ class LocalStore:
                     " values (?, ?, ?, ?, null, ?) on conflict (inquiry_id) do update set"
                     " binding_version = excluded.binding_version, state = excluded.state,"
                     " payload = excluded.payload, revoked = null, updated_at = excluded.updated_at",
-                    (key, record.binding_version, record.binding.state.value, _binding_payload(record.binding), ts(now)),
+                    (
+                        key,
+                        record.binding_version,
+                        record.binding.state.value,
+                        _binding_payload(record.binding),
+                        ts(now),
+                    ),
                 )
                 applied += 1
             advanced = next_cursor is not None
             db.execute(
                 "update binding_sync set cursor = coalesce(?, cursor), last_page_at = ?,"
-                " last_complete_at = case when ? then ? else last_complete_at end, pages = pages + 1 where id = 1",
+                " last_complete_at = case when ? then ? else last_complete_at end, pages = pages + 1 where"
+                " id = 1",
                 (next_cursor, ts(now), 1 if complete else 0, ts(now)),
             )
         return BindingApplyResult(
@@ -541,25 +572,74 @@ class LocalStore:
         )
 
     @staticmethod
+    def _conflict_tombstone(db: sqlite3.Connection, inquiry_id: str) -> bool:
+        row = db.execute("select revoked from bindings where inquiry_id = ?", (inquiry_id,)).fetchone()
+        if row is None or not row[0]:
+            return False
+        info = json.loads(row[0])
+        return isinstance(info, dict) and info.get("conflict") is True
+
+    @staticmethod
     def _tombstone(
-        db: sqlite3.Connection, inquiry_id: UUID, version: int, previous: InquiryBinding | None, now: datetime
+        db: sqlite3.Connection,
+        inquiry_id: UUID,
+        version: int,
+        previous: InquiryBinding | None,
+        now: datetime,
+        *,
+        conflict: bool = False,
     ) -> None:
         revoked = None
         if previous is not None:
-            revoked = json.dumps(
-                {"provider": previous.provider.value, "message_ids": sorted(previous.all_message_ids())},
-                separators=(",", ":"),
-            )
+            info: dict[str, Any] = {
+                "provider": previous.provider.value,
+                "message_ids": sorted(previous.all_message_ids()),
+            }
+            if conflict:
+                info["conflict"] = True
+            revoked = json.dumps(info, separators=(",", ":"))
         db.execute(
             "insert into bindings (inquiry_id, binding_version, state, payload, revoked, updated_at)"
             " values (?, ?, 'tombstoned', null, ?, ?) on conflict (inquiry_id) do update set"
-            " binding_version = max(bindings.binding_version, excluded.binding_version), state = 'tombstoned',"
-            " payload = null, revoked = coalesce(excluded.revoked, bindings.revoked), updated_at = excluded.updated_at",
+            " binding_version = max(bindings.binding_version, excluded.binding_version), state ="
+            " 'tombstoned',"
+            " payload = null, revoked = coalesce(excluded.revoked, json_remove(bindings.revoked,"
+            " '$.conflict')), updated_at = excluded.updated_at",
             (str(inquiry_id), version, revoked, ts(now)),
         )
 
+    def known_message_id_hashes(self) -> frozenset[str]:
+        """Hashes of the outbound/send-intent Message-IDs of all usable (non-tombstoned) bindings."""
+        hashes: set[str] = set()
+        for (payload,) in self._db.execute("select payload from bindings where state <> 'tombstoned'"):
+            binding = InquiryBinding.model_validate_json(payload)
+            hashes.update(message_id_hash(message_id) for message_id in binding.all_message_ids())
+        return frozenset(hashes)
+
+    def own_sent_message_id_hashes(self) -> frozenset[str]:
+        """Hashes of the Message-IDs Outlook actually used for this worker's sent inquiries.
+
+        When Outlook does not keep the intent's ``<inquiry-...>`` Message-ID it assigns its own;
+        a reply referencing that observed id is a reply to this system's inquiry even before the
+        backend adds it to the binding, so an unresolved one is surfaced as a matching gap.
+        """
+        hashes: set[str] = set()
+        for (observed,) in self._db.execute(
+            "select observed_message_id from send_intents where observed_message_id is not null"
+        ):
+            normalized = normalize_message_id(str(observed))
+            if normalized is not None:
+                hashes.add(message_id_hash(normalized))
+        return frozenset(hashes)
+
     def bindings_for_matching(self) -> tuple[InquiryBinding, ...]:
-        """Usable bindings plus tombstones carrying the revoked ids (they never grant access)."""
+        """Usable bindings plus server tombstones carrying the revoked ids (they never grant access).
+
+        A local *conflict* tombstone (two payloads under one version) is left out entirely: a
+        reply to it then matches nothing and is kept only as a bounded pending locator, so it is
+        neither uploaded while the conflict lasts nor discarded for good once the server publishes
+        a newer version (the reply-before-binding retry then re-reads it).
+        """
         result: list[InquiryBinding] = []
         for inquiry_id, version, state, payload, revoked in self._db.execute(
             "select inquiry_id, binding_version, state, payload, revoked from bindings order by inquiry_id"
@@ -568,6 +648,8 @@ class LocalStore:
                 result.append(InquiryBinding.model_validate_json(payload))
                 continue
             info = json.loads(revoked) if revoked else {"provider": EmailProviderKind.OUTLOOK_LOCAL.value}
+            if info.get("conflict") is True:
+                continue
             ids = tuple(info.get("message_ids", ()))[:20]
             result.append(
                 InquiryBinding(
@@ -591,7 +673,8 @@ class LocalStore:
 
     def processed(self, key_hash: str) -> ProcessedRow | None:
         row = self._db.execute(
-            "select key_hash, outcome, inquiry_id, received_at, first_seen_at, last_seen_at, entry_id, store_id,"
+            "select key_hash, outcome, inquiry_id, received_at, first_seen_at, last_seen_at, entry_id,"
+            " store_id,"
             " folder_key from processed where key_hash = ?",
             (key_hash,),
         ).fetchone()
@@ -631,12 +714,14 @@ class LocalStore:
         backlog_id: int | None = None
         with self._tx() as db:
             db.execute(
-                "insert into processed (key_hash, outcome, inquiry_id, received_at, first_seen_at, last_seen_at,"
+                "insert into processed (key_hash, outcome, inquiry_id, received_at, first_seen_at,"
+                " last_seen_at,"
                 " entry_id, store_id, folder_key) values (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " on conflict (key_hash) do update set outcome = excluded.outcome,"
                 " inquiry_id = coalesce(excluded.inquiry_id, processed.inquiry_id),"
                 " received_at = coalesce(processed.received_at, excluded.received_at),"
-                " last_seen_at = excluded.last_seen_at, entry_id = coalesce(excluded.entry_id, processed.entry_id),"
+                " last_seen_at = excluded.last_seen_at, entry_id = coalesce(excluded.entry_id,"
+                " processed.entry_id),"
                 " store_id = coalesce(excluded.store_id, processed.store_id),"
                 " folder_key = coalesce(excluded.folder_key, processed.folder_key)",
                 (
@@ -653,7 +738,8 @@ class LocalStore:
             )
             if backlog is not None:
                 cursor = db.execute(
-                    "insert into upload_backlog (idempotency_key, dedup_key_hash, inquiry_id, binding_version,"
+                    "insert into upload_backlog (idempotency_key, dedup_key_hash, inquiry_id,"
+                    " binding_version,"
                     " folder_key, received_at, request_json, state, created_at, next_attempt_at)"
                     " values (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)"
                     " on conflict (dedup_key_hash) do nothing",
@@ -672,10 +758,13 @@ class LocalStore:
                 backlog_id = cursor.lastrowid if cursor.rowcount else None
             if pending is not None:
                 db.execute(
-                    "insert into pending_matches (key_hash, internet_message_id, entry_id, store_id, folder_key,"
+                    "insert into pending_matches (key_hash, internet_message_id, entry_id, store_id,"
+                    " folder_key,"
                     " received_at, reference_hashes, own_reference, first_seen_at, retry_until, attempts)"
                     " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict (key_hash) do update set"
-                    " entry_id = excluded.entry_id, store_id = excluded.store_id, folder_key = excluded.folder_key,"
+                    " entry_id = excluded.entry_id, store_id = excluded.store_id, folder_key ="
+                    " excluded.folder_key,"
+                    " own_reference = max(pending_matches.own_reference, excluded.own_reference),"
                     " attempts = pending_matches.attempts + 1",
                     (
                         pending.key_hash,
@@ -707,7 +796,8 @@ class LocalStore:
                 return False
             changed = (row[0], row[1], row[2]) != (entry_id, store_id, folder_key)
             db.execute(
-                "update processed set last_seen_at = ?, entry_id = ?, store_id = ?, folder_key = ? where key_hash = ?",
+                "update processed set last_seen_at = ?, entry_id = ?, store_id = ?, folder_key = ? where"
+                " key_hash = ?",
                 (ts(now), entry_id, store_id, folder_key, key_hash),
             )
             if changed:
@@ -717,7 +807,8 @@ class LocalStore:
                     (key_hash, entry_id, store_id, folder_key, ts(now)),
                 )
                 db.execute(
-                    "update pending_matches set entry_id = ?, store_id = ?, folder_key = ? where key_hash = ?",
+                    "update pending_matches set entry_id = ?, store_id = ?, folder_key = ? where key_hash"
+                    " = ?",
                     (entry_id, store_id, folder_key, key_hash),
                 )
             return changed
@@ -732,7 +823,10 @@ class LocalStore:
         ]
 
     def outcome_counts(self) -> dict[str, int]:
-        return {str(k): int(v) for k, v in self._db.execute("select outcome, count(*) from processed group by outcome")}
+        return {
+            str(k): int(v)
+            for k, v in self._db.execute("select outcome, count(*) from processed group by outcome")
+        }
 
     # ------------------------------------------------------------------ item read failures
 
@@ -740,10 +834,13 @@ class LocalStore:
         with self._tx() as db:
             db.execute(
                 "insert into item_failures (entry_hash, failures, last_at) values (?, 1, ?)"
-                " on conflict (entry_hash) do update set failures = item_failures.failures + 1, last_at = excluded.last_at",
+                " on conflict (entry_hash) do update set failures = item_failures.failures + 1, last_at ="
+                " excluded.last_at",
                 (entry_hash, ts(now)),
             )
-            row = db.execute("select failures from item_failures where entry_hash = ?", (entry_hash,)).fetchone()
+            row = db.execute(
+                "select failures from item_failures where entry_hash = ?", (entry_hash,)
+            ).fetchone()
         return int(row[0]) if row else 1
 
     # ------------------------------------------------------------------ pending locators
@@ -769,12 +866,10 @@ class LocalStore:
     )
 
     def pending_locators(self, *, limit: int = 10_000) -> list[PendingLocator]:
+        query = f"select {self._PENDING_COLUMNS} from pending_matches"  # noqa: S608 - fixed column list
         return [
             self._pending_from_row(r)
-            for r in self._db.execute(
-                f"select {self._PENDING_COLUMNS} from pending_matches order by first_seen_at limit ?",  # noqa: S608
-                (limit,),
-            )
+            for r in self._db.execute(query + " order by first_seen_at limit ?", (limit,))
         ]
 
     def pending_matching(self, message_id_hashes: Iterable[str], *, limit: int = 500) -> list[PendingLocator]:
@@ -787,6 +882,17 @@ class LocalStore:
         row = self._db.execute("select count(*) from pending_matches").fetchone()
         return int(row[0]) if row else 0
 
+    def _with_own_sent(self, items: Sequence[PendingLocator]) -> list[PendingLocator]:
+        """Mark locators that reference an id Outlook actually used for one of our sent inquiries
+        (known only after the locator was created) as replies to this system's Message-IDs."""
+        own_sent = self.own_sent_message_id_hashes()
+        return [
+            item
+            if item.own_reference or not item.reference_hashes & own_sent
+            else dataclasses.replace(item, own_reference=True)
+            for item in items
+        ]
+
     def take_expired_pending(self, now: datetime) -> list[PendingLocator]:
         """Remove and return locators whose bounded retry window has elapsed."""
         with self._tx() as db:
@@ -794,7 +900,7 @@ class LocalStore:
                 f"select {self._PENDING_COLUMNS} from pending_matches where retry_until <= ?",  # noqa: S608
                 (ts(now),),
             ).fetchall()
-            expired = [self._pending_from_row(r) for r in rows]
+            expired = self._with_own_sent([self._pending_from_row(r) for r in rows])
             for item in expired:
                 db.execute("delete from pending_matches where key_hash = ?", (item.key_hash,))
                 outcome = Outcome.MATCHING_GAP if item.own_reference else Outcome.UNRELATED
@@ -809,7 +915,9 @@ class LocalStore:
         excess = self.pending_count() - capacity
         if excess <= 0:
             return []
-        candidates = sorted(self.pending_locators(), key=lambda p: (p.own_reference, p.first_seen_at))[:excess]
+        candidates = sorted(
+            self._with_own_sent(self.pending_locators()), key=lambda p: (p.own_reference, p.first_seen_at)
+        )[:excess]
         with self._tx() as db:
             for item in candidates:
                 db.execute("delete from pending_matches where key_hash = ?", (item.key_hash,))
@@ -823,7 +931,8 @@ class LocalStore:
     # ------------------------------------------------------------------ upload backlog
 
     _BACKLOG_COLUMNS: Final = (
-        "id, idempotency_key, dedup_key_hash, inquiry_id, binding_version, folder_key, received_at, request_json,"
+        "id, idempotency_key, dedup_key_hash, inquiry_id, binding_version, folder_key, received_at,"
+        " request_json,"
         " state, created_at, attempts, next_attempt_at, last_error, reply_id, acked_at"
     )
 
@@ -870,7 +979,8 @@ class LocalStore:
     ) -> None:
         with self._tx() as db:
             db.execute(
-                "update upload_backlog set state = 'acked', reply_id = ?, duplicate = ?, request_id = ?, acked_at = ?,"
+                "update upload_backlog set state = 'acked', reply_id = ?, duplicate = ?, request_id = ?,"
+                " acked_at = ?,"
                 " attempts = attempts + 1, last_error = null where id = ? and state = 'pending'",
                 (str(reply_id), 1 if duplicate else 0, request_id, ts(now), backlog_id),
             )
@@ -883,12 +993,15 @@ class LocalStore:
                 (ts(next_attempt_at), error_code[:64], backlog_id),
             )
 
-    def mark_upload_final(self, backlog_id: int, *, state: BacklogState, error_code: str, now: datetime) -> None:
+    def mark_upload_final(
+        self, backlog_id: int, *, state: BacklogState, error_code: str, now: datetime
+    ) -> None:
         if state in (BacklogState.PENDING, BacklogState.ACKED):
             raise LocalStoreError("final upload states are rejected/conflict/revoked")
         with self._tx() as db:
             db.execute(
-                "update upload_backlog set state = ?, last_error = ?, attempts = attempts + 1, acked_at = null"
+                "update upload_backlog set state = ?, last_error = ?, attempts = attempts + 1, acked_at ="
+                " null"
                 " where id = ? and state = 'pending'",
                 (state.value, error_code[:64], backlog_id),
             )
@@ -900,19 +1013,23 @@ class LocalStore:
     def update_upload_request(self, backlog_id: int, *, binding_version: int, request_json: str) -> None:
         with self._tx() as db:
             db.execute(
-                "update upload_backlog set binding_version = ?, request_json = ? where id = ? and state = 'pending'",
+                "update upload_backlog set binding_version = ?, request_json = ? where id = ? and state ="
+                " 'pending'",
                 (binding_version, request_json, backlog_id),
             )
 
     def pending_backlog_for_folder(self, folder_key: str) -> tuple[int, datetime | None]:
         row = self._db.execute(
-            "select count(*), min(received_at) from upload_backlog where folder_key = ? and state = 'pending'",
+            "select count(*), min(received_at) from upload_backlog where folder_key = ? and state ="
+            " 'pending'",
             (folder_key,),
         ).fetchone()
         return (int(row[0]), parse_ts(row[1])) if row else (0, None)
 
     def backlog_stats(self) -> BacklogStats:
-        counts = dict(self._db.execute("select state, count(*) from upload_backlog group by state").fetchall())
+        counts = dict(
+            self._db.execute("select state, count(*) from upload_backlog group by state").fetchall()
+        )
         oldest = self._db.execute(
             "select min(created_at), min(received_at) from upload_backlog where state = 'pending'"
         ).fetchone()
@@ -961,7 +1078,9 @@ class LocalStore:
 
     def begin_scan(self, folder_key: str, now: datetime) -> None:
         with self._tx() as db:
-            db.execute("update folders set last_scan_started_at = ? where folder_key = ?", (ts(now), folder_key))
+            db.execute(
+                "update folders set last_scan_started_at = ? where folder_key = ?", (ts(now), folder_key)
+            )
 
     def finish_scan(
         self,
@@ -974,7 +1093,9 @@ class LocalStore:
     ) -> None:
         """Advance the scan watermark (monotonic) only for a complete scan."""
         with self._tx() as db:
-            row = db.execute("select scan_watermark from folders where folder_key = ?", (folder_key,)).fetchone()
+            row = db.execute(
+                "select scan_watermark from folders where folder_key = ?", (folder_key,)
+            ).fetchone()
             if row is None:
                 raise LocalStoreError("unknown folder checkpoint")
             current = parse_ts(row[0])
@@ -983,7 +1104,8 @@ class LocalStore:
                 watermark = new_watermark
             db.execute(
                 "update folders set scan_watermark = ?, gap_reasons = ?,"
-                " last_complete_scan_at = case when ? then ? else last_complete_scan_at end where folder_key = ?",
+                " last_complete_scan_at = case when ? then ? else last_complete_scan_at end where"
+                " folder_key = ?",
                 (
                     ts(watermark) if watermark else None,
                     json.dumps(list(dict.fromkeys(gap_reasons))[:30]),
@@ -1012,7 +1134,8 @@ class LocalStore:
     # ------------------------------------------------------------------ send intents
 
     _INTENT_COLUMNS: Final = (
-        "intent_id, inquiry_id, payload_json, state, received_at, attempt_started_at, submitted_at, confirmed_at,"
+        "intent_id, inquiry_id, payload_json, state, received_at, attempt_started_at, submitted_at,"
+        " confirmed_at,"
         " report_json, report_acked, observed_message_id, error_code"
     )
 
@@ -1052,7 +1175,9 @@ class LocalStore:
         wanted = set(states)
         return [r for r in rows if r.state in wanted]
 
-    def record_intent_received(self, *, intent_id: UUID, inquiry_id: UUID, payload_json: str, now: datetime) -> bool:
+    def record_intent_received(
+        self, *, intent_id: UUID, inquiry_id: UUID, payload_json: str, now: datetime
+    ) -> bool:
         """Durably note an intent before anything else; ``False`` if it was already known."""
         with self._tx() as db:
             cursor = db.execute(
@@ -1062,9 +1187,26 @@ class LocalStore:
             )
             return cursor.rowcount == 1
 
-    def begin_attempt(self, intent_id: UUID, now: datetime) -> bool:
-        """``received`` -> ``attempting`` (committed before ``.Send``); never a second attempt."""
+    def begin_attempt(
+        self,
+        intent_id: UUID,
+        now: datetime,
+        *,
+        inquiry_id: UUID | None = None,
+        ceilings: Sequence[tuple[datetime, int]] = (),
+    ) -> bool:
+        """``received`` -> ``attempting`` (committed before ``.Send``); never a second attempt.
+
+        With ``inquiry_id`` the transition also requires that no other intent of that inquiry was
+        attempted, and every ``(since, limit)`` ceiling must still have room - checked inside the
+        same ``BEGIN IMMEDIATE`` write transaction, so two worker processes on this store can
+        never both pass the checks and send.
+        """
         with self._tx() as db:
+            if inquiry_id is not None and self._attempted_elsewhere(db, inquiry_id, intent_id):
+                return False
+            if any(self._attempted_count(db, since) >= limit for since, limit in ceilings):
+                return False
             cursor = db.execute(
                 "update send_intents set state = 'attempting', attempt_started_at = ?"
                 " where intent_id = ? and state = 'received' and attempt_started_at is null",
@@ -1085,9 +1227,18 @@ class LocalStore:
         if state in (IntentState.RECEIVED, IntentState.ATTEMPTING):
             raise LocalStoreError("finish_intent needs a final or evidence state")
         with self._tx() as db:
+            row = db.execute(
+                "select state from send_intents where intent_id = ?", (str(intent_id),)
+            ).fetchone()
+            if row is None:
+                raise LocalStoreError("unknown send intent")
+            current = IntentState(row[0])
+            if state not in _INTENT_TRANSITIONS[current]:
+                raise LocalStoreError(f"send intent cannot move from {current.value} to {state.value}")
             db.execute(
                 "update send_intents set state = ?, report_json = ?, report_acked = 0,"
-                " error_code = coalesce(?, error_code), observed_message_id = coalesce(?, observed_message_id),"
+                " error_code = coalesce(?, error_code), observed_message_id = coalesce(?,"
+                " observed_message_id),"
                 " submitted_at = case when ? = 'submitted' then ? else submitted_at end,"
                 " confirmed_at = case when ? = 'confirmed' then ? else confirmed_at end"
                 " where intent_id = ?",
@@ -1111,33 +1262,66 @@ class LocalStore:
                 (str(intent_id), report_json),
             )
 
-    def attempted_since(self, since: datetime) -> int:
-        row = self._db.execute(
-            "select count(*) from send_intents where attempt_started_at is not null and attempt_started_at >= ?",
+    @staticmethod
+    def _attempted_count(db: sqlite3.Connection, since: datetime) -> int:
+        """Intents that reached (or may have reached) ``.Send`` since ``since``.
+
+        An intent Outlook refused before ``.Send`` (state ``refused``) proves nothing was
+        submitted and does not count against the local ceilings.
+        """
+        row = db.execute(
+            f"select count(*) from send_intents where state in {_ATTEMPTED_SQL}"  # noqa: S608 - constant
+            " and attempt_started_at is not null and attempt_started_at >= ?",
             (ts(since),),
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def attempted_since(self, since: datetime) -> int:
+        return self._attempted_count(self._db, since)
+
+    def inquiry_attempted_elsewhere(self, inquiry_id: UUID, *, intent_id: UUID) -> bool:
+        """Whether another intent of this inquiry already reached ``.Send`` (or may have).
+
+        Only a refusal before any ``.Send`` proves that nothing was submitted; every other
+        attempted state (attempting, send_failed, submitted, confirmed) means a message may be on
+        its way, so a later intent for the same inquiry must never be sent blindly from here.
+        """
+        return self._attempted_elsewhere(self._db, inquiry_id, intent_id)
+
+    @staticmethod
+    def _attempted_elsewhere(db: sqlite3.Connection, inquiry_id: UUID, intent_id: UUID) -> bool:
+        row = db.execute(
+            f"select count(*) from send_intents where state in {_ATTEMPTED_SQL}"  # noqa: S608 - constant
+            " and inquiry_id = ? and intent_id <> ?",
+            (str(inquiry_id), str(intent_id)),
+        ).fetchone()
+        return bool(row and int(row[0]) > 0)
+
     # ------------------------------------------------------------------ gaps
 
-    def open_gap(self, kind: str, started_at: datetime, detail: str | None = None) -> None:
-        """Open a gap of ``kind`` unless one is already open."""
+    def open_gap(self, kind: str, started_at: datetime, detail: str | None = None) -> bool:
+        """Open a gap of ``kind`` unless one is already open; ``True`` when a new gap was opened."""
         with self._tx() as db:
             row = db.execute("select id from gaps where kind = ? and ended_at is null", (kind,)).fetchone()
-            if row is None:
-                db.execute(
-                    "insert into gaps (kind, started_at, detail) values (?, ?, ?)",
-                    (kind, ts(started_at), detail[:120] if detail else None),
-                )
+            if row is not None:
+                return False
+            db.execute(
+                "insert into gaps (kind, started_at, detail) values (?, ?, ?)",
+                (kind, ts(started_at), detail[:120] if detail else None),
+            )
+            return True
 
     def close_gap(self, kind: str, ended_at: datetime) -> None:
         with self._tx() as db:
             db.execute(
-                "update gaps set ended_at = max(started_at, ?), reported = 0 where kind = ? and ended_at is null",
+                "update gaps set ended_at = max(started_at, ?), reported = 0 where kind = ? and ended_at"
+                " is null",
                 (ts(ended_at), kind),
             )
 
-    def record_gap(self, kind: str, started_at: datetime, ended_at: datetime, detail: str | None = None) -> None:
+    def record_gap(
+        self, kind: str, started_at: datetime, ended_at: datetime, detail: str | None = None
+    ) -> None:
         with self._tx() as db:
             db.execute(
                 "insert into gaps (kind, started_at, ended_at, detail) values (?, ?, ?, ?)",
@@ -1154,7 +1338,9 @@ class LocalStore:
                 detail=r[4],
                 reported=bool(r[5]),
             )
-            for r in self._db.execute("select id, kind, started_at, ended_at, detail, reported from gaps order by id")
+            for r in self._db.execute(
+                "select id, kind, started_at, ended_at, detail, reported from gaps order by id"
+            )
         ]
         if since is not None:
             rows = [g for g in rows if g.ended_at is None or g.ended_at >= since]
@@ -1187,10 +1373,12 @@ class LocalStore:
         return int(removed)
 
 
-def backoff_delay(attempts: int, *, base: timedelta = timedelta(seconds=30), cap: timedelta = timedelta(hours=1)) -> timedelta:
+def backoff_delay(
+    attempts: int, *, base: timedelta = timedelta(seconds=30), cap: timedelta = timedelta(hours=1)
+) -> timedelta:
     """Bounded exponential backoff for transient upload failures."""
     exponent = min(max(attempts, 0), 12)
-    return min(cap, base * (2**exponent))
+    return min(cap, base * (1 << exponent))
 
 
 __all__ = [

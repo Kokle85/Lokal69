@@ -33,6 +33,11 @@ from typing import Any, Final, Literal
 from uuid import UUID
 
 from pydantic import ValidationError
+
+from outlook_bridge.errors import UploadBuildError
+from outlook_bridge.local_queue import message_id_hash, sha256_text
+from outlook_bridge.outlook_adapter import AttachmentDigest, MailSnapshot
+from outlook_bridge.wire import is_own_message_id_format
 from suv_deals.domain.enums import EmailProviderKind, MessageLanguage
 from suv_deals.domain.language import detect_text_language
 from suv_deals.domain.listings import sha256_json
@@ -66,15 +71,10 @@ from suv_deals.domain.replies import (
 )
 from suv_deals.errors import AppError
 
-from outlook_bridge.errors import UploadBuildError
-from outlook_bridge.local_queue import message_id_hash, sha256_text
-from outlook_bridge.outlook_adapter import AttachmentDigest, MailSnapshot
-from outlook_bridge.wire import is_own_message_id_format
-
 #: Placeholder digest for attachments that are never uploaded (classification uses metadata only).
 SENTINEL_DIGEST: Final = "0" * 64
-#: Optional domain extensions of the 37.8 request and their defaults; omitted when default so a
-#: matched seller reply is sent in exactly the spec v1.0 shape.
+#: Optional domain extensions of the 37.8 request and their defaults; omitted when default (see
+#: ``wire_payload``) so a matched seller reply is sent in exactly the spec v1.0 shape.
 REQUEST_EXTENSION_DEFAULTS: Final[dict[str, Any]] = {
     "message_type": "seller_reply",
     "correlation_status": "matched",
@@ -150,11 +150,21 @@ def _safe_locator(value: str | None) -> str | None:
 
 
 def wire_payload(request: ReplyIngestRequest) -> dict[str, Any]:
-    """The exact JSON body for ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 shape)."""
+    """The exact JSON body for ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 shape).
+
+    A matched seller reply is sent in exactly the spec's v1.0 shape. The optional domain
+    extensions appear only when they carry information the backend cannot derive itself: a
+    message type other than ``seller_reply`` (auto-reply, bounce, delivery notice), a quarantined
+    possible match with its reasons, and the count of withheld sensitive attachments. Correlation
+    reasons of a *matched* message are omitted: the backend re-derives the match from the
+    headers and its own bindings and never trusts worker-supplied reasons.
+    """
     data = request.model_dump(mode="json", by_alias=True)
+    if data.get("correlation_status") == "matched":
+        data.pop("correlation_reasons", None)
     for key, default in REQUEST_EXTENSION_DEFAULTS.items():
-        if data.get(key) == default:
-            data.pop(key, None)
+        if key in data and data[key] == default:
+            data.pop(key)
     return data
 
 
@@ -170,11 +180,20 @@ def idempotency_key_for(request: ReplyIngestRequest) -> str:
 class LocalMatcher:
     """Turns mailbox snapshots into local decisions and, for correlated replies, uploads."""
 
-    def __init__(self, mailbox_binding_id: UUID, *, retry_window: timedelta) -> None:
+    def __init__(
+        self,
+        mailbox_binding_id: UUID,
+        *,
+        retry_window: timedelta,
+        own_addresses: Sequence[str] = (),
+    ) -> None:
         if retry_window <= timedelta(0):
             raise ValueError("retry window must be positive")
         self._mailbox = mailbox_binding_id
         self._retry_window = retry_window
+        # The mailbox owner's own sender addresses: a copy of a manual reply by the owner in a
+        # seller thread is never a seller reply and stays local (shared correlation rule).
+        self._own_addresses = tuple(own_addresses)
 
     @property
     def mailbox_binding_id(self) -> UUID:
@@ -199,7 +218,9 @@ class LocalMatcher:
         return LocalKey(dedup, sha256_text(dedup), "content_hash", None)
 
     @staticmethod
-    def _attachment_meta(snapshot: MailSnapshot, digests: Mapping[int, AttachmentDigest]) -> tuple[AttachmentMeta, ...]:
+    def _attachment_meta(
+        snapshot: MailSnapshot, digests: Mapping[int, AttachmentDigest]
+    ) -> tuple[AttachmentMeta, ...]:
         metas: list[AttachmentMeta] = []
         for position, info in enumerate(snapshot.attachments):
             digest = digests.get(info.index)
@@ -256,15 +277,20 @@ class LocalMatcher:
         in_junk_folder: bool,
         first_seen_at: datetime,
         now: datetime,
+        own_sent_hashes: frozenset[str] = frozenset(),
     ) -> LocalDecision:
+        """Local decision for one item; ``own_sent_hashes`` are hashed Message-IDs Outlook actually
+        used for this worker's own sent inquiries (``LocalStore.own_sent_message_id_hashes``)."""
         key = self.local_key(snapshot)
         if not is_processable_item(snapshot.ref.message_class):
             return LocalDecision(kind=DecisionKind.NON_MAIL, key=key)
         inbound = self.to_inbound(snapshot, in_junk_folder=in_junk_folder)
-        correlation = correlate_reply(inbound, bindings)
+        correlation = correlate_reply(inbound, bindings, own_addresses=self._own_addresses)
         references = inbound.reference_ids()
         reference_hashes = frozenset(message_id_hash(r) for r in references)
-        own_reference = any(is_own_message_id_format(r) for r in references)
+        own_reference = any(is_own_message_id_format(r) for r in references) or bool(
+            reference_hashes & own_sent_hashes
+        )
         scope = correlation.upload_scope
         if scope in ("full", "quarantine"):
             allowed = [
@@ -365,12 +391,19 @@ class LocalMatcher:
         )
 
     @staticmethod
-    def _require_digest(decision: AttachmentDecision, snapshot: MailSnapshot, hashed: set[int]) -> AttachmentDecision:
+    def _require_digest(
+        decision: AttachmentDecision, snapshot: MailSnapshot, hashed: set[int]
+    ) -> AttachmentDecision:
         if decision.action != AttachmentAction.ALLOW_VEHICLE_DOCUMENT:
             return decision
-        if decision.index < len(snapshot.attachments) and snapshot.attachments[decision.index].index in hashed:
+        if (
+            decision.index < len(snapshot.attachments)
+            and snapshot.attachments[decision.index].index in hashed
+        ):
             return decision
-        return AttachmentDecision(index=decision.index, action=AttachmentAction.REJECT, reasons=("DIGEST_UNAVAILABLE",))
+        return AttachmentDecision(
+            index=decision.index, action=AttachmentAction.REJECT, reasons=("DIGEST_UNAVAILABLE",)
+        )
 
     def _build_fitting(
         self,
@@ -396,9 +429,14 @@ class LocalMatcher:
                 )
             except (ValidationError, AppError) as exc:
                 if "128 KiB" not in str(exc) or step == 7:
-                    raise UploadBuildError("correlated reply cannot be represented as a valid upload") from None
+                    raise UploadBuildError(
+                        "correlated reply cannot be represented as a valid upload"
+                    ) from None
             if step == 0 and len(message.references) > _FIT_REFERENCES:
-                kept = (*message.references[: _FIT_REFERENCES // 2], *message.references[-_FIT_REFERENCES // 2 :])
+                kept = (
+                    *message.references[: _FIT_REFERENCES // 2],
+                    *message.references[-_FIT_REFERENCES // 2 :],
+                )
                 values = dict(message.headers.values)
                 values["references"] = (" ".join(kept),)
                 message = message.model_copy(update={"headers": MessageHeaders(values=values)})

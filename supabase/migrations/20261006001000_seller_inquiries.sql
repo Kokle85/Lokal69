@@ -13,7 +13,9 @@
 -- Database-level guarantees (defence in depth behind domain.inquiries):
 --   * one inquiry per (workspace, canonical vehicle, verified seller entity,
 --     purpose): unique identity hash AND unique identity components, plus one
---     live inquiry per (qualification listing, seller);
+--     live inquiry per (qualification listing, seller), and one initial inquiry
+--     per ACTUAL vehicle/seller pair across cluster confirmations, seller merges
+--     and plausible-but-unresolved cross-site duplicates;
 --   * the state machine of spec 37.5 exactly as domain.inquiries.ALLOWED_TRANSITIONS
 --     (SV002), with guarded edges: reservation and dispatch re-check the kill
 --     switch, mode, authorization version, sender binding, verified recipient
@@ -23,12 +25,18 @@
 --   * at commit, every state carries its evidence (quota debit, committed send
 --     intent, acceptance/failure evidence, correlated reply) - SV003;
 --   * rate caps (owner-reducible ceilings of 2 per rolling 24 h and 5 per rolling
---     15 days) are enforced transactionally on ops.inquiry_quota_ledger; debits
---     of possibly transmitted inquiries are never released;
+--     15 days) are enforced transactionally on ops.inquiry_quota_ledger AND before
+--     every transmission (a debit counts at max(reservation, send attempt)), so a
+--     queued backlog never leaves in a burst; debits of possibly transmitted
+--     inquiries are never released; lifecycle timestamps are database-owned;
+--   * an uncertain attempt is resolved only by positive evidence (Sent Items or
+--     provider hit, a Message-ID-linked inbound message, or a documented
+--     pre-submission proof with no live worker and no pending Outbox item);
 --   * suppression removal is never automatic and needs a matching audit event;
 --   * replies can only be stored for an inquiry that was (possibly) sent, through
---     the active mailbox binding of the inquiry's own sender mailbox, under a
---     published, non-tombstoned binding version;
+--     the active mailbox binding (live credential) of the inquiry's own sender
+--     mailbox, under a published, non-tombstoned binding version; an automatic
+--     match is linked by Message-ID or provider thread, never by subject alone;
 --   * history tables are append-only (SV001); a mail:ingest credential carries
 --     no other scope.
 -- =============================================================================
@@ -454,6 +462,16 @@ create table app.seller_contacts (
   constraint seller_contacts_verified_ck check (
     status <> 'verified'
     or (address is not null and contact_kind is not null and verified_at is not null)),
+  -- Where the verified address was found must fit its kind (domain.seller_contacts.verify_recipient):
+  -- an ad e-mail on the advertisement itself, a relay bound to exactly this listing reference, an
+  -- official dealer contact on a page reached through the listing. Never "other".
+  constraint seller_contacts_verified_location_ck check (
+    status <> 'verified'
+    or (contact_kind = 'ad_email' and extraction_location in ('listing_contact_block', 'listing_description'))
+    or (contact_kind = 'marketplace_relay' and extraction_location = 'listing_relay_contact'
+        and pg_catalog.btrim(relay_listing_reference) = pg_catalog.btrim(listing_reference))
+    or (contact_kind = 'official_dealer_contact'
+        and extraction_location in ('dealer_page_linked_from_listing', 'marketplace_dealer_profile'))),
   constraint seller_contacts_unavailable_ck check (
     status <> 'unavailable'
     or (address is null and evidence_kind in ('contact_form_only', 'contact_reveal_restricted', 'no_email_found'))),
@@ -642,8 +660,15 @@ create table ops.email_sender_bindings (
   constraint email_sender_bindings_alias_ck check (not alias_verified or alias_verified_at is not null),
   -- Never a raw token: a sealed envelope or a scheme:path reference, not both.
   constraint email_sender_bindings_secret_ck check (secret_envelope is null or secret_reference is null),
+  -- integrations.secret_box envelope: format version 0x01, key id 1..255, 12-byte nonce,
+  -- ciphertext + 16-byte GCM tag. A raw token stored as bytes does not have this shape.
   constraint email_sender_bindings_envelope_ck check (
-    secret_envelope is null or pg_catalog.octet_length(secret_envelope) between 16 and 8192),
+    secret_envelope is null
+    or case
+         when pg_catalog.octet_length(secret_envelope) between 31 and 8192
+           then pg_catalog.get_byte(secret_envelope, 0) = 1 and pg_catalog.get_byte(secret_envelope, 1) >= 1
+         else false
+       end),
   constraint email_sender_bindings_reference_ck check (
     secret_reference is null or secret_reference ~ '^[a-z][a-z0-9+.-]{1,30}:[A-Za-z0-9._/-]{1,200}$'),
   constraint email_sender_bindings_health_ck check (health in ('unknown', 'healthy', 'degraded', 'unhealthy')),
@@ -847,8 +872,10 @@ create table app.seller_inquiries (
     (recipient_address is null or app.email_address_ok(recipient_address))
     and (recipient_contact_id is null) = (recipient_address is null)),
   constraint seller_inquiries_recipient_not_sender_ck check (
-    recipient_address is null or sender_from_address is null
-    or pg_catalog.lower(recipient_address) <> pg_catalog.lower(sender_from_address)),
+    recipient_address is null
+    or ((sender_from_address is null or pg_catalog.lower(recipient_address) <> pg_catalog.lower(sender_from_address))
+        and (sender_reply_to_address is null
+             or pg_catalog.lower(recipient_address) <> pg_catalog.lower(sender_reply_to_address)))),
   constraint seller_inquiries_state_ck check (state in (
     'candidate', 'qualifying', 'reserved', 'queued', 'sending', 'accepted', 'held_facts', 'uncertain',
     'suppressed', 'failed_definite', 'cancelled', 'replied', 'bounced', 'seller_opted_out', 'no_reply_yet')),
@@ -1017,7 +1044,29 @@ create table ops.email_delivery_attempts (
          or (outcome = 'uncertain' and reconciled_outcome in ('accepted', 'proven_not_submitted')))
     and (reconciliation_evidence is null
          or (reconciled_outcome is not null and pg_catalog.jsonb_typeof(reconciliation_evidence) = 'object'
-             and pg_catalog.octet_length(reconciliation_evidence::text) <= 16384)))
+             and pg_catalog.octet_length(reconciliation_evidence::text) <= 16384))),
+  -- Reconciliation resolves an uncertain send only on positive evidence, in the shape of
+  -- domain.inquiries.ReconciliationEvidence (reconcile_uncertain): acceptance needs a Sent
+  -- Items/provider hit or a correlated inbound message; non-submission needs a documented
+  -- pre-submission proof with no live worker and no pending Outbox item. An empty search
+  -- ("not_found") is never proof (spec 37.5).
+  constraint email_delivery_attempts_reconciliation_proof_ck check (
+    reconciled_outcome is null
+    or (reconciled_outcome = 'accepted'
+        and coalesce(reconciliation_evidence ->> 'sent_items' = 'found'
+                     or reconciliation_evidence ->> 'provider_search' = 'found'
+                     or reconciliation_evidence -> 'correlated_inbound' = 'true'::jsonb, false))
+    or (reconciled_outcome = 'proven_not_submitted'
+        and coalesce(
+              reconciliation_evidence ->> 'proven_not_submitted' in (
+                'connection_refused_before_submit', 'local_validation_failed_before_submit',
+                'credentials_rejected_before_submit', 'provider_documented_not_sent')
+              and reconciliation_evidence ->> 'worker_alive' = 'no'
+              and reconciliation_evidence ->> 'outbox_pending' = 'no'
+              and coalesce(reconciliation_evidence ->> 'sent_items', 'not_searched') <> 'found'
+              and coalesce(reconciliation_evidence ->> 'provider_search', 'not_searched') <> 'found'
+              and coalesce(reconciliation_evidence -> 'correlated_inbound', 'false'::jsonb) <> 'true'::jsonb,
+              false)))
 );
 -- At most one attempt in flight per inquiry.
 create unique index email_delivery_attempts_running_uidx
@@ -1121,6 +1170,14 @@ create table app.seller_replies (
   from_address text not null,
   in_reply_to text,
   reference_ids text[] not null default '{}',
+  -- Message-IDs of the returned original of a bounce/delivery notice (DSN), which usually
+  -- carries no In-Reply-To (domain.replies.parse_delivery_report().original_message_ids).
+  returned_message_ids text[] not null default '{}',
+  -- Correlation links, computed by the insert trigger (never caller-supplied): the
+  -- In-Reply-To/References/returned original names a Message-ID this system sent or
+  -- published for the inquiry, or the provider thread id is the inquiry's own thread.
+  header_linked boolean not null default false,
+  thread_linked boolean not null default false,
   subject text not null default '',
   sanitized_body text not null,
   body_sanitizer_version text not null,
@@ -1170,6 +1227,12 @@ create table app.seller_replies (
   constraint seller_replies_from_ck check (app.email_address_ok(from_address)),
   constraint seller_replies_in_reply_to_ck check (in_reply_to is null or app.rfc_message_id_ok(in_reply_to)),
   constraint seller_replies_references_ck check (app.rfc_message_id_array_ok(reference_ids, 200)),
+  constraint seller_replies_returned_ids_ck check (app.rfc_message_id_array_ok(returned_message_ids, 20)),
+  -- Never a subject-only (or unlinked) match (spec 37.7): an unquarantined automatic match is
+  -- linked to this inquiry by Message-ID or by its provider thread. Unlinked possible matches
+  -- are stored quarantined and become usable only through a recorded verification.
+  constraint seller_replies_link_ck check (
+    quarantined or correlation_status <> 'matched' or header_linked or thread_linked),
   constraint seller_replies_subject_ck check (
     pg_catalog.length(subject) <= 512 and subject !~ '[[:cntrl:]\u0085  ]'),
   constraint seller_replies_body_ck check (
@@ -1205,6 +1268,9 @@ create table app.seller_replies (
     (correlation_status <> 'quarantined' and message_type not in ('spam', 'ambiguous')
      and conflict_of_reply_id is null)
     or quarantined),
+  -- A verified match is reached only by releasing a quarantined possible match.
+  constraint seller_replies_verified_ck check (
+    correlation_status <> 'verified_match' or quarantine_released_at is not null),
   constraint seller_replies_release_ck check (
     (quarantine_released_at is null and quarantine_released_by is null and quarantine_release_reason is null)
     or (quarantine_released_at is not null and quarantine_released_by is not null and not quarantined
@@ -1532,6 +1598,9 @@ create table app.availability_events (
       else true
     end),
   constraint availability_events_reason_ck check (reason ~ '^[a-z][a-z0-9_]{0,79}$'),
+  -- An absence label is only ever backed by a complete scan (never a lone missing result).
+  constraint availability_events_absence_reason_ck check (
+    reason <> 'not_seen_in_complete_scan' or evidence_kind = 'complete_scan_absence'),
   constraint availability_events_reference_ck check (
     case
       when evidence_kind in ('seller_reported_sold', 'seller_reported_available', 'seller_reported_reserved')
@@ -1609,8 +1678,15 @@ language plpgsql
 set search_path = ''
 as $$
 begin
-  if new.workspace_id <> old.workspace_id or new.created_at <> old.created_at then
+  if new.id <> old.id or new.workspace_id <> old.workspace_id or new.created_at <> old.created_at then
     raise exception using errcode = 'SV004', message = 'seller entity identity is immutable';
+  end if;
+  if old.merged_into_id is null and new.merged_into_id is not null then
+    -- Serialise the merge with reservations/dispatches of the surviving entity (they lock
+    -- its row), so a merge can never slip between a one-inquiry check and its commit.
+    perform 1 from app.seller_entities t
+      where t.workspace_id = new.workspace_id and t.id = new.merged_into_id
+      for update;
   end if;
   if old.merged_into_id is not null
      and (new.merged_into_id is distinct from old.merged_into_id
@@ -1837,11 +1913,93 @@ begin
 end
 $$;
 
+-- Rolling-window quota usage (domain.inquiries.QuotaDebit.counted_at): every unreleased debit
+-- occupies the windows at the later of its reservation and its inquiry's send attempt, so an
+-- inquiry reserved days ago and transmitted now counts now. Re-checked before every
+-- transmission, this keeps SENDS (not only reservations) within the caps: a queued backlog
+-- (sender offline, owner pause) can never leave in a burst. Future-dated debits count.
+create or replace function ops.inquiry_quota_usage(
+  p_workspace_id uuid, p_exclude_inquiry_id uuid, out count_24h integer, out count_15d integer)
+language sql
+stable
+set search_path = ''
+as $$
+  select (pg_catalog.count(*) filter (where u.counted_at > pg_catalog.now() - interval '24 hours'))::integer,
+         (pg_catalog.count(*) filter (where u.counted_at > pg_catalog.now() - interval '15 days'))::integer
+    from (select greatest(q.debited_at, i.send_attempted_at) as counted_at
+            from ops.inquiry_quota_ledger q
+            join app.seller_inquiries i on i.workspace_id = q.workspace_id and i.id = q.inquiry_id
+           where q.workspace_id = p_workspace_id
+             and q.released_at is null
+             and q.inquiry_id is distinct from p_exclude_inquiry_id) as u
+$$;
+comment on function ops.inquiry_quota_usage(uuid, uuid) is
+  'Unreleased quota debits in the rolling 24 h / 15 day windows, counted at max(reservation, send attempt).';
+
+-- One initial inquiry per ACTUAL vehicle/seller pair (spec 37.1, 37.5), across identity and
+-- seller merges: the identity key is unique, but a listing-identity inquiry sent before its
+-- cluster was confirmed, or an inquiry to an entity later merged into this seller, is the same
+-- pair under another key. Returns the first other inquiry of this seller (or of an entity
+-- merged into it) about this vehicle that blocks the phase, else NULL.
+-- The vehicle is the qualifying listing, the cluster's active members, and every active member
+-- of a confirmed OR unreviewed cluster containing the listing (a plausible cross-site duplicate
+-- is held until resolved; a rejected cluster or an unlinked member is not the same car).
+-- 'reserve' is blocked by any reserved, queued or (possibly) transmitted inquiry (merge
+-- reconciliation must cancel an unsent one first); 'dispatch' by a (possibly) transmitted one.
+create or replace function app.seller_inquiry_vehicle_conflict(p app.seller_inquiries, p_phase text)
+returns uuid
+language sql
+stable
+set search_path = ''
+as $$
+  with vehicle_listings as (
+    select p.qualification_listing_id as listing_id
+    union
+    select m.listing_id
+      from app.vehicle_cluster_members m
+     where m.workspace_id = p.workspace_id and m.cluster_id = p.vehicle_cluster_id and m.unlinked_at is null
+    union
+    select m2.listing_id
+      from app.vehicle_cluster_members m1
+      join app.vehicle_clusters c
+        on c.workspace_id = m1.workspace_id and c.id = m1.cluster_id and c.review_status <> 'rejected'
+      join app.vehicle_cluster_members m2
+        on m2.workspace_id = m1.workspace_id and m2.cluster_id = m1.cluster_id and m2.unlinked_at is null
+     where m1.workspace_id = p.workspace_id and m1.listing_id = p.qualification_listing_id
+       and m1.unlinked_at is null
+  )
+  select o.id
+    from app.seller_inquiries o
+    join app.seller_entities e on e.workspace_id = o.workspace_id and e.id = o.seller_entity_id
+   where o.workspace_id = p.workspace_id
+     and o.id <> p.id
+     and (o.seller_entity_id = p.seller_entity_id or e.merged_into_id = p.seller_entity_id)
+     and (o.send_attempted_at is not null
+          or (p_phase = 'reserve'
+              and o.state in ('reserved', 'queued', 'sending', 'accepted', 'uncertain', 'failed_definite',
+                              'no_reply_yet', 'replied', 'bounced', 'seller_opted_out')))
+     and (o.qualification_listing_id in (select v.listing_id from vehicle_listings v)
+          or o.vehicle_listing_id in (select v.listing_id from vehicle_listings v)
+          or o.vehicle_cluster_id = p.vehicle_cluster_id
+          or exists (
+               select 1
+                 from app.vehicle_cluster_members om
+                where om.workspace_id = o.workspace_id and om.cluster_id = o.vehicle_cluster_id
+                  and om.unlinked_at is null
+                  and om.listing_id in (select v.listing_id from vehicle_listings v)))
+   order by o.created_at, o.id
+   limit 1
+$$;
+comment on function app.seller_inquiry_vehicle_conflict(app.seller_inquiries, text) is
+  'Another inquiry of the same seller (family) about the same (or a plausibly same) vehicle that blocks reserve/dispatch.';
+
 -- Re-validation immediately before reservation ('reserve'), queueing ('queue')
 -- and transmission ('dispatch'): spec 37.2 check 6 and 37.5. Raises SV002 for
--- a refused flow and SV003 for an inconsistent reference. Lock order:
--- seller_inquiry_controls (FOR UPDATE to reserve, else FOR SHARE) -> seller_entities
--- (FOR UPDATE, reserve only).
+-- a refused flow and SV003 for an inconsistent reference. Lock order (after the
+-- inquiry row itself): seller_inquiry_controls FOR UPDATE (every phase: it
+-- serialises reservations, dispatches, the quota ledger and a concurrent pause
+-- without share-to-exclusive upgrades) -> seller_entities FOR UPDATE (reserve
+-- and dispatch: serialises one seller's sends and seller merges).
 create or replace function app.seller_inquiry_preflight(p app.seller_inquiries, p_phase text)
 returns void
 language plpgsql
@@ -1851,6 +2009,10 @@ declare
   v_mode text;
   v_kill boolean;
   v_cooldown interval;
+  v_max_24h smallint;
+  v_max_15d smallint;
+  v_usage record;
+  v_conflict uuid;
   v_latest integer;
   v_auth_revoked timestamptz;
   v_auth_effective date;
@@ -1858,6 +2020,7 @@ declare
   v_auth_profiles text[];
   v_found boolean;
   v_listing record;
+  v_revision record;
   v_source record;
   v_sender record;
   v_contact record;
@@ -1868,23 +2031,14 @@ begin
     raise exception using errcode = 'invalid_parameter_value', message = 'unknown preflight phase';
   end if;
 
-  -- 1. Workspace controls: kill switch and mode. Locked, so a concurrent pause
-  --    either waits for this transaction or is seen by it. Reservation takes
-  --    FOR UPDATE (the quota ledger insert locks the same row FOR UPDATE: no
-  --    share-to-exclusive upgrade deadlock between two reserving workers).
-  if p_phase = 'reserve' then
-    select c.mode, c.kill_switch, c.seller_cooldown
-      into v_mode, v_kill, v_cooldown
-      from app.seller_inquiry_controls c
-     where c.workspace_id = p.workspace_id
-       for update;
-  else
-    select c.mode, c.kill_switch, c.seller_cooldown
-      into v_mode, v_kill, v_cooldown
-      from app.seller_inquiry_controls c
-     where c.workspace_id = p.workspace_id
-       for share;
-  end if;
+  -- 1. Workspace controls: kill switch and mode. Locked FOR UPDATE, so a
+  --    concurrent pause either waits for this transaction or is seen by it, and
+  --    two dispatches can never both take the last slot of a rolling window.
+  select c.mode, c.kill_switch, c.seller_cooldown, c.max_per_24h, c.max_per_15d
+    into v_mode, v_kill, v_cooldown, v_max_24h, v_max_15d
+    from app.seller_inquiry_controls c
+   where c.workspace_id = p.workspace_id
+     for update;
   if v_mode is null then
     raise exception using errcode = 'SV002', message = 'seller inquiry controls are not initialised for this workspace';
   end if;
@@ -1924,9 +2078,21 @@ begin
     raise exception using errcode = 'SV002', message = 'the inquiry language is not covered by the authorization';
   end if;
 
-  -- 3. Identity: surviving seller entity, canonical vehicle identity.
+  -- 3. Identity: surviving seller entity, canonical vehicle identity, and one inquiry
+  --    per actual vehicle/seller pair. The seller row is locked first (a concurrent merge
+  --    into it, or another reservation/dispatch for it, waits; later statements see them).
+  perform 1 from app.seller_entities e
+    where e.workspace_id = p.workspace_id and e.id = p.seller_entity_id
+    for update;
   perform app.seller_inquiry_assert_identity(
     p.workspace_id, p.vehicle_kind, p.vehicle_cluster_id, p.qualification_listing_id, p.seller_entity_id);
+  v_conflict := app.seller_inquiry_vehicle_conflict(p, p_phase);
+  if v_conflict is not null then
+    raise exception using
+      errcode = 'SV002',
+      message = 'this seller already has an inquiry about this vehicle (possibly under another listing,'
+             || ' cluster or merged seller identity); one initial inquiry per vehicle/seller pair';
+  end if;
 
   -- 4. Listing and source facts (hard rules stay with screening; this re-checks them).
   select l.source_id, l.availability, l.current_revision_id, l.quarantined, l.identity_conflict,
@@ -1948,16 +2114,37 @@ begin
       errcode = 'SV002',
       message = 'the qualifying listing is not eligible under a profile covered by the authorization';
   end if;
-  if p_phase = 'dispatch' then
-    if v_listing.current_revision_id is distinct from p.qualification_revision_id then
+  -- The bound qualification facts are still the listing's current facts (a changed price
+  -- or availability cancels stale work), and the snapshot is exactly the bound revision.
+  -- (An incomplete binding is reported by seller_inquiries_binding_complete_ck.)
+  if p.qualification_revision_id is not null
+     and v_listing.current_revision_id is distinct from p.qualification_revision_id then
+    raise exception using
+      errcode = 'SV002',
+      message = 'the listing changed since qualification; cancel the stale inquiry';
+  end if;
+  if p.qualified_availability is not null
+     and (v_listing.availability is distinct from p.qualified_availability or v_listing.availability = 'reserved') then
+    raise exception using
+      errcode = 'SV002',
+      message = 'the listing availability changed since qualification; cancel the stale inquiry';
+  end if;
+  if p.qualification_revision_id is not null then
+    select r.revision_number, r.semantic_hash, r.asking_minor, r.currency, r.quarantined
+      into v_revision
+      from app.listing_revisions r
+     where r.workspace_id = p.workspace_id and r.listing_id = p.qualification_listing_id
+       and r.id = p.qualification_revision_id;
+    if v_revision.quarantined is distinct from false
+       or (p.qualification_revision_number is not null
+           and v_revision.revision_number is distinct from p.qualification_revision_number)
+       or (p.qualified_semantic_hash is not null and v_revision.semantic_hash is distinct from p.qualified_semantic_hash)
+       or ((p.qualified_price_minor is null) = (p.qualified_currency is null)
+           and (v_revision.asking_minor, v_revision.currency)
+               is distinct from (p.qualified_price_minor, p.qualified_currency)) then
       raise exception using
-        errcode = 'SV002',
-        message = 'the listing changed since qualification; cancel the stale inquiry';
-    end if;
-    if v_listing.availability is distinct from p.qualified_availability or v_listing.availability = 'reserved' then
-      raise exception using
-        errcode = 'SV002',
-        message = 'the listing availability changed since qualification; cancel the stale inquiry';
+        errcode = 'SV003',
+        message = 'the qualification snapshot is not the bound listing revision (number, semantic hash, price)';
     end if;
   end if;
   select s.source_key, s.enabled, s.paused
@@ -1994,10 +2181,17 @@ begin
 
   -- 6. Recipient: verified evidence for this listing and seller (composite FKs),
   --    unchanged address, positively resolved language equal to the template's.
-  select c.status, c.address, c.language_status, c.language_code
+  select c.status, c.address, c.language_status, c.language_code, c.contact_kind
     into v_contact
     from app.seller_contacts c
    where c.workspace_id = p.workspace_id and c.id = p.recipient_contact_id;
+  if v_contact.contact_kind = 'official_dealer_contact' and not exists (
+       select 1 from app.seller_entities e
+        where e.workspace_id = p.workspace_id and e.id = p.seller_entity_id and e.seller_type = 'dealer') then
+    raise exception using
+      errcode = 'SV002',
+      message = 'an official dealer contact is a recipient only for a dealer seller';
+  end if;
   if v_contact.status is distinct from 'verified' then
     raise exception using errcode = 'SV002', message = 'the recipient contact is no longer verified';
   end if;
@@ -2023,11 +2217,8 @@ begin
   end if;
 
   if p_phase = 'reserve' then
-    -- 8a. Seller-level cooldown, serialised per seller entity: no burst of
-    --     inquiries to one dealer about several cars through different aliases.
-    perform 1 from app.seller_entities e
-      where e.workspace_id = p.workspace_id and e.id = p.seller_entity_id
-      for update;
+    -- 8a. Seller-level cooldown, serialised per seller entity (locked in step 3): no
+    --     burst of inquiries to one dealer about several cars through different aliases.
     select pg_catalog.count(*) into v_recent
       from app.seller_inquiries o
       join app.seller_entities e on e.workspace_id = o.workspace_id and e.id = o.seller_entity_id
@@ -2049,6 +2240,34 @@ begin
          select 1 from ops.inquiry_quota_ledger q
           where q.workspace_id = p.workspace_id and q.inquiry_id = p.id and q.released_at is null) then
       raise exception using errcode = 'SV002', message = 'the inquiry holds no quota debit';
+    end if;
+    -- The rolling caps are re-checked before every transmission (the controls row is
+    -- locked): a backlog reserved while the sender was offline leaves at the cap rate.
+    select u.count_24h, u.count_15d into v_usage from ops.inquiry_quota_usage(p.workspace_id, p.id) as u;
+    if v_usage.count_24h >= v_max_24h then
+      raise exception using
+        errcode = 'SV002',
+        message = pg_catalog.format('seller inquiry cap reached at dispatch: %s per rolling 24 hours', v_max_24h);
+    end if;
+    if v_usage.count_15d >= v_max_15d then
+      raise exception using
+        errcode = 'SV002',
+        message = pg_catalog.format('seller inquiry cap reached at dispatch: %s per rolling 15 days', v_max_15d);
+    end if;
+    -- The seller cooldown is re-checked against (possibly) transmitted inquiries: two
+    -- reservations made more than a cooldown apart, or for entities merged since, never
+    -- leave together.
+    select pg_catalog.count(*) into v_recent
+      from app.seller_inquiries o
+      join app.seller_entities e on e.workspace_id = o.workspace_id and e.id = o.seller_entity_id
+     where o.workspace_id = p.workspace_id
+       and o.id <> p.id
+       and (o.seller_entity_id = p.seller_entity_id or e.merged_into_id = p.seller_entity_id)
+       and o.send_attempted_at > pg_catalog.now() - v_cooldown;
+    if v_recent > 0 then
+      raise exception using
+        errcode = 'SV002',
+        message = 'seller cooldown: another inquiry to this seller was transmitted recently';
     end if;
     if exists (
          select 1 from ops.email_delivery_attempts a
@@ -2100,13 +2319,23 @@ begin
    where a.workspace_id = p_workspace_id and a.inquiry_id = p_inquiry_id
    order by a.attempt_number desc
    limit 1;
+  -- Provider acceptance: an accepted attempt, or an uncertain one reconciled by a Sent
+  -- Items/provider hit. A reconciliation that cites a correlated inbound message counts
+  -- through that message (v_correlated) only.
   v_accepted := exists (
     select 1 from ops.email_delivery_attempts a
      where a.workspace_id = p_workspace_id and a.inquiry_id = p_inquiry_id
-       and (a.outcome = 'accepted' or a.reconciled_outcome = 'accepted'));
+       and (a.outcome = 'accepted'
+            or (a.reconciled_outcome = 'accepted'
+                and (a.reconciliation_evidence ->> 'sent_items' = 'found'
+                     or a.reconciliation_evidence ->> 'provider_search' = 'found'))));
+  -- An inbound message proves submission only when it references a Message-ID of this
+  -- inquiry (In-Reply-To/References or a bounce's returned original); a thread-only or
+  -- quarantined possible match never does (domain.replies.correlate_reply).
   v_correlated := exists (
     select 1 from app.seller_replies r
-     where r.workspace_id = p_workspace_id and r.inquiry_id = p_inquiry_id and not r.quarantined);
+     where r.workspace_id = p_workspace_id and r.inquiry_id = p_inquiry_id and not r.quarantined
+       and r.header_linked);
 
   if v_state in ('reserved', 'queued', 'sending') and not v_has_debit then
     raise exception using
@@ -2197,6 +2426,14 @@ begin
         errcode = 'SV002',
         message = 'a seller inquiry is created as candidate, qualifying or held_facts and reserved by a transition';
     end if;
+    -- Lifecycle timestamps are evidence (cooldown, rolling caps, "possibly transmitted"):
+    -- only the transitions below set them.
+    if new.reserved_at is not null or new.queued_at is not null or new.send_attempted_at is not null
+       or new.accepted_at is not null or new.replied_at is not null then
+      raise exception using
+        errcode = 'SV004',
+        message = 'seller inquiry lifecycle timestamps are maintained by the database';
+    end if;
     perform app.seller_inquiry_assert_identity(
       new.workspace_id, new.vehicle_kind, new.vehicle_cluster_id, new.qualification_listing_id,
       new.seller_entity_id);
@@ -2236,6 +2473,20 @@ begin
   end if;
   if new.row_version < old.row_version then
     raise exception using errcode = 'SV005', message = 'seller inquiry row_version must not decrease';
+  end if;
+  -- reserved_at/queued_at/send_attempted_at/state_changed_at are set only by this trigger;
+  -- accepted_at/replied_at may carry the provider/receipt time, but only in the very
+  -- transition into accepted/replied, and only once. Backdating them would escape the seller
+  -- cooldown and the rolling caps; clearing send_attempted_at would hide a transmission.
+  if (new.reserved_at, new.queued_at, new.send_attempted_at, new.state_changed_at)
+     is distinct from (old.reserved_at, old.queued_at, old.send_attempted_at, old.state_changed_at)
+     or (new.accepted_at is distinct from old.accepted_at
+         and not (old.accepted_at is null and new.state = 'accepted' and old.state <> 'accepted'))
+     or (new.replied_at is distinct from old.replied_at
+         and not (old.replied_at is null and new.state = 'replied' and old.state <> 'replied')) then
+    raise exception using
+      errcode = 'SV004',
+      message = 'seller inquiry lifecycle timestamps are maintained by the database';
   end if;
 
   if new.state is distinct from old.state then
@@ -2394,6 +2645,9 @@ begin
         errcode = 'SV002',
         message = 'a send attempt is recorded as a running send intent before any external I/O';
     end if;
+    if new.lease_expires_at <= pg_catalog.now() then
+      raise exception using errcode = 'SV002', message = 'a send intent needs a live lease';
+    end if;
     if new.sender_binding_id is distinct from v_inquiry.sender_binding_id
        or new.sender_binding_version is distinct from v_inquiry.sender_binding_version
        or new.provider is distinct from v_inquiry.sender_provider then
@@ -2440,6 +2694,15 @@ begin
       errcode = 'SV004',
       message = 'send attempts are append-only except the outcome (changed: '
              || pg_catalog.array_to_string(changed, ', ') || ')';
+  end if;
+  -- Once the lease has expired the worker may still be submitting (spec 37.5): the attempt is
+  -- then finalised as 'uncertain' (or by positive provider evidence), never as a proven
+  -- pre-submission failure that would allow a retry. A late proof is a reconciliation.
+  if old.outcome = 'running' and new.outcome = 'pre_submission_failure'
+     and pg_catalog.now() > old.lease_expires_at then
+    raise exception using
+      errcode = 'SV002',
+      message = 'the attempt lease expired: finalise it as uncertain and reconcile with evidence';
   end if;
   if old.outcome <> 'running' then
     select pg_catalog.array_agg(c order by c) into changed
@@ -2502,12 +2765,10 @@ begin
         errcode = 'SV002',
         message = 'a quota debit is taken only when the inquiry is reserved';
     end if;
-    -- Rolling windows (now - window, now]; future-dated debits still count.
-    select pg_catalog.count(*) filter (where q.debited_at > pg_catalog.now() - interval '24 hours'),
-           pg_catalog.count(*) filter (where q.debited_at > pg_catalog.now() - interval '15 days')
-      into v_count_24h, v_count_15d
-      from ops.inquiry_quota_ledger q
-     where q.workspace_id = new.workspace_id and q.released_at is null;
+    -- Rolling windows (now - window, now], each debit counted at the later of its
+    -- reservation and its send attempt; future-dated debits still count.
+    select u.count_24h, u.count_15d into v_count_24h, v_count_15d
+      from ops.inquiry_quota_usage(new.workspace_id, new.inquiry_id) as u;
     if v_count_24h >= v_max_24h then
       raise exception using
         errcode = 'SV002',
@@ -2647,6 +2908,8 @@ declare
   v_inquiry record;
   v_mailbox record;
   v_latest_state text;
+  v_ids text[];
+  v_threads text[];
 begin
   if tg_op = 'INSERT' then
     select i.state, i.send_attempted_at, i.sender_binding_id into v_inquiry
@@ -2657,11 +2920,19 @@ begin
         errcode = 'SV003',
         message = 'replies are stored only for an inquiry that was (possibly) transmitted';
     end if;
-    select m.state, m.sender_binding_id into v_mailbox
+    select m.state, m.sender_binding_id, m.credential_id into v_mailbox
       from ops.mail_worker_bindings m
      where m.workspace_id = new.workspace_id and m.id = new.mailbox_binding_id;
     if v_mailbox.state is distinct from 'active' then
       raise exception using errcode = 'SV002', message = 'the mailbox worker binding is revoked';
+    end if;
+    if not exists (
+         select 1 from ops.api_credentials c
+          where c.workspace_id = new.workspace_id and c.id = v_mailbox.credential_id
+            and c.revoked_at is null and (c.expires_at is null or c.expires_at > pg_catalog.now())) then
+      raise exception using
+        errcode = 'SV002',
+        message = 'the mailbox worker credential is revoked or expired; the local backlog waits for a new one';
     end if;
     if v_mailbox.sender_binding_id is distinct from v_inquiry.sender_binding_id then
       raise exception using
@@ -2689,6 +2960,49 @@ begin
     if new.quarantine_released_at is not null then
       raise exception using errcode = 'SV002', message = 'a reply is stored before any quarantine release';
     end if;
+    -- Correlation links (never caller-supplied). Outbound identities: the inquiry's stable
+    -- Message-ID, every send intent's Message-ID, and the ids/threads published to this
+    -- mailbox in the binding version the worker matched against.
+    select coalesce(pg_catalog.array_agg(distinct x.mid) filter (where x.mid is not null), array[]::text[])
+      into v_ids
+      from (
+        select i.rfc_message_id as mid
+          from app.seller_inquiries i
+         where i.workspace_id = new.workspace_id and i.id = new.inquiry_id
+        union all
+        select a.rfc_message_id
+          from ops.email_delivery_attempts a
+         where a.workspace_id = new.workspace_id and a.inquiry_id = new.inquiry_id
+        union all
+        select pg_catalog.jsonb_array_elements_text(
+                 case when pg_catalog.jsonb_typeof(s.payload -> k.key) = 'array' then s.payload -> k.key
+                      else '[]'::jsonb end)
+          from ops.mail_binding_sync s
+          cross join (values ('outbound_message_ids'), ('send_intent_message_ids')) as k(key)
+         where s.workspace_id = new.workspace_id and s.mailbox_binding_id = new.mailbox_binding_id
+           and s.inquiry_id = new.inquiry_id and s.binding_version = new.binding_version
+      ) as x;
+    select coalesce(pg_catalog.array_agg(distinct x.tid) filter (where x.tid is not null), array[]::text[])
+      into v_threads
+      from (
+        select i.provider_thread_id as tid
+          from app.seller_inquiries i
+         where i.workspace_id = new.workspace_id and i.id = new.inquiry_id
+        union all
+        select a.provider_thread_id
+          from ops.email_delivery_attempts a
+         where a.workspace_id = new.workspace_id and a.inquiry_id = new.inquiry_id
+        union all
+        select pg_catalog.jsonb_array_elements_text(
+                 case when pg_catalog.jsonb_typeof(s.payload -> 'provider_thread_ids') = 'array'
+                      then s.payload -> 'provider_thread_ids' else '[]'::jsonb end)
+          from ops.mail_binding_sync s
+         where s.workspace_id = new.workspace_id and s.mailbox_binding_id = new.mailbox_binding_id
+           and s.inquiry_id = new.inquiry_id and s.binding_version = new.binding_version
+      ) as x;
+    new.header_linked := (pg_catalog.array_remove(array[new.in_reply_to], null) || new.reference_ids
+                          || new.returned_message_ids) && v_ids;
+    new.thread_linked := coalesce(new.provider_thread_id = any (v_threads), false);
     return new;
   end if;
 
@@ -2838,6 +3152,14 @@ begin
       raise exception using
         errcode = 'SV003',
         message = 'ingest is recorded only through the active mailbox binding''s own credential';
+    end if;
+    if not exists (
+         select 1 from ops.api_credentials c
+          where c.workspace_id = new.workspace_id and c.id = new.credential_id
+            and c.revoked_at is null and (c.expires_at is null or c.expires_at > pg_catalog.now())) then
+      raise exception using
+        errcode = 'SV002',
+        message = 'the mailbox worker credential is revoked or expired; the local backlog waits for a new one';
     end if;
     return new;
   end if;
@@ -3029,6 +3351,8 @@ grant execute on function
   app.message_body_hash(text, text),
   app.reply_attachments_ok(jsonb),
   ops.seller_inquiry_active_suppressions(uuid, uuid, text, text, uuid, uuid, text, uuid),
+  ops.inquiry_quota_usage(uuid, uuid),
+  app.seller_inquiry_vehicle_conflict(app.seller_inquiries, text),
   app.seller_inquiry_assert_identity(uuid, text, uuid, uuid, uuid),
   app.seller_inquiry_preflight(app.seller_inquiries, text),
   app.seller_inquiry_assert_evidence(uuid, uuid)
@@ -3061,7 +3385,7 @@ grant select, insert,
           sender_provider, sender_account_id, sender_from_address, sender_display_name, sender_reply_to_address,
           recipient_contact_id, recipient_address, recipient_binding_hash, state, state_reasons, suppression_reason,
           requalification_audit_id, rfc_message_id, provider_message_id, provider_thread_id, provider_receipt,
-          reserved_at, queued_at, send_attempted_at, accepted_at, replied_at, row_version)
+          accepted_at, replied_at, row_version)
   on table app.seller_inquiries to suv_backend;
 grant select, insert,
   update (outcome, finished_at, pre_submission_proof, provider_idempotency_key, provider_idempotency_documented,

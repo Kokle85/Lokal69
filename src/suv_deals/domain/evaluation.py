@@ -5,10 +5,11 @@ coverage is activated. It is a quality objective, not a guaranteed acquisition a
 target. Pure domain code: no I/O; ``now`` is a parameter.
 
 Window
-    ``evaluation_window_start`` is the finish time of the first complete, healthy, non-fixture
-    scan of an *activated* source at or after its activation time. Without such a scan the window
-    has not started (``coverage_not_established``) - scans alone, or a configured schedule, do
-    not start it. The window is ``[start, start + 15 days)``.
+    ``evaluation_window_start`` is the start of the earliest complete, healthy, non-fixture scan
+    of an *activated* source that finished at or after its activation (clamped to the activation
+    time), so the vehicles that very scan discovers are inside the window. Without such a scan
+    the window has not started (``coverage_not_established``) - scans alone, or a configured
+    schedule, do not start it. The window is ``[start, start + 15 days)``.
 
 Metrics (inside the window, up to ``now``)
     Healthy coverage intervals and gaps per source; unique eligible and unique well-matched
@@ -372,22 +373,26 @@ _OUTCOME_TEXT: Final[dict[EvaluationOutcome, str]] = {
 def evaluation_window_start(
     activations: Sequence[SourceActivation], scans: Sequence[ScanRecord]
 ) -> datetime | None:
-    """First complete healthy non-fixture scan finish at/after an activated source's activation."""
+    """Start of the earliest complete healthy non-fixture scan of an activated source that
+    finished at/after the activation, never earlier than the activation itself.
+
+    The scan that first proves usable coverage is part of the window: the candidates it finds are
+    first seen while it runs, so a window opening only at its finish would drop them.
+    """
     starts: list[datetime] = []
     for activation in activations:
         if activation.is_fixture or activation.activated_at is None:
             continue
-        finishes = [
-            s.finished_at
+        activated_at = activation.activated_at
+        starts.extend(
+            max(s.started_at, activated_at)
             for s in scans
             if s.source_key == activation.source_key
             and not s.is_fixture
             and s.healthy_complete
             and s.finished_at is not None
-            and s.finished_at >= activation.activated_at
-        ]
-        if finishes:
-            starts.append(min(finishes))
+            and s.finished_at >= activated_at
+        )
     return min(starts) if starts else None
 
 
@@ -498,31 +503,34 @@ def build_evaluation_report(
     else:
         window_status = "in_progress"
 
-    # Synthetic (fixture/canary) records - and anything linked to them - never count.
+    # Synthetic (fixture/canary) records - and anything linked to them - never count. A
+    # real-looking listing clustered with a canary/fixture vehicle is excluded (and counted) too.
     synthetic_candidates = {c.candidate_id for c in candidates if c.synthetic}
     synthetic_clusters = {
         c.vehicle_cluster_id for c in candidates if c.synthetic and c.vehicle_cluster_id is not None
     }
+    tainted_candidates = {
+        c.candidate_id
+        for c in candidates
+        if not c.synthetic and c.vehicle_cluster_id is not None and c.vehicle_cluster_id in synthetic_clusters
+    }
+    excluded_candidates = synthetic_candidates | tainted_candidates
 
     def synthetic_inquiry(item: EvaluationInquiry) -> bool:
         return (
             item.is_canary
-            or (item.candidate_id is not None and item.candidate_id in synthetic_candidates)
+            or (item.candidate_id is not None and item.candidate_id in excluded_candidates)
             or (item.vehicle_cluster_id is not None and item.vehicle_cluster_id in synthetic_clusters)
         )
 
     canary_inquiries = {i.inquiry_id for i in inquiries if synthetic_inquiry(i)}
     synthetic_reply = [r for r in replies if r.is_canary or r.inquiry_id in canary_inquiries]
-    synthetic_docs = [
-        d for d in document_resolutions if d.is_canary or d.candidate_id in synthetic_candidates
-    ]
-    synthetic = len(synthetic_candidates) + len(canary_inquiries) + len(synthetic_reply) + len(synthetic_docs)
+    synthetic_docs = [d for d in document_resolutions if d.is_canary or d.candidate_id in excluded_candidates]
+    synthetic = len(excluded_candidates) + len(canary_inquiries) + len(synthetic_reply) + len(synthetic_docs)
     real_candidates = [
         c
         for c in candidates
-        if not c.synthetic
-        and (c.vehicle_cluster_id is None or c.vehicle_cluster_id not in synthetic_clusters)
-        and _in_window(c.first_seen_at, start, end, current)
+        if c.candidate_id not in excluded_candidates and _in_window(c.first_seen_at, start, end, current)
     ]
     real_inquiries = [
         i for i in inquiries if not synthetic_inquiry(i) and _in_window(i.created_at, start, end, current)
@@ -538,7 +546,7 @@ def build_evaluation_report(
         d
         for d in document_resolutions
         if not d.is_canary
-        and d.candidate_id not in synthetic_candidates
+        and d.candidate_id not in excluded_candidates
         and _in_window(d.resolved_at, start, end, current)
     ]
 

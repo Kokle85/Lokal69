@@ -56,6 +56,7 @@ import binascii
 import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 from urllib.parse import quote, urlsplit
@@ -64,7 +65,7 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from suv_deals.clock import Clock, SystemClock
+from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.domain.enums import EmailProviderKind, Tristate
 from suv_deals.domain.inquiries import SenderBinding
 from suv_deals.domain.replies import (
@@ -194,6 +195,8 @@ CAPABILITIES: Final = ProviderCapabilities(
         "search_index_lag",
         "oauth_consent_publishing_status",
         "refresh_token_lifetime",
+        "history_record_id_as_start_history_id",
+        "search_after_epoch_seconds",
     ),
 )
 
@@ -210,6 +213,9 @@ class GmailApiSettings(BaseModel):
     max_history_pages: int = Field(default=10, ge=1, le=100)
     max_list_pages: int = Field(default=5, ge=1, le=50)
     default_max_messages: int = Field(default=200, ge=1, le=MAX_FETCH_MESSAGES)
+    #: True only with ``SELLER_REPLY_INGEST_MODE=provider_api`` (``seller_email`` derives it):
+    #: with the chosen local Outlook reply route the backend never reads the mailbox via the API.
+    reply_retrieval_enabled: bool = False
 
     @field_validator("api_root")
     @classmethod
@@ -347,6 +353,16 @@ def _parse_full_payload(payload: Mapping[str, Any], *, limit: int) -> _ParsedBod
     )
 
 
+@dataclass(frozen=True)
+class _HistoryPull:
+    """``users.history.list`` result: (record id, candidate message ids) in chronological order."""
+
+    records: tuple[tuple[str | None, tuple[str, ...]], ...]
+    latest: str | None
+    complete: bool
+    expired: bool
+
+
 class GmailApiProvider:
     """``SenderProvider`` for one bound Gmail account (see module docstring)."""
 
@@ -371,6 +387,10 @@ class GmailApiProvider:
         self._clock = clock or SystemClock()
         self._settings = settings or GmailApiSettings()
         self._user_root = f"{self._settings.api_root}/users/{quote(account, safe='@.+-_')}"
+        #: The mailbox owner's own addresses: a message from them is never a seller reply.
+        self._own_addresses = tuple(
+            dict.fromkeys(a for a in (account, binding.from_address, binding.reply_to_address) if a)
+        )
 
     # -- protocol properties --------------------------------------------------------------------
 
@@ -660,9 +680,22 @@ class GmailApiProvider:
                 reason=SendFailureReason.CREDENTIALS_REVOKED
                 if exc.revoked
                 else SendFailureReason.CREDENTIALS_UNAVAILABLE,
-                retryable=not exc.revoked,
+                # Nothing was sent and nothing about the message is wrong: retryable, so the
+                # domain retry/preflight path suppresses the inquiry while access is revoked
+                # (spec 37.5) instead of failing it permanently.
+                retryable=True,
                 proof="credentials_rejected_before_submit",
                 provider_error=exc.code,
+            )
+        except Exception:  # the credential store failed before any provider request was made
+            return self._failure(
+                message,
+                inquiry_id,
+                attempt_id,
+                reason=SendFailureReason.CREDENTIALS_UNAVAILABLE,
+                retryable=True,
+                proof="credentials_rejected_before_submit",
+                provider_error="token_provider_error",
             )
         if token.scopes and not set(token.scopes) & _SEND_SCOPES:
             return self._failure(
@@ -923,12 +956,30 @@ class GmailApiProvider:
     ) -> ReplyFetchResult:
         """Provider-API reply ingestion: metadata pre-filter, local correlation, minimal bodies.
 
-        ``cursor`` is a Gmail ``historyId``. An expired/unusable cursor (HTTP 404) is a reported
-        gap followed by a full re-sync from ``since`` (the caller passes an overlapping window).
-        Any incomplete pull keeps the previous cursor (re-read; ingest de-duplicates). More than
-        ``max_history_pages`` of history in one pull is reported as incomplete every time and
-        needs a larger page budget or a window re-sync.
+        Runs only with ``reply_retrieval_enabled`` (``SELLER_REPLY_INGEST_MODE=provider_api``);
+        otherwise nothing is read. ``cursor`` is a Gmail ``historyId``. An expired/unusable cursor
+        (HTTP 404) is a reported gap followed by a re-sync of the caller's overlapping window from
+        ``since``. Every pull makes progress without ever skipping a listed message:
+
+        * a history pull processes history records in chronological order; when it stops early
+          (message budget, page budget or a transient read failure) the next cursor is the id of
+          the last fully processed history record (a mailbox history id; should Gmail ever refuse
+          it, the 404 path re-syncs the window with an explicit gap), otherwise the mailbox's
+          current ``historyId``;
+        * a window pull moves the cursor to the ``historyId`` read *before* listing and hands
+          every listed message it did not inspect (budget, transient failure) back as
+          ``pending_retry_locators`` for ``recheck_locators``; a listing beyond the page budget is
+          an explicit gap (``WINDOW_TRUNCATED``).
         """
+        if not self._settings.reply_retrieval_enabled:
+            return ReplyFetchResult(
+                provider=EmailProviderKind.GMAIL_API,
+                retrieval_mode="provider_pull",
+                next_cursor=cursor,
+                complete=False,
+                problems=("REPLY_RETRIEVAL_DISABLED",),
+            )
+        since_utc = ensure_utc(since)
         limit = min(max_messages or self._settings.default_max_messages, MAX_FETCH_MESSAGES)
         try:
             token = await self._tokens.access_token()
@@ -940,60 +991,29 @@ class GmailApiProvider:
                 complete=False,
                 problems=("CREDENTIALS_REVOKED" if exc.revoked else "CREDENTIALS_UNAVAILABLE",),
             )
-        candidate_ids: list[str] = []
-        gap = False
-        advance_to: str | None = None
-        complete = True
+        gap = cursor is not None
         if cursor is not None and _HISTORY_ID_RE.fullmatch(cursor):
-            history = await self._history_ids(token, cursor)
+            history = await self._history_records(token, cursor)
             if history is None:
                 return self._unavailable_fetch(cursor)
-            ids, latest, complete, expired = history
-            if expired:
-                gap = True  # history id too old (HTTP 404): full re-sync from the time window
-            else:
-                candidate_ids = ids
-                advance_to = latest
-        elif cursor is not None:
-            gap = True  # unusable cursor: re-sync from the time window
-        if cursor is None or gap:
-            window_ids = await self._window_ids(token, since)
-            if window_ids is None:
-                return self._unavailable_fetch(cursor, gap=gap)
-            candidate_ids, advance_to, complete = window_ids
-        unique = list(dict.fromkeys(candidate_ids))
-        if len(unique) > limit:
-            unique = unique[:limit]
-            complete = False
-        replies: list[CorrelatedReply] = []
-        pending: list[str] = []
-        skipped = 0
-        for message_id in unique:
-            item = await self._inspect(token, message_id, mailbox_binding_id, bindings)
-            if item is None:
-                complete = False
-            elif isinstance(item, CorrelatedReply):
-                replies.append(item)
-            elif item == "pending":
-                pending.append(message_id)
-            else:
-                skipped += 1
-        if complete and advance_to is not None:
-            next_cursor: str | None = advance_to
-        else:
-            # Incomplete: keep the old cursor (re-read; ingest de-duplicates) or, after a gap or
-            # without a cursor, start again from the caller's overlapping time window.
-            next_cursor = cursor if cursor is not None and not gap else None
-        return ReplyFetchResult(
-            provider=EmailProviderKind.GMAIL_API,
-            retrieval_mode="provider_pull",
-            replies=tuple(replies),
-            pending_retry_locators=tuple(pending[:200]),
-            next_cursor=next_cursor,
-            complete=complete,
-            gap_detected=gap,
-            scanned=len(unique),
-            skipped_unrelated=skipped,
+            if not history.expired:
+                return await self._history_pull(
+                    token,
+                    history,
+                    cursor=cursor,
+                    limit=limit,
+                    mailbox_binding_id=mailbox_binding_id,
+                    bindings=bindings,
+                )
+            # History id too old (HTTP 404): explicit gap, full re-sync from the time window.
+        return await self._window_pull(
+            token,
+            since=since_utc,
+            cursor=cursor,
+            gap=gap,
+            limit=limit,
+            mailbox_binding_id=mailbox_binding_id,
+            bindings=bindings,
         )
 
     def _unavailable_fetch(self, cursor: str | None, *, gap: bool = False) -> ReplyFetchResult:
@@ -1006,11 +1026,9 @@ class GmailApiProvider:
             problems=("PROVIDER_UNAVAILABLE",),
         )
 
-    async def _history_ids(
-        self, token: AccessToken, cursor: str
-    ) -> tuple[list[str], str | None, bool, bool] | None:
-        """(ids, latest history id, complete, expired) or None when the provider is unavailable."""
-        ids: list[str] = []
+    async def _history_records(self, token: AccessToken, cursor: str) -> _HistoryPull | None:
+        """Chronological ``messageAdded`` records after ``cursor``; ``None`` = provider unavailable."""
+        records: list[tuple[str | None, tuple[str, ...]]] = []
         latest: str | None = None
         page_token: str | None = None
         for _page in range(self._settings.max_history_pages):
@@ -1023,13 +1041,16 @@ class GmailApiProvider:
                 params["pageToken"] = page_token
             result = await self._get(token, "/history", params)
             if result.status_code == 404:
-                return [], None, False, True
+                return _HistoryPull(records=(), latest=None, complete=False, expired=True)
             data = result.json() if result.ok else None
             if data is None:
                 return None
             for record in data.get("history") or []:
                 if not isinstance(record, Mapping):
                     continue
+                raw_id = record.get("id")
+                record_id = raw_id if isinstance(raw_id, str) and _HISTORY_ID_RE.fullmatch(raw_id) else None
+                ids: list[str] = []
                 for added in record.get("messagesAdded") or []:
                     message = added.get("message") if isinstance(added, Mapping) else None
                     if not isinstance(message, Mapping):
@@ -1038,26 +1059,137 @@ class GmailApiProvider:
                     mid = safe_opaque_id(message.get("id"))
                     if mid and "SENT" not in labels and "DRAFT" not in labels:
                         ids.append(mid)
+                records.append((record_id, tuple(ids)))
             history_id = data.get("historyId")
             if isinstance(history_id, str) and _HISTORY_ID_RE.fullmatch(history_id):
                 latest = history_id
             next_token = data.get("nextPageToken")
             if not isinstance(next_token, str) or not next_token:
-                return ids, latest, True, False
+                return _HistoryPull(records=tuple(records), latest=latest, complete=True, expired=False)
             page_token = next_token
-        return ids, latest, False, False
+        return _HistoryPull(records=tuple(records), latest=latest, complete=False, expired=False)
+
+    async def _history_pull(
+        self,
+        token: AccessToken,
+        history: _HistoryPull,
+        *,
+        cursor: str,
+        limit: int,
+        mailbox_binding_id: UUID,
+        bindings: Sequence[InquiryBinding],
+    ) -> ReplyFetchResult:
+        replies: list[CorrelatedReply] = []
+        pending: list[str] = []
+        seen: set[str] = set()
+        skipped = scanned = 0
+        checkpoint: str | None = None
+        stopped = False
+        for record_id, message_ids in history.records:
+            todo = [m for m in dict.fromkeys(message_ids) if m not in seen]
+            if scanned and scanned + len(todo) > limit:
+                stopped = True  # message budget: never start a record that cannot be finished
+                break
+            failed = False
+            for message_id in todo:
+                item = await self._inspect(token, message_id, mailbox_binding_id, bindings)
+                scanned += 1
+                if item is None:
+                    failed = True  # transient: this record is re-read by the next pull
+                    break
+                seen.add(message_id)
+                if isinstance(item, CorrelatedReply):
+                    replies.append(item)
+                elif item == "pending":
+                    pending.append(message_id)
+                else:
+                    skipped += 1
+            if failed:
+                stopped = True
+                break
+            if record_id is not None and int(record_id) > int(checkpoint or cursor):
+                checkpoint = record_id  # every message of every record up to here is processed
+        complete = history.complete and not stopped
+        # Complete: the mailbox's current history id. Otherwise never past an unprocessed record.
+        next_cursor = (history.latest or checkpoint or cursor) if complete else (checkpoint or cursor)
+        return ReplyFetchResult(
+            provider=EmailProviderKind.GMAIL_API,
+            retrieval_mode="provider_pull",
+            replies=tuple(replies),
+            pending_retry_locators=tuple(pending[:MAX_FETCH_MESSAGES]),
+            next_cursor=next_cursor,
+            complete=complete,
+            scanned=scanned,
+            skipped_unrelated=skipped,
+        )
+
+    async def _window_pull(
+        self,
+        token: AccessToken,
+        *,
+        since: datetime,
+        cursor: str | None,
+        gap: bool,
+        limit: int,
+        mailbox_binding_id: UUID,
+        bindings: Sequence[InquiryBinding],
+    ) -> ReplyFetchResult:
+        window = await self._window_ids(token, since)
+        if window is None:
+            return self._unavailable_fetch(cursor, gap=gap)
+        listed, baseline, listed_all = window
+        replies: list[CorrelatedReply] = []
+        pending: list[str] = []
+        leftover: list[str] = []
+        skipped = scanned = 0
+        for index, message_id in enumerate(listed):
+            if scanned >= limit:
+                leftover.extend(listed[index:])
+                break
+            item = await self._inspect(token, message_id, mailbox_binding_id, bindings)
+            scanned += 1
+            if item is None:
+                leftover.append(message_id)  # transient: re-read with recheck_locators
+            elif isinstance(item, CorrelatedReply):
+                replies.append(item)
+            elif item == "pending":
+                pending.append(message_id)
+            else:
+                skipped += 1
+        # With a baseline, everything arriving later is covered by history and every listed but
+        # uninspected message is handed back as a locator, so nothing listed is ever skipped.
+        # Without one the caller re-reads its overlapping window (cursor None).
+        locators = [*pending, *leftover] if baseline is not None else pending
+        return ReplyFetchResult(
+            provider=EmailProviderKind.GMAIL_API,
+            retrieval_mode="provider_pull",
+            replies=tuple(replies),
+            pending_retry_locators=tuple(dict.fromkeys(locators)),
+            next_cursor=baseline,
+            complete=listed_all and not leftover,
+            gap_detected=gap or not listed_all,
+            scanned=scanned,
+            skipped_unrelated=skipped,
+            problems=() if listed_all else ("WINDOW_TRUNCATED",),
+        )
 
     async def _window_ids(
         self, token: AccessToken, since: datetime
     ) -> tuple[list[str], str | None, bool] | None:
+        """(listed ids, baseline history id, listing complete) or ``None`` (provider unavailable).
+
+        The listing stops at ``MAX_FETCH_MESSAGES`` ids (reported as incomplete) so every listed
+        id fits into ``pending_retry_locators``.
+        """
         profile = await self._get(token, "/profile")  # baseline first: nothing arriving later is lost
         data = profile.json() if profile.ok else None
         if data is None:
             return None
         baseline = data.get("historyId")
         baseline_id = baseline if isinstance(baseline, str) and _HISTORY_ID_RE.fullmatch(baseline) else None
-        query = f"after:{int(since.timestamp())} -in:sent -in:drafts"
+        query = f"after:{int(ensure_utc(since).timestamp())} -in:sent -in:drafts"
         ids: list[str] = []
+        seen: set[str] = set()
         page_token: str | None = None
         for _page in range(self._settings.max_list_pages):
             params: dict[str, str | int | Sequence[str]] = {
@@ -1073,13 +1205,16 @@ class GmailApiProvider:
                 return None
             for item in listing.get("messages") or []:
                 mid = safe_opaque_id(item.get("id")) if isinstance(item, Mapping) else None
-                if mid:
+                if mid and mid not in seen:
+                    seen.add(mid)
                     ids.append(mid)
             next_token = listing.get("nextPageToken")
             if not isinstance(next_token, str) or not next_token:
-                return ids, baseline_id, True
+                return ids[:MAX_FETCH_MESSAGES], baseline_id, len(ids) <= MAX_FETCH_MESSAGES
+            if len(ids) >= MAX_FETCH_MESSAGES:
+                break
             page_token = next_token
-        return ids, baseline_id, False
+        return ids[:MAX_FETCH_MESSAGES], baseline_id, False
 
     async def _inspect(
         self,
@@ -1144,7 +1279,7 @@ class GmailApiProvider:
             body_text=body.text,
             in_junk_folder="SPAM" in _labels(full_data),
         )
-        correlation = correlate_reply(inbound, bindings)
+        correlation = correlate_reply(inbound, bindings, own_addresses=self._own_addresses)
         if correlation.upload_scope == "none":
             return "skip"  # fetched as a candidate but unrelated after correlation: never returned
         return CorrelatedReply(
@@ -1164,24 +1299,34 @@ class GmailApiProvider:
     ) -> ReplyFetchResult:
         """Re-inspect ``pending_retry_locators`` after a binding sync (reply-before-binding race).
 
-        Same metadata pre-filter and local correlation as a pull; nothing else is read. Locators
-        that are still unmatched stay pending (the caller bounds the retry window).
+        Also re-reads window-pull messages that were listed but not yet inspected. Same metadata
+        pre-filter and local correlation as a pull; nothing else is read. Locators that are still
+        unmatched stay pending (the caller bounds the retry window).
         """
-        ids = [lid for lid in dict.fromkeys(locators) if safe_opaque_id(lid)][:MAX_FETCH_MESSAGES]
+        valid = [lid for lid in dict.fromkeys(locators) if safe_opaque_id(lid)]
+        ids, overflow = valid[:MAX_FETCH_MESSAGES], valid[MAX_FETCH_MESSAGES:]
+        if not self._settings.reply_retrieval_enabled:
+            return ReplyFetchResult(
+                provider=EmailProviderKind.GMAIL_API,
+                retrieval_mode="provider_pull",
+                pending_retry_locators=tuple(valid),
+                complete=False,
+                problems=("REPLY_RETRIEVAL_DISABLED",),
+            )
         try:
             token = await self._tokens.access_token()
         except TokenUnavailable as exc:
             return ReplyFetchResult(
                 provider=EmailProviderKind.GMAIL_API,
                 retrieval_mode="provider_pull",
-                pending_retry_locators=tuple(ids),
+                pending_retry_locators=tuple(valid),
                 complete=False,
                 problems=("CREDENTIALS_REVOKED" if exc.revoked else "CREDENTIALS_UNAVAILABLE",),
             )
         replies: list[CorrelatedReply] = []
         pending: list[str] = []
         skipped = 0
-        complete = True
+        complete = not overflow  # locators beyond this call's budget stay pending, never dropped
         for message_id in ids:
             item = await self._inspect(token, message_id, mailbox_binding_id, bindings)
             if item is None:
@@ -1197,7 +1342,7 @@ class GmailApiProvider:
             provider=EmailProviderKind.GMAIL_API,
             retrieval_mode="provider_pull",
             replies=tuple(replies),
-            pending_retry_locators=tuple(pending),
+            pending_retry_locators=(*pending, *overflow),
             complete=complete,
             scanned=len(ids),
             skipped_unrelated=skipped,

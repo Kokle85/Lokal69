@@ -80,6 +80,7 @@ def evidence(**overrides: Any) -> RecipientEvidence:
         "evidence_url": URL,
         "extraction_location": ExtractionLocation.LISTING_CONTACT_BLOCK,
         "extraction_excerpt": "Kontakt: Verkauf@Autohaus-Example.INVALID",
+        "distinct_addresses_on_page": 1,
         "seller": seller(),
         "observed_at": NOW - timedelta(hours=2),
         "verified_at": NOW - timedelta(hours=1),
@@ -551,3 +552,51 @@ def test_excerpt_must_show_exactly_this_address(excerpt: str, shown: bool) -> No
         assert decision.reasons == (RecipientReason.EXCERPT_DOES_NOT_SHOW_ADDRESS,)
     dealer_decision = verify(dealer(address="info@autohaus-example.invalid", extraction_excerpt=excerpt))
     assert dealer_decision.verified == shown
+
+
+# ---------------------------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "verkauf@straße.de",  # IDNA 2003 would silently address "strasse.de", another domain
+        "verkauf@autohaus-ＥＸＡＭＰＬＥ.de",  # fullwidth compatibility forms  # noqa: RUF001
+        "verkauf@autohaus-exámple.de",  # decomposed accent: not the shown label
+        "verkauf@ὀδυσσεύς.example",  # final sigma would be folded
+    ],
+)
+def test_idna_mapping_that_changes_the_domain_is_rejected(raw: str) -> None:
+    with pytest.raises(AddressError) as exc:
+        canonicalize_address(raw)
+    assert exc.value.problem == "INVALID_ADDRESS"
+
+
+def test_idna_labels_that_round_trip_are_encoded() -> None:
+    expected = "verkauf@" + "müller-autohaus".encode("idna").decode() + ".de"
+    assert canonicalize_address("verkauf@müller-autohaus.de").canonical == expected
+    assert canonicalize_address("verkauf@MÜLLER-autohaus.DE").canonical == expected  # case only
+    # The IDNA 2008 form of "straße.de" is accepted exactly as shown.
+    assert canonicalize_address("verkauf@xn--strae-oqa.de").canonical == "verkauf@xn--strae-oqa.de"
+
+
+def test_extractor_must_count_the_addresses_on_the_page() -> None:
+    data = evidence().model_dump()
+    del data["distinct_addresses_on_page"]
+    with pytest.raises(ValidationError):
+        RecipientEvidence(**data)
+
+
+def test_stale_current_evidence_holds_for_a_recheck_instead_of_cancelling() -> None:
+    old = NOW - RECIPIENT_EVIDENCE_MAX_AGE - timedelta(hours=1)
+    stale = verify(evidence(observed_at=old - timedelta(hours=1), verified_at=old))
+    assert stale.status == RecipientStatus.RECHECK_REQUIRED
+    result = detect_contact_change(_bound(), stale, now=NOW)
+    assert not result.material_change and result.recheck_required
+    assert result.changes == (ContactChange.EVIDENCE_STALE,)
+    # A stale bound recipient plus a stale current decision is still one staleness hold.
+    late = NOW + RECIPIENT_EVIDENCE_MAX_AGE + timedelta(hours=2)
+    both = detect_contact_change(_bound(), stale, now=late)
+    assert both.changes == (ContactChange.EVIDENCE_STALE,) and not both.material_change

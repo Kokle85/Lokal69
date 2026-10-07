@@ -35,6 +35,7 @@ from outlook_bridge.config import BridgeConfig
 from outlook_bridge.errors import FolderScopeError, OutlookUnavailable, StaError, UploadBuildError
 from outlook_bridge.health import (
     GAP_CATCHUP_EXCEEDED,
+    GAP_ITEM_UNREADABLE,
     GAP_PENDING_CAPACITY,
     GAP_UNRESOLVED_MATCHING,
     GAP_UPLOAD_BUILD_FAILED,
@@ -51,6 +52,7 @@ from outlook_bridge.local_queue import (
 from outlook_bridge.log import event, get_logger
 from outlook_bridge.matching import DecisionKind, LocalMatcher
 from outlook_bridge.outlook_adapter import FolderRef, ItemRef, MailboxAdapter, MailSnapshot
+from suv_deals.domain.replies import is_processable_item
 
 ItemOutcomeKind = Literal[
     "uploaded",
@@ -140,14 +142,23 @@ class ItemProcessor:
         first_seen = existing.first_seen_at if existing is not None else now
         junk = folder.role == "junk"
         decision = self._matcher.evaluate(
-            snapshot, self._store.bindings_for_matching(), in_junk_folder=junk, first_seen_at=first_seen, now=now
+            snapshot,
+            self._store.bindings_for_matching(),
+            in_junk_folder=junk,
+            first_seen_at=first_seen,
+            now=now,
+            own_sent_hashes=self._store.own_sent_message_id_hashes(),
         )
         if decision.kind in (DecisionKind.UPLOAD, DecisionKind.QUARANTINE_UPLOAD):
             digests = (
-                self._mailbox.attachment_digests(ref, decision.digest_indices) if decision.digest_indices else {}
+                self._mailbox.attachment_digests(ref, decision.digest_indices)
+                if decision.digest_indices
+                else {}
             )
             try:
-                prepared = self._matcher.prepare_upload(snapshot, decision, digests, in_junk_folder=junk, observed_at=now)
+                prepared = self._matcher.prepare_upload(
+                    snapshot, decision, digests, in_junk_folder=junk, observed_at=now
+                )
             except UploadBuildError:
                 self._record(Outcome.LOCAL_REJECT, key_hash=key.key_hash, ref=ref, folder=folder, now=now)
                 self._store.record_gap(GAP_UPLOAD_BUILD_FAILED, now, now)
@@ -229,7 +240,9 @@ class Reconciler:
 
     # ------------------------------------------------------------------ scans
 
-    def reconcile(self, folders: Sequence[FolderRef], *, now: datetime, deep: bool = False) -> list[ScanResult]:
+    def reconcile(
+        self, folders: Sequence[FolderRef], *, now: datetime, deep: bool = False
+    ) -> list[ScanResult]:
         results = [self._scan_folder(folder, now=now, deep=deep) for folder in folders]
         if results and all(r.complete for r in results) and not deep:
             self._store.set_runtime_time("last_successful_reconcile_at", now)
@@ -239,7 +252,10 @@ class Reconciler:
     def _scan_folder(self, folder: FolderRef, *, now: datetime, deep: bool) -> ScanResult:
         config = self._config
         self._store.upsert_folder(
-            folder_key=folder.key, role=folder.role, store_id_hash=folder.store_id_hash, folder_id_hash=folder.folder_id_hash
+            folder_key=folder.key,
+            role=folder.role,
+            store_id_hash=folder.store_id_hash,
+            folder_id_hash=folder.folder_id_hash,
         )
         checkpoint = self._store.folder_checkpoint(folder.key)
         watermark = checkpoint.scan_watermark if checkpoint else None
@@ -252,7 +268,12 @@ class Reconciler:
         result = ScanResult(folder_key=folder.key, role=folder.role, complete=True, deep=deep, since=since)
         floor = now - config.max_catchup
         if since < floor:
-            self._store.record_gap(GAP_CATCHUP_EXCEEDED, since, floor, "checkpoint older than the catch-up window")
+            if checkpoint is None or GAP_CATCHUP_EXCEEDED not in checkpoint.gap_reasons:
+                # Recorded once per streak; while the checkpoint stays too old (e.g. held by a
+                # long detection gap) the reason stays on the checkpoint instead of a new row per scan.
+                self._store.record_gap(
+                    GAP_CATCHUP_EXCEEDED, since, floor, "checkpoint older than the catch-up window"
+                )
             result.gap_reasons.append(GAP_CATCHUP_EXCEEDED)
             since = floor
             result.since = floor
@@ -262,7 +283,9 @@ class Reconciler:
         except (OutlookUnavailable, FolderScopeError, StaError):
             result.complete = False
             result.gap_reasons.append("folder_unavailable")
-            self._store.finish_scan(folder.key, complete=False, new_watermark=None, gap_reasons=result.gap_reasons, now=now)
+            self._store.finish_scan(
+                folder.key, complete=False, new_watermark=None, gap_reasons=result.gap_reasons, now=now
+            )
             return result
         if listing.truncated:
             result.complete = False
@@ -308,6 +331,23 @@ class Reconciler:
 
     def _process_ref(self, ref: ItemRef, folder: FolderRef, *, now: datetime) -> str:
         entry_hash = sha256_text("entry\x00" + ref.store_id + "\x00" + ref.entry_id)
+        if ref.message_class is not None and not is_processable_item(ref.message_class):
+            # Meetings, sharing invitations, tasks and other non-mail items: ignored before any
+            # content is read (only a hashed locator key and the outcome are kept).
+            if self._store.processed(entry_hash) is None:
+                self._store.record_outcome(
+                    key_hash=entry_hash,
+                    outcome=Outcome.NON_MAIL,
+                    now=now,
+                    received_at=ref.received_at,
+                    folder_key=folder.key,
+                )
+            return "non_mail"
+        given_up = self._store.processed(entry_hash)
+        if given_up is not None and given_up.outcome == Outcome.UNREADABLE:
+            # Already given up (and surfaced as a gap): not re-read on every overlapping scan.
+            # A move gives the item a new EntryID, so it is retried once it shows up elsewhere.
+            return "unreadable_skipped"
         try:
             snapshot = self._mailbox.read_item(ref)
             if snapshot is None:
@@ -327,12 +367,17 @@ class Reconciler:
                     store_id=ref.store_id,
                     folder_key=folder.key,
                 )
+                # Given up after repeated failures: possibly a reply that is now never uploaded,
+                # so it is surfaced as a coverage gap (count only), never silently dropped.
+                self._store.record_gap(GAP_ITEM_UNREADABLE, ref.received_at or now, now, "item unreadable")
                 return "unreadable"
             return "read_failed"
 
     # ------------------------------------------------------------------ NewMailEx prompts
 
-    def process_event_ids(self, entry_ids: Iterable[str], folders: Sequence[FolderRef], *, now: datetime) -> Counter[str]:
+    def process_event_ids(
+        self, entry_ids: Iterable[str], folders: Sequence[FolderRef], *, now: datetime
+    ) -> Counter[str]:
         """Inspect items named by ``NewMailEx``; out-of-scope items are ignored unread."""
         by_entry = {folder.entry_id: folder for folder in folders}
         counts: Counter[str] = Counter()
@@ -378,26 +423,47 @@ class Reconciler:
             try:
                 snapshot = self._mailbox.read_item(ref)
                 if snapshot is None and pending.internet_message_id:
+                    # Moved since it was seen (new EntryID): re-find it inside the configured
+                    # folders only, by its immutable Internet Message-ID.
                     found = self._mailbox.find_by_internet_message_id(pending.internet_message_id)
                     snapshot = self._mailbox.read_item(found) if found is not None else None
+                if snapshot is None:
+                    counts["not_found"] += 1  # kept until its bounded window ends
+                    continue
+                target = by_entry.get(snapshot.ref.folder_entry_id)
+                if target is None:
+                    counts["out_of_scope"] += 1
+                    continue
+                counts[self._processor.process(snapshot, target, now=now).kind] += 1
             except (OutlookUnavailable, StaError):
                 counts["outlook_unavailable"] += 1
                 break
-            if snapshot is None:
-                counts["not_found"] += 1
-                continue
-            target = by_entry.get(snapshot.ref.folder_entry_id)
-            if target is None:
-                counts["out_of_scope"] += 1
-                continue
-            counts[self._processor.process(snapshot, target, now=now).kind] += 1
+            except Exception:
+                # One unreadable item must not stop the others; the locator stays bounded by its
+                # retry window and expiry then surfaces an unresolved gap (count only).
+                counts["read_failed"] += 1
         return counts
+
+    def retry_resolvable(self, folders: Sequence[FolderRef], *, now: datetime) -> Counter[str]:
+        """Re-read only pending locators whose references now match a known binding.
+
+        A pending reply-before-binding locator can only resolve when a binding names one of its
+        referenced Message-IDs, so unrelated replies (personal threads) are never re-read. This
+        also catches up a targeted retry that could not run at binding-sync time (for example
+        while Outlook was briefly unavailable).
+        """
+        known = self._store.known_message_id_hashes()
+        if not known:
+            return Counter()
+        return self.retry_pending(folders, now=now, message_id_hashes=known)
 
     def expire_pending(self, now: datetime) -> int:
         expired = self._store.take_expired_pending(now)
         for item in expired:
             if item.own_reference:
-                self._store.record_gap(GAP_UNRESOLVED_MATCHING, item.first_seen_at, now, "reply without binding")
+                self._store.record_gap(
+                    GAP_UNRESOLVED_MATCHING, item.first_seen_at, now, "reply without binding"
+                )
         return len(expired)
 
 

@@ -739,3 +739,18 @@ def test_envelope_addresses_must_be_valid() -> None:
         assert {"INVALID_ADDRESS", "HEADER_INJECTION"} & set(problems), address
     reply = MessageEnvelope(to=("seller@example.invalid",), reply_to=("broken@",))
     assert "INVALID_ADDRESS" in validate_scope(msg, envelope=reply).problems
+
+
+def test_preview_mirrors_only_an_exact_rendering() -> None:
+    message = rendered("seller_initial_de_v1")
+    edited = variant(message, body=message.body.replace("Guten Tag,", "Hallo,"))
+    with pytest.raises(TemplateRenderError) as exc:
+        render_preview_mk(edited)
+    assert "NOT_TEMPLATE_RENDERING" in problems_of(exc)
+    forged = message.model_copy(update={"template_hash": "0" * 64})
+    with pytest.raises(TemplateRenderError) as exc:
+        render_preview_mk(forged)
+    assert "TEMPLATE_NOT_REGISTERED" in problems_of(exc)
+    preview = render_preview_mk(message)
+    assert preview.source_body_hash == message.body_hash
+    assert preview.placeholders == message.placeholders
