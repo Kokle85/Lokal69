@@ -12,11 +12,13 @@ passed through to Supabase, Slack or any other service. One mode per deployment
     ``MCP_OAUTH_JWKS_URL`` (``ES256``/``RS256`` only; the JWK's algorithm must equal the header's;
     ``none``, ``HS*`` and ``crit`` headers are refused before any key lookup), issuer
     ``MCP_OAUTH_ISSUER``, audience ``MCP_OAUTH_AUDIENCE`` or the resource ``MCP_PUBLIC_URL``
-    (RFC 8707), ``exp``/``nbf``/``iat`` with a small leeway and a bounded lifetime. Scopes come
-    from ``scope`` (space separated) or ``scp`` and are mapped to `Scope` values; unknown scope
-    strings are ignored. Principal mapping: a canonical-UUID ``sub`` is a user and is mapped to
-    an *active* membership in an *active* workspace (``persistence.workspaces``); with several
-    memberships the signed ``workspace_id`` claim must name one of them. A machine client is
+    (RFC 8707; the dashboard's own issuer + audience pair is a configuration error, so a
+    dashboard session token is never an MCP token), ``exp``/``nbf``/``iat`` with a small leeway
+    and a bounded lifetime. Scopes come from ``scope`` (space separated) or ``scp`` and are
+    mapped to `Scope` values; unknown scope strings are ignored. Principal mapping: a
+    canonical-UUID ``sub`` is a user and is mapped to an *active* membership in an *active*
+    workspace (``persistence.workspaces``); with several memberships the signed
+    ``workspace_id`` claim must name one of them. A machine client is
     mapped through an explicit ``client_principals`` table keyed by the ``client_id``/``azp``
     claim, and only when ``sub`` is exactly the configured client subject (a user token issued
     through that client is never promoted to the machine principal). Nothing in a request can
@@ -72,7 +74,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from suv_deals.api.auth import SigningKeyResolver, StaticJwks
+from suv_deals.api.auth import SigningKeyResolver, StaticJwks, supabase_issuer
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
 from suv_deals.domain.enums import Role, Scope
@@ -300,6 +302,26 @@ def _url_problem(name: str, value: str | None, settings: Settings, *, required: 
     return None
 
 
+def _audience_problem(settings: Settings) -> str | None:
+    """Refuse the dashboard's (issuer, audience) pair for MCP access tokens.
+
+    RFC 8707 audience binding is only meaningful when no other token shares it: a dashboard
+    session token (``<SUPABASE_URL>/auth/v1`` issuer with ``SUPABASE_JWT_AUDIENCE``) must never
+    be accepted as an MCP access token (no token passthrough between the two surfaces).
+    """
+    audience = (settings.mcp_oauth_audience or "").strip()
+    if not audience:
+        return None
+    if settings.supabase_url and audience == settings.supabase_jwt_audience.strip():
+        try:
+            dashboard_issuer = supabase_issuer(settings.supabase_url)
+        except ValueError:
+            return None
+        if dashboard_issuer.rstrip("/") == (settings.mcp_oauth_issuer or "").strip().rstrip("/"):
+            return "MCP_OAUTH_AUDIENCE must not be the dashboard session audience (SUPABASE_JWT_AUDIENCE)"
+    return None
+
+
 class OAuthJwtVerifier:
     """Verifies OAuth JWT access tokens for this resource server (see module docstring)."""
 
@@ -355,6 +377,7 @@ class OAuthJwtVerifier:
                 _url_problem(
                     "MCP_OAUTH_JWKS_URL", settings.mcp_oauth_jwks_url, settings, required=resolver is None
                 ),
+                _audience_problem(settings),
             )
             if p is not None
         ]
@@ -625,8 +648,11 @@ def dev_local_problem(settings: Settings) -> str | None:
     MCP URL (``MCP_PUBLIC_URL``, else ``APP_BASE_URL``) must be a loopback address."""
     if settings.app_env not in ("development", "test"):
         return "MCP_AUTH_MODE=dev_local is only allowed when APP_ENV is development or test"
-    url = settings.mcp_public_url or settings.app_base_url
-    host = urlsplit(url.strip()).hostname if url else None
+    url = (settings.mcp_public_url or settings.app_base_url or "").strip()
+    try:
+        host = urlsplit(url).hostname if url else None
+    except ValueError:  # e.g. a broken IPv6 literal: a configuration problem, never a start-up crash
+        host = None
     if host not in LOOPBACK_HOSTS:
         return "MCP_AUTH_MODE=dev_local requires a loopback MCP_PUBLIC_URL/APP_BASE_URL"
     return None

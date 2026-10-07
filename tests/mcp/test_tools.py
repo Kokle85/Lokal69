@@ -15,9 +15,9 @@ from typing import Any
 import httpx2
 import pytest
 from jsonschema import Draft202012Validator
+from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
-from mcp import Client
 from suv_deals.api.middleware import RateLimit
 from suv_deals.domain.enums import Role, Scope
 from suv_deals.mcp.schemas import (
@@ -29,9 +29,8 @@ from suv_deals.mcp.schemas import (
     tool_input_schema,
     tool_output_schema,
 )
-from suv_deals.mcp.server import McpOptions, build_mcp
+from suv_deals.mcp.server import McpOptions
 from suv_deals.mcp.tools import ToolCall, ToolRegistry
-from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence.database import Database
 from suv_deals.views.common import ResponseEnvelope
 from suv_deals.views.operations import HealthView
@@ -313,6 +312,28 @@ async def test_validation_errors_name_fields_and_never_echo_values(data_mcp: Dat
             },
             ["note"],
         ),
+        (
+            "deals_get_comparables",
+            {"comparable_set_id": str(data_mcp.data.comparable_set_id), "limit": 101},
+            ["limit"],
+        ),
+        ("deals_get_valuation", {"valuation_id": "valuation-1"}, ["valuation_id"]),
+        ("reviews_list_pending", {"include_needs_information": "yes"}, ["include_needs_information"]),
+        (
+            "reviews_submit",
+            submit_args(data_mcp, SECRET_TOKEN, "submit-invalid-1", outcome="bought", summary="short"),
+            ["outcome", "summary"],
+        ),
+        (
+            "sources_pause",
+            {
+                "source_id": str(data_mcp.data.sources["running"]),
+                "expected_version": 0,
+                "reason": "no",
+                "idempotency_key": "pause-invalid-01",
+            },
+            ["expected_version", "reason"],
+        ),
     ]
     for tool, arguments, fields in bad:
         payload = await client.fails(
@@ -548,7 +569,11 @@ async def test_review_queue_pages_are_frozen_under_status_changes(data_mcp: Data
     other = next(i for i in other_view["data"]["items"] if i["case_id"] == str(priced))
     claimed = await client.ok(
         "reviews_claim",
-        {"case_id": other["case_id"], "expected_version": other["case_version"], "idempotency_key": "claim-between"},
+        {
+            "case_id": other["case_id"],
+            "expected_version": other["case_version"],
+            "idempotency_key": "claim-between",
+        },
         token=data_mcp.second_reviewer,
     )
     assert claimed["data"]["case_version"] == other["case_version"] + 1
@@ -560,11 +585,54 @@ async def test_review_queue_pages_are_frozen_under_status_changes(data_mcp: Data
     assert frozen[0]["case_version"] == other["case_version"]  # the frozen projection, not the live row
     result = await client.call(
         "reviews_claim",
-        {"case_id": other["case_id"], "expected_version": frozen[0]["case_version"], "idempotency_key": "claim-frozen"},
+        {
+            "case_id": other["case_id"],
+            "expected_version": frozen[0]["case_version"],
+            "idempotency_key": "claim-frozen",
+        },
         token=data_mcp.reviewer,
     )
     assert result["isError"] is True
     assert result["structuredContent"]["code"] in ("ALREADY_CLAIMED", "VERSION_CONFLICT")
+
+
+async def test_review_queue_pages_are_frozen_when_a_case_leaves_the_queue(data_mcp: DataHarness) -> None:
+    """A case decided between pages stays in the frozen page (membership was frozen), a fresh
+    query no longer lists it, and acting on the frozen projection is revalidated."""
+    client, data = data_mcp.client, data_mcp.data
+    priced, incomplete = data.cases["priced"], data.cases["incomplete"]
+    data_mcp.seed.conn.execute(
+        "update app.review_cases set priority = case when id = %s then 900 else -900 end"
+        " where workspace_id = %s and id in (%s, %s)",
+        (incomplete, data.workspace_id, priced, incomplete),
+    )
+    first = await client.ok("reviews_list_pending", {"limit": 1}, token=data_mcp.reviewer)
+    assert [i["case_id"] for i in first["data"]["items"]] == [str(incomplete)]
+    # Another reviewer claims and decides the second case: it leaves the pending queue.
+    claim = await client.ok(
+        "reviews_claim",
+        {"case_id": str(priced), "expected_version": 1, "idempotency_key": "claim-leaves-01"},
+        token=data_mcp.second_reviewer,
+    )
+    token = claim["data"]["claim_token"]
+    decided = await client.ok(
+        "reviews_submit", submit_args(data_mcp, token, "submit-leaves-01"), token=data_mcp.second_reviewer
+    )
+    assert decided["data"]["case_state"] == "watch"
+    second = await client.ok(
+        "reviews_list_pending", {"limit": 1, "cursor": first["next_cursor"]}, token=data_mcp.reviewer
+    )
+    assert [i["case_id"] for i in second["data"]["items"]] == [str(priced)]
+    assert second["data"]["items"][0]["case_version"] == 1  # the frozen projection
+    assert "FROZEN_QUEUE_PROJECTION" in {w["code"] for w in second["warnings"]}
+    fresh = await client.ok("reviews_list_pending", {"limit": 10}, token=data_mcp.reviewer)
+    assert [i["case_id"] for i in fresh["data"]["items"]] == [str(incomplete)]
+    stale = await client.call(
+        "reviews_claim",
+        {"case_id": str(priced), "expected_version": 1, "idempotency_key": "claim-leaves-02"},
+        token=data_mcp.reviewer,
+    )
+    assert stale["isError"] is True and stale["structuredContent"]["code"] == "VERSION_CONFLICT"
 
 
 # --------------------------------------------------------------------------------------------

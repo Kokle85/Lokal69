@@ -64,6 +64,10 @@ ignore = [
   "RUF012",
 ]
 
+[tool.ruff.lint.isort]
+# tests/mcp is a test package, not the MCP SDK; keep `mcp` third-party in every invocation.
+known-third-party = ["mcp"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "PLR", "DTZ", "B011"]
 "scripts/**" = ["S"]

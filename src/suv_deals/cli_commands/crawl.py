@@ -13,6 +13,12 @@ Safety rules (none of them can be overridden from the command line):
 The run is an ordinary discovery job (highest priority, one attempt) processed by an in-process
 worker, so leases, fencing, evidence, parser health and access-block handling are exactly those of
 the worker. Detail jobs it enqueues are left for ``suv-deals worker``.
+
+The page cap only exists inside this process (the discovery handler reads the per-run budget from
+the stored source). When the in-process worker does not get the job (another due discovery job
+came first, or a running ``suv-deals worker`` claimed it), the job is CANCELLED while it is still
+waiting, so no other worker can later run it with the source's full per-run budget; if another
+worker already holds it, the command says so (that run is still bounded by the source budget).
 """
 
 # ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
@@ -39,6 +45,8 @@ from suv_deals.cli_commands._common import (
 )
 
 if TYPE_CHECKING:
+    from suv_deals.domain.actor import ActorContext
+    from suv_deals.persistence.database import Database
     from suv_deals.persistence.sources_repo import SourceRecord
     from suv_deals.workers.runtime import RuntimeContext
 
@@ -71,6 +79,25 @@ def page_capped_runtime(ctx: RuntimeContext, page_cap: int) -> RuntimeContext:
 
     values: dict[str, Any] = {f.name: getattr(ctx, f.name) for f in dataclasses.fields(ctx)}
     return PageCappedRuntime(**values, page_cap=page_cap)
+
+
+async def withdraw_unprocessed(db: Database, actor: ActorContext, job_id: UUID) -> str:
+    """Cancel our discovery job while it still waits; describe what happened to it."""
+    from suv_deals.errors import AppError
+    from suv_deals.persistence import jobs
+    from suv_deals.persistence.transactions import unit_of_work
+
+    try:
+        async with unit_of_work(db, actor) as conn:
+            await jobs.cancel(conn, actor, job_id, reason="crawl once: not processed by this command")
+    except AppError:
+        async with unit_of_work(db, actor) as conn:
+            record = await jobs.get_job(conn, actor, job_id)
+        return (
+            f"job {job_id} was taken by another worker (state {record.state.value}; bounded by the "
+            "source's own per-run page budget, not by --max-pages)"
+        )
+    return f"job {job_id} was cancelled so that no other worker runs it without the page cap"
 
 
 def runtime_refusals(record: SourceRecord, *, network_enabled: bool, fixture_data: bool) -> list[str]:
@@ -205,14 +232,16 @@ def once(cli: CliContext, source_key: str, profile: str, max_pages: int, workspa
                 workspace_ids=(workspace_id,),
             )
             report = await worker.run_once()
+            if report is None or report.job_id != job_id:
+                outcome = await withdraw_unprocessed(base.db, actor, job_id)
         finally:
             await base.aclose()
         if report is None:
-            fail("the job could not be claimed; it stays queued for `suv-deals worker`")
+            fail(f"the job was not claimed by this command; {outcome}; re-run `crawl once`")
         if report.job_id != job_id:
             fail(
-                "another due discovery job was claimed first and processed; "
-                f"job {job_id} stays queued for `suv-deals worker`"
+                f"another due discovery job ({report.job_id}) was claimed first and processed; "
+                f"{outcome}; re-run `crawl once`"
             )
         state = "lease lost" if report.state is None else report.state.value
         echo(f"Job state: {state}" + (f" ({report.code})" if report.code else ""))

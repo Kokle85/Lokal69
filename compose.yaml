@@ -7,9 +7,14 @@
 # - api, worker, scheduler, dispatcher and reconciler run the SAME image with different commands.
 # - Settings come from ./.env (never committed); the crawler gets ONLY its own token.
 # - Every published port is bound to 127.0.0.1. The API binds 0.0.0.0 inside its container only.
-# - Network and notification switches default to OFF here and cannot be turned on by .env alone:
-#   export SOURCE_NETWORK_ENABLED=true / ALLOW_EXTERNAL_NOTIFICATIONS=true in the shell explicitly,
-#   and only after the activation gates in docs/runbook.md passed.
+# - Network and notification switches default to OFF here and cannot be turned on by .env alone.
+#   Compose also reads the project .env for ${...} interpolation, so the switches are interpolated
+#   from their OWN names, which the application .env does not contain (SOURCE_NETWORK_ENABLED=true
+#   in .env therefore changes nothing here). Enable one explicitly in the shell, never in .env,
+#   and only after the activation gates in docs/runbook.md passed:
+#     SUV_DEALS_ENABLE_SOURCE_NETWORK=true / SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS=true
+# - The application containers have a read-only root file system; the worker writes retained
+#   evidence (SNAPSHOT_STORAGE=local) to the "snapshots" volume only.
 # - Networks: "crawler" is internal and shared only by worker <-> crawl4ai; the crawler's own
 #   internet egress uses "crawler_egress", which no application service joins. The crawler has
 #   no database credentials and is not on the application network. Docker networks cannot stop
@@ -30,8 +35,8 @@ x-app: &app
     APP_ENV: ${APP_ENV:-development}
     CRAWL4AI_BASE_URL: http://crawl4ai:11235
     DATABASE_SET_ROLE: suv_backend
-    SOURCE_NETWORK_ENABLED: ${SOURCE_NETWORK_ENABLED:-false}
-    ALLOW_EXTERNAL_NOTIFICATIONS: ${ALLOW_EXTERNAL_NOTIFICATIONS:-false}
+    SOURCE_NETWORK_ENABLED: ${SUV_DEALS_ENABLE_SOURCE_NETWORK:-false}
+    ALLOW_EXTERNAL_NOTIFICATIONS: ${SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS:-false}
   # A database on the developer's host (e.g. the local PostgreSQL clusters) is reachable as
   # host.docker.internal; the crawler does NOT get this mapping.
   extra_hosts:
@@ -83,6 +88,8 @@ services:
   worker:
     <<: [*app, *no-http-healthcheck]
     command: ["suv-deals", "worker", "--queues", "discovery,detail,recheck,valuation"]
+    volumes:
+      - snapshots:/app/var/snapshots
     networks:
       - app
       - crawler
@@ -105,7 +112,9 @@ services:
 
   crawl4ai:
     # Pinned tag; record and pin the tested digest (CRAWL4AI_IMAGE_DIGEST) before production use.
-    # Do not replace or restart an existing shared crawler: point CRAWL4AI_BASE_URL at it instead.
+    # Do not replace or restart an existing shared crawler: host processes (`make dev`) point
+    # CRAWL4AI_BASE_URL at it (http://127.0.0.1:11235) instead of starting this service. Its
+    # published port is the same 127.0.0.1:11235, so it cannot start next to a running one.
     image: unclecode/crawl4ai:0.9.4
     environment:
       # Only the crawler's documented token setting is passed (spec 26); no database or Supabase keys.
@@ -133,6 +142,9 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+volumes:
+  snapshots: {}
 
 networks:
   app:

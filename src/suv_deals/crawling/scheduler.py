@@ -17,7 +17,10 @@ slots and due times):
    traffic to catch up). Racing schedulers get ``already_scheduled`` for the same slot.
 
 Real sources are not scheduled at all while ``SOURCE_NETWORK_ENABLED=false`` (their schedules stay
-due and visibly unscanned); fixture sources run offline.
+due and visibly unscanned); fixture sources run offline, and never in production, whose processes
+load no fixture data (`workers.runtime.fixture_runs_allowed`). One schedule that cannot be advanced
+(e.g. a lock timeout that outlived the transient retries) is reported in ``skipped`` and stays due;
+it never stops the remaining schedules of the workspace.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from suv_deals.adapters.registry import build_adapter, registry_problems
 from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import CoverageMode, SourceMode
-from suv_deals.errors import AppError, NotFound
+from suv_deals.errors import AppError, DependencyUnavailable, NotFound
 from suv_deals.observability.logging import log_context
 from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence import config_repo, sources_repo
@@ -45,12 +48,14 @@ from suv_deals.persistence.database import Database
 from suv_deals.persistence.sources_repo import ScheduleAdvance, SourceRecord
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
-from suv_deals.workers.runtime import active_workspace_ids, build_runtime
+from suv_deals.workers.runtime import active_workspace_ids, build_runtime, fixture_runs_allowed
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PARTITION: Final = "default"
 NETWORK_DISABLED: Final = "source_network_disabled"
+FIXTURE_IN_PRODUCTION: Final = "fixture_source_in_production"
+ADVANCE_FAILED: Final = "advance_failed"
 
 
 class WorkspaceTick(BaseModel):
@@ -166,6 +171,10 @@ async def tick_workspace(
             # Never enqueue work that may not run; the schedule stays due (visibly not scanned).
             skipped[NETWORK_DISABLED] += 1
             continue
+        if source.mode == SourceMode.FIXTURE and not fixture_runs_allowed(settings):
+            # Production processes have no fixture data: a job could only block, one per slot.
+            skipped[FIXTURE_IN_PRODUCTION] += 1
+            continue
 
         async def advance(schedule_id: UUID = schedule.id) -> ScheduleAdvance:
             async with unit_of_work(db, actor) as conn:
@@ -175,6 +184,16 @@ async def tick_workspace(
             try:
                 result = await retry_transient(advance)
             except NotFound:
+                continue
+            except DependencyUnavailable:
+                raise  # the database is gone: the whole workspace tick fails visibly
+            except AppError as exc:
+                # One schedule never stops the others; it stays due and is retried next tick.
+                logger.warning(
+                    "schedule could not be advanced",
+                    extra={"schedule_id": str(schedule.id), "error_code": exc.code.value},
+                )
+                skipped[f"{ADVANCE_FAILED}:{exc.code.value}"] += 1
                 continue
         if result.outcome == "enqueued" and result.job_id is not None:
             enqueued.append(result.job_id)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from tests.integration.db.helpers import Seed
@@ -19,20 +20,23 @@ from tests.integration.pipeline.support import (
     fixture_source_config,
     pipeline_settings,
     run,
+    seed_comparables,
+    seed_fx,
 )
 
-from suv_deals.adapters.base import FetchPurpose, ParserHealth, RawDocument
+from suv_deals.adapters.base import DiscoveryPage, FetchPurpose, ParserHealth, RawDocument, SearchRequest
 from suv_deals.adapters.fixture_client import FixtureCrawlClient
 from suv_deals.clock import SystemClock
 from suv_deals.crawling import discovery
 from suv_deals.crawling.detail import CARD_ONLY_SKIP
 from suv_deals.crawling.scheduler import run_scheduler_tick
-from suv_deals.domain.enums import JobState, JobType, SourceMode
+from suv_deals.domain.enums import AccessState, JobState, JobType, SourceMode
+from suv_deals.errors import VersionConflict
 from suv_deals.persistence import jobs, listings_repo
 from suv_deals.persistence.database import Conn
 from suv_deals.workers.reconciliation import ReconcileOptions, Reconciler
 from suv_deals.workers.runner import Worker
-from suv_deals.workers.runtime import offline_fixture_resolver
+from suv_deals.workers.runtime import RuntimeContext, offline_fixture_resolver
 
 pytestmark = pytest.mark.db
 
@@ -314,3 +318,84 @@ async def test_an_exhausted_retry_is_reported_and_counted_as_a_dead_letter(db_ur
         assert counted == 1.0
     finally:
         await env.close()
+
+
+class _LoopingAdapter:
+    """Wraps the real adapter: its LAST page claims a next page that links back to page 1."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.first_url: str | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def discover(self, request: SearchRequest, client: Any) -> DiscoveryPage:
+        page: DiscoveryPage = await self._inner.discover(request, client)
+        self.first_url = self.first_url or request.url
+        if page.access_state == AccessState.OK and not page.has_more:
+            return page.model_copy(update={"has_more": True, "next_url": self.first_url})
+        return page
+
+
+async def test_a_pagination_cycle_is_never_refetched(
+    env: PipelineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A "next" link back to an already fetched page ends the traversal (``partial``, gap recorded)
+    instead of re-fetching the same pages until the per-run page budget is used up."""
+    set_source_config(env, "rate_budget", '{"max_search_pages_per_run": 6}')
+    original = RuntimeContext.open_crawl_session
+
+    async def looping(self: RuntimeContext, workspace_id: Any, source: Any) -> Any:
+        session = await original(self, workspace_id, source)
+        session.adapter = _LoopingAdapter(session.adapter)  # type: ignore[assignment]
+        return session
+
+    monkeypatch.setattr(RuntimeContext, "open_crawl_session", looping)
+    assert await rerun_discovery(env, "pagination-loop") == "partial"
+    fetches = env.scalar(
+        "select count(*) from ops.fetch_attempts where workspace_id = %s and purpose = 'search'",
+        env.workspace_id,
+    )
+    assert fetches == 2  # pages 1 and 2 once each; page 1 is never fetched again
+    [run_row] = env.rows(
+        "select outcome, pages_fetched, gap_reasons from ops.crawl_runs where workspace_id = %s",
+        env.workspace_id,
+    )
+    assert run_row["outcome"] == "partial" and run_row["pages_fetched"] == 2
+    assert any("pagination loop" in g for g in run_row["gap_reasons"])
+    assert absences(env) == 0  # an incomplete traversal is no evidence about the inventory
+
+
+async def test_a_concurrent_change_before_the_valuation_commit_is_retried_not_dropped(
+    env: PipelineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``persist_valuation`` refuses a calculation whose inputs changed meanwhile (VERSION_CONFLICT,
+    "recompute"). The whole commit rolls back, so the job must run again with fresh reads; a dead
+    letter would leave the candidate without a valuation AND without its pending review case."""
+    from suv_deals.persistence import valuation_repo  # noqa: PLC0415
+
+    await seed_comparables(env)
+    await seed_fx(env)
+    await tick(env)
+    await worker(env, "worker-crawl", JobType.DISCOVERY, JobType.DETAIL).run_until_idle()
+    eligible = by_slid(env)["TEST-204"]["id"]
+    real_persist = valuation_repo.persist_valuation
+    conflicts: list[Any] = []
+
+    async def conflicting(conn: Any, actor: Any, valuation: Any, refs: Any, inputs: Any) -> Any:
+        if refs.listing_id == eligible and not conflicts:
+            conflicts.append(refs.listing_id)
+            raise VersionConflict("The cost profile changed since the calculation; recompute")
+        return await real_persist(conn, actor, valuation, refs, inputs)
+
+    monkeypatch.setattr(valuation_repo, "persist_valuation", conflicting)
+    first = await worker(env, "worker-value", JobType.VALUATION).run_until_idle()
+    [conflicted] = [r for r in first if r.code == "VERSION_CONFLICT"]
+    assert conflicted.state == JobState.RETRY_WAIT and conflicts == [eligible]
+    cases = "select count(*) from app.review_cases where workspace_id = %s and listing_id = %s"
+    assert env.scalar(cases, env.workspace_id, eligible) == 0  # rolled back with the valuation
+    env.seed.conn.execute("update ops.jobs set available_at = now() where id = %s", (conflicted.job_id,))
+    [again] = await worker(env, "worker-value-2", JobType.VALUATION).run_until_idle()
+    assert (again.job_id, again.state, again.attempt) == (conflicted.job_id, JobState.SUCCEEDED, 2)
+    assert env.scalar(cases, env.workspace_id, eligible) == 1

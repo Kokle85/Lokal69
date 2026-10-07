@@ -20,14 +20,17 @@ from uuid import UUID
 
 import pytest
 
+from suv_deals.api.middleware import RateLimit
 from suv_deals.domain.enums import Role, Scope
 from suv_deals.integrations.event_bridge import DEFAULT_POLICY, SubscriptionPolicy
-from suv_deals.mcp.auth import McpAccessToken, McpPrincipal
+from suv_deals.mcp.auth import ClientPrincipal, McpAccessToken, McpPrincipal, issue_api_credential
 from suv_deals.mcp.events import EXTENSION_ID
 from suv_deals.mcp.server import McpOptions
 from suv_deals.persistence.database import Database
+from suv_deals.persistence.transactions import unit_of_work
 from suv_deals.settings import Settings
 from tests.integration.db.helpers import Seed
+from tests.integration.persistence_core.support import system
 from tests.mcp.conftest import (
     CALLBACK_URL,
     MCP_URL,
@@ -146,7 +149,7 @@ async def events_harness(
 
 
 class SubscriberVerifier:
-    """Accepts one opaque token as a reviewer-like subscriber (no database needed)."""
+    """Accepts one opaque token as a reviewer subscriber (no database needed)."""
 
     async def verify_token(self, token: str) -> McpAccessToken | None:
         if token != "synthetic-subscriber":
@@ -155,7 +158,7 @@ class SubscriberVerifier:
         principal = McpPrincipal(
             workspace_id=uuid.uuid4(),
             principal_id=uuid.uuid4(),
-            principal_kind="mcp_client",
+            principal_kind="user",
             role=Role.REVIEWER,
             scopes=scopes,
             auth_mode="oauth",
@@ -419,7 +422,9 @@ async def test_external_notifications_disabled_refuses_without_contacting_anyone
         assert error["code"] == -32014 and error["data"] == {"feature": "deliveryMode", "value": "webhook"}
         # Authorization is answered first: a principal without the event scopes is Forbidden.
         viewer = await h.client.error(
-            "events/subscribe", subscribe_params(h.callback.secret), token=h.token(h.users.viewer, Role.VIEWER)
+            "events/subscribe",
+            subscribe_params(h.callback.secret),
+            token=h.token(h.users.viewer, Role.VIEWER),
         )
         assert viewer["code"] == -32012
         assert h.callback.requests == []
@@ -434,8 +439,6 @@ async def test_external_notifications_disabled_refuses_without_contacting_anyone
 async def test_unsubscribe_is_rate_limited_per_principal(
     db: Database, seed: Seed, keys: SigningKeys, tokens: TokenFactory
 ) -> None:
-    from suv_deals.api.middleware import RateLimit
-
     options = McpOptions(expensive_limit=RateLimit(capacity=2, per_seconds=60.0))
     async with events_harness(db, seed, keys, tokens, options=options) as h:
         for _ in range(2):
@@ -519,3 +522,57 @@ async def test_events_methods_require_authentication(
             response = await h.client.rpc(method, subscribe_params(h.callback.secret))
             assert response.status_code == 401
         assert h.callback.requests == []
+
+
+async def test_only_principals_the_dispatcher_can_recheck_may_subscribe(
+    db: Database, seed: Seed, keys: SigningKeys, tokens: TokenFactory
+) -> None:
+    """Before every delivery the dispatcher rechecks a membership or a stored credential. An
+    OAuth machine client mapped only in configuration has neither: it is not offered the event
+    and cannot subscribe (its subscription could never deliver); a machine principal behind a
+    stored API credential can."""
+    workspace = seed.workspace("MCP events machine")
+    subscriber_scopes = frozenset({Scope.REVIEWS_READ, Scope.EVENTS_SUBSCRIBE})
+    clients = {
+        "synthetic-machine": ClientPrincipal(
+            workspace_id=workspace, principal_id=uuid.uuid4(), role=Role.REVIEWER, scopes=subscriber_scopes
+        )
+    }
+    callback = FakeCallback()
+    async with mcp_client(
+        events_settings(), db, keys, events_http=callback, client_principals=clients
+    ) as client:
+        machine = tokens.mint(
+            "synthetic-machine", scopes=list(subscriber_scopes), extra={"client_id": "synthetic-machine"}
+        )
+        assert (await client.result("events/list", token=machine))["events"] == []
+        refused = await client.error("events/subscribe", subscribe_params(callback.secret), token=machine)
+        assert refused["code"] == -32012
+        await client.result("events/unsubscribe", unsubscribe_params(), token=machine)  # still idempotent
+    assert callback.requests == []
+    assert (
+        seed.scalar("select count(*) from ops.event_subscriptions where workspace_id = %s", (workspace,)) == 0
+    )
+
+    actor = system(workspace)
+    async with unit_of_work(db, actor) as conn:
+        issued = await issue_api_credential(
+            conn,
+            actor,
+            principal_id=uuid.uuid4(),
+            principal_kind="mcp_client",
+            role=Role.REVIEWER,
+            scopes=sorted(subscriber_scopes),
+            label="SYNTHETIC event subscriber",
+        )
+    static = events_settings(mcp_auth_mode="static_bearer")
+    async with mcp_client(static, db, keys, events_http=callback) as client:
+        token = issued.token.get_secret_value()
+        assert [e["name"] for e in (await client.result("events/list", token=token))["events"]] == [EVENT]
+        result = await client.result("events/subscribe", subscribe_params(callback.secret), token=token)
+        assert result["id"].startswith("sub_") and len(callback.requests) == 1
+    stored = seed.conn.execute(
+        "select credential_id, verification_state from ops.event_subscriptions where workspace_id = %s",
+        (workspace,),
+    ).fetchall()
+    assert stored == [(issued.credential_id, "verified")]

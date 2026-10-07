@@ -27,6 +27,7 @@ from tests.db_harness import (
     _url_for,
     admin_url,
     apply_sql_file,
+    create_migrated_database,
     drop_database,
     migration_files,
 )
@@ -286,6 +287,30 @@ def test_bootstrap_owner_requires_an_existing_auth_user(run_cli: Cli, db_url: st
         seed.conn.execute("update app.workspaces set active = false where id = %s", (workspace,))
 
 
+def test_bootstrap_owner_does_not_create_a_second_workspace_on_rerun(
+    run_cli: Cli, db_url: str, seed: Seed
+) -> None:
+    name = f"CLI rerun {uuid.uuid4().hex[:8]}"
+    env = {"MAINTENANCE_DATABASE_URL": db_url}
+    user = seed.user()
+    args = ("bootstrap", "owner", "--user-id", str(user), "--workspace-name", name, "--yes")
+    first = run_cli(*args, env=env)
+    assert first.exit_code == 0, first.output
+    workspace = seed.scalar("select id from app.workspaces where name = %s", (name,))
+    try:
+        again = run_cli(*args[:-2], f"  {name} ", "--yes", env=env)  # same name after trimming
+        assert again.exit_code == 1
+        assert f"already owns the active workspace {workspace}" in again.output
+        assert seed.scalar("select count(*) from app.workspaces where name = %s", (name,)) == 1
+        # Re-confirming ownership of the existing workspace stays possible.
+        confirmed = run_cli(
+            "bootstrap", "owner", "--user-id", str(user), "--workspace", str(workspace), "--yes", env=env
+        )
+        assert confirmed.exit_code == 0, confirmed.output
+    finally:
+        seed.conn.execute("update app.workspaces set active = false where id = %s", (workspace,))
+
+
 def test_bootstrap_owner_never_takes_the_url_from_the_command_line(run_cli: Cli) -> None:
     result = run_cli("bootstrap", "owner", "--user-id", str(uuid.uuid4()), "--workspace-name", "x", "--yes")
     assert result.exit_code == 2
@@ -342,6 +367,15 @@ def test_evidence_verify_recomputes_revision_hashes(
     failed = run_cli("evidence", "verify", "--workspace", str(workspace), env=db_env)
     assert failed.exit_code == 1
     assert "1 hash mismatch" in failed.output
+
+    # --skip-objects needs no storage configuration at all (e.g. the isolated restore check).
+    unconfigured = {**db_env, "SNAPSHOT_STORAGE": "supabase"}
+    refused = run_cli("evidence", "verify", "--workspace", str(workspace), env=unconfigured)
+    assert refused.exit_code == 1
+    assert "SUPABASE_URL" in refused.output
+    skipped = run_cli("evidence", "verify", "--workspace", str(workspace), "--skip-objects", env=unconfigured)
+    assert "1 hash mismatch" in skipped.output
+    assert "SUPABASE_URL" not in skipped.output
 
 
 def test_outbox_reviews_and_reconcile_are_read_only(
@@ -427,6 +461,51 @@ def test_db_migrate_applies_pending_migrations_once(
     password = str(psycopg.conninfo.conninfo_to_dict(emulated_database).get("password") or "")
     if len(password) >= 6:
         assert password not in applied.output
+
+
+@pytest.fixture
+def ledger_database_and_login() -> Iterator[tuple[str, str]]:
+    """A migrated scratch database WITH a migration ledger, plus a dedicated LOGIN member of
+    suv_backend that has no privilege on the ledger schema (as on a hosted project)."""
+    name, url = create_migrated_database("suv_test_cli_doctor")
+    login = f"suv_cli_probe_{uuid.uuid4().hex[:8]}"
+    password = uuid.uuid4().hex
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute(
+                "create schema supabase_migrations; create table supabase_migrations.schema_migrations"
+                " (version text primary key, statements text[], name text)"
+            )
+            conn.execute(
+                sql.SQL("create role {} login password {} in role suv_backend").format(
+                    sql.Identifier(login), sql.Literal(password)
+                )
+            )
+            conn.execute(
+                sql.SQL("grant connect on database {} to {}").format(
+                    sql.Identifier(name), sql.Identifier(login)
+                )
+            )
+        login_url = psycopg.conninfo.make_conninfo(url, user=login, password=password)
+        yield url, login_url
+    finally:
+        drop_database(name)
+        with psycopg.connect(admin_url(), autocommit=True) as admin:
+            admin.execute(sql.SQL("drop role if exists {}").format(sql.Identifier(login)))
+
+
+def test_doctor_reports_the_ledger_as_skipped_without_privilege(
+    run_cli: Cli, ledger_database_and_login: tuple[str, str]
+) -> None:
+    _owner_url, login_url = ledger_database_and_login
+    env = {"DATABASE_URL": login_url, "DATABASE_SET_ROLE": "suv_backend"}
+    result = run_cli("doctor", "--process", "scheduler", env=env)
+    out = result.output
+    assert "SKIP  database/migration_ledger" in out and "no privilege to read the ledger" in out
+    # The remaining checks still ran instead of one "database/check" error.
+    assert "database/check" not in out
+    assert "OK    database/set_role" in out
+    assert "OK    database/schema" in out
 
 
 def test_db_migrate_refuses_schemas_without_a_ledger(run_cli: Cli, db_url: str) -> None:

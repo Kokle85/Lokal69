@@ -216,6 +216,48 @@ async def test_unknown_api_paths_and_methods_are_typed_errors(keys: SigningKeys)
         assert put_me.headers["allow"] == "GET"
 
 
+async def test_extension_routers_get_405_with_their_own_allowed_methods(keys: SigningKeys) -> None:
+    """The ``extra_routers`` hook (spec 37.8 inquiry/mail-worker routers) gets the same typed 405
+    as the core routes, with the extension route's own ``Allow`` methods, while unknown paths
+    stay 404 and nothing under ``/api`` falls through to the MCP mount."""
+    extension = APIRouter(prefix="/api/v11")
+
+    @extension.get("/inquiries")
+    async def list_inquiries() -> Response:
+        return JSONResponse({"items": []})
+
+    @extension.post("/inquiries/{inquiry_id}/pause")
+    async def pause_inquiry(inquiry_id: str) -> Response:
+        return JSONResponse({"paused": inquiry_id})
+
+    events: list[str] = []
+    async with offline_client(keys, extra_routers=[extension], mcp_asgi=fake_mcp_app(events)) as (client, _):
+        assert (await client.get("/api/v11/inquiries")).json() == {"items": []}
+        wrong = await client.post("/api/v11/inquiries", json={})
+        assert wrong.status_code == 405
+        assert wrong.headers["allow"] == "GET"
+        assert error_of(wrong)["code"] == "VALIDATION_ERROR"
+        nested = await client.get(f"/api/v11/inquiries/{uuid.uuid4()}/pause")
+        assert nested.status_code == 405
+        assert nested.headers["allow"] == "POST"
+        missing = await client.post("/api/v11/unknown", json={})
+        assert missing.status_code == 404
+        assert error_of(missing)["code"] == "NOT_FOUND"
+        core = await client.post("/api/me", json={})
+        assert core.status_code == 405 and core.headers["allow"] == "GET"
+        unknown_api_head = await client.head("/api/v11/unknown")
+        assert unknown_api_head.status_code == 404  # never the MCP mount's answer
+        # Every method on an unknown /api path is 404 (not Starlette's generic 405), and an
+        # arbitrary method on a known path is 405 with the route's own methods.
+        for method in ("TRACE", "PROPFIND"):
+            odd = await client.request(method, "/api/v11/unknown")
+            assert odd.status_code == 404, method
+            assert error_of(odd)["code"] == "NOT_FOUND"
+        odd_known = await client.request("PROPFIND", "/api/me")
+        assert odd_known.status_code == 405
+        assert odd_known.headers["allow"] == "GET"
+
+
 async def test_strict_host_check(keys: SigningKeys) -> None:
     async with offline_client(keys) as (client, _):
         assert (await client.get("/healthz")).status_code == 200

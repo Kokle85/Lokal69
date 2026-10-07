@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pydantic import SecretStr
 
 from suv_deals.mcp.server import (
     McpApp,
+    McpOptions,
     build_mcp,
     create_standalone_app,
     mcp_allowed_hosts,
@@ -99,7 +102,10 @@ def test_allowed_origins_are_serialized_like_browsers_send_them() -> None:
 async def test_default_port_origin_is_accepted_on_the_wire(keys: SigningKeys) -> None:
     settings = make_settings(mcp_allowed_origins="https://dash.synthetic.example:443")
     async with mcp_client(settings, offline_db(), keys, token_verifier=StubVerifier()) as client:
-        headers = {**rpc_headers("tools/list", token="synthetic-good-token"), "Origin": "https://dash.synthetic.example"}
+        headers = {
+            **rpc_headers("tools/list", token="synthetic-good-token"),
+            "Origin": "https://dash.synthetic.example",
+        }
         response = await client.http.post("/mcp", json=envelope("tools/list"), headers=headers)
         assert response.status_code == 200
 
@@ -131,6 +137,14 @@ def test_allowed_hosts_ignore_malformed_urls() -> None:
             {"mcp_oauth_issuer": "https://issuer.synthetic.example:99999"},
             "MCP_OAUTH_ISSUER must be a plain http(s) URL",
         ),
+        (
+            {"mcp_auth_mode": "dev_local", "mcp_public_url": "http://[::1/mcp"},
+            "MCP_AUTH_MODE=dev_local requires a loopback MCP_PUBLIC_URL/APP_BASE_URL",
+        ),
+        (
+            {"mcp_auth_mode": "dev_local", "mcp_public_url": None, "app_base_url": "http://[::1"},
+            "MCP_AUTH_MODE=dev_local requires a loopback MCP_PUBLIC_URL/APP_BASE_URL",
+        ),
         ({"mcp_allowed_origins": "https://o.synthetic.example:99999"}, None),
         ({"app_base_url": "https://dash.synthetic.example:99999"}, None),
         (
@@ -151,7 +165,9 @@ async def test_malformed_settings_never_crash_the_backend(
 ) -> None:
     """A typo in an MCP setting disables (or narrows) the MCP endpoint; it never raises out of
     ``build_mcp``, which the dashboard backend calls at start-up."""
-    app = build_mcp(make_settings(**overrides), offline_db(), jwks=keys.jwks, metrics=AppMetrics(process_metrics=False))
+    app = build_mcp(
+        make_settings(**overrides), offline_db(), jwks=keys.jwks, metrics=AppMetrics(process_metrics=False)
+    )
     if problem is None:
         assert app.configured  # an unusable allow-list entry is dropped, the rest keeps working
     else:
@@ -159,3 +175,66 @@ async def test_malformed_settings_never_crash_the_backend(
         async with running(app) as http:
             response = await http.post("/mcp", json=envelope("tools/list"), headers=rpc_headers("tools/list"))
             assert response.status_code == 503
+
+
+async def test_get_never_opens_a_standalone_sse_stream(keys: SigningKeys) -> None:
+    """The stateless server sends nothing server-initiated: ``GET /mcp`` is ``405`` in every era
+    (the SDK would otherwise hold a handshake-era GET stream open indefinitely)."""
+    async with mcp_client(make_settings(), offline_db(), keys, token_verifier=StubVerifier()) as client:
+        sse = {"Accept": "text/event-stream"}
+        for headers in (
+            {**sse, "Authorization": "Bearer synthetic-good-token"},  # handshake era (no version header)
+            {**sse, "Authorization": "Bearer synthetic-good-token", "MCP-Protocol-Version": "2025-06-18"},
+            {**sse, "Authorization": "Bearer synthetic-good-token", "MCP-Protocol-Version": "2026-07-28"},
+            sse,  # unauthenticated: refused without consulting any verifier
+        ):
+            response = await asyncio.wait_for(client.http.get("/mcp", headers=headers), timeout=10)
+            assert response.status_code == 405, response.text
+            assert response.headers["allow"] == "POST"
+            assert response.json()["error"]["code"] == -32600
+            assert response.headers["cache-control"] == "no-store"
+
+
+async def test_handshake_era_posts_stay_stateless(keys: SigningKeys) -> None:
+    async with mcp_client(make_settings(), offline_db(), keys, token_verifier=StubVerifier()) as client:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer synthetic-good-token",
+        }
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "synthetic-legacy-client", "version": "0"},
+            },
+        }
+        response = await client.http.post("/mcp", json=initialize, headers=headers)
+        assert response.status_code == 200 and "mcp-session-id" not in response.headers
+        assert response.json()["result"]["serverInfo"]["name"] == "suv-deals"
+        listed = await client.http.post(
+            "/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, headers=headers
+        )
+        assert [t["name"] for t in listed.json()["result"]["tools"]] == [
+            "deals_health",
+            "deals_list_candidates",
+            "deals_get_candidate",
+            "deals_get_comparables",
+            "deals_get_valuation",
+        ]
+        unauthenticated = {k: v for k, v in headers.items() if k != "Authorization"}
+        assert (await client.http.post("/mcp", json=initialize, headers=unauthenticated)).status_code == 401
+
+
+async def test_oversized_bodies_are_refused(keys: SigningKeys) -> None:
+    options = McpOptions(max_request_body_size=4096)
+    async with mcp_client(
+        make_settings(), offline_db(), keys, token_verifier=StubVerifier(), options=options
+    ) as client:
+        body = envelope("tools/call", {"name": "deals_health", "arguments": {"padding": "x" * 8192}})
+        headers = rpc_headers("tools/call", "deals_health", "synthetic-good-token")
+        response = await client.http.post("/mcp", json=body, headers=headers)
+        assert response.status_code == 413

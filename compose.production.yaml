@@ -7,8 +7,14 @@
 #
 # Deploy with every external switch OFF (the defaults below), smoke-test auth, data access and
 # queue processing, then enable only what passed its activation gate by exporting the switch
-# explicitly for that deployment (SOURCE_NETWORK_ENABLED=true, ALLOW_EXTERNAL_NOTIFICATIONS=true,
-# EVENT_BRIDGE_ENABLED=true, ...). An env file alone cannot enable them: "environment" wins.
+# explicitly for that deployment, in the shell (never in an env file):
+#   SUV_DEALS_ENABLE_SOURCE_NETWORK=true, SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS=true,
+#   SUV_DEALS_ENABLE_EVENT_BRIDGE=true, SUV_DEALS_ENABLE_MCP_EVENTS=true,
+#   SUV_DEALS_NOTIFICATION_PROVIDER=slack|mcp_events, SUV_DEALS_ENABLE_FX_FETCH=true,
+#   SUV_DEALS_SELLER_INQUIRY_MODE=automatic.
+# An env file alone cannot enable them: "environment" wins over env_file, and the switches are
+# interpolated from these dedicated names, so even a .env next to this file that sets
+# SOURCE_NETWORK_ENABLED=true (Compose reads it for interpolation) changes nothing.
 #
 # Secrets: each application process reads ONLY its own root-owned 0600 env file under
 # /etc/suv-deals/ (outside the repository; never baked into the image; see docs/runbook.md for
@@ -28,14 +34,14 @@ x-app: &app
     APP_ENV: production
     CRAWL4AI_BASE_URL: http://crawl4ai:11235
     DATABASE_SET_ROLE: suv_backend
-    SOURCE_NETWORK_ENABLED: ${SOURCE_NETWORK_ENABLED:-false}
-    ALLOW_EXTERNAL_NOTIFICATIONS: ${ALLOW_EXTERNAL_NOTIFICATIONS:-false}
-    EVENT_BRIDGE_ENABLED: ${EVENT_BRIDGE_ENABLED:-false}
-    MCP_EVENTS_ENABLED: ${MCP_EVENTS_ENABLED:-false}
-    NOTIFICATION_PROVIDER: ${NOTIFICATION_PROVIDER:-disabled}
+    SOURCE_NETWORK_ENABLED: ${SUV_DEALS_ENABLE_SOURCE_NETWORK:-false}
+    ALLOW_EXTERNAL_NOTIFICATIONS: ${SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS:-false}
+    EVENT_BRIDGE_ENABLED: ${SUV_DEALS_ENABLE_EVENT_BRIDGE:-false}
+    MCP_EVENTS_ENABLED: ${SUV_DEALS_ENABLE_MCP_EVENTS:-false}
+    NOTIFICATION_PROVIDER: ${SUV_DEALS_NOTIFICATION_PROVIDER:-disabled}
     LLM_EXTRACTION_ENABLED: "false"
-    FX_FETCH_ENABLED: ${FX_FETCH_ENABLED:-false}
-    SELLER_INQUIRY_MODE: ${SELLER_INQUIRY_MODE:-disabled_until_sender_ready}
+    FX_FETCH_ENABLED: ${SUV_DEALS_ENABLE_FX_FETCH:-false}
+    SELLER_INQUIRY_MODE: ${SUV_DEALS_SELLER_INQUIRY_MODE:-disabled_until_sender_ready}
   read_only: true
   tmpfs:
     - /tmp
@@ -88,6 +94,10 @@ services:
     env_file:
       - /etc/suv-deals/worker.env
     command: ["suv-deals", "worker", "--queues", "discovery,detail,recheck,valuation"]
+    # Read-only root file system: retained evidence (SNAPSHOT_STORAGE=local) goes to this volume
+    # only; back it up separately (docs/runbook.md section 7).
+    volumes:
+      - snapshots:/app/var/snapshots
     networks:
       - app
       - crawler
@@ -142,6 +152,9 @@ services:
       options:
         max-size: "20m"
         max-file: "10"
+
+volumes:
+  snapshots: {}
 
 secrets:
   crawl4ai_api_token:

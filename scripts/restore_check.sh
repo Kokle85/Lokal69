@@ -5,8 +5,11 @@
 # =============================================================================
 # Steps (the elapsed time is recorded in the report):
 #   1. verify the sha256 of the dump and member-id files against the manifest;
-#   2. create a NEW database suv_restore_check_<ts> on a LOOPBACK cluster (RESTORE_ADMIN_URL must
-#      be 127.0.0.1/localhost/::1 or a local socket; anything else is refused);
+#   2. create a NEW database suv_restore_check_<ts> on a LOOPBACK cluster: RESTORE_ADMIN_URL is
+#      checked by `suv-deals db target --local-only`, which parses it like libpq (every listed
+#      host, ?host=/?hostaddr= parameters, PGHOST/PGHOSTADDR/PGSERVICE); anything that could
+#      leave this machine is refused. psql/pg_restore get the URL WITHOUT its password
+#      (PGPASSWORD carries it), so it never appears in a process list;
 #   3. prepare it like a Supabase project for these schemas: the test-only Supabase emulation
 #      (auth schema, roles, pgcrypto), btree_gist in schema extensions, role suv_backend, and the
 #      member ids as minimal auth.users rows (no e-mail, no credentials);
@@ -32,7 +35,7 @@ set -euo pipefail
 umask 077
 
 usage() {
-  sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,21 +60,60 @@ admin_url="${RESTORE_ADMIN_URL:-}"
 [ -n "$admin_url" ] || { echo "restore_check.sh: set RESTORE_ADMIN_URL (local cluster admin URL)." >&2; exit 2; }
 
 # --- 2a. the target must be a local, isolated cluster -------------------------------------
-target_host="$(python3 - "$admin_url" <<'EOF'
-import sys
-from urllib.parse import urlsplit
-url = sys.argv[1]
+# One guard for the Makefile and this script: a hostname/text check is not enough (libpq also
+# honours ?host=/?hostaddr=, several comma-separated hosts and PGHOST/PGHOSTADDR/PGSERVICE).
+cli=(suv-deals)
+if command -v uv >/dev/null 2>&1 && [ -f "$repo_root/uv.lock" ]; then cli=(uv run --frozen --project "$repo_root" suv-deals); fi
+set +e
+RESTORE_ADMIN_URL="$admin_url" "${cli[@]}" --no-env-file db target --local-only --url-env RESTORE_ADMIN_URL
+guard_status=$?
+set -e
+if [ "$guard_status" -eq 3 ]; then
+  echo "restore_check.sh: refused: RESTORE_ADMIN_URL must point to a loopback/local cluster." >&2
+  exit 3
+elif [ "$guard_status" -ne 0 ]; then
+  echo "restore_check.sh: could not check RESTORE_ADMIN_URL (suv-deals exit $guard_status)." >&2
+  exit 2
+fi
+
+# Keep the password out of every child's argument list (see backup.sh): URL without the password
+# on line 1, the password on line 2; the URL travels in the environment, never as an argument.
+split_password() {
+  SUV_PG_URL="$1" python3 - <<'EOF'
+import os
+from urllib.parse import unquote, urlsplit
+
+url = os.environ["SUV_PG_URL"]
+password = None
 if "://" in url:
-    print(urlsplit(url).hostname or "local socket")
-else:
-    parts = dict(p.split("=", 1) for p in url.split() if "=" in p)
-    print(parts.get("host", "local socket"))
+    parts = urlsplit(url)
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, _, hosts = netloc.rpartition("@")
+        user, sep, secret = userinfo.partition(":")
+        if sep:
+            password = unquote(secret)
+        netloc = f"{user}@{hosts}" if user else hosts
+    kept = []
+    for item in parts.query.split("&") if parts.query else []:
+        key, _, value = item.partition("=")
+        if unquote(key) == "password":
+            password = unquote(value)
+        else:
+            kept.append(item)
+    # Rebuilt by hand: urlunsplit would turn "postgresql:///db" (no authority) into "postgresql:/db".
+    query = "&".join(kept)
+    url = f"{parts.scheme}://{netloc}{parts.path}" + (f"?{query}" if query else "")
+print(url)
+print(password or "")
 EOF
-)"
-case "$target_host" in
-  127.0.0.1 | localhost | ::1 | "local socket" | /*) ;;
-  *) echo "restore_check.sh: refused: RESTORE_ADMIN_URL must point to a loopback/local cluster." >&2; exit 3 ;;
-esac
+}
+split="$(split_password "$admin_url")" || { echo "restore_check.sh: RESTORE_ADMIN_URL cannot be parsed." >&2; exit 2; }
+admin_url="$(sed -n 1p <<<"$split")"
+admin_password="$(sed -n 2p <<<"$split")"
+unset split
+if [ -n "$admin_password" ]; then export PGPASSWORD="$admin_password"; fi
+unset admin_password
 
 value() { { grep -E "^$1=" "$manifest" || true; } | head -1 | cut -d= -f2-; }
 dir="$(dirname "$manifest")"
@@ -117,13 +159,15 @@ pg_restore_cmd="${pg_bin:+$pg_bin/}pg_restore"
 
 # --- 2b. isolated database -------------------------------------------------------------------
 db="suv_restore_check_$(date -u +%Y%m%d%H%M%S)_$RANDOM"
-restore_url="$(python3 - "$admin_url" "$db" <<'EOF'
-import sys
-from urllib.parse import urlsplit, urlunsplit
-url, db = sys.argv[1], sys.argv[2]
+restore_url="$(SUV_PG_URL="$admin_url" SUV_PG_DB="$db" python3 - <<'EOF'
+import os
+from urllib.parse import urlsplit
+url, db = os.environ["SUV_PG_URL"], os.environ["SUV_PG_DB"]
 if "://" in url:
     parts = urlsplit(url)
-    print(urlunsplit((parts.scheme, parts.netloc, "/" + db, parts.query, parts.fragment)))
+    kept = [i for i in parts.query.split("&") if i and i.partition("=")[0] != "dbname"]
+    query = "&".join(kept)
+    print(f"{parts.scheme}://{parts.netloc}/{db}" + (f"?{query}" if query else ""))
 else:
     kept = [p for p in url.split() if not p.startswith("dbname=")]
     print(" ".join([*kept, f"dbname={db}"]))
@@ -217,8 +261,6 @@ if grep -q "supabase_migrations" <<<"$(value schemas)"; then
   expect "migration_ledger" "$ledger ledger row(s) restored" [ "$ledger" -gt 0 ]
 fi
 
-cli=(suv-deals)
-if command -v uv >/dev/null 2>&1 && [ -f "$repo_root/uv.lock" ]; then cli=(uv run --frozen --project "$repo_root" suv-deals); fi
 set +e
 evidence_output="$(env DATABASE_URL="$restore_url" DATABASE_SET_ROLE=suv_backend APP_ENV=test LOG_LEVEL=WARNING \
   SOURCE_NETWORK_ENABLED=false ALLOW_EXTERNAL_NOTIFICATIONS=false \

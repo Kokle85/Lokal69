@@ -188,16 +188,25 @@ class Worker:
 
     async def _heartbeat(self, execution: JobExecution, scope: anyio.CancelScope) -> None:
         options = self.ctx.options
+        # The lease expires at most ``job_lease_seconds`` after the last successful extension was
+        # answered (database time of the update <= our receipt of its answer). If heartbeats keep
+        # failing past that point the lease is certainly gone, even though the database cannot say
+        # so: stop the handler's network work instead of fetching for a job that another worker
+        # may already hold (spec 8: cancel work whose lease is lost).
+        extended_at = anyio.current_time()
         while True:
             await anyio.sleep(options.heartbeat_seconds)
             try:
                 alive = await jobs.heartbeat(self.ctx.db, execution.job, options.job_lease_seconds)
             except AppError:
-                continue  # a transient database problem: try again; expiry is judged by the database
+                if anyio.current_time() - extended_at < options.job_lease_seconds:
+                    continue  # a transient database problem: try again while the lease may hold
+                alive = False
             if not alive:
                 execution.mark_lost()
                 scope.cancel()  # stop the handler's network work; nothing more may be committed
                 return
+            extended_at = anyio.current_time()
 
     async def _finish(
         self, execution: JobExecution, outcome: JobOutcome | None, error: BaseException | None

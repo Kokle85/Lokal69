@@ -18,9 +18,10 @@ short transaction, no network I/O:
    case or an eligible/needs-facts screening whose last detail check is older than the sweep age get a
    low-priority ``detail`` job -- at most one per listing per sweep age, so a page that keeps failing
    (dead letter, blocked) is not re-fetched on every pass. Both are capped per source by the source's
-   per-run detail budget, only
-   for sources that may make network requests (enabled, unpaused, unblocked, ``detail_mode=fetch``,
-   and ``SOURCE_NETWORK_ENABLED`` for real sources); the jobs themselves still pass the persistent
+   per-run detail budget, only for sources that may make network requests (enabled, unpaused,
+   unblocked, ``detail_mode=fetch``, ``SOURCE_NETWORK_ENABLED`` for real sources, loaded fixture data
+   for fixture sources); stale candidates are selected per such source, so a paused or blocked
+   source's backlog never crowds the others out. The jobs themselves still pass the persistent
    budget gate before any request. Nothing is fetched here.
 4. **Valuation staleness** (spec 18): valuations past their freshness deadline (FX age, quote expiry,
    comparable freshness are folded into ``expires_at`` by the valuation assembly) are marked stale and
@@ -90,6 +91,7 @@ class ReconcileOptions:
     claim_expiry_limit: int = 100
     #: A listing's detail page is re-checked at most this often by the sweep (conservative daily).
     stale_detail_age: timedelta = timedelta(hours=24)
+    #: At most this many stale listings are selected per pass, over all network-eligible sources.
     stale_detail_candidates: int = 200
     watch_recheck_limit: int = 100
     stale_detail_priority: int = -10
@@ -171,10 +173,11 @@ async def _step[T](
 # --------------------------------------------------------------------------------------------
 
 _STALE_DETAIL_SQL: Final = """
-select l.id, l.source_id
+select l.id
   from app.listings l
   join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
  where l.workspace_id = %(ws)s
+   and l.source_id = %(source_id)s
    and s.role = 'acquisition' and s.detail_mode = 'fetch'
    and not l.quarantined and not l.identity_conflict
    and l.availability in ('available', 'reserved', 'unknown')
@@ -229,14 +232,17 @@ select
 
 
 async def _stale_detail_candidates(
-    conn: Conn, actor: ActorContext, age: timedelta, limit: int
-) -> list[tuple[UUID, UUID]]:
+    conn: Conn, actor: ActorContext, source_id: UUID, age: timedelta, limit: int
+) -> list[UUID]:
+    """Stale listings of ONE source (oldest detail check first)."""
     actor.require(Scope.DEALS_READ)
     async with mapped_errors():
         rows = await fetch_all(
-            conn, _STALE_DETAIL_SQL, {"ws": actor.workspace_id, "age": age, "limit": limit}
+            conn,
+            _STALE_DETAIL_SQL,
+            {"ws": actor.workspace_id, "source_id": source_id, "age": age, "limit": limit},
         )
-    return [(r["id"], r["source_id"]) for r in rows]
+    return [r["id"] for r in rows]
 
 
 async def _close_orphan_runs(conn: Conn, actor: ActorContext, limit: int) -> int:
@@ -389,9 +395,19 @@ class Reconciler:
     def _network_allowed(self, source: SourceRecord) -> bool:
         if not source.enabled or source.paused or source.technical_status in _NETWORK_BLOCKING:
             return False
-        if source.detail_mode != "fetch" or source.activation_problems():
+        if source.role != "acquisition" or source.detail_mode != "fetch" or source.activation_problems():
             return False
-        return source.mode == SourceMode.FIXTURE or self.ctx.settings.source_network_enabled
+        if source.mode == SourceMode.FIXTURE:
+            # Fixture pages exist only where this process loaded them (never in production).
+            return self.ctx.fixture_client is not None
+        return self.ctx.settings.source_network_enabled
+
+    async def _sweep_sources(self, conn: Conn, actor: ActorContext) -> list[SourceRecord]:
+        """Sources whose detail pages may be fetched now (stable order by source key)."""
+        listing = await sources_repo.list_sources(conn, actor)
+        records = await self._sources(conn, actor, {item.source_id for item in listing.items})
+        allowed = [s for s in records.values() if self._network_allowed(s)]
+        return sorted(allowed, key=lambda s: s.source_key)
 
     async def _sources(self, conn: Conn, actor: ActorContext, ids: set[UUID]) -> dict[UUID, SourceRecord]:
         found: dict[UUID, SourceRecord] = {}
@@ -438,31 +454,31 @@ class Reconciler:
         opts = self.options
 
         async def go(conn: Conn) -> int:
-            candidates = await _stale_detail_candidates(
-                conn, actor, opts.stale_detail_age, opts.stale_detail_candidates
-            )
-            if not candidates:
-                return 0
-            sources = await self._sources(conn, actor, {source_id for _, source_id in candidates})
-            used: dict[UUID, int] = {}
+            # Candidates are selected PER network-eligible source: a paused, blocked or disabled
+            # source with a large stale backlog can never fill the window and starve the others.
+            remaining = opts.stale_detail_candidates
             queued = 0
-            for listing_id, source_id in candidates:
-                source = sources.get(source_id)
-                if source is None or not self._network_allowed(source):
+            for source in await self._sweep_sources(conn, actor):
+                if remaining <= 0:
+                    break
+                # Never more than one run's detail budget per source per pass.
+                cap = min(source.rate_budget().max_detail_jobs_per_run, remaining)
+                if cap <= 0:
                     continue
-                if used.get(source_id, 0) >= source.rate_budget().max_detail_jobs_per_run:
-                    continue  # never more than one run's detail budget per source per pass
-                ref = await listings_repo.request_detail_refresh(
-                    conn,
-                    actor,
-                    listing_id,
-                    reason=STALE_DETAIL_REASON,
-                    job_type=JobType.DETAIL,
-                    priority=opts.stale_detail_priority,
+                candidates = await _stale_detail_candidates(
+                    conn, actor, source.id, opts.stale_detail_age, cap
                 )
-                if ref is not None and ref.created:
-                    used[source_id] = used.get(source_id, 0) + 1
-                    queued += 1
+                remaining -= len(candidates)
+                for listing_id in candidates:
+                    ref = await listings_repo.request_detail_refresh(
+                        conn,
+                        actor,
+                        listing_id,
+                        reason=STALE_DETAIL_REASON,
+                        job_type=JobType.DETAIL,
+                        priority=opts.stale_detail_priority,
+                    )
+                    queued += int(ref is not None and ref.created)
             return queued
 
         report.stale_detail_jobs = await _step(self.ctx, actor, go, dry_run=report.dry_run)

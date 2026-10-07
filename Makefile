@@ -30,6 +30,12 @@ DEV_API_PORT ?= 8000
 PYTEST ?= $(UV) run pytest
 NOT_LIVE := not live and not e2e
 
+# Local-target guard used before anything touches LOCAL_ADMIN_URL / LOCAL_DATABASE_URL. It parses
+# the connection string like libpq does (every comma-separated host, ?host= / ?hostaddr=
+# parameters, PGHOST / PGHOSTADDR / PGSERVICE defaults), prints the target without the password and
+# exits 3 unless all of it stays on this machine: a text match on "@127.0.0.1" is not enough.
+LOCAL_GUARD = $(CLI) --no-env-file db target --local-only --url-env
+
 # Every process of `make dev` runs with these overrides (environment beats .env).
 DEV_ENV := APP_ENV=development SOURCE_NETWORK_ENABLED=false ALLOW_EXTERNAL_NOTIFICATIONS=false \
 	EVENT_BRIDGE_ENABLED=false MCP_EVENTS_ENABLED=false NOTIFICATION_PROVIDER=disabled \
@@ -77,8 +83,9 @@ db-local-start: ## Start the local PostgreSQL 16/17 test clusters (or print how)
 	@echo "These are local development/test clusters only; nothing here touches a production database."
 
 db-migrate-local: ## Create/migrate the LOCAL development database (prints the target first)
-	@if ! [[ "$(LOCAL_ADMIN_URL)" =~ @(127\.0\.0\.1|localhost)(:[0-9]+)?/ && "$(LOCAL_DATABASE_URL)" =~ @(127\.0\.0\.1|localhost)(:[0-9]+)?/ ]]; then \
-	  echo "refusing: LOCAL_ADMIN_URL and LOCAL_DATABASE_URL must point to 127.0.0.1/localhost"; exit 3; fi
+	@[[ "$(LOCAL_DB)" =~ ^[a-z_][a-z0-9_]{0,62}$$ ]] || { echo "refusing: LOCAL_DB must be a plain database name"; exit 3; }
+	@LOCAL_ADMIN_URL="$(LOCAL_ADMIN_URL)" $(LOCAL_GUARD) LOCAL_ADMIN_URL
+	@LOCAL_DATABASE_URL="$(LOCAL_DATABASE_URL)" $(LOCAL_GUARD) LOCAL_DATABASE_URL
 	@echo "Local target database: $(LOCAL_DB) (loopback only)"
 	@if [ "$$(psql "$(LOCAL_ADMIN_URL)" -XAtc "select 1 from pg_database where datname = '$(LOCAL_DB)'")" != "1" ]; then \
 	  psql "$(LOCAL_ADMIN_URL)" -Xq -v ON_ERROR_STOP=1 -c 'create database "$(LOCAL_DB)"'; \
@@ -100,6 +107,7 @@ test-integration: ## Integration, API, MCP and CLI tests against the local Postg
 	  tests/integration tests/api tests/mcp tests/cli
 
 dev-fixtures: ## Register the SYNTHETIC fixture sources in the LOCAL database (they stay gated)
+	@LOCAL_DATABASE_URL="$(LOCAL_DATABASE_URL)" $(LOCAL_GUARD) LOCAL_DATABASE_URL
 	@$(DEV_ENV) $(CLI) sources sync --fixture-sources --yes
 
 dev: dev-fixtures ## api + worker + scheduler on the local database, network and notifications OFF
@@ -176,8 +184,8 @@ db-reset-local: ## DROP and recreate the LOCAL dev database (needs CONFIRM_DB_RE
 ifneq ($(CONFIRM_DB_RESET),yes-drop-$(LOCAL_DB))
 	$(error refusing: set CONFIRM_DB_RESET=yes-drop-$(LOCAL_DB) to drop the LOCAL database $(LOCAL_DB))
 endif
-	@if ! [[ "$(LOCAL_ADMIN_URL)" =~ @(127\.0\.0\.1|localhost)(:[0-9]+)?/ ]]; then \
-	  echo "refusing: LOCAL_ADMIN_URL must point to 127.0.0.1/localhost"; exit 3; fi
 	@case "$(LOCAL_DB)" in suv_dev|suv_dev_*) ;; *) echo "refusing: only suv_dev* databases can be reset"; exit 3;; esac
+	@[[ "$(LOCAL_DB)" =~ ^[a-z_][a-z0-9_]{0,62}$$ ]] || { echo "refusing: LOCAL_DB must be a plain database name"; exit 3; }
+	@LOCAL_ADMIN_URL="$(LOCAL_ADMIN_URL)" $(LOCAL_GUARD) LOCAL_ADMIN_URL
 	@psql "$(LOCAL_ADMIN_URL)" -Xq -v ON_ERROR_STOP=1 -c 'drop database if exists "$(LOCAL_DB)" with (force)'
 	@echo "Dropped $(LOCAL_DB). Recreate it with: make db-migrate-local"

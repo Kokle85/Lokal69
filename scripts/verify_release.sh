@@ -4,7 +4,10 @@
 # (spec sections 29, 31 "Tests must run on the exact final commit/build", 34)
 # =============================================================================
 # Steps (each recorded as passed / failed / not run in var/releases/<sha>_<ts>.txt):
-#   1. commit SHA, dirty-tree flag, uv.lock / dependency lock hashes, uv and Python versions;
+#   1. commit SHA, dirty-tree flag, uv.lock / dependency lock hashes, uv and Python versions,
+#      the YAML business-configuration hash, every source's adapter version/mode/enabled flag and
+#      the MCP SDK / protocol revision (spec 29 release record; the configuration revision STORED
+#      in a database is per environment: record it from `suv-deals config apply --dry-run`);
 #   2. ruff check + ruff format --check;
 #   3. mypy --strict (pyproject [tool.mypy]);
 #   4. JSON schema snapshot check (scripts/export_schemas.py --check);
@@ -52,7 +55,8 @@ steps=(
 
 if [ "$plan" -eq 1 ]; then
   echo "verify_release.sh plan (nothing is run):"
-  echo "  record: commit SHA, dirty flag, lock hashes, tool versions, migration hashes"
+  echo "  record: commit SHA, dirty flag, lock hashes, tool versions, configuration hash,"
+  echo "          source adapter versions, MCP SDK/protocol, migration hashes"
   for step in "${steps[@]}"; do
     name="${step%%|*}"
     if [ "$skip_db" -eq 1 ] && [[ "$name" == tests_db_* ]]; then
@@ -86,6 +90,25 @@ skipped=0
   echo "app_version=$(uv run --frozen python -c 'import suv_deals; print(suv_deals.__version__)' 2>/dev/null || echo unknown)"
   echo "release_image_digest=${RELEASE_IMAGE_DIGEST:-not recorded}"
   echo "crawl4ai_image_digest=${CRAWL4AI_IMAGE_DIGEST:-not recorded}"
+  echo "release_facts:"
+  uv run --frozen python - <<'EOF' 2>/dev/null || echo "  (could not be computed)"
+import importlib.metadata as md
+
+import mcp_types
+
+from suv_deals.adapters.registry import load_registry
+from suv_deals.domain.profiles import load_business_config
+from suv_deals.persistence.config_repo import config_hash
+from suv_deals.settings import REPO_ROOT
+
+config_dir = REPO_ROOT / "config"
+print(f"  config_yaml_sha256={config_hash(load_business_config(config_dir))}")
+print(f"  mcp_sdk={md.version('mcp')} mcp_protocol={mcp_types.LATEST_PROTOCOL_VERSION}")
+for c in sorted(load_registry(config_dir).configs, key=lambda c: c.source_key):
+    enabled = str(c.enabled).lower()
+    print(f"  source {c.source_key} adapter={c.adapter}@{c.adapter_version} mode={c.mode.value} enabled={enabled}")
+EOF
+  echo "  stored_configuration_revision=record per environment (suv-deals config apply --dry-run)"
   echo "migrations:"
   for file in supabase/migrations/*.sql; do
     echo "  $(basename "$file") sha256=$(sha256sum "$file" | cut -d' ' -f1)"

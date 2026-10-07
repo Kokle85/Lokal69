@@ -71,8 +71,12 @@ Tools alone never wake dot: a new turn needs a subscription the client creates i
 1. Enable on the deployment (only after the gates in docs/notification_bridge.md section 7):
    `MCP_EVENTS_ENABLED=true`, `EVENT_BRIDGE_ENABLED=true`, `EVENT_BRIDGE_PROVIDER=mcp_events`,
    `ALLOW_EXTERNAL_NOTIFICATIONS=true`, `MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY` set, and an
-   approved, verified destination binding. `suv-deals doctor --process api,dispatcher` must show
-   the route without conflicts.
+   approved, verified destination binding. With `compose.production.yaml` the switches are set
+   only through `SUV_DEALS_ENABLE_MCP_EVENTS=true`, `SUV_DEALS_ENABLE_EVENT_BRIDGE=true` and
+   `SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS=true` exported for that deployment (env files cannot
+   enable them; docs/runbook.md section 1); `EVENT_BRIDGE_PROVIDER` and the key live in the api and
+   dispatcher env files. `suv-deals doctor --process api,dispatcher` must show the route without
+   conflicts.
 2. In the plugin page, **rescan the MCP server** so the `review.pending.v1` event appears next to
    the tools (documented behaviour: events are discovered like tools; rescan after changes).
 3. In the intended dot conversation, ask dot to monitor the primary review queue. The client

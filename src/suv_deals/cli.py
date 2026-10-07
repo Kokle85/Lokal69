@@ -14,7 +14,8 @@ Commands (``suv-deals <command> --help`` for details)::
     reviews list                   review cases by state
     evidence verify                recompute revision and snapshot hashes (read-only)
     tax-rules validate PATH        tax rule-set validation (never approves)
-    db migrate                     print the target, then apply migrations (--yes)
+    db migrate | target            print the target, then apply migrations (--yes) / only print it
+                                   (--local-only: exit 3 unless it stays on this machine)
     api serve                      uvicorn for /api, /healthz, /readyz and /mcp (127.0.0.1 default)
     credentials create-mcp | revoke | list
                                    scoped MCP credentials (token shown once; --yes)

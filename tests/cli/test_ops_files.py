@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -99,6 +100,60 @@ def test_make_key_targets_run_the_documented_commands() -> None:
     assert "desktop/outlook-bridge/tests" in make_n("outlook-bridge-test").stdout
 
 
+_GUARD = "db target --local-only --url-env"
+
+
+@pytestmark_make
+def test_make_local_targets_run_the_libpq_aware_guard_first() -> None:
+    for target, variables in (
+        ("db-migrate-local", ("LOCAL_ADMIN_URL", "LOCAL_DATABASE_URL")),
+        ("dev-fixtures", ("LOCAL_DATABASE_URL",)),
+        ("db-reset-local", ("LOCAL_ADMIN_URL",)),
+    ):
+        lines = make_n(target, "CONFIRM_DB_RESET=yes-drop-suv_dev").stdout.splitlines()
+        guard_lines = [i for i, line in enumerate(lines) if _GUARD in line]
+        assert {lines[i].rsplit(" ", 1)[-1] for i in guard_lines} == set(variables), target
+        touching = [i for i, line in enumerate(lines) if "psql " in line or "sources sync" in line]
+        assert touching and max(guard_lines) < min(touching), target
+
+
+@pytestmark_make
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
+    ("target", "variable", "url"),
+    [
+        (
+            "db-migrate-local",
+            "LOCAL_ADMIN_URL",
+            "postgresql://suv:suv@127.0.0.1:5432/postgres?host=db.example.invalid",
+        ),
+        (
+            "db-migrate-local",
+            "LOCAL_DATABASE_URL",
+            "postgresql://suv:suv@127.0.0.1:5432/suv_dev?hostaddr=10.9.8.7",
+        ),
+        (
+            "db-reset-local",
+            "LOCAL_ADMIN_URL",
+            "postgresql://suv:suv@127.0.0.1:5432,db.example.invalid:5432/postgres",
+        ),
+        ("dev-fixtures", "LOCAL_DATABASE_URL", "postgresql://suv:suv@localhost/suv_dev?service=production"),
+    ],
+)
+def test_make_local_targets_refuse_urls_that_leave_the_machine(target: str, variable: str, url: str) -> None:
+    """Really runs the target: the guard must stop it before psql or the CLI touches anything."""
+    result = subprocess.run(
+        ["make", "-C", str(REPO), target, f"{variable}={url}", "CONFIRM_DB_RESET=yes-drop-suv_dev"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert f"{variable} is not a loopback address or a local socket" in result.stderr
+    assert "Created local database" not in result.stdout and "Dropped" not in result.stdout
+
+
 @pytestmark_make
 def test_destructive_reset_is_guarded_and_never_called_by_other_targets() -> None:
     refused = make_n("db-reset-local")
@@ -164,20 +219,83 @@ def test_compose_files_are_safe(name: str) -> None:
     assert "crawler" in services["worker"]["networks"]
 
 
+#: Application switches; Compose must never interpolate them from these names, because it also
+#: reads the project .env (the application's own configuration file) for interpolation.
+_SWITCHES = (
+    "SOURCE_NETWORK_ENABLED",
+    "ALLOW_EXTERNAL_NOTIFICATIONS",
+    "EVENT_BRIDGE_ENABLED",
+    "MCP_EVENTS_ENABLED",
+    "NOTIFICATION_PROVIDER",
+    "FX_FETCH_ENABLED",
+    "SELLER_INQUIRY_MODE",
+)
+
+
 def test_compose_switches_default_off() -> None:
     for name in ("compose.yaml", "compose.production.yaml"):
+        text = (REPO / name).read_text(encoding="utf-8")
+        for switch in _SWITCHES:
+            assert "${" + switch not in text, (name, switch)
         api_env = _compose(name)["services"]["api"]["environment"]
-        assert api_env["SOURCE_NETWORK_ENABLED"] == "${SOURCE_NETWORK_ENABLED:-false}"
-        assert api_env["ALLOW_EXTERNAL_NOTIFICATIONS"] == "${ALLOW_EXTERNAL_NOTIFICATIONS:-false}"
+        assert api_env["SOURCE_NETWORK_ENABLED"] == "${SUV_DEALS_ENABLE_SOURCE_NETWORK:-false}"
+        assert api_env["ALLOW_EXTERNAL_NOTIFICATIONS"] == "${SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS:-false}"
     production = _compose("compose.production.yaml")
     env = production["services"]["worker"]["environment"]
     assert env["APP_ENV"] == "production"
-    assert env["EVENT_BRIDGE_ENABLED"] == "${EVENT_BRIDGE_ENABLED:-false}"
-    assert env["NOTIFICATION_PROVIDER"] == "${NOTIFICATION_PROVIDER:-disabled}"
+    assert env["EVENT_BRIDGE_ENABLED"] == "${SUV_DEALS_ENABLE_EVENT_BRIDGE:-false}"
+    assert env["MCP_EVENTS_ENABLED"] == "${SUV_DEALS_ENABLE_MCP_EVENTS:-false}"
+    assert env["NOTIFICATION_PROVIDER"] == "${SUV_DEALS_NOTIFICATION_PROVIDER:-disabled}"
+    assert env["SELLER_INQUIRY_MODE"] == "${SUV_DEALS_SELLER_INQUIRY_MODE:-disabled_until_sender_ready}"
     crawler = production["services"]["crawl4ai"]
     assert "@${CRAWL4AI_IMAGE_DIGEST:?" in crawler["image"]  # refuses to run without the tested digest
     assert crawler["secrets"][0]["target"] == "api_token"
     assert "ports" not in crawler
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker compose is not installed")
+def test_project_env_file_cannot_enable_compose_switches(tmp_path: Path) -> None:
+    """Compose reads ./.env for ${...} interpolation; the application's switches there are inert."""
+    if subprocess.run(["docker", "compose", "version"], capture_output=True, check=False).returncode != 0:
+        pytest.skip("docker compose is not available")
+    shutil.copy(REPO / "compose.yaml", tmp_path / "compose.yaml")
+    (tmp_path / ".env").write_text(
+        "".join(f"{s}=true\n" for s in _SWITCHES[:2]) + "CRAWL4AI_API_TOKEN=fake-token-for-config\n",
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SUV_DEALS_", *_SWITCHES))}
+
+    def rendered(extra: dict[str, str]) -> dict[str, Any]:
+        result = subprocess.run(
+            ["docker", "compose", "-f", "compose.yaml", "config", "--format", "json"],
+            cwd=tmp_path,
+            env={**env, **extra},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        services: dict[str, Any] = yaml.safe_load(result.stdout)["services"]
+        return services
+
+    for service in ("api", "worker", "scheduler"):
+        environment = rendered({})[service]["environment"]
+        assert environment["SOURCE_NETWORK_ENABLED"] == "false"
+        assert environment["ALLOW_EXTERNAL_NOTIFICATIONS"] == "false"
+    enabled = rendered({"SUV_DEALS_ENABLE_SOURCE_NETWORK": "true"})["worker"]["environment"]
+    assert enabled["SOURCE_NETWORK_ENABLED"] == "true"  # only the explicit, dedicated switch
+
+
+def test_worker_evidence_volume_exists_for_the_read_only_root() -> None:
+    dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+    assert "mkdir -p /app/var/snapshots && chown -R app:app /app/var" in dockerfile
+    for name in ("compose.yaml", "compose.production.yaml"):
+        data = _compose(name)
+        worker = data["services"]["worker"]
+        assert worker["read_only"] is True
+        assert "snapshots:/app/var/snapshots" in worker["volumes"]
+        assert "snapshots" in data["volumes"]
 
 
 def test_dockerfile_and_dockerignore() -> None:
@@ -234,6 +352,24 @@ def test_verify_release_plan_runs_nothing() -> None:
     assert "lint" in result.stdout and "schemas" in result.stdout
 
 
+def test_verify_release_records_the_spec_29_release_facts(tmp_path: Path) -> None:
+    """The embedded Python block of verify_release.sh runs and records config/adapter/MCP facts."""
+    text = (SCRIPTS / "verify_release.sh").read_text(encoding="utf-8")
+    match = re.search(r"uv run --frozen python - <<'EOF'.*?\n(.*?)\nEOF\n", text, re.S)
+    assert match is not None
+    script = tmp_path / "facts.py"
+    script.write_text(match.group(1), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(script)], cwd=REPO, capture_output=True, text=True, timeout=120, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert re.search(r"^  config_yaml_sha256=[0-9a-f]{64}$", result.stdout, re.M)
+    assert "mcp_sdk=2.3.0 mcp_protocol=2026-07-28" in result.stdout
+    assert re.search(
+        r"^  source autoscout24_de adapter=\S+@\S+ mode=\S+ enabled=(true|false)$", result.stdout, re.M
+    )
+
+
 def test_backup_requires_a_url() -> None:
     env = {k: v for k, v in os.environ.items() if k not in ("BACKUP_DATABASE_URL", "DATABASE_URL")}
     result = subprocess.run(
@@ -243,10 +379,20 @@ def test_backup_requires_a_url() -> None:
     assert "BACKUP_DATABASE_URL" in result.stderr
 
 
-def test_restore_check_refuses_a_non_local_target(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://u:FAKE-pw@db.example.invalid:5432/postgres",
+        # A hostname check on the URL text would accept these; libpq would not stay local.
+        "postgresql://u:FAKE-pw@127.0.0.1:5432/postgres?host=db.example.invalid",
+        "postgresql://u:FAKE-pw@127.0.0.1:5432/postgres?hostaddr=10.9.8.7",
+        "postgresql://u:FAKE-pw@127.0.0.1:5432,db.example.invalid:5432/postgres",
+    ],
+)
+def test_restore_check_refuses_a_non_local_target(tmp_path: Path, url: str) -> None:
     manifest = tmp_path / "suv-deals_x.manifest"
     manifest.write_text("format=suv-deals-backup/1\n", encoding="utf-8")
-    env = {**os.environ, "RESTORE_ADMIN_URL": "postgresql://u:FAKE-pw@db.example.invalid:5432/postgres"}
+    env = {**os.environ, "RESTORE_ADMIN_URL": url}
     result = subprocess.run(
         ["bash", str(SCRIPTS / "restore_check.sh"), str(manifest)],
         env=env,
@@ -257,6 +403,53 @@ def test_restore_check_refuses_a_non_local_target(tmp_path: Path) -> None:
     assert result.returncode == 3
     assert "loopback" in result.stderr
     assert "FAKE-pw" not in result.stdout + result.stderr
+
+
+def _fake_pg_tools(tmp_path: Path, log: Path) -> dict[str, str]:
+    """psql/pg_dump stand-ins that record their arguments and whether PGPASSWORD was set."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("psql", "pg_dump"):
+        script = bin_dir / tool
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            'args="$*"\n'
+            "args=\"${args//$'\\n'/ }\"\n"
+            f'printf "%s argv=%s pgpassword=%s\\n" "{tool}" "$args" "${{PGPASSWORD:-}}" >> "{log}"\n'
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+def test_backup_never_passes_the_password_as_an_argument(tmp_path: Path) -> None:
+    log = tmp_path / "calls.log"
+    env = _fake_pg_tools(tmp_path, log)
+    env.pop("DATABASE_URL", None)
+    env["BACKUP_DATABASE_URL"] = (
+        "postgresql://owner:FAKE%2Fsecret-81@db.example.invalid:5432/prod?sslmode=require"
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backup.sh"), "--output-dir", str(tmp_path / "out")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    # The fake psql fails: the script stops at once instead of continuing with empty answers.
+    assert result.returncode == 1
+    assert "cannot connect to the backup source" in result.stderr
+    assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls and all(line.startswith("psql ") for line in calls)
+    for line in calls:
+        argv, _, pgpassword = line.partition(" pgpassword=")
+        assert "FAKE" not in argv and "secret" not in argv
+        assert "postgresql://owner@db.example.invalid:5432/prod?sslmode=require" in argv
+        assert pgpassword == "FAKE/secret-81"
+    assert "FAKE" not in result.stdout + result.stderr
 
 
 def test_bootstrap_owner_wrapper_help() -> None:

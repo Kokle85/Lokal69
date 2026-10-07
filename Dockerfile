@@ -51,7 +51,9 @@ COPY src ./src
 COPY config ./config
 COPY supabase/migrations ./supabase/migrations
 COPY scripts/migrate.sh scripts/rollback.sh ./scripts/
-RUN mkdir -p /app/var && chown app:app /app/var
+# /app/var/snapshots is the worker's evidence volume mount point (the root file system is
+# read-only in compose); created here so a new named volume inherits the app user's ownership.
+RUN mkdir -p /app/var/snapshots && chown -R app:app /app/var
 USER app:app
 EXPOSE 8000
 # Liveness of the api command only (GET /healthz never touches dependencies); worker-type

@@ -46,11 +46,11 @@ from datetime import datetime
 from typing import Any, Final
 from uuid import uuid4
 
+from mcp import types
 from mcp.server import ServerRequestContext
 from mcp.shared.exceptions import MCPError
 from pydantic import ValidationError
 
-from mcp import types
 from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
 from suv_deals.api.routes import request_recheck
 from suv_deals.clock import Clock, ensure_utc

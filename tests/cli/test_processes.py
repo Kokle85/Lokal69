@@ -8,7 +8,9 @@ import pytest
 import uvicorn
 from tests.cli.conftest import Cli
 
+from suv_deals.cli_commands import processes
 from suv_deals.cli_commands.processes import DEFAULT_APP_FACTORY, DEFAULT_REGISTRY, load_factory
+from suv_deals.errors import ValidationFailed
 
 DEV = {"APP_ENV": "development", "DATABASE_URL": "postgresql://fake:FAKE-pw@127.0.0.1:1/none"}
 
@@ -103,3 +105,17 @@ def test_dispatcher_warns_when_external_notifications_are_off(run_cli: Cli) -> N
     result = run_cli("dispatcher", "--once")
     assert "ALLOW_EXTERNAL_NOTIFICATIONS=false" in result.output
     assert result.exit_code != 0  # no DATABASE_URL in this test
+
+
+def test_api_serve_reports_app_factory_errors_without_a_traceback(
+    run_cli: Cli, monkeypatch: pytest.MonkeyPatch, captured_uvicorn: dict[str, Any]
+) -> None:
+    def refusing_factory(settings: Any) -> Any:
+        raise ValidationFailed("unsafe production configuration", details={"problems": ["CORS origin"]})
+
+    monkeypatch.setattr(processes, "load_factory", lambda spec, *, option: refusing_factory)
+    result = run_cli("api", "serve", env=DEV)
+    assert result.exit_code == 1
+    assert "VALIDATION_ERROR: unsafe production configuration" in result.output
+    assert "Traceback" not in result.output
+    assert captured_uvicorn == {}

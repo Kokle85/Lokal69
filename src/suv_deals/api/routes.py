@@ -37,13 +37,16 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
-from typing import Any, Final
+from typing import Any, Final, cast
 from uuid import UUID
 
 import anyio
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, FastAPI, Request
 from pydantic import BaseModel
 from starlette.responses import Response
+from starlette.routing import Match, Mount, Route
+from starlette.types import Receive, Send
+from starlette.types import Scope as AsgiScope
 
 from suv_deals.api.deps import (
     ApiState,
@@ -62,7 +65,6 @@ from suv_deals.api.deps import (
 from suv_deals.api.errors import JSON_MEDIA_TYPE, method_not_allowed
 from suv_deals.api.schemas import (
     ROUTE_INDEX,
-    ROUTES,
     AddNoteRequest,
     ApiRoute,
     CandidateDetailQuery,
@@ -687,27 +689,68 @@ async def get_outbox(request: Request, auth: Authenticated) -> Response:
 # Fallback for unknown /api paths (included after any extension routers, before the MCP mount)
 # --------------------------------------------------------------------------------------------
 
-fallback_router = APIRouter()
-_FALLBACK_METHODS: Final = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-_ROUTE_PATTERNS: Final = tuple(
-    (re.compile("^" + re.sub(r"\{[^/]+\}", "[^/]+", route.path) + "$"), route.method) for route in ROUTES
-)
+_PROBE_METHODS: Final = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+FALLBACK_PATHS: Final = ("/api", "/api/{rest:path}")
+
+
+def _allowed_methods(request: Request) -> list[str]:
+    """Methods for which another route of this app (core AND extension routers, however FastAPI
+    nests included routers) fully matches the request path, probed through Starlette's public
+    ``BaseRoute.matches``. Mounts (the MCP app at ``/`` matches everything) and the fallback
+    routes themselves are skipped."""
+    scope = request.scope
+    candidates = [
+        route
+        for route in request.app.router.routes
+        if not isinstance(route, Mount) and not (isinstance(route, Route) and route.endpoint is API_FALLBACK)
+    ]
+    allowed: list[str] = []
+    for method in _PROBE_METHODS:
+        probe = {
+            "type": "http",
+            "path": scope.get("path", ""),
+            "root_path": scope.get("root_path", ""),
+            "method": method,
+            "headers": [],
+            "query_string": b"",
+        }
+        if any(route.matches(dict(probe))[0] == Match.FULL for route in candidates):
+            allowed.append(method)
+    return sorted(allowed)
 
 
 async def api_fallback(request: Request) -> Response:
     """``404 NOT_FOUND`` (or ``405`` for a known path with another method) as an API error body,
-    so an unknown ``/api`` path never falls through to the MCP mount at ``/``."""
-    path = request.url.path
-    allowed = sorted({method for pattern, method in _ROUTE_PATTERNS if pattern.fullmatch(path)})
+    so an unknown ``/api`` path never falls through to the MCP mount at ``/``. Extension routers
+    included before the fallback get the same ``405`` with their own ``Allow`` methods."""
+    allowed = _allowed_methods(request)
     if allowed:
         raise method_not_allowed(allowed)
     raise AppError(ErrorCode.NOT_FOUND, "Not found")
 
 
-fallback_router.add_api_route("/api", api_fallback, methods=_FALLBACK_METHODS, include_in_schema=False)
-fallback_router.add_api_route(
-    "/api/{rest:path}", api_fallback, methods=_FALLBACK_METHODS, include_in_schema=False
-)
+class _ApiFallback:
+    """The fallback as a plain ASGI endpoint: a Starlette ``Route`` without ``methods`` accepts
+    EVERY method (``TRACE`` or an arbitrary token included), so an unknown ``/api`` path is 404
+    for all of them instead of Starlette's generic 405. Errors propagate to the app's handlers."""
+
+    async def __call__(self, scope: AsgiScope, receive: Receive, send: Send) -> None:
+        await api_fallback(Request(scope, receive))
+
+
+API_FALLBACK: Final = _ApiFallback()
+
+
+def install_api_fallback(app: FastAPI) -> None:
+    """Register the ``/api`` 404/405 fallback as top-level routes of ``app``.
+
+    Call it AFTER every router serving ``/api`` (core and extension routers) and BEFORE the MCP
+    mount at ``/``; ``app.create_app`` does.
+    """
+    for path in FALLBACK_PATHS:
+        # ``add_route`` is typed for request/response functions, but Starlette serves any ASGI
+        # callable object as-is (and only then accepts every method).
+        app.add_route(path, cast(Any, API_FALLBACK), include_in_schema=False)
 
 
 __all__ = [
@@ -716,7 +759,7 @@ __all__ = [
     "RECHECK_OPERATION",
     "check_dashboard_actions",
     "dashboard_action_request",
-    "fallback_router",
+    "install_api_fallback",
     "json_response",
     "readiness_view",
     "request_recheck",

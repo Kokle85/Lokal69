@@ -15,7 +15,16 @@ Engines:
   together with its ledger row, ``lock_timeout=10s``.
 
 The connection string comes from ``DATABASE_URL`` (or the variable named by ``--url-env``), never
-from a command-line argument. Migrations need the schema-owner role, not ``suv_backend``.
+from a command-line argument, and its password never reaches a child process's argument list
+(``psql`` gets a password-free connection string plus ``PGPASSWORD``). Migrations need the
+schema-owner role, not ``suv_backend``.
+
+``suv-deals db target`` prints where a connection string points without connecting; with
+``--local-only`` it exits 3 unless EVERY part of it stays on this machine (all hosts loopback or a
+local socket, no ``hostaddr`` elsewhere, no ``service`` file). The Makefile and
+``scripts/restore_check.sh`` use it as their single local-target guard: a pattern match on the URL
+text is not enough, because libpq also honours ``?host=``/``?hostaddr=`` query parameters,
+several comma-separated hosts and ``PGHOST``/``PGHOSTADDR``/``PGSERVICE`` defaults.
 """
 
 # ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
@@ -41,6 +50,7 @@ from suv_deals.cli_commands._common import (
     fail,
     load_settings,
     pass_cli,
+    password_free,
     refuse,
     safe,
 )
@@ -134,7 +144,12 @@ def apply_with_script(url: str, *, dry_run: bool) -> int:
     script = repo_root() / "scripts" / "migrate.sh"
     if not script.is_file():
         fail("scripts/migrate.sh is missing from this checkout", EXIT_USAGE)
-    env = {**os.environ, "DATABASE_URL": url}
+    # migrate.sh hands $DATABASE_URL to psql as an ARGUMENT (visible in the process list), so it
+    # gets the connection string WITHOUT the password; libpq reads the password from PGPASSWORD.
+    stripped, password = password_free(url)
+    env = {**os.environ, "DATABASE_URL": stripped}
+    if password is not None:
+        env["PGPASSWORD"] = password
     args = ["bash", str(script), "--dry-run" if dry_run else "--yes"]
     completed = subprocess.run(  # noqa: S603 - fixed argv, no shell; the URL travels in the environment
         args, env=env, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL
@@ -151,18 +166,54 @@ def db_group() -> None:
     """Database maintenance (migrations are forward-only; see docs/schema.md)."""
 
 
+_URL_ENV_OPTION = click.option(
+    "--url-env",
+    default="DATABASE_URL",
+    show_default=True,
+    help="Environment variable holding the connection string (never pass it as an argument).",
+)
+
+
+def url_from_env(cli: CliContext, url_env: str) -> str:
+    """The connection string named by ``--url-env`` (``DATABASE_URL`` also honours ``.env``)."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", url_env):
+        fail("--url-env must name an environment variable (upper case)", EXIT_USAGE)
+    if url_env == "DATABASE_URL":
+        settings = load_settings(cli)
+        url = settings.database_url.get_secret_value() if settings.database_url is not None else ""
+    else:
+        url = os.environ.get(url_env, "")
+    if not url:
+        fail(f"{url_env} is not set (server-side secret; set it in the environment)", EXIT_USAGE)
+    return url
+
+
+@db_group.command("target")
+@_URL_ENV_OPTION
+@click.option(
+    "--local-only",
+    is_flag=True,
+    help="Exit 3 unless every host is a loopback address or a local socket (no hostaddr/service).",
+)
+@pass_cli
+def target(cli: CliContext, *, url_env: str, local_only: bool) -> None:
+    """Print where a connection string points (password never shown). Never connects."""
+    found = database_target(url_from_env(cli, url_env))
+    echo(f"{url_env} target (from the connection string and libpq defaults; password never shown):")
+    for line in found.lines():
+        echo(line)
+    echo(f"  local    : {'yes' if found.is_local else 'no'} (loopback or local socket only)")
+    if local_only and not found.is_local:
+        refuse(f"--local-only: {url_env} is not a loopback address or a local socket")
+
+
 @db_group.command("migrate")
 @click.option("--yes", is_flag=True, help="Apply the pending migrations to the printed target.")
 @click.option("--dry-run", is_flag=True, help="Connect, list pending migrations, change nothing.")
 @click.option(
     "--local-only", is_flag=True, help="Refuse unless the target is a loopback host or local socket."
 )
-@click.option(
-    "--url-env",
-    default="DATABASE_URL",
-    show_default=True,
-    help="Environment variable holding the migration connection string (never pass it as an argument).",
-)
+@_URL_ENV_OPTION
 @click.option(
     "--engine",
     type=click.Choice(["auto", "psql", "psycopg"]),
@@ -175,23 +226,16 @@ def migrate(
     cli: CliContext, *, yes: bool, dry_run: bool, local_only: bool, url_env: str, engine: str
 ) -> None:
     """Print the target, then apply pending supabase/migrations/*.sql (requires --yes)."""
-    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", url_env):
-        fail("--url-env must name an environment variable (upper case)", EXIT_USAGE)
+    url = url_from_env(cli, url_env)
     settings = load_settings(cli)
-    if url_env == "DATABASE_URL":
-        url = settings.database_url.get_secret_value() if settings.database_url is not None else ""
-    else:
-        url = os.environ.get(url_env, "")
-    if not url:
-        fail(f"{url_env} is not set (server-side secret; set it in the environment)", EXIT_USAGE)
-    target = database_target(url)
+    found = database_target(url)
     directory = repo_root() / "supabase" / "migrations"
     echo("Migration target (from the connection string; password never shown):")
-    for line in target.lines():
+    for line in found.lines():
         echo(line)
     echo(f"  APP_ENV  : {settings.app_env}")
     echo(f"  files    : {len(migration_plan(directory))} in supabase/migrations")
-    if local_only and not target.is_local:
+    if local_only and not found.is_local:
         refuse("--local-only: the target is not a loopback address or a local socket")
     if not dry_run and not yes:
         echo("Nothing applied.")

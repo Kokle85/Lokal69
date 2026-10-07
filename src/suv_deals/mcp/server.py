@@ -15,7 +15,8 @@
   ``scopes_supported``) and answer ``401`` with ``WWW-Authenticate: Bearer ...
   resource_metadata="..."``. ``static_bearer``/``dev_local`` advertise no OAuth discovery.
 - `McpGuardMiddleware` (outermost): request ids (``X-Request-Id``), exactly one
-  ``Authorization`` header, loopback-only clients in ``dev_local``, ``scope="..."`` on bearer
+  ``Authorization`` header, loopback-only clients in ``dev_local``, ``405`` for ``GET /mcp`` (no
+  standalone SSE stream on this stateless server), ``scope="..."`` on bearer
   challenges, ``Cache-Control: no-store``, and ``503`` (never ``401``) when the identity provider's
   keys or the database are unavailable during authentication.
 
@@ -104,6 +105,11 @@ MCP_PATH: Final = "/mcp"
 DEFAULT_MAX_BODY_BYTES: Final = 256 * 1024
 REQUEST_ID_HEADER: Final = b"x-request-id"
 UNAVAILABLE_RETRY_AFTER: Final = "5"
+NO_SSE_STREAM: Final[Mapping[str, Any]] = {
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {"code": -32600, "message": "Method Not Allowed: this server offers no SSE stream"},
+}
 INSTRUCTIONS: Final = (
     "Bounded research tools for a private European SUV deal review queue. Read candidates, "
     "valuations, comparables and the pending review queue; claim, release and submit evidence-based "
@@ -363,6 +369,12 @@ class McpGuardMiddleware:
                 403,
                 {"error": "forbidden", "error_description": "Local access only"},
             )
+            return
+        if scope.get("path") == MCP_PATH and scope.get("method") == "GET":
+            # This stateless server sends nothing server-initiated, so it offers no standalone SSE
+            # stream (2026-07-28 removed it; handshake-era clients must accept 405). The SDK would
+            # otherwise keep a legacy GET stream open forever, outside every rate limit.
+            await self._reject(scope, receive, guarded_send, 405, NO_SSE_STREAM, Allow="POST")
             return
         authorizations = [v for k, v in scope.get("headers", ()) if k.lower() == b"authorization"]
         if len(authorizations) > 1:

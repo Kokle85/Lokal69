@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
-from tests.api.conftest import DataHarness, error_of
+from tests.api.conftest import DataHarness, comparable_error, error_of
 from tests.integration.db.helpers import Seed
+from tests.integration.read_queries.dataset import seed_foreign_workspace
 
 from suv_deals.api.routes import dashboard_action_request
 from suv_deals.domain.due_diligence import DashboardAction
+from suv_deals.persistence.database import Database
 
 pytestmark = pytest.mark.db
 
@@ -480,3 +482,50 @@ async def test_request_bodies_cannot_assign_actor_or_workspace_fields(
         )
         == 0
     )
+
+
+async def test_role_and_objects_follow_the_selected_workspace(
+    data_api: DataHarness, db: Database, seed: Seed
+) -> None:
+    """A user who is a viewer in workspace A and an owner in workspace B: the selected workspace
+    (``X-Workspace-Id``) decides both the role's scopes and which objects exist. Membership in
+    another workspace never widens either (cross-tenant IDOR for multi-membership users)."""
+    other = await seed_foreign_workspace(db, seed, "API-B2")
+    user = seed.user()
+    seed.membership(data_api.workspace_id, user, "viewer")
+    seed.membership(other.workspace_id, user, "owner")
+    in_a = {"X-Workspace-Id": str(data_api.workspace_id)}
+    in_b = {"X-Workspace-Id": str(other.workspace_id)}
+    a_source, b_source = data_api.data.sources["running"], other.sources["running"]
+
+    def pause_body(key: str, version: int = 1) -> dict[str, Any]:
+        return {
+            "expected_version": version,
+            "reason": "SYNTHETIC: workspace binding probe",
+            "idempotency_key": key,
+        }
+
+    as_viewer = await data_api.post(
+        f"/api/sources/{a_source}/pause", user, pause_body("bind-pause-0001"), headers=in_a
+    )
+    assert as_viewer.status_code == 403  # B's owner role never applies in A
+    through_b = await data_api.post(
+        f"/api/sources/{a_source}/pause", user, pause_body("bind-pause-0002"), headers=in_b
+    )
+    missing = await data_api.post(
+        f"/api/sources/{uuid4()}/pause", user, pause_body("bind-pause-0003"), headers=in_b
+    )
+    assert through_b.status_code == missing.status_code == 404  # A's source does not exist in B
+    assert comparable_error(through_b) == comparable_error(missing)
+    a_listing, b_listing = data_api.data.listings["priced"], other.listings["priced"]
+    assert (await data_api.get(f"/api/candidates/{a_listing}", user, headers=in_a)).status_code == 200
+    assert (await data_api.get(f"/api/candidates/{a_listing}", user, headers=in_b)).status_code == 404
+    assert (await data_api.get(f"/api/candidates/{b_listing}", user, headers=in_a)).status_code == 404
+    sources = (await data_api.get("/api/sources", user, headers=in_b)).json()["data"]["items"]
+    version = next(s["version"] for s in sources if s["source_id"] == str(b_source))
+    paused = await data_api.post(
+        f"/api/sources/{b_source}/pause", user, pause_body("bind-pause-0004", version), headers=in_b
+    )
+    assert paused.status_code == 200, paused.text
+    assert seed.scalar("select paused from app.sources where id = %s", (b_source,)) is True
+    assert seed.scalar("select paused from app.sources where id = %s", (a_source,)) is False

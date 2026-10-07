@@ -6,8 +6,9 @@ Token verification (`SupabaseJwtVerifier`):
 - The token comes from ``Authorization: Bearer`` only (the FastAPI dependency in ``api.deps``
   never reads cookies, query strings or bodies).
 - Signature: the project's JWKS at ``<SUPABASE_URL>/auth/v1/.well-known/jwks.json`` through
-  PyJWT's ``PyJWKClient`` (JWK-set cache of 10 minutes, unknown ``kid`` refresh at most once per
-  30 seconds, 5 second timeout, no redirects). The fetch is blocking urllib, so it runs in a worker
+  PyJWT's ``PyJWKClient`` (`SupabaseJwksClient`: JWK-set cache of 10 minutes, unknown ``kid``
+  refresh at most once per 30 seconds, 5 second timeout, no redirects, and no new network attempt
+  for 5 seconds after a failed fetch). The fetch is blocking urllib, so it runs in a worker
   thread. Tests and pinned-key deployments inject a `SigningKeyResolver` (`StaticJwks`).
 - Algorithms: ``ES256`` and ``RS256`` only; the JWK's own algorithm must equal the header's.
   ``HS256`` is accepted only when a legacy shared secret is configured explicitly; ``none`` and
@@ -34,8 +35,10 @@ MCP, CLI and system actors never do (a credential may narrow, never widen, the r
 
 from __future__ import annotations
 
+import math
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol
@@ -83,6 +86,7 @@ MAX_TOKEN_LENGTH: Final = 8192
 JWKS_CACHE_SECONDS: Final = 600
 JWKS_REFRESH_COOLDOWN_SECONDS: Final = 30
 JWKS_TIMEOUT_SECONDS: Final = 5.0
+JWKS_FAILURE_BACKOFF_SECONDS: Final = 5.0
 MIN_LEGACY_SECRET_BYTES: Final = 32
 WORKSPACE_HEADER: Final = "X-Workspace-Id"
 REQUIRED_CLAIMS: Final = ("exp", "iat", "sub", "aud", "iss", "role")
@@ -173,9 +177,48 @@ def supabase_issuer(supabase_url: str) -> str:
     return f"{supabase_url.strip().rstrip('/')}/auth/v1"
 
 
-def supabase_jwks_client(issuer: str) -> PyJWKClient:
+class SupabaseJwksClient(PyJWKClient):
+    """``PyJWKClient`` that fails fast for a short backoff after a failed JWKS fetch.
+
+    ``PyJWKClient`` holds one lock across its blocking fetch, so without a backoff an outage (or
+    an empty/invalid key set) makes every verification queue behind its own network attempt of up
+    to ``timeout`` seconds in a worker thread. After a failure the next ``failure_backoff``
+    seconds re-raise the same error class without touching the network (an unreachable endpoint
+    stays ``503``, an unusable key set stays ``401``); the first attempt after the backoff
+    retries. Verification stays fail-closed: no expired key set is ever reused.
+    """
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        failure_backoff: float = JWKS_FAILURE_BACKOFF_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(uri, **kwargs)
+        if not (failure_backoff >= 0 and math.isfinite(failure_backoff)):
+            raise ValueError("failure_backoff must be a finite, non-negative number of seconds")
+        self._failure_backoff = failure_backoff
+        self._monotonic = monotonic
+        self._failure: tuple[float, type[PyJWTError]] | None = None
+
+    def fetch_data(self) -> Any:
+        failure = self._failure
+        if failure is not None and self._monotonic() - failure[0] < self._failure_backoff:
+            raise failure[1]("The JWKS endpoint failed recently; retrying after a short backoff")
+        try:
+            data = super().fetch_data()
+        except PyJWTError as exc:
+            self._failure = (self._monotonic(), type(exc))
+            raise
+        self._failure = None
+        return data
+
+
+def supabase_jwks_client(issuer: str) -> SupabaseJwksClient:
     """Cached, bounded-refresh JWKS client for ``<issuer>/.well-known/jwks.json``."""
-    return PyJWKClient(
+    return SupabaseJwksClient(
         f"{issuer}/.well-known/jwks.json",
         cache_jwk_set=True,
         lifespan=JWKS_CACHE_SECONDS,
@@ -446,6 +489,7 @@ __all__ = [
     "Principal",
     "SigningKeyResolver",
     "StaticJwks",
+    "SupabaseJwksClient",
     "SupabaseJwtVerifier",
     "VerifiedUser",
     "actor_for",

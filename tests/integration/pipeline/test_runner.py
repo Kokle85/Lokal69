@@ -15,7 +15,7 @@ import pytest
 from tests.integration.pipeline.support import PipelineEnv, run
 
 from suv_deals.domain.enums import JobState, JobType
-from suv_deals.errors import DependencyUnavailable, SourcePaused, ValidationFailed
+from suv_deals.errors import DependencyUnavailable, SourcePaused, ValidationFailed, VersionConflict
 from suv_deals.persistence import jobs
 from suv_deals.persistence.database import Conn
 from suv_deals.persistence.transactions import job_unit_of_work
@@ -85,6 +85,7 @@ async def test_incompatible_payload_version_is_blocked_not_retried(env: Pipeline
         (ValidationFailed("synthetic invalid payload"), "dead_letter", "VALIDATION_ERROR"),
         (DependencyUnavailable("synthetic outage"), "retry_wait", "DEPENDENCY_UNAVAILABLE"),
         (SourcePaused("synthetic pause"), "blocked", "source_paused"),
+        (VersionConflict("synthetic concurrent change"), "retry_wait", "VERSION_CONFLICT"),
         (RuntimeError("synthetic bug"), "retry_wait", "UNEXPECTED_ERROR"),
     ],
 )
@@ -126,6 +127,38 @@ async def test_heartbeat_detects_a_lost_lease_and_cancels_the_handler(env: Pipel
         ).run_until_idle()
     assert report.lease_lost and report.state is None and not reached_end
     assert job_row(env, job_id)["state"] == "running"  # left for the reaper, nothing committed
+
+
+async def test_heartbeats_failing_past_the_lease_stop_the_handler(
+    env: PipelineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the database cannot be reached for heartbeats, the lease is certainly gone once a full
+    lease period passed since the last extension: the handler's (network) work is cancelled instead
+    of continuing for a job another worker may already hold."""
+    reached_end = False
+
+    async def slow(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
+        nonlocal reached_end
+        await anyio.sleep(10)  # e.g. a long fetch; cancelled once the lease is certainly lost
+        reached_end = True
+        return await succeed(ctx, execution)
+
+    async def unreachable(*_args: object, **_kwargs: object) -> bool:
+        raise DependencyUnavailable("synthetic: database unreachable for heartbeats")
+
+    monkeypatch.setattr(jobs, "heartbeat", unreachable)
+    fast = dataclasses.replace(
+        env.ctx, options=RuntimeOptions(job_lease_seconds=1, heartbeat_seconds=0.2), owns_db=False
+    )
+    job_id = await enqueue(env)
+    started = anyio.current_time()
+    with anyio.fail_after(5):
+        [report] = await Worker(
+            fast, registry_with(slow), workspace_ids=[env.workspace_id], worker_id="worker-hb-down"
+        ).run_until_idle()
+    assert report.lease_lost and report.state is None and not reached_end
+    assert anyio.current_time() - started >= 1.0  # never before a full lease period
+    assert job_row(env, job_id)["state"] == "running"  # nothing committed; the reaper recovers it
 
 
 async def test_new_job_types_plug_into_the_registry(env: PipelineEnv) -> None:

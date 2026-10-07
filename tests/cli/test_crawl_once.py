@@ -7,6 +7,7 @@ host ``dealer.example``, saved files, ``mode: fixture``): nothing is fetched fro
 from __future__ import annotations
 
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -161,3 +162,56 @@ def test_crawl_once_refuses_an_access_blocked_source(
     assert result.exit_code == 3
     assert "access_blocked" in result.output
     assert seed.scalar("select count(*) from ops.jobs where workspace_id = %s", (workspace,)) == 0
+
+
+@pytest.mark.db
+def test_crawl_once_cancels_its_job_when_another_job_is_claimed_first(
+    run_cli: Cli, db_env: dict[str, str], workspace: UUID, seed: Seed, tmp_path: Path
+) -> None:
+    """The page cap exists only in-process: a job this command did not run must not stay queued
+    for a background worker, which would run it with the source's full per-run page budget."""
+    env = {**db_env, "CONFIG_DIR": str(_config_with(tmp_path)), "LOG_LEVEL": "WARNING"}
+    ws = str(workspace)
+    assert run_cli("sources", "sync", "--workspace", ws, "--yes", env=env).exit_code == 0
+    applied = run_cli("config", "apply", "--workspace", ws, "--reason", "synthetic", "--yes", env=env)
+    assert applied.exit_code == 0, applied.output
+    source_id = seed.scalar(
+        "select id from app.sources where workspace_id = %s and source_key = 'fixture_dealer_de'",
+        (workspace,),
+    )
+    profile_id = seed.scalar(
+        "select id from app.search_profiles where workspace_id = %s and profile_key = 'primary'", (workspace,)
+    )
+    # An older due discovery job with the same top priority (e.g. left by an earlier run).
+    earlier = seed.job(
+        workspace,
+        job_type="discovery",
+        priority=1000,
+        max_attempts=1,
+        available_at=datetime.now(UTC) - timedelta(minutes=5),
+        payload={"source_id": str(source_id), "profile_id": str(profile_id), "partition_key": "default"},
+        source_id=source_id,
+        profile_id=profile_id,
+        partition_key="default",
+    )
+    result = run_cli(
+        "crawl", "once", "--source", "fixture_dealer_de", "--workspace", ws, "--max-pages", "1", env=env
+    )
+    assert result.exit_code == 1, result.output
+    assert f"another due discovery job ({earlier}) was claimed first" in result.output
+    assert "was cancelled so that no other worker runs it without the page cap" in result.output
+    states = dict(
+        seed.conn.execute(
+            "select case when id = %s then 'earlier' else 'cli' end, state from ops.jobs"
+            " where workspace_id = %s and job_type = 'discovery'",
+            (earlier, workspace),
+        ).fetchall()
+    )
+    assert states == {"earlier": "succeeded", "cli": "cancelled"}
+    assert (
+        seed.scalar(
+            "select count(*) from ops.audit_events where workspace_id = %s and action = 'job.cancel'",
+            (workspace,),
+        )
+        == 1
+    )

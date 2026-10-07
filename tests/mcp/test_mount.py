@@ -96,6 +96,8 @@ async def test_mount_keeps_api_precedence_and_serves_mcp(keys: SigningKeys) -> N
         assert (
             unauthenticated.headers["x-content-type-options"] == "nosniff"
         )  # backend security headers apply
+        stream = await asyncio.wait_for(http.get("/mcp", headers={"Accept": "text/event-stream"}), timeout=10)
+        assert stream.status_code == 405 and stream.headers["allow"] == "POST"
 
 
 async def test_load_mcp_app_returns_a_mountable_app_even_when_disabled(keys: SigningKeys) -> None:

@@ -164,12 +164,23 @@ def tokens(keys: SigningKeys) -> TokenFactory:
 
 
 def make_settings(**overrides: Any) -> Settings:
+    """Test settings. Every field the API derives security behaviour from is pinned explicitly,
+    because ``Settings`` still reads process environment variables (``_env_file=None`` only skips
+    ``.env``): an exported ``API_ALLOWED_ORIGINS`` or ``MCP_PUBLIC_URL`` must not change what the
+    CORS/Host tests assert."""
     values: dict[str, Any] = {
         "app_env": "test",
         "app_base_url": BASE_URL,
         "supabase_url": SUPABASE_URL,
+        "supabase_jwt_audience": "authenticated",
         "build_id": "synthetic-api.1",
         "mcp_cursor_signing_secret": SecretStr(CURSOR_SECRET.decode()),
+        "api_allowed_origins": "",
+        "mcp_public_url": None,
+        "mcp_allowed_origins": "",
+        "mcp_auth_mode": "oauth",
+        "database_url": None,
+        "database_set_role": None,
         "event_bridge_enabled": False,
         "allow_external_notifications": False,
         "source_network_enabled": False,

@@ -26,7 +26,21 @@ from suv_deals.cli import cli
 from suv_deals.settings import Settings
 
 #: Variables that are not Settings fields but are read by the CLI or libpq.
-_EXTRA_VARS = ("MAINTENANCE_DATABASE_URL", "MIGRATE_URL", "PGPASSWORD", "PGHOST", "PGPORT", "PGUSER")
+_EXTRA_VARS = (
+    "MAINTENANCE_DATABASE_URL",
+    "MIGRATE_URL",
+    "LOCAL_ADMIN_URL",
+    "LOCAL_DATABASE_URL",
+    "RESTORE_ADMIN_URL",
+    "PGPASSWORD",
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGPORT",
+    "PGUSER",
+    "PGDATABASE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+)
 
 
 @pytest.fixture(autouse=True)

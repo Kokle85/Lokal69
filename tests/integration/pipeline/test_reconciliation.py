@@ -167,6 +167,37 @@ async def test_stale_detail_sweep_never_refetches_a_failing_page_every_pass(env:
     assert later.stale_detail_jobs == 3
 
 
+async def test_a_paused_sources_backlog_never_starves_the_stale_detail_sweep(env: PipelineEnv) -> None:
+    """Candidates are chosen per network-eligible source: older stale listings of a paused source
+    can never fill the per-pass window and keep every other source from being swept."""
+    from tests.integration.repos_valuation_reviews.builders import make_listing  # noqa: PLC0415
+
+    await run_pipeline(env)
+    age_listing_details(env)  # the fixture source's listings: last checked three days ago
+    paused = env.seed.source(
+        env.workspace_id, source_key=f"synthetic_paused_{uuid.uuid4().hex[:8]}", detail_mode="fetch"
+    )
+    env.seed.conn.execute(
+        "update app.sources set paused = true, pause_reason = 'SYNTHETIC pause', paused_at = now()"
+        " where id = %s",
+        (paused,),
+    )
+    for _ in range(3):
+        make_listing(env.seed, env.workspace_id, paused)  # eligible
+    env.seed.conn.execute(
+        "update app.listings set last_detail_success_at = now() - interval '5 days' where source_id = %s",
+        (paused,),
+    )
+    report = await reconciler(env, stale_detail_candidates=3).reconcile_workspace(env.workspace_id)
+    assert report.errors == [] and report.stale_detail_jobs == 3
+    swept = env.rows(
+        "select source_id from ops.jobs where workspace_id = %s and job_type = 'detail'"
+        " and payload ->> 'reason' = 'stale_detail_sweep'",
+        env.workspace_id,
+    )
+    assert [r["source_id"] for r in swept] == [env.source_id] * 3  # nothing for the paused source
+
+
 async def test_due_watch_recheck_becomes_a_recheck_job(env: PipelineEnv) -> None:
     await run_pipeline(env)
     listing_id = by_slid(env)["TEST-204"]["id"]

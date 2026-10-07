@@ -114,16 +114,21 @@ async def database_findings(settings: Settings) -> list[Finding]:
             findings.append(Finding(area, "server_version", "ok", f"{version_text} (tested major version)"))
 
         # Migration ledger (supabase_migrations.schema_migrations; see docs/schema.md section 9).
+        # A dedicated login (e.g. a LOGIN member of suv_backend) may lack USAGE on that schema:
+        # to_regclass() itself then raises, which must not abort the remaining checks.
         files = migration_files()
-        if await scalar("select to_regclass('supabase_migrations.schema_migrations') is not null"):
-            try:
+        try:
+            has_ledger = await scalar(
+                "select to_regclass('supabase_migrations.schema_migrations') is not null"
+            )
+            applied: set[str] | None = None
+            if has_ledger:
                 cur = await conn.execute("select version from supabase_migrations.schema_migrations")
                 applied = {str(r["version"]) for r in await cur.fetchall()}
-            except psycopg.errors.InsufficientPrivilege:
-                findings.append(
-                    Finding(area, "migration_ledger", "skipped", "no privilege to read the ledger")
-                )
-            else:
+        except psycopg.errors.InsufficientPrivilege:
+            findings.append(Finding(area, "migration_ledger", "skipped", "no privilege to read the ledger"))
+        else:
+            if applied is not None:
                 known = {v for v, _ in files}
                 pending = [f"{v}_{n}" for v, n in files if v not in applied]
                 unknown = sorted(applied - known)
@@ -148,16 +153,16 @@ async def database_findings(settings: Settings) -> list[Finding]:
                             "section 9)",
                         )
                     )
-        else:
-            findings.append(
-                Finding(
-                    area,
-                    "migration_ledger",
-                    "info",
-                    "no supabase_migrations ledger (test harness or manual apply); "
-                    "the schema markers below decide",
+            else:
+                findings.append(
+                    Finding(
+                        area,
+                        "migration_ledger",
+                        "info",
+                        "no supabase_migrations ledger (test harness or manual apply); "
+                        "the schema markers below decide",
+                    )
                 )
-            )
 
         # Backend role (ADR 0001): owner-only function; skipped when the login role may not call it.
         try:

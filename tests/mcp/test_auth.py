@@ -7,12 +7,17 @@ an unreachable identity provider is ``503``, never ``401``. SYNTHETIC keys and d
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
 from jwt.exceptions import PyJWKClientConnectionError
 from pydantic import SecretStr
 
@@ -34,19 +39,23 @@ from suv_deals.mcp.auth import (
 from suv_deals.mcp.server import build_mcp
 from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence.database import Database
+from suv_deals.persistence.errors_map import StatementTimeout, TransientConflict
 from suv_deals.persistence.transactions import unit_of_work
 from tests.integration.db.helpers import Seed
 from tests.integration.persistence_core.support import member, system
 from tests.mcp.conftest import (
     API_HOST,
     BASE_URL,
+    ES_KID,
     ISSUER,
     MCP_URL,
     METADATA_URL,
+    RS_KID,
     McpClient,
     SigningKeys,
     TokenFactory,
     add_members,
+    b64url,
     build_app,
     envelope,
     make_settings,
@@ -124,10 +133,47 @@ async def test_protected_resource_metadata_names_the_issuer_and_scopes(keys: Sig
         assert body["bearer_methods_supported"] == ["header"]
 
 
+def _hs256_signed_with_public_key(tokens: TokenFactory, keys: SigningKeys, user: UUID) -> str:
+    """The classic algorithm confusion: HS256 keyed with the published RSA public key."""
+    pem = keys.rs_private.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT", "kid": RS_KID}).encode())
+    payload = b64url(json.dumps(tokens.claims(user, scopes=[Scope.DEALS_READ])).encode())
+    signature = b64url(hmac.new(pem, f"{header}.{payload}".encode(), hashlib.sha256).digest())
+    return f"{header}.{payload}.{signature}"
+
+
 def _bad_tokens(tokens: TokenFactory, keys: SigningKeys) -> dict[str, tuple[str, str]]:
     user = uuid.uuid4()
     scopes = [Scope.DEALS_READ]
+    claims = tokens.claims(user, scopes=scopes)
     return {
+        # Algorithm confusion: the JWK's algorithm must equal the header's; only ES256/RS256.
+        "rs256_header_with_es_kid": (
+            tokens.mint(user, alg="RS256", kid=ES_KID, scopes=scopes),
+            "invalid_token",
+        ),
+        "es256_header_with_rs_kid": (
+            tokens.mint(user, alg="ES256", kid=RS_KID, scopes=scopes),
+            "invalid_token",
+        ),
+        "ps256": (
+            jwt.encode(claims, keys.rs_private, algorithm="PS256", headers={"kid": RS_KID}),
+            "invalid_token",
+        ),
+        "hs256_with_public_key": (_hs256_signed_with_public_key(tokens, keys, user), "invalid_token"),
+        "missing_kid": (jwt.encode(claims, keys.es_private, algorithm="ES256"), "invalid_token"),
+        "issued_in_the_future": (tokens.mint(user, scopes=scopes, issued_offset=600), "invalid_token"),
+        "not_yet_valid": (
+            tokens.mint(user, scopes=scopes, extra={"nbf": claims["iat"] + 600}),
+            "invalid_token",
+        ),
+        "issuer_with_trailing_slash": (tokens.mint(user, scopes=scopes, issuer=f"{ISSUER}/"), "wrong_issuer"),
+        "audience_list_without_this_server": (
+            tokens.mint(user, scopes=scopes, audience=["https://a.synthetic.example", "authenticated"]),
+            "wrong_audience",
+        ),
         "garbage": ("not-a-jwt", "invalid_token"),
         "alg_none": (tokens.unsigned(user, scopes=scopes), "invalid_token"),
         "unknown_kid": (tokens.mint(user, scopes=scopes, kid="synthetic-unknown"), "invalid_token"),
@@ -153,6 +199,15 @@ def _bad_tokens(tokens: TokenFactory, keys: SigningKeys) -> dict[str, tuple[str,
 @pytest.mark.parametrize(
     "case",
     [
+        "rs256_header_with_es_kid",
+        "es256_header_with_rs_kid",
+        "ps256",
+        "hs256_with_public_key",
+        "missing_kid",
+        "issued_in_the_future",
+        "not_yet_valid",
+        "issuer_with_trailing_slash",
+        "audience_list_without_this_server",
         "garbage",
         "alg_none",
         "unknown_kid",
@@ -347,6 +402,37 @@ async def test_oauth_without_jwks_url_or_resolver_is_disabled() -> None:
     assert pinned.problems == ("the pinned OAuth signing keys are invalid",)
 
 
+SUPABASE_URL = "https://synthetic-project.supabase.example"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "problem"),
+    [
+        (
+            # Dashboard session tokens (Supabase issuer + its audience) must never be MCP tokens.
+            {"mcp_oauth_issuer": f"{SUPABASE_URL}/auth/v1", "mcp_oauth_audience": "authenticated"},
+            "MCP_OAUTH_AUDIENCE must not be the dashboard session audience (SUPABASE_JWT_AUDIENCE)",
+        ),
+        (
+            {"mcp_oauth_issuer": f"{SUPABASE_URL}/auth/v1/", "mcp_oauth_audience": " authenticated "},
+            "MCP_OAUTH_AUDIENCE must not be the dashboard session audience (SUPABASE_JWT_AUDIENCE)",
+        ),
+        # The same audience string from ANOTHER issuer is not a dashboard token.
+        ({"mcp_oauth_audience": "authenticated"}, None),
+        ({"mcp_oauth_audience": "api://suv-deals-synthetic"}, None),
+    ],
+)
+def test_audiences_shared_with_other_token_kinds_are_refused(
+    overrides: dict[str, Any], problem: str | None, keys: SigningKeys
+) -> None:
+    settings = make_settings(supabase_url=SUPABASE_URL, **overrides)
+    app = build_mcp(settings, offline_db(), jwks=keys.jwks, metrics=AppMetrics(process_metrics=False))
+    if problem is None:
+        assert app.configured, app.problems
+    else:
+        assert not app.configured and app.problems == (problem,)
+
+
 def test_scope_claim_parsing_ignores_unknown_values() -> None:
     assert parse_scope_claim({"scope": "openid deals:read  bogus reviews:read"}) == {
         Scope.DEALS_READ,
@@ -394,6 +480,18 @@ async def test_oauth_user_maps_to_membership_and_token_scopes_narrow_the_role(
         stranger = tokens.mint(users.stranger, scopes=[Scope.DEALS_READ])
         assert (await client.rpc("tools/list", token=stranger)).status_code == 401
         assert denials(client.metrics, "not_member") == 1
+
+
+@pytest.mark.db
+async def test_rs256_tokens_from_the_jwks_are_accepted(
+    db: Database, seed: Seed, keys: SigningKeys, tokens: TokenFactory
+) -> None:
+    workspace = seed.workspace("MCP RS256")
+    users = add_members(seed, workspace)
+    async with mcp_client(make_settings(), db, keys) as client:
+        token = tokens.mint(users.viewer, alg="RS256", scopes=[Scope.DEALS_READ])
+        assert jwt.get_unverified_header(token)["kid"] == RS_KID
+        assert len(await client.tools(token)) == 5
 
 
 @pytest.mark.db
@@ -636,27 +734,43 @@ async def test_issuing_credentials_is_restricted_and_bounded(db: Database, seed:
                 label="SYNTHETIC",
             )
     actor = system(workspace)
-    bad: list[dict[str, Any]] = [
-        {"scopes": [Scope.MAIL_INGEST], "role": Role.OWNER},
-        {"scopes": [Scope.CONFIG_ADMIN], "role": Role.OWNER},
-        {"scopes": [Scope.SOURCES_PAUSE], "role": Role.REVIEWER},
-        {"scopes": [], "role": Role.VIEWER},
-        {"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "lifetime": timedelta(days=400)},
-        {"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "label": "  "},
+    machine = uuid.uuid4()  # not a member: every refusal below is the named rule, nothing else
+    bad: list[tuple[dict[str, Any], str]] = [
+        ({"scopes": [Scope.MAIL_INGEST], "role": Role.OWNER}, "scopes"),
+        ({"scopes": [Scope.CONFIG_ADMIN], "role": Role.OWNER}, "scopes"),
+        ({"scopes": [Scope.SOURCES_PAUSE], "role": Role.REVIEWER}, "scopes"),
+        ({"scopes": [], "role": Role.VIEWER}, "scopes"),
+        ({"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "lifetime": timedelta(days=400)}, "lifetime"),
+        ({"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "lifetime": timedelta(0)}, "lifetime"),
+        ({"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "label": "  "}, "label"),
+        ({"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "label": "bidi " + chr(0x202E)}, "label"),
+        ({"scopes": [Scope.DEALS_READ], "role": Role.VIEWER, "kind": "oauth"}, "kind"),
     ]
-    for case in bad:
+    for case, field in bad:
         async with unit_of_work(db, actor) as conn:
-            with pytest.raises(ValidationFailed):
+            with pytest.raises(ValidationFailed) as caught:
                 await issue_api_credential(
                     conn,
                     actor,
-                    principal_id=users.owner,
+                    principal_id=machine,
                     principal_kind="mcp_client",
                     role=case["role"],
                     scopes=case["scopes"],
                     label=case.get("label", "SYNTHETIC"),
+                    kind=case.get("kind", "static_bearer"),
                     lifetime=case.get("lifetime", timedelta(days=1)),
                 )
+        assert caught.value.details == {"fields": [field]}, case
+    # The same principal with valid arguments is accepted (the refusals above were the rules).
+    accepted = await _issue(
+        db,
+        workspace,
+        principal=machine,
+        principal_kind="mcp_client",
+        role=Role.VIEWER,
+        scopes=(Scope.DEALS_READ,),
+    )
+    assert accepted.principal_kind == "mcp_client" and accepted.scopes == (Scope.DEALS_READ,)
     async with unit_of_work(db, actor) as conn:
         with pytest.raises(NotFound):  # a user credential needs an active membership allowing the scopes
             await issue_api_credential(
@@ -762,7 +876,9 @@ async def test_user_token_through_a_mapped_client_is_never_the_machine_principal
     metrics = AppMetrics(process_metrics=False)
     async with mcp_client(make_settings(), db, keys, client_principals=clients, metrics=metrics) as client:
         scopes = [Scope.DEALS_READ, Scope.SOURCES_PAUSE]
-        foreign_user = tokens.mint("idp|synthetic-user-7", scopes=scopes, extra={"client_id": "synthetic-machine"})
+        foreign_user = tokens.mint(
+            "idp|synthetic-user-7", scopes=scopes, extra={"client_id": "synthetic-machine"}
+        )
         assert (await client.rpc("tools/list", token=foreign_user)).status_code == 401
         assert denials(metrics, "not_member") == 1
         via_azp = tokens.mint(
@@ -777,7 +893,9 @@ async def test_user_token_through_a_mapped_client_is_never_the_machine_principal
             "synthetic-aliased@clients", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"}
         )
         assert len(await client.tools(aliased)) == 5
-        wrong_alias = tokens.mint("synthetic-aliased", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"})
+        wrong_alias = tokens.mint(
+            "synthetic-aliased", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"}
+        )
         assert (await client.rpc("tools/list", token=wrong_alias)).status_code == 401
         # A real member signing in through the mapped client is that member, not the machine.
         member_token = tokens.mint(users.viewer, scopes=scopes, extra={"client_id": "synthetic-machine"})
@@ -798,8 +916,6 @@ class _BusyDatabase:
 async def test_transient_identity_store_failures_are_503_never_500_or_401(
     mode: str, keys: SigningKeys, tokens: TokenFactory
 ) -> None:
-    from suv_deals.persistence.errors_map import StatementTimeout, TransientConflict
-
     for error in (TransientConflict("The record is busy; retry shortly"), StatementTimeout()):
         busy: Any = _BusyDatabase(error)
         metrics = AppMetrics(process_metrics=False)
@@ -833,6 +949,4 @@ async def test_machine_credentials_cannot_reuse_a_members_identity(db: Database,
                 label="SYNTHETIC impersonation attempt",
             )
     assert caught.value.details == {"fields": ["principal_id"]}
-    assert (
-        seed.scalar("select count(*) from ops.api_credentials where workspace_id = %s", (workspace,)) == 0
-    )
+    assert seed.scalar("select count(*) from ops.api_credentials where workspace_id = %s", (workspace,)) == 0

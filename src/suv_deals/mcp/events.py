@@ -19,7 +19,8 @@ Methods (the principal always comes from the verified token, never from params):
 ``events/list``
     The ``review.pending.v1`` descriptor (``delivery: ["webhook"]``, closed ``inputSchema`` with
     the permitted profiles, minimal ``payloadSchema``), only for principals holding
-    ``reviews:read`` + ``events:subscribe``; otherwise ``{"events": []}``.
+    ``reviews:read`` + ``events:subscribe`` whose access the dispatcher can recheck before each
+    delivery (`can_hold_subscriptions`); otherwise ``{"events": []}``.
 ``events/subscribe``
     ``event_bridge.validate_subscribe_params`` (authorization, name, closed arguments,
     ``delivery.mode == "webhook"``, an https/443 public callback, a client-supplied ``whsec_``
@@ -159,6 +160,15 @@ def _strip_meta(params: Mapping[str, Any] | None) -> dict[str, Any]:
     return {k: v for k, v in dict(params or {}).items() if k != "_meta"}
 
 
+def can_hold_subscriptions(principal: McpPrincipal) -> bool:
+    """Whether the dispatcher can recheck this principal's access before every delivery
+    (``subscriptions_repo.check_subscriber_access``): a workspace member, or a principal
+    behind a stored API credential. An OAuth machine client mapped only in configuration has
+    neither, so its subscription would be revoked at the first dispatch without ever
+    delivering; it is not offered the event and its subscribe is ``-32012``."""
+    return principal.principal_kind == "user" or principal.credential_id is not None
+
+
 def to_mcp_error(error: AppError, correlation_id: str | None = None) -> MCPError:
     """JSON-RPC error for an ``events/*`` failure (draft codes; never secrets or raw responses)."""
     if not isinstance(error, EventsProtocolError):
@@ -256,10 +266,11 @@ class EventsService:
         self, ctx: ServerRequestContext[Any, Any], params: EventsListParams
     ) -> dict[str, Any]:
         async def run() -> dict[str, Any]:
-            _, actor = self._actor(ctx)
-            return list_events(
+            principal, actor = self._actor(ctx)
+            listed = list_events(
                 actor, _strip_meta(ctx.params), permitted_profiles=self.services.permitted_profiles()
             )
+            return listed if can_hold_subscriptions(principal) else {"events": []}
 
         return await self._guarded(ctx, LIST_METHOD, run)
 
@@ -274,6 +285,8 @@ class EventsService:
             if not can_subscribe(actor):
                 # Authorization first (draft -32012), before any other answer about this server.
                 raise forbidden("requires reviews:read and events:subscribe")
+            if not can_hold_subscriptions(principal):
+                raise forbidden("this principal's access cannot be rechecked before delivery")
             if not services.settings.allow_external_notifications:
                 # The callback challenge is outbound traffic: refused before validation contacts anyone.
                 raise unsupported("deliveryMode", "webhook")
@@ -453,6 +466,7 @@ __all__ = [
     "EventsSubscribeParams",
     "EventsUnsubscribeParams",
     "VerificationCache",
+    "can_hold_subscriptions",
     "install_events",
     "install_extension",
     "permitted_profiles",

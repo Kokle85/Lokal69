@@ -133,6 +133,20 @@ def owner(
                     fail("the workspace is unknown or inactive")
                 echo(f"Workspace        : {workspace} (existing)")
             else:
+                # Re-running the same bootstrap must not silently create a second workspace (later
+                # commands would then need --workspace everywhere and data would split).
+                cur = await conn.execute(
+                    "select w.id from app.workspaces w join app.memberships m"
+                    " on m.workspace_id = w.id and m.user_id = %s and m.role = 'owner' and m.active"
+                    " where w.active and w.name = %s order by w.created_at limit 1",
+                    (owner_id, (workspace_name or "").strip()),
+                )
+                existing = await cur.fetchone()
+                if existing is not None:
+                    fail(
+                        f"this user already owns the active workspace {existing['id']} with that name; "
+                        "pass --workspace to (re)confirm ownership instead of creating another one"
+                    )
                 echo(f"Workspace        : new, named {workspace_name!r}")
             require_yes(yes, "bootstrap owner")
             request_id = f"cli:bootstrap-owner:{uuid4().hex[:12]}"

@@ -263,6 +263,16 @@ def discover_fixture_dirs(root: Path = FIXTURE_ROOT) -> tuple[Path, ...]:
     return tuple(sorted(p.parent for p in root.glob("*/MANIFEST.yaml")))
 
 
+def fixture_runs_allowed(settings: Settings) -> bool:
+    """Whether the processes of this environment load saved fixture data by default.
+
+    Production processes never do (`build_runtime`), so a ``mode: fixture`` source can never run
+    there: the scheduler and the sweeps must not create jobs for it (each would only block with
+    `FixtureDataUnavailable`, one more per slot).
+    """
+    return settings.app_env != "production"
+
+
 async def build_runtime(
     settings: Settings,
     *,
@@ -310,7 +320,7 @@ async def build_runtime(
         dirs = (
             tuple(fixture_dirs)
             if fixture_dirs is not None
-            else (() if settings.app_env == "production" else discover_fixture_dirs())
+            else (discover_fixture_dirs() if fixture_runs_allowed(settings) else ())
         )
         if dirs:
             ctx.fixture_client = FixtureCrawlClient(dirs, clock=resolved_clock)
@@ -500,9 +510,10 @@ def refusal_disposition(exc: BudgetRefused, attempt: int) -> Disposition:
 def disposition_for_error(exc: BaseException, job: ClaimedJob) -> Disposition | None:
     """Map an exception that escaped a handler to a job outcome (``None``: the lease is lost).
 
-    Typed blockers never get a retry timer; retryable dependency failures back off with bounded
-    attempts (`fail_retry` dead-letters exhausted jobs); non-retryable application errors are
-    dead letters that stay visible. Messages are redacted by `jobs` before they are stored.
+    Typed blockers never get a retry timer; retryable dependency failures and version conflicts
+    (a concurrent change of something the job read) back off with bounded attempts (`fail_retry`
+    dead-letters exhausted jobs); other non-retryable application errors are dead letters that
+    stay visible. Messages are redacted by `jobs` before they are stored.
     """
     if isinstance(exc, LeaseLost):
         return None
@@ -518,6 +529,12 @@ def disposition_for_error(exc: BaseException, job: ClaimedJob) -> Disposition | 
         if exc.code == ErrorCode.RATE_LIMITED:
             wait = timedelta(seconds=exc.retry_after_seconds) if exc.retry_after_seconds else None
             return Disposition.retry("RATE_LIMITED", wait or backoff_delay(job.attempts), exc.message)
+        if exc.code == ErrorCode.VERSION_CONFLICT:
+            # Something the job read changed before its commit (e.g. a tax rule or cost profile
+            # between a valuation's read and its persist: "recompute"). The whole commit rolled
+            # back; re-running with fresh reads is the remedy, never dropping the work as a dead
+            # letter on the first conflict (attempts stay bounded).
+            return Disposition.retry(exc.code.value, backoff_delay(job.attempts), exc.message)
         if exc.retryable:
             return Disposition.retry(exc.code.value, backoff_delay(job.attempts), exc.message)
         return Disposition.dead(exc.code.value, exc.message)
@@ -543,6 +560,7 @@ __all__ = [
     "call_with_budget",
     "discover_fixture_dirs",
     "disposition_for_error",
+    "fixture_runs_allowed",
     "offline_fixture_resolver",
     "refusal_disposition",
     "system_actor",

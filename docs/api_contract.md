@@ -21,7 +21,10 @@ the token is the signed-in user's Supabase Auth access token (a JWT). The server
 signature (project JWKS), issuer, audience (`authenticated`), expiry and not-before. A missing,
 malformed, expired or wrongly issued token is `401 UNAUTHENTICATED`. Tokens are never accepted
 in query strings or request bodies, and the user's token is never passed through to another
-service.
+service. The JWKS is cached for 10 minutes (an unknown `kid` forces at most one refresh per 30
+seconds); an unreachable JWKS endpoint is `503 DEPENDENCY_UNAVAILABLE`, never `401`, and after a
+failed fetch requests fail fast with the same error for 5 seconds instead of each waiting on its
+own network attempt.
 
 **Membership and workspace.** After verification the server sets `app.user_id` and resolves the
 user's *active* memberships (`app.memberships`). An authenticated user without an active
@@ -138,8 +141,10 @@ never the submitted values. Rendering an error never fails: a malformed correlat
 omitted, and a malformed request id is replaced by a server-generated one. Three transport
 statuses keep the code `VALIDATION_ERROR` in the body: `405` (method not allowed, with `Allow`),
 `413` (body too large, `details.limit_bytes`) and `415` (not `application/json`). Unknown `/api`
-paths are `404 NOT_FOUND`. A `401` carries `WWW-Authenticate: Bearer realm="suv-deals"` (plus
-`error="invalid_token"` when a token was presented); every invalid token gets the same message.
+paths are `404 NOT_FOUND` whatever the method; a known path (including one served by an
+extension router) with another method is `405` with that route's `Allow` methods. A `401` carries
+`WWW-Authenticate: Bearer realm="suv-deals"` (plus `error="invalid_token"` when a token was
+presented); every invalid token gets the same message.
 
 | Code | HTTP status | Retryable by default | Meaning |
 |---|---|---|---|

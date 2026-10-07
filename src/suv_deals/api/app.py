@@ -292,7 +292,7 @@ def create_app(
         app.add_api_route("/metrics", _metrics_route(app_metrics), methods=["GET"], include_in_schema=False)
     for extra in extra_routers:
         app.include_router(extra)
-    app.include_router(routes.fallback_router)  # unknown /api paths never reach the MCP mount
+    routes.install_api_fallback(app)  # unknown /api paths never reach the MCP mount
     if mcp_asgi is not None:
         app.mount("/", mcp_asgi)  # LAST: /api, /healthz and /readyz take precedence
     return app

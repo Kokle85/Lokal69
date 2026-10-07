@@ -19,7 +19,9 @@
 # Safety: read-only on the source. Prints the target as reported by the server (database,
 # address, role, version), never the connection string or password. Use the schema-owner role
 # (it bypasses RLS) through a DIRECT or SESSION connection (exported snapshots do not work through
-# a transaction pooler). pg_dump receives the URL as an argument: run on a trusted host only.
+# a transaction pooler). psql/pg_dump receive the connection string WITHOUT its password (process
+# lists show arguments); libpq reads the password from PGPASSWORD. A key=value DSN with an inline
+# password cannot be split here: use the URL form, PGPASSWORD or ~/.pgpass instead.
 #
 # Usage: BACKUP_DATABASE_URL=postgresql://... scripts/backup.sh [--output-dir DIR]
 #            [--with-local-snapshots DIR]
@@ -51,15 +53,60 @@ if [ -z "$url" ]; then
   echo "backup.sh: set BACKUP_DATABASE_URL (schema-owner role, direct/session connection)." >&2
   exit 2
 fi
-for tool in psql sha256sum; do
+for tool in psql sha256sum python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "backup.sh: $tool is required." >&2; exit 2; }
 done
 
+# Keep the password out of every child's argument list: print the URL without its password
+# (line 1) and the password (line 2). The URL travels in the environment, never as an argument.
+split_password() {
+  SUV_PG_URL="$1" python3 - <<'EOF'
+import os
+from urllib.parse import unquote, urlsplit
+
+url = os.environ["SUV_PG_URL"]
+password = None
+if "://" in url:
+    parts = urlsplit(url)
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, _, hosts = netloc.rpartition("@")
+        user, sep, secret = userinfo.partition(":")
+        if sep:
+            password = unquote(secret)
+        netloc = f"{user}@{hosts}" if user else hosts
+    kept = []
+    for item in parts.query.split("&") if parts.query else []:
+        key, _, value = item.partition("=")
+        if unquote(key) == "password":
+            password = unquote(value)
+        else:
+            kept.append(item)
+    # Rebuilt by hand: urlunsplit would turn "postgresql:///db" (no authority) into "postgresql:/db".
+    query = "&".join(kept)
+    url = f"{parts.scheme}://{netloc}{parts.path}" + (f"?{query}" if query else "")
+print(url)
+print(password or "")
+EOF
+}
+split="$(split_password "$url")" || { echo "backup.sh: the connection string cannot be parsed." >&2; exit 2; }
+url="$(sed -n 1p <<<"$split")"
+url_password="$(sed -n 2p <<<"$split")"
+unset split
+if [ -n "$url_password" ]; then export PGPASSWORD="$url_password"; fi
+unset url_password
+case "$url" in
+  *password=*) echo "backup.sh: warning: the key=value DSN keeps its inline password (use a URL or PGPASSWORD)." >&2 ;;
+esac
+
 psql_q=(psql "$url" -X -q -A -t -v ON_ERROR_STOP=1)
-IFS='|' read -r db_name db_host db_user server_version server_major can_read_all <<<"$("${psql_q[@]}" -F '|' -c \
+target="$("${psql_q[@]}" -F '|' -c \
   "select current_database(), coalesce(host(inet_server_addr()), 'local socket'), current_user,
           current_setting('server_version'), current_setting('server_version_num')::int / 10000,
-          (select rolsuper or rolbypassrls from pg_roles where rolname = current_user)")"
+          (select rolsuper or rolbypassrls from pg_roles where rolname = current_user)")" \
+  || { echo "backup.sh: cannot connect to the backup source (check BACKUP_DATABASE_URL)." >&2; exit 1; }
+IFS='|' read -r db_name db_host db_user server_version server_major can_read_all <<<"$target"
+[[ "$server_major" =~ ^[0-9]+$ ]] || { echo "backup.sh: unexpected answer from the backup source." >&2; exit 1; }
 
 # pg_dump must not be older than the server: prefer the matching Debian/Ubuntu binary.
 pg_bin=""
@@ -137,6 +184,12 @@ members="$(ask "$members_sql")"
 printf '%s\n' "commit;" >&"$psql_in"
 exec {psql_in}>&-
 wait "$PSQL_PID" 2>/dev/null || true
+# The snapshot session answers on one pipe with stderr merged: an error line must never end up
+# in the manifest or the member-id file.
+[[ "$summary" =~ ^count\.[a-z_.]+=[0-9]+( [a-z_.]+=[^[:space:]]+)*$ ]] \
+  || { echo "backup.sh: unexpected row-count answer from the snapshot session" >&2; exit 1; }
+[[ -z "$members" || "$members" =~ ^[0-9a-f-]{36}(,[0-9a-f-]{36})*$ ]] \
+  || { echo "backup.sh: unexpected member-id answer from the snapshot session" >&2; exit 1; }
 
 if [ -n "$members" ]; then tr ',' '\n' <<<"$members" >"$prefix.members"; else : >"$prefix.members"; fi
 

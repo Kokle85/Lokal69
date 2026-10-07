@@ -7,7 +7,10 @@ query, filters, workspace and principal.
 
 from __future__ import annotations
 
+import base64
+import json
 import uuid
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from typing import Any
 
@@ -16,12 +19,13 @@ import pytest
 from jsonschema import Draft202012Validator
 from tests.api.conftest import UNREACHABLE_DB, DataHarness, comparable_error, error_of, make_settings
 from tests.integration.db.helpers import Seed
-from tests.integration.read_queries.dataset import seed_foreign_workspace
+from tests.integration.read_queries.dataset import CURSOR_SECRET, seed_foreign_workspace
 from tests.integration.read_queries.schema_check import walk_numbers
 
 from suv_deals.api import routes
 from suv_deals.api.app import create_app
 from suv_deals.api.schemas import ROUTE_INDEX, ROUTES
+from suv_deals.domain.pagination import CursorPayload, encode_cursor
 from suv_deals.persistence.database import Database
 from suv_deals.views.jsonschema import model_schema
 
@@ -138,6 +142,19 @@ async def test_foreign_workspace_ids_are_identical_to_missing_ones(
             foreign.listings["priced"],
             {"reason": "probe recheck", "idempotency_key": "foreign-recheck1"},
         ),
+        "/api/reviews/{}/submit": (
+            foreign.cases["priced"],
+            {
+                "claim_token": "A" * 43,
+                "expected_version": 2,
+                "listing_revision": 2,
+                "outcome": "rejected",
+                "reason_codes": ["SYNTHETIC_PROBE"],
+                "summary": "SYNTHETIC: cross-workspace submit probe.",
+                "evidence_ids": [],
+                "idempotency_key": "foreign-submit-1",
+            },
+        ),
     }
     for template, (foreign_id, body) in writes.items():
         a = await data_api.post(template.format(foreign_id), reviewer, body)
@@ -209,8 +226,23 @@ async def test_cursors_are_signed_and_bound_to_filters_and_principal(data_api: D
         response = await data_api.get("/api/candidates", viewer, params={"limit": "1", "cursor": value})
         assert response.status_code == 422, problem
         details = error_of(response)["details"]
-        assert details["cursor"] in {problem, "malformed", "tampered"}, details
+        assert details["cursor"] == problem, details  # the MAC is checked before the body is parsed
         assert value not in response.text
+    # A correctly signed cursor past its expiry is refused as "expired" (restart from page one).
+    payload = CursorPayload.model_validate(
+        json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    )
+    issued = datetime.now(UTC) - timedelta(hours=2)
+    expired = encode_cursor(
+        payload.model_copy(update={"iat": issued, "exp": issued + timedelta(hours=1)}), CURSOR_SECRET
+    )
+    stale = await data_api.get("/api/candidates", viewer, params={"limit": "1", "cursor": expired})
+    assert stale.status_code == 422
+    assert error_of(stale)["details"]["cursor"] == "expired"
+    # The same position re-signed with another key is "tampered", never accepted.
+    forged = encode_cursor(payload, b"SYNTHETIC-attacker-key-0123456789abcdef")
+    forged_response = await data_api.get("/api/candidates", viewer, params={"limit": "1", "cursor": forged})
+    assert error_of(forged_response)["details"]["cursor"] == "tampered"
     filtered = await data_api.get(
         "/api/candidates", viewer, params={"limit": "1", "cursor": cursor, "country": "DE"}
     )

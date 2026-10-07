@@ -264,12 +264,18 @@ def evidence_verify(cli: CliContext, workspace: UUID | None, limit: int, skip_ob
         from suv_deals.persistence.storage import content_sha256, snapshot_store_from_settings
         from suv_deals.persistence.transactions import unit_of_work
 
-        store = snapshot_store_from_settings(
-            mode=settings.snapshot_storage,
-            local_dir=settings.snapshot_local_dir,
-            supabase_url=settings.supabase_url,
-            secret_key=settings.supabase_secret_key,
-            bucket=settings.supabase_storage_bucket,
+        # Built only when objects are read: --skip-objects (e.g. the restore check) needs no
+        # storage configuration at all.
+        store = (
+            None
+            if skip_objects
+            else snapshot_store_from_settings(
+                mode=settings.snapshot_storage,
+                local_dir=settings.snapshot_local_dir,
+                supabase_url=settings.supabase_url,
+                secret_key=settings.supabase_secret_key,
+                bucket=settings.supabase_storage_bucket,
+            )
         )
         failed = False
         async with open_database(settings, application_name="suv-deals-cli") as db:
@@ -288,7 +294,7 @@ def evidence_verify(cli: CliContext, workspace: UUID | None, limit: int, skip_ob
                 failed = failed or bool(revisions["mismatch"])
                 checked = missing = mismatched = skipped = 0
                 for row in snapshots:
-                    if skip_objects or row["storage_backend"] != store.backend:
+                    if store is None or row["storage_backend"] != store.backend:
                         skipped += 1
                         continue
                     try:

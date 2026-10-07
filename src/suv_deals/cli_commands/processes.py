@@ -326,7 +326,13 @@ def serve(
     settings = load_settings(cli)
     database_url(settings)  # the API needs its database (opened lazily by the app lifespan)
     factory = load_factory(app_factory, option="--app-factory")
-    app = factory(settings)
+    from suv_deals.cli_commands._common import describe_error, exit_code_for
+    from suv_deals.errors import AppError
+
+    try:
+        app = factory(settings)
+    except AppError as exc:  # e.g. an unsafe production configuration: no traceback, redacted
+        fail(describe_error(exc), exit_code_for(exc))
 
     import uvicorn
 

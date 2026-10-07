@@ -22,7 +22,19 @@ itself, and nothing activates a source, notification route or seller email.
 - Secrets are never command-line arguments: they come from the environment or `.env` (local) or
   root-owned env files / Docker secrets (VPS). `suv-deals doctor` reports presence only.
 - Every state-changing CLI command needs `--yes`; `crawl once` cannot override a gate or take a URL.
-- The `make db-*` targets only accept loopback targets and never read `DATABASE_URL` from `.env`.
+- The `make db-*` targets (and `make dev`) only accept loopback targets and never read
+  `DATABASE_URL` from `.env`. Their single guard is `suv-deals db target --local-only --url-env
+  NAME`, which parses the connection string like libpq (every comma-separated host, `?host=` /
+  `?hostaddr=` parameters, `PGHOST`/`PGHOSTADDR`/`PGSERVICE`) and exits 3 unless all of it stays on
+  this machine; `scripts/restore_check.sh` uses the same guard.
+- Under Docker Compose the switches are interpolated from dedicated names, never from the
+  application's own variables: `SUV_DEALS_ENABLE_SOURCE_NETWORK`,
+  `SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS` (both compose files) and, in
+  `compose.production.yaml`, `SUV_DEALS_ENABLE_EVENT_BRIDGE`, `SUV_DEALS_ENABLE_MCP_EVENTS`,
+  `SUV_DEALS_NOTIFICATION_PROVIDER`, `SUV_DEALS_ENABLE_FX_FETCH`, `SUV_DEALS_SELLER_INQUIRY_MODE`.
+  Compose also reads a project `.env` for interpolation, so `SOURCE_NETWORK_ENABLED=true` in `.env`
+  or in an env file changes nothing there; export the `SUV_DEALS_*` switch in the shell for that
+  deployment only (never put it in `.env`).
 
 ## 2. Processes
 
@@ -74,6 +86,7 @@ Supabase secret key unless evidence objects go to Supabase Storage.
 | Database | Local PostgreSQL 16/17 clusters (tests, `make db-migrate-local`) or `supabase start` | The Supabase project (session/direct connection) |
 | Secrets | `.env` (never committed) | `/etc/suv-deals/<process>.env` (root, 0600) + `/etc/suv-deals/secrets/crawl4ai_api_token` |
 | HTTPS | not needed on loopback | reverse proxy on the host terminates TLS for `/api`, `/mcp` |
+| Evidence files (`SNAPSHOT_STORAGE=local`) | `var/snapshots` (host processes) | the worker's `snapshots` volume (`/app/var/snapshots`; the containers' root file system is read-only); prefer the private Supabase bucket in production |
 
 ### 3.1 Crawl4AI topology
 
@@ -170,11 +183,12 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `sources list / inspect KEY [--from-db]` | gates with separate terms and technical status |
 | `sources sync [--fixture-sources] [--dry-run] --yes` | YAML -> `app.sources`; never enables a gated source |
 | `sources set-technical-status KEY STATUS --reason ... --yes`, `sources resume KEY --reason ... --yes` | audited owner recovery actions; neither one enables a source |
-| `crawl once --source KEY [--profile primary] [--max-pages 1]` | one bounded discovery through every gate |
+| `crawl once --source KEY [--profile primary] [--max-pages 1]` | one bounded discovery through every gate; if this command does not get its own job (another due discovery job first, or a running worker claimed it), the job is cancelled while it still waits, so the page cap can never be skipped silently |
 | `worker`, `scheduler`, `dispatcher`, `reconcile [--dry-run / --loop]` | runtime processes |
 | `outbox inspect`, `reviews list --status pending`, `evidence verify` | read-only checks |
 | `tax-rules validate PATH` | validates; never approves |
-| `db migrate [--dry-run] [--local-only] --yes` | prints the target first |
+| `db migrate [--dry-run] [--local-only] [--url-env NAME] --yes` | prints the target first; `psql` gets the connection string without its password (`PGPASSWORD`) |
+| `db target [--url-env NAME] [--local-only]` | prints where a connection string points (never the password, never connects); `--local-only` exits 3 unless every host is loopback / a local socket |
 | `api serve [--host 127.0.0.1] [--proxy-headers] [--forwarded-allow-ips]` | uvicorn |
 | `credentials create-mcp / revoke / list` | scoped MCP credentials (hash stored, token shown once) |
 | `bootstrap owner` | link an existing Auth user as workspace owner |
@@ -213,6 +227,9 @@ RESTORE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres \
   scripts/restore_check.sh var/backups/suv-deals_<ts>.manifest
 ```
 
+- Neither script puts a password into a process argument list: the URL is split, `psql`,
+  `pg_dump` and `pg_restore` get it without the password and libpq reads `PGPASSWORD`. Use the URL
+  form (a key=value DSN with an inline password cannot be split; use `PGPASSWORD`/`~/.pgpass`).
 - The member-id file contains auth user ids only (no e-mail, no password hashes); the restore
   check inserts them as minimal `auth.users` rows so memberships restore.
 - The restore check verifies schema, every manifest row count, job/outbox states, lease
@@ -223,7 +240,8 @@ RESTORE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres \
   subscriptions and outbox rows could act externally. Never point a process at it with network
   or notification switches on.
 - **Storage objects are not in a database backup.** Back up the private evidence bucket (or
-  `var/snapshots`) separately with its retention, and verify by content hash
+  `var/snapshots` / the worker's `snapshots` volume) separately with its retention, and verify by
+  content hash
   (`suv-deals evidence verify` reads retained objects and compares hashes).
 - A backup that has never been restored is not accepted as proven recovery.
 
@@ -232,13 +250,17 @@ RESTORE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres \
 Release (spec §29, §31):
 
 1. Commit; `scripts/verify_release.sh` on the exact commit (lint, mypy, schema snapshots, tests
-   without DB, DB tests on PostgreSQL 16 and 17, migration hashes) -> `var/releases/<sha>_<ts>.txt`.
+   without DB, DB tests on PostgreSQL 16 and 17, migration hashes, lock hashes, YAML configuration
+   hash, source adapter versions, MCP SDK/protocol) -> `var/releases/<sha>_<ts>.txt`. Add the
+   stored configuration revision of the target (`suv-deals config apply --dry-run`).
 2. Build the image with pinned base digests (Dockerfile header), record its digest
    (`RELEASE_IMAGE_DIGEST`) and the tested crawler digest (`CRAWL4AI_IMAGE_DIGEST`).
 3. Back up (section 7); apply expand-first migrations (section 4.1).
 4. Deploy with every switch off; smoke: `/readyz`, an authenticated `/api/me`, `deals_health` via
    MCP, `suv-deals worker --drain` on fixture data in a non-production workspace if available.
-5. Enable only sources/destinations that passed their activation gates.
+5. Enable only sources/destinations that passed their activation gates (Compose: export the
+   matching `SUV_DEALS_*` switch from section 1 for that deployment, then `docker compose -f
+   compose.production.yaml up -d`).
 
 Rollback:
 

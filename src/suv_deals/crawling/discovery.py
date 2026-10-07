@@ -210,6 +210,12 @@ async def _preflight(
 # --------------------------------------------------------------------------------------------
 
 
+def _page_key(request: SearchRequest) -> tuple[str, str | None, tuple[tuple[str, str], ...]]:
+    """What identifies the fetched page: its URL, plus an opaque cursor that is not that URL."""
+    cursor = None if request.cursor in (None, request.url) else request.cursor
+    return request.url, cursor, tuple(sorted(request.params.items()))
+
+
 def _cursor(page: DiscoveryPage, request: SearchRequest) -> dict[str, Any]:
     return {
         "next_url": page.next_url,
@@ -242,8 +248,10 @@ async def traverse(
         return SearchRequest.model_validate({**built.model_dump(), **update})
 
     request = build(None)
+    visited: set[tuple[str, str | None, tuple[tuple[str, str], ...]]] = set()
     while True:
         current = request
+        visited.add(_page_key(current))
         try:
             page = await call_with_budget(ctx, execution, partial(adapter.discover, current, session.client))
         except BudgetRefused as exc:
@@ -303,6 +311,15 @@ async def traverse(
             result.completeness = Completeness.PARTIAL
             result.cursor = _cursor(page, current)
             result.gap_reasons.append(f"next page refused: {exc.message}")
+            return result
+        if _page_key(request) in visited:
+            # A pagination cycle (e.g. a last page whose "next" link points back): stop instead of
+            # re-fetching pages already seen in this run (spec 9: never add traffic silently).
+            result.completeness = Completeness.PARTIAL
+            result.cursor = None
+            result.gap_reasons.append(
+                f"pagination loop: page {current.page_number} links back to a page already fetched"
+            )
             return result
 
 

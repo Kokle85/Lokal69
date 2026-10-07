@@ -16,7 +16,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from jwt import PyJWKClient
-from jwt.exceptions import PyJWKClientConnectionError
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKSetError
 from pydantic import SecretStr
 from tests.api.conftest import ES_KID, ISSUER, RS_KID, SUPABASE_URL, SigningKeys, TokenFactory, make_settings
 
@@ -24,6 +24,7 @@ from suv_deals.api.auth import (
     AuthFailure,
     MembershipDenied,
     StaticJwks,
+    SupabaseJwksClient,
     SupabaseJwtVerifier,
     VerifiedUser,
     actor_for,
@@ -241,8 +242,71 @@ async def test_jwks_outage_is_dependency_unavailable_not_401(keys: SigningKeys, 
 
 def test_jwks_client_targets_the_project_jwks_document_without_fetching() -> None:
     client = supabase_jwks_client(ISSUER)
+    assert isinstance(client, SupabaseJwksClient)
     assert client.uri == f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
     assert client.jwk_set_cache is not None  # cached JWK set (bounded refresh via the cooldown)
+
+
+class _FlakyFetch:
+    """Replaces ``PyJWKClient.fetch_data`` (the network fetch) with a local, scripted one."""
+
+    def __init__(self, jwks: dict[str, Any]) -> None:
+        self.jwks = jwks
+        self.calls = 0
+        self.error: Exception | None = PyJWKClientConnectionError("synthetic outage")
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fetch_data(client: PyJWKClient) -> Any:
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            assert client.jwk_set_cache is not None
+            client.jwk_set_cache.put(self.jwks)
+            return self.jwks
+
+        monkeypatch.setattr(PyJWKClient, "fetch_data", fetch_data)
+
+
+async def test_jwks_outage_fails_fast_for_a_short_backoff(
+    keys: SigningKeys, tokens: TokenFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``PyJWKClient`` holds one lock across its blocking fetch: without a backoff, every request
+    during an outage would queue behind its own network attempt (up to the 5 s timeout each)."""
+    fetch = _FlakyFetch(keys.jwks)
+    fetch.install(monkeypatch)
+    now = [1000.0]
+    client = SupabaseJwksClient(
+        f"{ISSUER}/.well-known/jwks.json", lifespan=600, failure_backoff=5.0, monotonic=lambda: now[0]
+    )
+    v = SupabaseJwtVerifier(issuer=ISSUER, audience="authenticated", resolver=client)
+    for _ in range(5):
+        with pytest.raises(DependencyUnavailable):
+            await v.verify(tokens.mint(USER))
+    assert fetch.calls == 1  # one network attempt; the rest failed fast without touching it
+    now[0] += 5.0
+    fetch.error = None  # the identity provider recovered
+    assert (await v.verify(tokens.mint(USER))).user_id == USER
+    assert fetch.calls == 2
+    assert (await v.verify(tokens.mint(USER, alg="RS256"))).user_id == USER
+    assert fetch.calls == 2  # served from the cache again
+
+
+async def test_unusable_jwks_document_is_not_refetched_per_request(
+    keys: SigningKeys, tokens: TokenFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty key set (a project still on the legacy secret) stays a ``401``, but attacker
+    tokens naming random kids cannot turn it into one JWKS fetch per request."""
+    fetch = _FlakyFetch(keys.jwks)
+    fetch.error = PyJWKSetError("The JWK Set did not contain any keys")
+    fetch.install(monkeypatch)
+    now = [50.0]
+    client = SupabaseJwksClient(f"{ISSUER}/.well-known/jwks.json", monotonic=lambda: now[0])
+    v = SupabaseJwtVerifier(issuer=ISSUER, audience="authenticated", resolver=client)
+    for _ in range(4):
+        assert await reason_of(v, tokens.mint(USER, kid=f"attacker-{uuid.uuid4()}")) == "invalid_token"
+    assert fetch.calls == 1
+    with pytest.raises(ValueError):
+        SupabaseJwksClient(f"{ISSUER}/.well-known/jwks.json", failure_backoff=float("nan"))
 
 
 def test_verifier_from_settings_uses_the_project_issuer_and_audience() -> None:
