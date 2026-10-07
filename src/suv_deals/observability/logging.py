@@ -94,8 +94,9 @@ _SLACK_TOKEN = re.compile(r"\b(xox[abeoprs]|xapp)-[A-Za-z0-9-]{4,}")
 _SLACK_HOOK = re.compile(r"(hooks\.slack\.com)(?:/|%2F)[^\s\"'<>&]+", re.IGNORECASE)
 _SUPABASE_KEY = re.compile(r"\b(sb_secret|sb_publishable)_[A-Za-z0-9_-]{4,}")
 # Bare API credentials of this system (persistence.credentials_repo: suvmcp_/suvdev_/suvmail_ +
-# 64 hex). Short display prefixes (fewer than 16 hex digits) stay readable.
-_APP_TOKEN = re.compile(r"\b(suv(?:mcp|dev|mail))_[0-9a-fA-F]{16,}")
+# 64 hex). Short display prefixes (fewer than 16 hex digits) stay readable. No leading word
+# boundary: a token glued to a word character (``credential_suvmail_...``) is masked too.
+_APP_TOKEN = re.compile(r"(suv(?:mcp|dev|mail))_[0-9a-fA-F]{16,}")
 # Provider API keys that may appear without a key name (LLM_API_KEY values: sk-..., sk-proj-..., sk-ant-...).
 _PROVIDER_API_KEY = re.compile(r"\bsk-(?:[a-z0-9]{2,8}-){0,2}[A-Za-z0-9_-]{16,}")
 _QUERY_PARAM = re.compile(r"([?&;])([\w.\-\[\]]{1,64})=([^&\s#'\"<>]*)")

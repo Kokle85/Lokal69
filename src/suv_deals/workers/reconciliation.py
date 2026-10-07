@@ -5,7 +5,11 @@ short transaction, no network I/O:
 
 1. **Reapers** (spec 13): expired job leases are requeued while attempts remain, otherwise
    dead-lettered (`jobs.reap_expired`; a crashed worker's job completes once logically through the
-   next lease holder); exhausted waiting jobs become visible dead letters (`jobs.reconcile_exhausted`);
+   next lease holder) -- except an expired ``seller_inquiry_send`` job, which is ``blocked`` with
+   EMAIL_DELIVERY_UNCERTAIN and never requeued, while its expired running send attempt and the
+   inquiry become ``uncertain`` (`inquiries_repo.reap_expired_attempts`, spec 37.5: no blind
+   resend; only positive reconciliation evidence decides); exhausted waiting jobs become
+   visible dead letters (`jobs.reconcile_exhausted`);
    expired dispatcher leases on outbox rows become ``uncertain`` when a send had started, otherwise
    ``retry_wait`` (`outbox.reap_expired_events`); leased MCP Events deliveries whose dispatcher died
    become ``uncertain`` (`subscriptions_repo.reap_expired_deliveries`), never blindly resent.
@@ -54,6 +58,7 @@ from suv_deals.errors import AppError, NotFound
 from suv_deals.persistence import (
     config_repo,
     idempotency,
+    inquiries_repo,
     jobs,
     listings_repo,
     notes_repo,
@@ -116,6 +121,8 @@ class ReconcileReport:
     dry_run: bool
     jobs_requeued: int = 0
     jobs_dead_lettered: int = 0
+    jobs_blocked_uncertain: int = 0
+    send_attempts_uncertain: int = 0
     jobs_exhausted: int = 0
     events_retry: int = 0
     events_uncertain: int = 0
@@ -230,6 +237,14 @@ select
   from ops.outbox where workspace_id = %(ws)s
 """
 
+_EXPIRED_SEND_SQL: Final = """
+select
+  (select count(*) from ops.jobs where workspace_id = %(ws)s and job_type = 'seller_inquiry_send'
+     and state = 'running' and lease_expires_at <= clock_timestamp()) as send_jobs,
+  (select count(*) from ops.email_delivery_attempts where workspace_id = %(ws)s
+     and outcome = 'running' and lease_expires_at <= clock_timestamp()) as send_attempts
+"""
+
 
 async def _stale_detail_candidates(
     conn: Conn, actor: ActorContext, source_id: UUID, age: timedelta, limit: int
@@ -327,8 +342,12 @@ class Reconciler:
                 stats = await jobs.queue_stats(conn, actor)
                 async with mapped_errors():
                     row = await fetch_one(conn, _EXPIRED_EVENT_LEASES_SQL, {"ws": ws})
-            assert row is not None
-            report.jobs_requeued = stats.expired_leases  # an upper bound: exhausted ones dead-letter
+                    sends = await fetch_one(conn, _EXPIRED_SEND_SQL, {"ws": ws})
+            assert row is not None and sends is not None
+            report.jobs_blocked_uncertain = int(sends["send_jobs"])
+            report.send_attempts_uncertain = int(sends["send_attempts"])
+            # An upper bound: exhausted ones dead-letter, expired send jobs block.
+            report.jobs_requeued = max(0, stats.expired_leases - report.jobs_blocked_uncertain)
             report.jobs_exhausted = stats.exhausted_waiting
             report.events_uncertain = int(row["would_be_uncertain"])
             report.events_retry = int(row["would_retry"])
@@ -345,6 +364,10 @@ class Reconciler:
                     self.ctx.metrics.record_dead_letter(job_type)
             report.jobs_requeued = len(reaped.requeued)
             report.jobs_dead_lettered = len(reaped.dead_lettered)
+            report.jobs_blocked_uncertain = len(reaped.blocked_uncertain)
+            report.send_attempts_uncertain = len(
+                await inquiries_repo.reap_expired_attempts(db, ws, limit=min(opts.reap_limit, 1000))
+            )
             report.jobs_exhausted = len(await jobs.reconcile_exhausted(db, ws, limit=opts.reap_limit))
             events = await outbox.reap_expired_events(
                 db, ws, retry_delay_seconds=opts.outbox_retry_delay_seconds, limit=opts.reap_limit

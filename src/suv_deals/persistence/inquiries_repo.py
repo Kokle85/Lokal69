@@ -38,6 +38,9 @@ Main entry points:
   empty Sent Items/provider search keeps the inquiry ``uncertain`` with its reservation and quota
   debit), ``retry`` (guarded ``failed_definite -> queued``), ``reap_expired_attempts`` (a crashed
   or expired attempt becomes ``uncertain``, never re-queued);
+- mailbox binding sync: every send-path transition (``sending``, the finalised outcome, a
+  reconciliation, the reaper's ``uncertain``) re-publishes the inquiry's binding for the sender's
+  active mailbox worker in the same transaction (``mail_workers_repo.publish_inquiry_binding``);
 - staleness and suppression: ``cancel_stale_inquiries``, ``cancel_inquiry``, ``requalify``,
   ``add_suppression`` (optionally suppressing matching untransmitted inquiries at once),
   ``remove_suppression`` (audited, never automatic), ``active_suppressions``.
@@ -73,6 +76,8 @@ from suv_deals.domain.inquiries import (
     MAX_READINESS_AGE,
     POSSIBLY_TRANSMITTED_STATES,
     PRE_RESERVATION_STATES,
+    WINDOW_15D,
+    WINDOW_24H,
     ComparableEvidence,
     CooldownDecision,
     CostEvidence,
@@ -117,6 +122,7 @@ from suv_deals.domain.inquiries import (
 )
 from suv_deals.domain.language import LanguageDecision
 from suv_deals.domain.listings import Co2Info, Documentation, NormalizedListing
+from suv_deals.domain.replies import normalize_message_id
 from suv_deals.domain.seller_contacts import (
     AddressError,
     ContactChange,
@@ -154,7 +160,7 @@ from suv_deals.integrations.email_providers.base import (
     attempt_outcome,
 )
 from suv_deals.integrations.mime_builder import BuiltMessage, MimeBuildError, build_inquiry_message, mailbox
-from suv_deals.persistence import audit, valuation_repo
+from suv_deals.persistence import audit, mail_workers_repo, valuation_repo
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
 from suv_deals.persistence.sellers_repo import (
@@ -628,6 +634,16 @@ async def _tx_now(conn: Conn) -> datetime:
     return ensure_utc(row["tx"])
 
 
+async def _publish_binding(conn: Conn, actor: ActorContext, inquiry_id: UUID) -> None:
+    """Re-publish the inquiry's mailbox binding after a send-path state change (spec 37.8).
+
+    ``mail_workers_repo.publish_inquiry_binding`` appends a new binding version for the sender's
+    active mailbox worker only when the state or payload changed (no mailbox: nothing happens), so
+    the desktop worker can link replies, bounces and Sent Items evidence to every send intent.
+    """
+    await mail_workers_repo.publish_inquiry_binding(conn, actor, inquiry_id)
+
+
 async def get_inquiry(conn: Conn, actor: ActorContext, inquiry_id: UUID) -> InquiryRecord:
     require_inquiry_reader(actor)
     async with mapped_errors():
@@ -811,7 +827,7 @@ async def record_authorization(
             pending = await fetch_all(
                 conn,
                 "select id from app.seller_inquiries where workspace_id = %(ws)s and state = any(%(states)s)"
-                " and send_attempted_at is null order by id",
+                " order by id",
                 {"ws": ws, "states": list(_PENDING_STATES)},
             )
         await cancel_untransmitted(
@@ -885,16 +901,32 @@ async def _locked_controls(conn: Conn, actor: ActorContext) -> InquiryControls:
 async def quota_usage(
     conn: Conn, actor: ActorContext, *, exclude_inquiry_id: UUID | None = None
 ) -> QuotaUsage:
-    """Unreleased debits in the rolling windows (database ``ops.inquiry_quota_usage``)."""
+    """Unreleased debits in the rolling windows, counted exactly as the repository enforces them
+    (``_debits``: at the later of reservation and the latest possible hand-over)."""
     require_inquiry_reader(actor)
     async with mapped_errors():
-        row = await fetch_one(
-            conn,
-            "select count_24h, count_15d from ops.inquiry_quota_usage(%(ws)s, %(exclude)s)",
-            {"ws": actor.workspace_id, "exclude": exclude_inquiry_id},
-        )
-    assert row is not None
-    return QuotaUsage(count_24h=int(row["count_24h"]), count_15d=int(row["count_15d"]))
+        now = await _now(conn)
+        debits = await _debits(conn, actor.workspace_id)
+    times = [d.counted_at for d in debits if d.inquiry_id != exclude_inquiry_id]
+    return QuotaUsage(
+        count_24h=sum(1 for t in times if t > now - WINDOW_24H),
+        count_15d=sum(1 for t in times if t > now - WINDOW_15D),
+    )
+
+
+async def rate_cap_decision(
+    conn: Conn,
+    actor: ActorContext,
+    *,
+    policy: RateCapPolicy,
+    exclude_inquiry_id: UUID | None = None,
+) -> RateCapDecision:
+    """``evaluate_rate_caps`` over ``_debits`` at the database's wall clock (the claim re-check)."""
+    require_inquiry_reader(actor)
+    async with mapped_errors():
+        now = await _now(conn)
+        debits = await _debits(conn, actor.workspace_id)
+    return evaluate_rate_caps(debits, now=now, policy=policy, exclude_inquiry_id=exclude_inquiry_id)
 
 
 async def control_view(conn: Conn, actor: ActorContext) -> InquiryControlView:
@@ -1126,18 +1158,39 @@ async def set_limits(
 # =============================================================================================
 
 
+#: The latest moment an inquiry's message may have been (or may still be) handed over: its latest
+#: send attempt, the end of every finished attempt, and NOW while an attempt is still running. On
+#: the ``outlook_local`` route the hand-over happens when the desktop worker claims the intent,
+#: up to the intent TTL after the attempt was committed; counting the debit only at
+#: ``send_attempted_at`` (the database's ``ops.inquiry_quota_usage``) would let intents committed
+#: while the worker was offline leave together with later ones, above 2 per rolling 24 hours.
+_TRANSMISSION_BOUND_SQL: Final = (
+    "greatest(i.send_attempted_at, (select max(case when a.outcome = 'running' then clock_timestamp()"
+    " else a.finished_at end) from ops.email_delivery_attempts a"
+    " where a.workspace_id = i.workspace_id and a.inquiry_id = i.id))"
+)
+
+
 async def _debits(conn: Conn, workspace_id: UUID) -> list[QuotaDebit]:
+    """Unreleased quota debits, each counted at the later of its reservation and the latest
+    moment its message may have been handed over (``_TRANSMISSION_BOUND_SQL``).
+
+    Stricter than the database guard (which counts at ``send_attempted_at``): the repository
+    decides under the same controls lock, the database stays the backstop.
+    """
     rows = await fetch_all(
         conn,
-        "select q.inquiry_id, q.debited_at, i.send_attempted_at from ops.inquiry_quota_ledger q"
-        " join app.seller_inquiries i on i.workspace_id = q.workspace_id and i.id = q.inquiry_id"
-        " where q.workspace_id = %(ws)s and q.released_at is null"
-        " and greatest(q.debited_at, coalesce(i.send_attempted_at, q.debited_at)) > now() -"
-        " interval '16 days'",
+        "select u.inquiry_id, u.debited_at, u.transmission_bound from ("  # noqa: S608 - fixed fragment
+        f"  select q.inquiry_id, q.debited_at, {_TRANSMISSION_BOUND_SQL} as transmission_bound"
+        "    from ops.inquiry_quota_ledger q"
+        "    join app.seller_inquiries i on i.workspace_id = q.workspace_id and i.id = q.inquiry_id"
+        "   where q.workspace_id = %(ws)s and q.released_at is null) u"
+        " where greatest(u.debited_at, coalesce(u.transmission_bound, u.debited_at))"
+        " > now() - interval '16 days'",
         {"ws": workspace_id},
     )
     return [
-        QuotaDebit(inquiry_id=r["inquiry_id"], at=r["debited_at"], send_attempted_at=r["send_attempted_at"])
+        QuotaDebit(inquiry_id=r["inquiry_id"], at=r["debited_at"], send_attempted_at=r["transmission_bound"])
         for r in rows
     ]
 
@@ -1241,12 +1294,15 @@ async def _neighbourhood(
         qualifying = row["qualification_listing_id"]
         if exclude_identity is not None and row["identity_key"] == exclude_identity:
             continue
-        if qualifying in confirmed:
+        # The same listing under another identity (e.g. qualified before its cluster was
+        # confirmed) is certainly the same vehicle; other cluster members are as linked.
+        same_listing = listing_id is not None and qualifying == listing_id
+        if same_listing or qualifying in confirmed:
             related.append(
                 RelatedListingLink(
                     related_listing_id=qualifying,
                     relation="confirmed_same_vehicle"
-                    if confirmed[qualifying]
+                    if same_listing or confirmed[qualifying]
                     else "possible_same_unresolved",
                     related_inquiry_state=item.state,
                     related_vehicle=vehicle,
@@ -1447,7 +1503,7 @@ async def add_suppression(
                 " join app.listings l on l.workspace_id = i.workspace_id and l.id ="
                 " i.qualification_listing_id"
                 " join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id"
-                " where i.workspace_id = %(ws)s and i.state = any(%(states)s) and i.send_attempted_at is null"
+                " where i.workspace_id = %(ws)s and i.state = any(%(states)s)"
                 " and %(hit)s = any(ops.seller_inquiry_active_suppressions(i.workspace_id,"
                 " i.seller_entity_id,"
                 "   coalesce(i.recipient_address, (select c.address from app.seller_contacts c"
@@ -1974,6 +2030,10 @@ async def record_readiness(
     else:
         target = InquiryState.HELD_FACTS
     state = record.state
+    if state == InquiryState.CANCELLED and target == InquiryState.CANCELLED:
+        # Still not eligible: the cancellation stands, and a cancelled record's readiness columns
+        # are frozen (database binding guard), so a periodic re-evaluation is a no-op.
+        return record
     codes = _codes((r.code.value for r in decision.reasons), 60)
     async with mapped_errors():
         if state == InquiryState.CANCELLED and target != InquiryState.CANCELLED:
@@ -2471,25 +2531,48 @@ def _stale(reasons: Sequence[str]) -> PreflightDecision:
     )
 
 
+#: Suppressions that lift on their own (owner resume, source resume). A re-queued inquiry whose
+#: earlier attempt provably never left can never be re-qualified (the database forbids it once an
+#: attempt exists), so for it these stop only this dispatch (``hold``) instead of closing it.
+_TRANSIENT_SUPPRESSIONS: Final = frozenset({SuppressionReason.KILL_SWITCH, SuppressionReason.SOURCE_PAUSED})
+
+
+def _held(record: InquiryRecord, decision: PreflightDecision, *extra: str) -> DispatchResult:
+    held = PreflightDecision(
+        outcome=PreflightOutcome.HOLD,
+        reasons=tuple(dict.fromkeys((*decision.reasons, *extra))),
+        next_attempt_at=None,
+    )
+    return DispatchResult(outcome="hold", inquiry_id=record.id, decision=held)
+
+
 async def _apply_preflight(
     conn: Conn, actor: ActorContext, record: InquiryRecord, decision: PreflightDecision
 ) -> DispatchResult:
+    """Record a non-proceed preflight decision; the result always reports the state truthfully."""
     if decision.outcome == PreflightOutcome.HOLD:
         return DispatchResult(
             outcome="hold", inquiry_id=record.id, decision=decision, next_attempt_at=decision.next_attempt_at
         )
+    attempted = record.send_attempted_at is not None
     if decision.target_state == InquiryState.SUPPRESSED:
-        suppression = (decision.suppression_reason or SuppressionReason.MANUAL).value
-        await cancel_untransmitted(
+        reason = decision.suppression_reason or SuppressionReason.MANUAL
+        if attempted and reason in _TRANSIENT_SUPPRESSIONS:
+            return _held(record, decision, "TRANSIENT_SUPPRESSION_AFTER_RETRY")
+        changed = await cancel_untransmitted(
             conn,
             actor,
             [record.id],
             reasons=decision.reasons,
             target="suppressed",
-            suppression_reason=suppression,
+            suppression_reason=reason.value,
         )
+        if not changed:  # pragma: no cover - a queued inquiry never has a possibly transmitted attempt
+            return _held(record, decision, "NOT_CANCELLABLE")
         return DispatchResult(outcome="suppressed", inquiry_id=record.id, decision=decision)
-    await cancel_untransmitted(conn, actor, [record.id], reasons=decision.reasons)
+    changed = await cancel_untransmitted(conn, actor, [record.id], reasons=decision.reasons)
+    if not changed:  # pragma: no cover - see above
+        return _held(record, decision, "NOT_CANCELLABLE")
     return DispatchResult(outcome="cancelled", inquiry_id=record.id, decision=decision)
 
 
@@ -2516,7 +2599,8 @@ async def dispatch(
       is returned for the provider. No external I/O happens before this commits.
     - ``cancel_stale``: ``cancelled`` (price/availability/revision/recipient/sender/identity changed)
       or ``suppressed`` (kill switch, revoked authorization or sender, source pause, suppression);
-      the quota debit is released (nothing was transmitted).
+      nothing was transmitted, so the quota debit is released, unless an earlier attempt (proven
+      never submitted) exists: then the debit stays, and a kill switch or source pause only holds.
     - ``hold``: nothing changes; ``next_attempt_at`` says when caps/cooldown free (``None`` = unknown).
 
     ``message_approval_required`` must be ``requires_message_approval(settings)`` (``False`` under
@@ -2726,6 +2810,7 @@ async def dispatch(
             "provider": sender_binding.provider.value,
         },
     )
+    await _publish_binding(conn, actor, inquiry_id)
     return DispatchResult(
         outcome="proceed",
         inquiry_id=inquiry_id,
@@ -2814,6 +2899,11 @@ async def record_outcome(
         raise ValidationFailed("the outcome does not belong to this send attempt")
     if outcome.provider != attempt.provider:
         raise ValidationFailed("the outcome names another provider than the attempt")
+    if attempt.rfc_message_id is not None and normalize_message_id(
+        outcome.rfc_message_id
+    ) != normalize_message_id(attempt.rfc_message_id):
+        # An outcome is evidence about exactly the message this attempt committed.
+        raise ValidationFailed("the outcome names another Message-ID than the send attempt")
     async with mapped_errors():
         now = await _now(conn)
     if attempt.outcome != SendAttemptOutcome.RUNNING:
@@ -2900,7 +2990,9 @@ async def record_outcome(
         if accepted is not None:
             await conn.execute(
                 "update app.seller_inquiries set state = 'accepted', state_reasons = %(reasons)s,"
-                " accepted_at = least(%(accepted_at)s::timestamptz, now()),"
+                # A reported acceptance time lies between the send attempt and now (never
+                # backdated before the attempt, never in the future).
+                " accepted_at = greatest(send_attempted_at, least(%(accepted_at)s::timestamptz, now())),"
                 " rfc_message_id = coalesce(rfc_message_id, %(message_id)s),"
                 " provider_message_id = coalesce(provider_message_id, %(pmid)s),"
                 " provider_thread_id = coalesce(provider_thread_id, %(ptid)s),"
@@ -2930,6 +3022,7 @@ async def record_outcome(
         reason=f"send attempt {target_outcome.value}",
         metadata={"attempt_id": str(attempt_id), "outcome": target_outcome.value, "error_code": error_code},
     )
+    await _publish_binding(conn, actor, record.id)
     return OutcomeResult(applied=True, inquiry_state=target_state, attempt_outcome=target_outcome)
 
 
@@ -3007,6 +3100,7 @@ async def _apply_reconciliation(
         reason=f"reconciled: {reconciled}",
         metadata={"attempt_id": str(attempt.attempt_id), "outcome": reconciled},
     )
+    await _publish_binding(conn, actor, record.id)
     state = decision.next_state if record.state == InquiryState.UNCERTAIN else record.state
     return ReconcileResult(decision=decision, inquiry_state=state, attempt_id=attempt.attempt_id)
 
@@ -3147,6 +3241,7 @@ async def reap_expired_attempts(db: Database, workspace_id: UUID, *, limit: int 
                 reason="send attempt lease expired without a recorded outcome; held for reconciliation",
                 metadata={"attempt_id": str(row["attempt_id"])},
             )
+            await _publish_binding(conn, actor, row["inquiry_id"])
             reaped.append(row["attempt_id"])
     return tuple(reaped)
 
@@ -3165,12 +3260,16 @@ async def cancel_inquiry(
     record = await _lock_inquiry(conn, actor, inquiry_id)
     if record.state == InquiryState.CANCELLED:
         return record
-    if record.state not in CANCELLABLE_STATES or record.possibly_transmitted:
+    changed = (
+        await cancel_untransmitted(conn, actor, [inquiry_id], reasons=_codes(reasons) or ["CANCELLED"])
+        if record.state in CANCELLABLE_STATES
+        else ()
+    )
+    if not changed:
         raise VersionConflict(
             "A (possibly) transmitted or finished inquiry is never cancelled",
             current_state=record.state.value,
         )
-    await cancel_untransmitted(conn, actor, [inquiry_id], reasons=_codes(reasons) or ["CANCELLED"])
     return await get_inquiry(conn, actor, inquiry_id)
 
 
@@ -3314,6 +3413,7 @@ __all__ = [
     "prepare_binding",
     "queue",
     "quota_usage",
+    "rate_cap_decision",
     "read_readiness_inputs",
     "reap_expired_attempts",
     "rebuild_binding",

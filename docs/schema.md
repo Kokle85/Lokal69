@@ -8,7 +8,7 @@ Access model: `docs/decisions/0001-bff-only-data-access.md` (ADR 0001).
 
 | Path | Purpose |
 |---|---|
-| `supabase/migrations/2026100600{01..08}00_*.sql` | Forward-only migrations, applied in name order |
+| `supabase/migrations/20261006000100_*.sql` ... `20261007000400_*.sql` | Forward-only migrations, applied in name order (M2 core 0100-0950, v1.1 inquiries 1000, v1.1 integration 20261007000100/0200/0400; section 11) |
 | `supabase/tests/supabase_emulation.sql` | **Test-only** Supabase emulation for plain PostgreSQL |
 | `supabase/seed.sql` | **Local development only**: one synthetic workspace |
 | `supabase/config.toml` | Supabase CLI local config (`app`/`ops` not exposed) |
@@ -41,7 +41,8 @@ DATABASE_URL=postgresql://... scripts/migrate.sh --yes       # non-interactive (
 - It never applies the test emulation or `seed.sql`.
 - Before production (spec §29): take a backup, run the full suite on the exact build, and
   apply expand-first migrations only.
-- psql receives the URL as an argument, so run the script only on a trusted host.
+- psql receives a password-free connection string; a password travels only in `PGPASSWORD`, and
+  a string from which it cannot be separated safely is refused (section 11.7).
 
 ### Rollback: forward fixes only
 
@@ -821,3 +822,154 @@ ledger rows and suppressions are additionally refused for every role by
 - The database verifies that the stored subject/body hash to `body_hash` and are header-safe, but
   not that they are the registered template rendering (no template texts in SQL); the scope
   validator and `dispatch_preflight` of `domain.seller_templates`/`domain.inquiries` own that.
+
+## 11. Spec v1.1 integration migrations and the inquiry repositories (B1a)
+
+This section extends sections 3, 4 and 10 for the migrations added after migration 1000 and for
+the transactional inquiry repositories (`persistence.sellers_repo`, `inquiries_repo`,
+`sender_bindings_repo`, `send_intents_repo`). Tests: `tests/integration/v11_inquiries/`
+(PostgreSQL 16 and 17, `Database(set_role="suv_backend")`, synthetic data only).
+
+### 11.1 Migration 20261007000100 (v1.1 integration foundation)
+
+- CHECK mirrors of `domain.enums` widened (names kept; `DROP` + `ADD ... NOT VALID` +
+  `VALIDATE`): `jobs_type_ck` gains `seller_inquiry_plan`, `seller_inquiry_send`,
+  `seller_inquiry_reconcile`, `seller_reply_process`; `seller_inquiries_suppression_ck` and
+  `email_suppressions_reason_ck` gain `authorization_revoked` (a revoked standing authorization is
+  no longer recorded as `kill_switch`; `resume` re-qualifies both only when the current
+  authorization is effective); `availability_events_evidence_kind_ck` gains
+  `source_reserved_badge` and `source_detail_not_found`, and `availability_events_mapping_ck`
+  maps them to `reserved` and `unknown` (a missing detail page or a complete-scan absence is
+  never `removed` or `sold_claimed`).
+- Read-path indexes `listings_created_idx (workspace_id, created_at desc, id desc)` and
+  `outbox_attention_created_idx (workspace_id, event_created_at, id)` (partial, attention states).
+- No table, column, grant or policy change; the security baseline is re-applied.
+
+### 11.2 Migration 20261007000200 (fixture lineage, mailbox-worker credential kind)
+
+- `app.listings.is_fixture boolean not null` (backfilled from the source's mode) and trigger
+  `app.listings_fixture_lineage`: on insert the value is derived from the source's mode at that
+  moment (an explicit value that disagrees raises `SV003`); on update it never changes (`SV004`).
+  Switching a source from fixture to a real mode therefore never turns earlier fixture listings
+  (and their review cases/outbox events) into real data.
+- `ops.api_credentials.credential_kind` gains `mail_worker`; `api_credentials_mail_worker_ck`
+  requires exactly `scopes = {mail:ingest}`, role `owner`, `principal_kind = 'mcp_client'` and a
+  `suvmail_xxxxxx` token prefix. Migration `20261007000400` then lets an active
+  `ops.mail_worker_bindings` row point only at such a credential (the `static_bearer` remark in
+  10.8 describes the state before these two migrations).
+
+### 11.3 Guard SQLSTATEs in v1.1 (extends section 3)
+
+- `SV002` also means "refused by a seller-inquiry flow guard": reservation/queue/dispatch
+  preflight (kill switch, mode, caps, seller cooldown, suppressions, stale listing facts, sender
+  or recipient change, one inquiry per vehicle/seller pair) and the mailbox guards.
+- `SV003` also covers the deferred evidence checks at `COMMIT` (10.6), fixture lineage at ingest
+  and an invalid mailbox-worker credential.
+- The persistence layer never parses these ad hoc: `persistence.errors_map.GUARD_RULES` matches
+  each refusal's exact MESSAGE (anchored expressions) and maps it to a typed `AppError` with a
+  stable `details.reason`; the public catalogue of those reasons is `docs/api_contract.md` section
+  10.5. Repositories run the domain checks first, so a guard refusal is the race/defence-in-depth
+  case.
+
+### 11.4 Queue semantics on the inquiry path (`persistence.jobs`)
+
+- `jobs.release` returns a claimed job to `queued` without consuming an attempt. It is only for
+  refusals that end on their own before any attempt was made (host spacing, Retry-After, daily
+  budget, circuit). A send job whose provider call may have started is never released.
+- `jobs.reap_expired`: an expired running `seller_inquiry_send` job becomes `blocked` with
+  `blocker_code = 'EMAIL_DELIVERY_UNCERTAIN'` (lease cleared, `completed_at` null,
+  `last_error_code = 'LEASE_EXPIRED'`) and is NEVER requeued or dead-lettered by the reaper
+  (`ReapResult.blocked_uncertain`, counted in `total` and `expired_by_type`). Every other job type
+  keeps `retry_wait` / `dead_letter`. This replaces the last-but-one bullet of 10.10.
+- The reconciliation pass (`workers.reconciliation`) also runs
+  `inquiries_repo.reap_expired_attempts`: a running attempt past its lease becomes `uncertain`
+  (`error_code = 'LEASE_EXPIRED'`) together with its `sending` inquiry; the reservation and the
+  quota debit stay. Report fields: `jobs_blocked_uncertain`, `send_attempts_uncertain` (dry runs
+  count them read-only). An operator `unblock` of such a job cannot cause a second transmission:
+  its dispatch holds because the inquiry is no longer `queued`.
+
+### 11.5 Lock order and recipes of the inquiry repositories (extends 4 and 10.7)
+
+```text
+ops.jobs row (send job only)
+  [-> app.listings, when an ingestion step links a seller in the same transaction]
+  -> app.seller_inquiry_controls (FOR UPDATE, always the first inquiry lock)
+  -> app.seller_entities (id order) -> app.seller_inquiries (id order)
+  -> ops.inquiry_quota_ledger -> ops.email_delivery_attempts
+  -> ops.email_suppressions / app.seller_contacts / ops.email_sender_bindings (reads, inserts)
+  -> ops.mail_binding_sync insert (its trigger updates the ops.mail_worker_bindings row)
+  -> ops.audit_events, ops.outbox (insert-only, last)
+```
+
+No inquiry path locks `app.listings` (or any earlier table of section 4) after the controls row.
+
+- The controls row is locked first by `sellers_repo.link_seller` / `merge_sellers`,
+  `inquiries_repo.record_authorization`, `pause` / `resume` / `set_mode` / `set_limits`,
+  `add_suppression`, `reserve`, `queue`, `dispatch`, `retry` and the worker `claim`, so these
+  serialise per workspace (two reservations or dispatches of one pair: exactly one wins, tested
+  with two pooled connections). `record_outcome` and `reconcile` lock inquiry -> attempt (then
+  the binding publication of the tail above) only; `reap_expired_attempts` takes the inquiry
+  `FOR UPDATE SKIP LOCKED`, then the attempt.
+- Seller identity: aliases are keyed by `sha256(SellerAlias.alias_key())`; `link_seller` merges
+  every entity an identity's aliases already belong to (oldest survives; one merge level) before
+  any reservation. A merge cancels the absorbed entity's untransmitted inquiries and, per
+  vehicle, the pending ones `reconcile_identity_merge` names; transmitted inquiries of the absorbed
+  entity keep counting for the survivor's cooldown and one-inquiry rule. Contact evidence is
+  immutable and names its entity (`seller_inquiries_recipient_seller_fk`), so a contact recorded
+  for an absorbed entity is re-verified against the survivor before that listing can reserve.
+- Contact evidence: one listing row is one listing incarnation (`listing_incarnation_id =
+  listing_id`); `status_reasons` stores `recipient_status:<status>`, the `RecipientReason`
+  values and `language_reason:<reason>` so the domain decisions are rebuilt exactly; an
+  identical re-verification within `RECIPIENT_EVIDENCE_MAX_AGE` only sets `last_rechecked_at`; a
+  material change inserts the new evidence, marks the old row `changed` with `superseded_by_id`,
+  then verifies the new one.
+- Outlook send intents are not a table: `send_intents_repo.dispatch_outlook` commits the running
+  attempt whose `attempt_id` is the intent id and the lease token, lease owner
+  `outlook_local:<mailbox_binding_id>`, lease expiry = the intent's `not_after`; the intent is
+  rebuilt deterministically from the attempt and the inquiry's immutable binding (MIME `Date` =
+  the commit time). Worker reports are stored sanitized (no addresses) under `worker_report` in
+  `provider_response` / `reconciliation_evidence`.
+- Sender secrets: `secret_envelope` is a `SecretBox` (AES-GCM) envelope whose associated data
+  binds workspace, binding, provider and account; `SELLER_EMAIL_OAUTH_SECRET_REFERENCE` =
+  `secretbox:ops.email_sender_bindings/<id>` is opened only by a system principal
+  (`sender_bindings_repo.BindingTokenProvider`); the `outlook_local` route stores no credential.
+- Tests arrange elapsed time only as the superuser with `session_replication_role = replica` for
+  one statement; neither `suv_backend` nor any repository can move these timestamps.
+- Never transmitted (`sellers_repo.NEVER_TRANSMITTED_SQL`): no attempt, or every attempt is a
+  proven pre-submission failure or reconciled `proven_not_submitted`. `cancel_untransmitted`
+  cancels/suppresses exactly those rows in a cancellable state, so a `queued` inquiry re-queued by
+  the guarded retry is closed by a suppression, a revoked authorization, a merge, stale facts or
+  the dispatch preflight like any other; its quota debit stays (the ledger guard releases only a
+  never-attempted debit) and it can never be re-qualified (database rule). For such an inquiry
+  the transient `kill_switch` / `source_paused` suppressions of the dispatch preflight only hold
+  the dispatch. A dispatch result always states the row's real state.
+- Rolling caps: the repository counts each unreleased debit at the later of its reservation and
+  the latest moment its message may have been handed over: the latest send attempt, the end of
+  every finished attempt, and now while an attempt is still running (`inquiries_repo._debits`,
+  used by readiness, reserve, dispatch, `next_window_at`, `quota_usage` and the claim). On the
+  `outlook_local` route the hand-over happens at the desktop claim, up to the intent TTL after the
+  commit; the database guard (`ops.inquiry_quota_usage`, counted at `send_attempted_at`) stays
+  the backstop under the same controls lock.
+- The worker claim (`send_intents_repo.claim`) is the revalidation right before `.Send`. It
+  evaluates the bound seller's SURVIVING root entity: suppressions of the whole merged family,
+  `app.seller_inquiry_vehicle_conflict` for the root (a (possibly) transmitted family inquiry
+  about the same or a plausibly same vehicle: `intent_invalid`, final) and the seller cooldown.
+  Refusals that lift on their own (kill switch or mode, rolling caps, seller cooldown, source
+  pause) answer `kill_switch`, which the provider maps to a RETRYABLE proven pre-submission
+  failure; `intent_invalid` (suppression, duplicate, changed listing, recipient or authorization)
+  closes that message for good. Claims change no state.
+- `record_outcome` accepts an outcome only for the attempt's own Message-ID; a reported
+  acceptance time is clamped to `[send_attempted_at, now]`.
+
+### 11.6 Migration timestamp `20261007000300` (reserved, not created)
+
+Work package B1a needed no DDL: every guard it relies on is in migrations 1000, 0100 and 0200,
+and Outlook intents are derived from attempts. The reserved timestamp stays unused; because
+`20261007000400` exists, any later migration must use a timestamp after it.
+
+### 11.7 Applying with `scripts/migrate.sh`
+
+The script hands psql a password-free connection string and passes a password only through
+`PGPASSWORD`; a connection string from which the password cannot be separated safely (an
+unencoded `/`, `?` or `#` in a URL password, an upper-case scheme, a `password` key in another
+letter case, an unparseable key=value string) is refused rather than guessed at.

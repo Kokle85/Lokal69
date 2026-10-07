@@ -90,6 +90,15 @@ CANCELLABLE_STATES: Final = frozenset(
         InquiryState.QUEUED,
     }
 )
+#: SQL predicate (inquiry alias ``i``): no send attempt of the inquiry may have reached the
+#: provider. Either there is none, or every one is a proven pre-submission failure or was
+#: reconciled as ``proven_not_submitted`` (a ``queued`` inquiry after a guarded retry).
+NEVER_TRANSMITTED_SQL: Final = (
+    "not exists (select 1 from ops.email_delivery_attempts a"
+    " where a.workspace_id = i.workspace_id and a.inquiry_id = i.id"
+    " and not ((a.outcome = 'pre_submission_failure' and a.pre_submission_proof is not null)"
+    "          or a.reconciled_outcome is not distinct from 'proven_not_submitted'))"
+)
 SELLER_ENTITY_MERGED: Final = "SELLER_ENTITY_MERGED"
 IDENTITY_MERGE_DUPLICATE: Final = "IDENTITY_MERGE_DUPLICATE"
 _STATUS_PREFIX: Final = "recipient_status:"
@@ -381,11 +390,14 @@ async def cancel_untransmitted(
     target: Literal["cancelled", "suppressed"] = "cancelled",
     suppression_reason: str | None = None,
 ) -> tuple[UUID, ...]:
-    """Cancel (or suppress) never-transmitted inquiries and release their quota debits.
+    """Cancel (or suppress) never-transmitted inquiries; release the debit when nothing was attempted.
 
-    Only rows in a cancellable state without any send attempt change (the database guard and
-    the ledger guard refuse anything else); the caller must already hold the controls and
-    seller locks of the inquiry path. Returns the ids that changed.
+    A row changes when it is in a cancellable state and NO send attempt may have reached the
+    provider: either it was never attempted, or (a ``queued`` inquiry after a guarded retry) every
+    attempt is a proven pre-submission failure or reconciled as ``proven_not_submitted``
+    (``NEVER_TRANSMITTED_SQL``). The quota debit is released only for a never-attempted inquiry
+    (the ledger guard keeps the debit of anything that had an attempt). The caller must already
+    hold the controls and seller locks of the inquiry path. Returns the ids that changed.
     """
     ids = sorted(set(inquiry_ids), key=str)
     if not ids:
@@ -398,13 +410,12 @@ async def cancel_untransmitted(
         for inquiry_id in ids:
             row = await fetch_one(
                 conn,
-                "update app.seller_inquiries i set state = %(target)s, state_reasons = %(reasons)s,"
+                "update app.seller_inquiries i set state = %(target)s, state_reasons = %(reasons)s,"  # noqa: S608
                 " suppression_reason = %(suppression)s, row_version = i.row_version + 1"
                 " where i.workspace_id = %(ws)s and i.id = %(id)s"
-                " and i.state = any(%(states)s) and i.send_attempted_at is null"
-                " and not exists (select 1 from ops.email_delivery_attempts a"
-                "                 where a.workspace_id = i.workspace_id and a.inquiry_id = i.id)"
-                " returning i.id, i.row_version",
+                f" and i.state = any(%(states)s) and {NEVER_TRANSMITTED_SQL}"
+                " returning i.id, i.row_version, exists (select 1 from ops.email_delivery_attempts a"
+                "   where a.workspace_id = i.workspace_id and a.inquiry_id = i.id) as attempted",
                 {
                     "ws": actor.workspace_id,
                     "id": inquiry_id,
@@ -416,11 +427,13 @@ async def cancel_untransmitted(
             )
             if row is None:
                 continue
-            await conn.execute(
-                "update ops.inquiry_quota_ledger set released_at = now(), release_reason = %(code)s"
-                " where workspace_id = %(ws)s and inquiry_id = %(id)s and released_at is null",
-                {"ws": actor.workspace_id, "id": inquiry_id, "code": f"inquiry_{target}"},
-            )
+            attempted = bool(row["attempted"])
+            if not attempted:
+                await conn.execute(
+                    "update ops.inquiry_quota_ledger set released_at = now(), release_reason = %(code)s"
+                    " where workspace_id = %(ws)s and inquiry_id = %(id)s and released_at is null",
+                    {"ws": actor.workspace_id, "id": inquiry_id, "code": f"inquiry_{target}"},
+                )
             await audit.record(
                 conn,
                 actor,
@@ -429,7 +442,11 @@ async def cancel_untransmitted(
                 inquiry_id,
                 new_version=int(row["row_version"]),
                 reason=", ".join(codes) or target,
-                metadata={"reasons": codes, "suppression_reason": suppression_reason},
+                metadata={
+                    "reasons": codes,
+                    "suppression_reason": suppression_reason,
+                    "debit_retained": attempted,
+                },
             )
             changed.append(inquiry_id)
     return tuple(changed)
@@ -446,10 +463,11 @@ async def _family_inquiries(
     """Inquiries of the entities (and entities merged into them), locked in id order."""
     rows = await fetch_all(
         conn,
-        "select i.id, i.identity_key, i.vehicle_kind, coalesce(i.vehicle_cluster_id, i.vehicle_listing_id)"
+        "select i.id, i.identity_key, i.vehicle_kind, coalesce(i.vehicle_cluster_id, i.vehicle_listing_id)"  # noqa: S608
         " as vehicle_id, i.seller_entity_id, i.state, i.reserved_at, i.send_attempted_at,"
         " (select count(*) from ops.email_delivery_attempts a"
         "   where a.workspace_id = i.workspace_id and a.inquiry_id = i.id) as attempts,"
+        f" {NEVER_TRANSMITTED_SQL} as never_transmitted,"
         " array(select i.qualification_listing_id"
         "       union select m.listing_id from app.vehicle_cluster_members m"
         "        where m.workspace_id = i.workspace_id and m.cluster_id = i.vehicle_cluster_id"
@@ -547,9 +565,11 @@ async def _merge(
     cancellable = {s.value for s in CANCELLABLE_STATES}
     to_cancel: set[UUID] = set()
     for row in rows:
-        transmitted = row["send_attempted_at"] is not None or int(row["attempts"]) > 0
-        if row["seller_entity_id"] == absorbed_id and not transmitted and row["state"] in cancellable:
-            to_cancel.add(row["id"])  # its seller entity can never reserve or dispatch again
+        # Its seller entity can never reserve or dispatch again: cancel what was never transmitted
+        # (including a re-queued inquiry whose only attempts provably never left).
+        of_absorbed = row["seller_entity_id"] == absorbed_id
+        if of_absorbed and row["never_transmitted"] and row["state"] in cancellable:
+            to_cancel.add(row["id"])
     duplicates: list[UUID] = []
     conflict = False
     remaining = [r for r in rows if r["id"] not in to_cancel]
@@ -1126,6 +1146,7 @@ __all__ = [
     "CANCELLABLE_STATES",
     "CONTACT_RULES_VERSION",
     "IDENTITY_MERGE_DUPLICATE",
+    "NEVER_TRANSMITTED_SQL",
     "SELLER_ENTITY_MERGED",
     "LinkedSeller",
     "MergeOutcome",

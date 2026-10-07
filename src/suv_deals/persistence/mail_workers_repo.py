@@ -62,9 +62,14 @@ Health (`mailbox_health`, `list_mailbox_health`)
     ``domain.lifecycle.mail_worker_coverage``. ``monitoring_active`` is never claimed without a
     fresh heartbeat, a connected Outlook and a fresh reconciliation.
 
-Lock order: ``app.seller_inquiries`` -> ``ops.mail_worker_bindings`` (taken by the sync
-sequence allocator) -> ``ops.mail_binding_sync``; checkpoints are written in their own short
-transactions. No network I/O happens here; tokens, addresses and message text are never logged.
+Lock order: ``app.seller_inquiries`` (id order when several) -> ``ops.mail_worker_bindings``
+(taken by the sync sequence allocator) -> ``ops.mail_binding_sync``; `publish_mailbox_bindings`
+locks all its inquiries before the first publication. Checkpoints are written in their own short
+transactions; the worker-level health row is created once and locked (``FOR UPDATE``) before a
+heartbeat or an account report reads its codes, so the two serialise. Worker-reported counts and
+ages are bounded and a reported gap never ends before it starts (it would be unreadable, i.e.
+hidden); open gaps are never evicted from the bounded window by newer closed ones. No network
+I/O happens here; tokens, addresses and message text are never logged.
 """
 
 from __future__ import annotations
@@ -75,7 +80,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, overload
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
@@ -133,6 +138,9 @@ MAX_BINDING_PAGE: Final = 100
 MAX_LIST_ITEMS: Final = 20
 MAX_GAP_ENTRIES: Final = 30
 MAX_GAP_TEXT: Final = 120
+#: Upper bounds for worker-reported counters and ages (integer columns; a bounded code length).
+MAX_REPORTED_COUNT: Final = 2_147_483_647
+MAX_REPORTED_AGE: Final = timedelta(days=3650)
 DEFAULT_HEARTBEAT_INTERVAL: Final = timedelta(seconds=60)
 DEFAULT_RECONCILE_INTERVAL: Final = timedelta(seconds=120)
 DEFAULT_HEALTH_WINDOW: Final = timedelta(hours=24)
@@ -266,20 +274,28 @@ async def resolve_worker(conn: Conn, token: str) -> WorkerIdentity:
 
 
 async def require_active_mailbox(conn: Conn, worker: WorkerIdentity) -> None:
-    """Re-check inside the caller's transaction that the worker's binding is still active."""
+    """Re-check inside the caller's transaction that the worker's binding is still active and that
+    its credential is still the binding's own, unrevoked and unexpired one (the identity may have
+    been resolved in an earlier transaction: a revocation in between stops the request)."""
     async with mapped_errors():
         row = await fetch_one(
             conn,
-            "select state, credential_id from ops.mail_worker_bindings where workspace_id = %(ws)s"
-            " and id = %(id)s",
+            "select m.state, m.credential_id,"
+            " coalesce(c.revoked_at is null and (c.expires_at is null or c.expires_at > clock_timestamp()),"
+            " false) as credential_live"
+            " from ops.mail_worker_bindings m"
+            " left join ops.api_credentials c on c.workspace_id = m.workspace_id and c.id = m.credential_id"
+            " where m.workspace_id = %(ws)s and m.id = %(id)s",
             {"ws": worker.workspace_id, "id": worker.mailbox_binding_id},
         )
     if row is None or row["state"] != "active":
         raise _revoked_mailbox()
-    if row["credential_id"] != worker.credential_id:
-        # Rotated since the request authenticated: the old token no longer speaks for the mailbox.
+    if row["credential_id"] != worker.credential_id or not row["credential_live"]:
+        # Rotated, revoked or expired since the request authenticated: the token no longer speaks
+        # for the mailbox (the worker keeps its backlog for a new credential).
         raise Unauthenticated(
-            "The mailbox worker credential was replaced", details={"reason": "mail_worker_credential_revoked"}
+            "The mailbox worker credential was replaced, revoked or has expired",
+            details={"reason": "mail_worker_credential_revoked"},
         )
 
 
@@ -527,7 +543,7 @@ def _require_publisher(actor: ActorContext) -> None:
 
 _INQUIRY_BINDING_SQL: Final = """
 select i.id, i.state, i.sender_binding_id, i.sender_provider, i.rfc_message_id, i.provider_message_id,
-       i.provider_thread_id, i.recipient_address, i.recipient_contact_id, i.seller_entity_id,
+       i.provider_thread_id, i.accepted_at, i.recipient_address, i.recipient_contact_id, i.seller_entity_id,
        i.qualification_listing_id, i.vehicle_cluster_id,
        c.listing_reference as contact_reference, c.listing_url as contact_url,
        l.source_listing_id, l.canonical_url
@@ -594,13 +610,22 @@ async def binding_payload(conn: Conn, workspace_id: UUID, inquiry: Mapping[str, 
     async with mapped_errors():
         attempts = await fetch_all(conn, _ATTEMPTS_SQL, params)
         addresses = await fetch_all(conn, _SELLER_ADDRESSES_SQL, params)
+    # Outbound: Message-IDs the provider accepted (or reconciliation proved accepted). Every other
+    # send intent's Message-ID (an uncertain or unfinished hand-over) is published separately so
+    # a reply to it can resolve the uncertain send.
     accepted = [
         a["rfc_message_id"]
         for a in attempts
         if a["outcome"] == "accepted" or a["reconciled_outcome"] == "accepted"
     ]
-    outbound = _message_ids([inquiry["rfc_message_id"], *accepted])
-    intents = [m for m in _message_ids(a["rfc_message_id"] for a in attempts) if m not in outbound]
+    if inquiry["accepted_at"] is not None:
+        accepted.insert(0, inquiry["rfc_message_id"])
+    outbound = _message_ids(accepted)
+    intents = [
+        m
+        for m in _message_ids([inquiry["rfc_message_id"], *(a["rfc_message_id"] for a in attempts)])
+        if m not in outbound
+    ]
     provider_ids = _texts([inquiry["provider_message_id"], *(a["provider_message_id"] for a in attempts)])
     threads = _texts([inquiry["provider_thread_id"], *(a["provider_thread_id"] for a in attempts)])
     aliases: list[str] = []
@@ -758,7 +783,12 @@ async def publish_mailbox_bindings(
     conn: Conn, actor: ActorContext, mailbox_binding_id: UUID, *, limit: int = 500
 ) -> list[PublishedBinding]:
     """Publish (or refresh) the binding of every (possibly) transmitted inquiry of the mailbox's
-    sender binding, oldest first. Used when a worker is bound and by reconciliation jobs."""
+    sender binding. Used when a worker is bound and by reconciliation jobs.
+
+    Every target inquiry row is locked (id order, the inquiry repositories' order) BEFORE the
+    first publication takes the mailbox row through the sync sequence allocator, so this batch
+    keeps the global order inquiry -> mailbox and cannot deadlock with a reply ingest or a send
+    transition that holds one inquiry and then publishes its binding."""
     _require_publisher(actor)
     if not 1 <= limit <= 5000:
         raise ValidationFailed("limit must be between 1 and 5000")
@@ -777,7 +807,7 @@ async def publish_mailbox_bindings(
             conn,
             "select id from app.seller_inquiries where workspace_id = %(ws)s"
             " and sender_binding_id = %(sender)s and send_attempted_at is not null"
-            " order by created_at, id limit %(limit)s",
+            " order by id limit %(limit)s for update",
             {"ws": actor.workspace_id, "sender": box["sender_binding_id"], "limit": limit},
         )
     published: list[PublishedBinding] = []
@@ -984,6 +1014,14 @@ def _clamp(value: datetime | None, now: datetime, field_name: str) -> datetime |
     return min(aware, now)
 
 
+@overload
+def _whole_seconds(value: datetime) -> datetime: ...
+@overload
+def _whole_seconds(value: None) -> None: ...
+def _whole_seconds(value: datetime | None) -> datetime | None:
+    return None if value is None else value.replace(microsecond=0)
+
+
 def _gap_code(kind: str, started_at: datetime, ended_at: datetime | None) -> str:
     end = "open" if ended_at is None else str(int(ended_at.timestamp()))
     return f"gap:{kind}:{int(started_at.timestamp())}:{end}"
@@ -1021,9 +1059,14 @@ def parse_gap_codes(codes: Iterable[str]) -> list[ReportedGap]:
 
 
 def _merge_gaps(
-    previous: Sequence[str], reported: Sequence[ReportedGap]
+    previous: Sequence[str], reported: Sequence[ReportedGap], *, limit: int = MAX_GAP_ENTRIES
 ) -> tuple[list[str], list[ReportedGap]]:
-    """New gap code list (newest ``MAX_GAP_ENTRIES``) and the gaps that are new or newly closed."""
+    """New gap code list (at most ``limit``) and the gaps that are new or newly closed.
+
+    Open gaps are never evicted by newer closed ones (an open gap stays visible until the worker
+    reports its end); the remaining room holds the newest closed gaps. A closed gap that rolls out
+    of the window was audited when it was first reported and when it closed.
+    """
     known = {(g.kind, g.started_at): g for g in parse_gap_codes(previous)}
     changed: list[ReportedGap] = []
     for gap in reported:
@@ -1032,7 +1075,12 @@ def _merge_gaps(
         if before is None or (before.ended_at is None and gap.ended_at is not None):
             changed.append(gap)
             known[key] = gap
-    ordered = sorted(known.values(), key=lambda g: (g.started_at, g.kind))[-MAX_GAP_ENTRIES:]
+    by_start = sorted(known.values(), key=lambda g: (g.started_at, g.kind))
+    still_open = [g for g in by_start if g.ended_at is None][-limit:]
+    closed = [g for g in by_start if g.ended_at is not None]
+    room = limit - len(still_open)
+    kept = {id(g) for g in [*still_open, *(closed[-room:] if room > 0 else [])]}
+    ordered = [g for g in by_start if id(g) in kept]
     return [_gap_code(g.kind, g.started_at, g.ended_at) for g in ordered], changed
 
 
@@ -1045,6 +1093,12 @@ def _folder_reasons(values: Iterable[str]) -> list[str]:
     return result
 
 
+_ENSURE_HEALTH_ROW_SQL: Final = """
+insert into ops.mail_worker_checkpoints (workspace_id, mailbox_binding_id, store_id_hash, folder_id_hash,
+                                         folder_role)
+values (%(ws)s, %(box)s, %(hash)s, %(hash)s, 'other')
+on conflict (workspace_id, mailbox_binding_id, store_id_hash, folder_id_hash) do nothing
+"""
 _HEALTH_ROW_SQL: Final = """
 select id, gap_reasons, last_complete_scan_at
   from ops.mail_worker_checkpoints
@@ -1084,6 +1138,32 @@ async def _db_now(conn: Conn) -> datetime:
     return ensure_utc(row["now"])
 
 
+async def _lock_health_row(conn: Conn, worker: WorkerIdentity) -> Mapping[str, Any]:
+    """Create (once) and lock the worker-level health row, so concurrent heartbeats and account
+    reports serialise on it: no lost gap/account code and no duplicate-row refusal."""
+    params = {"ws": worker.workspace_id, "box": worker.mailbox_binding_id, "hash": HEALTH_ROW_HASH}
+    await conn.execute(_ENSURE_HEALTH_ROW_SQL, params)
+    row = await fetch_one(conn, _HEALTH_ROW_SQL, params)
+    assert row is not None  # created above (or by a concurrent transaction that committed)
+    return row
+
+
+def _count(value: int) -> int:
+    """A worker-reported count, bounded to what the integer columns and codes can hold."""
+    return max(0, min(int(value), MAX_REPORTED_COUNT))
+
+
+def _reported_gap(kind: str, started_at: datetime, ended_at: datetime | None, now: datetime) -> ReportedGap:
+    """A worker-reported gap in the stored shape: times clamped to the database clock, at most
+    `MAX_REPORTED_AGE` old, whole seconds (a re-reported or newly closed gap keeps its identity),
+    and never ending before it started (such a gap would be unreadable and so hidden)."""
+    start = _whole_seconds(max(_clamp(started_at, now, "gaps.started_at") or now, now - MAX_REPORTED_AGE))
+    end = _clamp(ended_at, now, "gaps.ended_at")
+    if end is not None:
+        end = max(_whole_seconds(end), start)
+    return ReportedGap(kind=kind, started_at=start, ended_at=end, open=end is None, detected_by="worker")
+
+
 async def record_heartbeat(
     conn: Conn, worker: WorkerIdentity, request: MailWorkerHeartbeatRequest, *, request_id: str
 ) -> MailWorkerHeartbeatAck:
@@ -1097,33 +1177,18 @@ async def record_heartbeat(
     await require_active_mailbox(conn, worker)
     async with mapped_errors():
         now = await _db_now(conn)
-        health = await fetch_one(
-            conn,
-            _HEALTH_ROW_SQL,
-            {"ws": worker.workspace_id, "box": worker.mailbox_binding_id, "hash": HEALTH_ROW_HASH},
-        )
-    previous: list[str] = list(health["gap_reasons"]) if health is not None else []
-    reported = [
-        ReportedGap(
-            kind=g.kind,
-            started_at=_clamp(g.started_at, now, "gaps.started_at") or now,
-            ended_at=_clamp(g.ended_at, now, "gaps.ended_at"),
-            open=g.ended_at is None,
-            detected_by="worker",
-        )
-        for g in request.gaps
-    ]
-    gap_codes, changed = _merge_gaps(previous, reported)
+        health = await _lock_health_row(conn, worker)
+    previous: list[str] = list(health["gap_reasons"])
+    reported = [_reported_gap(g.kind, g.started_at, g.ended_at, now) for g in request.gaps]
+    # Two entries stay reserved for the account and matching-gap codes.
+    gap_codes, changed = _merge_gaps(previous, reported, limit=MAX_GAP_ENTRIES - 2)
     account = [c for c in previous if c.startswith("account:")][-1:]
-    codes = [
-        *gap_codes[-(MAX_GAP_ENTRIES - 2) :],
-        *account,
-        f"matching_gaps:{request.unresolved_matching_gaps}",
-    ]
-    backlog = request.backlog_count
+    codes = [*gap_codes, *account, f"matching_gaps:{_count(request.unresolved_matching_gaps)}"]
+    backlog = _count(request.backlog_count)
+    age = request.backlog_oldest_age_seconds
     oldest = (
-        now - timedelta(seconds=request.backlog_oldest_age_seconds)
-        if backlog > 0 and request.backlog_oldest_age_seconds is not None
+        now - min(timedelta(seconds=_count(age)), MAX_REPORTED_AGE)
+        if backlog > 0 and age is not None
         else None
     )
     beat = request.heartbeat
@@ -1155,7 +1220,7 @@ async def record_heartbeat(
             if checkpoint.store_id_hash == HEALTH_ROW_HASH and checkpoint.folder_id_hash == HEALTH_ROW_HASH:
                 raise ValidationFailed("checkpoint hashes are reserved", details={"fields": ["checkpoints"]})
             ack = _clamp(checkpoint.acknowledged_watermark, now, "checkpoints.acknowledged_watermark")
-            count = checkpoint.backlog_count
+            count = _count(checkpoint.backlog_count)
             await fetch_one(
                 conn,
                 _UPSERT_CHECKPOINT_SQL,
@@ -1247,25 +1312,18 @@ async def record_account_report(
     status: AccountStatus = (
         "mismatch" if "ACCOUNT_MISMATCH" in problems else "not_classic" if problems else "verified"
     )
-    common = {"ws": worker.workspace_id, "box": worker.mailbox_binding_id}
     async with mapped_errors():
-        health = await fetch_one(conn, _HEALTH_ROW_SQL, {**common, "hash": HEALTH_ROW_HASH})
-        previous: list[str] = list(health["gap_reasons"]) if health is not None else []
+        # The heartbeat writes the same row: create-and-lock it first, so a concurrent first
+        # heartbeat neither turns this report into a duplicate-row refusal nor loses its code.
+        health = await _lock_health_row(conn, worker)
+        previous: list[str] = list(health["gap_reasons"])
         codes = [c for c in previous if not c.startswith("account:")][-(MAX_GAP_ENTRIES - 1) :]
         codes.append(f"account:{status}")
-        if health is None:
-            await conn.execute(
-                "insert into ops.mail_worker_checkpoints (workspace_id, mailbox_binding_id, store_id_hash,"
-                " folder_id_hash, folder_role, gap_reasons) values (%(ws)s, %(box)s, %(hash)s, %(hash)s,"
-                " 'other', %(codes)s)",
-                {**common, "hash": HEALTH_ROW_HASH, "codes": codes},
-            )
-        else:
-            await conn.execute(
-                "update ops.mail_worker_checkpoints set gap_reasons = %(codes)s,"
-                " row_version = row_version + 1 where workspace_id = %(ws)s and id = %(id)s",
-                {"ws": worker.workspace_id, "id": health["id"], "codes": codes},
-            )
+        await conn.execute(
+            "update ops.mail_worker_checkpoints set gap_reasons = %(codes)s,"
+            " row_version = row_version + 1 where workspace_id = %(ws)s and id = %(id)s",
+            {"ws": worker.workspace_id, "id": health["id"], "codes": codes},
+        )
         await audit.record(
             conn,
             worker.actor(request_id),
@@ -1551,6 +1609,8 @@ __all__ = [
     "DEFAULT_RECONCILE_INTERVAL",
     "HEALTH_ROW_HASH",
     "MAX_BINDING_PAGE",
+    "MAX_REPORTED_AGE",
+    "MAX_REPORTED_COUNT",
     "SYNC_CURSOR_PREFIX",
     "AccountReportOutcome",
     "AccountStatus",

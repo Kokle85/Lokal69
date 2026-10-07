@@ -27,7 +27,12 @@ Contracts (docs/schema.md section 7):
   an actor is given).
 - The reaper (`reap_expired`) moves expired leases to ``retry_wait`` while attempts remain,
   otherwise to ``dead_letter``; it clears the lease fields, records ``LEASE_EXPIRED`` with the
-  previous holder, and never touches ``result_reference``. `reconcile_exhausted` dead-letters
+  previous holder, and never touches ``result_reference``. The one exception is
+  ``seller_inquiry_send`` (spec 37.5): its worker may have handed the email to a provider before
+  it died, so an expired send job moves to ``blocked`` with ``blocker_code
+  EMAIL_DELIVERY_UNCERTAIN`` and is NEVER requeued or dead-lettered by the reaper (the inquiry's
+  own attempt is made ``uncertain`` by ``inquiries_repo.reap_expired_attempts`` and only positive
+  reconciliation evidence decides it). `reconcile_exhausted` dead-letters
   waiting jobs whose attempts are used up so they never stay invisible.
 - Enqueue is idempotent on the open (non-terminal) dedup key (`jobs_dedup_open_uidx`); slot
   jobs are unique per ``(workspace, source, profile, partition, scheduled_slot)`` forever
@@ -236,14 +241,16 @@ class ReapResult(BaseModel):
 
     requeued: tuple[UUID, ...] = ()
     dead_lettered: tuple[UUID, ...] = ()
-    # Every expired lease per job type (requeued + dead-lettered): `record_lease_expiration`.
+    # Expired ``seller_inquiry_send`` jobs: ``blocked`` / EMAIL_DELIVERY_UNCERTAIN, never requeued.
+    blocked_uncertain: tuple[UUID, ...] = ()
+    # Every expired lease per job type (all three outcomes): `record_lease_expiration`.
     expired_by_type: dict[JobType, int] = Field(default_factory=dict)
     # The dead-lettered subset per job type: `record_dead_letter`.
     dead_lettered_by_type: dict[JobType, int] = Field(default_factory=dict)
 
     @property
     def total(self) -> int:
-        return len(self.requeued) + len(self.dead_lettered)
+        return len(self.requeued) + len(self.dead_lettered) + len(self.blocked_uncertain)
 
 
 class QueueStats(BaseModel):
@@ -844,10 +851,17 @@ with expired as (
   limit %(limit)s
 )
 update ops.jobs j
-set state = case when j.attempts < j.max_attempts then 'retry_wait' else 'dead_letter' end,
-    completed_at = case when j.attempts < j.max_attempts then null else clock_timestamp() end,
-    available_at = case when j.attempts < j.max_attempts
+set state = case when j.job_type = 'seller_inquiry_send' then 'blocked'
+                 when j.attempts < j.max_attempts then 'retry_wait' else 'dead_letter' end,
+    completed_at = case when j.job_type = 'seller_inquiry_send' or j.attempts < j.max_attempts
+                        then null else clock_timestamp() end,
+    available_at = case when j.job_type <> 'seller_inquiry_send' and j.attempts < j.max_attempts
                         then clock_timestamp() + %(delay)s::interval else j.available_at end,
+    blocker_code = case when j.job_type = 'seller_inquiry_send'
+                        then 'EMAIL_DELIVERY_UNCERTAIN' else j.blocker_code end,
+    blocker_detail = case when j.job_type = 'seller_inquiry_send'
+                          then 'send lease expired after a possible hand-over; reconcile, never resend'
+                          else j.blocker_detail end,
     lease_owner = null,
     lease_token = null,
     lease_expires_at = null,
@@ -898,12 +912,14 @@ async def reap_expired(
     Expiry is judged by database time. ``now`` can only make the reaper MORE conservative
     (``least(now, clock_timestamp())``): an application clock running ahead can never reap a
     lease the database still considers live. Jobs whose worker holds the row lock are skipped
-    until the next pass. Prior ``result_reference`` values are never touched.
+    until the next pass. Prior ``result_reference`` values are never touched. An expired
+    ``seller_inquiry_send`` job is ``blocked`` with EMAIL_DELIVERY_UNCERTAIN, never requeued.
     """
     if not 0 <= retry_delay_seconds <= 86_400 or not 1 <= limit <= 10_000:
         raise ValidationFailed("invalid reaper parameters")
     requeued: list[UUID] = []
     dead: list[UUID] = []
+    blocked: list[UUID] = []
     by_type: dict[JobType, int] = {}
     dead_by_type: dict[JobType, int] = {}
     async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
@@ -922,12 +938,15 @@ async def reap_expired(
         by_type[job_type] = by_type.get(job_type, 0) + 1
         if row["state"] == JobState.RETRY_WAIT.value:
             requeued.append(row["id"])
+        elif row["state"] == JobState.BLOCKED.value:
+            blocked.append(row["id"])
         else:
             dead.append(row["id"])
             dead_by_type[job_type] = dead_by_type.get(job_type, 0) + 1
     return ReapResult(
         requeued=tuple(requeued),
         dead_lettered=tuple(dead),
+        blocked_uncertain=tuple(blocked),
         expired_by_type=by_type,
         dead_lettered_by_type=dead_by_type,
     )

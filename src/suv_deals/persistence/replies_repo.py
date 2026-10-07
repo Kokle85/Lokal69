@@ -32,7 +32,9 @@ its consequences in ONE transaction (the caller's ``unit_of_work`` of the worker
    worker's message type is accepted only when it is not "upgrading" to ``seller_reply`` against
    the server's classification of the uploaded fields. A bounce/delivery notice whose returned
    original the worker's sanitiser removed (no In-Reply-To/References link) is stored
-   quarantined (``dsn_link_unverified``) for verification and has no effect.
+   quarantined (``dsn_link_unverified``) for verification and has no effect - but only when the
+   server's own classification of the uploaded From/subject/body is a delivery report too; an
+   unlinked message the worker merely LABELS a bounce is refused like any uncorrelated one.
 5. **Store** - the reply (sanitised body and subject as uploaded, original language, safe
    attachment metadata with the server's policy decision, Macedonian structured summary, claims),
    the dedup record and the locator.
@@ -42,8 +44,10 @@ its consequences in ONE transaction (the caller's ``unit_of_work`` of the worker
    suppressions (hard bounce -> the address; opt-out/complaint -> the seller and the address; never
    an acknowledgement); availability evidence through ``persistence.availability_repo`` (a "sold"
    statement is ``sold_claimed`` + ``seller_reported_sold``; a contradiction suppresses outreach
-   for the vehicle); valuation invalidation of the vehicle's listings (open valuations marked
-   stale and a deduplicated recomputation queued); a quoted price stays an unaccepted seller quote
+   for the vehicle; the statement's time is the message's received time bounded by the server
+   clock, so a future-dated upload cannot outrank later source observations); valuation
+   invalidation of the vehicle's listings (open valuations marked stale and a deduplicated
+   recomputation queued); a quoted price stays an unaccepted seller quote
    in the claims and never touches the advertised price; the binding is re-published when the
    inquiry state changed; and the minimal ``seller.reply.received.v1`` outbox signal (event id,
    inquiry id, reply id, listing/cluster id, safe dashboard URL, brief status: no body, address,
@@ -72,7 +76,7 @@ from pydantic import BaseModel, ConfigDict
 from suv_deals.api.schemas import MailWorkerBindingItem, MailWorkerReplyAck
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
-from suv_deals.domain.enums import InquiryState, JobType, ReplyMessageType, SuppressionReason
+from suv_deals.domain.enums import InquiryState, JobState, JobType, ReplyMessageType, SuppressionReason
 from suv_deals.domain.inquiries import ReconciliationEvidence
 from suv_deals.domain.listings import canonical_json
 from suv_deals.domain.replies import (
@@ -679,12 +683,20 @@ def _message(
     )
 
 
-def _message_type(request: ReplyIngestRequest, message: InboundMessage) -> ReplyMessageType:
-    """The worker's type, except that it never upgrades the server's view to ``seller_reply``."""
+def _message_type(
+    request: ReplyIngestRequest, message: InboundMessage
+) -> tuple[ReplyMessageType, ReplyMessageType]:
+    """``(effective type, server classification)``: the worker's type, except that it never
+    upgrades the server's view to ``seller_reply``."""
     server = classify_message(message.headers, message.body_text, attachments=message.attachments)
     if request.message_type in _UPGRADE_TYPES and server != ReplyMessageType.SELLER_REPLY:
-        return server
-    return request.message_type
+        return server, server
+    return request.message_type, server
+
+
+def _evidence_time(request: ReplyIngestRequest, now: datetime) -> datetime:
+    """The message's received time as evidence time, bounded by the server clock (``now``)."""
+    return min(request.source_message.received_at, now)
 
 
 def _quarantine_reason(correlation: CorrelationResult, mtype: ReplyMessageType) -> str | None:
@@ -857,7 +869,7 @@ async def _new(
         if b.inquiry_id != request.inquiry_id
     ]
     message = _message(worker, request, binding_item)
-    mtype = _message_type(request, message)
+    mtype, server_type = _message_type(request, message)
     own = [
         a
         for a in (worker.account_address, inquiry["sender_from_address"], inquiry["sender_reply_to_address"])
@@ -875,7 +887,15 @@ async def _new(
     )
     dsn_unverified = False
     if correlation.outcome == CorrelationOutcome.UNMATCHED or not for_this:
-        if mtype in _DSN_TYPES and correlation.outcome == CorrelationOutcome.UNMATCHED:
+        # A delivery report whose returned original the worker's sanitiser removed has no link
+        # the server can check; it is kept quarantined for verification ONLY when the uploaded
+        # fields themselves read as a delivery report. The worker's label alone never lets an
+        # unlinked message (unrelated personal mail) into the database.
+        if (
+            mtype in _DSN_TYPES
+            and server_type in _DSN_TYPES
+            and correlation.outcome == CorrelationOutcome.UNMATCHED
+        ):
             dsn_unverified = True
         else:
             raise ValidationFailed(
@@ -913,7 +933,7 @@ async def _new(
         claims = extract_reply_claims(
             body,
             request.detected_language,
-            quoted_at=request.source_message.received_at,
+            quoted_at=_evidence_time(request, now),
             attachment_count=len(request.attachments),
         )
         summary = build_mk_summary(claims, request.detected_language, attachments=decisions)
@@ -1026,17 +1046,19 @@ async def _apply_effects(
     transitions = await _transition(conn, worker, inquiry, path)
     suppressions = await _suppress(conn, system, inquiry, reply_id, decision)
     result: dict[str, Any] = {"transitions": transitions, "suppression_ids": suppressions}
-    received = request.source_message.received_at
     evidence = decision.availability_evidence
     if evidence is not None:
+        # The worker's received time is the statement's time, but never later than the server's
+        # clock: a future-dated statement (worker clock skew, a forged upload) would otherwise
+        # outrank every later source observation and pin the listing's availability.
         outcome = await availability_repo.record_seller_statement(
             conn,
             system,
             listing_id=inquiry["qualification_listing_id"],
             reply_id=reply_id,
             status=evidence.availability,
-            stated_at=received,
-            observed_at=max(now, received),
+            stated_at=_evidence_time(request, now),
+            observed_at=now,
             vehicle_cluster_id=inquiry["vehicle_cluster_id"],
         )
         if outcome.event is not None:
@@ -1245,18 +1267,37 @@ async def _invalidate_valuations(
     for listing_id in listings:
         if listing_id in covered:
             continue
-        job_id, _ = await jobs.enqueue(
-            conn,
-            actor,
-            jobs.JobSpec(
-                job_type=JobType.VALUATION,
-                dedup_key=f"valuation.recompute:{listing_id}",
-                payload={"listing_id": str(listing_id), "stale_valuation_ids": [], "reason": "evidence"},
-                listing_id=listing_id,
-            ),
-        )
-        jobs_queued.append(job_id)
+        jobs_queued.append(await _queue_recompute(conn, actor, listing_id))
     return tuple(stale), tuple(dict.fromkeys(jobs_queued))
+
+
+async def _queue_recompute(conn: Conn, actor: ActorContext, listing_id: UUID) -> UUID:
+    """The listing's deduplicated recomputation, by the same rule as
+    ``valuation_repo.mark_stale``: a recomputation that is already RUNNING read its inputs before
+    this reply, so it cannot absorb it - one follow-up job runs after it."""
+    base_key = f"valuation.recompute:{listing_id}"
+    payload = {
+        "listing_id": str(listing_id),
+        "stale_valuation_ids": [],
+        "reason": InvalidationReason.EVIDENCE.value,
+    }
+
+    def spec(dedup_key: str) -> jobs.JobSpec:
+        return jobs.JobSpec(
+            job_type=JobType.VALUATION, dedup_key=dedup_key, payload=payload, listing_id=listing_id
+        )
+
+    job_id, created = await jobs.enqueue(conn, actor, spec(base_key))
+    if created:
+        return job_id
+    existing = await fetch_one(
+        conn,
+        "select state from ops.jobs where workspace_id = %(ws)s and id = %(id)s",
+        {"ws": actor.workspace_id, "id": job_id},
+    )
+    if existing is not None and existing["state"] == JobState.RUNNING.value:
+        job_id, _ = await jobs.enqueue(conn, actor, spec(f"{base_key}:after:{job_id}"))
+    return job_id
 
 
 def signal_payload_is_minimal(payload: Mapping[str, Any]) -> bool:
