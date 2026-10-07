@@ -1,5 +1,5 @@
 """Read-query service: builds the shared views (``suv_deals.views``) from the database for the
-dashboard API and the MCP tools (spec 21, 23, 30, 32, 37.9).
+dashboard API and the MCP tools (spec 21, 23, 30, 32, 37.8-37.10).
 
 Every function is read-only (the review queue's first page stores its frozen snapshot), takes an
 `ActorContext`, checks its scope, and filters every statement by the actor's workspace (RLS is
@@ -25,6 +25,19 @@ from suv_deals.persistence.queries.economics import (
     get_comparables,
     get_valuation,
 )
+from suv_deals.persistence.queries.inquiries import (
+    INQUIRIES_QUERY,
+    REPLIES_QUERY,
+    EvaluationInputs,
+    MailWorkerHealthView,
+    evaluation_inputs,
+    evaluation_report,
+    get_inquiry,
+    get_reply,
+    list_inquiries,
+    list_replies,
+    mail_worker_health_view,
+)
 from suv_deals.persistence.queries.lifecycle import (
     V11_TABLES,
     CoverageLagsView,
@@ -48,23 +61,34 @@ from suv_deals.persistence.queries.reviews import get_review_case, review_queue
 __all__ = [
     "CANDIDATES_QUERY",
     "COMPARABLES_QUERY",
+    "INQUIRIES_QUERY",
     "OUTBOX_QUERY",
+    "REPLIES_QUERY",
     "SCHEMA_MARKERS",
     "V11_TABLES",
     "CoverageLagsView",
+    "EvaluationInputs",
     "ListingLifecycleView",
+    "MailWorkerHealthView",
     "QueryResult",
     "SchemaMarker",
     "SourceLagView",
     "coverage_lags_view",
     "cursor_secret",
+    "evaluation_inputs",
+    "evaluation_report",
     "get_candidate",
     "get_comparables",
+    "get_inquiry",
+    "get_reply",
     "get_review_case",
     "get_valuation",
     "health_view",
     "list_candidates",
+    "list_inquiries",
+    "list_replies",
     "listing_lifecycle_view",
+    "mail_worker_health_view",
     "outbox_attention_view",
     "overview_view",
     "review_queue",

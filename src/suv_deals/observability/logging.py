@@ -10,8 +10,9 @@
   PostgreSQL URLs (host kept, everything else dropped), credentials in other
   URLs, URL query parameters named like token/key/secret/signature/code/password,
   `whsec_`/`whsk_`/`whpk_` secrets, Slack tokens (`xox?-`, `xapp-`) and incoming
-  webhook URLs, Supabase `sb_secret_`/`sb_publishable_` keys, `sk-...` provider API
-  keys, key=value secrets (including `*_SECRET_KEY`/`*_ACCESS_KEY` assignments),
+  webhook URLs, Supabase `sb_secret_`/`sb_publishable_` keys, this system's bare
+  `suvmcp_`/`suvdev_`/`suvmail_` credentials, `sk-...` provider API keys,
+  key=value secrets (including `*_SECRET_KEY`/`*_ACCESS_KEY` assignments),
   cookies, PEM private keys, e-mail addresses and phone numbers (international
   and DE/IT/CH/MK national formats). Exception messages and tracebacks are
   redacted as text, so a failing connect never leaks DATABASE_URL.
@@ -92,6 +93,9 @@ _WHSEC = re.compile(r"\b(whsec|whsk|whpk)_[A-Za-z0-9+/=_-]{4,}")
 _SLACK_TOKEN = re.compile(r"\b(xox[abeoprs]|xapp)-[A-Za-z0-9-]{4,}")
 _SLACK_HOOK = re.compile(r"(hooks\.slack\.com)(?:/|%2F)[^\s\"'<>&]+", re.IGNORECASE)
 _SUPABASE_KEY = re.compile(r"\b(sb_secret|sb_publishable)_[A-Za-z0-9_-]{4,}")
+# Bare API credentials of this system (persistence.credentials_repo: suvmcp_/suvdev_/suvmail_ +
+# 64 hex). Short display prefixes (fewer than 16 hex digits) stay readable.
+_APP_TOKEN = re.compile(r"\b(suv(?:mcp|dev|mail))_[0-9a-fA-F]{16,}")
 # Provider API keys that may appear without a key name (LLM_API_KEY values: sk-..., sk-proj-..., sk-ant-...).
 _PROVIDER_API_KEY = re.compile(r"\bsk-(?:[a-z0-9]{2,8}-){0,2}[A-Za-z0-9_-]{16,}")
 _QUERY_PARAM = re.compile(r"([?&;])([\w.\-\[\]]{1,64})=([^&\s#'\"<>]*)")
@@ -164,6 +168,7 @@ _RULES: Final[tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]
     (_WHSEC, rf"\1_{REDACTED}"),
     (_SLACK_TOKEN, rf"\1-{REDACTED}"),
     (_SUPABASE_KEY, rf"\1_{REDACTED}"),
+    (_APP_TOKEN, rf"\1_{REDACTED}"),
     (_PROVIDER_API_KEY, _provider_key_sub),
     (_QUERY_PARAM, _query_sub),
     (_KV_SECRET, rf"\1\2{REDACTED}"),

@@ -158,7 +158,6 @@ _CURSOR_RE: Final = re.compile(rf"^{SYNC_CURSOR_PREFIX}\.(0|[1-9][0-9]{{0,17}})\
 _GAP_RE: Final = re.compile(r"^gap:([a-z0-9_]{1,64}):([0-9]{1,12}):([0-9]{1,12}|open)$")
 _CONTROL_RE: Final = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
 _REF_TEXT_RE: Final = re.compile(r"^[^\x00-\x1f\x7f]{1,200}$")
-_LABEL_RE: Final = re.compile(r"^[^\x00-\x1f\x7f]{1,120}$")
 _HEX64_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 _REASON_MIN, _REASON_MAX = 3, 500
 

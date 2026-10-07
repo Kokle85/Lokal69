@@ -66,7 +66,6 @@ from suv_deals.domain.enums import (
     ProfileKey,
     ReviewState,
     Scope,
-    SourceMode,
     Tristate,
     ValuationState,
 )
@@ -144,6 +143,8 @@ _EVIDENCE_VIA: Final[
     AvailabilityEvidenceKind.SOURCE_OBSERVATION: "detail",
     AvailabilityEvidenceKind.SOURCE_SOLD_BADGE: "detail",
     AvailabilityEvidenceKind.SOURCE_REMOVED_PAGE: "detail",
+    AvailabilityEvidenceKind.SOURCE_RESERVED_BADGE: "detail",
+    AvailabilityEvidenceKind.SOURCE_DETAIL_NOT_FOUND: "detail",
     AvailabilityEvidenceKind.COMPLETE_SCAN_ABSENCE: "reconciliation",
     AvailabilityEvidenceKind.SELLER_REPORTED_SOLD: "reconciliation",
     AvailabilityEvidenceKind.SELLER_REPORTED_AVAILABLE: "reconciliation",
@@ -157,7 +158,7 @@ _EVIDENCE_VIA: Final[
 # newest valuation of the current revision. ``%(now)s`` is the database time of the read.
 _CANDIDATE_SELECT: Final = """
 select l.id as listing_id, l.source_id, s.source_key, s.country as source_country,
-       s.paused as source_paused, s.mode as source_mode, l.created_at, l.updated_at,
+       s.paused as source_paused, l.is_fixture as listing_fixture, l.created_at, l.updated_at,
        l.first_seen_at, l.last_seen_at, l.last_detail_success_at, l.last_availability_check_at,
        l.availability, l.eligibility_state, l.eligibility_profile, l.screening, l.screened_at,
        l.quarantined, l.canonical_url,
@@ -270,9 +271,10 @@ def _rank_summary(ranking: object) -> RankSummary | None:
 
 
 def _is_fixture(row: Mapping[str, Any]) -> bool:
-    return bool(
-        row["source_mode"] == SourceMode.FIXTURE.value or row["case_fixture"] or row["valuation_fixture"]
-    )
+    # Fixture lineage is frozen on the listing at ingest (migration 20261007000200): a listing
+    # stays synthetic even if its source later switches mode, and a live source's listing never
+    # reads as a fixture because of the source's current mode.
+    return bool(row["listing_fixture"] or row["case_fixture"] or row["valuation_fixture"])
 
 
 def _summary(row: Mapping[str, Any], *, now: datetime) -> CandidateSummary:

@@ -1371,10 +1371,17 @@ def _evidence_kind(kind: DetailKind, availability: Availability) -> tuple[str, A
     # (spec 37.9 maps ``removed`` only from an explicit removal, never from a plain observation).
     if kind == "removed" or availability == Availability.REMOVED:
         return "source_removed_page", AvailabilityEvidenceKind.SOURCE_REMOVED_PAGE
+    # A not-found detail page from a healthy source only makes the listing ``unknown`` (spec 37.9:
+    # never removed or sold); the database maps this evidence kind to ``unknown`` only.
     if kind == "not_found":
+        if availability == Availability.UNKNOWN:
+            return "detail_not_found", AvailabilityEvidenceKind.SOURCE_DETAIL_NOT_FOUND
         return "detail_not_found", AvailabilityEvidenceKind.SOURCE_OBSERVATION
     if availability == Availability.SOLD_CLAIMED:
         return "source_sold_badge", AvailabilityEvidenceKind.SOURCE_SOLD_BADGE
+    # A parsed detail page reports ``reserved`` only from the source's explicit reserved badge.
+    if availability == Availability.RESERVED:
+        return "source_reserved_badge", AvailabilityEvidenceKind.SOURCE_RESERVED_BADGE
     return "detail_observation", AvailabilityEvidenceKind.SOURCE_OBSERVATION
 
 
