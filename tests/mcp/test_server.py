@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 from pydantic import SecretStr
 
-from suv_deals.mcp.server import McpApp, create_standalone_app, mcp_allowed_hosts, mcp_allowed_origins
+from suv_deals.mcp.server import (
+    McpApp,
+    build_mcp,
+    create_standalone_app,
+    mcp_allowed_hosts,
+    mcp_allowed_origins,
+)
 from suv_deals.observability.metrics import AppMetrics
 from tests.mcp.conftest import (
     SigningKeys,
@@ -14,7 +20,9 @@ from tests.mcp.conftest import (
     mcp_client,
     offline_db,
     rpc_headers,
+    running,
 )
+from tests.mcp.test_auth import StubVerifier
 
 DENIALS = "suv_deals_authorization_denials_total"
 
@@ -72,3 +80,82 @@ async def test_non_bearer_authorization_is_counted_and_refused(keys: SigningKeys
         response = await client.http.post("/mcp", json=envelope("tools/list"), headers=headers)
         assert response.status_code == 401
         assert metrics.registry.get_sample_value(DENIALS, {"surface": "mcp", "reason": "invalid_token"}) == 1
+
+
+def test_allowed_origins_are_serialized_like_browsers_send_them() -> None:
+    settings = make_settings(
+        mcp_allowed_origins="https://dash.synthetic.example:443, http://127.0.0.1:80,"
+        " https://dash.synthetic.example:8443, http://[::1]:5173, https://*.synthetic.example,"
+        " https://bad-port.synthetic.example:99999, https://[::1"
+    )
+    assert mcp_allowed_origins(settings) == [
+        "https://dash.synthetic.example",
+        "http://127.0.0.1",
+        "https://dash.synthetic.example:8443",
+        "http://[::1]:5173",
+    ]
+
+
+async def test_default_port_origin_is_accepted_on_the_wire(keys: SigningKeys) -> None:
+    settings = make_settings(mcp_allowed_origins="https://dash.synthetic.example:443")
+    async with mcp_client(settings, offline_db(), keys, token_verifier=StubVerifier()) as client:
+        headers = {**rpc_headers("tools/list", token="synthetic-good-token"), "Origin": "https://dash.synthetic.example"}
+        response = await client.http.post("/mcp", json=envelope("tools/list"), headers=headers)
+        assert response.status_code == 200
+
+
+def test_allowed_hosts_ignore_malformed_urls() -> None:
+    settings = make_settings(
+        mcp_public_url="https://api.synthetic.example:99999/mcp", app_base_url="https://[::1"
+    )
+    assert mcp_allowed_hosts(settings) == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "problem"),
+    [
+        (
+            {"mcp_auth_mode": "static_bearer", "mcp_public_url": None, "app_base_url": ""},
+            "MCP_PUBLIC_URL (or APP_BASE_URL) must be a plain http(s) URL",
+        ),
+        (
+            {"mcp_auth_mode": "static_bearer", "mcp_public_url": None, "app_base_url": "not a url"},
+            "MCP_PUBLIC_URL (or APP_BASE_URL) must be a plain http(s) URL",
+        ),
+        (
+            {"mcp_public_url": "https://api.synthetic.example:99999/mcp"},
+            "MCP_PUBLIC_URL must be a plain http(s) URL",
+        ),
+        ({"mcp_public_url": "https://[::1/mcp"}, "MCP_PUBLIC_URL must be a plain http(s) URL"),
+        (
+            {"mcp_oauth_issuer": "https://issuer.synthetic.example:99999"},
+            "MCP_OAUTH_ISSUER must be a plain http(s) URL",
+        ),
+        ({"mcp_allowed_origins": "https://o.synthetic.example:99999"}, None),
+        ({"app_base_url": "https://dash.synthetic.example:99999"}, None),
+        (
+            {
+                "mcp_events_enabled": True,
+                "allow_external_notifications": True,
+                "mcp_event_subscription_secret_encryption_key": SecretStr(
+                    "U1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1M="
+                ),
+                "callback_egress_proxy_url": "not a url",
+            },
+            "CALLBACK_EGRESS_PROXY_URL is invalid",
+        ),
+    ],
+)
+async def test_malformed_settings_never_crash_the_backend(
+    overrides: dict[str, object], problem: str | None, keys: SigningKeys
+) -> None:
+    """A typo in an MCP setting disables (or narrows) the MCP endpoint; it never raises out of
+    ``build_mcp``, which the dashboard backend calls at start-up."""
+    app = build_mcp(make_settings(**overrides), offline_db(), jwks=keys.jwks, metrics=AppMetrics(process_metrics=False))
+    if problem is None:
+        assert app.configured  # an unusable allow-list entry is dropped, the rest keeps working
+    else:
+        assert not app.configured and app.problems == (problem,)
+        async with running(app) as http:
+            response = await http.post("/mcp", json=envelope("tools/list"), headers=rpc_headers("tools/list"))
+            assert response.status_code == 503

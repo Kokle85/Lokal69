@@ -728,3 +728,111 @@ def test_oauth_verifier_from_settings_reports_missing_settings_by_name() -> None
     assert caught.value.problems == ("MCP_OAUTH_ISSUER must use https", "MCP_OAUTH_JWKS_URL is required")
     secret = SecretStr("never-printed")
     assert "never-printed" not in str(caught.value) and secret.get_secret_value() == "never-printed"
+
+
+# --------------------------------------------------------------------------------------------
+# Review regressions
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.db
+async def test_user_token_through_a_mapped_client_is_never_the_machine_principal(
+    db: Database, seed: Seed, keys: SigningKeys, tokens: TokenFactory
+) -> None:
+    """A mapped ``client_id`` alone must not promote any non-UUID ``sub`` (for example a user of
+    another identity provider signing in through the same client) to the machine principal."""
+    workspace = seed.workspace("MCP machine subject")
+    users = add_members(seed, workspace)
+    machine = uuid.uuid4()
+    clients = {
+        "synthetic-machine": ClientPrincipal(
+            workspace_id=workspace,
+            principal_id=machine,
+            role=Role.OWNER,
+            scopes=frozenset({Scope.DEALS_READ, Scope.SOURCES_PAUSE}),
+        ),
+        "synthetic-aliased": ClientPrincipal(
+            workspace_id=workspace,
+            principal_id=uuid.uuid4(),
+            role=Role.VIEWER,
+            scopes=frozenset({Scope.DEALS_READ}),
+            subject="synthetic-aliased@clients",
+        ),
+    }
+    metrics = AppMetrics(process_metrics=False)
+    async with mcp_client(make_settings(), db, keys, client_principals=clients, metrics=metrics) as client:
+        scopes = [Scope.DEALS_READ, Scope.SOURCES_PAUSE]
+        foreign_user = tokens.mint("idp|synthetic-user-7", scopes=scopes, extra={"client_id": "synthetic-machine"})
+        assert (await client.rpc("tools/list", token=foreign_user)).status_code == 401
+        assert denials(metrics, "not_member") == 1
+        via_azp = tokens.mint(
+            "idp|synthetic-user-8", scopes=scopes, drop=["client_id"], extra={"azp": "synthetic-machine"}
+        )
+        assert (await client.rpc("tools/list", token=via_azp)).status_code == 401
+        # The machine itself (sub == client id) keeps its explicit principal.
+        own = tokens.mint("synthetic-machine", scopes=scopes, extra={"client_id": "synthetic-machine"})
+        assert "sources_pause" in await _tool_names(client, own)
+        # A configured client subject is matched exactly.
+        aliased = tokens.mint(
+            "synthetic-aliased@clients", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"}
+        )
+        assert len(await client.tools(aliased)) == 5
+        wrong_alias = tokens.mint("synthetic-aliased", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"})
+        assert (await client.rpc("tools/list", token=wrong_alias)).status_code == 401
+        # A real member signing in through the mapped client is that member, not the machine.
+        member_token = tokens.mint(users.viewer, scopes=scopes, extra={"client_id": "synthetic-machine"})
+        assert "sources_pause" not in await _tool_names(client, member_token)
+
+
+class _BusyDatabase:
+    """A database whose every transaction fails like a lock or statement timeout."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def transaction(self, *args: Any, **kwargs: Any) -> Any:
+        raise self.error
+
+
+@pytest.mark.parametrize("mode", ["oauth", "static_bearer"])
+async def test_transient_identity_store_failures_are_503_never_500_or_401(
+    mode: str, keys: SigningKeys, tokens: TokenFactory
+) -> None:
+    from suv_deals.persistence.errors_map import StatementTimeout, TransientConflict
+
+    for error in (TransientConflict("The record is busy; retry shortly"), StatementTimeout()):
+        busy: Any = _BusyDatabase(error)
+        metrics = AppMetrics(process_metrics=False)
+        async with mcp_client(make_settings(mcp_auth_mode=mode), busy, keys, metrics=metrics) as client:
+            token = (
+                tokens.mint(uuid.uuid4(), scopes=[Scope.DEALS_READ])
+                if mode == "oauth"
+                else "suvmcp_" + "b" * 64
+            )
+            response = await client.rpc("tools/list", token=token)
+            assert response.status_code == 503, response.text
+            assert response.headers["retry-after"] == "5"
+            assert response.json()["error"] == "temporarily_unavailable"
+            assert token not in response.text
+
+
+@pytest.mark.db
+async def test_machine_credentials_cannot_reuse_a_members_identity(db: Database, seed: Seed) -> None:
+    workspace = seed.workspace("MCP machine identity")
+    users = add_members(seed, workspace)
+    actor = system(workspace)
+    async with unit_of_work(db, actor) as conn:
+        with pytest.raises(ValidationFailed) as caught:
+            await issue_api_credential(
+                conn,
+                actor,
+                principal_id=users.reviewer,
+                principal_kind="mcp_client",
+                role=Role.VIEWER,
+                scopes=[Scope.DEALS_READ],
+                label="SYNTHETIC impersonation attempt",
+            )
+    assert caught.value.details == {"fields": ["principal_id"]}
+    assert (
+        seed.scalar("select count(*) from ops.api_credentials where workspace_id = %s", (workspace,)) == 0
+    )

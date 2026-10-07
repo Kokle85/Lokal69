@@ -53,6 +53,7 @@ from mcp.server.auth.provider import TokenVerifier
 from mcp.server.auth.routes import build_resource_metadata_url, create_protected_resource_routes
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -183,6 +184,9 @@ class McpApp(Starlette):
 # --------------------------------------------------------------------------------------------
 
 
+_DEFAULT_PORTS: Final[Mapping[str, int]] = {"http": 80, "https": 443}
+
+
 def _host_token(hostname: str) -> str:
     try:
         return (
@@ -192,46 +196,70 @@ def _host_token(hostname: str) -> str:
         return hostname
 
 
+def _http_url(value: str | None) -> tuple[str, str, int | None] | None:
+    """``(scheme, lower-case hostname, explicit port)`` of a plain http(s) URL, else ``None``.
+
+    Never raises: a malformed URL (bad port, broken IPv6 literal, wildcard host) is ``None``, so
+    a configuration typo disables the endpoint instead of crashing the backend at start-up.
+    """
+    try:
+        parts = urlsplit((value or "").strip())
+        port = parts.port
+    except ValueError:
+        return None
+    hostname = parts.hostname
+    if parts.scheme not in _DEFAULT_PORTS or not hostname or "*" in hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    return parts.scheme, hostname.lower(), port
+
+
 def mcp_allowed_hosts(settings: Settings, override: Sequence[str] | None = None) -> list[str]:
     """``Host`` values accepted on ``/mcp``: those of ``MCP_PUBLIC_URL`` and ``APP_BASE_URL`` (with
-    their explicit port), any port for loopback names; never a wildcard host."""
+    their explicit port), any port for loopback names; never a wildcard host. Malformed URLs
+    contribute nothing (an empty list refuses every request with ``421``)."""
     if override is not None:
         hosts = [h.strip().lower() for h in override if h.strip()]
     else:
         hosts = []
         for url in (settings.mcp_public_url, settings.app_base_url):
-            parts = urlsplit((url or "").strip())
-            if parts.scheme not in ("http", "https") or not parts.hostname:
+            parsed = _http_url(url)
+            if parsed is None:
                 continue
-            host = _host_token(parts.hostname.lower())
-            default_port = {"http": 80, "https": 443}[parts.scheme]
-            if parts.port is None or parts.port == default_port:
+            scheme, hostname, port = parsed
+            host = _host_token(hostname)
+            if port is None or port == _DEFAULT_PORTS[scheme]:
                 hosts.append(host)
-            if parts.port is not None:
-                hosts.append(f"{host}:{parts.port}")
-            if parts.hostname in LOOPBACK_HOSTS:
+            if port is not None:
+                hosts.append(f"{host}:{port}")
+            if hostname in LOOPBACK_HOSTS:
                 hosts.append(f"{host}:*")
-    if any(h == "*" or h.startswith("*") for h in hosts):
+    if any("*" in h.removesuffix(":*") for h in hosts):
         raise ValueError("wildcard hosts are not allowed")
     return list(dict.fromkeys(hosts))
 
 
 def _origin(value: str, *, production: bool) -> str | None:
-    parts = urlsplit(value.strip())
-    if (
-        parts.scheme not in ("http", "https")
-        or not parts.hostname
-        or parts.username is not None
-        or parts.password is not None
-        or parts.path not in ("", "/")
-        or parts.query
-        or parts.fragment
-    ):
+    """The serialized origin a browser sends (``scheme://host[:port]``), or ``None`` if invalid.
+
+    The default port is omitted (``https://x:443`` is sent as ``https://x``), an IPv6 host is
+    bracketed; wildcards, paths, credentials and malformed ports are invalid (never a crash).
+    """
+    parsed = _http_url(value)
+    if parsed is None:
         return None
-    if parts.scheme == "http" and production and parts.hostname not in LOOPBACK_HOSTS:
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:  # pragma: no cover - _http_url parsed it already
         return None
-    port = f":{parts.port}" if parts.port is not None else ""
-    return f"{parts.scheme}://{_host_token(parts.hostname.lower())}{port}"
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        return None
+    scheme, hostname, port = parsed
+    if scheme == "http" and production and hostname not in LOOPBACK_HOSTS:
+        return None
+    suffix = f":{port}" if port is not None and port != _DEFAULT_PORTS[scheme] else ""
+    return f"{scheme}://{_host_token(hostname)}{suffix}"
 
 
 def mcp_allowed_origins(settings: Settings, override: Sequence[str] | None = None) -> list[str]:
@@ -406,12 +434,22 @@ def _resource_problem(settings: Settings) -> str | None:
     url = (settings.mcp_public_url or "").strip()
     if not url:
         return "MCP_PUBLIC_URL is required"
+    if _http_url(url) is None:
+        return "MCP_PUBLIC_URL must be a plain http(s) URL"
     parts = urlsplit(url)
     if parts.path.rstrip("/") != MCP_PATH:
         return "MCP_PUBLIC_URL must end with /mcp"
-    if parts.query or parts.fragment or parts.username is not None or parts.password is not None:
+    if parts.query or parts.fragment:
         return "MCP_PUBLIC_URL must be a plain URL"
     return None
+
+
+def _auth_settings(values: Mapping[str, Any], problem: str) -> AuthSettings:
+    """``AuthSettings`` or `McpAuthConfigError` naming the setting (never a start-up crash)."""
+    try:
+        return AuthSettings.model_validate(values)
+    except ValidationError:
+        raise McpAuthConfigError([problem]) from None
 
 
 def _auth_plan(
@@ -437,13 +475,14 @@ def _auth_plan(
         resource = settings.mcp_public_url.strip()
         # Validated by AuthSettings itself, which keeps an empty path empty (RFC 8414 issuer
         # comparison is exact: no trailing slash may be added).
-        auth = AuthSettings.model_validate(
+        auth = _auth_settings(
             {
                 "issuer_url": settings.mcp_oauth_issuer.strip(),
                 "resource_server_url": resource,
                 "required_scopes": None,
                 "validate_token_resource": True,
-            }
+            },
+            "MCP_OAUTH_ISSUER and MCP_PUBLIC_URL must be valid http(s) URLs",
         )
         return _AuthPlan(mode, verifier, auth, resource, loopback_only=False)
     if mode == "dev_local":
@@ -453,12 +492,19 @@ def _auth_plan(
     public = (settings.mcp_public_url or settings.app_base_url or "").strip()
     if settings.mcp_public_url and (problem := _resource_problem(settings)):
         raise McpAuthConfigError([problem])
-    if mode == "static_bearer" and settings.app_env == "production" and not public.startswith("https://"):
+    parsed = _http_url(public)
+    if parsed is None:
+        raise McpAuthConfigError(["MCP_PUBLIC_URL (or APP_BASE_URL) must be a plain http(s) URL"])
+    if mode == "static_bearer" and settings.app_env == "production" and parsed[0] != "https":
         raise McpAuthConfigError(["MCP_PUBLIC_URL must use https in production"])
     kind: Any = "static_bearer" if mode == "static_bearer" else "dev_local"
     verifier = token_verifier or CredentialVerifier(db=db, kinds=[kind], metrics=metrics)
     # No OAuth discovery for opaque credentials: no protected-resource metadata, no resource check.
-    auth = AuthSettings.model_validate({"issuer_url": public, "resource_server_url": None})
+    # The SDK requires an issuer URL; the (validated) public URL is an unused placeholder.
+    auth = _auth_settings(
+        {"issuer_url": public, "resource_server_url": None},
+        "MCP_PUBLIC_URL (or APP_BASE_URL) must be a plain http(s) URL",
+    )
     return _AuthPlan(mode, verifier, auth, None, loopback_only=mode == "dev_local")
 
 
@@ -555,6 +601,14 @@ def build_mcp(
         )
     except McpAuthConfigError as exc:
         return _disabled_app(settings, exc.problems, app_metrics)
+    try:
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=mcp_allowed_hosts(settings, opts.allowed_hosts),
+            allowed_origins=mcp_allowed_origins(settings, opts.allowed_origins),
+        )
+    except (ValueError, ValidationError):
+        return _disabled_app(settings, ["MCP host or origin allow-list is invalid"], app_metrics)
 
     registry = ToolRegistry.default()
     extra = list(extra_tools)
@@ -588,7 +642,10 @@ def build_mcp(
         if events_http is not None:
             http = events_http
         else:
-            owned_http = SafeHttpClient(proxy=settings.callback_egress_proxy_url)
+            try:
+                owned_http = SafeHttpClient(proxy=settings.callback_egress_proxy_url)
+            except (ValueError, TypeError):
+                return _disabled_app(settings, ["CALLBACK_EGRESS_PROXY_URL is invalid"], app_metrics)
             http = owned_http
         events = install_events(
             server,
@@ -610,11 +667,7 @@ def build_mcp(
         json_response=True,
         stateless_http=True,
         max_request_body_size=opts.max_request_body_size,
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=mcp_allowed_hosts(settings, opts.allowed_hosts),
-            allowed_origins=mcp_allowed_origins(settings, opts.allowed_origins),
-        ),
+        transport_security=transport_security,
         auth=plan.auth,
         token_verifier=plan.verifier,
     )

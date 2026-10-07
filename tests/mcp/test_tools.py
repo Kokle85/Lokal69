@@ -531,6 +531,42 @@ async def test_review_queue_pages_are_frozen_under_reprioritisation(data_mcp: Da
     assert mismatch["details"]["cursor"] == "mismatch"
 
 
+async def test_review_queue_pages_are_frozen_under_status_changes(data_mcp: DataHarness) -> None:
+    """A status change between pages (another reviewer claims the next case) does not move the
+    frozen page, and a claim against the frozen projection is revalidated against the case."""
+    client, data = data_mcp.client, data_mcp.data
+    priced, incomplete = data.cases["priced"], data.cases["incomplete"]
+    # The unclaimed "priced" case comes second (the "incomplete" one is held by someone else).
+    data_mcp.seed.conn.execute(
+        "update app.review_cases set priority = case when id = %s then 900 else -900 end"
+        " where workspace_id = %s and id in (%s, %s)",
+        (incomplete, data.workspace_id, priced, incomplete),
+    )
+    first = await client.ok("reviews_list_pending", {"limit": 1}, token=data_mcp.reviewer)
+    assert [i["case_id"] for i in first["data"]["items"]] == [str(incomplete)]
+    other_view = await client.ok("reviews_list_pending", {"limit": 10}, token=data_mcp.second_reviewer)
+    other = next(i for i in other_view["data"]["items"] if i["case_id"] == str(priced))
+    claimed = await client.ok(
+        "reviews_claim",
+        {"case_id": other["case_id"], "expected_version": other["case_version"], "idempotency_key": "claim-between"},
+        token=data_mcp.second_reviewer,
+    )
+    assert claimed["data"]["case_version"] == other["case_version"] + 1
+    second = await client.ok(
+        "reviews_list_pending", {"limit": 1, "cursor": first["next_cursor"]}, token=data_mcp.reviewer
+    )
+    frozen = second["data"]["items"]
+    assert [i["case_id"] for i in frozen] == [other["case_id"]]
+    assert frozen[0]["case_version"] == other["case_version"]  # the frozen projection, not the live row
+    result = await client.call(
+        "reviews_claim",
+        {"case_id": other["case_id"], "expected_version": frozen[0]["case_version"], "idempotency_key": "claim-frozen"},
+        token=data_mcp.reviewer,
+    )
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] in ("ALREADY_CLAIMED", "VERSION_CONFLICT")
+
+
 # --------------------------------------------------------------------------------------------
 # Other mutations
 # --------------------------------------------------------------------------------------------
@@ -724,9 +760,7 @@ async def test_unauthenticated_principal_cannot_reach_any_tool_handler(keys: Sig
             headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
         )
         assert response.status_code == 401
-    assert role_scopes(Role.VIEWER) == [Scope.DEALS_READ, Scope.REVIEWS_READ]
-    assert build_mcp is not None
-    assert isinstance(AppMetrics(process_metrics=False), AppMetrics)
+        assert "result" not in response.text
 
 
 async def test_every_tool_requires_its_own_scope(data_mcp: DataHarness) -> None:

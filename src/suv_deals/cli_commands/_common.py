@@ -222,46 +222,102 @@ def database_url(settings: Settings) -> str:
     return settings.database_url.get_secret_value()
 
 
+_LOOPBACK_ADDRESSES: Final = frozenset({"127.0.0.1", "::1"})
+
+
+def _is_local_host(host: str) -> bool:
+    return host in LOOPBACK_HOSTS or host.startswith("/") or host == "local socket"
+
+
 @dataclass(frozen=True, slots=True)
 class DatabaseTarget:
-    """Where a connection string points, WITHOUT the password."""
+    """Where a connection string points, WITHOUT the password.
+
+    libpq tries EVERY listed host in order, connects to ``hostaddr`` instead of resolving ``host``
+    and fills missing parameters from a ``service`` definition, so all of them are recorded:
+    a target is local only when no part of it can lead elsewhere.
+    """
 
     host: str
     port: str
     dbname: str
     user: str
     password_set: bool
+    hosts: tuple[str, ...] = ()
+    hostaddrs: tuple[str, ...] = ()
+    service: str | None = None
 
     @property
     def is_local(self) -> bool:
-        return self.host in LOOPBACK_HOSTS or self.host.startswith("/") or self.host == "local socket"
+        hosts = self.hosts or (self.host,)
+        return (
+            self.service is None
+            and all(_is_local_host(h) for h in hosts)
+            and all(a in _LOOPBACK_ADDRESSES for a in self.hostaddrs)
+        )
 
     def lines(self) -> list[str]:
-        return [
-            f"  host     : {self.host}",
+        lines = [
+            f"  host     : {', '.join(self.hosts) if len(self.hosts) > 1 else self.host}",
             f"  port     : {self.port}",
             f"  database : {self.dbname}",
             f"  user     : {self.user}",
             f"  password : {'set (not shown)' if self.password_set else 'not set'}",
         ]
+        if self.hostaddrs:
+            lines.insert(1, f"  hostaddr : {', '.join(self.hostaddrs)} (used instead of the host name)")
+        if self.service is not None:
+            lines.append(f"  service  : {self.service} (pg_service.conf may supply other parameters)")
+        return lines
+
+
+def _split(value: object) -> tuple[str, ...]:
+    return tuple(part.strip() for part in str(value or "").split(",") if part.strip())
 
 
 def database_target(url: str) -> DatabaseTarget:
-    """Parse a libpq URL/DSN without connecting; the password is never returned."""
+    """Parse a libpq URL/DSN without connecting; the password is never returned.
+
+    Environment defaults libpq would use (``PGHOST``, ``PGHOSTADDR``, ``PGSERVICE``, ...) are
+    taken into account, so ``is_local`` is not fooled by a parameter the string leaves out.
+    """
     import psycopg
 
     try:
         info = psycopg.conninfo.conninfo_to_dict(url)
     except psycopg.ProgrammingError:
         fail("the database connection string cannot be parsed", EXIT_USAGE)
-    host = str(info.get("host") or os.environ.get("PGHOST") or "local socket")
+    hosts = _split(info.get("host") or os.environ.get("PGHOST")) or ("local socket",)
+    hostaddrs = _split(info.get("hostaddr") or os.environ.get("PGHOSTADDR"))
+    service = str(info.get("service") or os.environ.get("PGSERVICE") or "") or None
     return DatabaseTarget(
-        host=host.split(",", maxsplit=1)[0],
+        host=hosts[0],
         port=str(info.get("port") or os.environ.get("PGPORT") or "5432"),
         dbname=str(info.get("dbname") or info.get("user") or "-"),
         user=str(info.get("user") or "-"),
         password_set=bool(info.get("password") or os.environ.get("PGPASSWORD")),
+        hosts=hosts,
+        hostaddrs=hostaddrs,
+        service=service,
     )
+
+
+def password_free(url: str) -> tuple[str, str | None]:
+    """``(connection string without its password, password)`` for child processes.
+
+    psql/pg_dump receive the connection string as an ARGUMENT, which any local user can read in
+    the process list; the password therefore travels separately in ``PGPASSWORD`` (environment).
+    """
+    import psycopg
+
+    try:
+        info = psycopg.conninfo.conninfo_to_dict(url)
+    except psycopg.ProgrammingError:
+        fail("the database connection string cannot be parsed", EXIT_USAGE)
+    password = info.pop("password", None)
+    if password is None:
+        return url, None
+    return psycopg.conninfo.make_conninfo(**{k: str(v) for k, v in info.items()}), str(password)
 
 
 # --------------------------------------------------------------------------------------------

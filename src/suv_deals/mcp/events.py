@@ -70,6 +70,7 @@ from suv_deals.integrations.event_bridge import (
     VerificationCacheEntry,
     VerificationRateLimiter,
     VerificationResult,
+    can_subscribe,
     forbidden,
     invalid_params,
     list_events,
@@ -270,6 +271,9 @@ class EventsService:
         async def run() -> dict[str, Any]:
             principal, actor = self._actor(ctx)
             services = self.services
+            if not can_subscribe(actor):
+                # Authorization first (draft -32012), before any other answer about this server.
+                raise forbidden("requires reviews:read and events:subscribe")
             if not services.settings.allow_external_notifications:
                 # The callback challenge is outbound traffic: refused before validation contacts anyone.
                 raise unsupported("deliveryMode", "webhook")
@@ -378,6 +382,7 @@ class EventsService:
         async def run() -> dict[str, Any]:
             _, actor = self._actor(ctx)
             request = validate_unsubscribe_params(_strip_meta(ctx.params), actor)
+            self.services.limiter.check(actor, "events.unsubscribe")  # a locking write per call
             await self._in_transaction(
                 actor, lambda conn: subscriptions_repo.unsubscribe(conn, actor, request)
             )

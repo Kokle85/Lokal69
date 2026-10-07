@@ -417,7 +417,31 @@ async def test_external_notifications_disabled_refuses_without_contacting_anyone
             "events/subscribe", subscribe_params(h.callback.secret), token=h.reviewer
         )
         assert error["code"] == -32014 and error["data"] == {"feature": "deliveryMode", "value": "webhook"}
+        # Authorization is answered first: a principal without the event scopes is Forbidden.
+        viewer = await h.client.error(
+            "events/subscribe", subscribe_params(h.callback.secret), token=h.token(h.users.viewer, Role.VIEWER)
+        )
+        assert viewer["code"] == -32012
         assert h.callback.requests == []
+        assert (
+            h.seed.scalar(
+                "select count(*) from ops.event_subscriptions where workspace_id = %s", (h.workspace_id,)
+            )
+            == 0
+        )
+
+
+async def test_unsubscribe_is_rate_limited_per_principal(
+    db: Database, seed: Seed, keys: SigningKeys, tokens: TokenFactory
+) -> None:
+    from suv_deals.api.middleware import RateLimit
+
+    options = McpOptions(expensive_limit=RateLimit(capacity=2, per_seconds=60.0))
+    async with events_harness(db, seed, keys, tokens, options=options) as h:
+        for _ in range(2):
+            await h.client.result("events/unsubscribe", unsubscribe_params(), token=h.reviewer)
+        limited = await h.client.error("events/unsubscribe", unsubscribe_params(), token=h.reviewer)
+        assert limited["code"] == -32013 and limited["data"]["limit"] == "requests"
 
 
 async def test_subscription_quota_is_resource_exhausted(

@@ -18,7 +18,9 @@ passed through to Supabase, Slack or any other service. One mode per deployment
     an *active* membership in an *active* workspace (``persistence.workspaces``); with several
     memberships the signed ``workspace_id`` claim must name one of them. A machine client is
     mapped through an explicit ``client_principals`` table keyed by the ``client_id``/``azp``
-    claim. Nothing in a request can choose the workspace.
+    claim, and only when ``sub`` is exactly the configured client subject (a user token issued
+    through that client is never promoted to the machine principal). Nothing in a request can
+    choose the workspace.
 
 ``static_bearer`` (`CredentialVerifier`)
     An opaque ``suvmcp_<64 hex>`` token looked up by its SHA-256 hash in ``ops.api_credentials``
@@ -74,7 +76,7 @@ from suv_deals.api.auth import SigningKeyResolver, StaticJwks
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
 from suv_deals.domain.enums import Role, Scope
-from suv_deals.errors import DependencyUnavailable, Forbidden, NotFound, ValidationFailed
+from suv_deals.errors import AppError, DependencyUnavailable, Forbidden, NotFound, ValidationFailed
 from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence import audit, workspaces
 from suv_deals.persistence.database import Conn, Database, fetch_one
@@ -233,6 +235,16 @@ def _token(
     )
 
 
+def _unavailable(error: AppError) -> DependencyUnavailable:
+    """Any failure of the identity store while authenticating (lock or statement timeout, an
+    aborted transaction, an outage) is a retryable ``503``: never a ``401`` that would make the
+    client discard a valid token, and never a ``500`` with a trace."""
+    if isinstance(error, DependencyUnavailable):
+        return error
+    logger.warning("mcp authentication store failed", extra={"code": error.code.value})
+    return DependencyUnavailable("The authentication store is temporarily unavailable")
+
+
 class _DenialRecorder:
     def __init__(self, metrics: AppMetrics | None) -> None:
         self._metrics = metrics
@@ -250,21 +262,32 @@ class _DenialRecorder:
 
 @dataclass(frozen=True, slots=True)
 class ClientPrincipal:
-    """An OAuth machine client mapped to an explicit workspace, principal and role."""
+    """An OAuth machine client mapped to an explicit workspace, principal and role.
+
+    Only a token whose ``sub`` is exactly ``subject`` (default: the client id itself, as RFC 9068
+    client-credentials tokens carry) is mapped; a user token issued through the same client
+    (another ``sub``) is never promoted to the machine principal.
+    """
 
     workspace_id: UUID
     principal_id: UUID
     role: Role
     scopes: frozenset[Scope]
+    subject: str | None = None
 
 
 def _url_problem(name: str, value: str | None, settings: Settings, *, required: bool = True) -> str | None:
     if not value:
         return f"{name} is required" if required else None
-    parts = urlsplit(value.strip())
+    try:
+        parts = urlsplit(value.strip())
+        _ = parts.port  # a malformed port is a configuration problem, never a start-up crash
+    except ValueError:
+        return f"{name} must be a plain http(s) URL"
     if (
         parts.scheme not in ("http", "https")
         or not parts.hostname
+        or "*" in parts.hostname
         or parts.username is not None
         or parts.password is not None
         or parts.fragment
@@ -373,6 +396,8 @@ class OAuthJwtVerifier:
         except _Rejected as exc:
             self._deny(exc.reason)
             return None
+        except AppError as exc:
+            raise _unavailable(exc) from None
 
     async def _key(self, token: str, alg: str) -> PyJWK:
         try:
@@ -447,7 +472,7 @@ class OAuthJwtVerifier:
         client = claims.get("client_id", claims.get("azp"))
         client_id = client if isinstance(client, str) and _CLIENT_ID_RE.fullmatch(client) else None
         mapped = self._clients.get(client_id) if client_id is not None else None
-        if mapped is not None and (sub == client_id or not _UUID_RE.fullmatch(sub)):
+        if mapped is not None and sub == (mapped.subject or client_id):
             return McpPrincipal(
                 workspace_id=mapped.workspace_id,
                 principal_id=mapped.principal_id,
@@ -534,6 +559,8 @@ class CredentialVerifier:
         except _Rejected as exc:
             self._deny(exc.reason)
             return None
+        except AppError as exc:
+            raise _unavailable(exc) from None
 
     async def _verify(self, token: str) -> McpAccessToken:
         match = _CREDENTIAL_TOKEN.fullmatch(token) if isinstance(token, str) else None
@@ -679,10 +706,17 @@ async def issue_api_credential(
             "lifetime must be positive and at most 365 days", details={"fields": ["lifetime"]}
         )
     text = _label(label)
+    membership = await workspaces.get_membership(conn, actor.workspace_id, principal_id)
     if principal_kind == "user":
-        membership = await workspaces.get_membership(conn, actor.workspace_id, principal_id)
         if membership is None or not membership.active or not wanted <= ROLE_SCOPES[membership.role]:
             raise NotFound("No active membership allows these scopes")
+    elif membership is not None:
+        # A machine credential must never act under a member's identity (claims, idempotency
+        # records, notes and subscriptions are keyed by principal id).
+        raise ValidationFailed(
+            "principal_id of an mcp_client credential must not be a workspace member",
+            details={"fields": ["principal_id"]},
+        )
     random_part = secrets.token_hex(32)
     prefix = TOKEN_PREFIXES[kind]
     token = f"{prefix}_{random_part}"
