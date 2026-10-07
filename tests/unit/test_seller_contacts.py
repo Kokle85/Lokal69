@@ -60,7 +60,9 @@ def alias(
     )
 
 
-def seller(*aliases: SellerAlias, entity: UUID | None = None, seller_type: SellerType = SellerType.DEALER) -> SellerIdentity:
+def seller(
+    *aliases: SellerAlias, entity: UUID | None = None, seller_type: SellerType = SellerType.DEALER
+) -> SellerIdentity:
     return SellerIdentity(seller_entity_id=entity, seller_type=seller_type, aliases=aliases or (alias(),))
 
 
@@ -186,7 +188,9 @@ def test_no_equivalence_without_evidence() -> None:
         kind="provider_documented_alias",
         evidence_ref="synthetic-note-1",
     )
-    assert addresses_equivalent("johndoe@gmail.com", "John.Doe@GMAIL.com".replace("John.Doe", "john.doe"), evidence=[proof])
+    assert addresses_equivalent(
+        "johndoe@gmail.com", "John.Doe@GMAIL.com".replace("John.Doe", "john.doe"), evidence=[proof]
+    )
     assert not addresses_equivalent("john@gmail.com", "johndoe@gmail.com", evidence=[proof])
 
 
@@ -196,7 +200,10 @@ def test_no_equivalence_without_evidence() -> None:
 
 
 def test_alias_normalization() -> None:
-    assert alias("WWW.Autohaus-Example.INVALID", "dealer_website_domain", None).reference == "autohaus-example.invalid"
+    assert (
+        alias("WWW.Autohaus-Example.INVALID", "dealer_website_domain", None).reference
+        == "autohaus-example.invalid"
+    )
     assert alias("de 123.456-789", "vat_id", None).reference == "DE123456789"
     with pytest.raises(ValidationError):
         alias("not a domain!", "dealer_website_domain", None)
@@ -326,7 +333,12 @@ def test_missing_or_invalid_address() -> None:
 
 
 def test_non_deliverable_and_own_addresses() -> None:
-    noreply = verify(evidence(address="noreply@example-marketplace.invalid", extraction_excerpt="noreply@example-marketplace.invalid"))
+    noreply = verify(
+        evidence(
+            address="noreply@example-marketplace.invalid",
+            extraction_excerpt="noreply@example-marketplace.invalid",
+        )
+    )
     assert noreply.reasons == (RecipientReason.NON_DELIVERABLE_ROLE,)
     own = verify(evidence(), sender_addresses=["verkauf@AUTOHAUS-example.invalid", "broken address"])
     assert own.reasons == (RecipientReason.RECIPIENT_IS_SENDER,)
@@ -347,7 +359,9 @@ def test_relay_bound_to_listing() -> None:
     decision = verify(relay())
     assert decision.verified
     assert decision.reasons == (RecipientReason.VERIFIED_RELAY_FOR_LISTING,)
-    assert verify(relay(relay_listing_reference="99999")).reasons == (RecipientReason.RELAY_NOT_BOUND_TO_LISTING,)
+    assert verify(relay(relay_listing_reference="99999")).reasons == (
+        RecipientReason.RELAY_NOT_BOUND_TO_LISTING,
+    )
     assert verify(relay(relay_listing_reference=None)).status == RecipientStatus.REJECTED
     unregistered = verify(relay(), relay_domains=())
     assert unregistered.status == RecipientStatus.NEEDS_TECHNICAL_REVIEW
@@ -414,7 +428,9 @@ def test_official_dealer_contact_via_listing() -> None:
 
 
 def test_evidence_times() -> None:
-    reversed_times = verify(evidence(observed_at=NOW - timedelta(hours=1), verified_at=NOW - timedelta(hours=2)))
+    reversed_times = verify(
+        evidence(observed_at=NOW - timedelta(hours=1), verified_at=NOW - timedelta(hours=2))
+    )
     assert reversed_times.reasons == (RecipientReason.INVALID_EVIDENCE_TIME,)
     future = verify(evidence(verified_at=NOW + timedelta(minutes=1), observed_at=NOW))
     assert future.status == RecipientStatus.NEEDS_TECHNICAL_REVIEW
@@ -431,7 +447,10 @@ def test_evidence_times() -> None:
 
 def test_invalid_listing_url_needs_review() -> None:
     decision = verify(
-        evidence(listing_url="https://user:pw@www.example.invalid/x", evidence_url="https://user:pw@www.example.invalid/x")
+        evidence(
+            listing_url="https://user:pw@www.example.invalid/x",
+            evidence_url="https://user:pw@www.example.invalid/x",
+        )
     )
     assert decision.reasons == (RecipientReason.INVALID_LISTING_URL,)
     assert decision.status == RecipientStatus.NEEDS_TECHNICAL_REVIEW
@@ -439,7 +458,7 @@ def test_invalid_listing_url_needs_review() -> None:
 
 def test_naive_time_rejected() -> None:
     with pytest.raises(ValueError, match="naive"):
-        evidence(observed_at=datetime(2026, 10, 6, 9, 0))  # noqa: DTZ001
+        evidence(observed_at=datetime(2026, 10, 6, 9, 0))
 
 
 def test_decision_invariant() -> None:
@@ -473,7 +492,13 @@ def test_no_change_and_staleness() -> None:
 @pytest.mark.parametrize(
     ("overrides", "change"),
     [
-        ({"address": "andere@autohaus-example.invalid", "extraction_excerpt": "andere@autohaus-example.invalid"}, ContactChange.ADDRESS_CHANGED),
+        (
+            {
+                "address": "andere@autohaus-example.invalid",
+                "extraction_excerpt": "andere@autohaus-example.invalid",
+            },
+            ContactChange.ADDRESS_CHANGED,
+        ),
         ({"seller": seller(alias("dealer-2"))}, ContactChange.SELLER_CHANGED),
         ({"listing_id": UUID(int=77)}, ContactChange.LISTING_CHANGED),
         ({"listing_incarnation_id": UUID(int=78)}, ContactChange.LISTING_CHANGED),

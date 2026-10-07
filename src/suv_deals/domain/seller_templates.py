@@ -31,6 +31,7 @@ Pure functions, no I/O. Business rules:
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -446,6 +447,8 @@ def _reference_problems(reference: str | None) -> list[str]:
     if reference is None or not reference.strip():
         return ["LISTING_REFERENCE_MISSING"]
     problems = _char_problems(reference)
+    if reference != reference.strip():
+        problems.append("LISTING_REFERENCE_INVALID_CHARACTERS")
     if len(reference) > MAX_LISTING_REFERENCE_LENGTH:
         problems.append("LISTING_REFERENCE_TOO_LONG")
     if _URLISH_RE.search(reference):
@@ -459,6 +462,8 @@ def _display_name_problems(name: str | None) -> list[str]:
     if name is None or not name.strip():
         return ["SENDER_DISPLAY_NAME_MISSING"]
     problems = _char_problems(name)
+    if name != name.strip():
+        problems.append("SENDER_DISPLAY_NAME_INVALID_CHARACTERS")
     if len(name) > MAX_SENDER_DISPLAY_NAME_LENGTH:
         problems.append("SENDER_DISPLAY_NAME_TOO_LONG")
     if _URLISH_RE.search(name):
@@ -466,6 +471,14 @@ def _display_name_problems(name: str | None) -> list[str]:
     if not _DISPLAY_NAME_RE.fullmatch(name):
         problems.append("SENDER_DISPLAY_NAME_INVALID_CHARACTERS")
     return problems
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return True
 
 
 def listing_url_problems(url: str | None) -> list[str]:
@@ -487,7 +500,7 @@ def listing_url_problems(url: str | None) -> list[str]:
         return sorted({*problems, "LISTING_URL_INVALID"})
     if parts.scheme not in {"http", "https"}:
         problems.append("LISTING_URL_SCHEME")
-    if not parts.hostname or "." not in parts.hostname:
+    if not parts.hostname or "." not in parts.hostname or _is_ip_literal(parts.hostname):
         problems.append("LISTING_URL_HOST")
     if has_userinfo:
         problems.append("URL_CREDENTIALS")
@@ -960,7 +973,7 @@ def validate_scope(message: RenderedMessage, *, envelope: MessageEnvelope | None
     keys = _QUESTION_KEYS[language]
     non_binding = False
     question_count = 0
-    for line in body.split("\n"):
+    for line in without_url.split("\n"):  # a "?" inside the listing URL is not a question
         for sentence in _SENTENCE_SPLIT_RE.split(line.strip()):
             text = _normalize_for_scan(sentence)
             if not text:

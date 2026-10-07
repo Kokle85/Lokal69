@@ -74,7 +74,9 @@ def frag(
     )
 
 
-def pref(language: str, *, verified: bool = True, excerpt: str | None = "seller wrote this") -> SellerLanguagePreference:
+def pref(
+    language: str, *, verified: bool = True, excerpt: str | None = "seller wrote this"
+) -> SellerLanguagePreference:
     return SellerLanguagePreference(
         language=language,
         verified=verified,
@@ -166,7 +168,9 @@ def test_non_latin_script() -> None:
 
 
 def test_urls_and_emails_do_not_count_as_words() -> None:
-    result = detect_text_language("https://the-and-with.example/the/and/with the@and.with.example www.this-that.example")
+    result = detect_text_language(
+        "https://the-and-with.example/the/and/with the@and.with.example www.this-that.example"
+    )
     assert result.language is None
 
 

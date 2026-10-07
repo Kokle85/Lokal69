@@ -84,7 +84,9 @@ def rendered(template_id: str = "seller_initial_de_v1", **overrides: Any) -> Ren
     )
 
 
-def variant(message: RenderedMessage, *, subject: str | None = None, body: str | None = None) -> RenderedMessage:
+def variant(
+    message: RenderedMessage, *, subject: str | None = None, body: str | None = None
+) -> RenderedMessage:
     """A modified message (as a wording change or an attack would produce), hash recomputed."""
     new_subject = message.subject if subject is None else subject
     new_body = message.body if body is None else body
@@ -292,6 +294,9 @@ def test_missing_listing_reference_blocks(reference: str | None) -> None:
         ("listing_reference", "R" * 65, "LISTING_REFERENCE_TOO_LONG"),
         ("listing_reference", "ref;drop", "LISTING_REFERENCE_INVALID_CHARACTERS"),
         ("listing_reference", "a  b", "LISTING_REFERENCE_INVALID_CHARACTERS"),
+        ("listing_reference", "AB12 ", "LISTING_REFERENCE_INVALID_CHARACTERS"),
+        ("sender_display_name", "Vasko ", "SENDER_DISPLAY_NAME_INVALID_CHARACTERS"),
+        ("sender_display_name", " Vasko", "SENDER_DISPLAY_NAME_INVALID_CHARACTERS"),
     ],
 )
 def test_placeholder_injection_is_rejected(field: str, value: str, problem: str) -> None:
@@ -312,6 +317,8 @@ def test_placeholder_injection_is_rejected(field: str, value: str, problem: str)
         ("ftp://files.example.invalid/x", "LISTING_URL_SCHEME"),
         ("data:text/html,hi", "LISTING_URL_SCHEME"),
         ("https://localhost/x", "LISTING_URL_HOST"),
+        ("https://192.0.2.10/listing/1", "LISTING_URL_HOST"),
+        ("https://[2001:db8::1]/listing/1", "LISTING_URL_HOST"),
         ("https://user:pw@www.example.invalid/x", "URL_CREDENTIALS"),
         ("https://www.example.invalid:8443/x", "LISTING_URL_PORT"),
         ("https://www.example.invalid/x#frag", "LISTING_URL_FRAGMENT"),
@@ -447,7 +454,7 @@ def test_realistic_labels_render_in_every_language(make: str, model: str, genera
 
 
 def _inject(msg: RenderedMessage, sentence: str) -> RenderedMessage:
-    marker = {"de": "Es handelt", "it": "Si tratta", "fr": "Il s\u2019agit", "en": "This is", "mk": "Ова е"}
+    marker = {"de": "Es handelt", "it": "Si tratta", "fr": "Il s\u2019agit", "en": "This is", "mk": "Ова е"}  # noqa: RUF001 (Cyrillic)
     return variant(msg, body=msg.body.replace(marker[msg.language], sentence + " " + marker[msg.language], 1))
 
 
@@ -467,7 +474,11 @@ def _inject(msg: RenderedMessage, sentence: str) -> RenderedMessage:
         ("seller_initial_de_v1", "Mein Budget ist begrenzt.", "BUDGET_OR_PROFIT"),
         ("seller_initial_de_v1", "Das Auto geht in den Export.", "UNRELATED_BUSINESS"),
         ("seller_initial_de_v1", "Rufen Sie mich per Telefon an.", "PERSONAL_DATA_CONTACT_CHANNEL"),
-        ("seller_initial_de_v1", "Bitte senden Sie Ihren Personalausweis.", "PERSONAL_DATA_IDENTITY_DOCUMENT"),
+        (
+            "seller_initial_de_v1",
+            "Bitte senden Sie Ihren Personalausweis.",
+            "PERSONAL_DATA_IDENTITY_DOCUMENT",
+        ),
         ("seller_initial_de_v1", "Das ist eine verbindliche Anfrage.", "COMMITMENT_PRICE_ACCEPTANCE"),
         ("seller_initial_it_v1", "Posso lasciare una caparra.", "COMMITMENT_DEPOSIT_OR_PAYMENT"),
         ("seller_initial_it_v1", "Vorrei fissare un appuntamento.", "APPOINTMENT_OR_VIEWING"),
@@ -491,7 +502,9 @@ def _inject(msg: RenderedMessage, sentence: str) -> RenderedMessage:
         ("seller_initial_mk_preview_v1", "Ќе платам капар.", "COMMITMENT_DEPOSIT_OR_PAYMENT"),
     ],
 )
-def test_scope_validator_rejects_commitments_and_extra_data(template_id: str, sentence: str, problem: str) -> None:
+def test_scope_validator_rejects_commitments_and_extra_data(
+    template_id: str, sentence: str, problem: str
+) -> None:
     base = rendered() if template_id == MK_PREVIEW_TEMPLATE_ID else rendered(template_id)
     msg = render_preview_mk(base) if template_id == MK_PREVIEW_TEMPLATE_ID else base
     result = validate_scope(_inject(msg, sentence))
@@ -530,7 +543,9 @@ def test_question_structure() -> None:
     assert "DOCUMENTS_QUESTION_INCOMPLETE" in validate_scope(no_coc).problems
     plain_price = variant(msg, body=msg.body.replace("niedrigster Verkaufspreis", "Preis"))
     assert "PRICE_QUESTION_NOT_LOWEST_FINAL" in validate_scope(plain_price).problems
-    no_disclaimer = variant(msg, body=msg.body.replace("Es handelt sich zunächst um eine unverbindliche Anfrage.\n", ""))
+    no_disclaimer = variant(
+        msg, body=msg.body.replace("Es handelt sich zunächst um eine unverbindliche Anfrage.\n", "")
+    )
     assert "NON_BINDING_STATEMENT_MISSING" in validate_scope(no_disclaimer).problems
     subject_question = variant(msg, subject=msg.subject + "?")
     assert "EXTRA_QUESTION" in validate_scope(subject_question).problems
@@ -551,9 +566,15 @@ def test_urls_markup_headers_and_signature() -> None:
     assert "UNRENDERED_PLACEHOLDER" in validate_scope(_inject(msg, "{{seller_note}}")).problems
     assert "SIGNATURE_MISMATCH" in validate_scope(variant(msg, body=msg.body + "PS\n")).problems
     assert "BODY_TOO_LONG" in validate_scope(variant(msg, body="Hello.\n" * 400 + msg.body)).problems
-    assert "SUBJECT_TOO_LONG" in validate_scope(variant(msg, subject="Enquiry " + "a" * 300 + " " + REF)).problems
+    assert (
+        "SUBJECT_TOO_LONG"
+        in validate_scope(variant(msg, subject="Enquiry " + "a" * 300 + " " + REF)).problems
+    )
     assert "LISTING_REFERENCE_MISSING" in validate_scope(variant(msg, subject="Enquiry")).problems
-    assert "CONTROL_CHARACTER" in validate_scope(variant(msg, body=msg.body.replace("Hello", "He\u200bllo"))).problems
+    assert (
+        "CONTROL_CHARACTER"
+        in validate_scope(variant(msg, body=msg.body.replace("Hello", "He\u200bllo"))).problems
+    )
 
 
 def test_ordinary_wording_fix_within_scope_passes() -> None:
@@ -580,7 +601,9 @@ def test_envelope_rules() -> None:
         "CC_BCC": MessageEnvelope(to=("a@example.invalid",), cc=("c@example.invalid",)),
         "ATTACHMENT": MessageEnvelope(to=("a@example.invalid",), attachments=("passport.pdf",)),
         "EXTRA_REPLY_TO": MessageEnvelope(to=("a@example.invalid",), reply_to=("x@e.invalid", "y@e.invalid")),
-        "HEADER_NOT_ALLOWED": MessageEnvelope(to=("a@example.invalid",), extra_headers={"Bcc": "x@example.invalid"}),
+        "HEADER_NOT_ALLOWED": MessageEnvelope(
+            to=("a@example.invalid",), extra_headers={"Bcc": "x@example.invalid"}
+        ),
     }
     for problem, envelope in cases.items():
         assert problem in validate_scope(msg, envelope=envelope).problems, problem

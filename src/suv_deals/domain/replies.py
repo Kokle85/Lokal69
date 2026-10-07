@@ -2353,8 +2353,8 @@ class ReplyClaims(BaseModel):
 _ABBREVIATIONS: Final = frozenset(
     {
         "ca", "inkl", "zzgl", "exkl", "excl", "incl", "nr", "bzw", "evtl", "ggf", "usw", "etc", "z", "b",
-        "d", "h", "u", "mfg", "str", "tel", "mwst", "ust", "vb", "vhb", "approx", "no", "n", "pag", "sig",
-        "dott", "ing", "rag", "mr", "mrs", "ms", "dr", "st", "av", "bd", "env", "ps", "km", "ccm", "tsd",
+        "d", "h", "u", "mfg", "str", "tel", "approx", "pag", "sig",
+        "dott", "ing", "rag", "mr", "mrs", "ms", "dr", "st", "av", "bd", "env", "tsd",
         "abs", "art", "geb", "mod", "ff", "vs", "co", "pp",
     }
 )  # fmt: skip
@@ -2599,6 +2599,7 @@ _CONDITION_RULES: Final[tuple[tuple[PriceCondition, re.Pattern[str]], ...]] = (
         PriceCondition.CASH_PAYMENT,
         re.compile(
             r"\b(?:barzahlung|bar bezahlen|in bar|nur bar|in contanti|contanti|en esp[èe]ces|comptant|cash)\b"
+            r"|(?<!al )\bbar\b"
         ),
     ),
     (

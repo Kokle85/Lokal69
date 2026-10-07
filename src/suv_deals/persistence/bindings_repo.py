@@ -36,7 +36,6 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Scope
 from suv_deals.domain.notifications import QuietHours
@@ -143,7 +142,9 @@ def _categories(values: Sequence[str]) -> list[str]:
     result = list(dict.fromkeys(values))
     unknown = [c for c in result if c not in CATEGORY_PROVIDERS]
     if unknown or not result:
-        raise ValidationFailed("event_categories must name known categories", details={"fields": ["event_categories"]})
+        raise ValidationFailed(
+            "event_categories must name known categories", details={"fields": ["event_categories"]}
+        )
     return result
 
 
@@ -164,7 +165,9 @@ def _binding(row: Mapping[str, Any]) -> DestinationBinding:
 def _preference(row: Mapping[str, Any]) -> NotificationPreference:
     data = dict(row)
     try:
-        data["quiet_hours"] = None if row["quiet_hours"] is None else QuietHours.model_validate(row["quiet_hours"])
+        data["quiet_hours"] = (
+            None if row["quiet_hours"] is None else QuietHours.model_validate(row["quiet_hours"])
+        )
     except ValidationError as exc:
         raise ValidationFailed("stored quiet hours are invalid") from exc
     data["event_categories"] = tuple(row["event_categories"] or ())
@@ -198,7 +201,7 @@ async def create_binding(
     async with mapped_errors():
         row = await fetch_one(
             conn,
-            "insert into app.destination_bindings (workspace_id, provider, label, external_workspace_id,"
+            "insert into app.destination_bindings (workspace_id, provider, label, external_workspace_id,"  # noqa: S608
             " external_channel_id, external_app_id) values (%(ws)s, %(provider)s, %(label)s, %(team)s,"
             f" %(channel)s, %(app)s) returning {_BINDING_COLUMNS}",
             {
@@ -212,7 +215,13 @@ async def create_binding(
         )
         assert row is not None
         await audit.record(
-            conn, actor, "notification.binding_create", "destination_binding", row["id"], None, 1,
+            conn,
+            actor,
+            "notification.binding_create",
+            "destination_binding",
+            row["id"],
+            None,
+            1,
             metadata={"provider": provider},
         )
     return _binding(row)
@@ -270,15 +279,26 @@ async def approve_binding(
             raise VersionConflict("The destination is already approved; create a new binding to change it")
         row = await fetch_one(
             conn,
-            "update app.destination_bindings set approval_reference = %(reference)s, approved_by = %(principal)s,"
+            "update app.destination_bindings set approval_reference = %(reference)s,"  # noqa: S608
+            " approved_by = %(principal)s,"
             " approved_at = clock_timestamp(), row_version = row_version + 1"
             f" where workspace_id = %(ws)s and id = %(id)s returning {_BINDING_COLUMNS}",
-            {"ws": actor.workspace_id, "id": binding_id, "reference": reference, "principal": actor.principal_id},
+            {
+                "ws": actor.workspace_id,
+                "id": binding_id,
+                "reference": reference,
+                "principal": actor.principal_id,
+            },
         )
         assert row is not None
         await audit.record(
-            conn, actor, "notification.binding_approve", "destination_binding", binding_id,
-            expected_version, row["row_version"],
+            conn,
+            actor,
+            "notification.binding_approve",
+            "destination_binding",
+            binding_id,
+            expected_version,
+            row["row_version"],
         )
     return _binding(row)
 
@@ -296,14 +316,20 @@ async def set_binding_enabled(
             await _check_exclusive(conn, actor, binding_overrides={binding_id: True})
         row = await fetch_one(
             conn,
-            "update app.destination_bindings set enabled = %(enabled)s, row_version = row_version + 1"
+            "update app.destination_bindings set enabled = %(enabled)s, row_version = row_version + 1"  # noqa: S608
             f" where workspace_id = %(ws)s and id = %(id)s returning {_BINDING_COLUMNS}",
             {"ws": actor.workspace_id, "id": binding_id, "enabled": enabled},
         )
         assert row is not None
         await audit.record(
-            conn, actor, "notification.route_change", "destination_binding", binding_id,
-            expected_version, row["row_version"], metadata={"enabled": enabled},
+            conn,
+            actor,
+            "notification.route_change",
+            "destination_binding",
+            binding_id,
+            expected_version,
+            row["row_version"],
+            metadata={"enabled": enabled},
         )
     return _binding(row)
 
@@ -317,14 +343,20 @@ async def mark_binding_verified(
         await _lock_binding(conn, actor, binding_id, expected_version)
         row = await fetch_one(
             conn,
-            "update app.destination_bindings set verified_at = clock_timestamp(), row_version = row_version + 1"
+            "update app.destination_bindings set verified_at = clock_timestamp(),"  # noqa: S608
+            " row_version = row_version + 1"
             f" where workspace_id = %(ws)s and id = %(id)s returning {_BINDING_COLUMNS}",
             {"ws": actor.workspace_id, "id": binding_id},
         )
         assert row is not None
         await audit.record(
-            conn, actor, "notification.binding_verify", "destination_binding", binding_id,
-            expected_version, row["row_version"],
+            conn,
+            actor,
+            "notification.binding_verify",
+            "destination_binding",
+            binding_id,
+            expected_version,
+            row["row_version"],
         )
     return _binding(row)
 
@@ -358,7 +390,7 @@ async def list_preferences(conn: Conn, actor: ActorContext) -> list[Notification
     return [_preference(r) for r in rows]
 
 
-async def upsert_preferences(  # noqa: PLR0913 - explicit preference fields
+async def upsert_preferences(
     conn: Conn,
     actor: ActorContext,
     binding_id: UUID,
@@ -378,7 +410,8 @@ async def upsert_preferences(  # noqa: PLR0913 - explicit preference fields
     async with mapped_errors():
         binding = await fetch_one(
             conn,
-            "select provider from app.destination_bindings where workspace_id = %(ws)s and id = %(id)s for share",
+            "select provider from app.destination_bindings where workspace_id = %(ws)s and id = %(id)s"
+            " for share",
             {"ws": actor.workspace_id, "id": binding_id},
         )
         if binding is None:
@@ -398,7 +431,7 @@ async def upsert_preferences(  # noqa: PLR0913 - explicit preference fields
         if expected_version is None:
             row = await fetch_one(
                 conn,
-                "insert into app.notification_preferences (workspace_id, destination_binding_id,"
+                "insert into app.notification_preferences (workspace_id, destination_binding_id,"  # noqa: S608
                 " event_categories, quiet_hours, urgency_policy) values (%(ws)s, %(binding)s,"
                 f" %(categories)s::text[], %(quiet)s, %(urgency)s) returning {_PREFERENCE_COLUMNS}",
                 params,
@@ -410,14 +443,19 @@ async def upsert_preferences(  # noqa: PLR0913 - explicit preference fields
             if current is None:
                 raise NotFound("Notification preferences not found")
             if current["row_version"] != expected_version:
-                raise VersionConflict(expected_version=expected_version, current_version=current["row_version"])
+                raise VersionConflict(
+                    expected_version=expected_version, current_version=current["row_version"]
+                )
             if current["enabled"]:
                 await _check_exclusive(
-                    conn, actor, preference_overrides={current["id"]: (True, tuple(categories))}, locked=locked
+                    conn,
+                    actor,
+                    preference_overrides={current["id"]: (True, tuple(categories))},
+                    locked=locked,
                 )
             row = await fetch_one(
                 conn,
-                "update app.notification_preferences set event_categories = %(categories)s::text[],"
+                "update app.notification_preferences set event_categories = %(categories)s::text[],"  # noqa: S608
                 " quiet_hours = %(quiet)s, urgency_policy = %(urgency)s, row_version = row_version + 1"
                 " where workspace_id = %(ws)s and destination_binding_id = %(binding)s"
                 f" returning {_PREFERENCE_COLUMNS}",
@@ -426,8 +464,14 @@ async def upsert_preferences(  # noqa: PLR0913 - explicit preference fields
             prior = expected_version
         assert row is not None
         await audit.record(
-            conn, actor, "notification.preferences_change", "notification_preference", row["id"],
-            prior, row["row_version"], metadata={"categories": categories},
+            conn,
+            actor,
+            "notification.preferences_change",
+            "notification_preference",
+            row["id"],
+            prior,
+            row["row_version"],
+            metadata={"categories": categories},
         )
     return _preference(row)
 
@@ -453,7 +497,7 @@ async def approve_preferences(
         await _lock_preference(conn, actor, preference_id, expected_version)
         row = await fetch_one(
             conn,
-            "update app.notification_preferences set approval_reference = %(reference)s,"
+            "update app.notification_preferences set approval_reference = %(reference)s,"  # noqa: S608
             " approved_by = %(principal)s, approved_at = clock_timestamp(), row_version = row_version + 1"
             f" where workspace_id = %(ws)s and id = %(id)s returning {_PREFERENCE_COLUMNS}",
             {
@@ -465,8 +509,13 @@ async def approve_preferences(
         )
         assert row is not None
         await audit.record(
-            conn, actor, "notification.preferences_approve", "notification_preference", preference_id,
-            expected_version, row["row_version"],
+            conn,
+            actor,
+            "notification.preferences_approve",
+            "notification_preference",
+            preference_id,
+            expected_version,
+            row["row_version"],
         )
     return _preference(row)
 
@@ -489,14 +538,20 @@ async def set_preferences_enabled(
             )
         row = await fetch_one(
             conn,
-            "update app.notification_preferences set enabled = %(enabled)s, row_version = row_version + 1"
+            "update app.notification_preferences set enabled = %(enabled)s, row_version = row_version + 1"  # noqa: S608
             f" where workspace_id = %(ws)s and id = %(id)s returning {_PREFERENCE_COLUMNS}",
             {"ws": actor.workspace_id, "id": preference_id, "enabled": enabled},
         )
         assert row is not None
         await audit.record(
-            conn, actor, "notification.route_change", "notification_preference", preference_id,
-            expected_version, row["row_version"], metadata={"enabled": enabled},
+            conn,
+            actor,
+            "notification.route_change",
+            "notification_preference",
+            preference_id,
+            expected_version,
+            row["row_version"],
+            metadata={"enabled": enabled},
         )
     return _preference(row)
 
@@ -590,23 +645,23 @@ async def routes_for_workspace(conn: Conn, workspace_id: UUID) -> list[Activatio
     return routes
 
 
-async def selected_route(conn: Conn, actor: ActorContext, category: EventCategory) -> ActivationRouteSelection | None:
+async def selected_route(
+    conn: Conn, actor: ActorContext, category: EventCategory
+) -> ActivationRouteSelection | None:
     """The single active route for ``category`` (``None``: no external activation)."""
     _require_reader(actor)
     return await route_for(conn, actor.workspace_id, category)
 
 
-async def route_for(conn: Conn, workspace_id: UUID, category: EventCategory) -> ActivationRouteSelection | None:
+async def route_for(
+    conn: Conn, workspace_id: UUID, category: EventCategory
+) -> ActivationRouteSelection | None:
     if category not in CATEGORY_PROVIDERS:
         raise ValidationFailed("unknown event category")
     matches = [r for r in await routes_for_workspace(conn, workspace_id) if r.category == category]
     if len(matches) > 1:  # pragma: no cover - prevented by _check_exclusive under row locks
         raise ValidationFailed("more than one active route for this category; disable one")
     return matches[0] if matches else None
-
-
-def _utc(value: datetime | None) -> datetime | None:
-    return None if value is None else ensure_utc(value)
 
 
 __all__ = [

@@ -41,6 +41,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
@@ -53,6 +54,7 @@ from suv_deals.domain.enums import (
     Availability,
     EligibilityState,
     OdometerClaim,
+    Precision,
     PriceBasis,
     PriceType,
     ProfileKey,
@@ -260,9 +262,7 @@ _NO_CLAIM: Final[dict[str, Any]] = {
 }
 
 
-async def _write_case(
-    conn: Conn, actor: ActorContext, row: _CaseRow, changes: Mapping[str, Any]
-) -> None:
+async def _write_case(conn: Conn, actor: ActorContext, row: _CaseRow, changes: Mapping[str, Any]) -> None:
     values = {**row.values(), **changes}
     params = {
         **values,
@@ -285,7 +285,9 @@ def _replay_error(code: str) -> AppError:
     return AppError(error_code, "The original request with this idempotency key failed", retryable=False)
 
 
-async def _begin(conn: Conn, actor: ActorContext, operation: str, key: str, request_hash: str) -> dict[str, Any] | None:
+async def begin_idempotent(
+    conn: Conn, actor: ActorContext, operation: str, key: str, request_hash: str
+) -> dict[str, Any] | None:
     started = await idempotency.begin(conn, actor, operation, key, request_hash)
     if isinstance(started, idempotency.Replay):
         return started.result
@@ -325,11 +327,15 @@ def _readiness(valuation_state: ValuationState | None, document: Any) -> str:
     if isinstance(body, Mapping):
         scenarios = body.get("scenarios")
         if isinstance(scenarios, Mapping):
-            unknown = [str(u.get("item")) for u in scenarios.get("unknown_lines") or () if isinstance(u, Mapping)]
+            unknown = [
+                str(u.get("item")) for u in scenarios.get("unknown_lines") or () if isinstance(u, Mapping)
+            ]
         comparable = body.get("comparable")
         if isinstance(comparable, Mapping):
             comparable_status = _COMPARABLE_STATUS.get(str(comparable.get("quality")))
-    return derive_readiness(valuation_state, unknown_cost_categories=unknown, comparable_status=comparable_status)
+    return derive_readiness(
+        valuation_state, unknown_cost_categories=unknown, comparable_status=comparable_status
+    )
 
 
 def _priority(rank: RankResult | None) -> tuple[int, dict[str, Any], str | None]:
@@ -357,7 +363,11 @@ async def _emit_pending(
         priority=priority,
         queue=snapshot.profile_key.value,
     )
-    route = None if draft.is_fixture else await bindings_repo.route_for(conn, actor.workspace_id, "candidate_discovery")
+    route = (
+        None
+        if draft.is_fixture
+        else await bindings_repo.route_for(conn, actor.workspace_id, "candidate_discovery")
+    )
     return await outbox.enqueue_event(
         conn,
         actor,
@@ -384,7 +394,7 @@ select l.id, l.current_revision_id, cr.revision_number as current_revision_numbe
 """
 
 
-async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of the work package
+async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work package
     conn: Conn,
     actor: ActorContext,
     listing_id: UUID,
@@ -415,7 +425,9 @@ async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of
         number = int(revision["revision_number"])
         current_number = listing["current_revision_number"]
         if current_number is not None and number < int(current_number):
-            return CaseUpsertResult(action="stale_revision", case_id=None, case_version=None, state=None, readiness=None)
+            return CaseUpsertResult(
+                action="stale_revision", case_id=None, case_version=None, state=None, readiness=None
+            )
         valuation_state: ValuationState | None = None
         valuation_fixture = False
         document: Any = None
@@ -436,11 +448,7 @@ async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of
         is_fixture = listing["source_mode"] == "fixture" or valuation_fixture
         readiness = _readiness(valuation_state, document)
         priority, ranking, ranking_version = _priority(rank)
-        qualifies = (
-            profile.enabled
-            and screening.state in _ELIGIBLE
-            and screening.profile == profile.key
-        )
+        qualifies = profile.enabled and screening.state in _ELIGIBLE and screening.profile == profile.key
         open_row = await fetch_one(
             conn,
             _CASE_SELECT + " and c.listing_id = %(listing_id)s and c.profile_key = %(profile)s"
@@ -449,7 +457,9 @@ async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of
         )
     if open_row is None:
         if not qualifies:
-            return CaseUpsertResult(action="not_qualifying", case_id=None, case_version=None, state=None, readiness=None)
+            return CaseUpsertResult(
+                action="not_qualifying", case_id=None, case_version=None, state=None, readiness=None
+            )
         return await _create_case(
             conn,
             actor,
@@ -478,7 +488,7 @@ async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of
             reason=f"revision {number} no longer qualifies for {profile.key.value} ({screening.state.value})",
         )
         await _apply_update(conn, actor, row, update, readiness=row.readiness)
-        await _audit_upsert(conn, actor, case, update.row_version, "superseded")
+        await _audit_upsert(conn, actor, case, case.row_version, update.row_version, action="superseded")
         return CaseUpsertResult(
             action="superseded",
             case_id=case.case_id,
@@ -566,7 +576,7 @@ async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of
             dashboard_base_url=dashboard_base_url,
             priority=event_priority,
         )
-    await _audit_upsert(conn, actor, case, new_snapshot.row_version, "updated")
+    await _audit_upsert(conn, actor, case, case.row_version, new_snapshot.row_version, action="updated")
     return CaseUpsertResult(
         action="updated",
         case_id=case.case_id,
@@ -578,7 +588,7 @@ async def upsert_review_case(  # noqa: PLR0913, PLR0917 - positional contract of
     )
 
 
-async def _apply_update(  # noqa: PLR0913 - explicit column overrides
+async def _apply_update(
     conn: Conn,
     actor: ActorContext,
     row: _CaseRow,
@@ -624,7 +634,7 @@ async def _apply_update(  # noqa: PLR0913 - explicit column overrides
     )
 
 
-async def _create_case(  # noqa: PLR0913 - explicit case columns
+async def _create_case(
     conn: Conn,
     actor: ActorContext,
     *,
@@ -648,10 +658,10 @@ async def _create_case(  # noqa: PLR0913 - explicit case columns
         created = await fetch_one(
             conn,
             "insert into app.review_cases (workspace_id, listing_id, revision_id, valuation_id, profile_key,"
-            " queue_label, state, readiness, priority, ranking, ranking_version, row_version, reason, is_fixture)"
-            " values (%(ws)s, %(listing_id)s, %(revision_id)s, %(valuation_id)s, %(profile)s, %(queue_label)s,"
-            " 'pending', %(readiness)s, %(priority)s, %(ranking)s, %(ranking_version)s, 1, %(reason)s,"
-            " %(is_fixture)s) returning id",
+            " queue_label, state, readiness, priority, ranking, ranking_version, row_version, reason,"
+            " is_fixture) values (%(ws)s, %(listing_id)s, %(revision_id)s, %(valuation_id)s, %(profile)s,"
+            " %(queue_label)s, 'pending', %(readiness)s, %(priority)s, %(ranking)s, %(ranking_version)s, 1,"
+            " %(reason)s, %(is_fixture)s) returning id",
             {
                 "ws": actor.workspace_id,
                 "listing_id": listing_id,
@@ -689,7 +699,7 @@ async def _create_case(  # noqa: PLR0913 - explicit case columns
         dashboard_base_url=dashboard_base_url,
         priority=event_priority,
     )
-    await _audit_upsert(conn, actor, snapshot, 1, "created", prior=None)
+    await _audit_upsert(conn, actor, snapshot, None, 1, action="created")
     return CaseUpsertResult(
         action="created",
         case_id=snapshot.case_id,
@@ -705,10 +715,10 @@ async def _audit_upsert(
     conn: Conn,
     actor: ActorContext,
     case: ReviewCaseSnapshot,
+    prior: int | None,
     new_version: int,
-    action: str,
     *,
-    prior: int | None | Literal["current"] = "current",
+    action: str,
 ) -> None:
     async with mapped_errors():
         await audit.record(
@@ -717,7 +727,7 @@ async def _audit_upsert(
             "review.case_upsert",
             "review_case",
             case.case_id,
-            case.row_version if prior == "current" else prior,
+            prior,
             new_version,
             metadata={"action": action, "is_fixture": case.is_fixture},
         )
@@ -728,7 +738,7 @@ async def _audit_upsert(
 # =============================================================================================
 
 
-async def claim(  # noqa: PLR0917 - positional contract of the work package
+async def claim(
     conn: Conn,
     actor: ActorContext,
     case_id: UUID,
@@ -740,7 +750,7 @@ async def claim(  # noqa: PLR0917 - positional contract of the work package
     """``reviews_claim``: a fresh opaque token (returned once), expiry by database time."""
     actor.require(Scope.REVIEWS_WRITE)
     request = {"case_id": str(case_id), "expected_version": expected_version}
-    replay = await _begin(
+    replay = await begin_idempotent(
         conn, actor, "reviews_claim", idempotency_key, idempotency.request_hash_for("reviews_claim", request)
     )
     if replay is not None:
@@ -781,14 +791,18 @@ async def claim(  # noqa: PLR0917 - positional contract of the work package
     return ClaimResult.of(grant)
 
 
-async def release(  # noqa: PLR0917 - positional contract of the work package
+async def release(
     conn: Conn, actor: ActorContext, case_id: UUID, claim_token: str, idempotency_key: str
 ) -> ReleaseResultView:
     """``reviews_release``: only the caller's current claim; nothing to release is a no-op."""
     actor.require(Scope.REVIEWS_WRITE)
     request = {"case_id": str(case_id), "claim_token": claim_token}
-    replay = await _begin(
-        conn, actor, "reviews_release", idempotency_key, idempotency.request_hash_for("reviews_release", request)
+    replay = await begin_idempotent(
+        conn,
+        actor,
+        "reviews_release",
+        idempotency_key,
+        idempotency.request_hash_for("reviews_release", request),
     )
     if replay is not None:
         return ReleaseResultView.model_validate(replay)
@@ -840,7 +854,10 @@ async def expire_claims(conn: Conn, actor: ActorContext, *, limit: int = 100) ->
         if expired is None:
             continue
         await _write_case(
-            conn, actor, row, {"state": expired.new_state.value, "row_version": expired.row_version, **_NO_CLAIM}
+            conn,
+            actor,
+            row,
+            {"state": expired.new_state.value, "row_version": expired.row_version, **_NO_CLAIM},
         )
         async with mapped_errors():
             await audit.record(
@@ -875,7 +892,7 @@ def _decision_view(decision: SubmitDecision, decision_id: UUID) -> ReviewDecisio
     return ReviewDecisionView.of(bounded, decision_id=decision_id)
 
 
-async def submit(  # noqa: PLR0913 - server-side context, never request fields
+async def submit(
     conn: Conn,
     actor: ActorContext,
     request: SubmitRequest,
@@ -890,7 +907,7 @@ async def submit(  # noqa: PLR0913 - server-side context, never request fields
     """``reviews_submit`` in ONE transaction (see module docstring)."""
     actor.require(Scope.REVIEWS_WRITE)
     key = request.idempotency_key
-    replay = await _begin(
+    replay = await begin_idempotent(
         conn, actor, "reviews_submit", key, idempotency.request_hash_for("reviews_submit", request)
     )
     if replay is not None:
@@ -898,7 +915,9 @@ async def submit(  # noqa: PLR0913 - server-side context, never request fields
     ws = actor.workspace_id
     preview = await _load_case(conn, actor, request.case_id, lock=False)
     async with mapped_errors():
-        listing = await fetch_one(conn, _LISTING_FACTS_SQL, {"ws": ws, "listing_id": preview.snapshot.listing_id})
+        listing = await fetch_one(
+            conn, _LISTING_FACTS_SQL, {"ws": ws, "listing_id": preview.snapshot.listing_id}
+        )
     if listing is None:  # pragma: no cover - composite FK guarantees the listing
         raise NotFound("Review case not found")
     row = await _load_case(conn, actor, request.case_id, lock=True)
@@ -915,7 +934,9 @@ async def submit(  # noqa: PLR0913 - server-side context, never request fields
                 {"ws": ws, "id": case.valuation_id},
             )
     guard = SubmitGuard(
-        eligibility=None if listing["eligibility_state"] is None else EligibilityState(listing["eligibility_state"]),
+        eligibility=None
+        if listing["eligibility_state"] is None
+        else EligibilityState(listing["eligibility_state"]),
         availability=Availability(listing["availability"]),
         freshness_ok=listing["last_detail_success_at"] is not None
         and now - ensure_utc(listing["last_detail_success_at"]) <= freshness_max_age,
@@ -982,7 +1003,9 @@ async def submit(  # noqa: PLR0913 - server-side context, never request fields
     return view
 
 
-def _valuation_current(valuation: Mapping[str, Any] | None, current_revision_id: UUID | None, now: datetime) -> bool:
+def _valuation_current(
+    valuation: Mapping[str, Any] | None, current_revision_id: UUID | None, now: datetime
+) -> bool:
     """The cited valuation still matches the committed facts: not stale/invalid, not expired and
     computed for the listing's current revision (its dependency fingerprint is still valid)."""
     if valuation is None:
@@ -1087,7 +1110,9 @@ def _alert_state(listing: Mapping[str, Any], valuation: Mapping[str, Any] | None
         )
     return AlertState(
         price_eur=price if price is not None and price > 0 else None,
-        eligibility=None if listing["eligibility_state"] is None else EligibilityState(listing["eligibility_state"]),
+        eligibility=None
+        if listing["eligibility_state"] is None
+        else EligibilityState(listing["eligibility_state"]),
         availability=Availability(listing["availability"]),
         tax_rules_valid=production_ready,
         conservative_contribution_eur=conservative,
@@ -1113,7 +1138,7 @@ async def _previous_alert(conn: Conn, actor: ActorContext, listing_id: UUID) -> 
         return None
 
 
-async def _shortlist_notification(  # noqa: PLR0913 - explicit inputs
+async def _shortlist_notification(
     conn: Conn,
     actor: ActorContext,
     decision: SubmitDecision,
@@ -1179,7 +1204,11 @@ async def _shortlist_notification(  # noqa: PLR0913 - explicit inputs
         is_fixture=decision.is_fixture,
         event_id=event_id,
     )
-    return {"notification": "event_created" if created else "event_exists", "event_id": str(created_id), **facts}
+    return {
+        "notification": "event_created" if created else "event_exists",
+        "event_id": str(created_id),
+        **facts,
+    }
 
 
 # =============================================================================================
@@ -1250,7 +1279,9 @@ def _claim_state(row: Mapping[str, Any], caller: UUID, now: datetime) -> ClaimSt
     expires = row["claim_expires_at"]
     if row["state"] != ReviewState.CLAIMED.value or expires is None or ensure_utc(expires) <= now:
         return ClaimStateView(claimed=False, held_by_caller=False, expires_at=None)
-    return ClaimStateView(claimed=True, held_by_caller=row["claim_holder"] == caller, expires_at=ensure_utc(expires))
+    return ClaimStateView(
+        claimed=True, held_by_caller=row["claim_holder"] == caller, expires_at=ensure_utc(expires)
+    )
 
 
 def _eur_amount(value: Any) -> AmountView:
@@ -1261,7 +1292,9 @@ def _eur_amount(value: Any) -> AmountView:
 
 
 def _queue_item(row: Mapping[str, Any], caller: UUID, now: datetime) -> ReviewQueueItem:
-    valuation_state = ValuationState(row["valuation_state"]) if row["valuation_state"] else ValuationState.NOT_STARTED
+    valuation_state = (
+        ValuationState(row["valuation_state"]) if row["valuation_state"] else ValuationState.NOT_STARTED
+    )
     title = row["title"]
     return ReviewQueueItem(
         case_id=row["id"],
@@ -1283,7 +1316,9 @@ def _queue_item(row: Mapping[str, Any], caller: UUID, now: datetime) -> ReviewQu
         make=row["make"],
         model=row["model"],
         seller_country=row["seller_country"],
-        payable=AmountView.from_minor(row["asking_minor"], row["currency"], unknown_reason="asking price unknown"),
+        payable=AmountView.from_minor(
+            row["asking_minor"], row["currency"], unknown_reason="asking price unknown"
+        ),
         payable_eur=_eur_amount(row["eur_amount"]),
         mileage_km=_plain(row["mileage_km"]),
         research_candidate=valuation_state not in _FIGURE_STATES,
@@ -1293,7 +1328,7 @@ def _queue_item(row: Mapping[str, Any], caller: UUID, now: datetime) -> ReviewQu
     )
 
 
-async def list_pending_queue(  # noqa: PLR0913 - pagination parameters
+async def list_pending_queue(
     conn: Conn,
     actor: ActorContext,
     filters: ReviewQueueFilters,
@@ -1381,8 +1416,8 @@ def _partial_date(year: int | None, month: int | None) -> PartialDate:
     if year is None:
         return PartialDate()
     if month is None:
-        return PartialDate(value=f"{year:04d}", precision="year")  # type: ignore[arg-type]
-    return PartialDate(value=f"{year:04d}-{month:02d}", precision="month")  # type: ignore[arg-type]
+        return PartialDate(value=f"{year:04d}", precision=Precision.YEAR)
+    return PartialDate(value=f"{year:04d}-{month:02d}", precision=Precision.MONTH)
 
 
 def _normalized_field(normalized: Any, *path: str) -> Any:
@@ -1394,10 +1429,12 @@ def _normalized_field(normalized: Any, *path: str) -> Any:
     return value
 
 
-def _enum_or[E](enum: type[E], value: Any, default: E) -> E:
+def _enum_or[E: StrEnum](enum: type[E], value: object, default: E) -> E:
+    if not isinstance(value, str):
+        return default
     try:
-        return enum(value)  # type: ignore[call-arg]
-    except (ValueError, TypeError):
+        return enum(value)
+    except ValueError:
         return default
 
 
@@ -1407,7 +1444,12 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
     row = await _load_case(conn, actor, case_id, lock=False)
     case = row.snapshot
     now = ensure_utc(await db_now(conn))
-    params = {"ws": actor.workspace_id, "listing_id": case.listing_id, "revision_id": case.revision_id, "id": case_id}
+    params = {
+        "ws": actor.workspace_id,
+        "listing_id": case.listing_id,
+        "revision_id": case.revision_id,
+        "id": case_id,
+    }
     async with mapped_errors():
         listing = await fetch_one(conn, _CANDIDATE_SQL, params)
         valuation = None
@@ -1422,12 +1464,15 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
         decisions = await fetch_all(
             conn,
             "select d.*, r.revision_number from app.review_decisions d"
-            " join app.listing_revisions r on r.workspace_id = d.workspace_id and r.id = d.listing_revision_id"
+            " join app.listing_revisions r"
+            "   on r.workspace_id = d.workspace_id and r.id = d.listing_revision_id"
             " where d.workspace_id = %(ws)s and d.case_id = %(id)s order by d.case_version limit 200",
             params,
         )
     assert listing is not None
-    valuation_state = ValuationState(valuation["state"]) if valuation is not None else ValuationState.NOT_STARTED
+    valuation_state = (
+        ValuationState(valuation["state"]) if valuation is not None else ValuationState.NOT_STARTED
+    )
     normalized = listing["normalized"]
     payable_eur = _eur_amount(listing["eur_amount"])
     summary = CandidateSummary(
@@ -1438,18 +1483,24 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
         source_key=listing["source_key"],
         source_country=listing["source_country"],
         seller_country=listing["seller_country"],
-        title=None if _normalized_field(normalized, "title") is None else str(_normalized_field(normalized, "title"))[:300],
+        title=None
+        if _normalized_field(normalized, "title") is None
+        else str(_normalized_field(normalized, "title"))[:300],
         make=listing["make"],
         model=listing["model"],
         generation=listing["vehicle_generation"],
         price=PriceSummary(
-            payable=AmountView.from_minor(listing["asking_minor"], listing["currency"], unknown_reason="asking price unknown"),
+            payable=AmountView.from_minor(
+                listing["asking_minor"], listing["currency"], unknown_reason="asking price unknown"
+            ),
             original_currency=listing["currency"],
             eur_equivalent=payable_eur,
             fx_rate=None,
             basis=_enum_or(PriceBasis, listing["price_basis"], PriceBasis.UNKNOWN),
             price_type=_enum_or(PriceType, listing["price_type"], PriceType.UNKNOWN),
-            negotiable=_enum_or(Tristate, _normalized_field(normalized, "price", "negotiable"), Tristate.UNKNOWN),
+            negotiable=_enum_or(
+                Tristate, _normalized_field(normalized, "price", "negotiable"), Tristate.UNKNOWN
+            ),
         ),
         mileage_km=_plain(listing["mileage_km"]),
         mileage_claim=_enum_or(
@@ -1457,8 +1508,12 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
         ),
         first_registration=_partial_date(listing["registration_year"], listing["registration_month"]),
         availability=Availability(listing["availability"]),
-        eligibility=None if listing["eligibility_state"] is None else EligibilityState(listing["eligibility_state"]),
-        eligibility_profile=None if listing["eligibility_profile"] is None else ProfileKey(listing["eligibility_profile"]),
+        eligibility=None
+        if listing["eligibility_state"] is None
+        else EligibilityState(listing["eligibility_state"]),
+        eligibility_profile=None
+        if listing["eligibility_profile"] is None
+        else ProfileKey(listing["eligibility_profile"]),
         queue_label=row.queue_label,
         valuation_id=case.valuation_id,
         valuation_state=valuation_state,
@@ -1492,9 +1547,15 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
             conservative_contribution=AmountView.from_minor(
                 valuation["conservative_contribution_minor"], currency, unknown_reason=reason
             ),
-            base_contribution=AmountView.from_minor(valuation["base_contribution_minor"], currency, unknown_reason=reason),
+            base_contribution=AmountView.from_minor(
+                valuation["base_contribution_minor"], currency, unknown_reason=reason
+            ),
         )
-    claim_row = {"state": case.state.value, "claim_expires_at": case.claim_expires_at, "claim_holder": case.claim_holder}
+    claim_row = {
+        "state": case.state.value,
+        "claim_expires_at": case.claim_expires_at,
+        "claim_holder": case.claim_holder,
+    }
     return ReviewCaseView(
         case_id=case.case_id,
         case_version=case.row_version,
@@ -1560,6 +1621,7 @@ __all__ = [
     "CaseUpsertResult",
     "ReviewQueueFilters",
     "ReviewQueueResult",
+    "begin_idempotent",
     "claim",
     "expire_claims",
     "get_case",

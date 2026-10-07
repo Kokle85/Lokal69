@@ -86,6 +86,7 @@ from suv_deals.domain.seller_templates import (
     PERMITTED_QUESTIONS,
     SCOPE_HASH,
     SCOPE_VERSION,
+    TEMPLATES,
     MessageEnvelope,
     QuestionId,
     RenderedMessage,
@@ -568,10 +569,13 @@ class VehicleIdentification(BaseModel):
                 gearbox=vehicle.gearbox,
                 drive=vehicle.drive,
             )
+        generation = match.generation
+        if generation is None and not match.generation_candidates and vehicle.generation:
+            generation = vehicle.generation  # stated by the listing; the taxonomy has no data for it
         return cls(
             make=match.make,
             model=match.model,
-            generation=match.generation,
+            generation=generation,
             generation_candidates=match.generation_candidates,
             is_suv=match.is_suv,
             confidence=match.confidence,
@@ -1010,10 +1014,89 @@ class ReadinessSeverity(StrEnum):
     INFO = "info"
 
 
+class ReadinessCode(StrEnum):
+    """Typed readiness reason codes (stable; persisted with the rationale)."""
+
+    AUTHORIZATION_NOT_EFFECTIVE = "AUTHORIZATION_NOT_EFFECTIVE"
+    AUTHORIZATION_REVOKED = "AUTHORIZATION_REVOKED"
+    HARD_RULE_FAILED = "HARD_RULE_FAILED"
+    SCREENING_NEEDS_FACTS = "SCREENING_NEEDS_FACTS"
+    PROFILE_OUT_OF_INQUIRY_SCOPE = "PROFILE_OUT_OF_INQUIRY_SCOPE"
+    NOT_SUV = "NOT_SUV"
+    SUV_IDENTITY_UNKNOWN = "SUV_IDENTITY_UNKNOWN"
+    VEHICLE_MODEL_UNIDENTIFIED = "VEHICLE_MODEL_UNIDENTIFIED"
+    VEHICLE_IDENTIFICATION_WEAK = "VEHICLE_IDENTIFICATION_WEAK"
+    GENERATION_AMBIGUOUS = "GENERATION_AMBIGUOUS"
+    GENERATION_UNKNOWN = "GENERATION_UNKNOWN"
+    SPEC_FUEL_UNKNOWN = "SPEC_FUEL_UNKNOWN"
+    SPEC_GEARBOX_UNKNOWN = "SPEC_GEARBOX_UNKNOWN"
+    SPEC_DRIVE_UNKNOWN = "SPEC_DRIVE_UNKNOWN"
+    SOURCE_NOT_PERMITTED = "SOURCE_NOT_PERMITTED"
+    SOURCE_NOT_ACTIVE = "SOURCE_NOT_ACTIVE"
+    OBSERVATION_STALE = "OBSERVATION_STALE"
+    COMPARABLES_MISSING = "COMPARABLES_MISSING"
+    INSUFFICIENT_COMPARABLES = "INSUFFICIENT_COMPARABLES"
+    MATCHING_RATIONALE_MISSING = "MATCHING_RATIONALE_MISSING"
+    SMALL_COMPARABLE_SAMPLE = "SMALL_COMPARABLE_SAMPLE"
+    COSTS_NOT_EVALUATED = "COSTS_NOT_EVALUATED"
+    KNOWN_COSTS_EXCEED_PROCEEDS = "KNOWN_COSTS_EXCEED_PROCEEDS"
+    UNKNOWN_COSTS_LISTED = "UNKNOWN_COSTS_LISTED"
+    PROCEEDS_UNKNOWN = "PROCEEDS_UNKNOWN"
+    PROPOSED_THRESHOLD_NOT_APPLIED = "PROPOSED_THRESHOLD_NOT_APPLIED"
+    TAX_RULE_NOT_APPROVED = "TAX_RULE_NOT_APPROVED"
+    ECONOMICS_INCOMPLETE = "ECONOMICS_INCOMPLETE"
+    FRAUD_WARNING = "FRAUD_WARNING"
+    IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
+    VEHICLE_UNAVAILABLE = "VEHICLE_UNAVAILABLE"
+    VEHICLE_RESERVED = "VEHICLE_RESERVED"
+    CONTRADICTORY_AVAILABILITY = "CONTRADICTORY_AVAILABILITY"
+    SELLER_OPTED_OUT = "SELLER_OPTED_OUT"
+    PRIOR_INQUIRY = "PRIOR_INQUIRY"
+    INQUIRY_IN_PROGRESS = "INQUIRY_IN_PROGRESS"
+    INQUIRY_SUPPRESSED = "INQUIRY_SUPPRESSED"
+    POSSIBLE_DUPLICATE_CONTACT = "POSSIBLE_DUPLICATE_CONTACT"
+    RECIPIENT_UNKNOWN = "RECIPIENT_UNKNOWN"
+    SELLER_EMAIL_UNAVAILABLE = "SELLER_EMAIL_UNAVAILABLE"
+    RECIPIENT_RECHECK_REQUIRED = "RECIPIENT_RECHECK_REQUIRED"
+    RECIPIENT_REJECTED = "RECIPIENT_REJECTED"
+    RECIPIENT_NEEDS_REVIEW = "RECIPIENT_NEEDS_REVIEW"
+    RECIPIENT_NOT_FOR_THIS_LISTING = "RECIPIENT_NOT_FOR_THIS_LISTING"
+    RECIPIENT_SELLER_MISMATCH = "RECIPIENT_SELLER_MISMATCH"
+    LANGUAGE_UNKNOWN = "LANGUAGE_UNKNOWN"
+    LANGUAGE_UNRESOLVED = "LANGUAGE_UNRESOLVED"
+    LANGUAGE_UNSUPPORTED = "LANGUAGE_UNSUPPORTED"
+    LANGUAGE_NOT_AUTHORIZED = "LANGUAGE_NOT_AUTHORIZED"
+    SENDER_NOT_READY = "SENDER_NOT_READY"
+    SENDER_PROVIDER_MISSING = "SENDER_PROVIDER_MISSING"
+    SENDER_ACCOUNT_MISSING = "SENDER_ACCOUNT_MISSING"
+    SENDER_FROM_INVALID = "SENDER_FROM_INVALID"
+    REPLY_TO_INVALID = "REPLY_TO_INVALID"
+    SENDER_DISPLAY_NAME_MISSING = "SENDER_DISPLAY_NAME_MISSING"
+    SENDER_NOT_VERIFIED = "SENDER_NOT_VERIFIED"
+    SENDER_ALIAS_NOT_VERIFIED = "SENDER_ALIAS_NOT_VERIFIED"
+    SENDER_REVOKED = "SENDER_REVOKED"
+    SENDER_UNHEALTHY = "SENDER_UNHEALTHY"
+    INQUIRIES_PAUSED = "INQUIRIES_PAUSED"
+    KILL_SWITCH_ACTIVE = "KILL_SWITCH_ACTIVE"
+    RATE_CAP_REACHED = "RATE_CAP_REACHED"
+    SELLER_COOLDOWN = "SELLER_COOLDOWN"
+    INQUIRY_RESOLVES_UNKNOWNS = "INQUIRY_RESOLVES_UNKNOWNS"
+    # One per SuppressionReason (active suppression matched for this inquiry).
+    SUPPRESSED_HARD_BOUNCE = "SUPPRESSED_HARD_BOUNCE"
+    SUPPRESSED_COMPLAINT = "SUPPRESSED_COMPLAINT"
+    SUPPRESSED_SELLER_OPT_OUT = "SUPPRESSED_SELLER_OPT_OUT"
+    SUPPRESSED_SOURCE_PAUSED = "SUPPRESSED_SOURCE_PAUSED"
+    SUPPRESSED_SENDER_REVOKED = "SUPPRESSED_SENDER_REVOKED"
+    SUPPRESSED_UNRESOLVED_SEND_OUTCOME = "SUPPRESSED_UNRESOLVED_SEND_OUTCOME"
+    SUPPRESSED_KILL_SWITCH = "SUPPRESSED_KILL_SWITCH"
+    SUPPRESSED_CONTRADICTORY_AVAILABILITY = "SUPPRESSED_CONTRADICTORY_AVAILABILITY"
+    SUPPRESSED_MANUAL = "SUPPRESSED_MANUAL"
+
+
 class ReadinessReason(BaseModel):
     model_config = _FROZEN
 
-    code: str = Field(pattern=r"^[A-Z0-9_]+$")
+    code: ReadinessCode
     check: int = Field(ge=0, le=6)  # spec 37.2 check number; 0 = authorization/general
     severity: ReadinessSeverity
     message: str = Field(max_length=300)
@@ -1064,7 +1147,7 @@ class InquiryReadinessDecision(BaseModel):
     rationale_hash: str
 
     def codes(self) -> set[str]:
-        return {r.code for r in self.reasons}
+        return {r.code.value for r in self.reasons}
 
 
 _SEVERITY_ORDER: Final[tuple[tuple[ReadinessSeverity, InquiryReadiness], ...]] = (
@@ -1079,8 +1162,10 @@ class _Collector:
     def __init__(self) -> None:
         self.reasons: list[ReadinessReason] = []
 
-    def add(self, code: str, check: int, severity: ReadinessSeverity, message: str) -> None:
-        self.reasons.append(ReadinessReason(code=code, check=check, severity=severity, message=message[:300]))
+    def add(self, code: ReadinessCode | str, check: int, severity: ReadinessSeverity, message: str) -> None:
+        self.reasons.append(
+            ReadinessReason(code=ReadinessCode(code), check=check, severity=severity, message=message[:300])
+        )
 
 
 def _check_authorization(i: InquiryReadinessInputs, c: _Collector) -> None:
@@ -1117,7 +1202,7 @@ def _check_rules_and_vehicle(i: InquiryReadinessInputs, c: _Collector) -> None:
             "VEHICLE_IDENTIFICATION_WEAK", 1, nf, "make/model identified only weakly (title/low confidence)"
         )
     if v.generation is None:
-        if len(v.generation_candidates) > 1:
+        if v.generation_candidates:
             c.add("GENERATION_AMBIGUOUS", 1, nf, "generation ambiguous near a model change")
         else:
             c.add("GENERATION_UNKNOWN", 1, nf, "generation not identified")
@@ -1799,6 +1884,9 @@ def bind_inquiry(
         problems.append("LANGUAGE_NOT_RESOLVED")
     if message.kind != "seller_inquiry":
         problems.append("NOT_A_SELLER_MESSAGE")
+    registered = TEMPLATES.get(message.template_id)
+    if registered is None or registered.template_hash() != message.template_hash:
+        problems.append("TEMPLATE_NOT_REGISTERED")
     if language.language is not None and message.language != language.language.value:
         problems.append("MESSAGE_LANGUAGE_MISMATCH")
     if message.scope_hash != SCOPE_HASH or not validate_scope(message).ok:
