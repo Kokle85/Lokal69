@@ -2,17 +2,19 @@
 
 - `suggest_possible_same_vehicle` stores a `domain.identity.SameVehicleSuggestion` as a cluster
   with two members. It never merges, deletes or rewrites listings, never merges two existing
-  clusters (that pair is reported for human review instead) and never re-links a listing that a
-  reviewer unlinked from that cluster as a false positive. The match basis holds signal codes and
-  scores only: no plate numbers and no personal contact data.
+  clusters (that pair is reported for human review instead) and never re-links or re-suggests a
+  pair that a reviewer unlinked as a false positive or whose cluster was rejected. The match
+  basis holds signal codes and scores only: no plate numbers and no personal contact data.
 - `confirm_member` / `unlink_member` / `review_cluster` are the manual review (signed-in owner or
   reviewer, ``reviews:write``); every change is audited and bumps the cluster ``row_version``.
   An unlinked member row is kept (who/when/why) so the false-positive decision stays visible.
 - `cluster_lifecycle` derives the earliest observed appearance and the latest source presence of
   the vehicle while keeping each source listing's own evidence (spec 37.9).
 
-Lock order: suggestions lock both listing rows (``app.listings``, id order) and then the cluster;
-reviews lock the cluster row and then its member row.
+Lock order: suggestions lock both listing rows (``app.listings``, in ``(source_id,
+source_listing_id, incarnation)`` byte order -- within one source the order search ingestion and the
+complete-scan absence pass use) and then the cluster; reviews lock the cluster row and then its
+member row.
 """
 
 from __future__ import annotations
@@ -233,6 +235,23 @@ async def _was_unlinked(conn: Conn, workspace_id: UUID, cluster_id: UUID, listin
     return row is not None
 
 
+async def _rejected_pair(conn: Conn, workspace_id: UUID, listing_a: UUID, listing_b: UUID) -> UUID | None:
+    """A cluster that held both listings and was rejected, or from which one of them was unlinked."""
+    row = await fetch_one(
+        conn,
+        "select c.id from app.vehicle_clusters c"
+        " join app.vehicle_cluster_members a on a.workspace_id = c.workspace_id and a.cluster_id = c.id"
+        "  and a.listing_id = %(a)s"
+        " join app.vehicle_cluster_members b on b.workspace_id = c.workspace_id and b.cluster_id = c.id"
+        "  and b.listing_id = %(b)s"
+        " where c.workspace_id = %(workspace_id)s"
+        " and (c.review_status = 'rejected' or a.unlinked_at is not null or b.unlinked_at is not null)"
+        " order by c.created_at, c.id limit 1",
+        {"workspace_id": workspace_id, "a": listing_a, "b": listing_b},
+    )
+    return None if row is None else row["id"]
+
+
 async def _add_member(  # noqa: PLR0917 - private helper
     conn: Conn,
     workspace_id: UUID,
@@ -279,7 +298,8 @@ async def suggest_possible_same_vehicle(
         rows = await fetch_all(
             conn,
             "select id from app.listings where workspace_id = %(workspace_id)s"
-            " and id = any(%(ids)s::uuid[]) order by id for update",
+            " and id = any(%(ids)s::uuid[])"
+            ' order by source_id, source_listing_id collate "C", incarnation for update',
             {"workspace_id": ws, "ids": [first, second]},
         )
         if len(rows) != 2:
@@ -289,6 +309,10 @@ async def suggest_possible_same_vehicle(
         shared = sorted(set(in_a) & set(in_b))
         if shared:
             return SuggestionResult(outcome="already_clustered", cluster_id=shared[0])
+        rejected = await _rejected_pair(conn, ws, listing_a, listing_b)
+        if rejected is not None:
+            # A reviewer already decided this pair is a false positive; never re-suggest it.
+            return SuggestionResult(outcome="previously_unlinked", cluster_id=rejected)
         if in_a and in_b:
             return SuggestionResult(outcome="both_clustered")
         if in_a or in_b:

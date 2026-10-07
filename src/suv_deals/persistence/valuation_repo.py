@@ -50,7 +50,11 @@ Valuations (``app.valuations``)
     18: valuations that depend on a changed listing revision, comparable set/observation, FX
     rate, cost quote/profile, tax rule set or business configuration are marked stale
     immediately and ONE deduplicated recomputation job is queued per affected listing
-    (``valuation.recompute:<listing_id>``).
+    (``valuation.recompute:<listing_id>``; while that job is already RUNNING, one follow-up
+    ``valuation.recompute:<listing_id>:after:<job id>``, because the running job may have read
+    the old inputs). `persist_valuation` holds FOR SHARE locks on the tax rule row and cost
+    profile it cites (a concurrent revoke/approval waits and then finds the new valuation), and
+    refuses cost evidence that is already superseded or cited but not tracked.
 """
 
 from __future__ import annotations
@@ -73,6 +77,7 @@ from suv_deals.domain.enums import (
     CostCategory,
     CostLineStatus,
     FxPurpose,
+    JobState,
     JobType,
     Scope,
     TaxRuleStatus,
@@ -1081,10 +1086,12 @@ async def _check_refs(conn: Conn, actor: ActorContext, valuation: Valuation, ref
         if (deps.tax_rule is None) != (refs.tax_rule_set_row_id is None):
             raise ValidationFailed("tax_rule_set_row_id differs from the recorded dependency")
         if refs.tax_rule_set_row_id is not None and deps.tax_rule is not None:
+            # FOR SHARE: a concurrent status change (revoke/expire/supersede) waits for this
+            # transaction, so its reverse invalidation sees the new valuation (no lost update).
             row = await fetch_one(
                 conn,
                 "select rules -> 'rule_set' ->> 'rule_set_id' as rule_set_id, version, sha256, status,"
-                " is_fixture from app.tax_rule_sets where workspace_id = %(ws)s and id = %(id)s",
+                " is_fixture from app.tax_rule_sets where workspace_id = %(ws)s and id = %(id)s for share",
                 {"ws": ws, "id": refs.tax_rule_set_row_id},
             )
             if row is None:
@@ -1101,6 +1108,12 @@ async def _check_refs(conn: Conn, actor: ActorContext, valuation: Valuation, ref
                 raise VersionConflict("The tax rule set status changed since the calculation; recompute")
         if (deps.cost_profile is None) != (refs.cost_profile_id is None):
             raise ValidationFailed("cost_profile_id differs from the recorded dependency")
+        if refs.cost_profile_id is not None:
+            # Same reason as the tax rule lock: a concurrent approval waits for this insert.
+            await conn.execute(
+                "select id from app.cost_profiles where workspace_id = %(ws)s and id = %(id)s for share",
+                {"ws": ws, "id": refs.cost_profile_id},
+            )
     if refs.cost_profile_id is not None:
         profile = await load_cost_profile(conn, actor, refs.cost_profile_id)
         if profile.profile.reference() != deps.cost_profile:
@@ -1118,7 +1131,37 @@ async def _check_refs(conn: Conn, actor: ActorContext, valuation: Valuation, ref
     cited = set(deps.cost_evidence_ids)
     if any(str(i) not in cited for i in refs.cost_evidence_ids):
         raise ValidationFailed("cost_evidence_ids must be evidence the scenarios cite")
+    await _check_cost_evidence(conn, actor, cited, refs.cost_evidence_ids)
     return revision_id
+
+
+async def _check_cost_evidence(
+    conn: Conn, actor: ActorContext, cited: set[str], tracked: Sequence[UUID]
+) -> None:
+    """Every cited ``app.cost_evidence`` row is tracked in ``cost_evidence_ids`` (otherwise a
+    superseding quote could never find the valuation), and none of them is already superseded
+    (the calculation read outdated evidence: recompute)."""
+    candidates: list[UUID] = []
+    for text in cited:
+        try:
+            candidates.append(UUID(text))
+        except ValueError:
+            continue  # not a cost-evidence row id (e.g. another kind of evidence reference)
+    wanted = sorted(set(candidates) | set(tracked), key=str)
+    if not wanted:
+        return
+    async with mapped_errors():
+        rows = await fetch_all(
+            conn,
+            "select c.id, exists (select 1 from app.cost_evidence n where n.workspace_id = c.workspace_id"
+            " and n.supersedes_id = c.id) as superseded from app.cost_evidence c"
+            " where c.workspace_id = %(ws)s and c.id = any(%(ids)s::uuid[])",
+            {"ws": actor.workspace_id, "ids": wanted},
+        )
+    if any(r["id"] not in set(tracked) for r in rows):
+        raise ValidationFailed("cost_evidence_ids must list every cost evidence row the scenarios cite")
+    if any(r["superseded"] for r in rows):
+        raise VersionConflict("Cited cost evidence was superseded since the calculation; recompute")
 
 
 _VALUATION_COLUMNS: Final = (
@@ -1297,13 +1340,17 @@ class ValuationStateChange(BaseModel):
     stale_at: datetime | None
     stale_reason: str | None
     changed: bool
+    recompute_job_id: UUID | None = None  # the (deduplicated) recomputation queued on a change
 
 
 def stale_reason_text(reasons: Sequence[InvalidationReason], detail: str | None = None) -> str:
     """Same wording as ``domain.valuation.mark_stale`` (``fx, tax_rule``), plus an optional detail."""
     if not reasons:
         raise ValidationFailed("marking a valuation stale needs at least one reason")
-    text = ", ".join(InvalidationReason(r).value for r in reasons)
+    try:
+        text = ", ".join(InvalidationReason(r).value for r in reasons)
+    except ValueError as exc:
+        raise ValidationFailed("unknown invalidation reason") from exc
     if detail:
         text = f"{text}: {detail}"
     return text[:500]
@@ -1317,9 +1364,11 @@ async def mark_stale(
     *,
     detail: str | None = None,
 ) -> ValuationStateChange:
-    """The only valuation state change: open -> ``stale`` (idempotent; ``invalid`` is terminal)."""
+    """The only valuation state change: open -> ``stale`` (idempotent; ``invalid`` is terminal).
+
+    A real change also queues the listing's deduplicated recomputation (``recompute_job_id``)."""
     require_writer(actor)
-    reasons = [reason] if isinstance(reason, InvalidationReason) else list(reason)
+    reasons = [reason] if isinstance(reason, str) else list(reason)  # a StrEnum is a str
     text = stale_reason_text(reasons, detail)
     params = {"ws": actor.workspace_id, "id": valuation_id, "reason": text}
     async with mapped_errors():
@@ -1361,6 +1410,9 @@ async def mark_stale(
             reason=text,
             metadata={"from": prior.value},
         )
+    # Spec 18: mark stale immediately, THEN queue the deduplicated recomputation (same
+    # transaction), so a stale valuation is never orphaned.
+    job_id, _ = await _enqueue_recompute(conn, actor, row["listing_id"], [valuation_id], reasons[0])
     return ValuationStateChange(
         valuation_id=valuation_id,
         listing_id=row["listing_id"],
@@ -1369,6 +1421,7 @@ async def mark_stale(
         stale_at=ensure_utc(updated["stale_at"]),
         stale_reason=text,
         changed=True,
+        recompute_job_id=job_id,
     )
 
 
@@ -1515,6 +1568,42 @@ async def find_dependents(
     return [r["id"] for r in rows]
 
 
+async def _enqueue_recompute(
+    conn: Conn,
+    actor: ActorContext,
+    listing_id: UUID,
+    valuation_ids: Sequence[UUID],
+    reason: InvalidationReason,
+) -> tuple[UUID, bool]:
+    """Queue the listing's recomputation (deduplicated). A recomputation that is already
+    RUNNING may have read its inputs before this change, so it cannot absorb it: one follow-up
+    job (``valuation.recompute:<listing_id>:after:<running job id>``) runs after it."""
+    base_key = f"valuation.recompute:{listing_id}"
+    payload = {
+        "listing_id": str(listing_id),
+        "stale_valuation_ids": [str(v) for v in valuation_ids[:100]],
+        "reason": InvalidationReason(reason).value,
+    }
+
+    def spec(dedup_key: str) -> jobs.JobSpec:
+        return jobs.JobSpec(
+            job_type=JobType.VALUATION, dedup_key=dedup_key, payload=payload, listing_id=listing_id
+        )
+
+    job_id, created = await jobs.enqueue(conn, actor, spec(base_key))
+    if created:
+        return job_id, True
+    async with mapped_errors():
+        existing = await fetch_one(
+            conn,
+            "select state from ops.jobs where workspace_id = %(ws)s and id = %(id)s",
+            {"ws": actor.workspace_id, "id": job_id},
+        )
+    if existing is not None and existing["state"] == JobState.RUNNING.value:
+        return await jobs.enqueue(conn, actor, spec(f"{base_key}:after:{job_id}"))
+    return job_id, False
+
+
 async def invalidate_dependents(
     conn: Conn, actor: ActorContext, change: DependencyChange, *, limit: int = 1000
 ) -> InvalidationResult:
@@ -1553,20 +1642,7 @@ async def invalidate_dependents(
     job_ids: dict[UUID, UUID] = {}
     created = 0
     for listing_id, valuation_ids in by_listing.items():
-        job_id, was_created = await jobs.enqueue(
-            conn,
-            actor,
-            jobs.JobSpec(
-                job_type=JobType.VALUATION,
-                dedup_key=f"valuation.recompute:{listing_id}",
-                payload={
-                    "listing_id": str(listing_id),
-                    "stale_valuation_ids": [str(v) for v in valuation_ids[:100]],
-                    "reason": change.reason.value,
-                },
-                listing_id=listing_id,
-            ),
-        )
+        job_id, was_created = await _enqueue_recompute(conn, actor, listing_id, valuation_ids, change.reason)
         job_ids[listing_id] = job_id
         created += int(was_created)
     if rows:

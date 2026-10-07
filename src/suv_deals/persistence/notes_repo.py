@@ -4,13 +4,14 @@
   claims. The label comes from the authenticated principal, never from the request: an MCP
   client (or system process) writes ``assistant`` notes, a signed-in owner ``owner`` notes and a
   reviewer ``reviewer`` notes. `add_note` is idempotent through ``ops.idempotency_records``
-  (operation ``deals_add_note``, request hash of ``{listing_id, note}``): the same key and text
-  return the original note, the same key with other text is ``IDEMPOTENCY_CONFLICT``. Note text
-  is untrusted data: bounded (1-4000 characters) and refused when it carries control or
-  bidi-override characters.
-- **Watchlists** (``app.watchlists``): one active watch per (listing, member) with an optional
-  recheck interval (1 hour to 30 days; ``next_recheck_at`` in database time) and expiry.
-  Adding again updates the active watch (new ``row_version``); removing is idempotent.
+  (operation ``deals_add_note``, request hash of the validated ``{listing_id, note, case_id}``):
+  the same key and text return the original note, the same key with other text is
+  ``IDEMPOTENCY_CONFLICT``. Note text is untrusted data: bounded (1-4000 characters after
+  trimming) and refused when it carries control or bidi-override characters.
+- **Watchlists** (``app.watchlists``, scope ``rechecks:request`` because a watch schedules
+  budget-controlled rechecks): one active watch per (listing, member) with an optional recheck
+  interval (1 hour to 30 days; ``next_recheck_at`` in database time) and expiry. Adding again
+  updates the active watch (new ``row_version``); removing is idempotent.
 """
 
 from __future__ import annotations
@@ -90,7 +91,8 @@ async def add_note(
 ) -> NoteView:
     """``deals_add_note``: a private, labelled note on a registered listing (idempotent)."""
     actor.require(Scope.NOTES_WRITE)
-    request: dict[str, Any] = {"listing_id": str(listing_id), "note": note}
+    body = _note_text(note)  # validate first: the idempotency hash covers the validated request
+    request: dict[str, Any] = {"listing_id": str(listing_id), "note": body}
     if case_id is not None:
         request["case_id"] = str(case_id)
     replay = await begin_idempotent(
@@ -98,7 +100,6 @@ async def add_note(
     )
     if replay is not None:
         return NoteView.model_validate(replay)
-    body = _note_text(note)
     async with mapped_errors():
         listing = await fetch_one(
             conn,

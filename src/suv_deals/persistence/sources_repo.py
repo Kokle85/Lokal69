@@ -1746,13 +1746,20 @@ async def advance_schedule(
         assert now_row is not None
         now = ensure_utc(now_row["now"])
         current = await jobs.current_slot(conn, schedule.interval) if slot is None else ensure_utc(slot)
-        if schedule.next_due_at > now or (schedule.last_slot is not None and current <= schedule.last_slot):
+        if schedule.next_due_at > now:
             return ScheduleAdvance(
-                schedule_id=schedule.id,
-                outcome="not_due",
-                slot=current,
-                next_due_at=schedule.next_due_at,
+                schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=schedule.next_due_at
             )
+        if schedule.last_slot is not None and current <= schedule.last_slot:
+            # Due by time but this slot was already handled (e.g. the interval changed): move the
+            # due time to the next slot so the schedule does not stay due forever.
+            due = schedule.last_slot + schedule.interval
+            await conn.execute(
+                "update ops.source_schedules set next_due_at = %(due)s, row_version = row_version + 1"
+                " where workspace_id = %(workspace_id)s and id = %(id)s",
+                {"workspace_id": actor.workspace_id, "id": schedule.id, "due": due},
+            )
+            return ScheduleAdvance(schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=due)
         next_due = current + schedule.interval
         gaps: list[str] = []
         if schedule.last_slot is not None and current > schedule.last_slot + schedule.interval:
@@ -1853,6 +1860,18 @@ async def start_crawl_run(
         "watermark_from": None if watermark_from is None else ensure_utc(watermark_from),
     }
     async with mapped_errors():
+        if profile_id is not None:
+            existing = await fetch_one(
+                conn,
+                "select coverage_mode from ops.source_schedules where workspace_id = %(workspace_id)s"
+                " and source_id = %(source_id)s and profile_id = %(profile_id)s"
+                " and partition_key = %(partition_key)s",
+                params,
+            )
+            if existing is not None and existing["coverage_mode"] != mode.value:
+                # The schedule's coverage contract decides how the finished run is applied; a run
+                # in the other mode could never be recorded (and would stay running forever).
+                raise ValidationFailed("the crawl run's coverage mode differs from its schedule")
         row = await fetch_one(
             conn,
             sql.SQL(
@@ -1992,7 +2011,11 @@ async def _apply_run_to_schedule(
                 advanced = True
         else:
             values["page_depth"] = None if run.page_depth is None else min(run.page_depth, 1000)
-            values["last_complete_traversal_at"] = run.started_at
+            # A late finish of an OLDER run never moves the last complete traversal backwards.
+            previous = schedule.last_complete_traversal_at
+            values["last_complete_traversal_at"] = (
+                run.started_at if previous is None else max(previous, run.started_at)
+            )
         values.update(
             {
                 "incomplete_since": None,

@@ -58,6 +58,8 @@ _KEY_RE: Final = re.compile(
 _BUCKET_RE: Final = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}$")
 _MIME_RE: Final = re.compile(r"^[A-Za-z0-9!#$&^_.+-]{1,100}/[A-Za-z0-9!#$&^_.+-]{1,100}$")
 _LOCAL_HOSTS: Final = frozenset({"127.0.0.1", "localhost", "::1"})
+# A legacy JWT-based service_role key (three base64url segments); sb_secret_ keys never match.
+_JWT_RE: Final = re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 _COLUMNS: Final = (
     "id",
     "workspace_id",
@@ -293,8 +295,17 @@ class SupabaseSnapshotStore:
         return f"SupabaseSnapshotStore(bucket={self._bucket!r})"
 
     def _headers(self) -> dict[str, str]:
+        """``apikey`` always; ``Authorization: Bearer`` only for a legacy JWT ``service_role`` key.
+
+        The current secret keys (``sb_secret_...``) are not JWTs: Supabase refuses them in the
+        ``Authorization: Bearer`` header ("send it on the apikey header instead"); the API gateway
+        derives the service-role authorization from the ``apikey`` header itself.
+        """
         secret = self._secret.get_secret_value()
-        return {"Authorization": f"Bearer {secret}", "apikey": secret}
+        headers = {"apikey": secret}
+        if _JWT_RE.fullmatch(secret):
+            headers["Authorization"] = f"Bearer {secret}"
+        return headers
 
     def _object_url(self, key: str) -> str:
         return f"{self._base}/storage/v1/object/{self._bucket}/{validate_object_key(key)}"
@@ -327,8 +338,9 @@ class SupabaseSnapshotStore:
                 "x-upsert": "false",
             },
         )
-        # 409 = the content-addressed object already exists (identical bytes).
-        if response.status_code not in (200, 201, 409):
+        # 409 (or a 400 whose body says "Duplicate", as older Storage versions answer) = the
+        # content-addressed object already exists, i.e. identical bytes are already stored.
+        if response.status_code not in (200, 201, 409) and not _is_duplicate(response):
             raise DependencyUnavailable(f"Snapshot storage refused the upload (HTTP {response.status_code})")
         return StoredObject(
             backend="supabase", object_key=key, content_hash=digest, bytes=len(data), mime_type=mime
@@ -336,7 +348,7 @@ class SupabaseSnapshotStore:
 
     async def get(self, object_key: str) -> bytes:
         response = await self._send("GET", self._object_url(object_key), headers=self._headers())
-        if response.status_code in (400, 404):
+        if response.status_code == 404 or _storage_status(response) == "404":
             raise NotFound("Snapshot content not found")
         if response.status_code != 200:
             raise DependencyUnavailable(f"Snapshot storage read failed (HTTP {response.status_code})")
@@ -355,6 +367,27 @@ class SupabaseSnapshotStore:
         )
         if response.status_code not in (200, 204, 404):
             raise DependencyUnavailable(f"Snapshot storage delete failed (HTTP {response.status_code})")
+
+
+def _storage_body(response: httpx.Response) -> dict[str, object]:
+    """The JSON error body of a 400 answer (older Storage versions wrap the real status in it)."""
+    if response.status_code != 400:
+        return {}
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _storage_status(response: httpx.Response) -> str | None:
+    status = _storage_body(response).get("statusCode")
+    return None if status is None else str(status)
+
+
+def _is_duplicate(response: httpx.Response) -> bool:
+    body = _storage_body(response)
+    return str(body.get("statusCode")) == "409" or str(body.get("error", "")).lower() == "duplicate"
 
 
 def snapshot_store_from_settings(
@@ -497,7 +530,12 @@ async def mark_snapshot_purged(conn: Conn, actor: ActorContext, snapshot_id: UUI
 async def snapshots_due_for_purge(
     conn: Conn, actor: ActorContext, *, limit: int = 100
 ) -> list[SnapshotRecord]:
-    """Retained snapshots past ``retain_until`` that were not purged yet (oldest first)."""
+    """Retained snapshots past ``retain_until`` that were not purged yet (oldest first).
+
+    Objects are content-addressed, so several rows can share one object key. A row is only due
+    when NO unpurged row with the same key is still inside its retention window; the shared
+    object is therefore never deleted while another snapshot still needs it.
+    """
     _require_system(actor)
     if not 1 <= limit <= 1000:
         raise ValidationFailed("limit must be between 1 and 1000")
@@ -506,8 +544,12 @@ async def snapshots_due_for_purge(
             conn,
             _SELECT
             + sql.SQL(
-                " where workspace_id = %(workspace_id)s and retain_until is not null and purged_at is null"
-                " and retain_until <= now() order by retain_until, id limit %(limit)s"
+                " s where s.workspace_id = %(workspace_id)s and s.retain_until is not null"
+                " and s.purged_at is null and s.retain_until <= now()"
+                " and not exists (select 1 from ops.source_snapshots o"
+                "   where o.workspace_id = s.workspace_id and o.object_key = s.object_key"
+                "   and o.purged_at is null and o.retain_until > now())"
+                " order by s.retain_until, s.id limit %(limit)s"
             ),
             {"workspace_id": actor.workspace_id, "limit": limit},
         )

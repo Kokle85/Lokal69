@@ -11,12 +11,20 @@ I/O. Lock order (docs/schema.md section 4): idempotency record -> ``app.listings
   ``domain.reviews.apply_new_revision`` creates a new case version, clears the stale valuation
   (or attaches the new revision's valuation) and returns decided cases to pending; an active
   claim stays but every submission against the old version/revision now fails with
-  ``VERSION_CONFLICT``. A revision that no longer qualifies supersedes the open case
-  (``mark_superseded``). Whenever the resulting case version is ``pending`` because of new
-  information, the ``review.pending`` outbox event of exactly that version is written in the
-  SAME transaction (``build_review_pending_event``; dedup key
+  ``VERSION_CONFLICT``. A new valuation of the same revision is a new case version too (the
+  state is kept). A revision that no longer qualifies supersedes the open case
+  (``mark_superseded``); a late OLDER revision changes nothing (``stale_revision``). Late
+  results never regress current facts: a screening of the current revision that disagrees with
+  the listing's committed screening (state/profile) changes nothing (``stale_screening``), an
+  OLDER valuation of the same revision than the one the case cites changes nothing
+  (``stale_valuation``), a call without a valuation keeps the cited one, and a call without a
+  ranking keeps the current priority/ranking. When the
+  resulting case version is ``pending`` and it is new (created), cites a new revision or has a
+  different readiness, the ``review.pending`` outbox event of exactly that version is written in
+  the SAME transaction (``build_review_pending_event``; dedup key
   ``review.pending:<case_id>:<case_version>``; integer ``event_version`` 1 while the payload
-  keeps ``schema_version`` "1.0"; fixture cases produce blocked fixture events).
+  keeps ``schema_version`` "1.0"; fixture cases produce blocked fixture events; the
+  ``candidate_discovery`` activation route, if one is active, is recorded as the destination).
 - **Claims** (`claim`, `release`, `expire_claims`): ``domain.reviews`` decides; expiry uses
   database time (``clock_timestamp()``); the random token is returned once and only its SHA-256
   is stored. Release only affects the caller's current claim and is idempotent.
@@ -136,7 +144,16 @@ _COMPARABLE_STATUS: Final[dict[str, str]] = {
     "insufficient_comparables": "insufficient_comparables",
 }
 
-UpsertAction = Literal["created", "updated", "unchanged", "superseded", "not_qualifying", "stale_revision"]
+UpsertAction = Literal[
+    "created",
+    "updated",
+    "unchanged",
+    "superseded",
+    "not_qualifying",
+    "stale_revision",
+    "stale_valuation",
+    "stale_screening",
+]
 
 
 # =============================================================================================
@@ -184,7 +201,7 @@ select c.id as case_id, c.workspace_id, c.listing_id, c.profile_key, c.state, c.
        c.claim_holder, c.claim_token_hash, c.claimed_at, c.claim_expires_at, c.latest_decision_id,
        d.outcome as latest_decision_outcome, dr.revision_number as latest_decision_listing_revision,
        c.superseded_by_id, c.is_fixture, c.queue_label, c.readiness, c.priority, c.ranking,
-       c.ranking_version, c.reason, c.created_at, c.updated_at
+       c.ranking_version, c.reason, c.created_at, c.updated_at, v.created_at as valuation_created_at
   from app.review_cases c
   join app.listing_revisions r on r.workspace_id = c.workspace_id and r.id = c.revision_id
   left join app.valuations v on v.workspace_id = c.workspace_id and v.id = c.valuation_id
@@ -364,9 +381,7 @@ async def _emit_pending(
         queue=snapshot.profile_key.value,
     )
     route = (
-        None
-        if draft.is_fixture
-        else await bindings_repo.route_for(conn, actor.workspace_id, "candidate_discovery")
+        None if draft.is_fixture else await bindings_repo.selected_route(conn, actor, "candidate_discovery")
     )
     return await outbox.enqueue_event(
         conn,
@@ -385,7 +400,8 @@ async def _emit_pending(
 
 
 _LISTING_FOR_CASE_SQL: Final = """
-select l.id, l.current_revision_id, cr.revision_number as current_revision_number, s.mode as source_mode
+select l.id, l.current_revision_id, cr.revision_number as current_revision_number, s.mode as source_mode,
+       l.eligibility_state, l.eligibility_profile
   from app.listings l
   join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
   left join app.listing_revisions cr on cr.workspace_id = l.workspace_id and cr.id = l.current_revision_id
@@ -428,14 +444,21 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
             return CaseUpsertResult(
                 action="stale_revision", case_id=None, case_version=None, state=None, readiness=None
             )
+        if _screening_outdated(listing, screening, current=number == current_number):
+            # A late result of an earlier screening of the current revision (e.g. under an older
+            # configuration): the listing's committed screening decides, never this call.
+            return CaseUpsertResult(
+                action="stale_screening", case_id=None, case_version=None, state=None, readiness=None
+            )
         valuation_state: ValuationState | None = None
+        valuation_created: datetime | None = None
         valuation_fixture = False
         document: Any = None
         if valuation_id is not None:
             valuation = await fetch_one(
                 conn,
-                "select id, listing_id, listing_revision_id, state, is_fixture, scenarios from app.valuations"
-                " where workspace_id = %(ws)s and id = %(id)s for share",
+                "select id, listing_id, listing_revision_id, state, is_fixture, scenarios, created_at"
+                " from app.valuations where workspace_id = %(ws)s and id = %(id)s for share",
                 {"ws": ws, "id": valuation_id},
             )
             if valuation is None or valuation["listing_id"] != listing_id:
@@ -443,9 +466,13 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
             if valuation["listing_revision_id"] != revision_id:
                 raise ValidationFailed("the valuation belongs to another revision of the listing")
             valuation_state = ValuationState(valuation["state"])
+            valuation_created = ensure_utc(valuation["created_at"])
             valuation_fixture = bool(valuation["is_fixture"])
             document = valuation["scenarios"]
-        is_fixture = listing["source_mode"] == "fixture" or valuation_fixture
+        is_fixture = listing["source_mode"] == "fixture"
+        if valuation_fixture and not is_fixture:
+            # Fixtures never leak into reality (spec 18): a real listing's case never cites one.
+            raise ValidationFailed("a real listing's review case cannot cite a fixture valuation")
         readiness = _readiness(valuation_state, document)
         priority, ranking, ranking_version = _priority(rank)
         qualifies = profile.enabled and screening.state in _ELIGIBLE and screening.profile == profile.key
@@ -481,6 +508,15 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
     case = row.snapshot
     if case.is_fixture != is_fixture:
         raise ValidationFailed("the fixture status of a review case cannot change; supersede it instead")
+    if number < case.listing_revision:
+        # A late, older revision never changes (or closes) a case on a newer revision.
+        return CaseUpsertResult(
+            action="stale_revision",
+            case_id=case.case_id,
+            case_version=case.row_version,
+            state=case.state,
+            readiness=row.readiness,
+        )
     if not qualifies:
         update = mark_superseded(
             case,
@@ -496,15 +532,24 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
             state=ReviewState.SUPERSEDED,
             readiness=row.readiness,
         )
-    if number < case.listing_revision:
-        return CaseUpsertResult(
-            action="stale_revision",
-            case_id=case.case_id,
-            case_version=case.row_version,
-            state=case.state,
-            readiness=row.readiness,
-        )
-    if number > case.listing_revision:
+    if rank is None:
+        # No ranking in this call: the case keeps its current priority (never reset to 0).
+        priority, ranking, ranking_version = row.priority, row.ranking, row.ranking_version
+    new_revision = number > case.listing_revision
+    if not new_revision and case.valuation_id is not None and valuation_id != case.valuation_id:
+        if valuation_id is None:
+            # Nothing valued in this call (e.g. a re-screening): keep the current valuation.
+            valuation_id, valuation_state, readiness = case.valuation_id, case.valuation_state, row.readiness
+        elif _older(valuation_created, valuation_id, open_row["valuation_created_at"], case.valuation_id):
+            # A late (retried) result: the case already cites a newer valuation of this revision.
+            return CaseUpsertResult(
+                action="stale_valuation",
+                case_id=case.case_id,
+                case_version=case.row_version,
+                state=case.state,
+                readiness=row.readiness,
+            )
+    if new_revision:
         update = apply_new_revision(
             case, revision_id=revision_id, listing_revision=number, reason=f"new material revision {number}"
         )
@@ -567,7 +612,10 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
         )
     event_id: UUID | None = None
     created = False
-    if new_snapshot.state == ReviewState.PENDING:
+    # The pending signal is re-sent for a new revision or a changed readiness. A recomputed
+    # valuation with the same readiness (e.g. a daily FX update) is a new case version but not
+    # a new signal: the case stays in the durable queue, and claims revalidate versions anyway.
+    if new_snapshot.state == ReviewState.PENDING and (new_revision or readiness != row.readiness):
         event_id, created = await _emit_pending(
             conn,
             actor,
@@ -586,6 +634,23 @@ async def upsert_review_case(  # noqa: PLR0917 - positional contract of the work
         event_id=event_id,
         event_created=created,
     )
+
+
+def _screening_outdated(listing: Mapping[str, Any], screening: ScreeningResult, *, current: bool) -> bool:
+    """The offered screening of the CURRENT revision disagrees with the listing's committed
+    screening (state/profile). Unscreened listings and not-yet-current revisions are trusted."""
+    if not current or listing["eligibility_state"] is None:
+        return False
+    profile = None if screening.profile is None else screening.profile.value
+    return (listing["eligibility_state"], listing["eligibility_profile"]) != (screening.state.value, profile)
+
+
+def _older(offered_at: datetime | None, offered: UUID, current_at: Any, current: UUID) -> bool:
+    """``True`` when the offered valuation precedes the cited one in ``current_valuation`` order
+    (``created_at``, then id)."""
+    if offered_at is None or current_at is None:
+        return False
+    return (offered_at, offered) < (ensure_utc(current_at), current)
 
 
 async def _apply_update(
@@ -913,26 +978,32 @@ async def submit(
     if replay is not None:
         return ReviewDecisionView.model_validate(replay)
     ws = actor.workspace_id
+    # Global lock order: listing -> valuation -> review case (docs/schema.md section 4). The
+    # unlocked preview only tells which listing/valuation to lock first; the locked case must
+    # still cite the same valuation, otherwise the case changed underneath (new version).
     preview = await _load_case(conn, actor, request.case_id, lock=False)
     async with mapped_errors():
         listing = await fetch_one(
             conn, _LISTING_FACTS_SQL, {"ws": ws, "listing_id": preview.snapshot.listing_id}
         )
-    if listing is None:  # pragma: no cover - composite FK guarantees the listing
-        raise NotFound("Review case not found")
-    row = await _load_case(conn, actor, request.case_id, lock=True)
-    case = row.snapshot
-    now = ensure_utc(await db_now(conn))
-    valuation = None
-    if case.valuation_id is not None:
-        async with mapped_errors():
+        valuation = None
+        if preview.snapshot.valuation_id is not None:
             valuation = await fetch_one(
                 conn,
                 "select id, listing_revision_id, state, expires_at, scenarios, currency,"
                 " base_contribution_minor, conservative_contribution_minor from app.valuations"
-                " where workspace_id = %(ws)s and id = %(id)s",
-                {"ws": ws, "id": case.valuation_id},
+                " where workspace_id = %(ws)s and id = %(id)s for share",
+                {"ws": ws, "id": preview.snapshot.valuation_id},
             )
+    if listing is None:  # pragma: no cover - composite FK guarantees the listing
+        raise NotFound("Review case not found")
+    row = await _load_case(conn, actor, request.case_id, lock=True)
+    case = row.snapshot
+    if case.valuation_id != preview.snapshot.valuation_id:
+        raise VersionConflict(
+            "The review case changed concurrently; reload and retry", current_version=case.row_version
+        )
+    now = ensure_utc(await db_now(conn))
     guard = SubmitGuard(
         eligibility=None
         if listing["eligibility_state"] is None
@@ -953,10 +1024,9 @@ async def submit(
         prompt_template_version=prompt_template_version,
     )
     if listing["current_revision_id"] != case.revision_id:
-        raise VersionConflict(
-            "The listing has a newer revision; reload before deciding",
-            current_listing_revision=None,
-        )
+        # The case still cites an older revision: the newer one is being screened/valued and
+        # will update the case (new version) before anyone can decide on it.
+        raise VersionConflict("The listing has a newer revision; reload before deciding")
     decision_id = await _insert_decision(conn, actor, decision)
     await _write_case(
         conn,
@@ -1151,7 +1221,7 @@ async def _shortlist_notification(
 ) -> dict[str, Any]:
     """Create the owner alert event when it is AUTHORIZED (an approved, enabled ``owner_alert``
     route) and MATERIAL (``evaluate_materiality``); otherwise record why not (audit)."""
-    route = await bindings_repo.route_for(conn, actor.workspace_id, "owner_alert")
+    route = await bindings_repo.selected_route(conn, actor, "owner_alert")
     if route is None:
         return {"notification": "no_active_route"}
     if dashboard_base_url is None:
@@ -1466,9 +1536,10 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
             "select d.*, r.revision_number from app.review_decisions d"
             " join app.listing_revisions r"
             "   on r.workspace_id = d.workspace_id and r.id = d.listing_revision_id"
-            " where d.workspace_id = %(ws)s and d.case_id = %(id)s order by d.case_version limit 200",
+            " where d.workspace_id = %(ws)s and d.case_id = %(id)s order by d.case_version desc limit 200",
             params,
         )
+        decisions.reverse()  # the NEWEST 200 (always including the latest), oldest first
     assert listing is not None
     valuation_state = (
         ValuationState(valuation["state"]) if valuation is not None else ValuationState.NOT_STARTED
@@ -1539,7 +1610,7 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
         valuation_ref = ValuationRef(
             valuation_id=valuation["id"],
             state=valuation_state,
-            research_candidate=valuation_state == ValuationState.INCOMPLETE,
+            research_candidate=valuation_state not in _FIGURE_STATES,
             is_fixture=valuation["is_fixture"],
             created_at=ensure_utc(valuation["created_at"]),
             expires_at=None if valuation["expires_at"] is None else ensure_utc(valuation["expires_at"]),

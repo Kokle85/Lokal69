@@ -29,9 +29,14 @@ Detail pages (`ingest_detail`, one transaction after the network fetch)
     - same-generation replays/conflicts: deterministic lower-observation-id tie-break, incidents
       audited.
 
+    A listing that comes back after a removed/not-found page with exactly the facts of its current
+    revision gets no duplicate revision (only availability and freshness change).
+
     An identity-critical change (`domain.identity.detect_identity_conflict`) creates a NEW listing
     incarnation flagged ``identity_conflict`` that inherits no revisions, evidence, screening or
-    reviews; the old incarnation is flagged and its availability becomes ``unknown``.
+    reviews; the old incarnation is flagged and its availability becomes ``unknown``. A late job of
+    a superseded incarnation is stored as evidence only (``superseded_incarnation``) and never
+    opens yet another incarnation.
     When the source's parser is unhealthy (spec 25) the observation and any new revision are stored
     as quarantined evidence and nothing is promoted or screened.
     Promoted facts are screened (`domain.filters.screen` with the current business config, recent
@@ -42,9 +47,9 @@ Availability (spec 9, 37.9)
     Removal is never inferred from absence. An explicit removed page sets ``removed``; a sold
     badge from the parser sets ``sold_claimed``; a complete scan that no longer shows a listing
     sets ``unknown`` with reason ``not_seen_in_complete_scan`` (`mark_complete_scan_absences`).
-    Every transition is handed to an `AvailabilityEventSink`. The default sink records an
-    ``listing.availability`` audit event; ``app.availability_events`` (spec 37.8) is not part of the
-    schema yet, so a table-backed sink plugs in through the same hook once it exists.
+    Every transition is handed to an `AvailabilityEventSink`. The default sink records a
+    ``listing.availability`` audit event and, once migration ``20261006001000`` has created
+    ``app.availability_events`` (spec 37.8), the evidence row there (`TableAvailabilitySink`).
 
 Scopes: ingestion is system work (system principals or ``config:admin``); detail refreshes need
 ``rechecks:request`` for rechecks; reads need ``deals:read``.
@@ -332,6 +337,8 @@ class AvailabilityTransition(BaseModel):
     generation: int | None = None
     observation_id: UUID | None = None
     run_id: UUID | None = None
+    # ``app.detail_observations.id`` of the evidence row (detail transitions only).
+    detail_observation_row_id: UUID | None = None
 
 
 class AvailabilityEventSink(Protocol):
@@ -366,7 +373,70 @@ class AuditAvailabilitySink:
         )
 
 
-DEFAULT_AVAILABILITY_SINK: Final = AuditAvailabilitySink()
+# Extraction/observation confidence of each availability reason (absence is the weakest evidence).
+_AVAILABILITY_CONFIDENCE: Final[dict[str, Literal["high", "medium", "low"]]] = {
+    "not_seen_in_complete_scan": "low",
+    "detail_not_found": "medium",
+    "identity_conflict_relisted": "medium",
+}
+
+
+class TableAvailabilitySink:
+    """One append-only ``app.availability_events`` row per transition (spec 37.8/37.9).
+
+    The table comes with migration ``20261006001000``. The row cites its evidence: the detail
+    observation row, or the complete crawl run for an absence (the database refuses an absence
+    event whose run is not a finished complete scan).
+    """
+
+    async def record(self, conn: Conn, actor: ActorContext, transition: AvailabilityTransition) -> None:
+        reference = None
+        if transition.detail_observation_row_id is None and transition.run_id is None:
+            reference = f"listing:{transition.listing_id}:g{transition.generation or 0}"
+        await conn.execute(
+            "insert into app.availability_events (workspace_id, source_id, listing_id, old_availability,"
+            " new_availability, evidence_kind, reason, crawl_run_id, detail_observation_id, source_reference,"
+            " effective_at, observed_at, confidence)"
+            " values (%(workspace_id)s, %(source_id)s, %(listing_id)s, %(old)s, %(new)s, %(kind)s,"
+            " %(reason)s, %(run_id)s, %(detail_id)s, %(reference)s, %(observed)s, %(observed)s,"
+            " %(confidence)s)",
+            {
+                "workspace_id": actor.workspace_id,
+                "source_id": transition.source_id,
+                "listing_id": transition.listing_id,
+                "old": transition.previous.value,
+                "new": transition.new.value,
+                "kind": transition.evidence_kind.value,
+                "reason": transition.reason,
+                "run_id": transition.run_id,
+                "detail_id": transition.detail_observation_row_id,
+                "reference": reference,
+                "observed": transition.observed_at,
+                "confidence": _AVAILABILITY_CONFIDENCE.get(transition.reason, "high"),
+            },
+        )
+
+
+async def availability_events_available(conn: Conn) -> bool:
+    """Whether ``app.availability_events`` exists in this database (a catalog lookup)."""
+    row = await fetch_one(conn, "select to_regclass('app.availability_events') is not null as present")
+    return bool(row and row["present"])
+
+
+class DefaultAvailabilitySink:
+    """The audit event always, plus the ``app.availability_events`` row once that table exists."""
+
+    def __init__(self) -> None:
+        self._audit = AuditAvailabilitySink()
+        self._table = TableAvailabilitySink()
+
+    async def record(self, conn: Conn, actor: ActorContext, transition: AvailabilityTransition) -> None:
+        await self._audit.record(conn, actor, transition)
+        if await availability_events_available(conn):
+            await self._table.record(conn, actor, transition)
+
+
+DEFAULT_AVAILABILITY_SINK: Final = DefaultAvailabilitySink()
 
 
 class DetailSnapshotRef(BaseModel):
@@ -432,6 +502,8 @@ class AbsenceReport(BaseModel):
 
     run_id: UUID
     marked_unknown: tuple[UUID, ...]
+    # Why the run was not used as absence evidence at all (None = it was evaluated).
+    skipped_reason: Literal["run_not_complete", "parser_unhealthy", "empty_traversal"] | None = None
 
 
 # --------------------------------------------------------------------------------------------
@@ -613,7 +685,7 @@ async def _quarantine_collision(
         conn,
         "select id, quarantined, row_version from app.listings where workspace_id = %(workspace_id)s"
         " and source_id = %(source_id)s and (identity_hash = %(hash)s or source_listing_id = %(slid)s)"
-        " order by id for update",
+        ' order by source_listing_id collate "C", incarnation for update',
         {
             "workspace_id": actor.workspace_id,
             "source_id": source_id,
@@ -1126,7 +1198,9 @@ async def load_screening_context(
 
 
 def _evidence_kind(kind: DetailKind, availability: Availability) -> tuple[str, AvailabilityEvidenceKind]:
-    if kind == "removed":
+    # A detail page whose own parse says "removed" is the same explicit evidence as a removed page
+    # (spec 37.9 maps ``removed`` only from an explicit removal, never from a plain observation).
+    if kind == "removed" or availability == Availability.REMOVED:
         return "source_removed_page", AvailabilityEvidenceKind.SOURCE_REMOVED_PAGE
     if kind == "not_found":
         return "detail_not_found", AvailabilityEvidenceKind.SOURCE_OBSERVATION
@@ -1215,6 +1289,36 @@ async def ingest_detail(  # noqa: PLR0917 - public contract (job, listing, parse
             availability=availability,
             observed_at=observed_at,
         )
+        successor = await fetch_one(
+            conn,
+            "select id from app.listings where workspace_id = %(workspace_id)s and source_id = %(source_id)s"
+            " and source_listing_id = %(slid)s and incarnation > %(incarnation)s"
+            " order by incarnation desc limit 1",
+            {
+                "workspace_id": ws,
+                "source_id": listing.source_id,
+                "slid": listing.source_listing_id,
+                "incarnation": listing.incarnation,
+            },
+        )
+        if successor is not None:
+            # A newer incarnation replaced this one (identity conflict): a late job of the old
+            # incarnation is kept as evidence only and never opens yet another incarnation.
+            result = await _superseded_incarnation(
+                conn,
+                job,
+                listing,
+                parsed,
+                snapshot_ref,
+                kind,
+                semantic,
+                availability,
+                observed_at,
+                quarantined,
+            )
+            if complete_job:
+                await jobs.complete(conn, job, _job_result(result))
+            return result
         newer = state.current_generation is None or job.generation > state.current_generation
         context = screening_context
         if kind == "listing" and not quarantined and newer and current_revision is not None:
@@ -1265,7 +1369,17 @@ async def ingest_detail(  # noqa: PLR0917 - public contract (job, listing, parse
                 quarantined=quarantined,
             )
         revision: RevisionRecord | None = None
-        if decision.create_revision and kind == "listing" and observation_row_id is not None:
+        create_revision = decision.create_revision and kind == "listing" and observation_row_id is not None
+        if (
+            create_revision
+            and current_revision is not None
+            and not current_revision.quarantined
+            and current_revision.semantic_hash == semantic
+        ):
+            # Same facts as the current revision after a removed/not-found interlude: the listing
+            # is back, but nothing business-meaningful changed, so no duplicate revision.
+            create_revision = False
+        if create_revision:
             assert normalized is not None
             revision = await _insert_revision(
                 conn,
@@ -1323,12 +1437,60 @@ async def ingest_detail(  # noqa: PLR0917 - public contract (job, listing, parse
                 incident_code=decision.incident_code,
             )
         else:
-            if kind == "listing" and context is None and decision.promote_current:
+            if context is None and decision.promote_current:
+                # Removed / not-found pages re-screen the current facts with the new availability.
                 context = await load_screening_context(conn, actor)
             result = await _apply_promotion(conn, actor, job, promotion, normalized, context, sink)
         if complete_job:
             await jobs.complete(conn, job, _job_result(result))
     return result
+
+
+async def _superseded_incarnation(  # noqa: PLR0917 - private helper
+    conn: Conn,
+    job: ClaimedJob,
+    listing: ListingRecord,
+    parsed: ParsedListing,
+    ref: DetailSnapshotRef,
+    kind: DetailKind,
+    semantic: str,
+    availability: Availability,
+    observed_at: datetime,
+    quarantined: bool,
+) -> IngestDetailResult:
+    assert job.generation is not None
+    row_id = await _insert_observation(
+        conn,
+        listing.workspace_id,
+        listing.id,
+        job.id,
+        job.generation,
+        ref,
+        parsed,
+        kind,
+        semantic,
+        availability,
+        observed_at,
+        promoted=False,
+        not_promoted_reason="superseded_incarnation",
+        quarantined=quarantined,
+    )
+    return IngestDetailResult(
+        job_listing_id=listing.id,
+        listing_id=listing.id,
+        kind=kind,
+        outcome=PromotionOutcome.HISTORICAL_ONLY,
+        observation_row_id=row_id,
+        revision_id=None,
+        revision_number=None,
+        promoted=False,
+        quarantined=quarantined,
+        identity_conflict=listing.identity_conflict,
+        availability_before=listing.availability,
+        availability_after=listing.availability,
+        eligibility_state=listing.eligibility_state,
+        screening_version=listing.screening_version,
+    )
 
 
 def _identity_conflicts(
@@ -1454,6 +1616,7 @@ async def _apply_promotion(  # noqa: PLR0917 - private helper
                 observed_at=promotion.observed_at,
                 generation=job.generation,
                 observation_id=decision.accepted_observation_id,
+                detail_observation_row_id=promotion.observation_row_id,
             ),
         )
     valuation_job_id = await _maybe_enqueue_valuation(
@@ -1529,7 +1692,7 @@ async def _identity_conflict(  # noqa: PLR0917 - private helper
     ws = actor.workspace_id
     normalized = parsed.listing
     assert normalized is not None and job.generation is not None
-    await _insert_observation(
+    old_observation_row_id = await _insert_observation(
         conn,
         ws,
         old.id,
@@ -1621,6 +1784,7 @@ async def _identity_conflict(  # noqa: PLR0917 - private helper
                 observed_at=observed_at,
                 generation=job.generation,
                 observation_id=ref.observation_id,
+                detail_observation_row_id=old_observation_row_id,
             ),
         )
     await audit.record(
@@ -1670,7 +1834,14 @@ async def mark_complete_scan_absences(
     """After a COMPLETE traversal: listings of the same (source, profile, partition) that an earlier
     complete traversal showed, that this one did not show and that nothing has seen since it
     started become ``availability = unknown`` (reason ``not_seen_in_complete_scan``). Absence never
-    means removed or sold. Run this in its own short transaction after `finish_crawl_run`.
+    means removed or sold. A detail check made after the traversal started is fresher, direct
+    evidence and is never overridden by the absence. A run of a parser-unhealthy source, or one that
+    stored no card at all, is no evidence about the inventory (``skipped_reason``; spec 9 and 25: a
+    parser incident never sweeps listings). Run this in its own short transaction after
+    `finish_crawl_run`.
+
+    Listings are locked in ``(source_listing_id, incarnation)`` byte order, the order search-page
+    ingestion of the same source uses, so the two cannot deadlock on overlapping listings.
     """
     _require_system(actor)
     if not 1 <= limit <= 10_000:
@@ -1680,19 +1851,28 @@ async def mark_complete_scan_absences(
     async with mapped_errors():
         run = await fetch_one(
             conn,
-            "select id, source_id, profile_id, partition_key, outcome, started_at from ops.crawl_runs"
-            " where workspace_id = %(workspace_id)s and id = %(id)s",
+            "select r.id, r.source_id, r.profile_id, r.partition_key, r.outcome, r.started_at,"
+            " r.cards_seen, s.technical_status from ops.crawl_runs r"
+            " join app.sources s on s.workspace_id = r.workspace_id and s.id = r.source_id"
+            " where r.workspace_id = %(workspace_id)s and r.id = %(id)s",
             {"workspace_id": ws, "id": run_id},
         )
         if run is None:
             raise NotFound("Crawl run not found")
         if run["outcome"] != "complete":
-            return AbsenceReport(run_id=run_id, marked_unknown=())
+            return AbsenceReport(run_id=run_id, marked_unknown=(), skipped_reason="run_not_complete")
+        # Spec 9/25: a parser incident (or a "complete" traversal that found nothing, its typical
+        # signature) is never evidence about the inventory; nothing is marked.
+        if run["technical_status"] == TechnicalStatus.PARSER_UNHEALTHY.value:
+            return AbsenceReport(run_id=run_id, marked_unknown=(), skipped_reason="parser_unhealthy")
+        if int(run["cards_seen"]) == 0:
+            return AbsenceReport(run_id=run_id, marked_unknown=(), skipped_reason="empty_traversal")
         rows = await fetch_all(
             conn,
             "select l.id, l.availability, l.source_id from app.listings l"
             " where l.workspace_id = %(workspace_id)s and l.source_id = %(source_id)s"
             " and l.availability in ('available', 'reserved') and l.last_seen_at < %(started)s"
+            " and (l.last_availability_check_at is null or l.last_availability_check_at < %(started)s)"
             " and exists (select 1 from app.listing_observations o"
             "   join ops.crawl_runs r on r.workspace_id = o.workspace_id and r.id = o.crawl_run_id"
             "  where o.workspace_id = l.workspace_id and o.listing_id = l.id and r.id <> %(run_id)s"
@@ -1700,7 +1880,7 @@ async def mark_complete_scan_absences(
             "    and r.partition_key = %(partition)s)"
             " and not exists (select 1 from app.listing_observations o"
             "  where o.workspace_id = l.workspace_id and o.listing_id = l.id and o.crawl_run_id = %(run_id)s)"
-            " order by l.id limit %(limit)s for update of l",
+            ' order by l.source_listing_id collate "C", l.incarnation limit %(limit)s for update of l',
             {
                 "workspace_id": ws,
                 "source_id": run["source_id"],
@@ -1810,6 +1990,7 @@ __all__ = [
     "AuditAvailabilitySink",
     "AvailabilityEventSink",
     "AvailabilityTransition",
+    "DefaultAvailabilitySink",
     "DetailJobRef",
     "DetailSnapshotRef",
     "IngestDetailResult",
@@ -1817,7 +1998,9 @@ __all__ = [
     "ListingRecord",
     "RevisionRecord",
     "ScreeningContext",
+    "TableAvailabilitySink",
     "allocate_detail_generation",
+    "availability_events_available",
     "current_revision",
     "find_listing",
     "get_listing",

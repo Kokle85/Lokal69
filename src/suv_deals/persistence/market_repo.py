@@ -24,7 +24,10 @@ Tables: ``app.market_observations``, ``app.comparable_sets``, ``app.comparable_s
 
   ``content_sha256`` = SHA-256 of the canonical JSON of the whole result; a loaded set is
   re-hashed and must match, so the ``ComparableReference.content_hash`` a valuation records
-  is verifiable. Members keep their stable ordinal (selected first, then excluded).
+  is verifiable. Members keep their stable ordinal (selected first, then excluded). Every
+  selected comparable must equal its stored observation of this workspace and share the
+  target's fixture flag (a hand-built result can never smuggle fixture evidence into a real
+  selection or persist a set that would not reload).
 """
 
 from __future__ import annotations
@@ -495,6 +498,7 @@ async def persist_comparable_set(
         "is_fixture": result.target.is_fixture,
         "computed_at": result.as_of,
     }
+    await _check_selected(conn, actor, result)
     members = [_selected_member(s, i) for i, s in enumerate(result.selected)]
     offset = len(members)
     members += [_excluded_member(e, offset + i) for i, e in enumerate(result.excluded)]
@@ -543,6 +547,22 @@ async def persist_comparable_set(
         computed_at=result.as_of,
         created_at=ensure_utc(row["created_at"]),
     )
+
+
+async def _check_selected(conn: Conn, actor: ActorContext, result: ComparableSetResult) -> None:
+    """Selected comparables are exactly the stored observations of this workspace (so the set
+    reloads with the same content hash) and never mix fixture with real evidence (spec 18)."""
+    if not result.selected:
+        return
+    stored = await _observations(conn, actor, [s.observation_id for s in result.selected])
+    for item in result.selected:
+        found = stored.get(item.observation_id)
+        if found is None:
+            raise NotFound("Market observation not found")
+        if found != item.observation:
+            raise ValidationFailed("a selected comparable differs from its stored observation")
+        if found.is_fixture != result.target.is_fixture:
+            raise ValidationFailed("fixture and real market evidence never mix in a comparable selection")
 
 
 async def _observations(

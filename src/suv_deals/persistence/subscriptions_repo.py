@@ -22,14 +22,16 @@ Subscriptions
       anything matched) and `revoke_subscription` set ``revoked_at``/``revoke_reason`` and cancel
       waiting deliveries, so new deliveries stop immediately.
     - `list_active_for_event` (system dispatcher) returns ``event_bridge.DeliveryTarget``s with
-      decrypted signing secrets and rechecks membership/scope first (``check_access`` or a
+      decrypted signing secrets and rechecks membership/scope first (``check_subscriber_access`` or a
       supplied hook); a subscriber that lost access is revoked in the same transaction.
 
 Deliveries
     One row per ``(subscription_id, event_id)`` (unique; the event id stays stable across
-    attempts). `claim_due_deliveries` leases due rows with ``FOR UPDATE SKIP LOCKED`` (fresh
-    token, ``attempts + 1``) only for active, verified, unexpired subscriptions, cancelling
-    waiting rows of revoked/expired ones. `record_delivery_outcome` is fenced on id + token +
+    attempts), only for a committed, non-fixture event that is not blocked or cancelled.
+    `claim_due_deliveries` leases due rows with ``FOR UPDATE SKIP LOCKED`` (fresh token,
+    ``attempts + 1``) only for active, verified, unexpired subscriptions whose subscriber still
+    has access (membership/credential recheck in SQL), cancelling waiting rows of
+    revoked/expired ones. `record_delivery_outcome` is fenced on id + token +
     owner + unexpired lease (database time); zero rows -> ``LeaseLost``. Outcomes: 2xx ->
     ``accepted`` (receipt only), 410/413 and other terminal failures -> ``failed``, retryable ->
     ``retry_wait`` (or ``dead_letter`` when attempts are exhausted), timeout after send ->
@@ -80,6 +82,9 @@ from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
 UNSUBSCRIBED_REASON: Final = "unsubscribed"
 ACCESS_REVOKED_REASON: Final = "access_revoked"
 _REQUIRED_SCOPES: Final = frozenset({Scope.REVIEWS_READ, Scope.EVENTS_SUBSCRIBE})
+#: Member roles whose scopes include both required scopes (owner, reviewer).
+_SUBSCRIBER_ROLES: Final = tuple(sorted(r.value for r in Role if ROLE_SCOPES[r] >= _REQUIRED_SCOPES))
+_UNDELIVERABLE_EVENT_STATES: Final = frozenset({"blocked", "cancelled"})
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 DeliveryState = Literal[
     "pending", "sending", "retry_wait", "accepted", "uncertain", "failed", "dead_letter", "cancelled"
@@ -287,8 +292,13 @@ async def create_or_refresh_subscription(
             identity,
         )
         assert active is not None
-        check_subscription_quota(int(active["n"]), is_refresh=False, policy=policy)
         now = ensure_utc(await db_now(conn))
+        is_refresh = (
+            existing is not None
+            and existing["revoked_at"] is None
+            and ensure_utc(existing["expires_at"]) > now
+        )
+        check_subscription_quota(int(active["n"]), is_refresh=is_refresh, policy=policy)
         if expires_at <= now:
             raise ValidationFailed("the granted subscription lifetime has already ended")
         if existing is None:
@@ -340,6 +350,8 @@ async def create_or_refresh_subscription(
                 previous_envelope, previous_until = None, None
             version += 1
             envelope = _seal(box, request.secret, ws, wire, version)
+        elif previous_until is not None and previous_until <= now:
+            previous_envelope, previous_until = None, None  # the rotation window has closed
         reactivated = current.revoked_at is not None
         reset_verification = rotated or reactivated
         row = await fetch_one(
@@ -455,7 +467,10 @@ async def list_subscriptions(
 async def record_verification(
     conn: Conn, actor: ActorContext, row_id: UUID, result: VerificationResult, box: SecretBox
 ) -> SubscriptionRecord:
-    """Store the outcome of the callback challenge for the CURRENT secret version."""
+    """Store the outcome of the callback challenge for the CURRENT secret version. An outcome
+    of an attempt older than the recorded verification is ignored (late result)."""
+    if actor.principal_kind != "system":
+        actor.require(Scope.EVENTS_SUBSCRIBE)
     row = await _load_row(conn, actor, row_id, lock=True)
     record = _record(row)
     if actor.principal_kind != "system" and record.principal_id != actor.principal_id:
@@ -471,6 +486,10 @@ async def record_verification(
         raise VersionConflict("The subscription secret changed during verification; verify again")
     if record.revoked_at is not None:
         raise VersionConflict("The subscription is no longer active")
+    if record.verified_at is not None and ensure_utc(result.attempted_at) < record.verified_at:
+        # A late outcome of an attempt that started before the recorded successful verification
+        # (attempts can finish out of order): it never overrides the newer fact.
+        return record
     verified_at = result.verified_at or result.attempted_at
     async with mapped_errors():
         updated = await fetch_one(
@@ -535,6 +554,8 @@ async def revoke_subscription(
 ) -> SubscriptionRecord:
     """Stop a subscription now (owner, the dispatcher after a failed access recheck, or the
     subscriber itself). Waiting deliveries are cancelled. Idempotent."""
+    if actor.principal_kind != "system" and not actor.scopes & {Scope.EVENTS_SUBSCRIBE, Scope.CONFIG_ADMIN}:
+        raise Forbidden("Missing scope: events:subscribe")
     if not isinstance(reason, str) or not 3 <= len(reason.strip()) <= 200:
         raise ValidationFailed("reason must be 3-200 characters")
     row = await _load_row(conn, actor, row_id, lock=True)
@@ -584,20 +605,30 @@ async def _revoke(
 # --------------------------------------------------------------------------------------------
 
 
-async def check_access(conn: Conn, record: SubscriptionRecord) -> bool:
-    """Membership/scope recheck before dispatch: the subscriber still holds ``reviews:read`` and
-    ``events:subscribe`` (an active membership for users; an unrevoked, unexpired credential
-    with both scopes for static MCP credentials)."""
+async def check_subscriber_access(conn: Conn, actor: ActorContext, record: SubscriptionRecord) -> bool:
+    """Membership/scope recheck before dispatch (system dispatcher): the subscriber still holds
+    ``reviews:read`` and ``events:subscribe``: an active membership whose role grants both for
+    users (also when they subscribed with a static credential, which must then be unrevoked,
+    unexpired and carry both scopes); for MCP-client credentials the credential alone.
+    `claim_due_deliveries` applies the same rule in SQL."""
+    _require_system(actor)
+    if record.workspace_id != actor.workspace_id:
+        return False
     params = {"ws": record.workspace_id, "principal": record.principal_id, "credential": record.credential_id}
     async with mapped_errors():
         if record.credential_id is not None:
-            row = await fetch_one(
+            credential = await fetch_one(
                 conn,
-                "select scopes from ops.api_credentials where workspace_id = %(ws)s and id = %(credential)s"
-                " and principal_id = %(principal)s and revoked_at is null and expires_at > clock_timestamp()",
+                "select scopes, principal_kind from ops.api_credentials where workspace_id = %(ws)s"
+                " and id = %(credential)s and principal_id = %(principal)s and revoked_at is null"
+                " and expires_at > clock_timestamp()",
                 params,
             )
-            return row is not None and set(row["scopes"]) >= _REQUIRED_SCOPES
+            if credential is None or not set(credential["scopes"]) >= _REQUIRED_SCOPES:
+                return False
+            if credential["principal_kind"] != "user":
+                return True
+            # A user's static credential never outlives the user's membership or role.
         row = await fetch_one(
             conn,
             "select role from app.memberships where workspace_id = %(ws)s and user_id = %(principal)s"
@@ -619,7 +650,11 @@ async def list_active_for_event(
     secrets (newest first, previous one only inside its rotation window). Subscribers that
     fail the access recheck are revoked here (same transaction) and excluded."""
     _require_system(actor)
-    hook = access_check or check_access
+
+    async def default_hook(c: Conn, r: SubscriptionRecord) -> bool:
+        return await check_subscriber_access(c, actor, r)
+
+    hook = access_check or default_hook
     async with mapped_errors():
         rows = await fetch_all(
             conn,
@@ -734,6 +769,17 @@ async def create_deliveries(
         raise ValidationFailed("max_attempts must be between 1 and 50")
     results: list[tuple[UUID, bool]] = []
     async with mapped_errors():
+        event = await fetch_one(
+            conn,
+            "select is_fixture, state from ops.outbox where workspace_id = %(ws)s and event_id = %(event)s",
+            {"ws": actor.workspace_id, "event": event_id},
+        )
+        if event is None:
+            raise NotFound("Event not found")
+        if event["is_fixture"] or event["state"] in _UNDELIVERABLE_EVENT_STATES:
+            # Fixtures never produce external notifications (spec 18); blocked/cancelled events
+            # stay visible in the outbox but are never delivered.
+            raise ValidationFailed("this event is not deliverable", details={"state": event["state"]})
         for subscription_id in dict.fromkeys(subscription_ids):
             params = {
                 "ws": actor.workspace_id,
@@ -772,6 +818,22 @@ update ops.event_deliveries d set state = 'cancelled', safe_error = 'subscriptio
    and (s.revoked_at is not null or s.expires_at <= clock_timestamp())
 """
 
+# The subscriber still has access (same rule as `check_subscriber_access`): deliveries of a
+# subscriber that lost it stay waiting (never leased) until the access recheck in
+# `list_active_for_event` revokes the subscription or the access is restored.
+_MEMBER_PREDICATE: Final = (
+    "exists (select 1 from app.memberships m where m.workspace_id = s.workspace_id"
+    " and m.user_id = s.principal_id and m.active and m.role = any(%(roles)s::text[]))"
+)
+_ACCESS_PREDICATE: Final = (
+    f"((s.credential_id is null and {_MEMBER_PREDICATE})"  # noqa: S608 - fixed SQL fragments
+    " or (s.credential_id is not null and exists (select 1 from ops.api_credentials c"
+    "   where c.workspace_id = s.workspace_id and c.id = s.credential_id"
+    "     and c.principal_id = s.principal_id and c.revoked_at is null"
+    "     and c.expires_at > clock_timestamp() and c.scopes @> %(required)s::text[]"
+    f"     and (c.principal_kind <> 'user' or {_MEMBER_PREDICATE}))))"
+)
+
 _CLAIM_DELIVERIES_SQL: Final = f"""
 with picked as (
   select d.id
@@ -783,6 +845,7 @@ with picked as (
      and d.attempts < d.max_attempts
      and s.revoked_at is null and s.verification_state = 'verified'
      and s.expires_at > clock_timestamp()
+     and {_ACCESS_PREDICATE}
    order by d.next_attempt_at, d.id
    for update of d skip locked
    limit %(limit)s
@@ -815,6 +878,8 @@ async def claim_due_deliveries(
         "owner": dispatcher_id,
         "lease": timedelta(seconds=float(lease_seconds)),
         "limit": limit,
+        "roles": list(_SUBSCRIBER_ROLES),
+        "required": sorted(s.value for s in _REQUIRED_SCOPES),
     }
     async with mapped_errors():
         await conn.execute(_CANCEL_INACTIVE_SQL, params)
@@ -962,7 +1027,7 @@ __all__ = [
     "SubscribeOutcome",
     "SubscriptionRecord",
     "UnsubscribeOutcome",
-    "check_access",
+    "check_subscriber_access",
     "claim_due_deliveries",
     "create_deliveries",
     "create_or_refresh_subscription",

@@ -4,9 +4,10 @@
   increasing ``revision`` per workspace, the validated config, its SHA-256, the ``before``
   config, the verified author (principal, kind, label), the reason and the effective time.
 - Optimistic concurrency: the caller passes the configuration it edited (``before``); it must be
-  the current revision's config (hash compared), otherwise `VersionConflict`. Two concurrent
-  writers both computing ``max + 1`` collide on ``config_revisions_revision_uk`` and the loser gets
-  `VersionConflict` (nothing of its transaction commits).
+  the current revision's config (hash compared), otherwise `VersionConflict`. The new row takes
+  exactly the number after the revision that check read, so two concurrent writers collide on
+  ``config_revisions_revision_uk`` and the loser gets `VersionConflict` (nothing of its transaction
+  commits) -- even when the winner commits between the loser's check and its insert.
 - Recording an identical configuration creates nothing (``created=False``).
 - ``app.search_profiles`` is synchronised in the same transaction and every profile row is bound
   to the new revision. A profile missing from the configuration is disabled (rows are never
@@ -157,6 +158,10 @@ async def record_config_revision(
     actor.require(Scope.CONFIG_ADMIN)
     if not isinstance(config, BusinessConfig):
         raise ValidationFailed("config must be a validated BusinessConfig")
+    labels = [profile.queue_label for profile in config.profiles.values()]
+    if len(set(labels)) != len(labels):
+        # Each profile is a visibly separate queue (spec 3); never a misleading VersionConflict.
+        raise ValidationFailed("every search profile needs its own queue label")
     clean_reason = _reason(reason)
     new_hash = config_hash(config)
     async with mapped_errors():
@@ -180,15 +185,18 @@ async def record_config_revision(
             sql.SQL(
                 "insert into app.config_revisions (workspace_id, revision, config, config_hash, before,"
                 " author_principal_id, author_kind, author_label, reason, effective_at)"
-                " values (%(workspace_id)s,"
-                " (select coalesce(max(revision), 0) + 1 from app.config_revisions"
-                "   where workspace_id = %(workspace_id)s),"
+                " values (%(workspace_id)s, %(revision)s,"
                 " %(config)s, %(hash)s, %(before)s, %(principal)s, %(kind)s, %(label)s, %(reason)s,"
                 " coalesce(%(effective_at)s::timestamptz, now()))"
                 " returning {columns}"
             ).format(columns=_REVISION_COLUMNS),
             {
                 "workspace_id": actor.workspace_id,
+                # Exactly the revision after the one the caller's ``before`` was checked against: a
+                # writer that committed in between owns that number, so this insert then fails on
+                # ``config_revisions_revision_uk`` (VersionConflict) instead of silently stacking a
+                # revision on top of a configuration this caller never saw (lost update).
+                "revision": 1 if current is None else current.revision + 1,
                 "config": Jsonb(config.model_dump(mode="json")),
                 "hash": new_hash,
                 "before": None if before is None else Jsonb(before.model_dump(mode="json")),
@@ -223,27 +231,103 @@ async def record_config_revision(
     )
 
 
+async def set_profile_enabled(
+    conn: Conn,
+    actor: ActorContext,
+    profile_key: ProfileKey,
+    enabled: bool,
+    *,
+    expected_revision: int,
+    reason: str,
+) -> ConfigRevisionResult:
+    """Enable or disable an optional profile (``manual_4000`` / ``below_target_watch``) as a NEW
+    auditable configuration revision (owner, ``config:admin``).
+
+    ``expected_revision`` is the revision number the owner looked at (`VersionConflict` when it is
+    stale). The primary profile can never be disabled (baseline). The optional profile keeps its
+    own, visibly different queue label, so its candidates never mix with the primary queue.
+    """
+    actor.require(Scope.CONFIG_ADMIN)
+    key = ProfileKey(profile_key)
+    if key == ProfileKey.PRIMARY:
+        raise ValidationFailed("the primary profile is always enabled")
+    async with mapped_errors():
+        current = await _current(conn, actor.workspace_id)
+    if current is None:
+        raise NotFound("No business configuration has been recorded")
+    if current.revision != expected_revision:
+        raise VersionConflict(
+            "The configuration changed since it was loaded; reload and retry",
+            current_revision=current.revision,
+        )
+    before = current.business_config()
+    profile = before.profiles.get(key)
+    if profile is None:
+        raise NotFound("The profile is not part of the configuration")
+    if profile.enabled == enabled:
+        async with mapped_errors():
+            profiles = await _profiles(conn, actor.workspace_id)
+        return ConfigRevisionResult(
+            revision=current, created=False, profiles=tuple(profiles), enabled_changes={}
+        )
+    profiles_map = dict(before.profiles)
+    profiles_map[key] = profile.model_copy(update={"enabled": bool(enabled)})
+    try:
+        after = BusinessConfig.model_validate({**before.model_dump(), "profiles": profiles_map})
+    except ValidationError as exc:
+        raise ValidationFailed("the resulting configuration violates the business baseline") from exc
+    return await record_config_revision(conn, actor, after, reason, before)
+
+
 async def _sync_profiles(
     conn: Conn, actor: ActorContext, config: BusinessConfig, revision_id: UUID
 ) -> dict[str, bool]:
-    """Upsert every profile and bind it to ``revision_id``; returns enabled-state changes."""
+    """Upsert every profile and bind it to ``revision_id``; returns enabled-state changes.
+
+    Queue labels are unique per workspace (``search_profiles_queue_label_uk``, not deferrable), so
+    labels that change are first parked on unique temporary values: a revision that swaps two
+    queue labels, or gives a label of a profile it drops to another profile, applies cleanly.
+    A dropped profile whose label is reused gets a ``retired`` label (rows are never deleted).
+    """
     changes: dict[str, bool] = {}
     rows = await fetch_all(
         conn,
-        "select profile_key, enabled from app.search_profiles"
+        "select profile_key, enabled, queue_label from app.search_profiles"
         " where workspace_id = %(workspace_id)s order by profile_key for update",
         {"workspace_id": actor.workspace_id},
     )
     existing = {r["profile_key"]: bool(r["enabled"]) for r in rows}
+    targets = {key.value: profile.queue_label for key, profile in config.profiles.items()}
+    retired: dict[str, str] = {}
+    moving: list[str] = []
+    for row in rows:
+        key, label = row["profile_key"], row["queue_label"]
+        target = targets.get(key)
+        if target is None and label in targets.values():
+            retired[key] = f"retired {key} queue ({revision_id})"
+            moving.append(key)
+        elif target is not None and target != label:
+            moving.append(key)
+    for key in sorted(moving):
+        await conn.execute(
+            "update app.search_profiles set queue_label = %(parked)s"
+            " where workspace_id = %(workspace_id)s and profile_key = %(key)s",
+            {"workspace_id": actor.workspace_id, "key": key, "parked": f"~sync {key} {revision_id}"},
+        )
     for key in _PROFILE_ORDER:
         profile = config.profiles.get(key)
         if profile is None:
             if key.value in existing:
                 await conn.execute(
                     "update app.search_profiles set enabled = false, config_revision_id = %(revision)s,"
-                    " row_version = row_version + 1"
+                    " queue_label = coalesce(%(retired)s, queue_label), row_version = row_version + 1"
                     " where workspace_id = %(workspace_id)s and profile_key = %(key)s",
-                    {"workspace_id": actor.workspace_id, "key": key.value, "revision": revision_id},
+                    {
+                        "workspace_id": actor.workspace_id,
+                        "key": key.value,
+                        "revision": revision_id,
+                        "retired": retired.get(key.value),
+                    },
                 )
                 if existing[key.value]:
                     changes[key.value] = False
@@ -354,4 +438,5 @@ __all__ = [
     "list_config_revisions",
     "list_profiles",
     "record_config_revision",
+    "set_profile_enabled",
 ]

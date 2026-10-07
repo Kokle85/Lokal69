@@ -123,6 +123,16 @@ def _require_reader(actor: ActorContext) -> None:
         actor.require(Scope.DEALS_READ)
 
 
+_ROUTE_READ_SCOPES: Final = frozenset({Scope.DEALS_READ, Scope.REVIEWS_READ, Scope.REVIEWS_WRITE})
+
+
+def _require_route_reader(actor: ActorContext) -> None:
+    """Route lookups happen inside review transactions (submit, case upsert): any reader of
+    deals or reviews may learn WHETHER a category has an active route, never change it."""
+    if actor.principal_kind != "system" and not actor.scopes & _ROUTE_READ_SCOPES:
+        raise Forbidden("Missing scope: deals:read or reviews:read")
+
+
 def _approval_text(value: str) -> str:
     text = value.strip() if isinstance(value, str) else ""
     if not 3 <= len(text) <= 500 or _CONTROL_RE.search(text):
@@ -400,10 +410,12 @@ async def upsert_preferences(
     urgency_policy: Mapping[str, Any] | None = None,
     expected_version: int | None = None,
 ) -> NotificationPreference:
-    """Create (``expected_version=None``) or change the preferences of one binding.
+    """Create (``expected_version=None``, disabled and unapproved) or change the preferences
+    of one binding.
 
     The provider must be allowed for every category; an ENABLED preference keeps the
-    one-route-per-category rule after the change.
+    one-route-per-category rule after the change. Adding a category to approved preferences
+    withdraws the approval and disables them (the owner approves each category).
     """
     _require_owner(actor)
     categories = _categories(event_categories)
@@ -446,7 +458,11 @@ async def upsert_preferences(
                 raise VersionConflict(
                     expected_version=expected_version, current_version=current["row_version"]
                 )
-            if current["enabled"]:
+            # The owner approved specific categories (spec 22): adding one withdraws the
+            # approval and disables the route until the owner approves the new scope.
+            added = set(categories) - set(current["event_categories"] or ())
+            reset = bool(added) and current["approved_at"] is not None
+            if current["enabled"] and not reset:
                 await _check_exclusive(
                     conn,
                     actor,
@@ -456,10 +472,14 @@ async def upsert_preferences(
             row = await fetch_one(
                 conn,
                 "update app.notification_preferences set event_categories = %(categories)s::text[],"  # noqa: S608
-                " quiet_hours = %(quiet)s, urgency_policy = %(urgency)s, row_version = row_version + 1"
+                " quiet_hours = %(quiet)s, urgency_policy = %(urgency)s, row_version = row_version + 1,"
+                " enabled = enabled and not %(reset)s,"
+                " approval_reference = case when %(reset)s then null else approval_reference end,"
+                " approved_by = case when %(reset)s then null else approved_by end,"
+                " approved_at = case when %(reset)s then null else approved_at end"
                 " where workspace_id = %(ws)s and destination_binding_id = %(binding)s"
                 f" returning {_PREFERENCE_COLUMNS}",
-                params,
+                {**params, "reset": reset},
             )
             prior = expected_version
         assert row is not None
@@ -494,7 +514,9 @@ async def approve_preferences(
     _require_owner(actor)
     reference = _approval_text(approval_reference)
     async with mapped_errors():
-        await _lock_preference(conn, actor, preference_id, expected_version)
+        current, _ = await _lock_preference(conn, actor, preference_id, expected_version)
+        if current["approved_at"] is not None:
+            raise VersionConflict("These preferences are already approved")
         row = await fetch_one(
             conn,
             "update app.notification_preferences set approval_reference = %(reference)s,"  # noqa: S608
@@ -609,12 +631,11 @@ async def _check_exclusive(
 
 async def active_routes(conn: Conn, actor: ActorContext) -> list[ActivationRouteSelection]:
     """Every active route (enabled + approved binding and preferences)."""
-    _require_reader(actor)
-    return await routes_for_workspace(conn, actor.workspace_id)
+    _require_route_reader(actor)
+    return await _routes(conn, actor.workspace_id)
 
 
-async def routes_for_workspace(conn: Conn, workspace_id: UUID) -> list[ActivationRouteSelection]:
-    """Internal read used inside other repositories' transactions (caller already authorized)."""
+async def _routes(conn: Conn, workspace_id: UUID) -> list[ActivationRouteSelection]:
     async with mapped_errors():
         rows = await fetch_all(
             conn,
@@ -649,16 +670,10 @@ async def selected_route(
     conn: Conn, actor: ActorContext, category: EventCategory
 ) -> ActivationRouteSelection | None:
     """The single active route for ``category`` (``None``: no external activation)."""
-    _require_reader(actor)
-    return await route_for(conn, actor.workspace_id, category)
-
-
-async def route_for(
-    conn: Conn, workspace_id: UUID, category: EventCategory
-) -> ActivationRouteSelection | None:
+    _require_route_reader(actor)
     if category not in CATEGORY_PROVIDERS:
         raise ValidationFailed("unknown event category")
-    matches = [r for r in await routes_for_workspace(conn, workspace_id) if r.category == category]
+    matches = [r for r in await _routes(conn, actor.workspace_id) if r.category == category]
     if len(matches) > 1:  # pragma: no cover - prevented by _check_exclusive under row locks
         raise ValidationFailed("more than one active route for this category; disable one")
     return matches[0] if matches else None
@@ -681,8 +696,6 @@ __all__ = [
     "list_bindings",
     "list_preferences",
     "mark_binding_verified",
-    "route_for",
-    "routes_for_workspace",
     "selected_route",
     "set_binding_enabled",
     "set_preferences_enabled",

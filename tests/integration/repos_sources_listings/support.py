@@ -193,7 +193,12 @@ def page(
         access_state=AccessState.OK,
         fetched_at=fetched_at,
         fetch=FetchOutcome(
-            requested_url=url, success=True, access_state=AccessState.OK, http_status=200, bytes=1000, fetched_at=fetched_at
+            requested_url=url,
+            success=True,
+            access_state=AccessState.OK,
+            http_status=200,
+            bytes=1000,
+            fetched_at=fetched_at,
         ),
     )
 

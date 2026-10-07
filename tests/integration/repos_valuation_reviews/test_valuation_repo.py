@@ -5,11 +5,13 @@ Everything runs as ``suv_backend`` under RLS with SYNTHETIC data only.
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 from tests.integration.db.helpers import Seed
 from tests.integration.repos_valuation_reviews.builders import (
     T0,
@@ -17,6 +19,7 @@ from tests.integration.repos_valuation_reviews.builders import (
     add_revision,
     complete_valuation,
     cost_profile,
+    make_listing,
     mkd_rate,
     owner,
     review_record,
@@ -51,7 +54,11 @@ async def test_complete_valuation_round_trip_reconstructs_the_view(db: Database,
     assert bundle.valuation.state == ValuationState.ESTIMATED
     sys_actor = system(world.workspace_id)
     stored = await run(
-        db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs)
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(
+            c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs
+        ),
     )
     assert stored.valuation == bundle.valuation
     expected = ValuationView.of(
@@ -72,21 +79,41 @@ async def test_complete_valuation_round_trip_reconstructs_the_view(db: Database,
     assert current is not None and current.id == stored.id
 
 
-async def test_persist_refuses_references_that_differ_from_the_fingerprint(db: Database, world: RealWorld) -> None:
+async def test_persist_refuses_references_that_differ_from_the_fingerprint(
+    db: Database, world: RealWorld
+) -> None:
     bundle = await complete_valuation(db, world)
     sys_actor = system(world.workspace_id)
     wrong_config = bundle.refs.model_copy(update={"config_revision_id": uuid.uuid4()})
     with pytest.raises(ValidationFailed):
-        await run(db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, wrong_config, bundle.inputs))
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.persist_valuation(
+                c, sys_actor, bundle.valuation, wrong_config, bundle.inputs
+            ),
+        )
     no_fx = bundle.refs.model_copy(update={"fx_rate_ids": ()})
     with pytest.raises(ValidationFailed):
-        await run(db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, no_fx, bundle.inputs))
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, no_fx, bundle.inputs),
+        )
     bad_inputs = bundle.inputs.model_copy(update={"import_line_sources": ()})
     with pytest.raises(ValidationFailed):
-        await run(db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, bundle.refs, bad_inputs))
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.persist_valuation(
+                c, sys_actor, bundle.valuation, bundle.refs, bad_inputs
+            ),
+        )
 
 
-async def test_foreign_workspace_valuation_is_not_found(db: Database, world: RealWorld, other_world: RealWorld) -> None:
+async def test_foreign_workspace_valuation_is_not_found(
+    db: Database, world: RealWorld, other_world: RealWorld
+) -> None:
     stored = await store_simple_valuation(db, world)
     foreign = viewer(other_world.workspace_id)
     with pytest.raises(NotFound):
@@ -107,9 +134,13 @@ async def test_reviewer_cannot_write_valuations(db: Database, world: RealWorld) 
 async def test_mark_stale_is_the_only_transition_and_idempotent(db: Database, world: RealWorld) -> None:
     stored = await store_simple_valuation(db, world)
     sys_actor = system(world.workspace_id)
-    first = await run(db, sys_actor, lambda c: valuation_repo.mark_stale(c, sys_actor, stored.id, InvalidationReason.FX))
+    first = await run(
+        db, sys_actor, lambda c: valuation_repo.mark_stale(c, sys_actor, stored.id, InvalidationReason.FX)
+    )
     assert first.changed and first.state == ValuationState.STALE and first.stale_reason == "fx"
-    again = await run(db, sys_actor, lambda c: valuation_repo.mark_stale(c, sys_actor, stored.id, InvalidationReason.CONFIG))
+    again = await run(
+        db, sys_actor, lambda c: valuation_repo.mark_stale(c, sys_actor, stored.id, InvalidationReason.CONFIG)
+    )
     assert not again.changed and again.stale_reason == "fx"
     loaded = await run(db, sys_actor, lambda c: valuation_repo.load_valuation(c, sys_actor, stored.id))
     assert loaded.valuation.state == ValuationState.STALE and not loaded.valuation.alert_eligible
@@ -131,20 +162,78 @@ async def test_listing_revision_change_marks_stale_and_queues_one_job_per_listin
     assert set(result.stale_valuation_ids) == {first.id, second.id}
     assert result.jobs_created == 1 and set(result.recompute_jobs) == {world.listing_id}
     job_id = result.recompute_jobs[world.listing_id]
-    job = seed.conn.execute("select job_type, state, listing_id, dedup_key from ops.jobs where id = %s", (job_id,)).fetchone()
-    assert job == ("valuation", JobState.QUEUED.value, world.listing_id, f"valuation.recompute:{world.listing_id}")
+    job = seed.conn.execute(
+        "select job_type, state, listing_id, dedup_key from ops.jobs where id = %s", (job_id,)
+    ).fetchone()
+    assert job == (
+        "valuation",
+        JobState.QUEUED.value,
+        world.listing_id,
+        f"valuation.recompute:{world.listing_id}",
+    )
     # A repeated invalidation finds nothing open and queues nothing new (deduplicated).
     again = await run(db, sys_actor, lambda c: valuation_repo.invalidate_dependents(c, sys_actor, change))
     assert again.stale_valuation_ids == () and again.jobs_created == 0
-    states = {r[0] for r in seed.conn.execute("select state from app.valuations where listing_id = %s", (world.listing_id,))}
+    states = {
+        r[0]
+        for r in seed.conn.execute(
+            "select state from app.valuations where listing_id = %s", (world.listing_id,)
+        )
+    }
     assert states == {"stale"}
 
 
-async def test_reverse_invalidation_by_each_dependency_kind(db: Database, seed: Seed, world: RealWorld) -> None:
+async def test_config_change_queues_one_recompute_job_per_stale_valuation(
+    db: Database, seed: Seed, world: RealWorld, other_world: RealWorld
+) -> None:
+    listing2, rev2 = make_listing(seed, world.workspace_id, world.source_id)
+    second_world = dataclasses.replace(world, listing_id=listing2, revision_id=rev2)
+    first = await store_simple_valuation(db, world)
+    second = await store_simple_valuation(db, second_world)
+    foreign = await store_simple_valuation(db, other_world)
+    sys_actor = system(world.workspace_id)
+    change = DependencyChange(
+        reason=InvalidationReason.CONFIG, current_config_revision_id=seed.config_revision(world.workspace_id)
+    )
+    result = await run(db, sys_actor, lambda c: valuation_repo.invalidate_dependents(c, sys_actor, change))
+    assert set(result.stale_valuation_ids) == {first.id, second.id} and result.jobs_created == 2
+    payloads = {
+        row[0]: row[1]
+        for row in seed.conn.execute(
+            "select listing_id, payload from ops.jobs where workspace_id = %s and job_type = 'valuation'",
+            (world.workspace_id,),
+        )
+    }
+    assert payloads[world.listing_id]["stale_valuation_ids"] == [str(first.id)]
+    assert payloads[listing2]["stale_valuation_ids"] == [str(second.id)]
+    again = await run(db, sys_actor, lambda c: valuation_repo.invalidate_dependents(c, sys_actor, change))
+    assert again.jobs_created == 0 and again.stale_valuation_ids == ()
+    # RLS: another workspace's valuations are never touched.
+    untouched = await run(
+        db,
+        system(other_world.workspace_id),
+        lambda c: valuation_repo.load_valuation(c, system(other_world.workspace_id), foreign.id),
+    )
+    assert untouched.valuation.state == ValuationState.NOT_STARTED
+    with pytest.raises(NotFound):
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.mark_stale(c, sys_actor, foreign.id, InvalidationReason.FX),
+        )
+
+
+async def test_reverse_invalidation_by_each_dependency_kind(
+    db: Database, seed: Seed, world: RealWorld
+) -> None:
     bundle = await complete_valuation(db, world)
     sys_actor = system(world.workspace_id)
     stored = await run(
-        db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs)
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(
+            c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs
+        ),
     )
     unrelated = await store_simple_valuation(db, world)
     changes = [
@@ -155,16 +244,22 @@ async def test_reverse_invalidation_by_each_dependency_kind(db: Database, seed: 
             market_observation_ids=(bundle.comparable.result.selected[0].observation_id,),
         ),
         DependencyChange(reason=InvalidationReason.COST_PROFILE, cost_profile_ids=(bundle.profile.id,)),
-        DependencyChange(reason=InvalidationReason.TAX_RULE, tax_rule_set_ids=tuple(r.id for r in bundle.rule_set.rows)),
+        DependencyChange(
+            reason=InvalidationReason.TAX_RULE, tax_rule_set_ids=tuple(r.id for r in bundle.rule_set.rows)
+        ),
     ]
     for change in changes:
-        found = await run(db, sys_actor, lambda c, ch=change: valuation_repo.find_dependents(c, sys_actor, ch))
+        found = await run(
+            db, sys_actor, lambda c, ch=change: valuation_repo.find_dependents(c, sys_actor, ch)
+        )
         assert found == [stored.id], change.reason
     newer = mkd_rate().model_copy(update={"rate_date": date(2026, 10, 6), "rate": Decimal("61.6")})
     fx2, created = await run(db, sys_actor, lambda c: valuation_repo.upsert_fx_rate(c, sys_actor, newer))
     assert created
     result = await run(
-        db, sys_actor, lambda c: valuation_repo.invalidate_dependents(c, sys_actor, DependencyChange.new_fx_rate(fx2))
+        db,
+        sys_actor,
+        lambda c: valuation_repo.invalidate_dependents(c, sys_actor, DependencyChange.new_fx_rate(fx2)),
     )
     assert result.stale_valuation_ids == (stored.id,)
     remaining = await run(db, sys_actor, lambda c: valuation_repo.load_valuation(c, sys_actor, unrelated.id))
@@ -172,7 +267,9 @@ async def test_reverse_invalidation_by_each_dependency_kind(db: Database, seed: 
     # A new business configuration invalidates everything computed under another one.
     new_config = seed.config_revision(world.workspace_id)
     config_change = DependencyChange(reason=InvalidationReason.CONFIG, current_config_revision_id=new_config)
-    config_result = await run(db, sys_actor, lambda c: valuation_repo.invalidate_dependents(c, sys_actor, config_change))
+    config_result = await run(
+        db, sys_actor, lambda c: valuation_repo.invalidate_dependents(c, sys_actor, config_change)
+    )
     assert config_result.stale_valuation_ids == (unrelated.id,)
 
 
@@ -180,12 +277,20 @@ async def test_revoking_a_tax_rule_invalidates_dependents(db: Database, world: R
     bundle = await complete_valuation(db, world)
     sys_actor = system(world.workspace_id)
     stored = await run(
-        db, sys_actor, lambda c: valuation_repo.persist_valuation(c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs)
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(
+            c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs
+        ),
     )
     own = owner(world.workspace_id)
     rs = bundle.rule_set.rule_set
     revoked = await run(
-        db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs.rule_set_id, rs.version, TaxRuleStatus.REVOKED)
+        db,
+        own,
+        lambda c: valuation_repo.transition_tax_rule_set(
+            c, own, rs.rule_set_id, rs.version, TaxRuleStatus.REVOKED
+        ),
     )
     assert revoked.rule_set.status == TaxRuleStatus.REVOKED
     loaded = await run(db, sys_actor, lambda c: valuation_repo.load_valuation(c, sys_actor, stored.id))
@@ -204,7 +309,9 @@ async def test_fx_upsert_is_insert_or_return_and_never_overwrites(db: Database, 
     stored, created = await run(db, sys_actor, lambda c: valuation_repo.upsert_fx_rate(c, sys_actor, rate))
     assert created and stored.rate.rate == Decimal("61.5") and str(stored.rate.rate) == "61.5"
     assert (stored.rate.base, stored.rate.quote, stored.rate.purpose) == ("EUR", "MKD", FxPurpose.REFERENCE)
-    same, created_again = await run(db, sys_actor, lambda c: valuation_repo.upsert_fx_rate(c, sys_actor, rate))
+    same, created_again = await run(
+        db, sys_actor, lambda c: valuation_repo.upsert_fx_rate(c, sys_actor, rate)
+    )
     assert not created_again and same.id == stored.id
     different = rate.model_copy(update={"rate": Decimal("62")})
     with pytest.raises(VersionConflict):
@@ -220,7 +327,9 @@ async def test_fx_upsert_is_insert_or_return_and_never_overwrites(db: Database, 
         retrieved_at=rate.retrieved_at,
         provider=rate.provider,
     )
-    inv, inv_created = await run(db, sys_actor, lambda c: valuation_repo.upsert_fx_rate(c, sys_actor, inverse))
+    inv, inv_created = await run(
+        db, sys_actor, lambda c: valuation_repo.upsert_fx_rate(c, sys_actor, inverse)
+    )
     assert inv_created and inv.id != stored.id
     too_precise = rate.model_copy(update={"rate": Decimal("1.00000000001"), "provider": "SYNTHETIC precise"})
     with pytest.raises(ValidationFailed):
@@ -229,7 +338,12 @@ async def test_fx_upsert_is_insert_or_return_and_never_overwrites(db: Database, 
         db,
         sys_actor,
         lambda c: valuation_repo.latest_fx_rates(
-            c, sys_actor, base="EUR", quote="MKD", purpose=FxPurpose.REFERENCE, on_or_before=date(2026, 12, 31)
+            c,
+            sys_actor,
+            base="EUR",
+            quote="MKD",
+            purpose=FxPurpose.REFERENCE,
+            on_or_before=date(2026, 12, 31),
         ),
     )
     assert [r.id for r in latest] == [stored.id]
@@ -258,18 +372,42 @@ async def test_tax_rule_set_lifecycle_and_mapping(db: Database, seed: Seed, worl
     # Never auto-approved: approval needs the owner, an approver name and a bound review record.
     sys_actor = system(world.workspace_id)
     with pytest.raises(Forbidden):
-        await run(db, sys_actor, lambda c: valuation_repo.transition_tax_rule_set(c, sys_actor, rs, version, TaxRuleStatus.UNDER_REVIEW))
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.transition_tax_rule_set(
+                c, sys_actor, rs, version, TaxRuleStatus.UNDER_REVIEW
+            ),
+        )
     with pytest.raises(ValidationFailed):
-        await run(db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.APPROVED))
-    review = await run(db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.UNDER_REVIEW))
+        await run(
+            db,
+            own,
+            lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.APPROVED),
+        )
+    review = await run(
+        db,
+        own,
+        lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.UNDER_REVIEW),
+    )
     assert review.rule_set.sha256 is not None
     with pytest.raises(ValidationFailed):
-        await run(db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.APPROVED))
+        await run(
+            db,
+            own,
+            lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.APPROVED),
+        )
     approved = await run(
         db,
         own,
         lambda c: valuation_repo.transition_tax_rule_set(
-            c, own, rs, version, TaxRuleStatus.APPROVED, approved_by="SYNTHETIC owner", review_record=review_record(draft)
+            c,
+            own,
+            rs,
+            version,
+            TaxRuleStatus.APPROVED,
+            approved_by="SYNTHETIC owner",
+            review_record=review_record(draft),
         ),
     )
     assert approved.rule_set.status == TaxRuleStatus.APPROVED
@@ -283,9 +421,15 @@ async def test_tax_rule_set_lifecycle_and_mapping(db: Database, seed: Seed, worl
     assert row is not None and row[0] == own.principal_id and '"approver":"SYNTHETIC owner"' in row[1]
     # Approval never activates; activation is a separate explicit step.
     assert approved.rule_set.status != TaxRuleStatus.ACTIVE
-    with pytest.raises(VersionConflict):  # domain + trigger: approved -> draft is not a transition
-        await run(db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.DRAFT))
-    active = await run(db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.ACTIVE))
+    with pytest.raises(ValidationFailed):  # domain + trigger: approved -> draft is not a transition
+        await run(
+            db,
+            own,
+            lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.DRAFT),
+        )
+    active = await run(
+        db, own, lambda c: valuation_repo.transition_tax_rule_set(c, own, rs, version, TaxRuleStatus.ACTIVE)
+    )
     assert active.rule_set.status == TaxRuleStatus.ACTIVE
     listed = await run(
         db, own, lambda c: valuation_repo.list_rule_sets(c, own, statuses=(TaxRuleStatus.ACTIVE,))
@@ -293,7 +437,9 @@ async def test_tax_rule_set_lifecycle_and_mapping(db: Database, seed: Seed, worl
     assert [s.rule_set.label() for s in listed] == [draft.label()]
 
 
-async def test_only_drafts_are_stored_and_fixture_rule_sets_never_approve(db: Database, world: RealWorld) -> None:
+async def test_only_drafts_are_stored_and_fixture_rule_sets_never_approve(
+    db: Database, world: RealWorld
+) -> None:
     own = owner(world.workspace_id)
     approved_shape = synthetic_rule_set().model_copy(update={"status": TaxRuleStatus.APPROVED})
     with pytest.raises(ValidationFailed):
@@ -310,7 +456,11 @@ async def test_only_drafts_are_stored_and_fixture_rule_sets_never_approve(db: Da
         )
     reviewer_actor = reviewer(world.workspace_id)
     with pytest.raises(Forbidden):
-        await run(db, reviewer_actor, lambda c: valuation_repo.store_rule_set(c, reviewer_actor, synthetic_rule_set()))
+        await run(
+            db,
+            reviewer_actor,
+            lambda c: valuation_repo.store_rule_set(c, reviewer_actor, synthetic_rule_set()),
+        )
 
 
 # --------------------------------------------------------------------------------------------
@@ -333,7 +483,9 @@ async def test_cost_profile_round_trip_and_owner_approval(db: Database, world: R
     assert reloaded.profile.reference() == approved.profile.reference()
     with pytest.raises(VersionConflict):
         await run(db, own, lambda c: valuation_repo.approve_cost_profile(c, own, stored.id))
-    unapproved = profile.model_copy(update={"approval_status": "approved", "approved_by": "x", "approved_at": T0})
+    unapproved = profile.model_copy(
+        update={"approval_status": "approved", "approved_by": "x", "approved_at": T0}
+    )
     with pytest.raises(ValidationFailed):
         await run(db, sys_actor, lambda c: valuation_repo.store_cost_profile(c, sys_actor, unapproved))
 
@@ -358,15 +510,40 @@ async def test_cost_evidence_keeps_hash_and_supersede_invalidates(db: Database, 
     assert loaded == [stored]
     line = valuation_repo.cost_line_from_evidence(stored)
     assert line.evidence_ids == (str(stored.id),) and line.provider == "SYNTHETIC transport provider"
-    # A valuation citing the quote becomes stale when a superseding quote arrives.
-    valuation = await store_simple_valuation(db, world)
-    seed_update = "update app.valuations set cost_evidence_ids = %s where id = %s"
-    _ = seed_update  # the array is fixed at insert; use find_dependents on a fresh valuation below
+    # A valuation that cites the quote becomes stale when a superseding quote arrives; an
+    # unrelated valuation does not.
+    bundle = await complete_valuation(db, world, transport=stored)
+    assert str(stored.id) in bundle.valuation.dependencies.cost_evidence_ids
+    citing = await run(
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(
+            c, sys_actor, bundle.valuation, bundle.refs, bundle.inputs
+        ),
+    )
+    unrelated = await store_simple_valuation(db, world)
     newer = quote.model_copy(update={"base": Money.of("720.00", "EUR"), "supersedes_id": stored.id})
     await run(db, sys_actor, lambda c: valuation_repo.insert_cost_evidence(c, sys_actor, newer))
-    untouched = await run(db, sys_actor, lambda c: valuation_repo.load_valuation(c, sys_actor, valuation.id))
+    stale = await run(db, sys_actor, lambda c: valuation_repo.load_valuation(c, sys_actor, citing.id))
+    assert stale.valuation.state == ValuationState.STALE
+    assert stale.valuation.stale_reason is not None and stale.valuation.stale_reason.startswith("cost_quote")
+    untouched = await run(db, sys_actor, lambda c: valuation_repo.load_valuation(c, sys_actor, unrelated.id))
     assert untouched.valuation.state == ValuationState.NOT_STARTED
+    # A valuation may only list evidence its scenarios cite.
+    foreign_ref = bundle.refs.model_copy(update={"cost_evidence_ids": (uuid.uuid4(),)})
     with pytest.raises(ValidationFailed):
+        await run(
+            db,
+            sys_actor,
+            lambda c: valuation_repo.persist_valuation(
+                c, sys_actor, bundle.valuation, foreign_ref, bundle.inputs
+            ),
+        )
+    with pytest.raises(PydanticValidationError):
         CostEvidenceInput(
-            kind="quote", category=CostCategory.TRANSPORT, base=Money.of("1", "EUR"), obtained_at=T0, scope=CostScope()
+            kind="quote",
+            category=CostCategory.TRANSPORT,
+            base=Money.of("1", "EUR"),
+            obtained_at=T0,
+            scope=CostScope(),
         )

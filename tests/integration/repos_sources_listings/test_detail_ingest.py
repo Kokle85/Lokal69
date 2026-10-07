@@ -1,4 +1,7 @@
-"""Detail ingestion: revisions, out-of-order generations, identity conflicts, quarantine, screening (spec 10, 14, 25)."""
+"""Detail ingestion: revisions, out-of-order generations, identity conflicts, quarantine, screening.
+
+Spec sections 10, 14 and 25.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +11,7 @@ from uuid import UUID
 
 import pytest
 from tests.integration.db.helpers import Seed, unique
-from tests.integration.persistence_core.support import expire_job_lease
+from tests.integration.persistence_core.support import expire_job_lease, member
 from tests.integration.repos_sources_listings.support import (
     PARSER,
     Env,
@@ -21,11 +24,19 @@ from tests.integration.repos_sources_listings.support import (
 )
 
 from suv_deals.adapters.base import ParsedListing
-from suv_deals.domain.enums import AccessState, Availability, EligibilityState, Fuel, TechnicalStatus
+from suv_deals.domain.enums import (
+    AccessState,
+    Availability,
+    EligibilityState,
+    Fuel,
+    JobType,
+    Role,
+    TechnicalStatus,
+)
 from suv_deals.domain.filters import SCREENING_VERSION, ScreeningResult
 from suv_deals.domain.identity import PromotionOutcome
-from suv_deals.errors import ValidationFailed
-from suv_deals.persistence import listings_repo, sources_repo
+from suv_deals.errors import Forbidden, ValidationFailed
+from suv_deals.persistence import jobs, listings_repo, sources_repo
 from suv_deals.persistence.database import Database
 from suv_deals.persistence.errors_map import LeaseLost
 from suv_deals.persistence.listings_repo import DetailSnapshotRef
@@ -36,7 +47,8 @@ pytestmark = pytest.mark.db
 
 def _listing(seed: Seed, listing_id: UUID) -> dict[str, Any]:
     cur = seed.conn.execute(
-        "select current_generation, current_observation_id, current_revision_id, availability, detail_generation,"
+        "select current_generation, current_observation_id, current_revision_id, availability,"
+        " detail_generation,"
         " last_detail_success_at, eligibility_state, eligibility_profile, screening, screening_version,"
         " screened_at, identity_conflict, incarnation, row_version from app.listings where id = %s",
         (listing_id,),
@@ -74,7 +86,9 @@ async def test_first_detail_promotes_revision_with_evidence(db: Database, env: E
     assert result.outcome == PromotionOutcome.PROMOTE_NEW_REVISION and result.revision_number == 1
     assert result.promoted and not result.quarantined
     row = _listing(seed, listing_id)
-    assert row["current_generation"] == job.generation == 1 and row["current_revision_id"] == result.revision_id
+    assert (
+        row["current_generation"] == job.generation == 1 and row["current_revision_id"] == result.revision_id
+    )
     assert row["availability"] == "available" and row["last_detail_success_at"] is not None
     assert seed.scalar("select state from ops.jobs where id = %s", (job.id,)) == "succeeded"
     evidence = seed.conn.execute(
@@ -82,7 +96,10 @@ async def test_first_detail_promotes_revision_with_evidence(db: Database, env: E
         " where revision_id = %s order by field_path",
         (result.revision_id,),
     ).fetchall()
-    assert evidence == [("price.amount_minor", "css", "high", None), ("vehicle.mileage_km", "json_ld", "high", None)]
+    assert evidence == [
+        ("price.amount_minor", "css", "high", None),
+        ("vehicle.mileage_km", "json_ld", "high", None),
+    ]
     typed = seed.conn.execute(
         "select asking_minor, currency, mileage_km, make, model, registration_year, registration_month, fuel"
         " from app.listing_revisions where id = %s",
@@ -104,7 +121,9 @@ async def test_unchanged_content_creates_no_new_revision(db: Database, env: Env,
     assert len(_revisions(seed, listing_id)) == 1
     row = _listing(seed, listing_id)
     assert row["current_generation"] == 2 and row["last_detail_success_at"] == later(30)
-    assert seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 2
+    assert (
+        seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 2
+    )
 
 
 async def test_price_reversion_creates_chronological_revisions(db: Database, env: Env, seed: Seed) -> None:
@@ -159,13 +178,22 @@ async def test_concurrent_detail_completions_serialize(db: Database, env: Env, s
     row = _listing(seed, listing_id)
     assert row["current_generation"] == 2  # whatever order the locks were granted in
     assert _current_price(seed, listing_id) == 240000
-    assert {r.outcome for r in results} <= {PromotionOutcome.PROMOTE_NEW_REVISION, PromotionOutcome.HISTORICAL_ONLY}
+    assert {r.outcome for r in results} <= {
+        PromotionOutcome.PROMOTE_NEW_REVISION,
+        PromotionOutcome.HISTORICAL_ONLY,
+    }
     numbers = [n for n, *_ in _revisions(seed, listing_id)]
     assert numbers == list(range(1, len(numbers) + 1))
-    assert seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 2
-    assert seed.scalar(
-        "select count(*) from ops.jobs where id = any(%s) and state = 'succeeded'", ([first.id, second.id],)
-    ) == 2
+    assert (
+        seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 2
+    )
+    assert (
+        seed.scalar(
+            "select count(*) from ops.jobs where id = any(%s) and state = 'succeeded'",
+            ([first.id, second.id],),
+        )
+        == 2
+    )
 
 
 async def test_identity_conflict_creates_new_incarnation(db: Database, env: Env, seed: Seed) -> None:
@@ -184,10 +212,14 @@ async def test_identity_conflict_creates_new_incarnation(db: Database, env: Env,
     # Nothing is inherited: the new incarnation starts at revision 1 with its own evidence.
     assert [n for n, *_ in _revisions(seed, result.listing_id)] == [1]
     assert len(_revisions(seed, listing_id)) == 1
-    assert seed.scalar(
-        "select not_promoted_reason from app.detail_observations where listing_id = %s and generation = 2",
-        (listing_id,),
-    ) == "identity_conflict"
+    assert (
+        seed.scalar(
+            "select not_promoted_reason from app.detail_observations"
+            " where listing_id = %s and generation = 2",
+            (listing_id,),
+        )
+        == "identity_conflict"
+    )
     # Later search cards resolve to the newest incarnation.
     async with unit_of_work(db, env.system) as conn:
         found = await listings_repo.find_listing(conn, env.system, env.source_id, slid)
@@ -222,7 +254,9 @@ async def test_challenge_page_is_not_ingested(db: Database, env: Env, seed: Seed
     challenge = ParsedListing(page_type="challenge", access_state=AccessState.ACCESS_BLOCKED)
     with pytest.raises(ValidationFailed):
         await run_detail(db, env, job, listing_id, challenge)
-    assert seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 0
+    assert (
+        seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 0
+    )
     assert seed.scalar("select state from ops.jobs where id = %s", (job.id,)) == "running"
 
 
@@ -233,7 +267,11 @@ async def test_parser_unhealthy_quarantines_new_revisions(db: Database, env: Env
     job = await refresh_and_claim(db, env, listing_id)
     async with unit_of_work(db, env.system) as conn:
         await sources_repo.set_technical_status(
-            conn, env.system, env.source_id, TechnicalStatus.PARSER_UNHEALTHY, reason="synthetic drift tripwire"
+            conn,
+            env.system,
+            env.source_id,
+            TechnicalStatus.PARSER_UNHEALTHY,
+            reason="synthetic drift tripwire",
         )
     before = _listing(seed, listing_id)
     result = await run_detail(db, env, job, listing_id, vehicle(slid, price_minor=100))
@@ -243,7 +281,8 @@ async def test_parser_unhealthy_quarantines_new_revisions(db: Database, env: Env
     revisions = _revisions(seed, listing_id)
     assert [(n, q) for n, _, _, q in revisions] == [(1, False), (2, True)]
     assert seed.scalar(
-        "select quarantined from app.detail_observations where listing_id = %s and generation = 2", (listing_id,)
+        "select quarantined from app.detail_observations where listing_id = %s and generation = 2",
+        (listing_id,),
     )
 
 
@@ -277,23 +316,31 @@ async def test_lease_lost_rolls_back_everything(db: Database, env: Env, seed: Se
     expire_job_lease(seed, job.id)
     with pytest.raises(LeaseLost):
         await run_detail(db, env, job, listing_id, vehicle(slid))
-    assert seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 0
+    assert (
+        seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 0
+    )
     assert seed.scalar("select count(*) from app.listing_revisions where listing_id = %s", (listing_id,)) == 0
     assert _listing(seed, listing_id)["current_generation"] is None
 
 
-async def test_transaction_retry_with_same_snapshot_ref_is_idempotent(db: Database, env: Env, seed: Seed) -> None:
+async def test_transaction_retry_with_same_snapshot_ref_is_idempotent(
+    db: Database, env: Env, seed: Seed
+) -> None:
     slid = unique("SYN")
     listing_id, _ = await discover(db, env, slid)
     job = await claim_detail(db, env)
     ref = DetailSnapshotRef(parser_version=PARSER)
     document = ParsedListing(page_type="detail", access_state=AccessState.OK, listing=vehicle(slid))
     async with unit_of_work(db, env.system) as conn:
-        first = await listings_repo.ingest_detail(conn, env.system, job, listing_id, document, ref, complete_job=False)
+        first = await listings_repo.ingest_detail(
+            conn, env.system, job, listing_id, document, ref, complete_job=False
+        )
         replay = await listings_repo.ingest_detail(conn, env.system, job, listing_id, document, ref)
     assert first.outcome == PromotionOutcome.PROMOTE_NEW_REVISION
     assert replay.outcome == PromotionOutcome.DUPLICATE_REPLAY and replay.revision_id is None
-    assert seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 1
+    assert (
+        seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 1
+    )
     assert len(_revisions(seed, listing_id)) == 1
 
 
@@ -305,3 +352,106 @@ async def test_job_must_belong_to_the_listing(db: Database, env: Env) -> None:
     target = other_id if job.listing_id == listing_id else listing_id
     with pytest.raises(ValidationFailed):
         await run_detail(db, env, job, target, vehicle(slid))
+
+
+async def test_reappearing_listing_with_same_facts_gets_no_duplicate_revision(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    slid = unique("SYN")
+    listing_id, _ = await discover(db, env, slid)
+    await run_detail(db, env, await claim_detail(db, env), listing_id, vehicle(slid))
+    removed = ParsedListing(page_type="removed", access_state=AccessState.REMOVED)
+    await run_detail(db, env, await refresh_and_claim(db, env, listing_id), listing_id, removed)
+    back = await run_detail(db, env, await refresh_and_claim(db, env, listing_id), listing_id, vehicle(slid))
+    assert back.promoted and back.revision_id is None and back.availability_after == Availability.AVAILABLE
+    assert len(_revisions(seed, listing_id)) == 1
+    row = _listing(seed, listing_id)
+    assert row["availability"] == "available" and row["current_generation"] == 3
+    assert row["eligibility_state"] == "eligible_primary"
+    assert back.valuation_job_id is not None  # eligibility changed from rejected back to eligible
+
+
+async def test_late_job_of_superseded_incarnation_is_evidence_only(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    slid = unique("SYN")
+    listing_id, _ = await discover(db, env, slid)
+    await run_detail(db, env, await claim_detail(db, env), listing_id, vehicle(slid))
+    conflicting = await refresh_and_claim(db, env, listing_id)  # generation 2
+    late = await refresh_and_claim(db, env, listing_id)  # generation 3, still for the old incarnation
+    other_car = vehicle(slid, make="Toyota", model="RAV4", first_registration="2009-03", fuel=Fuel.PETROL)
+    first = await run_detail(db, env, conflicting, listing_id, other_car)
+    assert first.identity_conflict and first.new_incarnation == 2
+    result = await run_detail(db, env, late, listing_id, other_car)
+    assert result.outcome == PromotionOutcome.HISTORICAL_ONLY and not result.promoted
+    assert seed.scalar("select max(incarnation) from app.listings where source_listing_id = %s", (slid,)) == 2
+    assert (
+        seed.scalar(
+            "select not_promoted_reason from app.detail_observations"
+            " where listing_id = %s and generation = 3",
+            (listing_id,),
+        )
+        == "superseded_incarnation"
+    )
+    assert seed.scalar("select state from ops.jobs where id = %s", (late.id,)) == "succeeded"
+
+
+async def test_late_completion_after_lease_recovery_and_newer_unavailable_observation(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    slid = unique("SYN")
+    listing_id, _ = await discover(db, env, slid)
+    stale = await claim_detail(db, env, "worker-a")  # generation 1
+    expire_job_lease(seed, stale.id)
+    reaped = await jobs.reap_expired(db, env.workspace_id)
+    assert stale.id in reaped.requeued
+    seed.conn.execute("update ops.jobs set available_at = now() where id = %s", (stale.id,))
+    recovered = await claim_detail(db, env, "worker-b")
+    assert (
+        recovered.id == stale.id and recovered.generation == stale.generation == 1
+    )  # retries keep generation
+    newer = await refresh_and_claim(db, env, listing_id)  # generation 2: the ad was removed meanwhile
+    removed = ParsedListing(page_type="removed", access_state=AccessState.REMOVED)
+    await run_detail(db, env, newer, listing_id, removed)
+    late = await run_detail(db, env, recovered, listing_id, vehicle(slid))
+    assert late.outcome == PromotionOutcome.HISTORICAL_ONLY and not late.promoted
+    row = _listing(seed, listing_id)
+    assert row["availability"] == "removed" and row["current_generation"] == 2  # never regressed
+    with pytest.raises(LeaseLost):  # the original holder lost the lease; nothing it writes commits
+        await run_detail(db, env, stale, listing_id, vehicle(slid, price_minor=1000))
+    assert (
+        seed.scalar("select count(*) from app.detail_observations where listing_id = %s", (listing_id,)) == 2
+    )
+
+
+async def test_refresh_scopes_dedup_and_generation_allocation(db: Database, env: Env, seed: Seed) -> None:
+    slid = unique("SYN")
+    listing_id, _ = await discover(db, env, slid)  # generation 1 waiting
+    reviewer = member(env.workspace_id, Role.REVIEWER)
+    viewer = member(env.workspace_id, Role.VIEWER)
+    async with unit_of_work(db, reviewer) as conn:
+        assert (
+            await listings_repo.request_detail_refresh(conn, reviewer, listing_id, reason="recheck") is None
+        )
+        with pytest.raises(Forbidden):
+            await listings_repo.request_detail_refresh(
+                conn, reviewer, listing_id, reason="detail is system work", job_type=JobType.DETAIL
+            )
+    async with unit_of_work(db, viewer) as conn:
+        with pytest.raises(Forbidden):
+            await listings_repo.request_detail_refresh(conn, viewer, listing_id, reason="viewer recheck")
+    seed.conn.execute(
+        "update ops.jobs set state = 'succeeded', completed_at = now() where listing_id = %s", (listing_id,)
+    )
+    async with unit_of_work(db, reviewer) as conn:
+        ref = await listings_repo.request_detail_refresh(conn, reviewer, listing_id, reason="price recheck")
+    assert ref is not None and ref.generation == 2
+    assert seed.scalar("select job_type from ops.jobs where id = %s", (ref.job_id,)) == "recheck"
+    async with unit_of_work(db, env.system) as conn:
+        allocated = [
+            await listings_repo.allocate_detail_generation(conn, env.system, listing_id) for _ in range(3)
+        ]
+    assert allocated == [3, 4, 5]
+    async with unit_of_work(db, viewer) as conn:
+        with pytest.raises(Forbidden):
+            await listings_repo.allocate_detail_generation(conn, viewer, listing_id)

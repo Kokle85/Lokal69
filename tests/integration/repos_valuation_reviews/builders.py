@@ -43,6 +43,7 @@ from suv_deals.domain.enums import (
     FxPurpose,
     Gearbox,
     ProfileKey,
+    ReviewOutcome,
     Role,
     TaxRuleStatus,
 )
@@ -50,6 +51,7 @@ from suv_deals.domain.filters import ScreeningResult
 from suv_deals.domain.listings import PartialDate, VehicleSpec
 from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.profiles import BusinessConfig, ContributionThreshold, SearchProfile
+from suv_deals.domain.reviews import SubmitRequest
 from suv_deals.domain.tax_engine import (
     IMPORT_CATEGORIES,
     Classification,
@@ -64,9 +66,10 @@ from suv_deals.domain.tax_engine import (
     load_rule_set_file,
 )
 from suv_deals.domain.valuation import ScreeningInput, Valuation, assemble_valuation
-from suv_deals.persistence import market_repo, valuation_repo
+from suv_deals.persistence import market_repo, reviews_repo, valuation_repo
 from suv_deals.persistence.database import Conn, Database
 from suv_deals.persistence.transactions import unit_of_work
+from suv_deals.views.reviews import ClaimResult
 
 REPO = Path(__file__).resolve().parents[3]
 TAX_FIXTURE = REPO / "tests" / "fixtures" / "tax" / "synthetic_rule_set.json"
@@ -133,10 +136,21 @@ def make_listing(seed: Seed, ws: UUID, source_id: UUID, *, eligible: bool = True
 def make_eligible(seed: Seed, ws: UUID, listing_id: UUID, *, eur: str = "2750.00") -> None:
     seed.conn.execute(
         "update app.listings set eligibility_state = 'eligible_primary', eligibility_profile = 'primary',"
-        " screening = %s, screening_version = 'screening@test', screened_at = now(), availability = 'available',"
-        " last_detail_success_at = now(), last_seen_at = now(), row_version = row_version + 1"
+        " screening = %s, screening_version = 'screening@test', screened_at = now(),"
+        " availability = 'available', last_detail_success_at = now(), last_seen_at = now(),"
+        " row_version = row_version + 1"
         " where workspace_id = %s and id = %s",
         (Jsonb({"eur_amount": eur, "synthetic": True}), ws, listing_id),
+    )
+
+
+def set_eligibility(seed: Seed, ws: UUID, listing_id: UUID, state: str, profile: str | None = None) -> None:
+    """The listing's committed screening (what ingest records when it screens a revision)."""
+    seed.conn.execute(
+        "update app.listings set eligibility_state = %s, eligibility_profile = %s,"
+        " screening = coalesce(screening, %s), screening_version = 'screening@test',"
+        " screened_at = now(), row_version = row_version + 1 where workspace_id = %s and id = %s",
+        (state, profile, Jsonb({"synthetic": True}), ws, listing_id),
     )
 
 
@@ -187,7 +201,7 @@ def business_config() -> BusinessConfig:
 # --------------------------------------------------------------------------------------------
 
 
-def observation(source_key: str, amount: str = "9000.00", **kw: Any) -> MarketObservation:
+def observation(source_key: str, amount: str | None = "9000.00", **kw: Any) -> MarketObservation:
     vehicle = VehicleSpec(
         make="Example",
         model="Trail",
@@ -203,7 +217,7 @@ def observation(source_key: str, amount: str = "9000.00", **kw: Any) -> MarketOb
         "url": f"https://mk-classifieds.example/ad/{uuid.uuid4().hex[:10]}",
         "observed_at": T0 - timedelta(days=3),
         "evidence_kind": EvidenceKind.ASKING_PRICE,
-        "amount": Money.of(amount, "EUR"),
+        "amount": None if amount is None else Money.of(amount, "EUR"),
         "vehicle": vehicle,
         "local_registration_status": "locally_registered",
     }
@@ -303,13 +317,14 @@ def tax_inputs() -> TaxInputs:
     )
 
 
-def mkd_rate() -> FxRate:
+def mkd_rate(at: datetime | None = None) -> FxRate:
+    """SYNTHETIC EUR->MKD reference rate (dated ``at`` when given)."""
     return FxRate(
         base="EUR",
         quote="MKD",
         rate=Decimal("61.5"),
-        rate_date=date(2026, 10, 5),
-        retrieved_at=datetime(2026, 10, 5, 16, tzinfo=UTC),
+        rate_date=date(2026, 10, 5) if at is None else at.date(),
+        retrieved_at=datetime(2026, 10, 5, 16, tzinfo=UTC) if at is None else at,
         provider="SYNTHETIC owner-approved MKD source",
         purpose=FxPurpose.REFERENCE,
     )
@@ -332,23 +347,37 @@ def cost_profile(key: str | None = None) -> CostProfile:
     )
 
 
-def other_lines() -> list[CostLine]:
-    eur = lambda v: Money.of(v, "EUR")  # noqa: E731
+def _eur(value: str) -> Money:
+    return Money.of(value, "EUR")
+
+
+def other_lines(transport: CostLine | None = None) -> list[CostLine]:
+    """SYNTHETIC cost lines; ``transport`` replaces the estimated transport line (e.g. a quote)."""
+    estimated = (
+        (CostCategory.TRANSPORT, "700.00"),
+        (CostCategory.CUSTOMS_BROKER, "250.00"),
+        (CostCategory.REPAIRS, "800.00"),
+    )
     lines = [
-        CostLine(category=c, label=f"SYNTHETIC {c.value}", status=CostLineStatus.ESTIMATED, currency="EUR", base=eur(v))
-        for c, v in (
-            (CostCategory.TRANSPORT, "700.00"),
-            (CostCategory.CUSTOMS_BROKER, "250.00"),
-            (CostCategory.REPAIRS, "800.00"),
+        CostLine(
+            category=c,
+            label=f"SYNTHETIC {c.value}",
+            status=CostLineStatus.ESTIMATED,
+            currency="EUR",
+            base=_eur(v),
         )
+        for c, v in estimated
+        if transport is None or c != CostCategory.TRANSPORT
     ]
+    if transport is not None:
+        lines.append(transport)
     lines += [
         CostLine(
             category=c,
             label=f"SYNTHETIC {c.value}",
             status=CostLineStatus.ESTIMATED,
             currency="EUR",
-            base=eur(v),
+            base=_eur(v),
             assumption_approved=True,
         )
         for c, v in ((CostCategory.RISK_RESERVE, "600.00"), (CostCategory.SELLING_COSTS, "150.00"))
@@ -378,8 +407,17 @@ class ValuationBundle:
     comparable: market_repo.StoredComparableSet
 
 
-async def complete_valuation(db: Database, world: RealWorld, *, revision_id: UUID | None = None) -> ValuationBundle:
-    """A complete, non-fixture ESTIMATED valuation whose every dependency is stored."""
+async def complete_valuation(
+    db: Database,
+    world: RealWorld,
+    *,
+    revision_id: UUID | None = None,
+    transport: valuation_repo.StoredCostEvidence | None = None,
+    as_of: datetime = T0,
+) -> ValuationBundle:
+    """A complete, non-fixture ESTIMATED valuation whose every dependency is stored.
+
+    ``transport``: stored cost evidence used as the transport line (cited by the valuation)."""
     ws = world.workspace_id
     own = owner(ws)
     sys_actor = system(ws)
@@ -387,11 +425,13 @@ async def complete_valuation(db: Database, world: RealWorld, *, revision_id: UUI
     revision = revision_id or world.revision_id
 
     async def deps(conn: Conn) -> tuple[valuation_repo.StoredFxRate, valuation_repo.StoredCostProfile, Any]:
-        fx, _ = await valuation_repo.upsert_fx_rate(conn, sys_actor, mkd_rate())
+        fx, _ = await valuation_repo.upsert_fx_rate(conn, sys_actor, mkd_rate(None if as_of == T0 else as_of))
         profile = await valuation_repo.store_cost_profile(conn, sys_actor, cost_profile())
         obs = [observation(world.source_key, a) for a in ("8800.00", "9000.00", "9200.00", "9400.00")]
         for item in obs:
-            await market_repo.insert_market_observation(conn, sys_actor, item, confidence="medium", source_id=world.source_id)
+            await market_repo.insert_market_observation(
+                conn, sys_actor, item, confidence="medium", source_id=world.source_id
+            )
         result = select_comparables(target(world.listing_id), obs, business_config(), as_of=T0)
         stored = await market_repo.persist_comparable_set(
             conn, sys_actor, result, listing_id=world.listing_id, target_revision_id=revision
@@ -402,9 +442,15 @@ async def complete_valuation(db: Database, world: RealWorld, *, revision_id: UUI
     calc = calculate(rule.rule_set, tax_inputs(), T0)
     assert calc.production_ready
     purchase = PurchaseInput(status=CostLineStatus.ESTIMATED, amount=Money.of("2800.00", "EUR"))
-    proceeds = ProceedsEstimate(status=CostLineStatus.ESTIMATED, currency="EUR", base=Money.of("8000.00", "EUR"), basis="owner_estimate")
-    lines = other_lines() + list(tax_cost_lines(calc))
-    scenarios = compute_scenarios(purchase, lines, proceeds, [fx.rate], ContributionThreshold(), as_of=T0)
+    proceeds = ProceedsEstimate(
+        status=CostLineStatus.ESTIMATED,
+        currency="EUR",
+        base=Money.of("8000.00", "EUR"),
+        basis="owner_estimate",
+    )
+    transport_line = None if transport is None else valuation_repo.cost_line_from_evidence(transport)
+    lines = other_lines(transport_line) + list(tax_cost_lines(calc))
+    scenarios = compute_scenarios(purchase, lines, proceeds, [fx.rate], ContributionThreshold(), as_of=as_of)
     valuation = assemble_valuation(
         listing_revision_id=str(revision),
         screening=ScreeningInput(
@@ -418,7 +464,7 @@ async def complete_valuation(db: Database, world: RealWorld, *, revision_id: UUI
         fx_rates=[fx.rate],
         cost_profile=profile.profile.reference(),
         config_revision_id=str(world.config_revision_id),
-        as_of=T0,
+        as_of=as_of,
     )
     refs = valuation_repo.ValuationRefs(
         listing_id=world.listing_id,
@@ -427,6 +473,7 @@ async def complete_valuation(db: Database, world: RealWorld, *, revision_id: UUI
         tax_rule_set_row_id=rule.row_for("passenger_car"),
         cost_profile_id=profile.id,
         fx_rate_ids=(fx.id,),
+        cost_evidence_ids=() if transport is None else (transport.id,),
     )
     inputs = valuation_repo.ValuationInputs(
         cost_lines=tuple(lines),
@@ -437,11 +484,15 @@ async def complete_valuation(db: Database, world: RealWorld, *, revision_id: UUI
     return ValuationBundle(valuation, refs, inputs, rule, fx, profile, comparable)
 
 
-def incomplete_valuation(world: RealWorld, *, revision_id: UUID | None = None, config: UUID | None = None) -> Valuation:
+def incomplete_valuation(
+    world: RealWorld, *, revision_id: UUID | None = None, config: UUID | None = None
+) -> Valuation:
     """A non-fixture valuation without tax rules or scenarios (state not_started)."""
     return assemble_valuation(
         listing_revision_id=str(revision_id or world.revision_id),
-        screening=ScreeningInput(eligibility=EligibilityState.ELIGIBLE_PRIMARY, profile_key=ProfileKey.PRIMARY),
+        screening=ScreeningInput(
+            eligibility=EligibilityState.ELIGIBLE_PRIMARY, profile_key=ProfileKey.PRIMARY
+        ),
         comparable=None,
         tax=None,
         scenarios=None,
@@ -468,10 +519,84 @@ async def store_simple_valuation(
     )
 
 
+# --------------------------------------------------------------------------------------------
+# Reviews
+# --------------------------------------------------------------------------------------------
+
+CURSOR_SECRET = b"SYNTHETIC-cursor-secret-0123456789abcdef"
+
+
+def idem_key(prefix: str = "key") -> str:
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+async def open_case(
+    db: Database,
+    world: RealWorld,
+    *,
+    listing_id: UUID | None = None,
+    revision_id: UUID | None = None,
+    valuation_id: UUID | None = None,
+    screening_result: ScreeningResult | None = None,
+    profile: SearchProfile | None = None,
+) -> reviews_repo.CaseUpsertResult:
+    """``upsert_review_case`` as the system worker for a screened revision."""
+    actor = system(world.workspace_id)
+    return await run(
+        db,
+        actor,
+        lambda c: reviews_repo.upsert_review_case(
+            c,
+            actor,
+            listing_id or world.listing_id,
+            revision_id or world.revision_id,
+            screening_result or screening(),
+            valuation_id,
+            profile or primary_profile(),
+            dashboard_base_url=DASHBOARD,
+        ),
+    )
+
+
+async def claim_case(db: Database, actor: ActorContext, case_id: UUID, version: int) -> ClaimResult:
+    return await run(db, actor, lambda c: reviews_repo.claim(c, actor, case_id, version, idem_key("claim")))
+
+
+def submit_request(
+    claim: ClaimResult,
+    *,
+    outcome: ReviewOutcome = ReviewOutcome.WATCH,
+    idempotency_key: str | None = None,
+    **overrides: Any,
+) -> SubmitRequest:
+    assert claim.claim_token is not None
+    values: dict[str, Any] = {
+        "case_id": claim.case_id,
+        "claim_token": claim.claim_token,
+        "expected_version": claim.case_version,
+        "listing_revision": claim.listing_revision,
+        "valuation_id": claim.valuation_id,
+        "outcome": outcome,
+        "reason_codes": ("SYNTHETIC_REASON",),
+        "summary": "SYNTHETIC rationale: asking price inside the band; costs still estimated.",
+        "missing_information": ("SYNTHETIC service history",)
+        if outcome == ReviewOutcome.NEEDS_INFORMATION
+        else (),
+        "idempotency_key": idempotency_key or idem_key("submit"),
+    }
+    values.update(overrides)
+    return SubmitRequest(**values)
+
+
+def decision_count(seed: Seed, case_id: UUID) -> int:
+    return int(seed.scalar("select count(*) from app.review_decisions where case_id = %s", (case_id,)))
+
+
 def outbox_rows(seed: Seed, ws: UUID, event_type: str = "review.pending") -> list[dict[str, Any]]:
     cur = seed.conn.execute(
         "select event_id, dedup_key, state, is_fixture, aggregate_version, payload, destination_binding_id,"
-        " event_version from ops.outbox where workspace_id = %s and event_type = %s order by event_created_at, id",
+        " event_version from ops.outbox where workspace_id = %s and event_type = %s"
+        " order by event_created_at, id",
         (ws, event_type),
     )
     names = [d.name for d in cur.description or ()]
@@ -495,4 +620,4 @@ def expire_claim(seed: Seed, case_id: UUID) -> None:
     )
 
 
-_ = (sha, CostCategory)
+_ = sha
