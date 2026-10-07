@@ -76,6 +76,12 @@ Processing (``decide_reply_processing``)
     purchase, buyer or price. A hard bounce suppresses the address; an opt-out or complaint
     suppresses without acknowledgement. Only a matched seller reply emits the minimal
     ``seller.reply.received.v1`` Slack-route signal (ids, safe dashboard URL, brief status).
+    ``ReplyProcessingDecision.transition_path`` turns the target state into the legal steps from
+    the inquiry's current state (``uncertain -> accepted`` first when the reply proves the send).
+
+Claims ignore the signature/footer region after a sign-off line (bank details, "All rights
+reserved", "informazioni riservate") except postscripts, and known boilerplate ("salvo il
+venduto", "unless sold", "sous réserve") anywhere.
 """
 
 from __future__ import annotations
@@ -1183,16 +1189,23 @@ def _reference_pattern(ref: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![A-Za-z0-9]){re.escape(_lower_same_length(ref))}(?![A-Za-z0-9])")
 
 
+def _url_mentioned(text_lower: str, url: str) -> bool:
+    """The listing URL (with or without scheme) appears in the text as a whole: ``.../123456``
+    is not a mention of ``.../1234567`` (a URL ending in a letter or digit must not continue
+    with one); a query, fragment, sub-path or punctuation may follow."""
+    lowered = _lower_same_length(url)
+    bare = re.sub(r"^https?://", "", lowered)
+    if len(bare) < 8:
+        return False
+    tail = r"(?![^\W_])" if bare[-1].isalnum() else ""
+    return re.search(rf"(?<![^\W_]){re.escape(bare)}{tail}", text_lower) is not None
+
+
 def _mentions_binding(text_lower: str, binding: InquiryBinding) -> bool:
     for ref in binding.listing_references:
         if len(ref) >= 4 and _reference_pattern(ref).search(text_lower):
             return True
-    for url in binding.listing_urls:
-        lowered = _lower_same_length(url)
-        bare = re.sub(r"^https?://", "", lowered)
-        if len(bare) >= 8 and (lowered in text_lower or bare in text_lower):
-            return True
-    return False
+    return any(_url_mentioned(text_lower, url) for url in binding.listing_urls)
 
 
 def _latest_bindings(
@@ -1978,6 +1991,22 @@ _EMAIL_RE: Final = re.compile(
     r"(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b"
 )
 _IBAN_RE: Final = re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")
+# Any-case IBAN candidates; removed only when the ISO 13616 mod-97 checksum holds, so ordinary
+# lower-case words and codes are never touched.
+_IBAN_ANYCASE_RE: Final = re.compile(
+    r"\b[A-Za-z]{2}\d{2}(?:[ ]?[A-Za-z0-9]{4}){2,7}(?:[ ]?[A-Za-z0-9]{1,4})?\b"
+)
+
+
+def _iban_checksum_ok(candidate: str) -> bool:
+    compact = candidate.replace(" ", "").upper()
+    if not 15 <= len(compact) <= 34:
+        return False
+    rearranged = compact[4:] + compact[:4]
+    digits = "".join(str(int(ch, 36)) for ch in rearranged)
+    return int(digits) % 97 == 1
+
+
 _URL_RE: Final = re.compile(r"(?:\bhttps?://|\bwww\.)[^\s<>\"'\])]{1,2048}", re.IGNORECASE)
 # Phone numbers: digit groups joined by short separator runs; separators and digits are disjoint
 # sets and the repetition is bounded, so matching stays linear. The digit count is checked after.
@@ -2127,6 +2156,14 @@ def _scrub_contacts(body: str, counts: dict[str, int]) -> str:
     body = count_sub(_EMAIL_RE, "emails", "[email removed]", body)
     body = count_sub(_URL_RE, "links", _link_placeholder, body)
     body = count_sub(_IBAN_RE, "bank_details", "[bank details removed]", body)
+
+    def checked_iban(match: re.Match[str]) -> str:
+        if _iban_checksum_ok(match.group(0)):
+            counts["bank_details"] += 1
+            return "[bank details removed]"
+        return match.group(0)
+
+    body = _IBAN_ANYCASE_RE.sub(checked_iban, body)
     body = count_sub(_STREET_RE, "addresses", "[address removed]", body)
     body = _ADDRESS_TAIL_RE.sub("[address removed]", body)
     body = _LABELLED_PHONE_RE.sub(_labelled_phone_sub(counts), body)
@@ -2863,6 +2900,8 @@ _DOC_KIND_RULES: Final[tuple[tuple[DocumentKind, re.Pattern[str]], ...]] = (
         re.compile(
             r"\b(?:fahrzeugschein|fahrzeugbrief|zulassungsbescheinigung\w*|zulassungsunterlagen"
             r"|zulassungspapiere"
+            # Swiss registration document (CH is a primary source market): DE/FR/IT names
+            r"|fahrzeugausweis\w*|fahrzeug-ausweis\w*|permis de circulation|licenza di circolazione"
             r"|kfz-brief|kfz-schein|libretto di circolazione|carta di circolazione|libretto"
             r"|certificato di propriet[àa]"
             r"|carte grise|certificat d'immatriculation|registration (?:document|papers?|certificate)s?"
@@ -2944,7 +2983,9 @@ _REQUEST_RULES: Final[dict[RequestKind, re.Pattern[str]]] = {
         r"|reservation|hold it for you|put it aside|keep it for you)\b"
     ),
     RequestKind.IDENTITY_DOCUMENT: re.compile(
-        r"\b(?:personalausweis\w*|ausweis(?!bar)\w*|reisepass\w*|passkopie|f[üu]hrerschein\w*"
+        # "Fahrzeug-Ausweis"/"Fahrzeugausweis" is the Swiss vehicle registration, not an ID card.
+        r"\b(?:personalausweis\w*|(?<!fahrzeug-)(?<!fahrzeug )ausweis(?!bar)\w*|reisepass\w*|passkopie"
+        r"|f[üu]hrerschein\w*"
         r"|identit[äa]tsnachweis"
         r"|carta d'identit[àa]|documento (?:d'|di )identit[àa]|passaporto|patente|codice fiscale"
         r"|carte d'identit[ée]|pi[èe]ce d'identit[ée]|passeport|permis de conduire|passport|id card"
@@ -3438,7 +3479,7 @@ _ENUMERATION_WORDS: Final = frozenset(
         "il", "lo", "la", "i", "gli", "le", "l", "un", "una", "uno", "e", "ed", "o", "oppure", "anche",
         "copia", "originale",
         # FR
-        "les", "d", "de", "du", "des", "une", "et", "ou", "aussi", "copie",
+        "les", "d", "de", "du", "une", "et", "ou", "aussi", "copie",
         # EN
         "the", "a", "an", "and", "or", "also", "too", "plus", "copy",
     }
@@ -3629,10 +3670,12 @@ _DANGEROUS_EXTENSIONS: Final = frozenset(
     }
 )  # fmt: skip
 _IDENTITY_FILENAME_RE: Final = re.compile(
-    r"(?:^|[^a-z])(?:personalausweis|ausweis|perso|reisepass|pass|passport|passaporto|passeport|identita"
-    r"|identity|id|carta identita|carta d identita|carte identite|carte d identite|cni|fuhrerschein"
-    r"|fuehrerschein|patente|permis|driving licen[cs]e|drivers? licen[cs]e|selfie|codice fiscale"
-    r"|tessera sanitaria|steuer id)(?:[^a-z]|$)"
+    # The Swiss vehicle registration ("Fahrzeug-Ausweis", "permis de circulation") is a vehicle
+    # document, not an identity document (names are folded to lower-case ASCII words first).
+    r"(?:^|[^a-z])(?:personalausweis|(?<!fahrzeug )ausweis|perso|reisepass|pass|passport|passaporto"
+    r"|passeport|identita|identity|id|carta identita|carta d identita|carte identite|carte d identite|cni"
+    r"|fuhrerschein|fuehrerschein|patente|permis(?! de circulation| circulation)|driving licen[cs]e"
+    r"|drivers? licen[cs]e|selfie|codice fiscale|tessera sanitaria|steuer id)(?:[^a-z]|$)"
 )
 _FINANCIAL_FILENAME_RE: Final = re.compile(
     r"(?:^|[^a-z])(?:iban|kontoauszug|bank|estratto conto|releve|rib|bank statement|kreditkarte"
@@ -3644,6 +3687,7 @@ _VEHICLE_DOC_FILENAME: Final[tuple[tuple[DocumentKind, re.Pattern[str]], ...]] =
         DocumentKind.REGISTRATION,
         re.compile(
             r"(?:^|[^a-z])(?:fahrzeugschein|fahrzeugbrief|zulassung\w*|zb ?[12]|libretto"
+            r"|fahrzeugausweis|fahrzeug ausweis|permis de circulation|licenza di circolazione"
             r"|carta di circolazione"
             r"|carte grise|immatriculation|registration|v5c|logbook)(?:[^a-z]|$)"
         ),
@@ -4182,6 +4226,37 @@ class ReplyProcessingDecision(BaseModel):
     follow_up: Literal[False] = False
     notes: tuple[str, ...] = ()
 
+    def transition_path(self, current: InquiryState) -> tuple[InquiryState, ...]:
+        """Legal state steps from the inquiry's ``current`` state (spec 37.5 state machine).
+
+        A reply proving an uncertain send first reconciles it (``uncertain -> accepted``); a
+        repeated target (a second reply) or a step the state machine does not allow from
+        ``current`` (a late bounce after a reply) is no step at all. Suppressions, evidence and
+        escalations of the decision apply independently of the path.
+        """
+        path: list[InquiryState] = []
+        state = current
+        if state == InquiryState.UNCERTAIN and self.resolves_uncertain_send:
+            path.append(InquiryState.ACCEPTED)
+            state = InquiryState.ACCEPTED
+        target = self.inquiry_transition
+        if target is not None and target != state and target in _REPLY_TRANSITIONS.get(state, frozenset()):
+            path.append(target)
+        return tuple(path)
+
+
+# The reply-driven subset of the inquiry state machine (domain.inquiries.ALLOWED_TRANSITIONS;
+# a unit test keeps the two consistent).
+_REPLY_TRANSITIONS: Final[dict[InquiryState, frozenset[InquiryState]]] = {
+    InquiryState.ACCEPTED: frozenset(
+        {InquiryState.REPLIED, InquiryState.BOUNCED, InquiryState.SELLER_OPTED_OUT}
+    ),
+    InquiryState.NO_REPLY_YET: frozenset(
+        {InquiryState.REPLIED, InquiryState.BOUNCED, InquiryState.SELLER_OPTED_OUT}
+    ),
+    InquiryState.REPLIED: frozenset({InquiryState.SELLER_OPTED_OUT}),
+}
+
 
 def decide_reply_processing(
     correlation: CorrelationResult,
@@ -4317,6 +4392,21 @@ def should_emit_reply_signal(correlation: CorrelationResult) -> bool:
 # =============================================================================================
 
 
+def _sanitize_subject(subject: str) -> str:
+    """Single-line subject for upload with e-mail addresses and labelled phone numbers removed.
+
+    Deterministic (it is part of the source fingerprint). Unlabelled digit runs are kept: the
+    inquiry subject carries the listing reference, which is often a long number.
+    """
+    single = _HEADER_CONTROL_RE.sub(" ", _normalize_text(subject))
+    single = _EMAIL_RE.sub("[email removed]", single)
+    single = _LABELLED_PHONE_RE.sub(
+        lambda m: f"{m.group(1)}[phone removed]" if sum(c.isdigit() for c in m.group(2)) >= 6 else m.group(0),
+        single,
+    )
+    return single[:MAX_SUBJECT_CHARS]
+
+
 def build_ingest_request(
     message: InboundMessage,
     correlation: CorrelationResult,
@@ -4331,7 +4421,8 @@ def build_ingest_request(
     Raises ``Forbidden`` for anything whose ``upload_scope`` is ``none``: unrelated personal
     mail and unresolved multi-inquiry ambiguity never leave the local mailbox. Only allowed
     vehicle-document attachment metadata is included; withheld sensitive attachments are
-    counted, never described; rejected ones are omitted.
+    counted, never described; rejected ones are omitted. The subject loses e-mail addresses
+    and labelled phone numbers, like the body.
     """
     scope = correlation.upload_scope
     if scope == "none" or correlation.inquiry_id is None or correlation.binding_version is None:
@@ -4352,7 +4443,7 @@ def build_ingest_request(
     if identity.received_at is None:
         raise ValidationFailed("the mailbox received time is required for an upload")
     received = identity.received_at
-    subject = _HEADER_CONTROL_RE.sub(" ", message.subject)[:MAX_SUBJECT_CHARS]
+    subject = _sanitize_subject(message.subject)
     return ReplyIngestRequest(
         schema_version="1.0",
         inquiry_id=correlation.inquiry_id,

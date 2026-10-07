@@ -30,8 +30,10 @@ Availability events (``derive_availability_event``)
     - a 404 detail page from a healthy source -> ``unknown`` (``detail_not_found``), not removed.
 
     None of them establishes a purchase, buyer or transaction price. Older evidence is kept as
-    history but never regresses the current status. A source showing the ad active after the
-    seller said "sold" is recorded without overriding the seller's statement.
+    history but never regresses the current status. A source showing the ad active or reserved
+    after the seller said "sold", or a later seller "available"/"reserved", is recorded as a
+    conflict without overriding the seller's statement. A complete-scan absence counts only
+    when the scan started after the last sighting in search *or* on a successful detail page.
 
 Contradictions (``detect_availability_conflicts``)
     An active duplicate elsewhere does not cancel a seller's "sold" statement (and a seller's
@@ -217,6 +219,7 @@ class SourceListingLifecycle(BaseModel):
     source_modified: TrustedSourceTime = TrustedSourceTime()
     last_complete_scan_at: datetime | None = None
     source_health: SourceHealth = SourceHealth.UNKNOWN
+    source_health_at: datetime | None = None  # time of the scan that set ``source_health``
     availability: Availability = Availability.UNKNOWN
     availability_evidence_kind: AvailabilityEvidenceKind | None = None
     availability_reason: str | None = Field(default=None, max_length=80)
@@ -228,6 +231,7 @@ class SourceListingLifecycle(BaseModel):
         "last_seen_on_search_at",
         "last_detail_success_at",
         "last_complete_scan_at",
+        "source_health_at",
         "availability_effective_at",
     )
     @classmethod
@@ -298,12 +302,19 @@ def apply_observation(
 
 
 def apply_scan_result(state: SourceListingLifecycle, scan: ScanRecord) -> SourceListingLifecycle:
-    """Record the source-level last complete scan time and health for this listing's view."""
+    """Record the source-level last complete scan time and health for this listing's view.
+
+    Out-of-order safe: the health comes from the newest scan only (an older blocked or failed
+    scan that is processed late never replaces a newer healthy state), and the last complete
+    scan time only moves forward.
+    """
     if scan.source_key != state.source_key:
         raise ValidationFailed("scan belongs to another source")
-    update: dict[str, object] = {
-        "source_health": scan.health if not scan.parser_incident else SourceHealth.PARSER_INCIDENT
-    }
+    update: dict[str, object] = {}
+    scan_at = scan.finished_at or scan.started_at
+    if state.source_health_at is None or scan_at >= state.source_health_at:
+        update["source_health"] = scan.health if not scan.parser_incident else SourceHealth.PARSER_INCIDENT
+        update["source_health_at"] = scan_at
     if scan.healthy_complete:
         update["last_complete_scan_at"] = _max(state.last_complete_scan_at, scan.finished_at)
     return state.model_copy(update=update)
@@ -508,11 +519,21 @@ def derive_availability_event(
     if new_status == state.availability and evidence_kind == state.availability_evidence_kind:
         return _no_event("no change")
     historical = state.availability_effective_at is not None and signal.when < state.availability_effective_at
-    conflict = (
-        new_status == Availability.AVAILABLE
-        and evidence_kind == AvailabilityEvidenceKind.SOURCE_OBSERVATION
-        and state.availability == Availability.SOLD_CLAIMED
+    seller_sold = (
+        state.availability == Availability.SOLD_CLAIMED
         and state.availability_evidence_kind == AvailabilityEvidenceKind.SELLER_REPORTED_SOLD
+    )
+    conflict = (
+        # The ad still showing active or "reserved", or the seller later saying available or
+        # reserved, does not silently cancel the seller's "sold": the contradiction is kept.
+        seller_sold
+        and new_status in (Availability.AVAILABLE, Availability.RESERVED)
+        and evidence_kind
+        in (
+            AvailabilityEvidenceKind.SOURCE_OBSERVATION,
+            AvailabilityEvidenceKind.SELLER_REPORTED_AVAILABLE,
+            AvailabilityEvidenceKind.SELLER_REPORTED_RESERVED,
+        )
     ) or (
         new_status == Availability.AVAILABLE
         and evidence_kind == AvailabilityEvidenceKind.SELLER_REPORTED_AVAILABLE
@@ -565,7 +586,9 @@ def _source_signal_problem(state: SourceListingLifecycle, signal: AvailabilitySi
             return "listing was never seen under a known search filter"
         if scan.filter_fingerprint != state.last_seen_filter_fingerprint:
             return "search filter changed; absence is not evidence"
-        if state.last_seen_on_search_at is not None and scan.started_at <= state.last_seen_on_search_at:
+        # A successful detail check counts as a sighting too: an ad whose page was live after
+        # the scan started is not "absent" because the search did not list it.
+        if state.latest_presence_at is not None and scan.started_at <= state.latest_presence_at:
             return "scan started before the last sighting"
         return None
     if signal.kind == AvailabilitySignalKind.DETAIL_NOT_FOUND and health != SourceHealth.HEALTHY:

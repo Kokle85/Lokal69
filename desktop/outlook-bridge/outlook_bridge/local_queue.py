@@ -439,6 +439,10 @@ class LocalStore:
                 (key, value),
             )
 
+    def delete_runtime(self, key: str) -> None:
+        with self._tx() as db:
+            db.execute("delete from runtime where key = ?", (key,))
+
     def get_runtime_time(self, key: str) -> datetime | None:
         return parse_ts(self.get_runtime(key))
 
@@ -899,6 +903,13 @@ class LocalStore:
                 "update upload_backlog set binding_version = ?, request_json = ? where id = ? and state = 'pending'",
                 (binding_version, request_json, backlog_id),
             )
+
+    def pending_backlog_for_folder(self, folder_key: str) -> tuple[int, datetime | None]:
+        row = self._db.execute(
+            "select count(*), min(received_at) from upload_backlog where folder_key = ? and state = 'pending'",
+            (folder_key,),
+        ).fetchone()
+        return (int(row[0]), parse_ts(row[1])) if row else (0, None)
 
     def backlog_stats(self) -> BacklogStats:
         counts = dict(self._db.execute("select state, count(*) from upload_backlog group by state").fetchall())

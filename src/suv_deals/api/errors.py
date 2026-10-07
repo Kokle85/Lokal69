@@ -106,7 +106,7 @@ def new_request_id() -> str:
 def request_id_of(request: Request) -> str:
     """The request id the request-context middleware assigned (a fresh one as a fallback)."""
     value = getattr(request.state, "request_id", None)
-    return value if is_valid_request_id(value) else new_request_id()
+    return value if isinstance(value, str) and is_valid_request_id(value) else new_request_id()
 
 
 def http_status_for(error: AppError) -> int:
@@ -124,7 +124,7 @@ def error_response(
     metrics: AppMetrics | None = None,
 ) -> Response:
     """The JSON error response for ``error`` (never raises for a valid `AppError`)."""
-    rid = request_id if is_valid_request_id(request_id) else new_request_id()
+    rid = request_id if isinstance(request_id, str) and is_valid_request_id(request_id) else new_request_id()
     _status, body = api_error(error, request_id=rid, as_of=(clock or SystemClock()).now())
     headers: dict[str, str] = {"Cache-Control": NO_STORE}
     if body.error.retry_after_seconds is not None:

@@ -870,3 +870,103 @@ class TestMailWorker:
         )
         assert advance_checkpoint(None, scanned_until=T0, all_candidates_committed=True) == T0
         assert advance_checkpoint(None, scanned_until=T0, all_candidates_committed=False) is None
+
+
+# =============================================================================================
+# Independent review regressions
+# =============================================================================================
+
+
+class TestIndependentReviewRegressions:
+    def test_absence_is_not_evidence_when_a_detail_page_was_live_after_the_scan_started(self) -> None:
+        # Last search sighting at +30 min; the scan runs 90-110 min; the detail page was fetched
+        # successfully (active) at +100 min - the search simply did not list it.
+        during = listing(last_detail_success_at=T0 + timedelta(minutes=100))
+        decision = derive_availability_event(during, absence(scan(90, duration=20)))
+        assert decision.event is None
+        assert decision.no_event_reason == "scan started before the last sighting"
+        later = listing(last_detail_success_at=T0 + timedelta(minutes=200))
+        assert derive_availability_event(later, absence(scan(90, duration=20))).event is None
+        # A detail success *before* the scan does not block the absence evidence.
+        before = listing(last_detail_success_at=T0 + timedelta(minutes=60))
+        event = derive_availability_event(before, absence(scan(90, duration=20))).event
+        assert event is not None and event.new_status == Availability.UNKNOWN
+        assert event.reason == "not_seen_in_complete_scan"
+
+    @pytest.mark.parametrize(
+        "signal",
+        [
+            AvailabilitySignal(
+                kind=AvailabilitySignalKind.RESERVED_BADGE, observed_at=T0 + timedelta(hours=2)
+            ),
+            AvailabilitySignal(
+                kind=AvailabilitySignalKind.DETAIL_ACTIVE, observed_at=T0 + timedelta(hours=2)
+            ),
+            AvailabilitySignal(
+                kind=AvailabilitySignalKind.SELLER_STATEMENT,
+                observed_at=T0 + timedelta(hours=2),
+                seller_status=Availability.AVAILABLE,
+                reply_id=UUID("88888888-8888-4888-8888-888888888889"),
+            ),
+            AvailabilitySignal(
+                kind=AvailabilitySignalKind.SELLER_STATEMENT,
+                observed_at=T0 + timedelta(hours=2),
+                seller_status=Availability.RESERVED,
+                reply_id=UUID("88888888-8888-4888-8888-888888888889"),
+            ),
+        ],
+        ids=["reserved_badge", "detail_active", "seller_available", "seller_reserved"],
+    )
+    def test_nothing_silently_overrides_a_seller_sold_statement(self, signal: AvailabilitySignal) -> None:
+        state = listing(
+            availability=Availability.SOLD_CLAIMED,
+            availability_evidence_kind=AvailabilityEvidenceKind.SELLER_REPORTED_SOLD,
+            availability_effective_at=T0 + timedelta(hours=1),
+        )
+        event = derive_availability_event(state, signal).event
+        assert event is not None
+        assert event.conflicts_with_current and not event.promote_current
+        # The cluster view reports the same contradiction and stops outreach.
+        if signal.kind == AvailabilitySignalKind.SELLER_STATEMENT and signal.seller_status is not None:
+            statements = [
+                SellerAvailabilityStatement(reply_id=REPLY, status=Availability.SOLD_CLAIMED, stated_at=T0),
+                SellerAvailabilityStatement(
+                    reply_id=signal.reply_id or REPLY, status=signal.seller_status, stated_at=signal.when
+                ),
+            ]
+            conflicts = detect_availability_conflicts([listing()], statements)
+            assert any(c.kind == "seller_statements_disagree" for c in conflicts)
+            assert all(c.stop_outreach for c in conflicts)
+
+    def test_removal_and_manual_resolution_after_seller_sold_are_still_promoted(self) -> None:
+        state = listing(
+            availability=Availability.SOLD_CLAIMED,
+            availability_evidence_kind=AvailabilityEvidenceKind.SELLER_REPORTED_SOLD,
+            availability_effective_at=T0 + timedelta(hours=1),
+        )
+        removed = derive_availability_event(
+            state,
+            AvailabilitySignal(kind=AvailabilitySignalKind.REMOVED_PAGE, observed_at=T0 + timedelta(hours=2)),
+        ).event
+        assert removed is not None and removed.promote_current and removed.new_status == Availability.REMOVED
+        manual = derive_availability_event(
+            state,
+            AvailabilitySignal(
+                kind=AvailabilitySignalKind.MANUAL,
+                observed_at=T0 + timedelta(hours=2),
+                manual_status=Availability.AVAILABLE,
+            ),
+        ).event
+        assert manual is not None and manual.promote_current and not manual.conflicts_with_current
+
+    def test_a_late_older_scan_never_regresses_the_current_source_health(self) -> None:
+        newer = scan(120)  # healthy, complete; finished at +125 min
+        older = scan(60, health=SourceHealth.BLOCKED, completeness=Completeness.BLOCKED)
+        state = apply_scan_result(apply_scan_result(listing(), newer), older)
+        assert state.source_health == SourceHealth.HEALTHY
+        assert state.source_health_at == newer.finished_at
+        assert state.last_complete_scan_at == newer.finished_at
+        # In order, the newer degraded scan does take over.
+        degraded = scan(180, health=SourceHealth.DEGRADED, completeness=Completeness.PARTIAL)
+        assert apply_scan_result(state, degraded).source_health == SourceHealth.DEGRADED
+        assert apply_scan_result(state, degraded).last_complete_scan_at == newer.finished_at

@@ -113,7 +113,9 @@ class RequestContextMiddleware:
             return
         supplied = _header(scope, b"x-request-id")
         candidate = supplied[0].decode("latin-1") if len(supplied) == 1 else None
-        request_id = candidate if is_valid_request_id(candidate) else new_request_id()
+        request_id = (
+            candidate if isinstance(candidate, str) and is_valid_request_id(candidate) else new_request_id()
+        )
         scope.setdefault("state", {})["request_id"] = request_id
         path: str = scope.get("path", "")
         started = self.monotonic()
@@ -168,7 +170,12 @@ class RequestContextMiddleware:
         self.metrics.observe_request("api", label, status, elapsed)
         logger.info(
             "request served",
-            extra={"method": scope.get("method"), "route": label, "status": status, "ms": round(elapsed * 1000)},
+            extra={
+                "method": scope.get("method"),
+                "route": label,
+                "status": status,
+                "ms": round(elapsed * 1000),
+            },
         )
 
 

@@ -47,6 +47,7 @@ from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence.database import Conn, Database
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
+from suv_deals.views.operations import ReadinessView
 
 STATE_ATTRIBUTE: Final = "suv_api"
 TRANSACTION_ATTEMPTS: Final = 3
@@ -80,6 +81,8 @@ class ApiState:
     options: ApiOptions
     fallback_config: BusinessConfig | None
     cursor_secret: Callable[[], bytes]
+    #: ``(loop time, view)`` of the last readiness probe (see ``routes.readiness_view``).
+    readiness_cache: tuple[float, ReadinessView] | None = None
 
 
 def api_state(request: Request) -> ApiState:
@@ -179,7 +182,8 @@ def query_model[M: BaseModel](request: Request, model: type[M]) -> M:
     repeated = sorted({key for key in params if len(params.getlist(key)) > 1})
     if repeated:
         raise ValidationFailed(
-            "Query parameters may appear only once", details={"fields": safe_field_names([[k] for k in repeated])}
+            "Query parameters may appear only once",
+            details={"fields": safe_field_names([[k] for k in repeated])},
         )
     try:
         return model.model_validate(dict(params))

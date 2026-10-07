@@ -25,6 +25,7 @@ from suv_deals.domain.enums import (
     ReplyMessageType,
     SuppressionReason,
 )
+from suv_deals.domain.inquiries import ALLOWED_TRANSITIONS
 from suv_deals.domain.notifications import text_problems
 from suv_deals.domain.replies import (
     MAX_BODY_BYTES,
@@ -2054,3 +2055,458 @@ class TestReviewRegressions:
         assert sanitize_reply_body(clean.text).text == clean.text
         short_after_scrub = sanitize_reply_body("x\n" * 70_000)  # long input, short output
         assert short_after_scrub.truncated and short_after_scrub.text.endswith("[truncated]")
+
+
+# =============================================================================================
+# Independent review (second round): each test pins a defect found and fixed in review
+# =============================================================================================
+
+
+class TestIndependentReviewRegressions:
+    # --- dedup: moved/copied messages ---------------------------------------------------------
+
+    def test_moved_graph_message_with_a_new_provider_id_is_a_duplicate_not_a_conflict(self) -> None:
+        # Microsoft Graph message ids change when a message is moved; Gmail/Outlook copies in two
+        # folders differ. Same Internet Message-ID + same content is the same message (37.10).
+        first = spec_request(source_message={"provider_message_id": "graph-id-inbox"})
+        moved = spec_request(
+            source_message={
+                "provider_message_id": "graph-id-after-rule-move",
+                "outlook_entry_id": "other-entry",
+            }
+        )
+        assert moved.fingerprint() == first.fingerprint()
+        assert moved.dedup_key() == first.dedup_key()
+        stored = StoredReplyIngest(
+            reply_id=REPLY_ID,
+            dedup_key=first.dedup_key().as_string(),
+            idempotency_key="idem-key-0001",
+            fingerprint=first.fingerprint(),
+            locators=(first.locator(),),  # type: ignore[arg-type]
+        )
+        decision = decide_ingest(
+            dedup_key=moved.dedup_key(),
+            idempotency_key="idem-key-0002",
+            fingerprint=moved.fingerprint(),
+            locator=moved.locator(),
+            existing_by_dedup_key=stored,
+            existing_by_idempotency_key=None,
+        )
+        assert decision.kind == IngestDecisionKind.DUPLICATE and decision.reply_id == REPLY_ID
+        assert decision.locator_changed and decision.record_locator == moved.locator()
+
+    def test_provider_id_still_distinguishes_messages_without_an_internet_message_id(self) -> None:
+        a = ReplySourceContent(provider_message_id="gmail-1", from_address=SELLER, body_text="Ja")
+        b = a.model_copy(update={"provider_message_id": "gmail-2"})
+        assert source_content_fingerprint(a) != source_content_fingerprint(b)
+        assert reply_dedup_key(MB, a).kind == "provider_message_id"
+
+    # --- classification: human subjects with delivery wording ------------------------------------
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "AW: Anfrage – leider nicht zustellbar?",
+            "Re: Enquiry – returned mail?",
+            "AW: Anfrage zu Example Trail – TEST-204 (Antwort verzögert)",
+            "R: Richiesta – consegna ritardata",
+            "RE : Renseignements – non remis ?",
+            "Re: Delivery receipt for the car papers",
+        ],
+    )
+    def test_delivery_wording_behind_a_human_reply_prefix_is_a_seller_reply(self, subject: str) -> None:
+        headers = reply_headers(Subject=subject)
+        assert classify_message(headers, "Das Auto ist verkauft.") == ReplyMessageType.SELLER_REPLY
+        result = correlate_reply(message(headers, "Das Auto ist verkauft. TEST-204"), [binding()])
+        decision = decide_reply_processing(result, extract_reply_claims("Das Auto ist verkauft.", "de"))
+        # Never a hard bounce that would suppress the seller's address and lose the reply.
+        assert decision.inquiry_transition == InquiryState.REPLIED
+        assert SuppressionReason.HARD_BOUNCE not in decision.suppressions
+
+    def test_structural_bounce_evidence_still_wins_over_a_reply_prefix(self) -> None:
+        daemon = {"From": "MAILER-DAEMON@mx.example.invalid", "Subject": "AW: Anfrage"}
+        assert classify_message(daemon, "Action: failed") == ReplyMessageType.BOUNCE
+        failed = {"From": SELLER, "Subject": "Re: x", "X-Failed-Recipients": SELLER}
+        assert classify_message(failed, "") == ReplyMessageType.BOUNCE
+        ndr = {"From": "postmaster@mx.example.invalid", "Subject": "Undeliverable: RE: Anfrage"}
+        assert classify_message(ndr, "") == ReplyMessageType.BOUNCE
+
+    # --- correlation privacy --------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "item_class", ["IPM.Schedule.Meeting.Request", "IPM.Appointment", "IPM.Sharing", "IPM.Task"]
+    )
+    def test_non_mail_items_in_the_thread_never_leave_the_mailbox(self, item_class: str) -> None:
+        msg = InboundMessage(
+            identity=SourceMessageIdentity(
+                mailbox_binding_id=MB,
+                provider=EmailProviderKind.OUTLOOK_LOCAL,
+                internet_message_id="<meeting@example.invalid>",
+                received_at=NOW,
+            ),
+            headers=reply_headers(),
+            body_text="Besichtigung Montag 10 Uhr, TEST-204",
+            message_class=item_class,
+        )
+        result = correlate_reply(msg, [binding()])
+        assert result.outcome == CorrelationOutcome.UNMATCHED
+        assert result.reasons == (CorrelationReason.NON_MAIL_ITEM,)
+        assert result.upload_scope == "none" and not should_emit_reply_signal(result)
+        with pytest.raises(Forbidden):
+            build_ingest_request(
+                msg,
+                result,
+                sanitized=sanitize_reply_body(msg.body_text),
+                attachment_decisions=(),
+                detected_language=MessageLanguage.DE,
+                observed_at=NOW,
+            )
+
+    def test_owner_messages_in_the_seller_thread_stay_local(self) -> None:
+        own = "owner@example.invalid"
+        headers = {
+            "From": f"Owner <{own}>",
+            "In-Reply-To": "<seller-reply@example.invalid>",
+            "References": f"{OUT_ID} <seller-reply@example.invalid>",
+            "Subject": "Re: Anfrage zu Example Trail – TEST-204",
+        }
+        msg = message(headers, "Danke, ich melde mich. TEST-204")
+        # Without the owner's addresses it would be uploaded as a changed-address possible match.
+        assert correlate_reply(msg, [binding()]).upload_scope == "quarantine"
+        result = correlate_reply(msg, [binding()], own_addresses=(own,))
+        assert result.outcome == CorrelationOutcome.UNMATCHED
+        assert result.reasons == (CorrelationReason.OWN_MESSAGE,) and result.upload_scope == "none"
+        # The seller's own reply is unaffected by the owner list.
+        seller_reply = correlate_reply(message(reply_headers(), "Ja"), [binding()], own_addresses=(own,))
+        assert seller_reply.outcome == CorrelationOutcome.MATCHED
+
+    def test_owner_controlled_test_seller_address_stays_matchable(self) -> None:
+        # Activation evidence uses an owner-controlled test address as the "seller" (37.10).
+        test_seller = "owner-test@example.invalid"
+        canary = binding(verified_seller_aliases=(test_seller,), is_canary=True)
+        headers = reply_headers(From=test_seller)
+        result = correlate_reply(message(headers, "Canary reply"), [canary], own_addresses=(test_seller,))
+        assert result.outcome == CorrelationOutcome.MATCHED and result.is_canary
+        decision = decide_reply_processing(result, extract_reply_claims("Canary reply", "en"))
+        assert decision.counts_as_real_reply is False
+
+    def test_verified_sender_without_thread_or_listing_reference_stays_local(self) -> None:
+        msg = message(
+            {"From": SELLER, "Subject": "Our October offers"}, "New cars every week!", msgid="<n@x.invalid>"
+        )
+        result = correlate_reply(msg, [binding()])
+        assert result.outcome == CorrelationOutcome.UNMATCHED and result.upload_scope == "none"
+        assert result.sender_verified
+        assert CorrelationReason.SENDER_ONLY_NO_THREAD in result.reasons
+        assert CorrelationReason.REFERENCE_NOT_FOUND in result.reasons
+        with pytest.raises(Forbidden):
+            build_ingest_request(
+                msg,
+                result,
+                sanitized=sanitize_reply_body(msg.body_text),
+                attachment_decisions=(),
+                detected_language=MessageLanguage.EN,
+                observed_at=NOW,
+            )
+
+    def test_verified_sender_with_listing_reference_is_only_a_quarantined_possible_match(self) -> None:
+        msg = message(
+            {"From": SELLER, "Subject": "Your question"}, "TEST-204 is sold.", msgid="<n@x.invalid>"
+        )
+        result = correlate_reply(msg, [binding()])
+        assert result.outcome == CorrelationOutcome.QUARANTINED and result.inquiry_id == INQ
+        assert result.upload_scope == "quarantine" and result.reference_corroborated
+        decision = decide_reply_processing(result, extract_reply_claims(msg.body_text, "en"))
+        assert decision.apply_to_vehicle is False and decision.availability_evidence is None
+        # Two of this dealer's inquiries referenced: no single candidate, nothing leaves.
+        second = binding(inquiry_id=INQ2, listing_references=("TEST-999",), listing_urls=())
+        both = message(
+            {"From": SELLER, "Subject": "TEST-204 and TEST-999"}, "Both sold.", msgid="<b@x.invalid>"
+        )
+        multi = correlate_reply(both, [binding(), second])
+        assert multi.outcome == CorrelationOutcome.QUARANTINED and multi.upload_scope == "none"
+        assert set(multi.candidate_inquiry_ids) == {INQ, INQ2}
+
+    def test_listing_url_must_match_as_a_whole(self) -> None:
+        short = binding(listing_references=(), listing_urls=("https://dealer.example/vehicles/123456",))
+        longer = message(
+            {"From": SELLER, "Subject": "Re"},
+            "see https://dealer.example/vehicles/1234567",
+            msgid="<u@x.invalid>",
+        )
+        assert correlate_reply(longer, [short]).outcome == CorrelationOutcome.UNMATCHED
+        for text in (
+            "see https://dealer.example/vehicles/123456.",
+            "https://dealer.example/vehicles/123456?ref=mail",
+            "dealer.example/vehicles/123456/details",
+        ):
+            same = message({"From": SELLER, "Subject": "Re"}, text, msgid="<u@x.invalid>")
+            assert correlate_reply(same, [short]).outcome == CorrelationOutcome.QUARANTINED
+
+    # --- quoted text ----------------------------------------------------------------------------
+
+    def test_bottom_posted_reply_after_a_quoted_block_is_kept(self) -> None:
+        body = (
+            "Am 06.10.2026 um 10:00 schrieb Synthetic Sender <owner@example.invalid>:\n"
+            "> Ist das Fahrzeug noch verfügbar?\n"
+            "> Was ist Ihr niedrigster Verkaufspreis für das Fahrzeug?\n"
+            "\n"
+            "Ja, noch verfügbar. Letzter Preis 2.600 €.\n"
+            "\n"
+            "Gruß\nHans"
+        )
+        text, removed = strip_quoted_text(body)
+        assert (
+            removed and "Ja, noch verfügbar" in text and "niedrigster" not in text and "schrieb" not in text
+        )
+        clean = sanitize_reply_body(body)
+        assert "Letzter Preis 2.600 €" in clean.text
+        claims = extract_reply_claims(clean.text, "de")
+        assert claims.availability_summary == "available"
+        assert [(p.amount, p.currency) for p in claims.prices] == [(Decimal(2600), "EUR")]
+
+    def test_unprefixed_quote_after_an_attribution_is_still_cut(self) -> None:
+        body = "Ja.\n\nOn Mon, 6 Oct 2026 Synthetic Sender wrote:\nIs the vehicle still available?\nPrice?"
+        assert strip_quoted_text(body) == ("Ja.\n", True)
+        top_posted = "Yes, sold.\n\nOn Mon, X wrote:\n> Is it available?\n"
+        text, _ = strip_quoted_text(top_posted)
+        assert text.strip() == "Yes, sold." and "available" not in text
+
+    # --- claims: signatures, disclaimers and boilerplate ----------------------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("The car is still available.\n\nKind regards\nDealer Ltd. All rights reserved.", "en"),
+            ("È ancora disponibile.\nCordiali saluti\nQuesta email contiene informazioni riservate.", "it"),
+            ("L'auto è ancora disponibile. Tutti i diritti riservati.", "it"),
+            (
+                "Toujours disponible.\nCordialement\n"
+                "Ce courriel est réservé à l'usage exclusif du destinataire.",
+                "fr",
+            ),
+            ("Le véhicule est toujours disponible, sous réserve de vente.", "fr"),
+            (
+                "Das Fahrzeug ist noch verfügbar.\nMit freundlichen Grüßen\n"
+                "Autohaus\nFahrzeug reserviert? Nein.",
+                "de",
+            ),
+        ],
+    )
+    def test_footer_and_disclaimer_wording_is_not_an_availability_statement(
+        self, text: str, lang: str
+    ) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert claims.availability_summary == "available"
+        result = correlate_reply(message(reply_headers(), text), [binding()])
+        decision = decide_reply_processing(result, claims)
+        assert decision.availability_evidence is not None
+        assert decision.availability_evidence.availability == Availability.AVAILABLE
+        assert EscalationReason.CONTRADICTORY_REPLY not in decision.escalation_reasons
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Prezzo 2.800 €, salvo il venduto.", "it"),
+            ("Available unless sold.", "en"),
+            ("Alle Angebote freibleibend, Zwischenverkauf vorbehalten.", "de"),
+            ("Tutti i diritti riservati.", "it"),
+            ("Tous droits réservés.", "fr"),
+        ],
+    )
+    def test_prior_sale_and_rights_boilerplate_is_never_sold_or_reserved(self, text: str, lang: str) -> None:
+        statuses = {c.status for c in extract_reply_claims(text, lang).availability}
+        assert not statuses & {AvailabilityClaimStatus.SOLD, AvailabilityClaimStatus.RESERVED}
+
+    def test_bank_details_in_the_signature_are_not_a_payment_request(self) -> None:
+        text = (
+            "Ja, das Fahrzeug ist noch verfügbar.\n\nMit freundlichen Grüßen\nAutohaus Example GmbH\n"
+            "Bankverbindung: IBAN [bank details removed]\nZahlung per Überweisung"
+        )
+        claims = extract_reply_claims(text, "de")
+        assert claims.requests == () and claims.escalation_kinds == ()
+        assert claims.availability_summary == "available"
+        # A payment request in the message itself still escalates.
+        asked = extract_reply_claims("Bitte überweisen Sie 300 € Anzahlung.\nGruß\nHans", "de")
+        assert RequestKind.PAYMENT in asked.escalation_kinds
+
+    def test_postscript_after_the_sign_off_is_still_read(self) -> None:
+        text = "Sì, è ancora disponibile.\nCordiali saluti\nMario\n\nPS: prezzo finale 2.600 €"
+        claims = extract_reply_claims(text, "it")
+        assert [(p.amount, p.currency) for p in claims.prices] == [(Decimal(2600), "EUR")]
+        assert PriceCondition.FINAL_OR_LOWEST in claims.prices[0].conditions
+        # A sign-off word as the very first line is not a signature start.
+        assert extract_reply_claims("Regards\nThe car is still available.", "en").availability_summary == (
+            "available"
+        )
+
+    # --- claims: qualifications, deposits, documents, interjections ----------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Für 2.500 € können Sie es haben, wenn Sie es diese Woche abholen.", "de"),
+            ("If you pick it up this week, 2,500 EUR.", "en"),
+            ("Se lo ritira subito, 2.500 €.", "it"),
+            ("2 500 € si vous venez cette semaine.", "fr"),
+        ],
+    )
+    def test_conditional_quote_keeps_its_qualification(self, text: str, lang: str) -> None:
+        (price,) = extract_reply_claims(text, lang).prices
+        assert price.amount == Decimal(2500) and price.currency == "EUR"
+        assert PriceCondition.CONDITIONAL in price.conditions and price.accepted is False
+        summary = build_mk_summary(extract_reply_claims(text, lang), MessageLanguage(lang))
+        assert "условена понуда" in summary.text and "2.500 EUR" in summary.text
+
+    def test_deposit_verb_is_a_deposit_and_a_payment_request_not_a_quote(self) -> None:
+        text = "Ich kann Ihnen den Wagen für 2.700 Euro reservieren, wenn Sie 300 Euro anzahlen."
+        claims = extract_reply_claims(text, "de")
+        assert [p.amount for p in claims.prices] == [Decimal(2700)]
+        (deposit,) = claims.other_amounts
+        assert deposit.context == AmountContext.DEPOSIT_OR_PAYMENT and deposit.amount == Decimal(300)
+        assert {RequestKind.PAYMENT, RequestKind.RESERVATION} <= set(claims.escalation_kinds)
+        # The noun "Anzahl" (number of owners) is not a deposit.
+        counted = extract_reply_claims("Anzahl Vorbesitzer: 2. Preis 2.800 €.", "de")
+        assert [p.amount for p in counted.prices] == [Decimal(2800)] and counted.other_amounts == ()
+        assert counted.requests == ()
+
+    @pytest.mark.parametrize(
+        ("text", "lang", "expected"),
+        [
+            ("Fahrzeugbrief ja, CoC nicht.", "de", {(REG, "mentioned"), (COC, "not_available")}),
+            ("Fahrzeugbrief ist da, CoC nicht.", "de", {(REG, "available"), (COC, "not_available")}),
+            (
+                "Den Fahrzeugschein, den CoC und das Serviceheft habe ich.",
+                "de",
+                {(REG, "available"), (COC, "available"), (DocumentKind.SERVICE_HISTORY, "available")},
+            ),
+            (
+                "Fahrzeugschein, CoC und Serviceheft fehlen.",
+                "de",
+                {
+                    (REG, "not_available"),
+                    (COC, "not_available"),
+                    (DocumentKind.SERVICE_HISTORY, "not_available"),
+                },
+            ),
+            ("CoC vorhanden, Fahrzeugbrief auch.", "de", {(COC, "available"), (REG, "available")}),
+        ],
+    )
+    def test_document_status_is_shared_only_by_bare_list_items(
+        self, text: str, lang: str, expected: set[tuple[DocumentKind, str]]
+    ) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert {(d.kind, d.status.value) for d in claims.documents} == expected
+
+    def test_clause_initial_no_is_an_answer_not_a_negation(self) -> None:
+        assert extract_reply_claims("No it's sold.", "en").availability_summary == "sold"
+        assert extract_reply_claims("No it's not sold.", "en").availability_summary == "not_stated"
+        assert extract_reply_claims("It is not sold.", "en").availability_summary == "not_stated"
+        # Requests keep "no" as a negation.
+        assert extract_reply_claims("No reservation needed.", "en").requests == ()
+
+    # --- sanitising: bank details and the uploaded subject --------------------------------------
+
+    def test_lower_case_iban_is_removed_only_with_a_valid_checksum(self) -> None:
+        clean = sanitize_reply_body("iban de89370400440532013000 bitte")
+        assert "370400440532013000" not in clean.text and clean.removed.bank_details == 1
+        kept = sanitize_reply_body("Code de12abcd1234efgh")
+        assert kept.text == "Code de12abcd1234efgh" and kept.removed.bank_details == 0
+
+    def test_uploaded_subject_loses_contact_data_but_keeps_the_listing_reference(self) -> None:
+        headers = reply_headers(
+            Subject="Re: Anfrage – 412345678 – Tel. 0171 1234567 oder max@example.invalid"
+        )
+        msg = message(headers, "Ja, verfügbar. TEST-204")
+        req = build_ingest_request(
+            msg,
+            correlate_reply(msg, [binding()]),
+            sanitized=sanitize_reply_body(msg.body_text),
+            attachment_decisions=(),
+            detected_language=MessageLanguage.DE,
+            observed_at=NOW,
+        )
+        assert "@" not in req.subject and "1234567" not in req.subject.replace("412345678", "")
+        assert "412345678" in req.subject
+        assert req.subject == "Re: Anfrage – 412345678 – Tel. [phone removed] oder [email removed]"
+
+    # --- state-machine steps ----------------------------------------------------------------------
+
+    def test_transition_path_follows_the_inquiry_state_machine(self) -> None:
+        uncertain = binding(state=InquiryBindingState.UNCERTAIN, outbound_message_ids=(OUT_ID,))
+        reply = correlate_reply(message(reply_headers(), "Ja, noch verfügbar."), [uncertain])
+        decision = decide_reply_processing(reply, extract_reply_claims("Ja, noch verfügbar.", "de"))
+        assert decision.transition_path(InquiryState.UNCERTAIN) == (
+            InquiryState.ACCEPTED,
+            InquiryState.REPLIED,
+        )
+        assert decision.transition_path(InquiryState.ACCEPTED) == (InquiryState.REPLIED,)
+        assert decision.transition_path(InquiryState.NO_REPLY_YET) == (InquiryState.REPLIED,)
+        assert decision.transition_path(InquiryState.REPLIED) == ()  # a second reply
+        auto = correlate_reply(
+            message(reply_headers(Subject="Automatic reply: Anfrage"), "Ich bin nicht im Büro."), [uncertain]
+        )
+        assert decide_reply_processing(auto).transition_path(InquiryState.UNCERTAIN) == (
+            InquiryState.ACCEPTED,
+        )
+        bounce_headers = {"From": "MAILER-DAEMON@mx.example.invalid", "Subject": "Undelivered Mail"}
+        bounce_body = (
+            f"Final-Recipient: rfc822; {SELLER}\nAction: failed\nStatus: 5.1.1\nMessage-ID: {OUT_ID}\n"
+        )
+        bounce = decide_reply_processing(
+            correlate_reply(message(bounce_headers, bounce_body), [binding()]),
+            bounce=parse_delivery_report(bounce_body),
+        )
+        assert bounce.transition_path(InquiryState.REPLIED) == ()  # late bounce after a reply
+        assert bounce.suppressions == (SuppressionReason.HARD_BOUNCE,)  # still suppresses
+        opt_out = decide_reply_processing(reply, extract_reply_claims("Bitte keine weiteren Anfragen.", "de"))
+        assert opt_out.transition_path(InquiryState.REPLIED) == (InquiryState.SELLER_OPTED_OUT,)
+        # Every step this package proposes is legal in domain.inquiries.
+        for current in InquiryState:
+            for candidate in (decision, bounce, opt_out):
+                state = current
+                for step in candidate.transition_path(current):
+                    assert step in ALLOWED_TRANSITIONS[state], (current, step)
+                    state = step
+
+    # --- Swiss registration documents (CH is a primary source market) ---------------------------
+
+    @pytest.mark.parametrize(
+        ("name", "mime"),
+        [
+            ("Fahrzeugausweis.pdf", "application/pdf"),
+            ("Fahrzeug-Ausweis.pdf", "application/pdf"),
+            ("permis de circulation.pdf", "application/pdf"),
+            ("licenza di circolazione.jpg", "image/jpeg"),
+        ],
+    )
+    def test_swiss_registration_document_is_a_vehicle_document_not_an_identity_document(
+        self, name: str, mime: str
+    ) -> None:
+        (decision,) = evaluate_attachments((attachment(name, mime),), body_text="Anbei der Fahrzeug-Ausweis.")
+        assert decision.action == AttachmentAction.ALLOW_VEHICLE_DOCUMENT
+        assert decision.document_kind == REG and decision.redaction_check_required
+        # Real identity documents are still withheld.
+        for identity in ("Personalausweis.jpg", "permis de conduire.jpg", "Ausweis Kopie.jpg"):
+            (withheld,) = evaluate_attachments((attachment(identity, "image/jpeg"),))
+            assert withheld.action == AttachmentAction.QUARANTINE_SENSITIVE, identity
+
+    @pytest.mark.parametrize(
+        ("text", "lang"),
+        [
+            ("Der Fahrzeugausweis ist vorhanden.", "de"),
+            ("Den Fahrzeug-Ausweis schicke ich Ihnen.", "de"),
+            ("Le permis de circulation est disponible.", "fr"),
+            ("La licenza di circolazione è disponibile.", "it"),
+        ],
+    )
+    def test_swiss_registration_wording_is_a_document_claim_not_an_identity_request(
+        self, text: str, lang: str
+    ) -> None:
+        claims = extract_reply_claims(text, lang)
+        assert {(d.kind, d.status) for d in claims.documents} == {(REG, DocumentClaimStatus.AVAILABLE)}
+        assert claims.requests == ()
+        assert InquiryQuestion.DOCUMENTS not in claims.unanswered_questions()
+        assert extract_reply_claims("Bitte senden Sie mir eine Ausweiskopie.", "de").escalation_kinds == (
+            RequestKind.IDENTITY_DOCUMENT,
+        )

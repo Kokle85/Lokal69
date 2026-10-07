@@ -27,7 +27,11 @@ service.
 user's *active* memberships (`app.memberships`). An authenticated user without an active
 membership is `403 FORBIDDEN`. With exactly one active membership that workspace is used. With
 several, the client sends `X-Workspace-Id: <uuid>`; the value is checked against the user's
-active memberships and is never trusted on its own (an unknown or foreign workspace is `403`).
+active memberships and is never trusted on its own (an unknown or foreign workspace is `403`,
+with the same body as no membership). A malformed or repeated header, or a missing header while
+several memberships are active, is `422 VALIDATION_ERROR` with `details.fields =
+["X-Workspace-Id"]`; only `GET /api/me` then defaults to the first membership (ordered by workspace
+name) so the client can bootstrap. Inactive memberships and inactive workspaces authorize nothing.
 The selected workspace becomes the transaction GUC `app.workspace_id` (row-level security is
 defence in depth; every query also carries an explicit workspace predicate).
 
@@ -48,15 +52,20 @@ changes); those operations are not part of this route set or the MCP toolset.
 a cross-site request cannot carry the user's credentials; no CSRF token is needed. Do not add
 cookie authentication without adding CSRF protection.
 
-**CORS.** Only the configured dashboard origin (the origin of `APP_BASE_URL`) is allowed. No
-wildcard origins, `Access-Control-Allow-Credentials` is not sent (no cookies), allowed methods are
+**CORS.** Only the configured dashboard origins are allowed: `API_ALLOWED_ORIGINS`
+(comma-separated), or the origin of `APP_BASE_URL` when that is empty; invalid entries, wildcards
+and (in production) non-loopback `http` origins are dropped. CORS applies to `/api` paths only (the
+mounted MCP endpoint validates `Origin` itself). No wildcard origins, `Access-Control-Allow-Credentials` is not sent (no cookies), allowed methods are
 `GET`, `POST` and `OPTIONS`, allowed request headers are `Authorization`, `Content-Type`,
 `X-Request-Id` and `X-Workspace-Id`, and preflight results may be cached for 600 seconds.
 
 **Other headers.** Every `/api` response is `Cache-Control: no-store` and
 `Content-Type: application/json`. A client may send `X-Request-Id` (printable ASCII, at most 200
 characters); otherwise the server generates one. It is echoed as `request_id` and as the error
-`correlation_id`.
+`correlation_id`. Requests are rate limited per authenticated principal (separate token buckets for
+mutations and reads; in memory per process) with `429 RATE_LIMITED` and `Retry-After`. Request
+bodies are `application/json` only (`415` otherwise) and at most 64 KiB (`413`). Routes without
+query parameters refuse any query parameter (`422`), and repeated parameters are refused.
 
 ## 2. Response envelope and conventions
 
@@ -118,7 +127,11 @@ Messages and details are safe: no SQL, tokens, cookies, credential-bearing URLs 
 clamped to 0-86,400 seconds. Validation failures list the failing field names in
 `details.fields` (including fields that break a domain rule, such as duplicate reason codes),
 never the submitted values. Rendering an error never fails: a malformed correlation id is
-omitted, and a malformed request id is replaced by a server-generated one.
+omitted, and a malformed request id is replaced by a server-generated one. Three transport
+statuses keep the code `VALIDATION_ERROR` in the body: `405` (method not allowed, with `Allow`),
+`413` (body too large, `details.limit_bytes`) and `415` (not `application/json`). Unknown `/api`
+paths are `404 NOT_FOUND`. A `401` carries `WWW-Authenticate: Bearer realm="suv-deals"` (plus
+`error="invalid_token"` when a token was presented); every invalid token gets the same message.
 
 | Code | HTTP status | Retryable by default | Meaning |
 |---|---|---|---|
@@ -233,7 +246,14 @@ Route notes:
   ids. **Release** is idempotent and only affects the caller's claim (`not_held`/`not_claimed` are
   no-ops). **Submit** checks claim ownership, expiry, case version, listing revision and valuation
   applicability in one transaction; outcomes are `needs_information`, `watch`, `shortlisted` and
-  `rejected`, never a purchase or a seller contact.
+  `rejected`, never a purchase or a seller contact. The spec 19 dashboard actions "needs
+  inspection", "needs documents" and "price confirmation needed" are submitted here as a
+  `needs_information` decision whose `reason_codes` include `needs_inspection`, `needs_documents`
+  or `price_confirmation_needed` (`domain.due_diligence.DashboardAction`) and whose
+  `missing_information` lists the open items (`api.routes.dashboard_action_request` builds the
+  body); those reason codes with any other outcome are `422` (`details.fields =
+  ["outcome", "reason_codes"]`). An optional `Idempotency-Key` header must equal the body's
+  `idempotency_key` on every mutation.
 - **Notes** are private, labelled (`owner`, `reviewer`, `assistant`) and separate from extracted
   claims. **Recheck** queues a budget-controlled job for a registered listing (never an arbitrary
   URL) and returns `202` with the job id.

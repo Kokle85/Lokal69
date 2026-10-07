@@ -440,3 +440,18 @@ class TestInquiriesRepliesDocuments:
         assert lines[0].startswith("Evaluation window 2026-10-06 to 2026-10-21 (in progress, day 2 of 15)")
         assert any(line.startswith(f"Coverage {SOURCE}: healthy") for line in lines)
         assert all("guarantee" not in line.lower() for line in lines)
+
+
+class TestIndependentReviewRegressions:
+    def test_threshold_in_another_currency_is_reported_not_silently_ignored(self) -> None:
+        report = build_evaluation_report(
+            now=T0 + EVALUATION_WINDOW + timedelta(hours=1),
+            activations=ACTIVE,
+            scans=regular_scans(3),
+            candidates=[valued("1600", "2500", approved_contribution_threshold=Money.of("1500", "CHF"))],
+        )
+        assert report.outcome == EvaluationOutcome.NO_SUITABLE_DEAL
+        assert report.qualifying_deal_ids == () and report.owner_judgement_candidate_ids == ()
+        assert any("could not be compared with the owner-approved threshold" in r for r in report.reasons)
+        assert all(r != "no candidate met the quality criteria" for r in report.reasons)
+        report.summary_lines()  # passes the owner-wording guard

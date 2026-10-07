@@ -28,6 +28,7 @@ from suv_deals.domain.replies import (
     format_amount_mk,
     normalize_message_id,
     sanitize_reply_body,
+    strip_quoted_text,
 )
 
 MB = UUID("77777777-7777-4777-8777-777777777777")
@@ -440,3 +441,82 @@ def test_quoted_outbound_questions_never_become_claims(
         quoted = f"-----Original Message-----\nFrom: x\n{questions}"
     claims = extract_reply_claims(f"Danke.\n{quoted}", language)
     assert claims.availability == () and claims.prices == ()
+
+
+@SETTINGS
+@given(
+    first=st.text(alphabet="abcdefXYZ0123456789-_", min_size=1, max_size=40),
+    second=st.text(alphabet="abcdefXYZ0123456789-_", min_size=1, max_size=40),
+)
+def test_provider_id_of_a_moved_or_copied_message_never_changes_its_fingerprint(
+    first: str, second: str
+) -> None:
+    """Graph message ids change on a move and copies differ: with an Internet Message-ID the
+    provider id is a locator, never part of the immutable source fingerprint (37.8)."""
+    a = request(
+        source_message={**request().source_message.model_dump(mode="json"), "provider_message_id": first}
+    )
+    b = request(
+        source_message={**request().source_message.model_dump(mode="json"), "provider_message_id": second}
+    )
+    assert a.fingerprint() == b.fingerprint()
+    assert a.dedup_key() == b.dedup_key()
+
+
+FOOTERS = [
+    "Autohaus Example GmbH\nBankverbindung: IBAN DE89 3704 0044 0532 0130 00\nZahlung per Überweisung",
+    "© 2026 Dealer Ltd. All rights reserved. Vehicle reserved. Sold as seen. Deposit 500 EUR.",
+    "Questa email contiene informazioni riservate. Auto venduta. Prenotazione appuntamento.",
+    "Tous droits réservés. Véhicule vendu. Rendez-vous. Acompte 300 €.",
+    "Anzahlung 500 €, Preis 9.999 €, Termin vereinbaren, Fahrzeug verkauft",
+]
+
+
+@SETTINGS
+@given(
+    body=SENTENCES,
+    footer=st.sampled_from(FOOTERS),
+    sign_off=st.sampled_from(
+        ["Mit freundlichen Grüßen", "Cordiali saluti", "Cordialement", "Kind regards", "--"]
+    ),
+    language=st.sampled_from([None, *MessageLanguage]),
+)
+def test_signature_and_footer_never_add_claims(
+    body: str, footer: str, sign_off: str, language: MessageLanguage | None
+) -> None:
+    """Whatever follows a sign-off line (bank details, disclaimers, "All rights reserved") never
+    adds availability, price, document or request claims to the seller's message."""
+    base = f"{body}\n{sign_off}\nHans"
+    analysed = strip_quoted_text(base)[0]
+    lines = analysed.split("\n")
+    assume(sign_off in lines and any(line.strip() for line in lines[: lines.index(sign_off)]))
+    without = extract_reply_claims(base, language)
+    with_footer = extract_reply_claims(f"{base}\n{footer}", language)
+    assert {c.status for c in with_footer.availability} == {c.status for c in without.availability}
+    assert [(p.amount, p.currency) for p in with_footer.prices] == [
+        (p.amount, p.currency) for p in without.prices
+    ]
+    assert {r.kind for r in with_footer.requests} == {r.kind for r in without.requests}
+    assert {(d.kind, d.status) for d in with_footer.documents} == {
+        (d.kind, d.status) for d in without.documents
+    }
+
+
+@SETTINGS
+@given(text=st.one_of(TEXT, SENTENCES), subject=TEXT)
+def test_verified_sender_without_thread_or_reference_never_uploads(text: str, subject: str) -> None:
+    """A message from the verified seller address with no thread link and no reference to the
+    listing (a dealer newsletter) is not even a possible match: nothing leaves the mailbox."""
+    assume("test-204" not in f"{subject}\n{text}".lower())
+    msg = InboundMessage(
+        identity=SourceMessageIdentity(
+            mailbox_binding_id=MB,
+            provider=EmailProviderKind.OUTLOOK_LOCAL,
+            internet_message_id="<n@x.invalid>",
+        ),
+        headers={"From": SELLER, "Subject": subject},
+        body_text=text,
+    )
+    result = correlate_reply(msg, [BINDING])
+    assert result.upload_scope == "none"
+    assert result.outcome == CorrelationOutcome.UNMATCHED

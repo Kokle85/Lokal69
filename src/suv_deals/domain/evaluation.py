@@ -671,12 +671,24 @@ def _no_deal_reasons(
         if c.conservative_contribution is not None and c.conservative_contribution.amount <= 0
     ]
     below = [c for c in complete if _meets_threshold(c) is False]
+    incomparable = [
+        c
+        for c in complete
+        if c.approved_contribution_threshold is not None
+        and c.conservative_contribution is not None
+        and c.approved_contribution_threshold.currency != c.conservative_contribution.currency
+    ]
     if non_positive:
         reasons.append(
             f"{len(non_positive)} complete valuation(s) show no positive conservative contribution"
         )
     if below:
         reasons.append(f"{len(below)} complete valuation(s) are below the owner-approved threshold")
+    if incomparable:
+        reasons.append(
+            f"{len(incomparable)} complete valuation(s) could not be compared with the owner-approved "
+            "threshold (different currency; no conversion is assumed)"
+        )
     if not reasons:
         reasons.append("no candidate met the quality criteria")
     return reasons
