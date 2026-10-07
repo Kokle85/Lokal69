@@ -151,17 +151,37 @@ schemas: ## Re-export the JSON schemas (schemas/)
 schemas-check: ## Fail when a committed schema snapshot is stale
 	$(UV) run python scripts/export_schemas.py --check
 
-dashboard-install: ## npm ci in dashboard/ (skipped while dashboard/ has no package.json)
-	@if [ -f dashboard/package.json ]; then npm --prefix dashboard ci; else echo "dashboard/package.json not present; skipping"; fi
+# Dashboard (dashboard/README.md). Browser config is VITE_SUPABASE_URL + VITE_SUPABASE_PUBLISHABLE_KEY only.
+.PHONY: dashboard-audit dashboard-e2e e2e e2e-clean
 
-dashboard-build: ## Build the dashboard
-	@if [ -f dashboard/package.json ]; then npm --prefix dashboard run build; else echo "dashboard/package.json not present; skipping"; fi
+dashboard-install: ## npm ci in dashboard/ (exact versions from package-lock.json)
+	npm --prefix dashboard ci
 
-dashboard-test: ## Dashboard unit tests
-	@if [ -f dashboard/package.json ]; then npm --prefix dashboard test; else echo "dashboard/package.json not present; skipping"; fi
+dashboard-build: ## Type-check, build (strict CSP) and security-check the dashboard into dashboard/dist
+	npm --prefix dashboard run build
 
-dashboard-lint: ## Dashboard lint
-	@if [ -f dashboard/package.json ]; then npm --prefix dashboard run lint; else echo "dashboard/package.json not present; skipping"; fi
+dashboard-test: ## Dashboard unit/component tests (vitest + Testing Library)
+	npm --prefix dashboard test
+
+dashboard-lint: ## Dashboard lint (oxlint) + static security checks (no raw-HTML sinks, only 2 VITE_ vars)
+	npm --prefix dashboard run lint
+
+dashboard-audit: ## npm audit of the dashboard's production dependencies (report only; never forces upgrades)
+	npm --prefix dashboard audit --omit=dev
+
+dashboard-e2e: e2e ## Alias of `make e2e`
+
+e2e: ## Browser E2E: harness self-test, then Playwright vs mock Supabase Auth + real backend + built dashboard
+	@TEST_DATABASE_ADMIN_URL="$(PG16_ADMIN_URL)" $(PYTEST) -q tests/e2e
+	@[ -d dashboard/node_modules ] || npm --prefix dashboard ci
+	@cd dashboard && TEST_DATABASE_ADMIN_URL="$(PG16_ADMIN_URL)" npm run e2e
+
+e2e-clean: ## Drop leftover SYNTHETIC suv_e2e_* databases of aborted E2E runs (loopback cluster only)
+	@if ! [[ "$(PG16_ADMIN_URL)" =~ @(127\.0\.0\.1|localhost)(:[0-9]+)?/ ]]; then \
+	  echo "refusing: PG16_ADMIN_URL must point to 127.0.0.1/localhost"; exit 3; fi
+	@for db in $$(psql "$(PG16_ADMIN_URL)" -XAtc "select datname from pg_database where datname ~ '^suv_e2e_[0-9a-f]{12}$$'"); do \
+	  psql "$(PG16_ADMIN_URL)" -Xq -v ON_ERROR_STOP=1 -c "drop database if exists \"$$db\" with (force)" && echo "dropped $$db"; \
+	done
 
 outlook-bridge-test: ## Local Outlook bridge tests (in-memory fakes; no Outlook needed)
 	@if [ -d desktop/outlook-bridge/tests ]; then $(PYTEST) desktop/outlook-bridge/tests -q; \
