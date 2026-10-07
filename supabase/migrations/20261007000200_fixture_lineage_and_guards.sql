@@ -83,8 +83,9 @@ begin
 end
 $$;
 
-drop trigger if exists listings_fixture_lineage on app.listings;
-create trigger listings_fixture_lineage before insert or update of is_fixture on app.listings
+-- CREATE OR REPLACE TRIGGER (PostgreSQL 14+) instead of DROP + CREATE: the hosted
+-- project's migration connector holds DROP TRIGGER for an interactive confirmation.
+create or replace trigger listings_fixture_lineage before insert or update of is_fixture on app.listings
   for each row execute function app.listings_fixture_lineage();
 
 -- -----------------------------------------------------------------------------

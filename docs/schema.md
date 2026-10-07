@@ -579,6 +579,48 @@ Advisor notes (2026-10-06):
   indexes only where real query plans need them (spec §11). Three "multiple permissive policies"
   warnings are the intended self-lookup policies for memberships, workspaces and API credentials.
 
+#### v1.1 migrations (applied 2026-10-07)
+
+| File | Recorded version | Stored text |
+|---|---|---|
+| 20261006000950_host_budgets_inflight_and_idempotency_scope | 20261007201139 | byte-exact (sha256 `902d845a…9768`) |
+| 20261006001000_seller_inquiries, part 1 of 4 | 20261007201930 | see note (sha256 `a71062db…6e56`) |
+| 20261006001000_seller_inquiries, part 2 of 4 | 20261007202353 | see note (sha256 `5f8eade4…0412`) |
+| 20261006001000_seller_inquiries, part 3 of 4 | 20261007202601 | byte-exact (sha256 `48192da0…d9c7`) |
+| 20261006001000_seller_inquiries, part 4 of 4 | 20261007202735 | byte-exact (sha256 `8ee7b7a8…6343`) |
+| 20261007000100_v11_integration_foundation | 20261007202801 | byte-exact (sha256 `0f6ea83a…7fab`) |
+| 20261007000200_fixture_lineage_and_guards | 20261007220520 | byte-exact (sha256 `286f3de0…ed29`) |
+| 20261007000400_mail_worker_credential_kind | 20261007220534 | byte-exact (sha256 `44c614a4…437e`) |
+
+Connector constraints found while applying, now enforced by `tests/unit/test_migrations_ascii.py`:
+
+- **Size and splitting.** Migration 1000 (187 KB) was applied as four statement-boundary parts
+  under the names `20261006001000_seller_inquiries_part1`…`part4`. Applying the parts in order was
+  verified on PostgreSQL 17 to produce a schema identical to applying the whole file.
+- **Non-ASCII.** The connector does not carry U+2028/U+2029 faithfully (raw characters arrived as
+  spaces; `\u` escapes in the tool arguments are decoded). Migration 1000 now writes them as regex
+  escapes (` `, ` `). The stored text of parts 1 and 2 is the previous revision of the
+  file, with the literal characters in the same six regex classes; it is otherwise byte-identical
+  and has the same meaning (verified on the project: the checks reject U+0085/U+2028/U+2029 and
+  accept an ordinary space). Every migration must now be pure ASCII.
+- **`DROP TRIGGER`.** The connector holds `DROP TRIGGER` for an interactive confirmation and times
+  out after 60 s without reaching PostgreSQL (`DROP CONSTRAINT`, `UPDATE` and `ENABLE/DISABLE
+  TRIGGER` pass). Migration 0200 therefore uses `CREATE OR REPLACE TRIGGER` (PostgreSQL 14+), and
+  no migration may contain `DROP TRIGGER`.
+
+Verified after applying (2026-10-07): 36 `app` + 24 `ops` tables; RLS enabled on all of them; no
+table grants, function `EXECUTE` or schema `USAGE` for `anon`/`authenticated`/`service_role`/`PUBLIC`;
+`ops.backend_role_problems()` is `[]`; `app.listings.is_fixture` is NOT NULL with the
+`listings_fixture_lineage` trigger, `listings_touch` stays enabled; `api_credentials_kind_ck`
+allows `mail_worker` and `api_credentials_mail_worker_ck` is validated.
+
+Advisor notes (2026-10-07): security — only the two WARNs on the project-provided
+`public.rls_auto_enable()` (unchanged). Performance — the same three intended "multiple permissive
+policies" WARNs; INFO "unused index" now also lists the new v1.1 indexes (empty database) and one
+more "unindexed foreign key", `app.seller_contacts.seller_contacts_listing_fk` on
+`(workspace_id, source_id, listing_id)`: `seller_contacts_listing_idx` covers the same columns in
+the order `(workspace_id, listing_id, source_id)`, which serves the FK's equality lookups.
+
 ## 10. Spec v1.1 seller inquiries and the mailbox route (migration 1000)
 
 `supabase/migrations/20261006001000_seller_inquiries.sql` is one additive, forward-only (expand)
