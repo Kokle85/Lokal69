@@ -14,7 +14,8 @@ Message types (``classify_message``)
     ``Action: failed``, mailer-daemon/postmaster senders, ``X-Failed-Recipients``, Outlook
     ``REPORT.IPM.Note.NDR`` and DE/IT/FR/EN subjects such as "Undelivered Mail",
     "Unzustellbar", "Non recapitabile", "Non remis"), ``delivery_notice`` (delayed/delivered DSN
-    actions, read receipts/MDNs, "Zugestellt:", "Consegnato:", "Remis :"), ``auto_reply``
+    actions, read receipts/MDNs, "Zugestellt:", "Consegnato:", "Remis :"; subject wording counts
+    only when the subject does not start with a human "Re:"/"AW:"/"R:"/"Fwd:" prefix), ``auto_reply``
     (``Auto-Submitted`` other than ``no``, ``X-Autoreply``/``X-Autorespond``, ``Precedence:
     auto_reply``, Outlook OOF templates and subjects such as "Out of office", "Abwesenheitsnotiz",
     "Fuori sede", "Réponse automatique"; ordinary words such as "Abwesend", "Assente" or
@@ -31,7 +32,10 @@ Correlation (``correlate_reply``)
     sender must be a verified seller alias (exact local part, normalised domain; no Gmail
     dot/plus folding) and the text must not reference a *different* inquiry's listing. A
     thread-id-only link (Outlook/Gmail threading can follow subjects) additionally needs a
-    verified sender *and* a listing reference. A subject match alone never correlates.
+    verified sender *and* a listing reference. A subject match alone never correlates; without a
+    thread link a verified sender is a possible match only when the text also references that
+    inquiry's listing (a dealer newsletter stays local). Non-mail Outlook items and the mailbox
+    owner's own messages (``own_addresses``) are never reply-processed and stay local.
     Forwarded, changed-address, spam, ambiguous and multi-inquiry messages are quarantined: never
     applied to a vehicle before verification. ``upload_scope`` says what may leave the mailbox:
     ``full`` (matched), ``quarantine`` (exactly one candidate inquiry, uploaded flagged and not
@@ -41,11 +45,13 @@ Correlation (``correlate_reply``)
     that send as submitted; a thread-only link or a quarantined possible match never does.
 
 Source fingerprint and ingest dedup (``source_content_fingerprint``, ``decide_ingest``)
-    The fingerprint covers the schema-selected immutable content: Internet Message-ID, provider
-    message id, From, In-Reply-To, References, subject, sanitised body and attachment content
-    metadata (name, MIME type, size, SHA-256; order-insensitive). Outlook EntryID/StoreID,
-    attachment local references, ``received_at``, ``observed_at``, ``detected_language`` and
-    binding/sync metadata are excluded. Same dedup key + same fingerprint -> duplicate (the
+    The fingerprint covers the schema-selected immutable content: Internet Message-ID (or, only
+    when that is absent, the provider message id), From, In-Reply-To, References, subject,
+    sanitised body and attachment content metadata (name, MIME type, size, SHA-256;
+    order-insensitive). Outlook EntryID/StoreID, a provider message id next to an Internet
+    Message-ID (Graph ids change on a move; copies differ), attachment local references,
+    ``received_at``, ``observed_at``, ``detected_language`` and binding/sync metadata are
+    excluded. Same dedup key + same fingerprint -> duplicate (the
     existing reply id; a changed locator is recorded in locator history). Same key + different
     fingerprint -> ``IDEMPOTENCY_CONFLICT`` and quarantine, never an overwrite. The request
     idempotency key and the source identity are both checked; neither is trusted alone.
@@ -111,7 +117,7 @@ from suv_deals.domain.parsing import Locale, parse_number
 from suv_deals.errors import Forbidden, IdempotencyConflict, ValidationFailed
 
 REPLY_SCHEMA_VERSION: Final = "1.0"
-FINGERPRINT_VERSION: Final = "reply-source-fingerprint/1"
+FINGERPRINT_VERSION: Final = "reply-source-fingerprint/2"
 SANITIZER_VERSION: Final = "reply-sanitizer/1"
 CLAIMS_VERSION: Final = "reply-claims/1"
 MK_SUMMARY_VERSION: Final = "reply-mk-summary/1"
@@ -904,7 +910,11 @@ def explain_classification(
         return done(ReplyMessageType.AUTO_REPLY)
 
     report = _report_kind(hdrs, attachments)
-    delay_subject = bool(_DELAY_SUBJECT_RE.search(subject))
+    # Report subjects never start with a human reply/forward prefix ("AW: ... nicht zustellbar?",
+    # "R: ... consegna ritardata"): behind one, delivery wording is the sender's own text and only
+    # structural evidence (DSN/MDN parts, mailer-daemon sender, X-Failed-Recipients) counts.
+    human_subject = bool(_REPLY_PREFIX_RE.match(subject))
+    delay_subject = not human_subject and bool(_DELAY_SUBJECT_RE.search(subject))
     if delay_subject:
         signals.append(ClassificationSignal.DELAY_SUBJECT)
     if report == "delivery-status":
@@ -926,7 +936,7 @@ def explain_classification(
 
     daemon = _is_mailer_daemon(hdrs)
     failed_rcpt = bool(hdrs.get_all("x-failed-recipients"))
-    bounce_subject = bool(_BOUNCE_SUBJECT_RE.search(subject))
+    bounce_subject = not human_subject and bool(_BOUNCE_SUBJECT_RE.search(subject))
     if daemon:
         signals.append(ClassificationSignal.MAILER_DAEMON_SENDER)
     if failed_rcpt:
@@ -942,7 +952,7 @@ def explain_classification(
         return done(ReplyMessageType.BOUNCE)
     if delay_subject:
         return done(ReplyMessageType.DELIVERY_NOTICE)
-    if _DELIVERY_SUBJECT_RE.search(subject):
+    if not human_subject and _DELIVERY_SUBJECT_RE.search(subject):
         signals.append(ClassificationSignal.DELIVERY_SUBJECT)
         return done(ReplyMessageType.DELIVERY_NOTICE)
 
@@ -1092,6 +1102,8 @@ class CorrelationReason(StrEnum):
     SUBJECT_ONLY = "SUBJECT_ONLY"
     BINDING_REVOKED = "BINDING_REVOKED"
     OTHER_MAILBOX_BINDING = "OTHER_MAILBOX_BINDING"
+    NON_MAIL_ITEM = "NON_MAIL_ITEM"  # meetings, sharing invitations, tasks: never reply processing
+    OWN_MESSAGE = "OWN_MESSAGE"  # sent by the mailbox owner (e.g. a manual reply in the thread)
 
 
 UploadScope = Literal["full", "quarantine", "none"]
@@ -1210,12 +1222,17 @@ def correlate_reply(
     *,
     message_type: ReplyMessageType | None = None,
     all_bindings_for_reference_check: Sequence[InquiryBinding] | None = None,
+    own_addresses: Sequence[str] = (),
 ) -> CorrelationResult:
     """Match one inbound message to at most one inquiry (see module docstring).
 
     ``bindings`` are the worker's synced bindings (any mailbox; only the message's own mailbox
-    is used). ``message_type`` defaults to ``classify_message``. The decision is made locally,
-    before any body or attachment leaves the mailbox.
+    is used). ``message_type`` defaults to ``classify_message``. ``own_addresses`` are the
+    mailbox owner's own sender addresses: a message from one of them (a manual reply by the
+    owner in the seller thread, a Sent Items copy) is never a seller reply and stays local.
+    Non-mail Outlook items (meetings, sharing invitations, tasks) are never reply-processed
+    (spec 37.6) and stay local too. The decision is made locally, before any body or attachment
+    leaves the mailbox.
     """
     mtype = message_type or classify_message(
         message.headers,
@@ -1226,6 +1243,26 @@ def correlate_reply(
     )
     identity = message.identity
     usable, revoked, other_mailbox = _latest_bindings(bindings, identity.mailbox_binding_id)
+    if message.message_class and not is_processable_item(message.message_class):
+        return CorrelationResult(
+            outcome=CorrelationOutcome.UNMATCHED,
+            message_type=mtype,
+            reasons=(CorrelationReason.NON_MAIL_ITEM,),
+        )
+    own = {address for address in (canonical_address(a) for a in own_addresses) if address}
+    from_addresses = message.from_addresses
+    if (
+        own
+        and len(from_addresses) == 1
+        and from_addresses[0] in own
+        # An owner-controlled test seller address (activation canary) stays matchable.
+        and not any(from_addresses[0] in b.verified_seller_aliases for b in usable)
+    ):
+        return CorrelationResult(
+            outcome=CorrelationOutcome.UNMATCHED,
+            message_type=mtype,
+            reasons=(CorrelationReason.OWN_MESSAGE,),
+        )
     reference_pool = list(all_bindings_for_reference_check or usable)
     refs = set(message.reference_ids())
     dsn = (
@@ -1381,14 +1418,17 @@ def _correlate_without_thread(
     other_mailbox_hit: bool,
     refs: set[str],
 ) -> CorrelationResult:
-    """No header/thread link: a verified seller address can only produce a quarantined
-    *possible* match; a subject/reference match alone never correlates."""
+    """No header/thread link: a verified seller address *plus* a reference to that inquiry's
+    listing can only produce a quarantined *possible* match; a subject/reference match alone, or
+    a verified sender alone (a dealer newsletter, unrelated mail), never correlates."""
+    # A reply to an outbound message whose binding has not synced yet: keep only a bounded local
+    # locator and retry after the next binding sync (spec 37.8 reply-before-binding race).
+    retry = bool(refs) and not revoked_hit and not other_mailbox_hit
     by_sender = [b for b in usable if sender is not None and sender in b.verified_seller_aliases]
     if by_sender and mtype not in (ReplyMessageType.BOUNCE, ReplyMessageType.DELIVERY_NOTICE):
         mentioned = [b for b in by_sender if _mentions_binding(text_lower, b)]
-        candidates = mentioned if len(mentioned) == 1 else by_sender
-        if len(candidates) == 1:
-            only = candidates[0]
+        if len(mentioned) == 1:
+            only = mentioned[0]
             return CorrelationResult(
                 outcome=CorrelationOutcome.QUARANTINED,
                 message_type=mtype,
@@ -1398,24 +1438,37 @@ def _correlate_without_thread(
                 reasons=(
                     CorrelationReason.SENDER_VERIFIED,
                     CorrelationReason.SENDER_ONLY_NO_THREAD,
-                    CorrelationReason.REFERENCE_CORROBORATED
-                    if _mentions_binding(text_lower, only)
-                    else CorrelationReason.REFERENCE_NOT_FOUND,
+                    CorrelationReason.REFERENCE_CORROBORATED,
                 ),
                 sender_verified=True,
-                reference_corroborated=_mentions_binding(text_lower, only),
+                reference_corroborated=True,
                 is_canary=only.is_canary,
             )
+        if mentioned:
+            return CorrelationResult(
+                outcome=CorrelationOutcome.QUARANTINED,
+                message_type=mtype,
+                candidate_inquiry_ids=tuple(sorted({b.inquiry_id for b in mentioned}, key=str)),
+                reasons=(
+                    CorrelationReason.SENDER_VERIFIED,
+                    CorrelationReason.SENDER_ONLY_NO_THREAD,
+                    CorrelationReason.MULTIPLE_INQUIRIES,
+                ),
+                sender_verified=True,
+            )
+        # Verified sender, no thread link and no reference to any of its listings: not even a
+        # possible match. The content stays in the local mailbox.
         return CorrelationResult(
-            outcome=CorrelationOutcome.QUARANTINED,
+            outcome=CorrelationOutcome.UNMATCHED,
             message_type=mtype,
-            candidate_inquiry_ids=tuple(sorted({b.inquiry_id for b in candidates}, key=str)),
             reasons=(
                 CorrelationReason.SENDER_VERIFIED,
                 CorrelationReason.SENDER_ONLY_NO_THREAD,
-                CorrelationReason.MULTIPLE_INQUIRIES,
+                CorrelationReason.REFERENCE_NOT_FOUND,
+                CorrelationReason.NO_BINDING_MATCH,
             ),
             sender_verified=True,
+            retry_after_binding_sync=retry,
         )
     reasons: list[CorrelationReason] = []
     if revoked_hit:
@@ -1425,9 +1478,6 @@ def _correlate_without_thread(
     if any(_mentions_binding(text_lower, b) for b in usable):
         reasons.append(CorrelationReason.SUBJECT_ONLY)
     reasons.append(CorrelationReason.NO_BINDING_MATCH)
-    # A reply to an outbound message whose binding has not synced yet: keep only a bounded local
-    # locator and retry after the next binding sync (spec 37.8 reply-before-binding race).
-    retry = bool(refs) and not revoked_hit and not other_mailbox_hit
     return CorrelationResult(
         outcome=CorrelationOutcome.UNMATCHED,
         message_type=mtype,
@@ -1521,7 +1571,11 @@ class ReplySourceContent(BaseModel):
         return {
             "version": FINGERPRINT_VERSION,
             "internet_message_id": self.internet_message_id,
-            "provider_message_id": self.provider_message_id,
+            # Where an Internet Message-ID exists, a provider message id is a per-copy locator
+            # (Microsoft Graph ids change when a message is moved; Gmail/Outlook copies in two
+            # folders differ): including it would turn a moved or copied message into a false
+            # IDEMPOTENCY_CONFLICT. It is identity only as the fallback key.
+            "provider_message_id": None if self.internet_message_id else self.provider_message_id,
             "from": self.from_address,
             "in_reply_to": self.in_reply_to,
             "references": list(self.references),
@@ -1972,30 +2026,50 @@ def strip_quoted_text(text: str) -> tuple[str, bool]:
     / "Il ... ha scritto:" / "Le ... a écrit :" attributions (also wrapped over two lines) and
     Outlook header blocks (From/Von/Da/De followed by Sent/Date/To/Subject lines). Remaining
     ``>``-quoted lines are removed individually (inline replies keep the seller's own text).
+    An attribution followed by a ``>``-quoted block is bottom-posting: the attribution and the
+    ``>`` lines go, and the seller's own text after the block is kept.
     """
     lines = text.split("\n")
-    cut: int | None = None
-    for index, line in enumerate(lines):
+    kept: list[str] = []
+    removed = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if _QUOTE_HEADER_RE.search(line):
-            cut = index
+            removed = True
             break
+        attribution = False
         if _ATTRIBUTION_END_RE.search(line):
             if _ATTRIBUTION_START_RE.search(line):
-                cut = index
-                break
-            if index > 0 and _ATTRIBUTION_START_RE.search(lines[index - 1]):
-                cut = index - 1
-                break
+                attribution = True
+            elif (
+                index > 0
+                and kept
+                and kept[-1] == lines[index - 1]
+                and _ATTRIBUTION_START_RE.search(lines[index - 1])
+            ):
+                kept.pop()  # an attribution wrapped over two lines
+                attribution = True
+        if attribution:
+            removed = True
+            following = index + 1
+            while following < len(lines) and not lines[following].strip():
+                following += 1
+            if following < len(lines) and lines[following].lstrip().startswith(">"):
+                index = following  # ">" lines are dropped below; own text after them is kept
+                continue
+            break  # an un-prefixed quote: everything after the attribution is the old message
         if _HEADER_BLOCK_FROM_RE.search(line):
-            following = lines[index + 1 : index + 6]
-            if sum(1 for item in following if _HEADER_BLOCK_NEXT_RE.search(item)) >= 2:
-                cut = index
+            following_lines = lines[index + 1 : index + 6]
+            if sum(1 for item in following_lines if _HEADER_BLOCK_NEXT_RE.search(item)) >= 2:
+                removed = True
                 break
-    removed = cut is not None
-    kept = lines[:cut] if cut is not None else lines
-    unquoted = [line for line in kept if not line.lstrip().startswith(">")]
-    removed = removed or len(unquoted) != len(kept)
-    return "\n".join(unquoted), removed
+        if line.lstrip().startswith(">"):
+            removed = True
+        else:
+            kept.append(line)
+        index += 1
+    return "\n".join(kept), removed
 
 
 def _phone_sub(counts: dict[str, int]) -> Any:
@@ -2620,9 +2694,11 @@ _PRICE_KEYWORDS: Final[dict[MessageLanguage, re.Pattern[str]]] = {
     _L.EN: re.compile(r"\b(?:price\w*|cost\w*|lowest|final|asking|ono)\b"),
 }
 _DEPOSIT_WORDS: Final = re.compile(
-    r"\b(?:anzahlung|kaution|reservierungsgeb[üu]hr|vorkasse|[üu]berweis\w*|restbetrag|saldo|solde|caparra"
-    r"|acconto|anticipo|bonifico"
-    r"|acompte|arrhes|virement|caution|deposit|down payment|bank transfer|wire transfer|paypal)\b"
+    # "anzahlen"/"Anzahlung" (deposit) but not the noun "Anzahl" (number of owners, keys, ...)
+    r"\b(?:anzahl(?:ung\w*|en|t)|angeld|kaution|reservierungsgeb[üu]hr|vorkasse|vorauszahl\w*|[üu]berweis\w*"
+    r"|restbetrag|saldo|solde|caparra|acconto|anticipo|bonifico|versament\w*"
+    r"|acompte|arrhes|virement|caution|deposit|down payment|advance payment|upfront|bank transfer"
+    r"|wire transfer|paypal)\b"
 )
 _OTHER_COST_WORDS: Final = re.compile(
     r"\b(?:transport\w*|[üu]berf[üu]hrung|lieferung|versand|geb[üu]hr\w*|ummeldung|kennzeichen|zoll"
@@ -2842,7 +2918,8 @@ _DOC_STATUS_RULES: Final[tuple[tuple[DocumentClaimStatus, re.Pattern[str]], ...]
         DocumentClaimStatus.AVAILABLE,
         re.compile(
             r"(?:\bvorhanden\b|\bliegt vor\b|\bliegen vor\b|\bist dabei\b|\bsind dabei\b|\bhaben wir\b"
-            r"|\bhabe ich\b"
+            r"|\bhabe ich\b|\bhab ich\b|\bist da\b|\bsind da\b|\bliegt bei\b|\bliegen bei\b"
+            r"|\bce l'ho\b|\bce l'abbiamo\b|\bje l'ai\b|\bi've got\b|\bwe've got\b"
             r"|\bverf[üu]gbar\b|\bkann ich (?:ihnen )?(?:zu)?(?:schicken|senden)\b|\bschicke ich\b"
             r"|\bsende ich\b"
             r"|\bdisponibil[ei]\b|\bc'[èe]\b|\bci sono\b|\bpresent[ei]\b|\babbiamo\b|\bposso inviar\w*"
@@ -2855,9 +2932,10 @@ _DOC_STATUS_RULES: Final[tuple[tuple[DocumentClaimStatus, re.Pattern[str]], ...]
 )
 _REQUEST_RULES: Final[dict[RequestKind, re.Pattern[str]]] = {
     RequestKind.PAYMENT: re.compile(
-        r"\b(?:anzahlung|[üu]berweisung|[üu]berweisen|vorkasse|kaution|iban|paypal|western union|bezahlen"
-        r"|caparra|acconto|bonifico|pagamento|pagare|ricarica|acompte|arrhes|virement|paiement|payer"
-        r"|mandat cash|deposit|down payment|bank transfer|wire transfer|payment|escrow)\b"
+        r"\b(?:anzahl(?:ung|en|t)|angeld|[üu]berweisung|[üu]berweisen|vorkasse|vorauszahlung|kaution|iban"
+        r"|paypal|western union|bezahlen|caparra|acconto|bonifico|versamento|pagamento|pagare|ricarica"
+        r"|acompte|arrhes|virement|paiement|payer|mandat cash|deposit|down payment|advance payment"
+        r"|pay upfront|pay in advance|bank transfer|wire transfer|payment|escrow)\b"
     ),
     RequestKind.RESERVATION: re.compile(
         r"\b(?:reservieren|reservierung|zur[üu]cklegen|zur[üu]ckhalten|prenotare|prenotarl[ao]|prenotazione"
@@ -2912,6 +2990,80 @@ def _languages(language: MessageLanguage | None) -> tuple[MessageLanguage, ...]:
     return (language,) if language is not None else tuple(MessageLanguage)
 
 
+# --- analysis region ---------------------------------------------------------------------------
+
+# Sign-off lines after which a signature, company footer or legal disclaimer follows. Stricter
+# than the sanitiser's list: "Thanks!" or "Cheers" can open a message, these do not.
+_SIGN_OFF_RE: Final = re.compile(
+    r"^\s*(?:mit (?:freundlichen|besten|herzlichen|lieben) gr(?:ü|ue|u)(?:ß|ss)en"
+    r"|(?:freundliche|beste|viele|liebe|herzliche) gr(?:ü|ue)(?:ß|ss)e|mfg|lg|gru(?:ß|ss)"
+    r"|cordiali saluti|distinti saluti|saluti|cordialmente|un (?:caro )?saluto|cordialement"
+    r"|bien cordialement|bien [àa] vous|salutations(?: distingu[ée]es)?|kind regards|best regards"
+    r"|warm regards|regards|best wishes|yours sincerely|sincerely)\b[\s,.!]*$",
+    re.IGNORECASE,
+)
+_POSTSCRIPT_RE: Final = re.compile(r"^\s*(?:p\.?\s?s\.?|n\.?\s?b\.?)\s*[:.)-]?\s", re.IGNORECASE)
+# Boilerplate that contains availability words without being an availability statement:
+# copyright lines, confidentiality disclaimers ("informazioni riservate", "réservé à l'usage"),
+# "subject to prior sale" wording and French "sous réserve".
+_BOILERPLATE_RE: Final = re.compile(
+    r"\ball rights reserved\b|\balle rechte vorbehalten\b|\btutti i diritti (?:sono )?riservati\b"
+    r"|\btous droits r[ée]serv[ée]s\b"
+    r"|\b(?:informazion\w*|contenut\w*|dati|messaggio|comunicazion\w*|documento|carattere|natura|uso)"
+    r"(?:\s+[\w']+){0,4}?\s+(?:riservat\w*|confidenzial\w*)(?:\s+e\s+(?:riservat\w*|confidenzial\w*))?"
+    r"|\b(?:riservat\w*|confidenzial\w*)\s+e\s+(?:riservat\w*|confidenzial\w*)"
+    r"|\br[ée]serv[ée]e?s?\s+[àa]\s+l'usage\b|\busage\s+(?:\w+\s+)?r[ée]serv[ée]e?s?\b"
+    r"|\bsous r[ée]serve\b|\br[ée]serve de propri[ée]t[ée]\b"
+    r"|\bsalvo (?:il )?vendut[oa]\b|\bsauf vente\b|\bunless (?:already |previously )?sold\b"
+    r"|\bsubject to (?:prior )?sale\b|\bzwischenverkauf vorbehalten\b"
+    r"|\b(?:sofern|falls|wenn) (?:nicht )?(?:zwischenzeitlich |bereits |schon )?verkauft\b"
+)
+
+
+def _blank_ranges(text: str, ranges: Iterable[tuple[int, int]]) -> str:
+    """``text`` with every ``[start, end)`` range replaced by spaces; newlines and therefore all
+    indices stay aligned with the input."""
+    chars = list(text)
+    for start, end in ranges:
+        for position in range(max(0, start), min(len(chars), end)):
+            if chars[position] != "\n":
+                chars[position] = " "
+    return "".join(chars)
+
+
+def _claims_region(text: str) -> str:
+    """Same-length copy of ``text`` with the signature/footer/disclaimer region blanked.
+
+    Everything after the first sign-off line ("Mit freundlichen Grüßen", "Cordiali saluti",
+    "Kind regards", a ``-- `` delimiter) that follows some message text is the signature,
+    company footer or legal disclaimer - bank details, "All rights reserved", "informazioni
+    riservate" - and never a claim; postscript paragraphs ("PS: ...") after it are kept.
+    Known boilerplate phrases are blanked wherever they occur.
+    """
+    ranges: list[tuple[int, int]] = []
+    position = 0
+    seen_text = False
+    signature = False
+    in_postscript = False
+    for line in text.split("\n"):
+        start, end = position, position + len(line)
+        position = end + 1
+        if not signature:
+            if seen_text and (_SIGNATURE_DELIMITER_RE.match(line) or _SIGN_OFF_RE.match(line)):
+                signature = True
+            elif line.strip():
+                seen_text = True
+        if signature:
+            if _POSTSCRIPT_RE.match(line):
+                in_postscript = True
+            elif not line.strip():
+                in_postscript = False
+            if not in_postscript:
+                ranges.append((start, end))
+    ranges.extend(m.span() for m in _BOILERPLATE_RE.finditer(_lower_same_length(text)))
+    return _blank_ranges(text, ranges) if ranges else text
+
+
 def _tokens_before(lowered: str, clause_start: int, position: int, count: int = 3) -> list[str]:
     window = lowered[clause_start:position]
     return re.findall(r"[\w']+", window)[-count:]
@@ -2923,6 +3075,16 @@ def _negated(
     tokens = _tokens_before(lowered, clause_start, position, count)
     negations = set().union(*(_NEGATIONS[lang] for lang in langs))
     return any(t in negations or t.endswith("n't") or t.startswith("n'") for t in tokens)
+
+
+def _availability_negated(lowered: str, clause_start: int, position: int, lang: MessageLanguage) -> bool:
+    """Negation before an availability word. A clause-initial English "no" followed by more words
+    is an answer interjection ("No it's sold"), not a negation of the word."""
+    tokens = re.findall(r"[\w']+", lowered[clause_start:position])
+    if len(tokens) > 1 and tokens[0] == "no":
+        tokens = tokens[1:]
+    negations = _NEGATIONS[lang]
+    return any(t in negations or t.endswith("n't") or t.startswith("n'") for t in tokens[-3:])
 
 
 def _mask(text: str, start: int, end: int) -> str:
@@ -2960,7 +3122,7 @@ def _availability_claims(
                         for match in rule.pattern.finditer(work, c_start, c_end):
                             start, end = match.start(), match.end()
                             work = _mask(work, start, end)
-                            if check_negation and _negated(lowered, c_start, start, (lang,)):
+                            if check_negation and _availability_negated(lowered, c_start, start, lang):
                                 continue
                             if status == AvailabilityClaimStatus.SOLD and any(
                                 t in _PASSIVE_SALE_BEFORE[lang]
@@ -3134,6 +3296,12 @@ def _price_claims(
         if not any(a.standalone for a in amounts):
             continue
         conditions, basis, cond_warnings = _sentence_conditions(text, lowered, span)
+        if PriceCondition.CONDITIONAL not in conditions and _conditional(
+            lowered[span.start : span.end], _languages(language)
+        ):
+            # "2.500 €, wenn Sie es diese Woche abholen" / "if you pick it up": the quote keeps
+            # its qualification instead of reading as an unconditional price.
+            conditions = (*conditions, PriceCondition.CONDITIONAL)
         has_keyword = any(
             _PRICE_KEYWORDS[lang].search(lowered, span.start, span.end) for lang in _languages(language)
         )
@@ -3261,6 +3429,22 @@ def _price_claims(
     return prices, mentions, warnings
 
 
+_ENUMERATION_WORDS: Final = frozenset(
+    {
+        # DE
+        "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "und",
+        "oder", "sowie", "auch", "als", "kopie", "original",
+        # IT
+        "il", "lo", "la", "i", "gli", "le", "l", "un", "una", "uno", "e", "ed", "o", "oppure", "anche",
+        "copia", "originale",
+        # FR
+        "les", "d", "de", "du", "des", "une", "et", "ou", "aussi", "copie",
+        # EN
+        "the", "a", "an", "and", "or", "also", "too", "plus", "copy",
+    }
+)  # fmt: skip
+
+
 def _document_claims(
     text: str,
     lowered: str,
@@ -3274,11 +3458,11 @@ def _document_claims(
         if span.question:
             continue
         clauses = _clauses(lowered, span)
-        rows: list[tuple[list[tuple[DocumentKind, int, int]], DocumentClaimStatus | None]] = []
+        rows: list[tuple[list[tuple[DocumentKind, int, int]], DocumentClaimStatus | None, bool]] = []
         for c_start, c_end in clauses:
             clause = lowered[c_start:c_end]
             if _conditional(clause, _languages(language)):
-                rows.append(([], None))
+                rows.append(([], None, False))
                 continue
             work = lowered
             kinds: list[tuple[DocumentKind, int, int]] = []
@@ -3291,15 +3475,21 @@ def _document_claims(
                 if pattern.search(work, c_start, c_end):
                     status = candidate
                     break
-            rows.append((kinds, status))
-        for index, (kinds, status) in enumerate(rows):
+            # Only a bare list item ("den Fahrzeugschein, den CoC und ... habe ich") shares the
+            # status of its neighbours; "Fahrzeugbrief ja, CoC nicht" must not inherit "nicht".
+            rest = re.findall(r"[^\W\d_]+", work[c_start:c_end])
+            enumeration_only = all(token in _ENUMERATION_WORDS for token in rest)
+            rows.append((kinds, status, enumeration_only))
+        for index, (kinds, status, enumeration_only) in enumerate(rows):
             if not kinds:
                 continue
             effective = status
+            if effective is None and enumeration_only:
+                later = [s for _, s, _e in rows[index + 1 :] if s is not None]
+                earlier = [s for _, s, _e in rows[:index] if s is not None]
+                effective = later[0] if later else (earlier[-1] if earlier else None)
             if effective is None:
-                later = [s for _, s in rows[index + 1 :] if s is not None]
-                earlier = [s for _, s in rows[:index] if s is not None]
-                effective = later[0] if later else (earlier[-1] if earlier else DocumentClaimStatus.MENTIONED)
+                effective = DocumentClaimStatus.MENTIONED
             seen: set[DocumentKind] = set()
             for kind, start, end in kinds:
                 if kind in seen:
@@ -3380,7 +3570,7 @@ def extract_reply_claims(
             lang = None
     normalized = _normalize_text(text)
     unquoted, _removed = strip_quoted_text(normalized)
-    unquoted = unquoted[:MAX_BODY_BYTES]
+    unquoted = _claims_region(unquoted[:MAX_BODY_BYTES])
     lowered = _lower_same_length(unquoted)
     spans = _sentences(lowered)
     quoted = None if quoted_at is None else _aware(quoted_at)
