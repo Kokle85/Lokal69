@@ -625,17 +625,30 @@ def suppression(
 
 
 def mail_credential(seed: Seed, workspace_id: UUID, scopes: list[str] | None = None, **cols: Any) -> UUID:
+    """A synthetic mailbox-worker credential row (only its hash; no token exists).
+
+    Migration ``20261007000400`` binds mailboxes only to ``credential_kind = 'mail_worker'``
+    credentials (``suvmail_`` prefix, exactly ``mail:ingest``, owner role). That is the default
+    here; a test that probes another shape (extra scopes, another role) gets a ``static_bearer``
+    row unless it names ``credential_kind`` itself, because ``api_credentials_mail_worker_ck``
+    refuses any other shape for the mail_worker kind before the binding guard could run.
+    """
+    wanted = scopes or ["mail:ingest"]
+    narrow = wanted == ["mail:ingest"] and cols.get("role", "owner") == "owner"
+    kind = cols.pop("credential_kind", "mail_worker" if narrow else "static_bearer")
     values: dict[str, Any] = {
         "workspace_id": workspace_id,
         "principal_id": uuid.uuid4(),
         "principal_kind": "mcp_client",
         "role": "owner",
-        "credential_kind": "static_bearer",
+        "credential_kind": kind,
         "token_hash": sha(unique("mail-worker-token")),
-        "scopes": scopes or ["mail:ingest"],
+        "scopes": wanted,
         "label": "Synthetic mailbox worker",
         "expires_at": datetime.now(UTC) + timedelta(days=30),
     }
+    if kind == "mail_worker":
+        values["token_prefix"] = f"suvmail_{uuid.uuid4().hex[:6]}"
     values.update(cols)
     return seed.insert_id("ops.api_credentials", **values)
 
