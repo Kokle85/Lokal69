@@ -145,7 +145,7 @@ as $$
      and pg_catalog.length(name) between 1 and 64
      and name = pg_catalog.btrim(name)
      and name !~ '[[:cntrl:]<>"@\\\[\]{}`|;:/]'
-     and name !~ '[\u0085  ]'
+     and name !~ '[\u0085\u2028\u2029]'
 $$;
 comment on function app.sender_display_name_ok(text) is
   'Header-safe verified sender display name (no CR/LF, controls, address, markup or URL characters).';
@@ -840,10 +840,10 @@ create table app.seller_inquiries (
     (original_subject is null) = (original_body is null)
     and (original_subject is null
          or (pg_catalog.length(original_subject) between 1 and 200
-             and original_subject !~ '[[:cntrl:]\u0085  ]'
+             and original_subject !~ '[[:cntrl:]\u0085\u2028\u2029]'
              and pg_catalog.is_normalized(original_subject, 'NFC')
              and pg_catalog.length(original_body) between 1 and 2000
-             and original_body !~ '[\x01-\x09\x0b-\x1f\x7f\u0085  ]'
+             and original_body !~ '[\x01-\x09\x0b-\x1f\x7f\u0085\u2028\u2029]'
              and pg_catalog.is_normalized(original_body, 'NFC')))),
   constraint seller_inquiries_body_hash_ck check (
     original_body is null or body_hash is null
@@ -852,10 +852,10 @@ create table app.seller_inquiries (
     (mk_preview_subject is null) = (mk_preview_body is null)
     and (mk_preview_subject is null
          or (pg_catalog.length(mk_preview_subject) between 1 and 200
-             and mk_preview_subject !~ '[[:cntrl:]\u0085  ]'
+             and mk_preview_subject !~ '[[:cntrl:]\u0085\u2028\u2029]'
              and pg_catalog.is_normalized(mk_preview_subject, 'NFC')
              and pg_catalog.length(mk_preview_body) between 1 and 2000
-             and mk_preview_body !~ '[\x01-\x09\x0b-\x1f\x7f\u0085  ]'
+             and mk_preview_body !~ '[\x01-\x09\x0b-\x1f\x7f\u0085\u2028\u2029]'
              and pg_catalog.is_normalized(mk_preview_body, 'NFC')))),
   constraint seller_inquiries_preview_hash_ck check (
     mk_preview_body is null or mk_preview_hash is null
@@ -1234,7 +1234,7 @@ create table app.seller_replies (
   constraint seller_replies_link_ck check (
     quarantined or correlation_status <> 'matched' or header_linked or thread_linked),
   constraint seller_replies_subject_ck check (
-    pg_catalog.length(subject) <= 512 and subject !~ '[[:cntrl:]\u0085  ]'),
+    pg_catalog.length(subject) <= 512 and subject !~ '[[:cntrl:]\u0085\u2028\u2029]'),
   constraint seller_replies_body_ck check (
     pg_catalog.octet_length(sanitized_body) <= 65536
     and sanitized_body !~ '[\x01-\x08\x0b-\x1f\x7f]'),
