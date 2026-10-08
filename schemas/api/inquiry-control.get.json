@@ -6,7 +6,8 @@
     "VALIDATION_ERROR",
     "RATE_LIMITED",
     "DEPENDENCY_UNAVAILABLE",
-    "INTERNAL_ERROR"
+    "INTERNAL_ERROR",
+    "NOT_FOUND"
   ],
   "idempotencyKeyHeader": null,
   "mcpTool": null,
@@ -209,5 +210,5 @@
     "type": "object"
   },
   "successStatus": 200,
-  "summary": "Kill switch, mode, owner-reducible caps and current usage."
+  "summary": "Kill switch, mode, owner-reducible caps and current usage (NOT_FOUND until the workspace controls exist)."
 }

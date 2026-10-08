@@ -17,6 +17,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 from tests.integration.db.helpers import Seed, backend
 from tests.integration.v11_db.support import SENDER_ADDRESS, InquiryWorld, update_inquiry
 from tests.integration.v11_replies.support import (
@@ -525,6 +526,20 @@ async def test_odd_gap_times_never_hide_a_gap(db: Database, seed: Seed, iw: Inqu
     dropped from health, which then claimed ``monitoring_active``."""
     mw = await issue(db, iw)
     now = datetime.now(UTC)
+    # A gap that ends before it starts is refused at the wire (422), so it can never be stored.
+    with pytest.raises(ValidationError):
+        beat(
+            mw,
+            gaps=[
+                {
+                    "kind": "outlook_closed",
+                    "started_at": (now + timedelta(hours=1)).isoformat(),
+                    "ended_at": (now - timedelta(minutes=10)).isoformat(),
+                }
+            ],
+        )
+    # Future times (a worker clock ahead of the server) are clamped to the server clock; the
+    # clamped gap still never ends before it starts.
     await heartbeat(
         db,
         mw,
@@ -534,7 +549,7 @@ async def test_odd_gap_times_never_hide_a_gap(db: Database, seed: Seed, iw: Inqu
                 {
                     "kind": "outlook_closed",
                     "started_at": (now + timedelta(hours=1)).isoformat(),
-                    "ended_at": (now - timedelta(minutes=10)).isoformat(),
+                    "ended_at": (now + timedelta(hours=2)).isoformat(),
                 },
                 {"kind": "suspend", "started_at": "0001-01-01T00:00:00+00:00"},
             ],

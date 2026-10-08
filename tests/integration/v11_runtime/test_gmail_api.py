@@ -6,7 +6,10 @@
 - a timeout after the request was written is ``uncertain``: the send job is blocked with
   ``EMAIL_DELIVERY_UNCERTAIN``, the inquiry waits, and nothing is ever resent;
 - reconciliation by Message-ID: a found SENT copy -> ``accepted``; nothing found -> stays
-  ``uncertain`` (an empty search never releases the reservation) and is still never resent.
+  ``uncertain`` (an empty search never releases the reservation) and is still never resent;
+- a PROVEN pre-submission failure (the token endpoint refused before any Gmail request) follows
+  ``domain.inquiries.should_retry``: the same job retries through the guarded repository retry,
+  with the same account, and the second attempt is accepted (one message reaches Gmail).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from tests.integration.v11_runtime.support import (
     box,
     debits_of,
     eligible_live_listing,
+    expire_job_wait,
     gmail_settings,
     inquiries_of,
     jobs_of,
@@ -124,4 +128,32 @@ async def test_uncertain_send_not_found_stays_uncertain_and_is_never_resent(env:
     assert len(api.sent) == 1 and len(attempts_of(env, inquiry["id"])) == 1
     # The next pass in the same hour does not schedule another reconcile job.
     assert (await Reconciler(live.ctx).reconcile_workspace(env.workspace_id)).inquiry_reconcile_jobs == 0
+    no_approval_state(env)
+
+
+async def test_proven_pre_submission_failure_is_retried_through_the_guard(env: PipelineEnv) -> None:
+    api = GmailApi(token_failures=1)
+    live = await _gmail_env(env, api)
+    listing = await eligible_live_listing(live)
+    await link_seller(live, listing)
+    await work(live)
+    [send] = jobs_of(env, JobType.SELLER_INQUIRY_SEND)
+    assert send["state"] == "retry_wait" and send["last_error_code"] == "PRE_SUBMISSION_FAILURE", send
+    [inquiry] = inquiries_of(env)
+    assert inquiry["state"] == InquiryState.FAILED_DEFINITE
+    [first] = attempts_of(env, inquiry["id"])
+    assert first["outcome"] == "pre_submission_failure" and api.sent == []
+    assert debits_of(env) == 1  # the reservation and its debit stay
+
+    expire_job_wait(env, send["id"])
+    await work(live, JobType.SELLER_INQUIRY_SEND)
+    [send] = jobs_of(env, JobType.SELLER_INQUIRY_SEND)
+    assert send["state"] == "succeeded" and send["result_reference"]["outcome"] == "accepted", send
+    attempts = attempts_of(env, inquiry["id"])
+    assert [a["outcome"] for a in attempts] == ["pre_submission_failure", "accepted"]
+    assert [a["attempt_number"] for a in attempts] == [1, 2]
+    assert len(api.sent) == 1  # exactly one message ever reached the provider
+    [inquiry] = inquiries_of(env)
+    assert inquiry["state"] == InquiryState.ACCEPTED
+    assert debits_of(env) == 1
     no_approval_state(env)

@@ -46,6 +46,25 @@ def test_spec_27_commands_exist() -> None:
         assert extra in ALL_COMMANDS
     for extra in [("credentials", "create-mcp"), ("credentials", "revoke"), ("bootstrap", "owner")]:
         assert extra in ALL_COMMANDS
+    v11 = [
+        ("mail-worker", "credential", "issue"),
+        ("mail-worker", "credential", "revoke"),
+        ("mail-worker", "credential", "list"),
+        ("sender-binding", "create"),
+        ("sender-binding", "verify"),
+        ("sender-binding", "status"),
+        ("inquiries", "authorize"),
+        ("inquiries", "set-mode"),
+        ("inquiries", "set-limits"),
+        ("inquiries", "status"),
+        ("inquiries", "pause"),
+        ("inquiries", "resume"),
+        ("evaluation", "report"),
+    ]
+    assert set(v11) <= set(ALL_COMMANDS)
+    # No command sends, replies to or approves a seller e-mail (spec 37.1: no approve button).
+    words = {part for path in ALL_COMMANDS for name in path for part in name.split("-")}
+    assert not words & {"send", "reply", "approve", "approval"}
 
 
 def test_root_help(run_cli: Cli) -> None:

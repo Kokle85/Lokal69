@@ -17,8 +17,9 @@ Read models are the shared views of ``views.inquiries`` (the exact output of the
   shuffle or duplicate rows). Filters: one state, ``uncertain_only`` and the dashboard's
   ``attention_only`` (uncertain, held for facts, suppressed, failed, stuck sending); replies of one
   inquiry and ``quarantined_only``. Lists never contain message text or addresses. The first page
-  WRITES its snapshot (run inside ``transactions.unit_of_work``), and the snapshot layer also
-  requires ``deals:read`` or ``reviews:read`` (owner and reviewer roles carry both).
+  WRITES its snapshot (run inside ``transactions.unit_of_work``); the snapshot layer lets
+  ``inquiries:read`` alone page these two queries (``query_snapshots.INQUIRY_QUERY_NAMES``),
+  every other snapshot query still needs ``deals:read`` or ``reviews:read``.
 - `mail_worker_health_view`: ``persistence.mail_workers_repo.list_mailbox_health`` (heartbeat age,
   sync lag, backlog age, unresolved matching gaps, account check, every coverage gap) for the
   dashboard and ``doctor``; ``monitoring_active`` is never claimed without fresh evidence.

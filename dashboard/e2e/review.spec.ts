@@ -175,6 +175,41 @@ test.describe('review workflow', () => {
     expect(problems).toEqual([])
   })
 
+  test('a REAL server-side claim expiry (60 s lease) refuses the submit, keeps the draft and saves nothing', async ({ page }) => {
+    test.setTimeout(240_000)
+    const data = manifest()
+    const { problems } = guard(page)
+    // The browser clock runs two minutes behind the server (clock skew), so the page still believes
+    // its claim is valid when the server's 60-second lease (REVIEW_CLAIM_DURATION_SECONDS) has ended.
+    await page.clock.install({ time: new Date(Date.now() - 120_000) })
+    await signIn(page, 'reviewer')
+    await page.goto(`/reviews/${data.cases.golf}`)
+    await claimCase(page)
+    await fillWatchDecision(page, 'SYNTHETIC E2E: written while the server-side claim lease ran out.')
+    await page.waitForTimeout(65_000) // real time: the server lease ends; the skewed page clock still shows time left
+    await expect(page.getByTestId('claim-state')).toContainText('You hold the claim until')
+    const submit = page.getByRole('button', { name: 'Submit decision' })
+    await expect(submit).toBeEnabled()
+    const refused = page.waitForResponse((response) => response.url().endsWith('/submit'))
+    await submit.click()
+    const response = await refused
+    expect(response.status()).toBe(409)
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('CLAIM_EXPIRED')
+    await expect(page.getByText('Your claim expired or is no longer current')).toBeVisible()
+    await expect(page.getByTestId('decision-saved')).toHaveCount(0)
+    await expect(page.getByLabel(/^Summary/)).toHaveValue('SYNTHETIC E2E: written while the server-side claim lease ran out.')
+    await expect(submit).toBeDisabled()
+    // Reload, claim again (the server grants a fresh lease) and submit the kept draft.
+    await page.getByRole('button', { name: 'Reload the case' }).click()
+    await expect(page.getByTestId('decision-entry')).toHaveCount(0)
+    await claimCase(page)
+    await submit.click()
+    await expect(page.getByTestId('decision-saved')).toContainText('Decision saved: watch')
+    await expect(page.getByTestId('decision-entry')).toHaveCount(1)
+    await expect(page.getByTestId('decision-entry')).toContainText('by you')
+    expect(problems).toEqual([])
+  })
+
   test('a page reloaded while a decision is in flight reports the server state and never resubmits', async ({ page }) => {
     const data = manifest()
     const { problems } = guard(page)

@@ -122,7 +122,7 @@ from suv_deals.domain.inquiries import (
 )
 from suv_deals.domain.language import LanguageDecision
 from suv_deals.domain.listings import Co2Info, Documentation, NormalizedListing
-from suv_deals.domain.replies import normalize_message_id
+from suv_deals.domain.replies import ReplyClaims, normalize_message_id
 from suv_deals.domain.seller_contacts import (
     AddressError,
     ContactChange,
@@ -3370,42 +3370,88 @@ async def requalify(conn: Conn, actor: ActorContext, inquiry_id: UUID, *, reason
     return await _requalify(conn, actor, inquiry_id, reason=text, code="REQUALIFIED")
 
 
+#: The reply-driven steps of the state machine (``domain.replies`` / ``ALLOWED_TRANSITIONS``).
+_STORED_REPLY_STEPS: Final[dict[InquiryState, frozenset[InquiryState]]] = {
+    InquiryState.ACCEPTED: frozenset(
+        {InquiryState.REPLIED, InquiryState.BOUNCED, InquiryState.SELLER_OPTED_OUT}
+    ),
+    InquiryState.NO_REPLY_YET: frozenset(
+        {InquiryState.REPLIED, InquiryState.BOUNCED, InquiryState.SELLER_OPTED_OUT}
+    ),
+    InquiryState.REPLIED: frozenset({InquiryState.SELLER_OPTED_OUT}),
+}
+_STORED_REPLIES_SQL: Final = (
+    "select id, message_type, claims from app.seller_replies where workspace_id = %(ws)s"
+    " and inquiry_id = %(id)s and not quarantined and message_type in ('seller_reply', 'bounce')"
+    " order by ingested_at, id"
+)
+
+
+def _stored_reply_target(message_type: str, claims: Mapping[str, Any] | None) -> InquiryState:
+    """The state a matched reply moves an accepted inquiry to (``decide_reply_processing``): a
+    bounce -> ``bounced``; a seller reply that opts out or complains -> ``seller_opted_out``;
+    any other seller reply -> ``replied``."""
+    if message_type == "bounce":
+        return InquiryState.BOUNCED
+    if claims:
+        try:
+            parsed = ReplyClaims.model_validate(dict(claims))
+        except ValidationError:
+            parsed = None
+        if parsed is not None and (parsed.opted_out or parsed.complaint):
+            return InquiryState.SELLER_OPTED_OUT
+    return InquiryState.REPLIED
+
+
 async def mark_replied(
-    conn: Conn, actor: ActorContext, inquiry_id: UUID, *, reply_id: UUID
+    conn: Conn, actor: ActorContext, inquiry_id: UUID, *, reply_id: UUID | None = None
 ) -> InquiryRecord | None:
-    """``accepted``/``no_reply_yet`` -> ``replied`` for a seller reply stored earlier (B2a addition).
+    """Apply the state steps of replies stored before the send was accepted (B2a addition).
 
     A reply that arrived while the send was still ``sending``/``uncertain`` is stored without a
     state step (``domain.replies`` has no reply transition from those states). Once the send is
-    reconciled as accepted, the seller-reply processing job applies the step here. Only an
-    unquarantined ``seller_reply`` of this very inquiry qualifies (the database evidence guard
-    repeats it). Returns the updated record, or ``None`` when no step applies.
+    accepted (a worker/provider report, or the reconciliation citing that very reply), the
+    reconcile job, the seller-reply processing job or the reconciliation pass walks every stored,
+    unquarantined seller reply and bounce of this inquiry in ingest order, exactly as the ingest
+    would have: ``accepted``/``no_reply_yet`` -> ``replied`` | ``bounced`` | ``seller_opted_out``
+    (an opt-out or complaint), and ``replied`` -> ``seller_opted_out``; a step the state machine
+    does not allow (a late bounce after a reply) is no step. The suppressions were recorded at
+    ingest already. ``reply_id`` names the triggering reply for the audit only. Lock order: the
+    inquiry row, then the binding publication (as ``record_outcome``). Returns the updated
+    record, or ``None`` when no step applies.
     """
     require_inquiry_writer(actor)
     record = await _lock_inquiry(conn, actor, inquiry_id)
     if record.state not in (InquiryState.ACCEPTED, InquiryState.NO_REPLY_YET):
         return None
     async with mapped_errors():
-        reply = await fetch_one(
-            conn,
-            "select 1 as found from app.seller_replies where workspace_id = %(ws)s and id = %(reply)s"
-            " and inquiry_id = %(id)s and not quarantined and message_type = 'seller_reply'",
-            {"ws": actor.workspace_id, "reply": reply_id, "id": inquiry_id},
-        )
-    if reply is None:
+        rows = await fetch_all(conn, _STORED_REPLIES_SQL, {"ws": actor.workspace_id, "id": inquiry_id})
+    state: InquiryState = record.state
+    path: list[tuple[InquiryState, UUID]] = []
+    for row in rows:
+        target = _stored_reply_target(row["message_type"], row["claims"])
+        if target != state and target in _STORED_REPLY_STEPS.get(state, frozenset()):
+            path.append((target, row["id"]))
+            state = target
+    if not path:
         return None
-    require_transition(record.state, InquiryState.REPLIED)
-    async with mapped_errors():
-        await conn.execute(
-            "update app.seller_inquiries set state = 'replied', state_reasons = %(reasons)s,"
-            " row_version = row_version + 1 where workspace_id = %(ws)s and id = %(id)s and state = %(from)s",
-            {
-                "ws": actor.workspace_id,
-                "id": inquiry_id,
-                "from": record.state.value,
-                "reasons": ["SELLER_REPLY_STORED_BEFORE_ACCEPTANCE"],
-            },
-        )
+    previous: InquiryState = record.state
+    for target, _source in path:
+        require_transition(previous, target)
+        async with mapped_errors():
+            await conn.execute(
+                "update app.seller_inquiries set state = %(to)s, state_reasons = %(reasons)s,"
+                " row_version = row_version + 1"
+                " where workspace_id = %(ws)s and id = %(id)s and state = %(from)s",
+                {
+                    "ws": actor.workspace_id,
+                    "id": inquiry_id,
+                    "from": previous.value,
+                    "to": target.value,
+                    "reasons": ["SELLER_REPLY_STORED_BEFORE_ACCEPTANCE"],
+                },
+            )
+        previous = target
     await audit.record(
         conn,
         actor,
@@ -3414,7 +3460,11 @@ async def mark_replied(
         inquiry_id,
         prior_version=record.row_version,
         reason="seller reply stored before the send was reconciled",
-        metadata={"reply_id": str(reply_id), "from_state": record.state.value},
+        metadata={
+            "reply_id": str(reply_id or path[-1][1]),
+            "from_state": record.state.value,
+            "to_state": state.value,
+        },
     )
     await _publish_binding(conn, actor, inquiry_id)
     return await get_inquiry(conn, actor, inquiry_id)

@@ -6,6 +6,8 @@
  *                   -> unconfirmed          (network loss / 5xx after sending: outcome unknown)
  *   unconfirmed -> pending (retry)          (SAME idempotency key and SAME body)
  *   retry refused before evaluation         (401/403/429: stays unconfirmed, see NOT_EVALUATED_CODES)
+ *   retry turned away as busy               (a `retryable` refusal, e.g. 409 VERSION_CONFLICT with
+ *                                            `retryable: true`: stays unconfirmed, see stillUnknown)
  *
  * Guarantees:
  * - at most one request is in flight (a second click while pending is ignored, guarded by a ref so
@@ -67,8 +69,21 @@ function toApiError(error: unknown): ApiError {
  */
 const NOT_EVALUATED_CODES = new Set<ApiError['code']>(['UNAUTHENTICATED', 'FORBIDDEN', 'RATE_LIMITED', 'ABORTED'])
 
+/**
+ * Whether an attempt's outcome is still unknown after `error`.
+ *
+ * A RETRY that the server turns away as `retryable` (a transient refusal: `409 VERSION_CONFLICT`
+ * with `retryable: true` after a lock timeout, a serialization failure or a deadlock, or while the
+ * same idempotency key is still in progress) proves only that THIS retry was rolled back; the
+ * original send may still commit. Settling it as "rejected" would unlock a new attempt with a new key
+ * (a second note, recheck or re-qualifying resume once the original commits) and report "nothing was
+ * saved" for a change that may apply, so the attempt stays unconfirmed: only another same-key retry
+ * (or the owner's explicit discard after checking the server state) ends it. On a FIRST send a
+ * retryable refusal is definitive: that transaction was rolled back and nothing else is in flight.
+ */
 function stillUnknown(error: ApiError, viaRetry: boolean): boolean {
-  return error.outcomeUnknown || (viaRetry && NOT_EVALUATED_CODES.has(error.code))
+  if (error.outcomeUnknown) return true
+  return viaRetry && (NOT_EVALUATED_CODES.has(error.code) || error.retryable)
 }
 
 export function useIdempotentMutation<B extends { idempotency_key: string }, R>(

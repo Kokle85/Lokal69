@@ -3,7 +3,13 @@
  * Vite configuration of the private review dashboard.
  *
  * - Only TWO VITE_ variables may exist (VITE_SUPABASE_URL, VITE_SUPABASE_PUBLISHABLE_KEY); any other
- *   VITE_ variable, or a Supabase SECRET key in the publishable slot, fails the dev server and build.
+ *   VITE_ variable, or a Supabase SECRET key in either of them (also padded, quoted or in another
+ *   case: `configRules.isSecretKey`), fails the dev server, preview and every build mode.
+ * - A PRODUCTION build (`vite build`, mode `production`) also fails when either required variable is
+ *   missing or invalid (`src/configRules.ts`), so a misconfigured bundle is never shipped. The dev
+ *   server, tests and `vite build --mode development` keep the in-app "not configured" page.
+ * - Screens are code-split (`src/App.tsx`); supabase-js stays in the entry chunk because the session
+ *   restore needs it immediately.
  * - `/api` is proxied to DASHBOARD_API_TARGET (Node-side only, never exposed to the bundle) by both the
  *   dev server and `vite preview`, so the browser always calls the API same-origin.
  * - Production builds get a strict Content-Security-Policy <meta> (no inline scripts or styles;
@@ -12,34 +18,7 @@
  */
 import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv, type Plugin } from 'vite'
-
-const ALLOWED_VITE_VARS = new Set(['VITE_SUPABASE_URL', 'VITE_SUPABASE_PUBLISHABLE_KEY'])
-
-function jwtRole(key: string): string | null {
-  const payload = key.split('.')[1]
-  if (!payload) return null
-  try {
-    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { role?: unknown }
-    return typeof decoded.role === 'string' ? decoded.role : null
-  } catch {
-    return null
-  }
-}
-
-function guardEnvironment(env: Record<string, string>): void {
-  const unexpected = Object.keys(env).filter((name) => name.startsWith('VITE_') && !ALLOWED_VITE_VARS.has(name))
-  if (unexpected.length) {
-    throw new Error(
-      `Refusing to start: unexpected VITE_ variables (${unexpected.join(', ')}). Only ${[...ALLOWED_VITE_VARS].join(
-        ' and ',
-      )} may be exposed to the browser.`,
-    )
-  }
-  const key = env.VITE_SUPABASE_PUBLISHABLE_KEY ?? ''
-  if (/^sb_secret_/i.test(key) || jwtRole(key) === 'service_role') {
-    throw new Error('Refusing to start: VITE_SUPABASE_PUBLISHABLE_KEY holds a Supabase SECRET key.')
-  }
-}
+import { guardBrowserEnvironment, requireProductionConfig } from './src/configRules.ts'
 
 function originOf(value: string | undefined): string | null {
   if (!value) return null
@@ -76,9 +55,11 @@ function contentSecurityPolicy(supabaseOrigin: string | null): Plugin {
   }
 }
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_')
-  guardEnvironment(env)
+  // Every mode (dev server, preview, development or production build): Vite inlines VITE_ values.
+  guardBrowserEnvironment(env)
+  if (command === 'build' && mode === 'production') requireProductionConfig(env)
   // Node-side only (never in the bundle: Vite exposes VITE_ variables only). Read from the process
   // environment or from the .env files, as .env.example documents.
   const apiTarget = loadEnv(mode, process.cwd(), 'DASHBOARD_').DASHBOARD_API_TARGET || 'http://127.0.0.1:8000'
@@ -92,8 +73,8 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), contentSecurityPolicy(originOf(env.VITE_SUPABASE_URL))],
     server: { host: '127.0.0.1', port: 5173, strictPort: true, proxy, headers: securityHeaders },
     preview: { host: '127.0.0.1', port: 4173, strictPort: true, proxy, headers: securityHeaders },
-    // supabase-js dominates the single bundle (~650 kB, ~185 kB gzip); acceptable for a private tool.
-    build: { sourcemap: false, target: 'es2023', chunkSizeWarningLimit: 900 },
+    // Screens are separate chunks; supabase-js dominates the entry chunk (~570 kB, ~170 kB gzip).
+    build: { sourcemap: false, target: 'es2023', chunkSizeWarningLimit: 700 },
     test: {
       environment: 'jsdom',
       setupFiles: ['./src/test/setup.ts'],

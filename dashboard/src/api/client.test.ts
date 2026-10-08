@@ -242,3 +242,79 @@ describe('ApiClient error mapping', () => {
     await expect(client.overview()).rejects.toMatchObject({ code: 'FORBIDDEN', correlationId: null })
   })
 })
+
+function v11Client(api: ReturnType<typeof fakeApi>) {
+  return new ApiClient({ tokens: tokens(), getWorkspaceId: () => null, fetchImpl: api.fetch, newRequestId: () => 'req-test' })
+}
+
+describe('ApiClient v1.1 routes', () => {
+  it('calls exactly the contract paths with their query parameters', async () => {
+    const api = fakeApi({
+      'GET /api/inquiries': () => ok({ items: [] }),
+      'GET /api/inquiries/:id': () => ok({}),
+      'GET /api/replies': () => ok({ items: [] }),
+      'GET /api/replies/:id': () => ok({}),
+      'GET /api/inquiry-control': () => ok({}),
+      'GET /api/mail-workers/health': () => ok({}),
+      'GET /api/mail-workers/coverage-gaps': () => ok({}),
+      'GET /api/lifecycle/lags': () => ok({}),
+      'GET /api/listings/:id/lifecycle': () => ok({}),
+      'GET /api/evaluation': () => ok({}),
+    })
+    const c = v11Client(api)
+    const id = '66666666-6666-4666-8666-666666666666'
+    await c.inquiries({ attention_only: true, limit: 10 })
+    await c.inquiry(id)
+    await c.replies({ inquiry_id: id, quarantined_only: true })
+    await c.reply(id)
+    await c.inquiryControl()
+    await c.mailWorkerHealth({ include_revoked: true })
+    await c.mailCoverageGaps()
+    await c.lifecycleLags()
+    await c.listingLifecycle(id)
+    await c.evaluation({ days: 15 })
+    expect(api.calls.map((call) => `${call.method} ${call.path}${call.url.search}`)).toEqual([
+      'GET /api/inquiries?attention_only=true&limit=10',
+      `GET /api/inquiries/${id}`,
+      `GET /api/replies?inquiry_id=${id}&quarantined_only=true`,
+      `GET /api/replies/${id}`,
+      'GET /api/inquiry-control',
+      'GET /api/mail-workers/health?include_revoked=true',
+      'GET /api/mail-workers/coverage-gaps',
+      'GET /api/lifecycle/lags',
+      `GET /api/listings/${id}/lifecycle`,
+      'GET /api/evaluation?days=15',
+    ])
+  })
+
+  it('sends pause and resume with the idempotency key in the body and header, and refuses bad ids locally', async () => {
+    const api = fakeApi({
+      'POST /api/inquiry-control/pause': () => ok({}),
+      'POST /api/inquiry-control/resume': () => ok({}),
+    })
+    const c = v11Client(api)
+    const key = newIdempotencyKey('inquiry-pause')
+    await c.pauseInquiries({ expected_version: 3, reason: 'SYNTHETIC pause', idempotency_key: key })
+    await c.resumeInquiries({ expected_version: 4, reason: 'SYNTHETIC resume', idempotency_key: newIdempotencyKey('inquiry-resume'), remove_suppressions: true })
+    const [pause, resume] = api.calls
+    expect(pause?.headers.get('Idempotency-Key')).toBe(key)
+    expect(pause?.body).toEqual({ expected_version: 3, reason: 'SYNTHETIC pause', idempotency_key: key })
+    expect(resume?.body).toMatchObject({ remove_suppressions: true })
+    await expect(c.inquiry('../inquiry-control')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(c.replies({ inquiry_id: 'nope' })).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    expect(api.calls).toHaveLength(2)
+  })
+
+  it('maps EMAIL_DELIVERY_UNCERTAIN to a typed error', async () => {
+    const api = fakeApi({
+      'POST /api/inquiry-control/pause': () =>
+        apiError(409, 'EMAIL_DELIVERY_UNCERTAIN', 'reconcile first', { details: { reason: 'send_attempt_unresolved' } }),
+    })
+    const error = await v11Client(api)
+      .pauseInquiries({ expected_version: 1, reason: 'SYNTHETIC', idempotency_key: newIdempotencyKey('inquiry-pause') })
+      .catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ApiError)
+    expect((error as ApiError).code).toBe('EMAIL_DELIVERY_UNCERTAIN')
+    expect((error as ApiError).outcomeUnknown).toBe(false)
+  })
+})

@@ -69,7 +69,7 @@ class ApiOptions:
 
     api_body_limit: int = 64 * 1024
     other_body_limit: int = 4 * 1024 * 1024
-    #: Extra per-prefix body limits (for example a later mail-ingest router at 128 KiB).
+    #: Extra per-prefix body limits; they override the built-in ``/v1/mail-workers`` 128 KiB one.
     prefix_body_limits: Mapping[str, int] = field(default_factory=dict)
     #: Overrides the Host allow-list derived from APP_BASE_URL / MCP_PUBLIC_URL.
     allowed_hosts: tuple[str, ...] | None = None

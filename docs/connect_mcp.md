@@ -12,7 +12,7 @@ listed in step 8.
 |---|---|---|
 | Endpoint | `https://<approved-domain>/mcp` (Streamable HTTP; served by `suv-deals api serve` behind the HTTPS reverse proxy) | tests/mcp (in-process client) |
 | SDK / protocol | official `mcp` 2.3.0, protocol revision 2026-07-28 (older handshake revisions still served, stateless) | docs/research/mcp_python_sdk.md, tests/mcp |
-| Tools (12) and scopes | `deals_health`, `deals_list_candidates`, `deals_get_candidate`, `deals_get_comparables`, `deals_get_valuation` (`deals:read`); `reviews_list_pending` (`reviews:read`); `reviews_claim`, `reviews_release`, `reviews_submit` (`reviews:write`); `deals_request_recheck` (`rechecks:request`); `deals_add_note` (`notes:write`); `sources_pause` (`sources:pause`) | `schemas/tools/*.json`, tests/contracts |
+| Tools (12 + 3) and scopes | `deals_health`, `deals_list_candidates`, `deals_get_candidate`, `deals_get_comparables`, `deals_get_valuation` (`deals:read`); `reviews_list_pending` (`reviews:read`); `reviews_claim`, `reviews_release`, `reviews_submit` (`reviews:write`); `deals_request_recheck` (`rechecks:request`); `deals_add_note` (`notes:write`); `sources_pause` (`sources:pause`); spec 37.8: `seller_inquiries_get`, `seller_replies_get` (`inquiries:read`), `seller_inquiries_pause` (`inquiries:pause`) | `schemas/tools/*.json`, tests/contracts, tests/mcp/test_v11_tools.py |
 | Discovery | `tools/list` shows only the tools the credential's scopes allow | tests/mcp |
 | Unauthenticated access | every private call is `401` with a `WWW-Authenticate: Bearer` challenge; a missing identity provider or database is `503`, never an open endpoint | tests/mcp |
 | Events (optional) | `events/list`, `events/subscribe`, `events/unsubscribe` for `review.pending.v1` only when `MCP_EVENTS_ENABLED=true` (and the encryption key is set) | tests/mcp, docs/notification_bridge.md |
@@ -93,11 +93,63 @@ this plugin, ChatGPT's challenge/delivery timeouts, `ttlMs` usage, callback egre
 active subscription. If events are unavailable, evaluate the separately approved Slack fallback
 (docs/notification_bridge.md section 5); otherwise the dashboard/MCP pull queue remains complete.
 
-## 6. Spec v1.1 seller replies (Slack signal route; later package)
+## 6. Spec v1.1 seller inquiries and replies (Slack signal -> dot -> MCP)
 
-For seller replies the owner chose a different route (spec §37.6): local classic Outlook worker
--> authenticated backend API -> minimal private Slack signal -> dot -> authenticated MCP reply
-tool. Native MCP Events stay the route for candidate discovery; routing is per event category so
-one reply never activates dot twice. The Slack post is an ID-only signal: dot reads the full,
-correlated reply only through the authenticated MCP reply tools, which belong to the later v1.1
-wiring package (not yet mounted on this server). Nothing in this page enables seller email.
+### 6.1 The three inquiry tools (served; verified in tests)
+
+| Tool | Scope | Input (exactly spec 37.8) | Result `data` |
+|---|---|---|---|
+| `seller_inquiries_get` | `inquiries:read` | `inquiry_id` (uuid) | `InquiryView`: state, qualification, authorization/template versions, sender as provider/binding reference, recipient domain and verification evidence, send-attempt summary, `approval_required: false` |
+| `seller_replies_get` | `inquiries:read` | `reply_id` (uuid) | `ReplyView`: inquiry/vehicle ids, original language and sanitised body, Macedonian summary, sender identity (domain and correlation evidence), received/ingested times, extracted claims (a price is an `unaccepted_seller_quote`), safe attachment metadata, current valuation status. A quarantined (unverified) reply returns metadata only (`content_withheld: true`) |
+| `seller_inquiries_pause` | `inquiries:pause` | `expected_version` (>= 1), `reason` (3-2000), `idempotency_key` (8-128) | `InquiryPauseResult` (kill switch on; `already_paused` when it already was) |
+
+- The workspace always comes from the token; ids of another workspace are `NOT_FOUND`, exactly like
+  unknown ids. `tools/list` shows a tool only to a caller holding its scope: reviewers get the two
+  read tools, viewers none, and `inquiries:pause` is an owner scope (grant it to dot only on the
+  owner's explicit decision; e.g. `credentials create-mcp --role owner --scopes
+  deals:read,reviews:read,inquiries:read,inquiries:pause`).
+- A seller's e-mail address is never returned on MCP: `recipient_address_visible` requires
+  `config:admin`, which is never effective on MCP. Replies carry no secret, no Outlook locator, no
+  unrelated thread message and no signed external link; seller text is untrusted data. A
+  quarantined reply (forwarded, changed address, ambiguous: possibly unrelated personal mail) is
+  returned without subject, body, summary, claims or attachment metadata (`content_withheld:
+  true`) until the owner verified it on the dashboard.
+- There is **no** send, reply, follow-up, resume or approve tool. Pausing is idempotent (same key
+  and request replay the same result on MCP and on the dashboard, which share the operation),
+  versioned (`VERSION_CONFLICT` with `current_version`) and never resumes anything; resuming is an
+  owner action on the dashboard (`POST /api/inquiry-control/resume`) or the CLI.
+
+### 6.2 The reply route (spec 37.6)
+
+```text
+classic Outlook (owner's PC) -> desktop worker (local correlation only)
+  -> POST /v1/mail-workers/replies (mailbox-bound suvmail_ credential)
+  -> app.seller_replies + ops.mail_ingest_dedup + outbox seller.reply.received (one transaction)
+  -> dispatcher -> private Slack channel (ID-only signal: event id, inquiry id, reply id,
+     listing reference, dashboard link, fixed status words)
+  -> dot's Slack trigger -> seller_replies_get / seller_inquiries_get over MCP
+```
+
+- Native MCP Events stay the route for candidate discovery (`review.pending.v1`); seller replies
+  and seller-reply owner alerts go to the Slack route selected for their category only, so one
+  reply never activates dot twice (`workers.dispatcher._handle_signal`). Both post to the single
+  `SLACK_CHANNEL_ID`: dot's Slack trigger must match only the message metadata `event_type`
+  `suv_deals.seller_reply_received` (owner alerts carry `suv_deals.owner_alert`), see
+  docs/notification_bridge.md section 5.1.
+- The Slack post carries no body, address or attachment; dot must call `seller_replies_get` to read
+  the reply. A Slack 2xx is a provider receipt, never proof that dot processed the signal.
+- Delivery needs `ALLOW_EXTERNAL_NOTIFICATIONS=true`, `SELLER_REPLY_SIGNAL_PROVIDER=slack` and an
+  approved, enabled and verified Slack destination binding (docs/notification_bridge.md).
+
+### 6.3 What is verified and what is not
+
+| Item | Status |
+|---|---|
+| Tool schemas, scope filtering, workspace isolation, address hiding, idempotent/versioned pause | verified in tests (tests/mcp/test_v11_tools.py, synthetic data) |
+| Desktop worker -> API -> stored reply -> outbox signal | verified in tests with the REAL desktop worker code and a fake Outlook (tests/integration/mail_worker_e2e) |
+| Classic Outlook on the owner's PC, the real mailbox, the Windows credential store | **not verified** (no machine connected) |
+| Private Slack channel, posting identity, dot's subscription/trigger and bot-message handling | **not verified** (no channel or dot trigger configured) |
+| dot actually calling `seller_replies_get` after a signal | **not verified**; record the end-to-end evidence of docs/seller_email_activation.md section "Activation evidence" |
+
+Nothing in this page enables sending: seller e-mail is sent only by the pipeline under the standing
+authorization once docs/seller_email_activation.md is complete.

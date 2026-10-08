@@ -69,17 +69,21 @@ export function readPendingSubmission(caseId: string, userId: string | null): Pe
 export type PendingResolution =
   | { kind: 'recorded'; decision: ReviewDecisionView }
   | { kind: 'not_recorded' }
+  | { kind: 'decided_by_other'; decision: ReviewDecisionView }
   | { kind: 'superseded' }
 
 /**
- * What the server state says about an earlier, unconfirmed submission: a decision made against
- * exactly the submitted case version with the submitted outcome is that submission.
+ * What the server state says about an earlier, unconfirmed submission. Only a decision that the
+ * server attributes to THIS caller (`decided_by_caller`), made against exactly the submitted case
+ * version with the submitted outcome, is that submission: a decision another reviewer recorded on
+ * the same version is never mistaken for ours, even with the same outcome.
  */
 export function resolvePendingSubmission(marker: PendingSubmission, current: ReviewCaseView): PendingResolution {
-  const decision = current.decisions.find(
-    (item) => item.case_version === marker.expectedVersion && item.outcome === marker.outcome,
-  )
-  if (decision) return { kind: 'recorded', decision }
+  const atVersion = current.decisions.filter((item) => item.case_version === marker.expectedVersion)
+  const mine = atVersion.find((item) => item.decided_by_caller && item.outcome === marker.outcome)
+  if (mine) return { kind: 'recorded', decision: mine }
+  const other = atVersion.find((item) => !item.decided_by_caller)
+  if (other) return { kind: 'decided_by_other', decision: other }
   if (current.case_version === marker.expectedVersion) return { kind: 'not_recorded' }
   return { kind: 'superseded' }
 }

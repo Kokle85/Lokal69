@@ -1878,7 +1878,12 @@ async def test_outlook_verify_account_from_worker_report() -> None:
     gateway.account = account_report(account_smtp_address="other@example.com")
     mismatch = await outlook(gateway).verify_account()
     assert "ACCOUNT_MISMATCH" in mismatch.problems and "FROM_NOT_VERIFIED" in mismatch.problems
-    gateway.account = account_report(security_settings_unchanged=False)
+    # A report claiming weakened security never reaches verification: the wire model refuses it
+    # (``security_settings_unchanged`` is ``Literal[True]``; the mail-worker API answers 422).
+    with pytest.raises(ValidationError):
+        account_report(security_settings_unchanged=False)
+    # The provider's own check stays as defence in depth (an unvalidated copy still fails).
+    gateway.account = account_report().model_copy(update={"security_settings_unchanged": False})
     assert "SECURITY_SETTINGS_WEAKENED" in (await outlook(gateway).verify_account()).problems
     gateway.account = account_report()
     gateway.heartbeat = heartbeat(age=timedelta(hours=1))

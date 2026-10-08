@@ -6,7 +6,9 @@ answer with the shared ``ResponseEnvelope``.
 
 - Inquiries and replies (``inquiries:read``): frozen-snapshot list pages and single records. The
   recipient/sender ADDRESS is shown only to the owner (``views.inquiries.recipient_address_visible``,
-  applied by the read service); bodies are never part of a list.
+  applied by the read service), and so is the text of a QUARANTINED reply (an unverified possible
+  match that may be unrelated personal mail; ``reply_content_visible``); bodies are never part of
+  a list.
 - Inquiry control: ``GET`` shows kill switch, mode, caps, usage and how many kill-switch /
   authorization-revoked suppressions a resume could remove. ``pause`` (``inquiries:pause``) is
   the ``seller_inquiries_pause`` tool's rule set (``mcp.tools.pause_inquiries``: expected version,
@@ -59,7 +61,7 @@ from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import SuppressionReason
 from suv_deals.domain.money import Money
 from suv_deals.errors import AppError, ErrorCode
-from suv_deals.mcp.tools import pause_inquiries
+from suv_deals.mcp.tools import pause_inquiries, visible_reply
 from suv_deals.persistence import idempotency, inquiries_repo, queries
 from suv_deals.persistence.database import Conn, db_now
 from suv_deals.persistence.errors_map import TransientConflict
@@ -185,7 +187,8 @@ async def get_reply(request: Request, reply_id: str, auth: Authenticated) -> Res
     no_query(request)
     target = path_id(reply_id, "reply_id")
     result = await _read(request, auth, lambda conn, actor: queries.get_reply(conn, actor, target))
-    return _respond(REPLY, result.envelope(auth.request_id))
+    # A quarantined reply's text is for the owner only (``views.inquiries.reply_content_visible``).
+    return _respond(REPLY, visible_reply(result, auth.actor).envelope(auth.request_id))
 
 
 # --------------------------------------------------------------------------------------------

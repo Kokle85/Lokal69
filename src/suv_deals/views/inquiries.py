@@ -19,6 +19,11 @@ Privacy rules (spec 37.1, 37.7, 37.8):
   statement is ``sold_claimed`` evidence, and nothing here records a purchase or an agreement.
 - Attachments are metadata only (name, MIME type, size, SHA-256, policy decision): no bytes, no
   local paths or locators, no URLs, no signed access links.
+- A quarantined reply (an unverified possible match: forwarded, changed address, ambiguous,
+  conflicting upload) may be unrelated personal mail. Its text is shown to the owner only
+  (`reply_content_visible`, the same ``config:admin`` rule as addresses, so never over MCP);
+  everyone else gets its metadata and quarantine reason (`ReplyView.for_scopes`,
+  ``content_withheld: true``).
 """
 
 from __future__ import annotations
@@ -96,6 +101,14 @@ ReasonCode = str
 def recipient_address_visible(scopes: Iterable[Scope]) -> bool:
     """Whether a principal with ``scopes`` may see a seller's full e-mail address (owner only)."""
     return Scope.CONFIG_ADMIN in set(scopes)
+
+
+def reply_content_visible(scopes: Iterable[Scope], *, quarantined: bool) -> bool:
+    """Whether a principal with ``scopes`` may read a reply's text (subject, body, summary, claims,
+    attachment names). A QUARANTINED reply is an unverified possible match that may be unrelated
+    personal mail of the owner: like an address, only the owner (``config:admin``, never effective
+    on MCP) reads it while verifying it; everyone else gets ``ReplyView.without_content``."""
+    return not quarantined or recipient_address_visible(scopes)
 
 
 def address_domain(address: str | None) -> str | None:
@@ -469,6 +482,36 @@ class ReplyView(ViewModel):
     attachments: tuple[ReplyAttachmentView, ...] = Field(max_length=MAX_REPLY_ATTACHMENTS)
     withheld_sensitive_attachments: int = Field(ge=0, le=200)
     valuation: ValuationStatusView
+    content_withheld: bool = Field(
+        default=False,
+        description=(
+            "True when subject, body, Macedonian summary, claims and attachment metadata are"
+            " withheld: a quarantined (unverified) possible match may be unrelated personal mail, so"
+            " only the owner reads it on the dashboard (never over MCP)."
+        ),
+    )
+
+    def for_scopes(self, scopes: Iterable[Scope]) -> ReplyView:
+        """This reply as a principal with ``scopes`` may see it (`reply_content_visible`)."""
+        if reply_content_visible(scopes, quarantined=self.quarantined):
+            return self
+        return self.without_content()
+
+    def without_content(self) -> ReplyView:
+        """This reply's metadata only (``content_withheld``): no subject, body, summary, claims or
+        attachment metadata (a quarantined reply for anyone but the owner, and always on MCP)."""
+        return self.model_copy(
+            update={
+                "subject": "",
+                "sanitized_body": "",
+                "mk_summary": None,
+                "mk_summary_version": None,
+                "mk_summary_generated_at": None,
+                "claims": None,
+                "attachments": (),
+                "content_withheld": True,
+            }
+        )
 
 
 class ReplySummaryView(ViewModel):
@@ -580,4 +623,5 @@ __all__ = [
     "ValuationStatusView",
     "address_domain",
     "recipient_address_visible",
+    "reply_content_visible",
 ]

@@ -3,7 +3,8 @@
  *
  *   1. mock Supabase Auth  http://127.0.0.1:54399  tests/e2e/mock_supabase_auth.py (ES256 JWKS)
  *   2. backend API         http://127.0.0.1:8765   tests/e2e/run_backend.py (create_app on a fresh,
- *                                                   migrated, seeded PostgreSQL database)
+ *                                                   migrated, seeded PostgreSQL database; review
+ *                                                   claim lease 60 s for the real expiry test)
  *   3. dashboard           http://127.0.0.1:4173   `vite build` (with the mock as VITE_SUPABASE_URL and
  *                                                   the strict CSP) served by `vite preview`, whose
  *                                                   /api proxy forwards to the backend, so the browser
@@ -48,7 +49,7 @@ export default defineConfig({
       stderr: 'pipe',
     },
     {
-      command: `uv run python tests/e2e/run_backend.py --port 8765 --supabase-url ${MOCK_AUTH} --app-origin ${APP}`,
+      command: `uv run python tests/e2e/run_backend.py --port 8765 --supabase-url ${MOCK_AUTH} --app-origin ${APP} --claim-duration-seconds 60`,
       cwd: '..',
       url: `${API}/readyz`,
       reuseExistingServer: false,

@@ -25,9 +25,11 @@ seller's SURVIVING (merged) family, no (possibly) transmitted inquiry of that fa
 same or a plausibly same vehicle, the seller cooldown holds, the listing facts are still the
 qualification snapshot, the recipient is still the verified contact and the rolling caps (counted
 at the latest possible hand-over) still hold. A business refusal is ``proceed: false`` with a
-wire ``refusal_reason`` (never an error): the kill switch answers ``kill_switch`` (retryable),
-a final refusal ``intent_invalid``; rolling caps, the seller cooldown and a source pause answer
-``not_now`` (the worker waits and claims again). Claims change no state.
+wire ``refusal_reason`` (never an error): the kill switch answers ``kill_switch`` (retryable;
+also when the serving process's own ``SELLER_INQUIRY_MODE``/``SELLER_INQUIRY_KILL_SWITCH`` forbid
+sending, ``claim(process_gate=...)``), a final refusal ``intent_invalid``; rolling caps, the
+seller cooldown and a source pause answer ``not_now`` (the worker waits and claims again). Claims
+change no state.
 
 Report = ``map_outlook_report`` then ``inquiries_repo.record_outcome`` (a running attempt is
 finalised once: ``sent_items_confirmed`` -> accepted, ``submitted_to_outbox``/``send_call_failed``
@@ -543,15 +545,25 @@ async def claim(
     claim_attempt_id: str,
     worker_id: str,
     request_id: str,
+    process_gate: str | None = None,
 ) -> ClaimResult:
     """Fresh server revalidation immediately before ``.Send`` (never replayed from an earlier claim).
 
     Lock order: controls (``FOR UPDATE``, so a concurrent pause is either seen or waits) ->
     inquiry -> attempt reads. Business refusals are ``proceed: false`` with a refusal reason.
+
+    ``process_gate``: the detail code when the serving process's own settings forbid sending
+    (``SELLER_INQUIRY_MODE`` not ``automatic`` or ``SELLER_INQUIRY_KILL_SWITCH`` on). The claim
+    is then refused exactly like the database kill switch (``kill_switch``, audited with that
+    detail) once the intent is known to be the worker's own (no existence leak).
     """
     await require_active_mailbox(conn, worker)
     record, attempt = await _worker_attempt(conn, worker, intent_id, request_id)
-    refusal = await _claim_refusal(conn, worker, record, attempt, request_id)
+    refusal = (
+        (OutlookRefusalReason.KILL_SWITCH, process_gate)
+        if process_gate is not None
+        else await _claim_refusal(conn, worker, record, attempt, request_id)
+    )
     actor = worker.actor(request_id)
     await audit.record(
         conn,

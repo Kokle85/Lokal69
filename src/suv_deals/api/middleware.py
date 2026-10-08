@@ -33,6 +33,7 @@ replicated.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import threading
@@ -435,11 +436,32 @@ DEFAULT_PREAUTH_LIMIT: Final = RateLimit(capacity=20, per_seconds=3.0)
 UNKNOWN_CLIENT: Final = "unknown"
 
 
+#: An IPv6 client is limited per /64: one subscriber or host typically controls a whole /64
+#: (SLAAC privacy addresses rotate inside it), so per-address buckets would be no limit at all.
+IPV6_CLIENT_PREFIX: Final = 64
+
+
 def client_address(scope: Scope) -> str:
     """The ASGI client host (the proxy's address unless the server trusts proxy headers)."""
     client = scope.get("client")
     host = client[0] if isinstance(client, list | tuple) and client else None
     return host[:64] if isinstance(host, str) and host else UNKNOWN_CLIENT
+
+
+def limiter_key(client: str) -> str:
+    """The bucket a client shares in `PreAuthLimiter`: an IPv4 address as it is, an IPv4-mapped
+    IPv6 address as its IPv4 address, any other IPv6 address as its ``/64`` network (zone id and
+    spelling ignored); anything that is not an IP address (a test client label) unchanged."""
+    try:
+        address = ipaddress.ip_address(client.split("%", 1)[0].strip())
+    except ValueError:
+        return client
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+        return str(ipaddress.IPv6Network((address, IPV6_CLIENT_PREFIX), strict=False))
+    return str(address)
 
 
 class PreAuthLimiter:
@@ -453,7 +475,8 @@ class PreAuthLimiter:
     authentication takes nothing. Like `PrincipalRateLimiter` it is per process, bounded in the
     number of tracked clients, and keyed by the ASGI client address (behind a reverse proxy run
     uvicorn with ``--proxy-headers`` and a trusted ``--forwarded-allow-ips``, or every client
-    shares the proxy's bucket).
+    shares the proxy's bucket); IPv6 clients share one bucket per ``/64`` (`limiter_key`), so
+    rotating addresses inside one's own prefix buys no new budget.
     """
 
     def __init__(
@@ -486,6 +509,7 @@ class PreAuthLimiter:
 
     def check(self, client: str) -> None:
         """Refuse (``RATE_LIMITED``) a client that has no failed-authentication budget left."""
+        client = limiter_key(client)
         now = self._monotonic()
         with self._lock:
             bucket = self._refill(client, now)
@@ -498,6 +522,7 @@ class PreAuthLimiter:
 
     def failed(self, client: str) -> None:
         """Record one failed authentication of ``client`` (never raises)."""
+        client = limiter_key(client)
         now = self._monotonic()
         with self._lock:
             bucket = self._refill(client, now)
@@ -524,6 +549,7 @@ __all__ = [
     "DEFAULT_OTHER_BODY_LIMIT",
     "DEFAULT_PREAUTH_LIMIT",
     "DEFAULT_READ_LIMIT",
+    "IPV6_CLIENT_PREFIX",
     "MAIL_WORKER_PATH_PREFIX",
     "REQUEST_ID_HEADER",
     "ApiCorsMiddleware",
@@ -536,4 +562,5 @@ __all__ = [
     "client_address",
     "is_api_path",
     "is_mail_worker_path",
+    "limiter_key",
 ]

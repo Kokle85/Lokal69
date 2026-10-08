@@ -100,11 +100,25 @@ export interface ErrorDescription {
   hint: string | null
 }
 
+export interface DescribeOptions {
+  /**
+   * What a `VERSION_CONFLICT` is about (default: a review case or listing), e.g. "inquiry controls",
+   * so the title never names the wrong object.
+   */
+  subject?: string
+}
+
+/** A stable machine reason (`details.reason`, e.g. `inquiry_kill_switch`), or `null`. */
+export function guardReason(error: ApiError): string | null {
+  const reason = error.details?.reason
+  return typeof reason === 'string' && /^[a-z][a-z0-9_]{0,79}$/.test(reason) ? reason : null
+}
+
 /**
  * User-facing wording per error code. The server message is shown too (it is safe by contract),
  * but the title/hint are fixed strings so the UI never depends on server wording.
  */
-export function describeError(error: ApiError): ErrorDescription {
+export function describeError(error: ApiError, options: DescribeOptions = {}): ErrorDescription {
   switch (error.code) {
     case 'ALREADY_CLAIMED':
       return {
@@ -120,10 +134,33 @@ export function describeError(error: ApiError): ErrorDescription {
         hint: 'Reload the case and claim it again; your draft is kept.',
       }
     case 'VERSION_CONFLICT':
+      if (error.retryable) {
+        // `errors_map.TransientConflict`: a lock timeout, serialization failure or deadlock, or the
+        // same request still in progress. Nothing changed; this request was rolled back.
+        return {
+          title: 'The server was busy',
+          message: `The ${options.subject ?? 'record'} was busy (another operation held it, or the same request was still being processed). This request was not applied.`,
+          hint: 'Try again in a moment.',
+        }
+      }
+      if (options.subject) {
+        return {
+          title: `The ${options.subject} changed`,
+          message: `The ${options.subject} changed since you loaded them${conflictSuffix(error, 'version')}. Nothing was saved.`,
+          hint: 'Reload to see the current state, then decide again.',
+        }
+      }
       return {
         title: 'The case or listing changed',
-        message: `The data changed since you loaded it${conflictSuffix(error)}. Nothing was saved.`,
+        message: `The data changed since you loaded it${conflictSuffix(error, 'case version')}. Nothing was saved.`,
         hint: 'Reload to see the current facts before deciding; your draft is kept.',
+      }
+    case 'EMAIL_DELIVERY_UNCERTAIN':
+      return {
+        title: 'Seller e-mail outcome uncertain',
+        message:
+          'An earlier send attempt may have reached the provider. It is held for reconciliation with positive evidence and is never resent blindly.',
+        hint: null,
       }
     case 'IDEMPOTENCY_CONFLICT':
       return {
@@ -201,14 +238,14 @@ export function describeError(error: ApiError): ErrorDescription {
   }
 }
 
-function conflictSuffix(error: ApiError): string {
+function conflictSuffix(error: ApiError, versionLabel: string): string {
   const details = error.details ?? {}
   const parts: string[] = []
   if (typeof details.current_listing_revision === 'number') {
     parts.push(`listing revision ${details.current_listing_revision} is now current`)
   }
   if (typeof details.current_version === 'number') {
-    parts.push(`case version ${details.current_version} is now current`)
+    parts.push(`${versionLabel} ${details.current_version} is now current`)
   }
   return parts.length ? ` (${parts.join('; ')})` : ''
 }

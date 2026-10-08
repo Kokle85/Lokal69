@@ -341,9 +341,14 @@ async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
     """
     from suv_deals.cli_commands._common import active_workspaces, open_database, operator_actor
     from suv_deals.errors import AppError
-    from suv_deals.persistence import inquiries_repo, mail_workers_repo, sender_bindings_repo
+    from suv_deals.persistence import inquiries_repo, mail_workers_repo
     from suv_deals.persistence.database import db_now
     from suv_deals.persistence.transactions import unit_of_work
+    from suv_deals.workers.inquiry_handlers import (
+        automatic_sending_enabled,
+        configured_sender_binding,
+        configured_sender_problems,
+    )
 
     area = "seller_inquiry"
     if settings.database_url is None or not settings.database_url.get_secret_value():
@@ -361,7 +366,8 @@ async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
                     now = await db_now(conn)
                     controls = await inquiries_repo.get_controls(conn, actor)
                     authorization = await inquiries_repo.current_authorization(conn, actor)
-                    sender = await sender_bindings_repo.active_binding(conn, actor)
+                    # The binding the runtime would send from: the configured identity only.
+                    sender = await configured_sender_binding(conn, actor, settings)
                     boxes = await mail_workers_repo.list_mailbox_health(conn, ws)
                 findings.extend(
                     _readiness(
@@ -371,6 +377,8 @@ async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
                         authorization=authorization,
                         sender=sender,
                         boxes=boxes,
+                        process_open=automatic_sending_enabled(settings),
+                        identity_problems=configured_sender_problems(settings, sender) if sender else (),
                     )
                 )
     except AppError:
@@ -385,22 +393,43 @@ async def _v11_present(conn: Any) -> bool:
 
 
 def _readiness(
-    prefix: str, now: Any, *, controls: Any, authorization: Any, sender: Any, boxes: Sequence[Any]
+    prefix: str,
+    now: Any,
+    *,
+    controls: Any,
+    authorization: Any,
+    sender: Any,
+    boxes: Sequence[Any],
+    process_open: bool = True,
+    identity_problems: Sequence[str] = (),
 ) -> list[Finding]:
+    """``process_open``: this process's ``SELLER_INQUIRY_MODE`` is ``automatic``,
+    ``SELLER_INQUIRY_KILL_SWITCH`` is off and the owner's ``SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL``
+    switch is off (`workers.inquiry_handlers.automatic_sending_enabled`; all are part of the gate).
+    ``identity_problems``: codes why the binding is not exactly the configured sending identity
+    (``workers.inquiry_handlers.configured_sender_problems``); the runtime never sends from it."""
     area = "seller_inquiry"
     findings: list[Finding] = []
     if controls is None:
         findings.append(Finding(area, f"{prefix}controls", "info", "no control row yet (sending disabled)"))
     else:
-        sending = controls.mode == "automatic" and not controls.kill_switch
+        database_open = controls.mode == "automatic" and not controls.kill_switch
+        sending = database_open and process_open
+        note = ""
+        if not database_open:
+            note = " (nothing is sent)"
+        elif not process_open:
+            note = (
+                " (nothing is sent: the process settings SELLER_INQUIRY_MODE/KILL_SWITCH"
+                "/REQUIRE_MESSAGE_APPROVAL forbid it)"
+            )
         findings.append(
             Finding(
                 area,
                 f"{prefix}controls",
                 "ok" if sending else "info",
                 f"mode={controls.mode}, kill_switch={'on' if controls.kill_switch else 'off'}, "
-                f"caps={controls.max_per_24h}/24h {controls.max_per_15d}/15d"
-                + ("" if sending else " (nothing is sent)"),
+                f"caps={controls.max_per_24h}/24h {controls.max_per_15d}/15d" + note,
             )
         )
     if authorization is None:
@@ -428,6 +457,15 @@ def _readiness(
             f"{'verified' if sender.alias_verified else 'unverified'}, health {sender.health}"
         )
         findings.append(Finding(area, f"{prefix}sender_binding", "ok" if sender.usable else "warn", detail))
+        if identity_problems:
+            findings.append(
+                Finding(
+                    area,
+                    f"{prefix}sender_identity",
+                    "warn",
+                    "not the configured sender (nothing is sent from it): " + ", ".join(identity_problems),
+                )
+            )
     active = [b for b in boxes if b.binding_state == "active"]
     if sender is not None and sender.provider.value == "outlook_local":
         if not active:

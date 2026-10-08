@@ -1,5 +1,6 @@
 /**
- * The dashboard's only HTTP client. It calls ONLY the routes of docs/api_contract.md.
+ * The dashboard's only HTTP client. It calls ONLY the routes of docs/api_contract.md (section 6 and
+ * the spec v1.1 dashboard routes of section 10.2; never the `/v1/mail-workers` worker API).
  *
  * - Every request carries `Authorization: Bearer <Supabase access token>` obtained from the
  *   supabase-js session at call time (never cached here, never stored elsewhere). The Supabase
@@ -22,6 +23,21 @@ import {
   type ClaimResult,
   type ComparableSetView,
   type ComparablesQuery,
+  type CoverageLagsView,
+  type EvaluationQuery,
+  type EvaluationReport,
+  type InquiryControlView,
+  type InquiryListQuery,
+  type InquiryListView,
+  type InquiryPauseRequest,
+  type InquiryPauseResult,
+  type InquiryResumeRequest,
+  type InquiryResumeResult,
+  type InquiryView,
+  type ListingLifecycleView,
+  type MailCoverageGapListView,
+  type MailWorkerHealthQuery,
+  type MailWorkerHealthView,
   type MeView,
   type NoteView,
   type OutboxPage,
@@ -32,6 +48,9 @@ import {
   type RecheckRequestResult,
   type ReleaseRequest,
   type ReleaseResultView,
+  type ReplyListQuery,
+  type ReplyListView,
+  type ReplyView,
   type ResponseEnvelope,
   type ReviewCaseView,
   type ReviewDecisionView,
@@ -204,6 +223,48 @@ export class ApiClient {
   }
   async outbox(query: OutboxQuery, options: RequestOptions = {}) {
     return this.get<OutboxPage>('/api/outbox', { ...query }, options)
+  }
+
+  // ------------------------------------------------------------------ spec v1.1 routes (contract 10.2)
+  // There is deliberately no send, approve or reply method: the standing authorization (spec 37.1)
+  // needs no per-message approval and the pipeline sends from validated records only.
+
+  async inquiries(query: InquiryListQuery, options: RequestOptions = {}) {
+    return this.get<InquiryListView>('/api/inquiries', { ...query }, options)
+  }
+  async inquiry(inquiryId: string, options: RequestOptions = {}) {
+    return this.get<InquiryView>(`/api/inquiries/${pathId(inquiryId, 'inquiry_id')}`, undefined, options)
+  }
+  async replies(query: ReplyListQuery, options: RequestOptions = {}) {
+    if (query.inquiry_id !== undefined) pathId(query.inquiry_id, 'inquiry_id')
+    return this.get<ReplyListView>('/api/replies', { ...query }, options)
+  }
+  async reply(replyId: string, options: RequestOptions = {}) {
+    return this.get<ReplyView>(`/api/replies/${pathId(replyId, 'reply_id')}`, undefined, options)
+  }
+  async inquiryControl(options: RequestOptions = {}) {
+    return this.get<InquiryControlView>('/api/inquiry-control', undefined, options)
+  }
+  async pauseInquiries(body: InquiryPauseRequest, options: RequestOptions = {}) {
+    return this.post<InquiryPauseResult>('/api/inquiry-control/pause', body, options)
+  }
+  async resumeInquiries(body: InquiryResumeRequest, options: RequestOptions = {}) {
+    return this.post<InquiryResumeResult>('/api/inquiry-control/resume', body, options)
+  }
+  async mailWorkerHealth(query: MailWorkerHealthQuery = {}, options: RequestOptions = {}) {
+    return this.get<MailWorkerHealthView>('/api/mail-workers/health', { ...query }, options)
+  }
+  async mailCoverageGaps(query: MailWorkerHealthQuery = {}, options: RequestOptions = {}) {
+    return this.get<MailCoverageGapListView>('/api/mail-workers/coverage-gaps', { ...query }, options)
+  }
+  async lifecycleLags(options: RequestOptions = {}) {
+    return this.get<CoverageLagsView>('/api/lifecycle/lags', undefined, options)
+  }
+  async listingLifecycle(listingId: string, options: RequestOptions = {}) {
+    return this.get<ListingLifecycleView>(`/api/listings/${pathId(listingId, 'listing_id')}/lifecycle`, undefined, options)
+  }
+  async evaluation(query: EvaluationQuery = {}, options: RequestOptions = {}) {
+    return this.get<EvaluationReport>('/api/evaluation', { ...query }, options)
   }
 
   // ------------------------------------------------------------------ transport

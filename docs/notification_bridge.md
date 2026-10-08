@@ -206,6 +206,33 @@ actual product only supports scheduled polling, configure that only with user au
 If no supported wake route exists, keep `bridge_status=unavailable` and rely on the complete
 dashboard/MCP queue.
 
+### 5.1 Spec v1.1 category signals (seller replies and seller-reply owner alerts)
+
+Native MCP Events stay the route for candidate discovery only. The two v1.1 event types take
+their own path in the dispatcher (`workers.dispatcher._handle_signal`) and are posted ONLY to the
+Slack route selected for their category, never through MCP Events:
+
+| Outbox event type | Category | Slack metadata `event_type` | Built by |
+|---|---|---|---|
+| `seller.reply.received` (`seller.reply.received.v1`) | `seller_reply` (Slack only) | `suv_deals.seller_reply_received` | `slack.build_seller_reply_post_body` |
+| `seller_reply.owner_alert` (decision needed / opportunity supported) | `owner_alert` | `suv_deals.owner_alert` | `slack.build_owner_alert_post_body` |
+
+- Gates (`slack.signal_send_blockers` and the route check): `ALLOW_EXTERNAL_NOTIFICATIONS=true`,
+  `SELLER_REPLY_SIGNAL_PROVIDER=slack` (seller replies), and an enabled, owner-approved and
+  **verified** Slack destination binding selected for the category (`bindings_repo.selected_route`).
+  A failing gate leaves the event visibly `blocked` with a code; no request is made.
+- Payloads carry ids, a fixed-vocabulary status, typed reason codes and the authenticated
+  dashboard link `<APP_BASE_URL>/inquiries/<inquiry_id>/replies/<reply_id>`; never a body,
+  address, attachment or credential. Fixture-lineage replies never alert.
+- A decision-needed owner alert is raised only for a reason not yet alerted for that inquiry
+  (at most one alert per distinct reason per inquiry, decided under the inquiry row lock).
+- Every Slack category posts to the single configured `SLACK_CHANNEL_ID` (the binding's channel
+  must equal it), so an owner alert lands in the channel dot watches. **dot's trigger must match
+  only messages whose metadata `event_type` is `suv_deals.seller_reply_received`**; owner alerts
+  (`suv_deals.owner_alert`) are for the owner. Without that filter one escalating reply would
+  start dot twice. Register both metadata types under `metadata.event_subscriptions` in the app
+  manifest, like `suv_deals.review_pending`.
+
 ## 6. Observability
 
 - `observability/logging.py`: JSON lines with `request_id`, `run_id`, `job_id`, `case_id`,

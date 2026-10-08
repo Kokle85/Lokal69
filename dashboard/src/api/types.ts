@@ -1,5 +1,6 @@
 /**
- * Typed dashboard BFF contract (docs/api_contract.md, section 6).
+ * Typed dashboard BFF contract (docs/api_contract.md, section 6, and the spec v1.1 dashboard routes
+ * of section 10.2: `api.schemas.V11_DASHBOARD_ROUTES`, snapshots in schemas/api/*.json).
  *
  * Written by hand from the contract and the serialization schemas of the backend views
  * (src/suv_deals/views/*, src/suv_deals/api/schemas.py; snapshots in schemas/). This is the ONLY
@@ -57,6 +58,7 @@ export type ErrorCode =
   | 'INSUFFICIENT_DATA'
   | 'DEPENDENCY_UNAVAILABLE'
   | 'INTERNAL_ERROR'
+  | 'EMAIL_DELIVERY_UNCERTAIN'
 
 export const ERROR_CODES: readonly ErrorCode[] = [
   'VALIDATION_ERROR',
@@ -73,6 +75,7 @@ export const ERROR_CODES: readonly ErrorCode[] = [
   'INSUFFICIENT_DATA',
   'DEPENDENCY_UNAVAILABLE',
   'INTERNAL_ERROR',
+  'EMAIL_DELIVERY_UNCERTAIN',
 ]
 
 export type WarningCode =
@@ -1224,6 +1227,8 @@ export interface ReviewDecisionView {
   decided_at: DateTimeString
   supersedes_decision_id: Uuid | null
   is_fixture: boolean
+  /** True when the authenticated caller of this response recorded the decision. */
+  decided_by_caller: boolean
   notice: string
 }
 
@@ -1503,6 +1508,639 @@ export interface OutboxPage {
   items: OutboxItemView[]
 }
 
+// =========================================================================== spec v1.1 (section 37)
+//
+// Seller inquiries, replies, inquiry control, mail-worker health, lifecycle/lags and the 15-day
+// evaluation (docs/api_contract.md section 10.2; views/inquiries.py, views/mail_workers.py,
+// views/lifecycle.py, domain/evaluation.py). There is NO approval anywhere: `approval_required`
+// is always `false` (bounded standing authorization, spec 37.1).
+
+// --------------------------------------------------------------------------- v1.1 enums
+
+export type InquiryState =
+  | 'candidate'
+  | 'qualifying'
+  | 'reserved'
+  | 'queued'
+  | 'sending'
+  | 'accepted'
+  | 'held_facts'
+  | 'uncertain'
+  | 'suppressed'
+  | 'failed_definite'
+  | 'cancelled'
+  | 'replied'
+  | 'bounced'
+  | 'seller_opted_out'
+  | 'no_reply_yet'
+
+export const INQUIRY_STATES: readonly InquiryState[] = [
+  'candidate',
+  'qualifying',
+  'reserved',
+  'queued',
+  'sending',
+  'accepted',
+  'held_facts',
+  'uncertain',
+  'suppressed',
+  'failed_definite',
+  'cancelled',
+  'replied',
+  'bounced',
+  'seller_opted_out',
+  'no_reply_yet',
+]
+
+export type SuppressionReason =
+  | 'hard_bounce'
+  | 'complaint'
+  | 'seller_opt_out'
+  | 'source_paused'
+  | 'sender_revoked'
+  | 'unresolved_send_outcome'
+  | 'kill_switch'
+  | 'contradictory_availability'
+  | 'manual'
+  | 'authorization_revoked'
+/** The four template languages an inquiry may be SENT in (English only with verified evidence). */
+export type MessageLanguage = 'de' | 'it' | 'fr' | 'en'
+/** An ISO 639-1 code as stored (a contact or reply may be in an unsupported language). */
+export type LanguageCode = string
+export type EmailProviderKind = 'outlook_local' | 'gmail_api' | 'microsoft_graph'
+export type InquiryReadiness = 'inquiry_ready' | 'needs_facts' | 'needs_technical_review' | 'not_eligible'
+export type VehicleKind = 'vehicle_cluster' | 'listing_incarnation'
+export type ContactStatus = 'verified' | 'unverified' | 'unavailable' | 'changed' | 'unknown'
+export type ContactKind = 'ad_email' | 'marketplace_relay' | 'official_dealer_contact'
+export type LanguageStatus = 'resolved' | 'language_unresolved' | 'unsupported_language' | 'unknown'
+export type AttemptOutcome = 'running' | 'accepted' | 'pre_submission_failure' | 'definite_rejection' | 'uncertain'
+export type ReconciledOutcome = 'accepted' | 'proven_not_submitted'
+export type InquiryMode = 'disabled_until_sender_ready' | 'automatic' | 'paused'
+export type ReplyMessageType = 'seller_reply' | 'auto_reply' | 'bounce' | 'delivery_notice' | 'spam' | 'ambiguous'
+export type CorrelationStatus = 'matched' | 'quarantined' | 'verified_match'
+export type ProcessingState = 'stored' | 'processed' | 'failed'
+export type AttachmentAction = 'allow_vehicle_document' | 'quarantine_sensitive' | 'reject'
+export type QuoteKind = 'single' | 'range' | 'minimum'
+export type AvailabilitySummary = 'available' | 'sold' | 'reserved' | 'not_available' | 'conflicting' | 'not_stated'
+export type DocumentKind = 'registration' | 'coc' | 'service_history' | 'inspection' | 'documents_general'
+export type DocumentClaimStatus = 'available' | 'attached' | 'refused' | 'not_available' | 'mentioned'
+export type PriceCondition =
+  | 'negotiable'
+  | 'final_or_lowest'
+  | 'fixed'
+  | 'no_discount'
+  | 'cash_payment'
+  | 'export_only'
+  | 'conditional'
+  | 'time_limited'
+/** A seller request; each needs an owner decision when it is an escalation (spec 37.7). */
+export type RequestKind =
+  | 'payment'
+  | 'reservation'
+  | 'identity_document'
+  | 'appointment'
+  | 'commitment'
+  | 'price_acceptance'
+  | 'opt_out'
+  | 'complaint'
+export type InquiryQuestion = 'availability' | 'documents' | 'lowest_price'
+export type LagName =
+  | 'source_scan_lag'
+  | 'detection_delay'
+  | 'detail_freshness'
+  | 'mail_reply_detection_lag'
+  | 'notification_processing_lag'
+  | 'mailbox_sync_lag'
+  | 'backlog_age'
+/** Only `measured` carries a value; `unknown`/`inconsistent` are never zero. */
+export type LagStatus = 'measured' | 'unknown' | 'inconsistent'
+export type ComponentStatus = 'healthy' | 'stale' | 'down' | 'unknown'
+export type AccountStatus = 'unknown' | 'verified' | 'mismatch' | 'not_classic'
+export type EvaluationOutcome =
+  | 'coverage_not_established'
+  | 'deal_found'
+  | 'candidates_need_owner_judgement'
+  | 'no_suitable_deal_yet'
+  | 'no_suitable_deal'
+
+// --------------------------------------------------------------------------- inquiries
+
+/** The canonical vehicle of an inquiry: a confirmed cluster or one listing incarnation. */
+export interface InquiryVehicleRef {
+  vehicle_kind: VehicleKind
+  vehicle_cluster_id: Uuid | null
+  /** The qualifying listing (source advertisement). */
+  listing_id: Uuid
+  source_key: string | null
+  listing_reference: string | null
+  listing_url: string | null
+}
+
+/** The verified recipient; `address` is `null` unless the caller is the owner (`config:admin`). */
+export interface RecipientView {
+  contact_id: Uuid | null
+  verification_status: ContactStatus
+  contact_kind: ContactKind | null
+  address: string | null
+  address_domain: string | null
+  address_redacted: boolean
+  language: LanguageCode | null
+  language_status: LanguageStatus
+  verified_at: DateTimeString | null
+}
+
+/** The bound sending identity: never an address, an account id or a credential. */
+export interface SenderRef {
+  sender_binding_id: Uuid | null
+  binding_version: number | null
+  provider: EmailProviderKind | null
+  display_name: string | null
+}
+
+export interface InquiryQualificationView {
+  listing_revision_id: Uuid | null
+  revision_number: number | null
+  semantic_hash: string | null
+  asking_price: AmountView
+  availability: Availability | null
+  readiness: InquiryReadiness
+  readiness_reasons: string[]
+  rules_version: string | null
+  evaluated_at: DateTimeString | null
+}
+
+export interface InquiryAuthorizationRef {
+  authorization_id: Uuid | null
+  version: number | null
+  fingerprint: string | null
+}
+
+export interface InquiryTemplateView {
+  template_id: string | null
+  template_version: number | null
+  template_set_version: string | null
+  scope_hash: string | null
+  body_hash: string | null
+}
+
+/** The exact message (registered template rendering) and its INFORMATIONAL Macedonian preview. */
+export interface InquiryMessageView {
+  original_subject: string
+  original_body: string
+  mk_preview_subject: string | null
+  mk_preview_body: string | null
+  preview_is_informational: true
+}
+
+export interface SendAttemptSummary {
+  attempt_number: number
+  provider: EmailProviderKind
+  outcome: AttemptOutcome
+  send_intent_committed_at: DateTimeString
+  finished_at: DateTimeString | null
+  reconciled_outcome: ReconciledOutcome | null
+  reconciled_at: DateTimeString | null
+  submission_uncertain: boolean
+  error_code: string | null
+}
+
+export interface SendAttemptsView {
+  count: number
+  last_outcome: AttemptOutcome | null
+  uncertain: boolean
+  attempts: SendAttemptSummary[]
+}
+
+export interface InquiryTimestamps {
+  created_at: DateTimeString
+  state_changed_at: DateTimeString
+  reserved_at: DateTimeString | null
+  queued_at: DateTimeString | null
+  send_attempted_at: DateTimeString | null
+  /** Provider acceptance: not delivery, not reading. */
+  accepted_at: DateTimeString | null
+  replied_at: DateTimeString | null
+  updated_at: DateTimeString
+}
+
+/** `GET /api/inquiries/{inquiry_id}` (= MCP `seller_inquiries_get`). */
+export interface InquiryView {
+  inquiry_id: Uuid
+  identity_key: string
+  purpose: 'initial_availability_documents_price'
+  seller_entity_id: Uuid
+  vehicle: InquiryVehicleRef
+  state: InquiryState
+  state_reasons: string[]
+  qualification: InquiryQualificationView
+  authorization: InquiryAuthorizationRef
+  template: InquiryTemplateView
+  language: MessageLanguage | null
+  recipient: RecipientView
+  sender: SenderRef
+  rfc_message_id: string | null
+  send_attempts: SendAttemptsView
+  /** A send attempt may have reached the provider; held for reconciliation, never resent blindly. */
+  delivery_uncertain: boolean
+  suppression_reason: SuppressionReason | null
+  message: InquiryMessageView | null
+  reply_count: number
+  latest_reply_id: Uuid | null
+  timestamps: InquiryTimestamps
+  row_version: number
+  approval_required: false
+}
+
+/** One row of `GET /api/inquiries` (no message text, no addresses). */
+export interface InquirySummaryView {
+  inquiry_id: Uuid
+  seller_entity_id: Uuid
+  vehicle: InquiryVehicleRef
+  state: InquiryState
+  language: MessageLanguage | null
+  recipient_status: ContactStatus
+  delivery_uncertain: boolean
+  suppression_reason: SuppressionReason | null
+  reply_count: number
+  state_changed_at: DateTimeString
+  reserved_at: DateTimeString | null
+  send_attempted_at: DateTimeString | null
+  accepted_at: DateTimeString | null
+  row_version: number
+}
+
+export interface InquiryListView {
+  items: InquirySummaryView[]
+}
+
+// --------------------------------------------------------------------------- replies
+
+/** Who sent the reply and how it was correlated (never by subject alone). */
+export interface ReplySenderView {
+  /** `null` unless the caller is the owner. */
+  address: string | null
+  address_domain: string | null
+  address_redacted: boolean
+  matches_verified_recipient: boolean
+  correlation_status: CorrelationStatus
+  correlation_reasons: string[]
+  header_linked: boolean
+  thread_linked: boolean
+}
+
+/** Attachment metadata only: no bytes, no local reference, no path or URL. */
+export interface ReplyAttachmentView {
+  filename: string
+  mime_type: string
+  byte_size: number
+  sha256: string
+  action: AttachmentAction | null
+  document_kind: string | null
+}
+
+/** A seller's stated price: always an UNACCEPTED quote, never a purchase price. */
+export interface PriceQuoteView {
+  kind: QuoteKind
+  amount: DecimalString | null
+  low: DecimalString | null
+  high: DecimalString | null
+  currency: CurrencyCode | null
+  /** The quote's basis/conditions as the seller stated them. */
+  conditions: PriceCondition[]
+  status: 'unaccepted_seller_quote'
+  accepted: false
+  excerpt: string
+}
+
+export interface DocumentClaimView {
+  kind: DocumentKind
+  status: DocumentClaimStatus
+  excerpt: string
+}
+
+export interface ReplyClaimsView {
+  claims_version: string | null
+  availability: AvailabilitySummary
+  price_quotes: PriceQuoteView[]
+  documents: DocumentClaimView[]
+  requests: RequestKind[]
+  /** Requests needing an owner decision (payment, reservation, identity documents, ...). */
+  escalations: RequestKind[]
+  unanswered_questions: InquiryQuestion[]
+}
+
+export interface ValuationStatusView {
+  valuation_id: Uuid | null
+  state: ValuationState | null
+  stale_reason: string | null
+  recalculation_pending: boolean
+}
+
+/** `GET /api/replies/{reply_id}` (= MCP `seller_replies_get`). */
+export interface ReplyView {
+  reply_id: Uuid
+  inquiry_id: Uuid
+  seller_entity_id: Uuid
+  vehicle: InquiryVehicleRef
+  message_type: ReplyMessageType
+  original_language: LanguageCode | null
+  subject: string
+  /** Sanitized original text: untrusted seller data. */
+  sanitized_body: string
+  mk_summary: string | null
+  mk_summary_version: string | null
+  mk_summary_generated_at: DateTimeString | null
+  sender: ReplySenderView
+  received_at: DateTimeString
+  observed_at: DateTimeString
+  ingested_at: DateTimeString
+  processing_state: ProcessingState
+  processed_at: DateTimeString | null
+  claims: ReplyClaimsView | null
+  quarantined: boolean
+  quarantine_reason: string | null
+  attachments: ReplyAttachmentView[]
+  withheld_sensitive_attachments: number
+  valuation: ValuationStatusView
+  /** True when text, summary, claims and attachment metadata are withheld (quarantined, not the owner). */
+  content_withheld: boolean
+}
+
+/** One row of `GET /api/replies` (no body). */
+export interface ReplySummaryView {
+  reply_id: Uuid
+  inquiry_id: Uuid
+  vehicle: InquiryVehicleRef
+  message_type: ReplyMessageType
+  original_language: LanguageCode | null
+  availability: AvailabilitySummary | null
+  quarantined: boolean
+  processing_state: ProcessingState
+  received_at: DateTimeString
+  ingested_at: DateTimeString
+}
+
+export interface ReplyListView {
+  items: ReplySummaryView[]
+}
+
+// --------------------------------------------------------------------------- inquiry control
+
+/** `GET /api/inquiry-control`: kill switch, mode, owner-reducible caps and current usage. */
+export interface InquiryControlView {
+  /** Send as `expected_version` to pause or resume. */
+  version: number
+  mode: InquiryMode
+  kill_switch: boolean
+  kill_switch_reason: string | null
+  kill_switch_set_at: DateTimeString | null
+  max_per_24h: number
+  max_per_15d: number
+  ceiling_per_24h: 2
+  ceiling_per_15d: 5
+  seller_cooldown_seconds: number
+  used_24h: number
+  used_15d: number
+  updated_at: DateTimeString
+  approval_required: false
+  /** Active kill-switch / authorization-revoked suppressions a resume could remove (audited). */
+  removable_suppressions: number
+}
+
+export interface InquiryPauseResult {
+  version: number
+  kill_switch: true
+  already_paused: boolean
+  kill_switch_set_at: DateTimeString
+  mode: InquiryMode
+  notice: string
+}
+
+export interface InquiryResumeResult {
+  version: number
+  kill_switch: false
+  mode: InquiryMode
+  resumed_at: DateTimeString
+  suppressions_removed: number
+}
+
+// --------------------------------------------------------------------------- lifecycle and lags
+
+/** One observed lag; a configured interval is context only, never an observed latency. */
+export interface LagView {
+  name: LagName
+  status: LagStatus
+  value_seconds: number | null
+  reason: string | null
+  configured_interval_seconds: number | null
+  note: string
+}
+
+export interface V11TableState {
+  relation: string
+  present: boolean
+}
+
+export interface SourceLagView {
+  source_id: Uuid
+  source_key: string
+  state: SourceRunState
+  last_successful_scan_at: DateTimeString | null
+  last_complete_scan_at: DateTimeString | null
+  source_scan_lag: LagView
+}
+
+/** `GET /api/lifecycle/lags`. */
+export interface CoverageLagsView {
+  sources: SourceLagView[]
+  notification_processing_lag: LagView
+  mail_reply_detection_lag: LagView
+  v11_tables: V11TableState[]
+  notes: string[]
+}
+
+/** `GET /api/listings/{listing_id}/lifecycle`. */
+export interface ListingLifecycleView {
+  listing_id: Uuid
+  source_id: Uuid
+  source_key: string
+  source_state: SourceRunState
+  first_seen_at: DateTimeString
+  last_seen_on_search_at: DateTimeString | null
+  last_detail_success_at: DateTimeString | null
+  last_availability_check_at: DateTimeString | null
+  last_complete_source_scan_at: DateTimeString | null
+  source_published_at: DateTimeString | null
+  source_published_trusted: boolean
+  availability: Availability
+  detail_freshness: LagView
+  detection_delay: LagView
+  availability_history_source: 'audit_events' | 'availability_events'
+  notes: string[]
+}
+
+// --------------------------------------------------------------------------- mail workers
+
+export interface MailCoverageGap {
+  kind: string
+  started_at: DateTimeString
+  ended_at: DateTimeString | null
+  open: boolean
+  detected_by: 'worker' | 'server'
+}
+
+/** One hashed store/folder checkpoint (no names, addresses or subjects). */
+export interface FolderCheckpointView {
+  store_id_hash: string
+  folder_id_hash: string
+  folder_role: string
+  last_complete_scan_at: DateTimeString | null
+  last_scan_started_at: DateTimeString | null
+  overlap_watermark: DateTimeString | null
+  heartbeat_at: DateTimeString | null
+  backlog_count: number | null
+  backlog_oldest_at: DateTimeString | null
+  gap_reasons: string[]
+}
+
+/** Separate health dimensions of one mailbox worker; monitoring only while all are fresh. */
+export interface MailboxHealthView {
+  mailbox_binding_id: Uuid
+  sender_binding_id: Uuid
+  provider: EmailProviderKind
+  worker_label: string
+  binding_state: 'active' | 'revoked'
+  generated_at: DateTimeString
+  last_heartbeat_at: DateTimeString | null
+  heartbeat_age_seconds: number | null
+  heartbeat_status: ComponentStatus
+  outlook_status: ComponentStatus
+  mailbox_sync_ok: boolean | null
+  mailbox_sync_lag: LagView
+  last_successful_reconciliation_at: DateTimeString | null
+  reconciliation_status: ComponentStatus
+  backlog_count: number | null
+  backlog_age: LagView
+  unresolved_matching_gaps: number | null
+  account_status: AccountStatus
+  coverage_gaps: MailCoverageGap[]
+  open_gap_count: number
+  folders: FolderCheckpointView[]
+  monitoring_active: boolean
+  reasons: string[]
+}
+
+/** `GET /api/mail-workers/health`. */
+export interface MailWorkerHealthView {
+  generated_at: DateTimeString
+  mailboxes: MailboxHealthView[]
+  any_monitoring_active: boolean
+  open_gap_count: number
+  notes: string[]
+}
+
+export interface MailCoverageGapItem {
+  mailbox_binding_id: Uuid
+  worker_label: string
+  binding_state: 'active' | 'revoked'
+  gap: MailCoverageGap
+}
+
+/** `GET /api/mail-workers/coverage-gaps`: open gaps first. */
+export interface MailCoverageGapListView {
+  generated_at: DateTimeString
+  open_gap_count: number
+  items: MailCoverageGapItem[]
+}
+
+// --------------------------------------------------------------------------- 15-day evaluation
+
+/** An exact amount in one currency (a decimal string; the browser never computes with it). */
+export interface MoneyView {
+  amount: DecimalString
+  currency: CurrencyCode
+}
+
+export interface EvaluationCoverageGap {
+  subject: string
+  start: DateTimeString
+  end: DateTimeString
+  reason: string
+}
+
+export interface CoverageInterval {
+  source_key: string
+  start: DateTimeString
+  end: DateTimeString
+  scans: number
+}
+
+export interface SourceCoverage {
+  source_key: string
+  window_start: DateTimeString
+  window_end: DateTimeString
+  intervals: CoverageInterval[]
+  gaps: EvaluationCoverageGap[]
+  healthy_seconds: number
+  /** A decimal ratio string (0..1) of the elapsed window, or `null` when not applicable. */
+  coverage_ratio: DecimalString | null
+}
+
+export interface InquiryCounts {
+  attempted: number
+  accepted: number
+  uncertain: number
+  failed_definite: number
+  suppressed: number
+  held_for_facts: number
+  cancelled: number
+  in_progress: number
+  with_seller_reply: number
+  suppression_reasons: Array<[string, number]>
+}
+
+/** Best SUPPORTED economics: a research estimate, never a confirmed profit. */
+export interface EconomicsSummary {
+  candidate_id: Uuid
+  vehicle_cluster_id: Uuid | null
+  valuation_state: ValuationState
+  conservative_contribution: MoneyView
+  base_contribution: MoneyView
+  /** `null`: no owner-approved threshold. */
+  meets_approved_threshold: boolean | null
+  unknowns: string[]
+  label: string
+}
+
+/** `GET /api/evaluation`: the 15-day report from stored evidence (zero is reported as zero). */
+export interface EvaluationReport {
+  version: string
+  generated_at: DateTimeString
+  window_status: 'not_started' | 'in_progress' | 'complete'
+  window_start: DateTimeString | null
+  window_end: DateTimeString | null
+  coverage: SourceCoverage[]
+  sources_with_healthy_coverage: number
+  eligible_vehicles: number
+  well_matched_vehicles: number
+  small_sample_matches: number
+  inquiries: InquiryCounts
+  seller_replies: number
+  auto_replies: number
+  bounces: number
+  delivery_notices: number
+  missing_documents_resolved: number
+  best_supported_economics: EconomicsSummary | null
+  vehicles_with_incomplete_economics: number
+  most_common_unknowns: Array<[string, number]>
+  qualifying_deal_ids: Uuid[]
+  owner_judgement_candidate_ids: Uuid[]
+  outcome: EvaluationOutcome
+  reasons: string[]
+  excluded_synthetic_records: number
+  optimises_for_volume: false
+}
+
 // --------------------------------------------------------------------------- queries and bodies
 
 export interface CandidateListQuery {
@@ -1573,6 +2211,49 @@ export interface PauseSourceRequest {
   expected_version: number
   reason: string
   idempotency_key: IdempotencyKey
+}
+
+// --------------------------------------------------------------------------- v1.1 queries and bodies
+
+export interface InquiryListQuery {
+  cursor?: string
+  limit?: number
+  state?: InquiryState
+  uncertain_only?: boolean
+  /** Uncertain, held for facts, suppressed, failed and stuck-sending inquiries. */
+  attention_only?: boolean
+}
+
+export interface ReplyListQuery {
+  cursor?: string
+  limit?: number
+  inquiry_id?: Uuid
+  quarantined_only?: boolean
+}
+
+export interface MailWorkerHealthQuery {
+  include_revoked?: boolean
+}
+
+export interface EvaluationQuery {
+  /** The window is fixed at 15 days; anything else is refused. */
+  days?: 15
+}
+
+/** `POST /api/inquiry-control/pause` (= MCP `seller_inquiries_pause`). */
+export interface InquiryPauseRequest {
+  expected_version: number
+  reason: string
+  idempotency_key: IdempotencyKey
+}
+
+/** `POST /api/inquiry-control/resume` (owner only, dashboard only). */
+export interface InquiryResumeRequest {
+  expected_version: number
+  reason: string
+  idempotency_key: IdempotencyKey
+  /** Also remove the active kill-switch / authorization-revoked suppressions (each audited). */
+  remove_suppressions?: boolean
 }
 
 /** Request-body rules mirrored from the backend for early feedback (the server stays authoritative). */

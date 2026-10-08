@@ -14,6 +14,15 @@ export interface Manifest {
   comparable_set_id: string
   titles: Record<string, string>
   sources: Record<string, string>
+  /** The SYNTHETIC spec v1.1 world (tests/e2e/seed_v11.py). */
+  v11: {
+    inquiries: Record<'suppressed' | 'replied' | 'uncertain' | 'held' | 'waiting', string>
+    replies: Record<'seller' | 'quarantined', string>
+    references: Record<'suppressed' | 'replied' | 'uncertain' | 'held' | 'waiting', string>
+    listings: Record<'suppressed' | 'replied' | 'uncertain' | 'held' | 'waiting', string>
+    worker_label: string
+    mailbox_id: string
+  }
 }
 
 export type UserKey = 'owner' | 'reviewer' | 'reviewer2' | 'viewer' | 'expiring' | 'multi' | 'stranger'
@@ -105,4 +114,17 @@ export function hold(): { promise: Promise<void>; release: () => void } {
     holder.resolve = resolve
   })
   return { promise, release: () => holder.resolve?.() }
+}
+
+/**
+ * Spec 37.1 (standing authorization): no button or link anywhere offers to approve, send, resend or
+ * answer a seller message.
+ */
+export async function expectNoApproveOrSendControl(page: Page): Promise<void> {
+  const names = [
+    ...(await page.getByRole('button').allTextContents()),
+    ...(await page.getByRole('link').allTextContents()),
+  ]
+  expect(names.length).toBeGreaterThan(0)
+  for (const name of names) expect(name).not.toMatch(/\b(approve|approval|send|resend|reply to|answer)\b/i)
 }

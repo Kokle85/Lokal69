@@ -140,10 +140,14 @@ def now_utc() -> datetime:
 
 
 def runtime_settings(db_url: str, **overrides: Any) -> Settings:
-    """Automatic mode on the default ``outlook_local`` route; external notifications OFF."""
+    """Automatic mode on the default ``outlook_local`` route with the configured sending identity
+    (``SELLER_EMAIL_ACCOUNT_ID`` / ``SELLER_EMAIL_FROM``, required in automatic mode); external
+    notifications OFF."""
     values: dict[str, Any] = {
         "seller_inquiry_mode": "automatic",
         "seller_email_provider": "outlook_local",
+        "seller_email_account_id": SENDER_ACCOUNT,
+        "seller_email_from": SENDER_ADDRESS,
     }
     values.update(overrides)
     return pipeline_settings(db_url, **values)
@@ -783,11 +787,13 @@ GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 
 class GmailApi:
     """SYNTHETIC Gmail: ``send_mode`` = ``ok`` | ``timeout``; ``search_finds`` decides the
-    reconciliation search by Message-ID."""
+    reconciliation search by Message-ID; the first ``token_failures`` token requests answer 503
+    (nothing reaches Gmail: a proven pre-submission failure)."""
 
-    def __init__(self, *, send_mode: str = "ok", search_finds: bool = False) -> None:
+    def __init__(self, *, send_mode: str = "ok", search_finds: bool = False, token_failures: int = 0) -> None:
         self.send_mode = send_mode
         self.search_finds = search_finds
+        self.token_failures = token_failures
         self.sent: list[dict[str, Any]] = []
         self.calls: list[str] = []
 
@@ -795,6 +801,9 @@ class GmailApi:
         url = str(request.url)
         path = request.url.path
         self.calls.append(f"{request.method} {path}")
+        if url.startswith(GOOGLE_TOKEN) and self.token_failures > 0:
+            self.token_failures -= 1
+            return httpx.Response(503, json={"error": "temporarily_unavailable"})
         if url.startswith(GOOGLE_TOKEN):
             return httpx.Response(
                 200,

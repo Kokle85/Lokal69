@@ -301,6 +301,11 @@
               "null"
             ]
           },
+          "content_withheld": {
+            "default": false,
+            "description": "True when subject, body, Macedonian summary, claims and attachment metadata are withheld: a quarantined (unverified) possible match may be unrelated personal mail, so only the owner reads it on the dashboard (never over MCP).",
+            "type": "boolean"
+          },
           "ingested_at": {
             "format": "date-time",
             "type": "string"
@@ -589,7 +594,8 @@
           "quarantine_reason",
           "attachments",
           "withheld_sensitive_attachments",
-          "valuation"
+          "valuation",
+          "content_withheld"
         ],
         "title": "ReplyView",
         "type": "object"

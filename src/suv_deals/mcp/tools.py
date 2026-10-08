@@ -45,7 +45,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Final
 from uuid import uuid4
@@ -100,6 +100,7 @@ from suv_deals.persistence import (
 )
 from suv_deals.persistence.database import Conn, Database, db_now
 from suv_deals.persistence.errors_map import TransientConflict
+from suv_deals.persistence.queries import QueryResult
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
 from suv_deals.views.common import (
@@ -110,7 +111,7 @@ from suv_deals.views.common import (
     is_valid_request_id,
     warning,
 )
-from suv_deals.views.inquiries import InquiryPauseResult
+from suv_deals.views.inquiries import InquiryPauseResult, ReplyView
 from suv_deals.views.jsonschema import model_schema
 
 logger = logging.getLogger("suv_deals.mcp.tools")
@@ -366,9 +367,23 @@ async def seller_inquiries_get(call: ToolCall[SellerInquiriesGetInput]) -> Respo
 
 
 async def seller_replies_get(call: ToolCall[SellerRepliesGetInput]) -> ResponseEnvelope[Any]:
+    """One correlated reply (spec 37.8). A QUARANTINED reply is an unverified possible match that
+    may be unrelated personal mail: only its metadata leaves over MCP (``content_withheld``;
+    ``views.inquiries.reply_content_visible`` needs ``config:admin``, never effective on MCP), so
+    its text never reaches dot or a model provider before the owner verified it on the dashboard."""
     reply_id = call.arguments.reply_id
     result = await call.in_transaction(lambda conn: queries.get_reply(conn, call.actor, reply_id))
-    return result.envelope(call.request_id)
+    return visible_reply(result, call.actor).envelope(call.request_id)
+
+
+def visible_reply(result: QueryResult[ReplyView], actor: ActorContext) -> QueryResult[ReplyView]:
+    """``result`` as ``actor`` may see it (`ReplyView.for_scopes`; shared with the dashboard route):
+    withheld content carries no claims, so the unverified-claims warning goes with it."""
+    view = result.data.for_scopes(actor.scopes)
+    if not view.content_withheld:
+        return result
+    warnings = tuple(w for w in result.warnings if w.code != WarningCode.SELLER_CLAIMS_UNVERIFIED)
+    return replace(result, data=view, warnings=warnings)
 
 
 async def seller_inquiries_pause(call: ToolCall[SellerInquiriesPauseInput]) -> ResponseEnvelope[Any]:
@@ -676,4 +691,5 @@ __all__ = [
     "request_id_for",
     "success_result",
     "tool_names",
+    "visible_reply",
 ]

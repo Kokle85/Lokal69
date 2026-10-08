@@ -267,6 +267,34 @@ describe('review submission', () => {
     await waitFor(() => expect(sessionStorage.getItem(`suvdash:pending-submit:${CASE_ID}`)).toBeNull())
   })
 
+  it('after a reload, never mistakes another reviewer\'s decision on the same version for ours (decided_by_caller)', async () => {
+    const world = reviewWorld()
+    const theirs = decision({ case_version: 2, decided_by_caller: false, actor: { principal_id: '22222222-2222-4222-8222-222222222222', principal_kind: 'user', role: 'reviewer' } })
+    world.current.value = reviewCase({ case_version: 3, state: 'watch', decisions: [theirs], latest_decision_id: theirs.decision_id })
+    writePendingSubmission({
+      caseId: CASE_ID,
+      userId: TEST_USER_ID,
+      idempotencyKey: 'review-submit:k-earlier-attempt',
+      outcome: 'watch',
+      expectedVersion: 2,
+      startedAt: new Date().toISOString(),
+    })
+    renderApp(`/reviews/${CASE_ID}`, { api: world.api })
+    expect(await screen.findByTestId('earlier-submission-other')).toHaveTextContent('Your submission was not recorded: another reviewer recorded a decision')
+    expect(screen.queryByTestId('earlier-submission-recorded')).toBeNull()
+    expect(within(screen.getByTestId('decision-history')).getByText(/by a reviewer/)).toBeInTheDocument()
+    expect(world.api.callsTo('POST /api/reviews/:id/submit')).toHaveLength(0)
+    await waitFor(() => expect(sessionStorage.getItem(`suvdash:pending-submit:${CASE_ID}`)).toBeNull())
+  })
+
+  it('marks the caller\'s own decisions as "by you" in the history', async () => {
+    const world = reviewWorld()
+    const mine = decision({ case_version: 2 })
+    world.current.value = reviewCase({ case_version: 3, state: 'watch', decisions: [mine], latest_decision_id: mine.decision_id })
+    renderApp(`/reviews/${CASE_ID}`, { api: world.api })
+    expect(await screen.findByTestId('decision-entry')).toHaveTextContent('by you')
+  })
+
   it('after a reload with an unrecorded pending action, asks to claim again', async () => {
     const world = reviewWorld()
     world.current.value = reviewCase({ case_version: 2, state: 'claimed', claim: { claimed: true, held_by_caller: true, expires_at: new Date(Date.now() + 60_000).toISOString() } })

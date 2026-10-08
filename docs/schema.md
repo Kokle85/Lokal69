@@ -927,8 +927,12 @@ the transactional inquiry repositories (`persistence.sellers_repo`, `inquiries_r
   `inquiries_repo.reap_expired_attempts`: a running attempt past its lease becomes `uncertain`
   (`error_code = 'LEASE_EXPIRED'`) together with its `sending` inquiry; the reservation and the
   quota debit stay. Report fields: `jobs_blocked_uncertain`, `send_attempts_uncertain` (dry runs
-  count them read-only). An operator `unblock` of such a job cannot cause a second transmission:
-  its dispatch holds because the inquiry is no longer `queued`.
+  count them read-only). An operator `unblock` of such a job needs an explicit
+  `acknowledge_uncertain_delivery=True` (otherwise `EMAIL_DELIVERY_UNCERTAIN` with
+  `details.reason = uncertain_delivery_ack_required`; the acknowledgement is audited) and still
+  cannot cause a second transmission: its dispatch holds because the inquiry is no longer
+  `queued`. The reconciliation pass itself unblocks (acknowledged) only a reaped send job that
+  provably committed no send intent while its inquiry is still `queued` (section 11.8).
 
 ### 11.5 Lock order and recipes of the inquiry repositories (extends 4 and 10.7)
 
@@ -970,7 +974,11 @@ No inquiry path locks `app.listings` (or any earlier table of section 4) after t
   `outlook_local:<mailbox_binding_id>`, lease expiry = the intent's `not_after`; the intent is
   rebuilt deterministically from the attempt and the inquiry's immutable binding (MIME `Date` =
   the commit time). Worker reports are stored sanitized (no addresses) under `worker_report` in
-  `provider_response` / `reconciliation_evidence`.
+  `provider_response` / `reconciliation_evidence`. `send_intents_repo.list_pending` also lists,
+  as `expired`, recent (7 days) intents whose attempt the reaper made `uncertain`
+  (`LEASE_EXPIRED`) that no worker ever claimed with `proceed` (no granted `send_intent.claim`
+  audit) and that carry no worker report: the worker refuses them `intent_expired` without a
+  claim, which proves non-submission and lets the inquiry be reconciled.
 - Sender secrets: `secret_envelope` is a `SecretBox` (AES-GCM) envelope whose associated data
   binds workspace, binding, provider and account; `SELLER_EMAIL_OAUTH_SECRET_REFERENCE` =
   `secretbox:ops.email_sender_bindings/<id>` is opened only by a system principal
@@ -990,16 +998,21 @@ No inquiry path locks `app.listings` (or any earlier table of section 4) after t
   every finished attempt, and now while an attempt is still running (`inquiries_repo._debits`,
   used by readiness, reserve, dispatch, `next_window_at`, `quota_usage` and the claim). On the
   `outlook_local` route the hand-over happens at the desktop claim, up to the intent TTL after the
-  commit; the database guard (`ops.inquiry_quota_usage`, counted at `send_attempted_at`) stays
-  the backstop under the same controls lock.
+  commit; the database guard (`ops.inquiry_quota_usage`) counts each debit at the same latest
+  possible hand-over since migration `20261008000100` (section 11.8) and stays the backstop
+  under the same controls lock.
 - The worker claim (`send_intents_repo.claim`) is the revalidation right before `.Send`. It
   evaluates the bound seller's SURVIVING root entity: suppressions of the whole merged family,
   `app.seller_inquiry_vehicle_conflict` for the root (a (possibly) transmitted family inquiry
   about the same or a plausibly same vehicle: `intent_invalid`, final) and the seller cooldown.
-  Refusals that lift on their own (kill switch or mode, rolling caps, seller cooldown, source
-  pause) answer `kill_switch`, which the provider maps to a RETRYABLE proven pre-submission
-  failure; `intent_invalid` (suppression, duplicate, changed listing, recipient or authorization)
-  closes that message for good. Claims change no state.
+  The kill switch or a mode other than `automatic` (in the workspace controls, or in the serving
+  process's own `SELLER_INQUIRY_MODE` / `SELLER_INQUIRY_KILL_SWITCH`: `claim(process_gate=...)`)
+  answers `kill_switch`, which the worker reports and the provider maps to a RETRYABLE proven
+  pre-submission failure. Refusals that lift on their own without an owner action (rolling caps,
+  seller cooldown, source pause) answer `not_now`: the worker keeps the intent, claims again
+  later while it is valid and reports `intent_expired` once its validity ends (nothing is reported
+  for `not_now` itself). `intent_invalid` (suppression, duplicate, changed listing, recipient or
+  authorization) closes that message for good. Claims change no state.
 - `record_outcome` accepts an outcome only for the attempt's own Message-ID; a reported
   acceptance time is clamped to `[send_attempted_at, now]`.
 
@@ -1015,3 +1028,35 @@ The script hands psql a password-free connection string and passes a password on
 `PGPASSWORD`; a connection string from which the password cannot be separated safely (an
 unencoded `/`, `?` or `#` in a URL password, an upper-case scheme, a `password` key in another
 letter case, an unparseable key=value string) is refused rather than guessed at.
+
+### 11.8 Migration 20261008000100 and the v1.1 runtime (wave B2)
+
+- `20261008000100_inquiry_quota_backstop` (forward-only, expand): `CREATE OR REPLACE` of
+  `ops.inquiry_quota_usage(p_workspace_id, p_exclude_inquiry_id)` only. Each unreleased debit now
+  counts at `greatest(debited_at, send_attempted_at, latest end of the inquiry's attempts)`, where
+  a still-`running` attempt counts as `clock_timestamp()` (the desktop worker may hand it over at
+  any moment until the intent expires), exactly like the repository (`inquiries_repo._debits`,
+  11.5). The function is therefore `VOLATILE`; signature, owner, grants (`EXECUTE` for
+  `suv_backend` only) and `search_path` are unchanged, and the guard semantics (evaluated on every
+  ledger insert and before every `queued -> sending`, under the controls lock; released debits
+  never count) stay. No table, column, grant or policy change; the security baseline is re-applied.
+  Pure ASCII, no `DROP TRIGGER`. Tests: `tests/integration/v11_runtime/test_quota_backstop.py`
+  (PostgreSQL 16 and 17). Not yet listed in section 9: the lead applies it to the Supabase project.
+- No further DDL in wave B2. The runtime (`workers.inquiry_handlers`, `workers.reply_handlers`,
+  `workers.reconciliation`) uses only the recipes of 11.5 plus:
+  - `inquiries_repo.mark_replied` (lock order: the inquiry row, then the binding publication, as
+    `record_outcome`): an `accepted`/`no_reply_yet` inquiry takes the state steps of replies stored
+    while its send was still unresolved (`replied`, `seller_opted_out`, `bounced`), audited as
+    `seller_inquiry.replied`.
+  - The reconciliation pass enqueues, bounded and without network I/O: plan jobs, send jobs for
+    `queued` inquiries without one, one guarded-retry send job per attempt number for a
+    `failed_definite` inquiry whose last attempt is proven never submitted (fewer than
+    `MAX_SEND_ATTEMPTS` = 3 attempts, no open send job), reconcile jobs for old `uncertain`
+    attempts (at most one per inquiry per hour), the one `seller_reply_process` job per reply
+    (dedup key `seller_reply.process:<reply_id>`, also queued by the mail-worker reply ingest in
+    the ingest transaction), and the acknowledged unblock of a reaped send job that committed no
+    intent. Report fields: `inquiry_plan_jobs`, `inquiry_replan_jobs`, `inquiry_send_jobs`,
+    `inquiry_retry_jobs`, `inquiry_reconcile_jobs`, `reply_process_jobs`,
+    `inquiries_marked_replied`, `inquiry_send_jobs_unblocked`.
+  - A seller-reply owner alert (`ops.outbox` event `seller_reply.owner_alert`) is decided under the
+    inquiry row lock and inserted last (outbox stays the tail of the lock order).

@@ -14,6 +14,7 @@ export function MutationStatus<B, R>({
   confirmed,
   pendingText = 'Sending…',
   extraOnRejected,
+  subject,
 }: {
   phase: MutationPhase<B, R>
   onRetry: () => void
@@ -21,6 +22,8 @@ export function MutationStatus<B, R>({
   confirmed: (data: R) => ReactNode
   pendingText?: string
   extraOnRejected?: ReactNode
+  /** What a version conflict is about (see `describeError`). */
+  subject?: string
 }) {
   const region = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -52,9 +55,14 @@ export function MutationStatus<B, R>({
       {phase.kind === 'unconfirmed' ? (
         <div className="notice notice-warn" data-testid="mutation-unconfirmed">
           <p className="panel-title">Not confirmed: it may or may not have been saved</p>
-          <p>{describeError(phase.error).message}</p>
+          <p>{describeError(phase.error, subject ? { subject } : {}).message}</p>
           {phase.error.code === 'RATE_LIMITED' || phase.error.code === 'FORBIDDEN' || phase.error.code === 'UNAUTHENTICATED' ? (
             <p>The last retry was refused before the server looked at it ({describeError(phase.error).title.toLowerCase()}), so the earlier send is still unconfirmed.{describeError(phase.error).hint ? ` ${describeError(phase.error).hint}` : ''}</p>
+          ) : phase.error.retryable && !phase.error.outcomeUnknown && phase.attempt.sends > 1 ? (
+            <p data-testid="retry-busy">
+              The last retry was turned away as busy, which says nothing about the earlier send: it is still unconfirmed and may
+              still be applied. Retry again in a moment; nothing new can be sent until it is resolved.
+            </p>
           ) : null}
           <p>
             Retrying sends the identical request with the same idempotency key, so the server applies it at most once and
@@ -79,7 +87,7 @@ export function MutationStatus<B, R>({
       ) : null}
       {phase.kind === 'rejected' ? (
         <div data-testid="mutation-rejected">
-          <ErrorPanel error={phase.error} />
+          <ErrorPanel error={phase.error} subject={subject} />
           {extraOnRejected}
         </div>
       ) : null}

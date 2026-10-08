@@ -203,7 +203,8 @@ function CandidateBody({ detail, timeZone, onChanged }: { detail: CandidateDetai
           ]}
         />
         <p className="muted small">
-          &quot;First seen by this system&quot; is not the advert&apos;s age: an older listing can be noticed late.
+          &quot;First seen by this system&quot; is not the advert&apos;s age: an older listing can be noticed late.{' '}
+          <Link to={`/candidates/${summary.listing_id}/lifecycle`}>Detail freshness and detection delay</Link>
         </p>
       </Section>
 

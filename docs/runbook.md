@@ -15,7 +15,7 @@ itself, and nothing activates a source, notification route or seller email.
 | `SOURCE_NETWORK_ENABLED` | `false` | Every real source fetch is blocked (`source_network_disabled`); only `mode: fixture` sources run against saved files. |
 | `ALLOW_EXTERNAL_NOTIFICATIONS` | `false` | The dispatcher records events as blocked; nothing leaves the system. The dashboard/MCP queue stays complete (pull mode). |
 | `EVENT_BRIDGE_ENABLED`, `MCP_EVENTS_ENABLED`, `NOTIFICATION_PROVIDER` | `false`, `false`, `disabled` | No activation route; `bridge_status=unavailable`. |
-| `SELLER_INQUIRY_MODE` | `disabled_until_sender_ready` | No seller email (spec §37; wiring is a later package). |
+| `SELLER_INQUIRY_MODE` | `disabled_until_sender_ready` | No seller e-mail. Even with `automatic`, nothing is sent unless the kill switch is off, the standing authorization is active and the sender binding is verified (section 10; `suv-deals inquiries status` shows `sending_possible`). |
 | `LLM_EXTRACTION_ENABLED` | `false` | No LLM calls; budget 0. |
 
 - Fixture data never notifies (fixture outbox rows are blocked at enqueue time).
@@ -192,6 +192,19 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `api serve [--host 127.0.0.1] [--proxy-headers] [--forwarded-allow-ips]` | uvicorn |
 | `credentials create-mcp / revoke / list` | scoped MCP credentials (hash stored, token shown once) |
 | `bootstrap owner` | link an existing Auth user as workspace owner |
+| `reconcile --workspace ID [--dry-run]` | one reconciliation pass for one active workspace (not with `--loop`) |
+| `mail-worker credential issue --sender-binding ID --label ... [--expires 90d] --yes` | binds the desktop mail worker to the sender binding's mailbox (`ops.mail_worker_bindings`) and prints its `suvmail_` token ONCE (only the hash is stored) |
+| `mail-worker credential revoke MAILBOX_ID --reason ... --yes`, `mail-worker credential list [--all]` | permanent revocation (the worker's next request is `401`, its local backlog is kept); health dimensions without tokens or addresses |
+| `sender-binding create --provider outlook_local\|gmail_api --account-id ... --from-address ... --display-name ... [--reply-to ...] [--vault-ref scheme:path] --reason ... --yes` | registers the owner-authorized sending identity, UNVERIFIED; a provider secret only as an external reference (never a value); output shows only the address domain |
+| `sender-binding verify ID --reason ... --yes` | `outlook_local` only: records the technical verification from the desktop worker's evidence (classic-Outlook account report of the bound address, fresh heartbeat, stable account key); refuses (exit 3) with problem codes otherwise. A prerequisite, never a message approval |
+| `sender-binding status [--all] [--json]` | verification, alias, health and secret presence (domains only) |
+| `inquiries authorize [--file PATH] --reason ... --yes` | creates the workspace controls (mode `disabled_until_sender_ready`) and records the owner's versioned standing authorization from `config/seller_inquiry_authorization.yaml` (idempotent for an identical latest version; an audit record, never a message approval) |
+| `inquiries set-mode disabled_until_sender_ready\|automatic\|paused --reason ... --expected-version N --yes` | workspace mode; `automatic` is refused (exit 3) without an active authorization and a usable sender binding |
+| `inquiries set-limits --max-per-24h 0..2 --max-per-15d 0..5 [--cooldown-days 7..365] --reason ... --expected-version N --yes` | owner-reducible ceilings; never above 2/24 h and 5/15 days; the seller cooldown is never shorter than 7 days and is kept when `--cooldown-days` is omitted |
+| `inquiries status [--json]` | mode, kill switch, caps/usage, authorization, sender, mail workers, removable suppressions and `sending_possible` |
+| `inquiries pause --reason ... --expected-version N --yes` | activates the kill switch (never resumes) |
+| `inquiries resume --reason ... --expected-version N [--remove-suppressions --owner-user-id UID] --yes` | owner action: clears the kill switch; optionally removes kill-switch/authorization-revoked suppressions (each audited, as the owner) |
+| `evaluation report --days 15 [--json]` | the 15-day quality evaluation from stored evidence (zero is reported as zero) |
 
 ## 6. Incidents (spec §30)
 
@@ -204,6 +217,9 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | Notification uncertainty | Never resend blindly. `suv-deals outbox inspect` lists `uncertain` events; the dispatcher's follow-up rules (Slack lookup / single same-id resend for MCP Events) run on their own. | Provider receipt recorded or the event stays visibly `uncertain` with its reason. |
 | Stale tax/FX rules | Valuations are marked stale/incomplete automatically (`reconcile`). Validate candidate rule files: `suv-deals tax-rules validate config/tax_rules`. | An approved current rule set (docs/tax_rule_approval.md) and `suv-deals reconcile` recalculation. |
 | Secret exposure | Stop the affected integration (e.g. `docker compose stop dispatcher`, revoke MCP credentials: `suv-deals credentials revoke ID --reason ... --yes`), request controlled rotation from the owner. Run `uv run python scripts/redact_logs.py` on logs before sharing. | Old access revoked, new scoped credential tested, `suv-deals doctor` clean, logs reviewed. |
+| Uncertain seller-inquiry send | Never resend, never cancel: an `uncertain` inquiry keeps its reservation and quota debit. Look: dashboard Inquiries (attention filter) or `GET /api/inquiries?uncertain_only=true`; `suv-deals inquiries status`. If the desktop worker is offline, start it (it reports Outbox / Sent Items evidence when it reconnects); a reply quoting the Message-ID also proves submission. If the cause is unclear, pause: `suv-deals inquiries pause --reason "uncertain send" --expected-version N --yes`. | The inquiry moves to `accepted` only on positive evidence (Sent Items / provider hit / correlated reply), or to `failed_definite` only on proof of non-submission (e.g. the worker refused an expired, never-claimed intent `intent_expired`). An empty Sent Items search proves nothing. |
+| Stale or offline desktop mail worker | `suv-deals mail-worker credential list` (heartbeat age, monitoring) or dashboard Mail workers; check the PC is awake, classic Outlook runs and the account syncs. Coverage gaps are recorded, never hidden. Replies keep arriving in Outlook; nothing is lost while the worker is off. | Heartbeat fresh, `monitoring=true`, gap closed in `GET /api/mail-workers/coverage-gaps`; the worker's local backlog drains (reconciliation over the overlap window recovers mail received while it was off). |
+| Lost or compromised desktop credential | `suv-deals mail-worker credential revoke MAILBOX_ID --reason ... --yes` (the worker stops at once and keeps its backlog), then issue a new binding (section 10.2) and store the new token on the PC. | New heartbeat with the new credential; old token `401` (`mail_worker_credential_revoked`). |
 | Disk / memory pressure | Reduce concurrency: run one worker, stop optional snapshots (`SNAPSHOT_STORAGE=disabled`), restart the affected service. | Resource recovery without losing queue state: `outbox inspect`, `reconcile --dry-run`. |
 
 Readiness versus liveness: `/healthz` is process liveness only; `/readyz` includes database,
@@ -279,3 +295,106 @@ crawler (`doctor --crawler` against the real runtime), each source (terms decisi
 `crawl once` live smoke), Supabase (migrations + `doctor` + restore drill), MCP auth (real client,
 `docs/connect_mcp.md`), MCP Events / Slack (docs/notification_bridge.md canary), tax rules
 (docs/tax_rule_approval.md), seller email (docs/seller_email_activation.md).
+
+## 10. Seller inquiries and the desktop mail worker (spec §37)
+
+Owner decisions in force: ONE automatic initial inquiry per verified vehicle/seller pair
+(availability, documents, lowest price) with no per-message or first-template approval (there is
+no approve button anywhere); caps 2 per rolling 24 hours and 5 per rolling 15 days; default send
+path `outlook_local` (classic Outlook on the owner's PC with the owner's Gmail account in it),
+optional `gmail_api`. Nothing is sent unless `SELLER_INQUIRY_MODE=automatic`, the kill switch is
+off, the standing authorization is active and the sender binding is verified. Fixture-lineage
+listings never reserve or send. The owner's real mailbox address appears only in the runtime
+configuration and the database, never in the repository or a ticket.
+
+### 10.1 Sender binding (owner, once)
+
+1. `suv-deals sender-binding create --workspace W --provider outlook_local --account-id
+   <stable Outlook account key> --from-address <the owner's mailbox> --display-name "<name used as
+   signature>" --reason "owner-authorized sending identity" --yes` (unverified, health `unknown`).
+   For `gmail_api` add `--vault-ref <scheme:path>` naming the external secret store entry; never a
+   token value.
+2. After the desktop worker runs (10.2, 10.3) and has sent its account report and heartbeat:
+   `suv-deals sender-binding verify <id> --reason "technical verification" --yes`. It refuses with
+   problem codes (`NO_ACTIVE_MAIL_WORKER`, `WORKER_ACCOUNT_MISMATCH`, `WORKER_ACCOUNT_NOT_CLASSIC`,
+   `WORKER_HEARTBEAT_STALE`, `ACCOUNT_KEY_MISMATCH`, `REPLY_TO_NOT_VERIFIABLE_ON_OUTLOOK_LOCAL`)
+   until the evidence holds; then the binding is verified and `healthy` (`suv-deals sender-binding
+   status`, `suv-deals doctor`). `gmail_api` is verified through the provider check of
+   docs/seller_email_activation.md section 4/6 instead.
+
+### 10.1a Controls, authorization and mode
+
+1. `suv-deals inquiries authorize --workspace W --reason "owner standing authorization" --yes`
+   creates the controls row (mode `disabled_until_sender_ready`, kill switch off, caps 2/5) and
+   records the versioned standing authorization (spec 37.1) from
+   `config/seller_inquiry_authorization.yaml`.
+2. After 10.1-10.3 and the activation evidence (docs/seller_email_activation.md section 8):
+   `suv-deals inquiries set-mode automatic --reason ... --expected-version N --yes` and set the
+   process setting `SELLER_INQUIRY_MODE=automatic` (both must be automatic; under Compose
+   `SUV_DEALS_SELLER_INQUIRY_MODE`) for the worker AND the API process: the dispatcher plans
+   nothing and the desktop worker's claim (served by the API) is refused `kill_switch` while the
+   process setting is not `automatic` or `SELLER_INQUIRY_KILL_SWITCH=true`. `suv-deals inquiries
+   status` (run with the same environment) then shows `process_mode: automatic` and
+   `sending_possible: true` once `SELLER_EMAIL_ACCOUNT_ID` / `SELLER_EMAIL_FROM` (and
+   `SELLER_EMAIL_REPLY_TO`, if the binding has one) name exactly the verified binding
+   (`sender_identity_problems: []`; the runtime never sends from another identity, 10.5).
+   Lower the caps any time with `inquiries set-limits`.
+
+### 10.2 Issuing the mail-worker credential
+
+`suv-deals mail-worker credential issue --workspace W --sender-binding <id> --label "Owner laptop
+classic Outlook" --expires 90d --yes` prints, ONCE: the mailbox binding id and the `suvmail_`
+token. The token is narrow (`mail:ingest` only, one workspace, one mailbox), revocable and stored
+only as a hash. Type it directly into the PC's credential store (10.3); never paste it into a chat,
+file, ticket or e-mail. Rotate by issuing a new binding and revoking the old one.
+
+### 10.3 Installing the desktop worker on Windows (classic Outlook)
+
+Follow `desktop/outlook-bridge/README.md` ("Installation"); in short:
+
+- Classic Outlook for Windows with the owner's mailbox account added and synchronising (new Outlook
+  has no Object Model; the worker reports it as unsupported). Do not change Trust Center,
+  Object Model Guard, registry or antivirus settings to make it run.
+- Python 3.12/3.13 venv, `requirements-windows.txt`, and this repository's revision of `suv_deals`
+  installed `--no-deps` (the SAME revision as the backend).
+- `config.toml` (no secrets): `api_base_url` (https), `mailbox_binding_id` from 10.2, the account
+  SMTP address, the folders mailbox rules move mail into.
+- `python -m outlook_bridge credential set --expires-at <expiry from 10.2>` (hidden input; Windows
+  Credential Manager, current user).
+- `python -m outlook_bridge check` must exit 0, then run `python -m outlook_bridge run` in the
+  signed-in user session (never as a service/SYSTEM). The PC must be awake for timely replies;
+  offline periods are recorded as coverage gaps.
+
+### 10.4 Pausing, resuming and limits
+
+- Pause (kill switch) from the dashboard, the MCP tool `seller_inquiries_pause` (`inquiries:pause`)
+  or `suv-deals inquiries pause --reason ... --expected-version N --yes`. Untransmitted work stops
+  at the next guard (reservation, dispatch, the worker's claim right before `.Send`).
+- Resume is an owner action only: dashboard (`POST /api/inquiry-control/resume`) or
+  `suv-deals inquiries resume --reason ... --expected-version N --yes`. With
+  `--remove-suppressions --owner-user-id <owner's user id>` (dashboard: `remove_suppressions`), the
+  kill-switch suppressions (and, while the authorization is effective, authorization-revoked ones)
+  are removed, each with its own audit event. Opt-out, bounce, complaint and other suppressions
+  need their own explicit owner decision.
+- The caps can only be lowered (`max_per_24h` 0..2, `max_per_15d` 0..5) and the seller cooldown only
+  lengthened (7..365 days; omitted = unchanged). A claim refused for caps,
+  seller cooldown or a paused source answers `not_now`: the worker keeps the intent and asks again
+  later; it expires honestly (`intent_expired`) if the wait outlasts it.
+
+### 10.5 Why nothing was sent (send job codes)
+
+The job rows (`ops.jobs.last_error_code`, `blocker_code`) carry ids and codes only, never an address or
+a body. The runtime codes of a `seller_inquiry_plan` / `seller_inquiry_send` job (`workers.inquiry_handlers`):
+
+| Code | Where | Meaning and fix |
+|---|---|---|
+| `sender_identity_not_configured` (plan refusal) | plan | No verified binding of `SELLER_EMAIL_PROVIDER` is exactly the configured identity (`SELLER_EMAIL_ACCOUNT_ID`, `SELLER_EMAIL_FROM`, `SELLER_EMAIL_REPLY_TO`). Set them to the verified binding's values (`suv-deals doctor` requires them in automatic mode); another verified identity is never used. |
+| `SENDER_SETUP_INCOMPLETE` (blocked) | send | The inquiry's binding is no longer the configured identity, or the sender secret is unusable: `SECRET_REFERENCE_BINDING_MISMATCH` (`SELLER_EMAIL_OAUTH_SECRET_REFERENCE` must name the bound binding itself), `SECRET_REFERENCE_UNSUPPORTED` (only `secretbox:` references), `SECRET_BOX_NOT_CONFIGURED` (the secret-box key is missing). Fix the setting; nothing was transmitted. |
+| `SEND_HELD_PAUSED` (released) | send | Kill switch on or mode not automatic; the job waits without consuming attempts. |
+| `MAILBOX_WORKER_MISSING`, `WORKER_HEARTBEAT_STALE` (released) | send, `outlook_local` | No active desktop worker for the sender, or it is offline; nothing was published. Start the worker (10.3). |
+| `MAILBOX_WORKER_CREDENTIAL_NOT_LIVE` (released) | send, `outlook_local` | The mailbox's worker credential is revoked or expired; issue a new one (10.2). Its `ops.mail_worker_bindings` row stays `active` until a new binding replaces it. |
+| `EMAIL_DELIVERY_UNCERTAIN` (blocked) | send | The message may have left; it is never resent. The reconciliation pass resolves it from evidence (Sent Items report, provider search, a correlated reply). |
+
+A proven pre-submission refusal (for example a claim refused while paused) leaves the inquiry
+`failed_definite`; the reconciliation pass enqueues one guarded-retry send job per attempt
+number (`inquiry_retry_jobs` in `suv-deals reconcile`), at most three attempts in total.

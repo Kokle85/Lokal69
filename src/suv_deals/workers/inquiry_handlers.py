@@ -18,8 +18,12 @@ Three job types, registered in `workers.handlers.default_registry`:
     is NOT fixture lineage. Otherwise the readiness stays recorded (visible, informational) and
     the job finishes with a typed reason. Waiting conditions (rolling caps, seller cooldown) are
     not failures: the job is released (no attempt consumed) until
-    ``inquiries_repo.next_window_at`` says the window frees. There is no approval state and no
-    approval wait anywhere: the bounded standing authorization is the only authority.
+    ``inquiries_repo.next_window_at`` says the window frees. A reserved/queued, never-transmitted
+    inquiry bound to stale facts of this listing (the plan job of a NEW revision) is cancelled
+    (``inquiries_repo.cancel_stale_inquiries``, debit released) and the job re-runs at once, so the
+    current revision is decided and reserved anew instead of finishing as "inquiry exists". There
+    is no approval state and no approval wait anywhere: the bounded standing authorization is the
+    only authority.
 
 ``seller_inquiry_send`` (`handle_seller_inquiry_send`)
     Revalidates immediately before transmission through ``inquiries_repo.dispatch`` (the
@@ -34,6 +38,9 @@ Three job types, registered in `workers.handlers.default_registry`:
       ``mime_builder`` from the stored, immutable rendering) is handed to the provider OUTSIDE
       any transaction (`InquiryRuntime.api_provider`: the gated provider with the
       ``BindingTokenProvider`` and a live kill-switch probe), then ``record_outcome`` stores it.
+      A provider that cannot be built first goes through the non-transmitting preflight (a
+      revoked sender is suppressed, an unusable one holds); only a setup problem the preflight
+      cannot see blocks the job for the operator.
       A timeout or any ambiguity is ``uncertain``: the job is blocked with
       ``EMAIL_DELIVERY_UNCERTAIN`` and the inquiry waits for reconciliation; it is never resent.
       A proven pre-submission failure follows ``domain.inquiries.should_retry`` (the next run
@@ -116,13 +123,14 @@ from suv_deals.integrations.email_providers.outlook_local import (
     HEARTBEAT_STALE_AFTER,
     OutlookLocalProvider,
 )
-from suv_deals.integrations.secret_box import SecretBox
+from suv_deals.integrations.secret_box import SecretBox, SecretBoxError
 from suv_deals.integrations.seller_email import (
     API_PROVIDERS,
     GatedSenderProvider,
     ProviderDependencies,
     SenderSetupError,
     build_sender_provider,
+    configured_binding_problems,
     default_http_client,
     secret_reference_problems,
 )
@@ -170,6 +178,8 @@ CANDIDATE_STATES: Final = frozenset(
 )
 #: Listing availability that can never be asked about.
 _UNAVAILABLE: Final = frozenset({"sold_claimed", "removed"})
+#: Reserved but never transmitted: bound to the qualification snapshot, cancellable when stale.
+_UNSENT_BOUND_STATES: Final = frozenset({InquiryState.RESERVED, InquiryState.QUEUED})
 #: Typed job-result outcomes (``result_reference.outcome``).
 Outcome = Literal[
     "reserved",
@@ -243,13 +253,50 @@ def configured_provider(settings: Settings) -> EmailProviderKind:
     return EmailProviderKind(value) if value else EmailProviderKind.OUTLOOK_LOCAL
 
 
+def configured_sender_problems(settings: Settings, binding: SenderBindingRecord | None) -> list[str]:
+    """Why ``binding`` is not exactly the CONFIGURED sending identity (empty list: it is).
+
+    The configured identity is ``SELLER_EMAIL_PROVIDER`` (unset: ``outlook_local``),
+    ``SELLER_EMAIL_ACCOUNT_ID``, ``SELLER_EMAIL_FROM`` and ``SELLER_EMAIL_REPLY_TO`` (spec 37.3:
+    an explicitly configured mailbox, never "an arbitrary default account"). The API route
+    enforces this in `seller_email.build_sender_provider`; the ``outlook_local`` route publishes
+    intents without constructing a provider, so the runtime checks it here for every route,
+    before a reservation and before a send intent. Codes only (no address is echoed).
+    """
+    if binding is None:
+        return ["SENDER_BINDING_MISSING"]
+    effective = settings.model_copy(update={"seller_email_provider": configured_provider(settings).value})
+    status = sender_bindings_repo.sender_status(binding, mode="automatic", kill_switch=False)
+    return configured_binding_problems(effective, status)
+
+
+async def configured_sender_binding(
+    conn: Conn, actor: ActorContext, settings: Settings
+) -> SenderBindingRecord | None:
+    """The newest unrevoked binding of the configured provider that IS the configured identity;
+    otherwise the newest one of that provider (its readiness is still recorded, but
+    `reservation_refusal` refuses to reserve with it)."""
+    provider = configured_provider(settings)
+    candidates = [b for b in await sender_bindings_repo.list_bindings(conn, actor) if b.provider == provider]
+    for binding in candidates:  # newest first
+        if not configured_sender_problems(settings, binding):
+            return binding
+    return candidates[0] if candidates else None
+
+
 def automatic_sending_enabled(settings: Settings) -> bool:
-    """Process-level switches: ``SELLER_INQUIRY_MODE=automatic`` and the settings kill switch off.
+    """Process-level switches: ``SELLER_INQUIRY_MODE=automatic``, the settings kill switch off and
+    the owner's explicit ``SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL`` off (default). That owner
+    setting DISABLES automatic sending like a pause; it never creates an approval wait.
 
     The workspace controls row (mode, kill switch, caps) is checked separately by the domain and
     the database guards; both must allow sending.
     """
-    return settings.seller_inquiry_mode == "automatic" and not settings.seller_inquiry_kill_switch
+    return (
+        settings.seller_inquiry_mode == "automatic"
+        and not settings.seller_inquiry_kill_switch
+        and not requires_message_approval(settings)
+    )
 
 
 @dataclass(slots=True)
@@ -324,7 +371,27 @@ class InquiryRuntime:
             problems = secret_reference_problems(reference)
             if problems or reference is None:
                 raise SenderSetupError("the sender secret reference is not configured", problems)
-            box = self.secret_box or SecretBox.from_settings(self.settings)
+            try:
+                named = sender_bindings_repo.parse_secret_reference(reference)
+            except ValidationFailed:
+                raise SenderSetupError(
+                    "the sender secret reference is not supported", ["SECRET_REFERENCE_UNSUPPORTED"]
+                ) from None
+            if named != binding.id:
+                # The process-wide reference names ANOTHER binding: its sealed grant (another
+                # account's credential) is never borrowed for this binding's messages.
+                raise SenderSetupError(
+                    "the sender secret reference names another binding",
+                    ["SECRET_REFERENCE_BINDING_MISMATCH"],
+                )
+            try:
+                box = self.secret_box or SecretBox.from_settings(self.settings)
+            except SecretBoxError:
+                # A visible setup blocker (SENDER_SETUP_INCOMPLETE), never a dead letter that the
+                # orphan sweep would replace with a new send job on every pass.
+                raise SenderSetupError(
+                    "the server-side secret box is not configured", ["SECRET_BOX_NOT_CONFIGURED"]
+                ) from None
             provider = BindingTokenProvider(
                 db=self.db,
                 workspace_id=workspace_id,
@@ -343,6 +410,11 @@ class InquiryRuntime:
         unmet technical prerequisite; there is no approval prerequisite)."""
         if binding.provider not in API_PROVIDERS:
             raise SenderSetupError("not an API provider binding", ["PROVIDER_NOT_API"])
+        if not automatic_sending_enabled(self.settings):
+            # Nothing network-related (client, token provider) is built unless sending is on.
+            raise SenderSetupError("automatic sending is off", ["SELLER_INQUIRY_MODE_NOT_AUTOMATIC"])
+        if binding.provider != configured_provider(self.settings):
+            raise SenderSetupError("the bound provider is not the configured one", ["PROVIDER_MISMATCH"])
         sender = sender_bindings_repo.sender_status(
             binding, mode=controls.mode, kill_switch=controls.kill_switch
         )
@@ -398,8 +470,14 @@ def plan_dedup_key(listing_id: UUID, revision_id: UUID, suffix: str | None = Non
     return base if suffix is None else f"{base}:{suffix}"
 
 
-def send_dedup_key(inquiry_id: UUID, attempt_number: int) -> str:
-    return f"{SEND_PREFIX}:{inquiry_id}:{attempt_number}"
+def send_dedup_key(inquiry_id: UUID, attempt_number: int, reserved_at: datetime | None = None) -> str:
+    """One send job per transmission attempt of one RESERVATION: a never-transmitted inquiry that
+    was suppressed (long pause) and re-qualified by ``resume`` is reserved again (the database
+    sets a new ``reserved_at``) and needs its own send job for attempt 1."""
+    base = f"{SEND_PREFIX}:{inquiry_id}:{attempt_number}"
+    if reserved_at is None:
+        return base
+    return f"{base}:r{int(ensure_utc(reserved_at).timestamp() * 1_000_000)}"
 
 
 def reconcile_dedup_key(inquiry_id: UUID, bucket: str) -> str:
@@ -459,11 +537,13 @@ async def enqueue_send_job(
     inquiry_id: UUID,
     listing_id: UUID,
     attempt_number: int,
+    reserved_at: datetime | None = None,
     options: InquiryRuntimeOptions | None = None,
 ) -> UUID | None:
-    """The send job of one transmission attempt (``attempt_number`` 1..3)."""
+    """The send job of one transmission attempt (``attempt_number`` 1..3) of the reservation
+    made at ``reserved_at`` (`send_dedup_key`)."""
     opts = options or InquiryRuntimeOptions()
-    key = send_dedup_key(inquiry_id, attempt_number)
+    key = send_dedup_key(inquiry_id, attempt_number, reserved_at)
     if await _job_exists(conn, actor, JobType.SELLER_INQUIRY_SEND, key, listing_id):
         return None
     job_id, created = await jobs.enqueue(
@@ -575,10 +655,21 @@ async def _release_in(
     available_at: datetime | timedelta,
     code: str,
     detail: str | None = None,
+    audited: bool = False,
 ) -> None:
-    """Return the job to ``queued`` WITHOUT consuming an attempt (a waiting condition)."""
+    """Return the job to ``queued`` WITHOUT consuming an attempt (a waiting condition).
+
+    The reason stays visible on the job (``last_error_code`` / detail). Only rare waits (the
+    rolling window) are also audited: a periodic hold (worker offline overnight, a paused
+    workspace) would otherwise write an audit event every few minutes.
+    """
     await jobs.release(
-        conn, execution.job, available_at=available_at, code=code, detail=detail, actor=execution.actor
+        conn,
+        execution.job,
+        available_at=available_at,
+        code=code,
+        detail=detail,
+        actor=execution.actor if audited else None,
     )
 
 
@@ -646,6 +737,9 @@ def reservation_refusal(
     binding = snapshot.sender_binding
     if binding is None or binding.provider != configured_provider(settings):
         return "sender_provider_not_configured"
+    if configured_sender_problems(settings, binding):
+        # Another (even verified) identity than SELLER_EMAIL_ACCOUNT_ID / SELLER_EMAIL_FROM.
+        return "sender_identity_not_configured"
     if decision.readiness != InquiryReadiness.INQUIRY_READY:
         return f"readiness_{decision.readiness.value}"
     return None
@@ -674,9 +768,7 @@ async def _read_plan(
         if contact is None:
             # No exact-listing seller/contact evidence yet: there is nobody to ask (spec 37.3).
             return listing, None, _result("seller_not_linked", listing_id=listing_id)
-        binding = await sender_bindings_repo.active_binding(
-            conn, actor, provider=configured_provider(ctx.settings)
-        )
+        binding = await configured_sender_binding(conn, actor, ctx.settings)
         try:
             snapshot = await inquiries_repo.read_readiness_inputs(
                 conn,
@@ -745,6 +837,10 @@ async def _plan_commit(
         await apply_disposition(conn, job, Disposition.complete(result))
         return JobOutcome(state=JobState.SUCCEEDED, code=str(result["outcome"]), details=result)
 
+    # Lock order (docs/schema.md 11.5): ops.jobs row -> app.seller_inquiry_controls FIRST, then the
+    # seller entity and the inquiry. Recording the readiness updates the inquiry row, so the
+    # controls row is taken before it (the reservation below re-locks it as a no-op).
+    await sellers_repo.lock_controls(conn, actor.workspace_id)
     try:
         record = await inquiries_repo.open_inquiry(
             conn, actor, snapshot.identity, qualification_listing_id=listing.id
@@ -753,6 +849,28 @@ async def _plan_commit(
         return await done(
             _result("inquiry_exists", listing_id=listing.id, reason=(exc.details or {}).get("reason"))
         )
+    if record.state in _UNSENT_BOUND_STATES and record.qualification_listing_id == listing.id:
+        # Spec 37.5/37.10: a changed price, revision or availability cancels stale queued work.
+        # This plan job is the trigger for the listing's NEW facts: without this step the stale
+        # reservation would only be cancelled later by the dispatch preflight, after this job had
+        # finished as "inquiry_exists", and the current revision would never be inquired about.
+        cancelled = await inquiries_repo.cancel_stale_inquiries(conn, actor, listing_id=listing.id)
+        if record.id in cancelled:
+            # Never transmitted: the debit is released. Re-run at once with fresh reads (the
+            # readiness snapshot above still saw the reservation); no attempt is consumed.
+            await _release_in(
+                conn,
+                execution,
+                available_at=timedelta(0),
+                code="INQUIRY_STALE_CANCELLED",
+                detail="the unsent reservation was bound to stale listing facts; re-planned at once",
+                audited=True,
+            )
+            return JobOutcome(
+                state=JobState.QUEUED,
+                code="INQUIRY_STALE_CANCELLED",
+                details={"inquiry_id": str(record.id), "outcome": "stale_cancelled"},
+            )
     if record.state not in PRE_RESERVATION_STATES and record.state != InquiryState.CANCELLED:
         # Reserved, queued, (possibly) sent, suppressed...: the one inquiry of this pair exists.
         return await done(_result("inquiry_exists", inquiry_id=record.id, state=record.state))
@@ -780,7 +898,13 @@ async def _plan_commit(
         reason = details.get("reason") or (_problems(exc) or [exc.code.value])[0]
         return await done(_result("reservation_refused", reservation=str(reason)[:80], **base))
     send_job = await enqueue_send_job(
-        conn, actor, inquiry_id=queued.id, listing_id=listing.id, attempt_number=1, options=rt.options
+        conn,
+        actor,
+        inquiry_id=queued.id,
+        listing_id=listing.id,
+        attempt_number=1,
+        reserved_at=queued.reserved_at,
+        options=rt.options,
     )
     return await done(
         _result(
@@ -815,7 +939,12 @@ async def _hold_plan(
     if window.next_at is not None:
         code = _hold_code(codes, "INQUIRY_WAIT_WINDOW")
         await _release_in(
-            conn, execution, available_at=window.next_at, code=code, detail="waiting for the rolling window"
+            conn,
+            execution,
+            available_at=window.next_at,
+            code=code,
+            detail="waiting for the rolling window or the seller cooldown",
+            audited=True,
         )
         return JobOutcome(state=JobState.QUEUED, code=code, details={"next_at": window.next_at.isoformat()})
     result = _result("held", **base)
@@ -862,10 +991,15 @@ class MailboxState:
     outlook_connected: bool
     mailbox_sync_ok: bool
     now: datetime
+    #: The mailbox's worker credential is the binding's own, unrevoked and unexpired one (a
+    #: revoked -- e.g. stolen -- credential can no longer claim an intent, however fresh the
+    #: last heartbeat it sent before the revocation is).
+    credential_live: bool = True
 
     def fresh(self, max_age: timedelta) -> bool:
         return (
-            self.heartbeat_at is not None
+            self.credential_live
+            and self.heartbeat_at is not None
             and self.now - self.heartbeat_at <= max_age
             and self.outlook_connected
             and self.mailbox_sync_ok
@@ -878,10 +1012,12 @@ async def mailbox_state(conn: Conn, actor: ActorContext, sender_binding_id: UUID
         row = await fetch_one(
             conn,
             "select m.id, c.heartbeat_at, coalesce(c.outlook_connected, false) as outlook_connected,"
-            " coalesce(c.mailbox_sync_ok, false) as mailbox_sync_ok, clock_timestamp() as now"
+            " coalesce(c.mailbox_sync_ok, false) as mailbox_sync_ok, clock_timestamp() as now,"
+            " coalesce(k.revoked_at is null and k.expires_at > clock_timestamp(), false) as credential_live"
             " from ops.mail_worker_bindings m"
             " left join ops.mail_worker_checkpoints c on c.workspace_id = m.workspace_id"
             "  and c.mailbox_binding_id = m.id and c.store_id_hash = %(hash)s and c.folder_id_hash = %(hash)s"
+            " left join ops.api_credentials k on k.workspace_id = m.workspace_id and k.id = m.credential_id"
             " where m.workspace_id = %(ws)s and m.sender_binding_id = %(sender)s and m.state = 'active'"
             " order by m.created_at desc, m.id limit 1",
             {"ws": actor.workspace_id, "sender": sender_binding_id, "hash": HEALTH_ROW_HASH},
@@ -895,6 +1031,7 @@ async def mailbox_state(conn: Conn, actor: ActorContext, sender_binding_id: UUID
         outlook_connected=bool(row["outlook_connected"]),
         mailbox_sync_ok=bool(row["mailbox_sync_ok"]),
         now=ensure_utc(row["now"]),
+        credential_live=bool(row["credential_live"]),
     )
 
 
@@ -923,7 +1060,12 @@ async def handle_seller_inquiry_send(ctx: RuntimeContext, execution: JobExecutio
         return await _close_fixture(ctx, execution, record)
     held, database_paused = _paused(ctx.settings, reads.controls)
     waited = reads.now - (record.queued_at or record.reserved_at or reads.now)
-    if held and (not database_paused or waited < rt.options.max_send_hold):
+    # A paused workspace holds untransmitted work without consuming attempts. After
+    # `max_send_hold` a QUEUED inquiry goes to the dispatch preflight, which records the
+    # kill-switch suppression (debit released; `resume` re-qualifies it). A proven-unsent
+    # `failed_definite` inquiry only ever waits here: its retry runs after the pause.
+    long_pause = database_paused and waited >= rt.options.max_send_hold
+    if held and (record.state == InquiryState.FAILED_DEFINITE or not long_pause):
         return await _release(
             ctx,
             execution,
@@ -931,6 +1073,10 @@ async def handle_seller_inquiry_send(ctx: RuntimeContext, execution: JobExecutio
             code="SEND_HELD_PAUSED",
             detail="seller inquiries are paused or not in automatic mode; nothing was transmitted",
         )
+    if held:
+        # A long workspace pause: the preflight records it (the workspace controls refuse every
+        # transmission while paused, so this path never builds a provider or an intent).
+        return await _dispatch_only(ctx, execution, inquiry_id)
     if record.state == InquiryState.FAILED_DEFINITE:
         retried = await _guarded_retry(ctx, execution, record)
         if retried is not None:
@@ -938,6 +1084,12 @@ async def handle_seller_inquiry_send(ctx: RuntimeContext, execution: JobExecutio
     provider = record.sender_provider
     if provider is None or reads.binding is None:
         return await _dispatch_only(ctx, execution, inquiry_id)  # the preflight cancels it as stale
+    problems = configured_sender_problems(ctx.settings, reads.binding)
+    if problems:
+        # Bound to an identity that is not (or no longer) the configured sender: never published
+        # or handed to a provider. The non-transmitting preflight decides first (a revoked sender
+        # is suppressed, stale facts cancel); otherwise the job waits visibly for the operator.
+        return await _sender_not_configured(ctx, execution, inquiry_id, problems)
     if provider == EmailProviderKind.OUTLOOK_LOCAL:
         return await _send_outlook(ctx, execution, rt, record)
     if provider in API_PROVIDERS:
@@ -1021,10 +1173,25 @@ async def _apply_hold(
     return JobOutcome(state=JobState.QUEUED, code=code, details={"reasons": reasons[:20]})
 
 
-async def _dispatch_only(ctx: RuntimeContext, execution: JobExecution, inquiry_id: UUID) -> JobOutcome:
-    """An inquiry without a usable bound sender: the preflight records why (never transmits)."""
+class _StateChanged(Exception):
+    """The preflight would proceed on a path that never transmits: roll the intent back."""
+
+
+async def _dispatch_only(
+    ctx: RuntimeContext,
+    execution: JobExecution,
+    inquiry_id: UUID,
+    *,
+    on_proceed: Callable[[], Awaitable[JobOutcome]] | None = None,
+) -> JobOutcome:
+    """Run the dispatch preflight on a path that never transmits (an incomplete bound sender, a
+    long workspace pause, a provider that cannot be built): it records the cancellation or
+    suppression (e.g. a revoked sender) or holds. Should the preflight proceed after all, the
+    transaction is rolled back -- no intent is ever committed here -- and ``on_proceed`` decides
+    (default: release the job for an immediate re-run, e.g. the owner resumed in between)."""
     job = execution.job
     lease = AttemptLease(owner=job.lease_owner, token=job.lease_token, expires_at=job.lease_expires_at)
+    options = inquiry_runtime(ctx).options
 
     async def commit() -> JobOutcome:
         async with job_unit_of_work(ctx.db, job) as (conn, _locked):
@@ -1036,15 +1203,40 @@ async def _dispatch_only(ctx: RuntimeContext, execution: JobExecution, inquiry_i
                 message_approval_required=requires_message_approval(ctx.settings),
                 job_id=job.id,
             )
-            if result.outcome == "proceed":  # pragma: no cover - an incomplete binding never proceeds
-                raise ValidationFailed("an inquiry without a bound sender cannot be dispatched")
-            disposition = _dispatch_disposition(result, inquiry_runtime(ctx).options)
+            if result.outcome == "proceed":
+                raise _StateChanged
+            disposition = _dispatch_disposition(result, options)
             if disposition is None:
-                return await _apply_hold(conn, execution, result, inquiry_runtime(ctx).options)
+                return await _apply_hold(conn, execution, result, options)
             await apply_disposition(conn, job, disposition)
             return JobOutcome(state=JobState.SUCCEEDED, code=result.outcome)
 
-    return await retry_transient(commit)
+    try:
+        return await retry_transient(commit)
+    except _StateChanged:
+        if on_proceed is not None:
+            return await on_proceed()
+        return await _release(
+            ctx,
+            execution,
+            available_at=timedelta(0),
+            code="SEND_STATE_CHANGED",
+            detail="the controls changed during the preflight; re-evaluated at once, nothing was sent",
+        )
+
+
+async def _sender_not_configured(
+    ctx: RuntimeContext, execution: JobExecution, inquiry_id: UUID, problems: Sequence[str]
+) -> JobOutcome:
+    """A sender setup problem (codes in ``problems``): the non-transmitting preflight first, then
+    -- only if it would proceed -- the job is blocked ``SENDER_SETUP_INCOMPLETE`` for the operator
+    (no intent, no provider call; the inquiry stays queued with its debit)."""
+    detail = ", ".join(problems)[:300] or "SENDER_SETUP_INCOMPLETE"
+
+    async def block() -> JobOutcome:
+        return await _block(ctx, execution, "SENDER_SETUP_INCOMPLETE", detail)
+
+    return await _dispatch_only(ctx, execution, inquiry_id, on_proceed=block)
 
 
 async def _send_outlook(
@@ -1062,6 +1254,14 @@ async def _send_outlook(
             available_at=rt.options.worker_offline_delay,
             code="MAILBOX_WORKER_MISSING",
             detail="no active desktop mailbox worker is bound to the sender; nothing was published",
+        )
+    if not box.credential_live:
+        return await _release(
+            ctx,
+            execution,
+            available_at=rt.options.worker_offline_delay,
+            code="MAILBOX_WORKER_CREDENTIAL_NOT_LIVE",
+            detail="the desktop worker's credential is revoked or expired; nothing was published",
         )
     if not box.fresh(rt.options.heartbeat_max_age):
         return await _release(
@@ -1119,7 +1319,11 @@ async def _send_api(
     try:
         provider = rt.api_provider(actor.workspace_id, binding, controls)
     except SenderSetupError as exc:
-        return await _block(ctx, execution, "SENDER_SETUP_INCOMPLETE", ", ".join(exc.problems)[:300])
+        # The dispatch preflight decides first, without transmitting: a revoked sender is a
+        # suppression (debit released), an unusable sender or a changed binding holds or cancels
+        # like on every other route. Only a setup problem the preflight cannot see (process
+        # configuration, secret reference) blocks the job for the operator.
+        return await _sender_not_configured(ctx, execution, record.id, exc.problems)
     lease = AttemptLease(owner=job.lease_owner, token=job.lease_token, expires_at=job.lease_expires_at)
 
     async def commit_intent() -> DispatchResult | JobOutcome:
@@ -1376,6 +1580,16 @@ async def handle_seller_inquiry_reconcile(ctx: RuntimeContext, execution: JobExe
                 if inbound:
                     from suv_deals.workers.reply_handlers import enqueue_reply_process_job  # noqa: PLC0415
 
+                    # The seller's reply was stored while the send was unresolved (no state step
+                    # was possible then): apply its step now (``replied``, ``seller_opted_out`` or
+                    # ``bounced``; `inquiries_repo.mark_replied`), in this transaction.
+                    for reply_id in inbound[:5]:
+                        replied = await inquiries_repo.mark_replied(
+                            conn, actor, inquiry_id, reply_id=reply_id
+                        )
+                        if replied is not None:
+                            state = replied.state
+                            break
                     for reply_id in inbound[:5]:
                         await enqueue_reply_process_job(
                             conn,
@@ -1392,11 +1606,14 @@ async def handle_seller_inquiry_reconcile(ctx: RuntimeContext, execution: JobExe
                     inquiry_id=inquiry_id,
                     listing_id=record.qualification_listing_id,
                     attempt_number=len(attempts) + 1,
+                    reserved_at=record.reserved_at,
                     options=rt.options,
                 )
             else:
                 outcome = "still_uncertain"
-            done = _result(outcome, inquiry_id=inquiry_id, reasons=list(reconciled.decision.reasons))
+            done = _result(
+                outcome, inquiry_id=inquiry_id, state=state, reasons=list(reconciled.decision.reasons)
+            )
             await apply_disposition(conn, job, Disposition.complete(done))
             return JobOutcome(state=JobState.SUCCEEDED, code=outcome, details=done)
 
@@ -1448,6 +1665,8 @@ __all__ = [
     "MailboxState",
     "automatic_sending_enabled",
     "configured_provider",
+    "configured_sender_binding",
+    "configured_sender_problems",
     "correlated_inbound_replies",
     "enqueue_plan_job",
     "enqueue_reconcile_job",

@@ -157,7 +157,7 @@ schemas-check: ## Fail when a committed schema snapshot is stale
 dashboard-install: ## npm ci in dashboard/ (exact versions from package-lock.json)
 	npm --prefix dashboard ci
 
-dashboard-build: ## Type-check, build (strict CSP) and security-check the dashboard into dashboard/dist
+dashboard-build: ## Type-check, build (strict CSP) and security-check dashboard/dist (needs the 2 VITE_ vars)
 	npm --prefix dashboard run build
 
 dashboard-test: ## Dashboard unit/component tests (vitest + Testing Library)

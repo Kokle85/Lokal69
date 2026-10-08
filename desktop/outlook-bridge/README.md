@@ -97,17 +97,21 @@ the mailbox synchronising for timely detection; every other interval is a report
 |---|---|
 | `GET /v1/mail-workers/inquiry-bindings?cursor=&limit=100` | spec 37.8 (normative) |
 | `POST /v1/mail-workers/replies` (+ `Idempotency-Key`) | spec 37.8 (normative), v1.0 JSON |
-| `GET /v1/mail-workers/send-intents?limit=` | proposal of this package (outlook_local) |
-| `POST /v1/mail-workers/send-intents/{id}/claim` | proposal: revalidation immediately before `.Send`; every claim carries a new `claim_attempt_id` (and Idempotency-Key) and must be evaluated fresh, never answered from an idempotency replay |
-| `POST /v1/mail-workers/send-intents/{id}/report` | proposal: `OutlookSendReport` mirror |
-| `POST /v1/mail-workers/heartbeat` | proposal: health, checkpoints, gaps; answer carries Slack/MCP health |
-| `POST /v1/mail-workers/account-report` | proposal: `OutlookAccountReport` mirror |
+| `GET /v1/mail-workers/send-intents?limit=` | served (`api.mail_worker_routes`); pending intents plus reaped, never-claimed ones flagged `expired: true` (refused locally as `intent_expired`, without a claim, so the backend can reconcile the inquiry) |
+| `POST /v1/mail-workers/send-intents/{id}/claim` | served: revalidation immediately before `.Send`; every claim carries a new `claim_attempt_id` (and Idempotency-Key) and is evaluated fresh, never answered from an idempotency replay. Refusals: `kill_switch` (reported as a retryable pre-submission refusal), `not_now` (rolling caps, seller cooldown, source pause: nothing is reported, the intent waits and is claimed again after 10 minutes while valid), or a final reason |
+| `POST /v1/mail-workers/send-intents/{id}/report` | served: `OutlookSendReport` mirror (`Idempotency-Key: report-<intent>-<state>`); the observed Internet Message-ID of the sent copy is published back in the binding so replies to a rewritten header still correlate |
+| `POST /v1/mail-workers/heartbeat` | served: health, checkpoints, gaps (a gap never ends before it starts); answer carries Slack/MCP health |
+| `POST /v1/mail-workers/account-report` | served: `OutlookAccountReport` mirror (`security_settings_unchanged` is always `true`); a refused report is `409` |
 
 The worker never names a workspace and refuses client-side any binding page, upload or intent for
 another mailbox binding. A matched seller reply is sent in exactly the spec v1.0 shape; the optional
 domain extensions (`message_type`, `correlation_status`/`correlation_reasons`,
-`withheld_sensitive_attachments`) appear only for auto-replies/bounces, quarantined possible matches
-and withheld attachments. Limits: request <= 128 KiB, body <= 64 KiB, subject <= 512 characters,
+`withheld_sensitive_attachments`, and for a bounce/delivery notice `returned_message_ids`: the
+returned original's Message-IDs read from the RAW report before sanitising) appear only for
+auto-replies/bounces, quarantined possible matches and withheld attachments. The backend and this
+client ship together from one repository revision; `tests/contracts/test_mail_worker_contract.py`
+keeps both sides field-for-field identical and `tests/integration/mail_worker_e2e` runs this worker
+against the real backend app and PostgreSQL. Limits: request <= 128 KiB, body <= 64 KiB, subject <= 512 characters,
 <= 20 attachment metadata entries (name, MIME type, size, SHA-256, opaque local reference; never bytes
 or paths). Typed failures: 400/422 rejected locally, 401 stops transmission, 403/404/409 force a
 binding resync first, `IDEMPOTENCY_CONFLICT` is final (server quarantine), 429 honours `Retry-After`,

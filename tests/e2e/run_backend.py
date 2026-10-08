@@ -7,7 +7,9 @@
 3. serves ``suv_deals.api.app.create_app`` with uvicorn: ``SUPABASE_URL`` points at the mock auth
    server (the real JWKS client fetches its keys), the database is used through
    ``SET ROLE suv_backend`` (least privilege, RLS as in production), the dashboard origin is the
-   only CORS origin, JWT leeway is 0 (so the short-lived E2E tokens expire on time) and the
+   only CORS origin, JWT leeway is 0 (so the short-lived E2E tokens expire on time), the review
+   claim lease is the configurable ``REVIEW_CLAIM_DURATION_SECONDS`` minimum of 60 seconds (so a
+   REAL server-side claim expiry can be tested; ``--claim-duration-seconds``) and the
    per-principal rate limits are relaxed for the test burst;
 4. drops the database on exit (SIGTERM/SIGINT from Playwright), unless ``--keep-db``.
 
@@ -66,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app-origin", default="http://127.0.0.1:4173")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--keep-db", action="store_true", help="do not drop the database on exit")
+    parser.add_argument(
+        "--claim-duration-seconds",
+        type=int,
+        default=60,
+        help="review claim lease (REVIEW_CLAIM_DURATION_SECONDS, 60-3600; 60 for the claim-expiry test)",
+    )
     args = parser.parse_args(argv)
     if args.host not in ("127.0.0.1", "localhost"):
         parser.error("the E2E backend binds to loopback only")
@@ -83,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[e2e-backend] seeded; manifest at {args.manifest}", flush=True)
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             app_env="test",
             app_base_url=args.app_origin,
             api_allowed_origins=args.app_origin,
@@ -95,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             source_network_enabled=False,
             allow_external_notifications=False,
             event_bridge_enabled=False,
+            review_claim_duration_seconds=args.claim_duration_seconds,
             log_level=os.environ.get("E2E_BACKEND_LOG_LEVEL", "WARNING"),
         )
         app = create_app(

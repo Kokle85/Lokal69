@@ -91,6 +91,7 @@ from uuid import UUID, uuid4
 
 import anyio
 from psycopg import sql
+from pydantic import ValidationError
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
@@ -588,12 +589,14 @@ class Dispatcher:
         report = DispatchReport(workspace_id=workspace_id)
         selected, refusal = self.selection()
         for _ in range(self.options.events_per_cycle):
-            claimed = await outbox.claim_events(
+            # Category signals first (a seller reply is time-critical and rare: at most a few per
+            # day under the inquiry caps); the generic claim cannot lease them (see
+            # `claim_signal_events`) and also refuses fixture rows into ``blocked``.
+            claimed = await claim_signal_events(
                 self.ctx.db, workspace_id, self.dispatcher_id, self.options.outbox_lease_seconds, 1
             )
             if not claimed:
-                # Category signals the generic claim cannot lease (see `claim_signal_events`).
-                claimed = await claim_signal_events(
+                claimed = await outbox.claim_events(
                     self.ctx.db, workspace_id, self.dispatcher_id, self.options.outbox_lease_seconds, 1
                 )
             if not claimed:
@@ -1223,30 +1226,34 @@ class Dispatcher:
         config = self._slack_config(binding)
         if config is None or slack.signal_send_blockers(self.settings, config, category=category):
             return await self._transition(actor, event, OutboxState.BLOCKED, SLACK_BLOCKED)
+        # Parse the stored payload BEFORE the send is marked as attempted: a payload that does not
+        # parse (e.g. a non-https dashboard link) is visible and never retried; nothing was sent.
+        notice: slack.SlackSellerReplyNotice | slack.SlackOwnerAlertNotice
+        try:
+            if event.event_type == SELLER_REPLY_EVENT:
+                notice = slack.SlackSellerReplyNotice.model_validate(dict(event.payload))
+            else:
+                notice = slack.SlackOwnerAlertNotice.model_validate(dict(event.payload))
+        except ValidationError:
+            return await self._transition(actor, event, OutboxState.BLOCKED, INVALID_PAYLOAD)
+        if notice.event_id != event.event_id:
+            return await self._transition(actor, event, OutboxState.BLOCKED, INVALID_PAYLOAD)
         try:
             async with unit_of_work(self.ctx.db, actor) as conn:
                 await outbox.begin_send(conn, event)
         except LeaseLost:
             return EventResult(event.event_id, event.event_type, None, provider="slack")
         try:
-            if event.event_type == SELLER_REPLY_EVENT:
+            if isinstance(notice, slack.SlackSellerReplyNotice):
                 posted = await slack.post_seller_reply_signal(
-                    event.payload,
-                    config=config,
-                    settings=self.settings,
-                    http=self.http(),
-                    clock=self.ctx.clock,
+                    notice, config=config, settings=self.settings, http=self.http(), clock=self.ctx.clock
                 )
             else:
                 posted = await slack.post_owner_alert(
-                    event.payload,
-                    config=config,
-                    settings=self.settings,
-                    http=self.http(),
-                    clock=self.ctx.clock,
+                    notice, config=config, settings=self.settings, http=self.http(), clock=self.ctx.clock
                 )
         except AppError:
-            # Refused before any request (blocked or an invalid payload): nothing was sent.
+            # Refused before any request (activation gates): nothing was sent.
             return await self._transition(actor, event, OutboxState.BLOCKED, SLACK_BLOCKED)
         self.ctx.metrics.record_delivery("slack", _slack_metric(posted.kind))
 

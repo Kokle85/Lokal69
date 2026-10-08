@@ -28,8 +28,14 @@ Routes (each runs ONE short transaction of the worker's workspace unless noted):
   ``duplicate: true``; a conflicting upload is ``409``.
 - ``GET /send-intents``: pending intents of the worker's mailbox plus reaped, never-claimed,
   unreported ones flagged ``expired: true`` (the worker reports them ``intent_expired``).
+  ``kill_switch_active`` is also ``true`` while this process's settings forbid sending
+  (`process_gate`).
 - ``POST /send-intents/{intent_id}/claim``: ``Idempotency-Key`` required, but never stored or
-  replayed: a claim is ALWAYS evaluated fresh (``send_intents_repo.claim``).
+  replayed: a claim is ALWAYS evaluated fresh (``send_intents_repo.claim``). It is the last guard
+  before ``.Send``: while ``SELLER_INQUIRY_MODE`` is not ``automatic`` or
+  ``SELLER_INQUIRY_KILL_SWITCH`` is on, every claim is refused ``kill_switch`` (audited), even for
+  an intent committed earlier (owner decision: nothing is sent unless the mode is automatic and
+  the kill switch is off).
 - ``POST /send-intents/{intent_id}/report``: ``Idempotency-Key`` required; the same key and report
   replay the acknowledgement (``persistence.idempotency``), another report under the same key is
   ``409``. The path id must equal the body's ``intent_id``.
@@ -85,6 +91,7 @@ from suv_deals.persistence.database import Conn
 from suv_deals.persistence.errors_map import TransientConflict, mapped_errors
 from suv_deals.persistence.mail_workers_repo import WorkerIdentity
 from suv_deals.persistence.replies_repo import ReplyIngestOptions
+from suv_deals.settings import Settings
 
 router = APIRouter()
 
@@ -182,6 +189,25 @@ async def _work[T](request: Request, ctx: WorkerContext, work: Callable[[Conn], 
     return await in_transaction(api_state(request), ctx.worker.actor(ctx.request_id), work)
 
 
+#: ``process_gate`` detail codes (audited on the refused claim; never a value).
+GATE_KILL_SWITCH: Final = "SETTINGS_KILL_SWITCH_ACTIVE"
+GATE_MODE: Final = "SETTINGS_MODE_NOT_AUTOMATIC"
+
+
+def process_gate(settings: Settings) -> str | None:
+    """Why this process's settings forbid sending (``None`` when they allow it).
+
+    ``SELLER_INQUIRY_KILL_SWITCH`` and ``SELLER_INQUIRY_MODE`` are process-level switches next to
+    the workspace controls in the database; both must allow sending, so a switch flipped on the
+    API process stops an intent that was committed before (at the worker's claim).
+    """
+    if settings.seller_inquiry_kill_switch:
+        return GATE_KILL_SWITCH
+    if settings.seller_inquiry_mode != "automatic":
+        return GATE_MODE
+    return None
+
+
 def _wire_intent(intent: OutlookSendIntent, *, expired: bool) -> MailWorkerSendIntent:
     return MailWorkerSendIntent.model_validate({**intent.model_dump(), "expired": expired})
 
@@ -218,7 +244,12 @@ async def post_reply(request: Request, ctx: Worker) -> Response:
         key,
         request_id=ctx.request_id,
         now=state.clock.now(),
-        options=ReplyIngestOptions(dashboard_base_url=state.settings.app_base_url),
+        options=ReplyIngestOptions(
+            dashboard_base_url=state.settings.app_base_url,
+            # The worker's ``seller_reply_process`` job (owner decisions, opportunity check) is
+            # queued in the same transaction; the reconciliation pass is only the backstop.
+            enqueue_processing_job=True,
+        ),
     )
     return _wire(ack)
 
@@ -242,8 +273,11 @@ async def get_send_intents(request: Request, ctx: Worker) -> Response:
         *(_wire_intent(i, expired=False) for i in batch.intents),
         *(_wire_intent(i, expired=True) for i in batch.expired),
     )
+    closed = process_gate(api_state(request).settings) is not None
     return _wire(
-        MailWorkerSendIntentBatch(intents=intents[: query.limit], kill_switch_active=batch.kill_switch_active)
+        MailWorkerSendIntentBatch(
+            intents=intents[: query.limit], kill_switch_active=batch.kill_switch_active or closed
+        )
     )
 
 
@@ -255,6 +289,7 @@ async def post_claim(request: Request, intent_id: str, ctx: Worker) -> Response:
     body = await body_model(request, MailWorkerClaimRequest)
     _same_intent(target, body.intent_id)
     ctx.worker.require_mailbox(body.mailbox_binding_id)
+    gate = process_gate(api_state(request).settings)
     result = await _work(
         request,
         ctx,
@@ -265,6 +300,7 @@ async def post_claim(request: Request, intent_id: str, ctx: Worker) -> Response:
             claim_attempt_id=body.claim_attempt_id,
             worker_id=body.worker_id,
             request_id=ctx.request_id,
+            process_gate=gate,
         ),
     )
     return _wire(
@@ -341,10 +377,13 @@ async def post_account_report(request: Request, ctx: Worker) -> Response:
 
 
 __all__ = [
+    "GATE_KILL_SWITCH",
+    "GATE_MODE",
     "REPORT_OPERATION",
     "Worker",
     "WorkerContext",
     "authenticate_worker",
+    "process_gate",
     "required_idempotency_key",
     "router",
 ]

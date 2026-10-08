@@ -22,6 +22,7 @@ from tests.integration.db.helpers import Seed
 from tests.integration.pipeline.support import (
     PipelineEnv,
     build_env,
+    run,
     seed_comparables,
     seed_fx,
 )
@@ -47,7 +48,14 @@ from tests.integration.v11_runtime.support import (
 )
 
 from suv_deals.domain.enums import InquiryState, JobType
-from suv_deals.workers.inquiry_handlers import enqueue_plan_job, enqueue_send_job
+from suv_deals.persistence import inquiries_repo
+from suv_deals.persistence.database import Conn
+from suv_deals.workers.inquiry_handlers import (
+    InquiryRuntimeOptions,
+    enqueue_plan_job,
+    enqueue_send_job,
+    inquiry_runtime,
+)
 from suv_deals.workers.reconciliation import Reconciler
 
 pytestmark = pytest.mark.db
@@ -356,3 +364,53 @@ async def test_reconciliation_skips_a_workspace_without_business_configuration(
     report = await Reconciler(env.ctx).reconcile_workspace(bare, dry_run=True)
     assert report.errors == []
     assert report.inquiry_plan_jobs == 0
+
+
+# --------------------------------------------------------------------------------------------
+# A long owner pause: suppression of the queued work, then resume and a fresh reservation
+# --------------------------------------------------------------------------------------------
+
+
+async def test_long_pause_suppresses_queued_work_and_resume_reserves_again(env: PipelineEnv) -> None:
+    sender = await prepare_sender(env)
+    assert sender.worker is not None
+    await _planned(env)
+    [inquiry] = inquiries_of(env)
+    assert inquiry["state"] == InquiryState.QUEUED and debits_of(env) == 1
+    await pull_kill_switch(env)
+    # The pause has lasted longer than the hold window (PROPOSED default 24 h; 0 here).
+    rt = inquiry_runtime(env.ctx)
+    rt.options = InquiryRuntimeOptions(max_send_hold=timedelta(0))
+    reports = await work(env, JobType.SELLER_INQUIRY_SEND)
+    assert [r.code for r in reports] == ["suppressed"]
+    [send] = jobs_of(env, JobType.SELLER_INQUIRY_SEND)
+    assert send["state"] == "succeeded" and send["result_reference"]["outcome"] == "suppressed"
+    [inquiry] = inquiries_of(env)
+    assert inquiry["state"] == InquiryState.SUPPRESSED
+    assert debits_of(env) == 0 and attempts_of(env, inquiry["id"]) == []  # never transmitted
+    assert (await pending_intents(env, sender.worker)).intents == ()
+
+    # The owner resumes: re-qualified (nothing sent by the resume itself) ...
+    owner = env.owner
+
+    async def resume(conn: Conn) -> None:
+        controls = await inquiries_repo.get_controls(conn, owner)
+        assert controls is not None
+        await inquiries_repo.resume(
+            conn, owner, expected_version=controls.version, reason="owner resumed inquiries"
+        )
+
+    await run(env.ctx, owner, resume)
+    [inquiry] = inquiries_of(env)
+    assert inquiry["state"] == InquiryState.QUALIFYING
+    # ... and the next reconciliation pass decides it again: a NEW reservation with its own send job.
+    report = await Reconciler(env.ctx).reconcile_workspace(env.workspace_id)
+    assert report.inquiry_replan_jobs == 1 and report.errors == []
+    await work(env)
+    sends = jobs_of(env, JobType.SELLER_INQUIRY_SEND)
+    assert [s["result_reference"]["outcome"] for s in sends] == ["suppressed", "intent_published"]
+    assert sends[0]["dedup_key"] != sends[1]["dedup_key"]
+    [inquiry] = inquiries_of(env)
+    assert inquiry["state"] == InquiryState.SENDING and debits_of(env) == 1
+    assert len(attempts_of(env, inquiry["id"])) == 1
+    no_approval_state(env)

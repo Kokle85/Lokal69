@@ -37,16 +37,39 @@ short transaction, no network I/O:
    - a ``seller_inquiry_plan`` job for current eligible, real-lineage listings that have no inquiry
      record, once per (revision, current seller contact evidence): the valuation pipeline plans each
      new revision itself; this catches a seller contact recorded after that plan found nobody to ask;
+   - a fresh ``seller_inquiry_plan`` job (no open plan job of the listing) for a not-yet-reserved
+     inquiry (``candidate``/``qualifying``/``held_facts``, e.g. readiness recorded while
+     ``disabled_until_sender_ready``, held by an owner pause, or re-qualified by ``resume``) and for
+     a never-transmitted reservation the dispatch preflight cancelled because its bound facts went
+     stale (readiness still ``inquiry_ready``: changed listing, sender re-verification...), once per
+     (revision, prerequisite fingerprint): the fingerprint covers the inquiry state, the listing's
+     revision and availability, the controls version, the latest authorization version, the
+     unrevoked sender bindings (+ versions), the listing's contact evidence, the process-level
+     switches (``SELLER_INQUIRY_MODE``, kill switch, owner approval setting, send route) and the UTC
+     day, so a sender verification, a mode change (database or process), a resume or new contact
+     evidence is re-decided at the next pass and anything else at most once a day;
+   - a reaped ``seller_inquiry_send`` job (``blocked`` with ``EMAIL_DELIVERY_UNCERTAIN``) that
+     provably committed no send intent (no delivery attempt names it) while its inquiry is still
+     ``queued`` is returned to the queue (``jobs.unblock`` with the audited acknowledgement): it
+     crashed before any I/O, so nothing can have left;
    - a ``seller_inquiry_send`` job for a ``queued`` inquiry that has none (never for one with a
      running attempt);
-   - a ``seller_inquiry_reconcile`` job (at most one per inquiry per hour) for every ``uncertain``
-     inquiry whose unreconciled uncertain attempt ended more than ``inquiry_reconcile_after`` and
-     less than ``inquiry_reconcile_horizon`` ago;
+   - a ``seller_inquiry_send`` job for a ``failed_definite`` inquiry whose last attempt is proven
+     never submitted (e.g. the desktop worker refused its claim during a pause) and that has
+     attempts left and no open send job: the job only runs the GUARDED retry
+     (``domain.inquiries.should_retry``; the database refuses anything else), one per attempt;
+   - a ``seller_inquiry_reconcile`` job (at most one per inquiry per hour, none while an earlier
+     one is open or blocked) for every ``uncertain`` inquiry whose unreconciled uncertain attempt
+     ended more than ``inquiry_reconcile_after`` and less than ``inquiry_reconcile_horizon`` ago;
    - the ONE ``seller_reply_process`` job of every recent, unquarantined seller reply that has none
-     (an ingest path that did not queue it).
+     (an ingest path that did not queue it);
+   - ``accepted``/``no_reply_yet`` inquiries that already have an unquarantined seller reply or
+     bounce (stored while the send was still unresolved) take the stored replies' own steps:
+     ``replied``, ``seller_opted_out`` (opt-out/complaint) or ``bounced``
+     (``inquiries_repo.mark_replied``).
 
-   The plan sweep and the configuration-dependent invalidation skip a workspace without a business
-   configuration.
+   The plan sweeps and the configuration-dependent invalidation skip a workspace without a
+   business configuration; one failing sub-step never stops the others.
 6. **Metrics**: queue depth / oldest due age per job type, lease expirations and dead letters.
 
 ``dry_run=True`` reports what a pass WOULD do: transactional steps run and are rolled back, the
@@ -55,6 +78,7 @@ database-level reapers are replaced by read-only counts. Nothing is committed in
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import signal
 from collections.abc import Awaitable, Callable
@@ -92,6 +116,7 @@ from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
 from suv_deals.workers.inquiry_handlers import (
     PLAN_PREFIX,
+    configured_provider,
     enqueue_plan_job,
     enqueue_reconcile_job,
     enqueue_send_job,
@@ -130,6 +155,8 @@ class ReconcileOptions:
     interval_seconds: float = 300.0
     #: Seller-inquiry sweeps: plan jobs per pass, send jobs per pass, reconcile jobs per pass.
     inquiry_plan_limit: int = 50
+    #: Re-decided not-yet-reserved inquiries per pass.
+    inquiry_replan_limit: int = 50
     inquiry_send_limit: int = 50
     inquiry_reconcile_limit: int = 50
     #: An uncertain send is reconciled once it is this old (the provider/worker may still report)...
@@ -139,6 +166,9 @@ class ReconcileOptions:
     #: Seller replies of this age or younger get their processing job if none exists.
     reply_process_horizon: timedelta = timedelta(days=7)
     reply_process_limit: int = 50
+    replied_backfill_limit: int = 50
+    #: Reaped send jobs that provably committed no send intent, returned to the queue per pass.
+    unsent_send_unblock_limit: int = 20
 
     def __post_init__(self) -> None:
         if self.stale_detail_age < timedelta(hours=1):
@@ -172,9 +202,14 @@ class ReconcileReport:
     valuations_invalidated: int = 0
     recompute_jobs: int = 0
     inquiry_plan_jobs: int = 0
+    inquiry_replan_jobs: int = 0
     inquiry_send_jobs: int = 0
+    #: Send jobs for proven-unsent ``failed_definite`` inquiries (guarded retry decides).
+    inquiry_retry_jobs: int = 0
     inquiry_reconcile_jobs: int = 0
     reply_process_jobs: int = 0
+    inquiries_marked_replied: int = 0
+    inquiry_send_jobs_unblocked: int = 0
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -310,8 +345,53 @@ select l.id, l.current_revision_id, c.id as contact_id
  limit %(limit)s
 """
 
+#: Not-yet-reserved inquiries of current eligible real-lineage listings without an open plan job,
+#: with the fingerprint of everything that can turn their decision around (the inquiry's state,
+#: the listing's revision and availability, controls, authorization, senders, contacts, the UTC
+#: day). A NEVER-transmitted reservation that was cancelled because its bound facts went stale
+#: (dispatch preflight: changed listing, sender re-verification, availability...; its readiness
+#: is still ``inquiry_ready``) is a candidate again: the standing authorization is unused, so
+#: the current facts are decided anew (``record_readiness`` re-qualifies it; the database
+#: refuses it once any attempt exists). Suppressed records need the owner's resume.
+_REPLAN_SQL: Final = """
+select distinct on (l.id) l.id, l.current_revision_id,
+       pg_catalog.md5(pg_catalog.concat_ws('|', i.state, l.current_revision_id, l.availability,
+                      ctl.version, auth.version, snd.fp, con.fp,
+                      pg_catalog.to_char(clock_timestamp() at time zone 'UTC', 'YYYYMMDD'))) as fingerprint
+  from app.seller_inquiries i
+  join app.listings l on l.workspace_id = i.workspace_id and l.id = i.qualification_listing_id
+  left join app.seller_inquiry_controls ctl on ctl.workspace_id = i.workspace_id
+  left join lateral (select max(a.version) as version from app.seller_inquiry_authorizations a
+                      where a.workspace_id = i.workspace_id) auth on true
+  left join lateral (select string_agg(b.id::text || '.' || b.version::text, ',' order by b.id) as fp
+                       from ops.email_sender_bindings b
+                      where b.workspace_id = i.workspace_id and b.revoked_at is null) snd on true
+  left join lateral (select string_agg(c.id::text || '.' || c.status, ',' order by c.id) as fp
+                       from app.seller_contacts c
+                      where c.workspace_id = l.workspace_id and c.listing_id = l.id) con on true
+ where i.workspace_id = %(ws)s
+   and (i.state in ('candidate', 'qualifying', 'held_facts')
+        or (i.state = 'cancelled' and i.readiness = 'inquiry_ready' and i.send_attempted_at is null
+            and not exists (select 1 from ops.email_delivery_attempts a
+                             where a.workspace_id = i.workspace_id and a.inquiry_id = i.id)
+            and not exists (select 1 from app.seller_inquiries o
+                             where o.workspace_id = i.workspace_id
+                               and o.qualification_listing_id = i.qualification_listing_id
+                               and o.id <> i.id and o.state <> 'cancelled')))
+   and l.eligibility_state in ('eligible_primary', 'eligible_manual_profile')
+   and not l.is_fixture and not l.quarantined and not l.identity_conflict
+   and l.current_revision_id is not null
+   and l.availability in ('available', 'reserved', 'unknown')
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = l.workspace_id and j.listing_id = l.id
+                      and j.job_type = 'seller_inquiry_plan'
+                      and j.state in ('queued', 'running', 'retry_wait'))
+ order by l.id, i.updated_at, i.id
+ limit %(limit)s
+"""
+
 _ORPHAN_QUEUED_SQL: Final = """
-select i.id, i.qualification_listing_id as listing_id,
+select i.id, i.qualification_listing_id as listing_id, i.reserved_at,
        (select count(*) from ops.email_delivery_attempts a
          where a.workspace_id = i.workspace_id and a.inquiry_id = i.id) as attempts
   from app.seller_inquiries i
@@ -320,6 +400,40 @@ select i.id, i.qualification_listing_id as listing_id,
    and not exists (select 1 from ops.email_delivery_attempts a
                     where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
                       and a.outcome = 'running')
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = i.workspace_id and j.job_type = 'seller_inquiry_send'
+                      and j.payload ->> 'inquiry_id' = i.id::text
+                      and j.state in ('queued', 'running', 'retry_wait', 'blocked'))
+ order by i.updated_at, i.id
+ limit %(limit)s
+"""
+
+#: ``failed_definite`` inquiries whose LAST attempt is proven never submitted (a pre-submission
+#: failure, e.g. the desktop worker refusing its claim while the workspace was paused, or a
+#: reconciled ``proven_not_submitted``), with attempts left, nothing running, accepted or
+#: unresolved, and no open send job. On the ``outlook_local`` route the send job completed when
+#: the intent was published, so without this sweep the worker's refusal report would end the
+#: authorized inquiry for good. The new send job only calls the GUARDED retry
+#: (``inquiries_repo.retry``: ``domain.inquiries.should_retry``, same account, < 3 attempts; the
+#: database refuses everything else) and is one per attempt number (``send_dedup_key``).
+_RETRYABLE_FAILED_SQL: Final = """
+select i.id, i.qualification_listing_id as listing_id, i.reserved_at, n.attempts
+  from app.seller_inquiries i
+  join lateral (select count(*) as attempts, max(a.attempt_number) as last_number
+                  from ops.email_delivery_attempts a
+                 where a.workspace_id = i.workspace_id and a.inquiry_id = i.id) n on true
+ where i.workspace_id = %(ws)s
+   and i.state = 'failed_definite'
+   and n.attempts between 1 and 2
+   and exists (select 1 from ops.email_delivery_attempts a
+                where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
+                  and a.attempt_number = n.last_number
+                  and (a.outcome = 'pre_submission_failure' or a.reconciled_outcome = 'proven_not_submitted'))
+   and not exists (select 1 from ops.email_delivery_attempts a
+                    where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
+                      and (a.outcome in ('running', 'accepted', 'definite_rejection')
+                           or (a.outcome = 'uncertain' and a.reconciled_outcome is null)
+                           or a.reconciled_outcome = 'accepted'))
    and not exists (select 1 from ops.jobs j
                     where j.workspace_id = i.workspace_id and j.job_type = 'seller_inquiry_send'
                       and j.payload ->> 'inquiry_id' = i.id::text
@@ -342,6 +456,50 @@ select r.id, r.inquiry_id, i.qualification_listing_id as listing_id
  limit %(limit)s
 """
 
+#: Send jobs the reaper blocked with EMAIL_DELIVERY_UNCERTAIN although they never committed a
+#: send intent: no delivery attempt names the job (``dispatch`` / ``dispatch_outlook`` commit the
+#: attempt with its ``job_id`` in the job's own fenced transaction, and the provider call or the
+#: desktop worker's claim only ever follows that commit), and their inquiry is still ``queued``
+#: (nothing of it is running). The job crashed before any I/O, so nothing can have left; without
+#: this sweep the queued inquiry would wait for an operator forever (the orphan sweep never adds
+#: a second job beside a blocked one).
+_UNSENT_BLOCKED_SEND_SQL: Final = """
+select j.id
+  from ops.jobs j
+  join app.seller_inquiries i on i.workspace_id = j.workspace_id and i.id::text = j.payload ->> 'inquiry_id'
+ where j.workspace_id = %(ws)s
+   and j.job_type = 'seller_inquiry_send'
+   and j.state = 'blocked' and j.blocker_code = %(blocker)s
+   and i.state = 'queued'
+   and not exists (select 1 from ops.email_delivery_attempts a
+                    where a.workspace_id = j.workspace_id and a.job_id = j.id)
+   and not exists (select 1 from ops.email_delivery_attempts a
+                    where a.workspace_id = i.workspace_id and a.inquiry_id = i.id and a.outcome = 'running')
+ order by j.updated_at, j.id
+ limit %(limit)s
+"""
+
+#: Accepted inquiries whose seller already replied (or whose message bounced) while the send was
+#: unresolved: ``inquiries_repo.mark_replied`` applies the stored replies' own steps.
+_REPLIED_BACKFILL_SQL: Final = """
+select i.id,
+       (select r.id from app.seller_replies r
+         where r.workspace_id = i.workspace_id and r.inquiry_id = i.id
+           and not r.quarantined and r.message_type in ('seller_reply', 'bounce')
+         order by r.ingested_at, r.id limit 1) as reply_id
+  from app.seller_inquiries i
+ where i.workspace_id = %(ws)s
+   and i.state in ('accepted', 'no_reply_yet')
+   and exists (select 1 from app.seller_replies r
+                where r.workspace_id = i.workspace_id and r.inquiry_id = i.id
+                  and not r.quarantined and r.message_type in ('seller_reply', 'bounce'))
+ order by i.updated_at, i.id
+ limit %(limit)s
+"""
+
+#: Uncertain inquiries due for a reconcile job: at most one per hour, and none while an earlier
+#: reconcile job is open or BLOCKED (a missing reconciliation source needs the operator once;
+#: it must not pile up one more blocked job every hour for the whole horizon).
 _UNCERTAIN_SQL: Final = """
 select i.id, i.qualification_listing_id as listing_id,
        to_char(clock_timestamp() at time zone 'UTC', 'YYYYMMDDHH24') as bucket
@@ -357,10 +515,35 @@ select i.id, i.qualification_listing_id as listing_id,
    and not exists (select 1 from ops.jobs j
                     where j.workspace_id = i.workspace_id and j.job_type = 'seller_inquiry_reconcile'
                       and j.payload ->> 'inquiry_id' = i.id::text
-                      and j.state in ('queued', 'running', 'retry_wait'))
+                      and j.state in ('queued', 'running', 'retry_wait', 'blocked'))
  order by i.updated_at, i.id
  limit %(limit)s
 """
+
+
+def _process_fingerprint(settings: Settings) -> str:
+    """The process-level switches the plan job reads (``inquiry_handlers.reservation_refusal``):
+    a restart with another ``SELLER_INQUIRY_MODE``, kill switch, owner approval setting, send
+    route or configured sending identity re-decides not-yet-reserved inquiries at the next pass,
+    not only on the next UTC day. The identity enters only as a digest (never an address)."""
+    identity = hashlib.sha256(
+        "\x00".join(
+            (
+                settings.seller_email_account_id or "",
+                (settings.seller_email_from or "").lower(),
+                (settings.seller_email_reply_to or "").lower(),
+            )
+        ).encode()
+    ).hexdigest()
+    return "|".join(
+        (
+            str(settings.seller_inquiry_mode),
+            str(bool(settings.seller_inquiry_kill_switch)),
+            str(bool(settings.seller_inquiry_require_message_approval)),
+            configured_provider(settings).value,
+            identity,
+        )
+    )
 
 
 async def _has_business_config(conn: Conn, actor: ActorContext) -> bool:
@@ -730,6 +913,26 @@ class Reconciler:
                 created += int(job_id is not None)
             return created
 
+        async def replans(conn: Conn) -> int:
+            if not await _has_business_config(conn, actor):
+                return 0
+            async with mapped_errors():
+                rows = await fetch_all(conn, _REPLAN_SQL, {"ws": ws, "limit": opts.inquiry_replan_limit})
+            process = _process_fingerprint(self.ctx.settings)
+            created = 0
+            for row in rows:
+                digest = hashlib.sha256(f"{row['fingerprint']}|{process}".encode()).hexdigest()
+                job_id = await enqueue_plan_job(
+                    conn,
+                    actor,
+                    listing_id=row["id"],
+                    revision_id=row["current_revision_id"],
+                    reason="reconciliation_recheck",
+                    suffix=f"recheck-{digest[:16]}",
+                )
+                created += int(job_id is not None)
+            return created
+
         async def sends(conn: Conn) -> int:
             async with mapped_errors():
                 rows = await fetch_all(conn, _ORPHAN_QUEUED_SQL, {"ws": ws, "limit": opts.inquiry_send_limit})
@@ -741,6 +944,25 @@ class Reconciler:
                     inquiry_id=row["id"],
                     listing_id=row["listing_id"],
                     attempt_number=int(row["attempts"]) + 1,
+                    reserved_at=row["reserved_at"],
+                )
+                created += int(job_id is not None)
+            return created
+
+        async def retries(conn: Conn) -> int:
+            async with mapped_errors():
+                rows = await fetch_all(
+                    conn, _RETRYABLE_FAILED_SQL, {"ws": ws, "limit": opts.inquiry_send_limit}
+                )
+            created = 0
+            for row in rows:
+                job_id = await enqueue_send_job(
+                    conn,
+                    actor,
+                    inquiry_id=row["id"],
+                    listing_id=row["listing_id"],
+                    attempt_number=int(row["attempts"]) + 1,
+                    reserved_at=row["reserved_at"],
                 )
                 created += int(job_id is not None)
             return created
@@ -789,10 +1011,60 @@ class Reconciler:
                 created += int(job_id is not None)
             return created
 
-        report.inquiry_plan_jobs = await _step(self.ctx, actor, plans, dry_run=report.dry_run)
-        report.inquiry_send_jobs = await _step(self.ctx, actor, sends, dry_run=report.dry_run)
-        report.inquiry_reconcile_jobs = await _step(self.ctx, actor, reconciles, dry_run=report.dry_run)
-        report.reply_process_jobs = await _step(self.ctx, actor, replies, dry_run=report.dry_run)
+        async def replied(conn: Conn) -> int:
+            async with mapped_errors():
+                rows = await fetch_all(
+                    conn, _REPLIED_BACKFILL_SQL, {"ws": ws, "limit": opts.replied_backfill_limit}
+                )
+            changed = 0
+            for row in rows:
+                record = await inquiries_repo.mark_replied(conn, actor, row["id"], reply_id=row["reply_id"])
+                changed += int(record is not None)
+            return changed
+
+        async def unblock_unsent(conn: Conn) -> int:
+            async with mapped_errors():
+                rows = await fetch_all(
+                    conn,
+                    _UNSENT_BLOCKED_SEND_SQL,
+                    {
+                        "ws": ws,
+                        "blocker": jobs.EMAIL_DELIVERY_UNCERTAIN,
+                        "limit": opts.unsent_send_unblock_limit,
+                    },
+                )
+            for row in rows:
+                # The acknowledgement is backed by evidence (no attempt names this job) and audited.
+                await jobs.unblock(
+                    conn,
+                    actor,
+                    row["id"],
+                    reason="reaped before any send intent was committed (no delivery attempt names"
+                    " this job); nothing can have been transmitted",
+                    acknowledge_uncertain_delivery=True,
+                )
+            return len(rows)
+
+        async def sub(name: str, operation: Callable[[Conn], Awaitable[int]]) -> int:
+            # One failing sub-step never stops the others (as for the top-level steps).
+            try:
+                return await _step(self.ctx, actor, operation, dry_run=report.dry_run)
+            except AppError as exc:
+                report.errors.append(f"inquiries.{name}:{exc.code.value}")
+                logger.warning(
+                    "reconciliation step failed",
+                    extra={"step": f"inquiries.{name}", "error_code": exc.code.value},
+                )
+                return 0
+
+        report.inquiry_plan_jobs = await sub("plans", plans)
+        report.inquiry_replan_jobs = await sub("replans", replans)
+        report.inquiry_send_jobs_unblocked = await sub("unblock_unsent", unblock_unsent)
+        report.inquiry_send_jobs = await sub("sends", sends)
+        report.inquiry_retry_jobs = await sub("retries", retries)
+        report.inquiry_reconcile_jobs = await sub("reconciles", reconciles)
+        report.reply_process_jobs = await sub("replies", replies)
+        report.inquiries_marked_replied = await sub("replied", replied)
 
     # ------------------------------------------------------------------ 6 metrics
 

@@ -362,9 +362,10 @@ class MailWorkerHealthQuery(ApiQuery):
 
 
 class EvaluationQuery(ApiQuery):
-    """``GET /api/evaluation``: the 15-day quality evaluation (the window length is fixed)."""
+    """``GET /api/evaluation``: the 15-day quality evaluation (the window length is fixed; ``days``
+    may be given as ``15`` and anything else is refused)."""
 
-    days: Literal[15] = EVALUATION_WINDOW_DAYS
+    days: Annotated[int, Field(ge=EVALUATION_WINDOW_DAYS, le=EVALUATION_WINDOW_DAYS)] = EVALUATION_WINDOW_DAYS
 
 
 # --------------------------------------------------------------------------- spec 37.8 mail workers
@@ -1124,7 +1125,11 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         "/api/inquiry-control",
         InquiryControlView,
         scope=Scope.INQUIRIES_READ,
-        summary="Kill switch, mode, owner-reducible caps and current usage.",
+        summary=(
+            "Kill switch, mode, owner-reducible caps and current usage (NOT_FOUND until the"
+            " workspace controls exist)."
+        ),
+        errors=_NF,
     ),
     _r(
         "POST",

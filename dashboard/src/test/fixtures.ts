@@ -284,6 +284,7 @@ export function decision(overrides: Partial<ReviewDecisionView> = {}): ReviewDec
     decided_at: '2026-10-07T10:01:00Z',
     supersedes_decision_id: null,
     is_fixture: false,
+    decided_by_caller: true,
     notice: 'A review decision; not a purchase.',
     ...overrides,
   }

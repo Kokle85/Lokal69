@@ -23,9 +23,12 @@ Commands (``suv-deals <command> --help`` for details)::
     mail-worker credential issue | revoke | list
                                    the desktop mail worker's mailbox binding and credential
                                    (token shown once; --yes)
-    sender-binding create | status the owner-authorized sending identity (secret by reference only)
-    inquiries status | pause | resume
-                                   seller-inquiry controls (reason + expected version; --yes)
+    sender-binding create | verify | status
+                                   the owner-authorized sending identity (secret by reference only;
+                                   verify = outlook_local technical check from the worker's evidence)
+    inquiries authorize | status | set-mode | set-limits | pause | resume
+                                   seller-inquiry controls and the standing authorization record
+                                   (reason + expected version; --yes; no message approval exists)
     evaluation report --days 15    the 15-day quality evaluation from stored evidence
 
 Design rules: secrets are never command-line arguments (environment / ``.env`` only); every

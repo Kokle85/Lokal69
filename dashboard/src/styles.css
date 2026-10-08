@@ -844,3 +844,84 @@ blockquote.untrusted {
     color: var(--muted);
   }
 }
+
+/* ------------------------------------------------------------------ spec v1.1 screens */
+
+.subnav {
+  margin: 0.25rem 0 1rem;
+}
+
+.subnav ul {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
+  margin: 0;
+  padding: 0;
+}
+
+.subnav a {
+  display: inline-block;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.subnav a.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.message-text {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 0.95rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.escalation ul {
+  margin: 0.25rem 0 0;
+}
+
+.attention-group {
+  margin-bottom: 1rem;
+}
+
+.control-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.lag {
+  overflow-wrap: anywhere;
+}
+
+.id-link {
+  margin-right: 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.timeline > li {
+  overflow-wrap: anywhere;
+}
+
+/* Short labels never break mid-word; header words wrap only between words. */
+.badge {
+  white-space: nowrap;
+}
+
+.responsive-table th {
+  overflow-wrap: normal;
+  word-break: normal;
+}

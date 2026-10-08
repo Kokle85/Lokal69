@@ -9,11 +9,22 @@ static single-page app (Vite 8 + React 19.3 + React Router 8 + TypeScript 6) tha
   (`/api/*`), always with `Authorization: Bearer <Supabase access token>`; the browser never reads
   database tables and never computes tax, costs or contributions;
 - shows the seven screens of spec 23 (overview, candidate queue, candidate detail, economics,
-  review, sources, settings) plus a placeholder for the v1.1 seller-inquiry screens.
+  review, sources, settings) and the spec v1.1 screens (section 37): seller inquiries (attention
+  section, list, detail with the original message and the informational Macedonian preview),
+  seller replies (original text, Macedonian summary, unaccepted quotes, escalations), inquiry
+  control (pause/resume), mail-worker health and coverage gaps, coverage and lags (per source and
+  per listing) and the 15-day evaluation.
+
+**Standing authorization (spec 37.1):** there is no approve, send or reply control anywhere. The
+pipeline sends one initial inquiry per verified vehicle/seller pair from validated records only
+(mode `automatic`, kill switch off, authorization active, sender verified); the dashboard shows
+what happened and lets the owner pause or resume.
 
 All typed API shapes live in one module, [`src/api/types.ts`](src/api/types.ts), written by hand
-from the contract and the backend view models (`src/suv_deals/views/*`, `schemas/*.json`). The
-only HTTP client is [`src/api/client.ts`](src/api/client.ts).
+from the contract and the backend view models (`src/suv_deals/views/*`, `schemas/*.json`,
+`schemas/api/*.json` for the v1.1 routes of `api.schemas.V11_DASHBOARD_ROUTES`). The only HTTP
+client is [`src/api/client.ts`](src/api/client.ts); it has one method per contract route and
+deliberately none that could send, approve or answer anything.
 
 ## Setup
 
@@ -35,11 +46,15 @@ npm run dev                    # http://127.0.0.1:5173, /api proxied to DASHBOAR
 | `VITE_SUPABASE_PUBLISHABLE_KEY` | browser bundle | The **publishable** key (`sb_publishable_...`). Sent to Supabase Auth only (supabase-js puts it in the `apikey` header), never to the dashboard backend. |
 | `DASHBOARD_API_TARGET` | dev/preview server only (Node) | Where `vite` and `vite preview` proxy `/api` (default `http://127.0.0.1:8000`). Not exposed to the bundle. |
 
-Nothing else may be `VITE_`-prefixed: `vite.config.ts` refuses to start or build when another
-`VITE_` variable exists, or when the publishable slot holds a **secret** key (`sb_secret_...` or a
-legacy `service_role` JWT). The app shows a "not configured" page when a value is missing. Never put
-server secrets (database URL, Supabase secret key, Slack tokens, cursor secrets) anywhere in this
-directory.
+Nothing else may be `VITE_`-prefixed: `vite.config.ts` refuses to start the dev server or preview,
+and refuses every build mode, when another `VITE_` variable exists or when either variable holds a
+**secret** key (`sb_secret_...` anywhere in the value, also padded with whitespace, quoted or in
+another case, or a legacy `service_role` JWT; `src/configRules.ts` `isSecretKey`, shared with the
+app). Vite inlines every `VITE_` value into the JavaScript it serves, so this check runs first. A **production build** (`npm run build`, mode `production`) also fails
+when either required variable is missing or invalid (`src/configRules.ts`, shared with the app), so
+a bundle that could only say "not configured" is never shipped. The dev server, the unit tests and
+`vite build --mode development` keep the in-app "not configured" page. Never put server secrets
+(database URL, Supabase secret key, Slack tokens, cursor secrets) anywhere in this directory.
 
 ### Dev proxy
 
@@ -51,8 +66,8 @@ the API same-origin, exactly as in production; no CORS configuration is needed i
 
 | Command | What it does |
 |---|---|
-| `npm run build` | `tsc -b` (app, tests, configs, E2E specs), `vite build` into `dist/`, then `scripts/check-security.mjs --dist` (CSP meta present, no inline scripts/handlers/styles, no secret key in the bundle) |
-| `npm test` | Vitest 5 + Testing Library (jsdom 29.1.1): API client, auth gating, review idempotency/conflicts, unknown-money rendering, XSS escaping, mobile nav, static security grep |
+| `npm run build` | `tsc -b` (app, tests, configs, E2E specs), `vite build` into `dist/` (fails without the two `VITE_` variables), then `scripts/check-security.mjs --dist` (CSP meta present, no inline scripts/handlers/styles, no secret key in the bundle). Screens are code-split: the entry chunk keeps React, the router and supabase-js (needed at once to restore the session), each screen is its own chunk |
+| `npm test` | Vitest 5 + Testing Library (jsdom 29.1.1): API client (incl. every v1.1 route), auth gating, review idempotency/conflicts and `decided_by_caller`, unknown-money rendering, XSS escaping, mobile nav, static security grep, and the v1.1 screens (no approve/send control, informational preview label, withheld addresses and quarantined text, escalations, unaccepted quotes, unknown lags never zero, powered-off worker as a coverage gap, zero deals as zero, pause/resume incl. outcome-unknown retry and reload marker) |
 | `npm run lint` | oxlint (correctness + React/a11y rules, `react/no-danger`, `jsx-no-target-blank`, no `eval`) and the source security grep |
 | `npm run e2e` | Playwright 1.56.1 (chromium) against real local services (see below) |
 | `npm audit --omit=dev` | production dependency audit (also `make dashboard-audit`) |
@@ -72,10 +87,12 @@ From the repository root: `make dashboard-install dashboard-lint dashboard-build
    `/auth/v1/.well-known/jwks.json`. Tokens carry `iss=<mock>/auth/v1`, `aud=authenticated`,
    `role=authenticated` and the test user's UUID as `sub`.
 2. **Backend** on `:8765` - `tests/e2e/run_backend.py` creates a fresh migrated PostgreSQL database
-   (`tests/db_harness.py`, local cluster on `127.0.0.1:5432`), seeds it (`tests/e2e/seed.py`) and
-   serves `suv_deals.api.app.create_app` with `SUPABASE_URL` pointing at the mock (the backend's
-   real JWKS client fetches the mock's key), `DATABASE_SET_ROLE=suv_backend`, JWT leeway 0 and
-   relaxed rate limits. The database is dropped when Playwright stops the server.
+   (`tests/db_harness.py`, local cluster on `127.0.0.1:5432`), seeds it (`tests/e2e/seed.py`, plus
+   the v1.1 world of `tests/e2e/seed_v11.py`) and serves `suv_deals.api.app.create_app` with
+   `SUPABASE_URL` pointing at the mock (the backend's real JWKS client fetches the mock's key),
+   `DATABASE_SET_ROLE=suv_backend`, JWT leeway 0, a 60-second review claim lease
+   (`REVIEW_CLAIM_DURATION_SECONDS`, `--claim-duration-seconds`; the real claim-expiry test waits
+   for it) and relaxed rate limits. The database is dropped when Playwright stops the server.
 3. **Dashboard** on `:4173` - a production build (`vite build --outDir dist-e2e` with
    `VITE_SUPABASE_URL=http://127.0.0.1:54399`, the strict CSP included) served by `vite preview`.
 
@@ -84,8 +101,18 @@ From the repository root: `make dashboard-install dashboard-lint dashboard-build
 origin, which mirrors the recommended production deployment (static files and API behind one
 origin). The backend still only allows `http://127.0.0.1:4173` as a CORS origin.
 
-The seed manifest (ids, titles, users) is written to `e2e/.generated/seed-manifest.json` (ignored by
-git). Users: `owner@e2e.invalid`, `reviewer@e2e.invalid`, `reviewer2@e2e.invalid`,
+The seed manifest (ids, titles, users, the v1.1 inquiry/reply ids) is written to
+`e2e/.generated/seed-manifest.json` (ignored by git).
+
+The **v1.1 world** (`tests/e2e/seed_v11.py`, checked by `tests/e2e/test_seed_v11.py` on its own
+database) is created through the real repositories and the real mail-worker API (in-process, the
+path the desktop reply worker uses): inquiry controls in `automatic` mode, the standing
+authorization, a verified `outlook_local` sender, and inquiries that are `replied` (a seller reply
+with a final price and a deposit/reservation request, plus a quarantined possible match from
+another address), `uncertain` (handed to the Outbox without proof), `held_facts` (no resolvable
+language), `suppressed` (seller opt-out) and `qualifying` while the 24-hour cap is used up. The
+mail worker's heartbeat is moved 6 hours back so the owner's PC looks powered off. Every address is
+`...@example.invalid`; the E2E backend runs no worker, so nothing is ever sent. Users: `owner@e2e.invalid`, `reviewer@e2e.invalid`, `reviewer2@e2e.invalid`,
 `viewer@e2e.invalid`, `expiring@e2e.invalid` (access tokens really live 6 s while the response
 advertises an hour, so the backend rejects them mid-review), `multi@e2e.invalid` (two workspaces)
 and `stranger@e2e.invalid` (no membership); the shared test password is in `tests/e2e/users.py`.
@@ -103,7 +130,22 @@ first tab's stale handle gets `CLAIM_EXPIRED` with a reload path, nothing saved)
 (375x812) navigation with no horizontal scroll and no clipped content (`overflow-x: hidden` is not
 used to hide overflow); skip link and visible focus; the real backend refusing forged (foreign key
 with the mock's `kid`), tampered, unsigned and misplaced tokens; no tokens in URLs or in web storage
-outside supabase-js' own key.
+outside supabase-js' own key; a REAL server-side claim expiry (60-second lease, browser clock
+skewed behind the server) refused with `CLAIM_EXPIRED`, draft kept, re-claim and save.
+
+v1.1 (`e2e/inquiries.spec.ts`): attention groups (uncertain, held, suppressed) and the caps wait,
+filters in the URL, inquiry detail with the informational Macedonian preview, the recipient address
+withheld from a reviewer and shown to the owner, send attempts and timeline, reply escalations and
+an unaccepted quote, a quarantined reply as metadata only (its text for the owner only, its derived
+availability withheld in the list, and its deposit request attributed to an unverified sender with
+a do-not-pay warning for the owner), the owner's Slack link `/inquiries/<id>/replies/<id>` opening the
+reply after sign-in, no
+approve/send control on any of these pages, a viewer without the area, a powered-off PC shown as an
+open coverage gap (never "monitoring") whose last report is never shown as current, unknown lags
+as unknown (never 0 s), detection delay unknown
+without a trusted source time, zero suitable deals as 0, owner pause with a lost response resolved
+by a same-key retry then resume, a reviewer seeing the controls read-only, and every v1.1 screen at
+375 px without horizontal scrolling.
 
 `tests/e2e/test_mock_auth.py` (run by `make e2e` first) checks that the backend's real
 `SupabaseJwtVerifier`, fed with the mock's JWKS, accepts the mock's tokens and refuses everything
@@ -164,8 +206,35 @@ Recommended response headers from the static host (the build already contains a 
   connect-src 'self' <supabase origin>; object-src 'none'; base-uri 'none'; frame-src 'none'` (no
   inline scripts or styles). The E2E suite fails on any CSP violation.
 - **Roles.** Mutation controls are shown only for the scopes returned by `/api/me` (viewer:
-  read-only; reviewer: claim/decide/notes/recheck; owner: also source pause and the owner-only
-  administration details in Settings). The backend enforces every scope regardless.
+  read-only, no seller-inquiry area; reviewer: claim/decide/notes/recheck and the inquiry screens
+  read-only; owner: also source pause, inquiry pause/resume and the owner-only administration
+  details in Settings). The backend enforces every scope regardless.
+- **Seller inquiries (spec 37).** No approve, send or reply control exists. The Macedonian preview
+  is labelled as an informational audit translation, never an approval draft. Seller addresses
+  and the text of a quarantined reply appear only when the API returns them (owner only); seller
+  text is untrusted and rendered as text. A quoted price is always shown as an unaccepted seller
+  quote; requests that need an owner decision (payment, reservation, identity documents, ...) are
+  highlighted. Pause/resume use the same idempotent mutation as reviews (one key per attempt,
+  same-key retry when the outcome is unknown, and a non-secret reload marker that reports the
+  server state without resending). The owner can also run the resume while the kill switch is
+  already off when the control view still counts removable kill-switch / revoked-authorization
+  suppressions ("Re-qualify suppressed inquiries"); after a reload such a request is reported as
+  undeterminable rather than as applied, because it leaves the control version unchanged. Unknown
+  lags and counts are shown as `unknown`, never 0; a worker without a fresh heartbeat is a
+  coverage gap, never healthy, and the dimensions it reports about itself (mailbox sync, sync lag,
+  backlog, matching gaps) are shown as "unknown now" with the last report for context only.
+  Filter forms follow Back/Forward, and the replies of an inquiry are paged, never truncated.
+  A quarantined reply's derived availability is withheld from everyone but the owner in the reply
+  lists (the owner sees it labelled as an unverified match). The payment / reservation / identity
+  requests of a reply whose sender is not verified as the seller (quarantined, or not the verified
+  recipient) are attributed to "the sender" with a do-not-pay warning, never to "the seller". The
+  owner's Slack links (`/inquiries/<inquiry_id>/replies/<reply_id>`, the backend's
+  `dashboard_reply_url`) open the reply, which is loaded by its own id only.
+- **Unknown outcomes stay unknown.** A retry that the server turns away as `retryable` (a
+  `409 VERSION_CONFLICT` with `retryable: true`: a lock timeout, serialization failure or deadlock,
+  or the same request still in progress) proves only that the retry was rolled back, so the attempt
+  stays "not confirmed" and locked to the same key; a busy refusal of a FIRST send is reported as
+  "busy", not as "changed".
 - **Workspace.** With several memberships the user picks a workspace; the choice (an id, not a
   credential) is remembered per user in `localStorage` and sent as `X-Workspace-Id`, which the
   backend validates against the user's memberships.

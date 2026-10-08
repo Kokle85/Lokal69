@@ -58,8 +58,13 @@ All values live in the runtime `.env`/secret store, never in source control or c
 
 `seller_email.build_sender_provider` refuses to construct a sending provider unless the mode is
 `automatic`, the kill switch is off, the binding is verified (provider, stable account id, From,
-display name, alias status, healthy, not revoked) and exactly matches these settings. That is a
-technical prerequisite, not an approval. A live kill-switch probe must be supplied
+display name, alias status, healthy, not revoked) and exactly matches these settings. The
+`outlook_local` route builds no provider, so the runtime applies the same identity rule itself
+(`workers.inquiry_handlers.configured_sender_problems`): only the binding that is exactly
+`SELLER_EMAIL_PROVIDER`/`_ACCOUNT_ID`/`_FROM`/`_REPLY_TO` is ever reserved with or published to the
+desktop worker (otherwise the plan records `sender_identity_not_configured` and a queued send job
+is blocked `SENDER_SETUP_INCOMPLETE`; docs/runbook.md 10.5). That is a technical prerequisite,
+not an approval. A live kill-switch probe must be supplied
 (`KILL_SWITCH_PROBE_MISSING` otherwise); it is re-read immediately before every transmission and
 fails closed. A kill-switch refusal is a proven pre-submission failure marked retryable: it stops
 that transmission only, and the domain retry policy plus the dispatch preflight (which suppresses
@@ -74,13 +79,18 @@ submits with `MailItem.Send` from the configured account only.
    and is refused (`NEW_OUTLOOK_UNSUPPORTED`). UNVERIFIED: installed edition/version.
 2. In Outlook, add the selected sender mailbox (ADR 0002: the owner's personal Gmail) through
    Outlook's own sign-in flow. No password or token is copied anywhere else.
-3. Install and start the desktop worker (separate package) under the signed-in interactive user;
-   do not disable Trust Center, Object Model Guard or antivirus checks (the worker reports
-   `security_settings_unchanged`; a weakened setting blocks verification).
+3. Install and start the desktop worker (`desktop/outlook-bridge`; docs/runbook.md section 10.3)
+   under the signed-in interactive user with the mailbox-bound credential issued by
+   `suv-deals mail-worker credential issue` (runbook 10.2); do not disable Trust Center, Object
+   Model Guard or antivirus checks (`security_settings_unchanged` is `Literal[true]` on the wire: a
+   report claiming otherwise is refused).
 4. The worker reports the account (`OutlookAccountReport`): classic flavour, SMTP address, stable
    account key, display name. Set `SELLER_EMAIL_ACCOUNT_ID` to the reported stable key (the SMTP
    address is accepted with a warning) and `SELLER_EMAIL_FROM` to that SMTP address. Outlook
-   offers no send-as alias verification here, so only the account's own address verifies.
+   offers no send-as alias verification here, so only the account's own address verifies. Record
+   the verification with `suv-deals sender-binding verify <binding id> --reason ... --yes`: it
+   checks the worker's account report (bound address, classic Outlook), a fresh heartbeat and the
+   stable account key (by its SHA-256 in the audit trail) and refuses with problem codes otherwise.
 5. UNVERIFIED for the account type: whether classic Outlook stores sent Gmail/IMAP messages in
    Sent Items (Gmail may save them server-side instead). Receipt reconciliation relies on the
    worker's Sent Items evidence; record what the test in section 6 shows.
@@ -189,8 +199,11 @@ monitoring or sending is claimed.
 
 ## 7. Operating and stopping
 
-* Pause everything: `SELLER_INQUIRY_KILL_SWITCH=true` or the MCP `seller_inquiries_pause` tool
-  (scope `inquiries:pause`). Untransmitted work stops at once; reconciliation keeps running.
+* Pause everything: the dashboard pause, the MCP `seller_inquiries_pause` tool (scope
+  `inquiries:pause`), `suv-deals inquiries pause --reason ... --expected-version N --yes` or
+  `SELLER_INQUIRY_KILL_SWITCH=true`. Untransmitted work stops at the next guard (reservation,
+  dispatch, the desktop worker's claim right before `.Send`); reconciliation keeps running.
+  Resuming is an owner action (dashboard or `suv-deals inquiries resume`), never an MCP tool.
 * Revoke access: remove the OAuth grant at the provider (the next token refresh reports
   `CREDENTIALS_REVOKED`, health turns `credentials_revoked`, sending stops and pending inquiries
   are suppressed with `sender_revoked` at the next preflight) or remove the Outlook account; never
@@ -200,3 +213,25 @@ monitoring or sending is claimed.
   reply/bounce) resolves it; `not_found_yet` never releases anything. An automatic retry happens
   only after a proven pre-submission failure with no possibly running earlier attempt, and only
   through the same account.
+
+## 8. Activation evidence checklist
+
+Collect every row for the ACTUAL account and client before `SELLER_INQUIRY_MODE=automatic`; keep
+the evidence in the activation log (ids, timestamps, codes; never an address, token or body). Each
+row is a one-time technical check, not a message approval.
+
+| # | Evidence | How | Done when |
+|---|---|---|---|
+| 1 | Sender binding verified | `suv-deals sender-binding create` (runbook 10.1), desktop worker account report, `suv-deals sender-binding verify` (outlook_local) or the provider check (gmail_api, section 4) | `suv-deals sender-binding status` shows `verified`, `usable`, `healthy`; `suv-deals doctor` lists `seller_inquiry/sender_binding` OK |
+| 2 | Configured runtime | classic Outlook version (`python -m outlook_bridge check`), worker revision equals the backend revision, `suv-deals doctor` v1.1 readiness lines | heartbeat fresh, `monitoring active`, no open coverage gap (`GET /api/mail-workers/coverage-gaps`) |
+| 3 | Standing authorization active | `suv-deals inquiries status` | `authorization: active`, caps 2/24 h and 5/15 days (or lower), kill switch off only at the end |
+| 4 | Owner-controlled canary | a SYNTHETIC canary inquiry to an owner-controlled test address (never a seller) through the configured route, marked as canary | the canary never reserves a vehicle/seller pair, never debits the quota ledger and never counts as a seller inquiry or one of the 15-day deals (`domain.evaluation` excludes canary records and reports only their count). **Blocked today:** the canary representation of docs/schema.md section 10.10 is not implemented, so this row cannot be completed yet |
+| 5 | Receipt reconciliation | the canary's Message-ID found in Sent Items (outlook_local) or by the provider search (gmail_api) | `found_sent`; record whether the provider kept the client Message-ID (a rewritten one is published to the worker as an observed Message-ID) |
+| 6 | Correlated test reply | reply from the owner-controlled address; the desktop worker correlates it locally -> `POST /v1/mail-workers/replies` -> outbox `seller.reply.received.v1` -> private Slack signal -> dot -> MCP `seller_replies_get` | the reply is stored (`ingest_status: stored`), exactly one Slack signal, dot's tool call recorded; an unrelated personal message sent at the same time is NOT uploaded |
+| 7 | Stop works | dashboard/MCP/CLI pause, then the worker's next claim | the claim answers `kill_switch`; nothing leaves Outlook; resume by the owner |
+
+If row 4-6 cannot be completed (no canary representation, no classic-Outlook runtime, no verified
+Slack trigger), report the precise blocker and keep the mode at `disabled_until_sender_ready`;
+never claim monitoring or sending. After activation, real seller inquiries use the standing
+authorization without any further approval.
+

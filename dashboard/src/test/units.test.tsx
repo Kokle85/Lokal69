@@ -4,7 +4,20 @@ import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { Amount, ExternalLink, STALE_AFTER_MS, ViewMeta } from '../components/ui'
 import { validateConfig } from '../config'
-import { amountText, decimalText, groupDecimal, kmText, localInputToRfc3339, safeHttpUrl, safeNextPath } from '../format'
+import { requireProductionConfig } from '../configRules'
+import {
+  amountText,
+  bytesText,
+  countText,
+  decimalText,
+  durationText,
+  groupDecimal,
+  kmText,
+  localInputToRfc3339,
+  ratioPercentText,
+  safeHttpUrl,
+  safeNextPath,
+} from '../format'
 import { buildSubmission, draftForAction, EMPTY_DRAFT } from '../review/decisionDraft'
 import { readPendingSubmission, resolvePendingSubmission, writePendingSubmission } from '../review/pendingMarker'
 import { TEST_USER_ID as USER } from './fakeAuth'
@@ -112,6 +125,48 @@ describe('configuration', () => {
     expect(validateConfig({ VITE_SUPABASE_URL: 'http://127.0.0.1:54399', VITE_SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_x' }).ok).toBe(true)
     expect(validateConfig({}).ok).toBe(false)
   })
+
+  it('refuses a production build without the required public variables', () => {
+    expect(() => requireProductionConfig({})).toThrow(/Refusing to build for production: VITE_SUPABASE_URL is not set/)
+    expect(() => requireProductionConfig({ VITE_SUPABASE_URL: 'https://p.supabase.co', VITE_SUPABASE_PUBLISHABLE_KEY: 'sb_secret_abc' })).toThrow(/SECRET key/)
+    expect(requireProductionConfig({ VITE_SUPABASE_URL: 'https://p.supabase.co', VITE_SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_x' })).toEqual({
+      supabaseUrl: 'https://p.supabase.co',
+      publishableKey: 'sb_publishable_x',
+    })
+  })
+})
+
+describe('v1.1 display helpers', () => {
+  it('renders durations from whole seconds and unknown as unknown (never zero)', () => {
+    expect(durationText(null)).toBe('unknown')
+    expect(durationText(undefined)).toBe('unknown')
+    expect(durationText(-1)).toBe('unknown')
+    expect(durationText(0)).toBe('0 s')
+    expect(durationText(42)).toBe('42 s')
+    expect(durationText(310)).toBe('5 min 10 s')
+    expect(durationText(3_600)).toBe('1 h')
+    expect(durationText(11_100)).toBe('3 h 5 min')
+    expect(durationText(7 * 86_400)).toBe('7 days')
+  })
+
+  it('turns a decimal ratio into a percentage by moving digits (never overstated)', () => {
+    expect(ratioPercentText('0.93525179856')).toBe('93.5 %')
+    expect(ratioPercentText('0.99999')).toBe('99.9 %')
+    expect(ratioPercentText('1')).toBe('100.0 %')
+    expect(ratioPercentText('0')).toBe('0.0 %')
+    expect(ratioPercentText('0.05')).toBe('5.0 %')
+    expect(ratioPercentText(null)).toBe('not applicable')
+    expect(ratioPercentText('garbage')).toBe('garbage')
+  })
+
+  it('formats byte sizes and counts, keeping unknown distinct from zero', () => {
+    expect(bytesText(820)).toBe('820 B')
+    expect(bytesText(120_400)).toBe('117.5 kB')
+    expect(bytesText(3 * 1024 * 1024 + 1)).toBe('3.0 MB')
+    expect(bytesText(null)).toBe('unknown')
+    expect(countText(null)).toBe('unknown')
+    expect(countText(0)).toBe('0')
+  })
 })
 
 describe('decision draft', () => {
@@ -173,6 +228,9 @@ describe('pending submission marker', () => {
     expect(resolvePendingSubmission(marker, reviewCase({ case_version: 2 })).kind).toBe('not_recorded')
     expect(resolvePendingSubmission(marker, reviewCase({ case_version: 3, decisions: [decision({ case_version: 2 })] })).kind).toBe('recorded')
     expect(resolvePendingSubmission(marker, reviewCase({ case_version: 5, decisions: [] })).kind).toBe('superseded')
+    // The same outcome on the same version, but recorded by ANOTHER reviewer, is never ours.
+    const other = decision({ case_version: 2, decided_by_caller: false })
+    expect(resolvePendingSubmission(marker, reviewCase({ case_version: 3, decisions: [other] }))).toEqual({ kind: 'decided_by_other', decision: other })
   })
 
   it('drops malformed or old markers', () => {

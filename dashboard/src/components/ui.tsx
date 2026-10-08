@@ -7,7 +7,7 @@
  * tab with `rel="noopener noreferrer"` so the external page cannot reach `window.opener`.
  */
 import { useEffect, useState, type ReactNode } from 'react'
-import { describeError, type ApiError } from '../api/errors'
+import { describeError, guardReason, type ApiError } from '../api/errors'
 import type { AmountView, ResponseWarning } from '../api/types'
 import { ageText, amountText, dateTimeText, label, safeHttpUrl } from '../format'
 
@@ -77,6 +77,45 @@ const BADGE_TONES: Record<string, string> = {
   uncertain: 'warn',
   removed: 'bad',
   sold_claimed: 'bad',
+  // spec v1.1 (seller inquiries, replies, mail workers, lags)
+  accepted: 'ok',
+  replied: 'ok',
+  verified: 'ok',
+  verified_match: 'ok',
+  matched: 'ok',
+  measured: 'ok',
+  processed: 'ok',
+  automatic: 'ok',
+  resolved: 'ok',
+  inquiry_ready: 'ok',
+  needs_technical_review: 'warn',
+  not_eligible: 'bad',
+  qualifying: 'info',
+  reserved: 'info',
+  queued: 'info',
+  sending: 'info',
+  candidate: 'info',
+  no_reply_yet: 'info',
+  stored: 'info',
+  held_facts: 'warn',
+  unverified: 'warn',
+  changed: 'warn',
+  quarantined: 'warn',
+  language_unresolved: 'warn',
+  unsupported_language: 'warn',
+  disabled_until_sender_ready: 'muted',
+  cancelled: 'muted',
+  suppressed: 'bad',
+  failed_definite: 'bad',
+  bounced: 'bad',
+  seller_opted_out: 'bad',
+  unavailable: 'bad',
+  inconsistent: 'bad',
+  down: 'bad',
+  mismatch: 'bad',
+  not_classic: 'bad',
+  failed: 'bad',
+  revoked: 'muted',
 }
 
 export function Badge({ value, tone, children }: { value?: string | null; tone?: string; children?: ReactNode }) {
@@ -129,8 +168,20 @@ export function EmptyState({ children }: { children: ReactNode }) {
   return <div className="state state-empty">{children}</div>
 }
 
-export function ErrorPanel({ error, onRetry, retryLabel = 'Retry' }: { error: ApiError; onRetry?: () => void; retryLabel?: string }) {
-  const description = describeError(error)
+export function ErrorPanel({
+  error,
+  onRetry,
+  retryLabel = 'Retry',
+  subject,
+}: {
+  error: ApiError
+  onRetry?: () => void
+  retryLabel?: string
+  /** What a version conflict is about (see `describeError`). */
+  subject?: string
+}) {
+  const description = describeError(error, subject ? { subject } : {})
+  const reason = guardReason(error)
   return (
     <div className="panel panel-error" role="alert">
       <p className="panel-title">{description.title}</p>
@@ -141,6 +192,12 @@ export function ErrorPanel({ error, onRetry, retryLabel = 'Retry' }: { error: Ap
       {description.hint ? <p>{description.hint}</p> : null}
       <p className="muted">
         Error code <code>{error.code}</code>
+        {reason ? (
+          <>
+            {' '}
+            · reason <code data-testid="error-reason">{reason}</code>
+          </>
+        ) : null}
         {error.correlationId ? (
           <>
             {' '}

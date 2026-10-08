@@ -235,9 +235,9 @@ async def test_claim_rechecks_the_merged_seller_family(db: Database, seed: Seed,
             absorbed_id=world.seller_entity_id,
             reason="same dealer: identical VAT id (synthetic)",
         )
-    # The merged family was contacted moments ago: not now (retryable refusal, nothing closed).
+    # The merged family was contacted moments ago: not now (the worker waits, nothing closed).
     cooling = await _claim(db, worker, intent.intent_id)
-    assert not cooling.proceed and cooling.refusal_reason == OutlookRefusalReason.KILL_SWITCH
+    assert not cooling.proceed and cooling.refusal_reason == OutlookRefusalReason.NOT_NOW
     assert cooling.detail == "SELLER_COOLDOWN"
     # It is even the same car: this message must never leave.
     confirm_cluster(seed, ws, [world.listing_id, other.listing_id])
@@ -315,7 +315,9 @@ async def test_rolling_cap_counts_the_hand_over_not_the_commit(
     assert await _state(db, world, backlog.id) == "queued"
 
 
-async def test_claim_refused_by_a_reduced_cap_waits_instead_of_closing(db: Database, world: World) -> None:
+async def test_claim_refused_by_a_reduced_cap_waits_instead_of_closing(
+    db: Database, seed: Seed, world: World
+) -> None:
     worker = await _worker(db, world)
     inquiry_id, intent = await _intent(db, world, worker)
     boss = owner(world.workspace_id)
@@ -330,15 +332,22 @@ async def test_claim_refused_by_a_reduced_cap_waits_instead_of_closing(db: Datab
             reason="owner reduces the daily cap (synthetic)",
         )
     claim = await _claim(db, worker, intent.intent_id)
-    assert not claim.proceed and claim.refusal_reason == OutlookRefusalReason.KILL_SWITCH
+    # The cap lifts on its own: "not now". The worker keeps the intent and claims it again later;
+    # nothing is reported for it and nothing is closed (wire evolution: ``not_now``).
+    assert not claim.proceed and claim.refusal_reason == OutlookRefusalReason.NOT_NOW
     assert claim.detail == "RATE_CAP_REACHED"
+    assert await _state(db, world, inquiry_id) == "sending"
+    # The intent's validity ends before the cap lifts: the worker reports ``intent_expired`` (it
+    # never claimed successfully, so nothing left), which proves non-submission.
+    _intent_expired(seed.conn, intent.intent_id)
     refused = await _send_report(
         db,
         worker,
-        _report(intent, OutlookSubmissionState.REFUSED_BEFORE_SEND, refusal=OutlookRefusalReason.KILL_SWITCH),
+        _report(
+            intent, OutlookSubmissionState.REFUSED_BEFORE_SEND, refusal=OutlookRefusalReason.INTENT_EXPIRED
+        ),
     )
-    assert refused.inquiry_state == InquiryState.FAILED_DEFINITE
-    assert refused.attempt_outcome == SendAttemptOutcome.PRE_SUBMISSION_FAILURE  # retryable, not final
+    assert refused.inquiry_state == InquiryState.FAILED_DEFINITE  # retryable, not final
     actor = system(world.workspace_id)
     async with unit_of_work(db, actor) as conn:
         retried = await inquiries_repo.retry(conn, actor, inquiry_id)

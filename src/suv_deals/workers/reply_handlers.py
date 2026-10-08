@@ -20,8 +20,9 @@ reconciliation (a reply stored while the inquiry was still ``sending`` becomes e
    previous opportunity alert of the inquiry (``domain.notifications.evaluate_materiality``).
    While a recalculation of the listing is still pending the job is released (no attempt
    consumed), at most `ReplyRuntimeOptions.recalculation_wait` after the ingest.
-3. **State** (spec 37.5): a seller reply stored before the send was reconciled moves the
-   accepted inquiry to ``replied`` (``inquiries_repo.mark_replied``).
+3. **State** (spec 37.5): a seller reply stored before the send was reconciled applies its
+   step to the accepted inquiry (``replied``, or ``seller_opted_out`` for an opt-out/complaint;
+   ``inquiries_repo.mark_replied``).
 
 Routine replies (receipt, translation, recalculation) stay in the dashboard/audit trail: no alert
 per e-mail. No outgoing reply, follow-up, offer or acceptance is ever generated here. Fixture
@@ -65,7 +66,7 @@ from suv_deals.domain.replies import (
 )
 from suv_deals.errors import NotFound, ValidationFailed
 from suv_deals.persistence import inquiries_repo, jobs, outbox, valuation_repo
-from suv_deals.persistence.database import Conn, fetch_one
+from suv_deals.persistence.database import Conn, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import mapped_errors
 from suv_deals.persistence.replies_repo import REPLY_PROCESS_PREFIX
 from suv_deals.persistence.transactions import job_unit_of_work, retry_transient, unit_of_work
@@ -211,6 +212,16 @@ select count(*) as n from ops.jobs
  where workspace_id = %(ws)s and job_type = 'valuation' and listing_id = %(listing)s
    and state in ('queued', 'running', 'retry_wait')
 """
+_LOCK_INQUIRY_SQL: Final = """
+select 1 as locked from app.seller_inquiries where workspace_id = %(ws)s and id = %(inquiry)s for update
+"""
+_DECISION_ALERTS_SQL: Final = """
+select o.event_id, o.payload ->> 'reply_id' as reply_id, o.payload -> 'reasons' as reasons
+  from ops.outbox o
+ where o.workspace_id = %(ws)s and o.event_type = %(type)s and o.aggregate_id = %(inquiry)s
+   and o.payload ->> 'kind' = 'decision_needed'
+ order by o.event_created_at, o.id
+"""
 _PREVIOUS_OPPORTUNITY_SQL: Final = """
 select payload ->> 'valuation_id' as valuation_id from ops.outbox
  where workspace_id = %(ws)s and event_type = %(type)s and aggregate_id = %(inquiry)s
@@ -286,6 +297,35 @@ async def _valuations(
     return int(pending["n"]) if pending is not None else 0, current, previous
 
 
+async def _decision_alerts(
+    conn: Conn, actor: ActorContext, facts: _ReplyFacts
+) -> tuple[list[str], frozenset[str]]:
+    """``(this reply's decision alerts, reasons already alerted for OTHER replies)`` of the inquiry.
+
+    Called under the inquiry row lock (``FOR UPDATE``), so concurrent processing jobs of replies to
+    the same inquiry serialise here and each sees the alerts the other committed.
+    """
+    async with mapped_errors():
+        await fetch_one(conn, _LOCK_INQUIRY_SQL, {"ws": actor.workspace_id, "inquiry": facts.inquiry_id})
+        rows = await fetch_all(
+            conn,
+            _DECISION_ALERTS_SQL,
+            {
+                "ws": actor.workspace_id,
+                "type": SELLER_REPLY_OWNER_ALERT_EVENT_TYPE,
+                "inquiry": facts.inquiry_id,
+            },
+        )
+    own: list[str] = []
+    alerted: set[str] = set()
+    for row in rows:
+        if row["reply_id"] == str(facts.reply_id):
+            own.append(str(row["event_id"]))
+        elif isinstance(row["reasons"], list):
+            alerted.update(str(r) for r in row["reasons"])
+    return own, frozenset(alerted)
+
+
 async def _enqueue_alert(
     conn: Conn,
     ctx: RuntimeContext,
@@ -295,7 +335,14 @@ async def _enqueue_alert(
     kind: SellerReplyAlertKind,
     reasons: Sequence[str],
     valuation_id: UUID | None = None,
-) -> UUID:
+) -> tuple[UUID, bool]:
+    """Write one owner alert (business dedup key: one per inquiry and reason set / valuation).
+
+    Returns ``(event_id, raised_for_this_reply)``: an alert that exists already is never written
+    again; it counts as this reply's own only when an earlier run of this reply's job wrote it
+    (the job may be released while the recalculation is pending), not when an earlier reply of
+    the same inquiry raised the same request.
+    """
     draft = build_seller_reply_owner_alert(
         event_id=uuid4(),
         kind=kind,
@@ -308,7 +355,7 @@ async def _enqueue_alert(
         valuation_id=valuation_id,
         is_fixture=facts.is_fixture,
     )
-    event_id, _created = await outbox.enqueue_event(
+    event_id, created = await outbox.enqueue_event(
         conn,
         actor,
         event_type=draft.event_type,
@@ -321,7 +368,16 @@ async def _enqueue_alert(
         is_fixture=draft.is_fixture,
         event_id=draft.event_id,
     )
-    return event_id
+    if created:
+        return event_id, True
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select payload ->> 'reply_id' as reply_id from ops.outbox"
+            " where workspace_id = %(ws)s and event_id = %(event)s",
+            {"ws": actor.workspace_id, "event": event_id},
+        )
+    return event_id, row is not None and row["reply_id"] == str(facts.reply_id)
 
 
 async def handle_seller_reply_process(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
@@ -366,11 +422,19 @@ async def handle_seller_reply_process(ctx: RuntimeContext, execution: JobExecuti
                 result["inquiry_state"] = replied.state.value
             alerts: list[str] = []
             if reasons and not facts.is_fixture:
-                alerts.append(
-                    str(
-                        await _enqueue_alert(conn, ctx, actor, facts, kind="decision_needed", reasons=reasons)
+                # Only a consequential request NOT yet alerted for this inquiry raises a decision
+                # alert (with all of this reply's reasons, for context). A seller varying the
+                # requests across replies therefore gets at most one alert per distinct reason,
+                # never one per combination (2^8 - 1) or per e-mail.
+                own, alerted = await _decision_alerts(conn, actor, facts)
+                if own:
+                    alerts.extend(own)  # an earlier run of this job raised it already
+                elif set(reasons) - alerted:
+                    event_id, ours = await _enqueue_alert(
+                        conn, ctx, actor, facts, kind="decision_needed", reasons=reasons
                     )
-                )
+                    if ours:
+                        alerts.append(str(event_id))
             if (
                 opportunity is not None
                 and opportunity.realert_allowed
@@ -378,30 +442,30 @@ async def handle_seller_reply_process(ctx: RuntimeContext, execution: JobExecuti
                 and not facts.is_fixture
                 and (previous is None or previous.id != current.id)
             ):
-                alerts.append(
-                    str(
-                        await _enqueue_alert(
-                            conn,
-                            ctx,
-                            actor,
-                            facts,
-                            kind="opportunity_supported",
-                            reasons=[r.value.lower() for r in opportunity.reasons],
-                            valuation_id=current.id,
-                        )
-                    )
+                event_id, ours = await _enqueue_alert(
+                    conn,
+                    ctx,
+                    actor,
+                    facts,
+                    kind="opportunity_supported",
+                    reasons=[r.value.lower() for r in opportunity.reasons],
+                    valuation_id=current.id,
                 )
+                if ours:
+                    alerts.append(str(event_id))
+            # Alerts raised for THIS reply (a seller repeating a request is not re-alerted).
             result["owner_alert_event_ids"] = alerts
             if waiting:
                 # The decision alert (if any) is committed now; the opportunity check waits for
-                # the recalculation the ingest queued (no attempt consumed).
+                # the recalculation the ingest queued (no attempt consumed). The poll is NOT
+                # audited (the reason stays on the job): every seller e-mail would otherwise
+                # write up to recalculation_wait / recalculation_poll audit rows.
                 await jobs.release(
                     conn,
                     job,
                     available_at=options.recalculation_poll,
                     code="RECALCULATION_PENDING",
                     detail="waiting for the valuation recalculation queued by the reply",
-                    actor=actor,
                 )
                 return JobOutcome(state=JobState.QUEUED, code="RECALCULATION_PENDING", details=result)
             if pending > 0 and not recalculated:

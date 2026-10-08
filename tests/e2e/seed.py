@@ -13,13 +13,17 @@
   ``alpha``    eligible_primary, two revisions (price drop), INCOMPLETE valuation with UNKNOWN cost
                lines (transport, customs broker, all import taxes: no approved rule set), MK
                comparables, field evidence, a note, availability events and a PENDING review case;
-  ``bravo``, ``charlie``, ``delta``, ``echo``, ``foxtrot``  eligible_primary with pending cases (one
-               per mutating E2E test);
+  ``bravo``, ``charlie``, ``delta``, ``echo``, ``foxtrot``, ``golf``  eligible_primary with pending
+               cases (one per mutating E2E test; ``golf`` is the real server-side claim-expiry case);
   ``xss``      eligible_primary whose title, description, fault list and provenance text are XSS /
                prompt-injection payloads (must render inert), pending case;
   ``rejected`` 200,000 km: rejected by screening (MILEAGE_TOO_HIGH) and by a reviewer decision;
   ``net_only`` net-only price: needs_facts (PRICE_BASIS_NET_ONLY, gross price missing);
-  ``paused``   on the paused source with a ``watch`` decision.
+  ``paused``   on the paused source with a ``watch`` decision;
+- the spec v1.1 world (``tests/e2e/seed_v11.py``): inquiry controls, standing authorization, a
+  verified ``outlook_local`` sender, replied / uncertain / held / suppressed / cap-waiting inquiries,
+  a seller reply with escalations, a quarantined possible match and a mail worker whose PC looks
+  powered off (``example.invalid`` addresses only; nothing is ever sent).
 
 Rows are written through the repositories (configuration, gates, market evidence, comparable
 sets, valuations, availability audit) as ``suv_backend``, and with the superuser test connection
@@ -66,6 +70,7 @@ from suv_deals.domain.valuation import ScreeningInput, assemble_valuation
 from suv_deals.persistence import valuation_repo
 from suv_deals.persistence.database import Conn, Database
 from suv_deals.persistence.listings_repo import AuditAvailabilitySink, AvailabilityTransition
+from tests.e2e.seed_v11 import seed_v11
 from tests.e2e.users import MAIN_ROLES, PASSWORD, SECOND_ROLES, USERS
 from tests.integration.db.helpers import Seed, sha, unique
 from tests.integration.read_queries.dataset import (
@@ -95,6 +100,7 @@ TITLES = {
     "delta": "SYNTHETIC E2E Delta Trail 2.0 TDI",
     "echo": "SYNTHETIC E2E Echo Trail 2.0 TDI",
     "foxtrot": "SYNTHETIC E2E Foxtrot Trail 2.0 TDI",
+    "golf": "SYNTHETIC E2E Golf Trail 2.0 TDI",
     "xss": XSS_TITLE,
     "rejected": "SYNTHETIC E2E Rejected Trail 200,000 km",
     "net_only": "SYNTHETIC E2E Net-only Trail (price excl. VAT)",
@@ -395,6 +401,7 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
         "delta": 2900,
         "echo": 2600,
         "foxtrot": 2650,
+        "golf": 2675,
         "xss": 2700,
     }
     for offset, (key, eur) in enumerate(eligible.items()):
@@ -478,7 +485,7 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
     data.valuations["alpha"] = valuation_id
 
     data.cases["alpha"] = _case(seed, ws, alpha, alpha_rev, valuation_id=valuation_id, priority=50)
-    for key in ("bravo", "charlie", "delta", "echo", "foxtrot", "xss"):
+    for key in ("bravo", "charlie", "delta", "echo", "foxtrot", "golf", "xss"):
         data.cases[key] = _case(seed, ws, data.listings[key], data.revisions[key][-1], priority=40)
 
     for key, outcome, reasons, summary in (
@@ -532,6 +539,7 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
     await _availability_events(db, ws, alpha, running, now)
     _outbox(seed, data, now)
     _bindings(seed, ws, now)
+    v11 = await seed_v11(db, seed, ws, now)
 
     return {
         "schema": "suv-dashboard-e2e-manifest/1",
@@ -548,5 +556,6 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
         "evidence_ids": {"alpha_price": str(evidence_id)},
         "titles": TITLES,
         "sources": {key: str(value) for key, value in data.sources.items()},
+        "v11": v11,
         "marker": str(uuid.uuid4()),
     }

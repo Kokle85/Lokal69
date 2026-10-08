@@ -13,7 +13,7 @@ import type {
   SubmitReviewRequest,
 } from '../api/types'
 import { Amount, Badge, EmptyState, ErrorPanel, KeyValues, LoadingState, Notice, Section, Timestamp, UntrustedText, ViewMeta, Warnings, useNow } from '../components/ui'
-import { kmText, label } from '../format'
+import { compareInstants, kmText, label } from '../format'
 import { useApiQuery } from '../hooks/useApiQuery'
 import { useClaimStore, type ClaimHandle } from '../review/claimStore'
 import {
@@ -177,6 +177,12 @@ function EarlierSubmissionNotice({
             Check again
           </button>
         </>
+      ) : resolution.kind === 'decided_by_other' ? (
+        <p data-testid="earlier-submission-other">
+          Your submission was not recorded: another reviewer recorded a decision on the same case version first (
+          {label(resolution.decision.outcome)} at <Timestamp value={resolution.decision.decided_at} timeZone={timeZone} />
+          ). See the decision history below.
+        </p>
       ) : (
         <p>The case has changed since (now version {reviewCase.case_version}); see the decision history below.</p>
       )}
@@ -643,7 +649,7 @@ function FieldErrors({ errors }: { errors: Array<{ message: string }> }) {
 }
 
 function DecisionHistory({ decisions, timeZone }: { decisions: ReviewDecisionView[]; timeZone: string }) {
-  const ordered = [...decisions].sort((a, b) => b.decided_at.localeCompare(a.decided_at))
+  const ordered = [...decisions].sort((a, b) => compareInstants(b.decided_at, a.decided_at))
   return (
     <Section title="Decision history" id="history">
       {ordered.length === 0 ? (
@@ -654,7 +660,8 @@ function DecisionHistory({ decisions, timeZone }: { decisions: ReviewDecisionVie
             <li key={decision.decision_id} data-testid="decision-entry">
               <Badge value={decision.outcome} /> <Timestamp value={decision.decided_at} timeZone={timeZone} />{' '}
               <span className="muted">
-                by a {decision.actor.role} ({label(decision.actor.principal_kind)}) · version {decision.case_version} → {decision.new_case_version}
+                by {decision.decided_by_caller ? 'you' : `a ${decision.actor.role}`} ({label(decision.actor.principal_kind)}) · version{' '}
+                {decision.case_version} → {decision.new_case_version}
               </span>
               <div>
                 Reasons: {decision.reason_codes.map((code) => <code key={code}>{code} </code>)}

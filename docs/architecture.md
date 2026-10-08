@@ -27,6 +27,35 @@ config/sources/*.yaml  ->  scheduler (15 min slots, ops.source_schedules)
   -> dot/owner review via MCP tools or dashboard -> app.review_decisions
 ```
 
+Spec v1.1 (section 37, ADR 0002): one automatic initial inquiry per verified vehicle/seller pair
+under the owner's standing authorization (no per-message approval), and the reply route back.
+Nothing is sent unless `SELLER_INQUIRY_MODE=automatic` (process) and the workspace controls are
+`automatic`, the kill switch is off, the standing authorization is effective and the sender
+binding is verified; fixture-lineage listings never reserve or send.
+
+```text
+valuation pipeline (new revision) / reconciliation sweep
+  -> ops.jobs seller_inquiry_plan (workers.inquiry_handlers)
+     readiness (domain.inquiries) -> reserve: quota debit + immutable binding (inquiries_repo)
+  -> ops.jobs seller_inquiry_send: dispatch preflight + DB guards, attempt committed BEFORE I/O
+     outlook_local (default): send intent = the committed running attempt (send_intents_repo)
+       -> GET /v1/mail-workers/send-intents -> desktop worker (classic Outlook, owner's PC)
+       -> POST .../claim (fresh revalidation: kill_switch | not_now | intent_invalid) -> .Send
+       -> POST .../report -> inquiries_repo.record_outcome (uncertain stays uncertain)
+     gmail_api (optional): provider call outside any transaction -> record_outcome
+  -> reconciliation: reaped/uncertain attempts -> seller_inquiry_reconcile (evidence only, never
+     a blind resend); proven-unsent failures -> one guarded retry per attempt (max 3)
+
+seller reply in the owner's mailbox
+  -> desktop worker (local correlation only; unrelated mail never uploaded)
+  -> POST /v1/mail-workers/replies -> app.seller_replies + ops.mail_ingest_dedup
+     + ops.outbox seller.reply.received + ops.jobs seller_reply_process (one transaction)
+  -> dispatcher -> Slack route of category seller_reply ONLY (ids + dashboard link; never MCP
+     Events, which stay candidate discovery only) -> dot -> MCP seller_replies_get
+  -> seller_reply_process (workers.reply_handlers): state steps, recalculation,
+     seller_reply.owner_alert (category owner_alert) for decisions/opportunities
+```
+
 ## Package map and ownership
 
 | Path | Responsibility | Depends on |
@@ -65,6 +94,35 @@ config/sources/*.yaml  ->  scheduler (15 min slots, ops.source_schedules)
 | `mcp/*` | MCP server (official `mcp` SDK, Streamable HTTP), tools, auth, events | persistence, domain |
 | `integrations/*` | FX (ECB), MCP Events webhook delivery, Slack adapter | domain |
 | `observability/*` | JSON logging with redaction, Prometheus metrics, audit helpers | – |
+| `views/*` | Read models (pydantic) shared by the dashboard API and MCP tools; address/quarantined-text visibility rules (`views.inquiries`) | domain |
+| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`) | persistence, workers, api |
+
+Spec v1.1 seller-inquiry and reply modules (section 37, ADR 0002):
+
+| Path | Responsibility | Depends on |
+|---|---|---|
+| `domain/inquiries.py` | Inquiry state machine, readiness, caps/cooldown, dispatch preflight, retry policy (pure) | filters, costs, seller_contacts, language, seller_templates |
+| `domain/seller_templates.py` | Versioned deterministic templates and the template-scope validator | seller_contacts, taxonomy, notifications |
+| `domain/language.py` | Evidence-based inquiry language (de/it/fr/en; unsupported is held) | provenance, notifications |
+| `domain/seller_contacts.py` | Exact-listing contact evidence, address canonicalisation, seller identity | listings, notifications |
+| `domain/replies.py` | Reply classification, correlation, dedup, claims, processing decisions, `dashboard_reply_url` | listings, parsing, notifications |
+| `domain/lifecycle.py`, `domain/evaluation.py` | Availability/freshness lags; the 15-day quality evaluation | listings, costs |
+| `integrations/seller_email.py`, `integrations/email_providers/*` | Provider registry; `outlook_local` (default, desktop worker), `gmail_api` (optional), `microsoft_graph` (skeleton) | domain.inquiries, domain.replies, mime_builder |
+| `integrations/mime_builder.py` | RFC 5322/MIME rendering of the stored, immutable inquiry | seller_templates, seller_contacts |
+| `integrations/secret_box.py` | AES-GCM envelopes (MCP Events secrets, sealed sender OAuth grants) | – |
+| `persistence/sellers_repo.py`, `inquiries_repo.py`, `sender_bindings_repo.py` | Seller identity/merges, reservation/queue/dispatch/outcome/retry under the controls lock, sending identities | domain |
+| `persistence/send_intents_repo.py` | Outlook send intents (derived from attempts), the worker claim and reports | inquiries_repo |
+| `persistence/mail_workers_repo.py`, `replies_repo.py`, `availability_repo.py` | Worker identity/bindings sync/health, correlated reply ingest, availability evidence | domain |
+| `persistence/queries/inquiries.py`, `queries/lifecycle.py` | Paged reads for the dashboard/MCP (inquiries, replies, health, evaluation, lags) | views |
+| `workers/inquiry_handlers.py` | `seller_inquiry_plan` / `_send` / `_reconcile` jobs | persistence, integrations |
+| `workers/reply_handlers.py` | `seller_reply_process` job: state steps, recalculation wait, owner alerts | persistence |
+| `workers/reconciliation.py` | Also the bounded inquiry/reply sweeps (plan, send, guarded retry, reconcile, reply jobs) | persistence |
+| `workers/dispatcher.py` | Also the v1.1 category signals: `seller.reply.received` / `seller_reply.owner_alert` -> Slack route of their category only | integrations.slack |
+| `api/mail_worker_routes.py` | `/v1/mail-workers` (mailbox-bound `suvmail_` credential) | persistence |
+| `api/inquiry_routes.py` | Dashboard inquiry/reply/control/health/lifecycle/evaluation routes | persistence, views |
+| `mcp/tools.py` (`V11_TOOLS`) | `seller_inquiries_get`, `seller_replies_get`, `seller_inquiries_pause` (no send/resume tool) | persistence, views |
+| `desktop/outlook-bridge/` | Windows desktop worker (classic Outlook Object Model): local correlation, claim-then-send, reports, heartbeats; wire models in `outlook_bridge/wire.py` | the backend only over `/v1/mail-workers` |
+| `dashboard/` | Private React dashboard (BFF routes only, ADR 0001) including the v1.1 inquiry screens | `/api/...` |
 
 ## Coding conventions (binding)
 
@@ -84,7 +142,8 @@ config/sources/*.yaml  ->  scheduler (15 min slots, ops.source_schedules)
 - Seller-provided text is untrusted data: stored, bounded, escaped on output, never obeyed.
 - No network I/O inside a database transaction. Short transactions; global lock order:
   `ops.jobs` row -> `app.sources` -> `app.listings` -> `app.listing_revisions`
-  -> `app.valuations` -> `app.review_cases` -> `ops.outbox`.
+  -> `app.valuations` -> `app.review_cases` -> `ops.outbox`. The seller-inquiry tail
+  (`app.seller_inquiry_controls` first, never `app.listings` after it) is in docs/schema.md 11.5.
 
 ## Database conventions
 
@@ -106,7 +165,12 @@ config/sources/*.yaml  ->  scheduler (15 min slots, ops.source_schedules)
 - `tests/integration`: real PostgreSQL via `tests/db_harness.py` (`db_url` fixture, marker `db`).
 - `tests/adapters`: saved fixtures in `tests/adapters/fixtures/<source_key>/` with a
   `MANIFEST.yaml` (source, date, parser version, real/synthetic designation).
-- `tests/contracts`: MCP tool and API schema contracts; JSON schema snapshots in `schemas/`.
+- `tests/contracts`: MCP tool and API schema contracts; JSON schema snapshots in `schemas/`; the
+  backend/desktop mail-worker wire parity and backend dashboard links vs. dashboard routes.
+- `tests/integration/v11_*`, `tests/integration/mail_worker_e2e`: the v1.1 database, repositories,
+  runtime workers and the real desktop worker against the real app (synthetic `example.invalid`
+  data only; nothing is ever sent).
+- `desktop/outlook-bridge/tests`: the desktop worker with in-memory fakes (`outlook_bridge.testing`).
 - `tests/adversarial`: SSRF, injection, signature forgery, XSS payloads.
 - `tests/e2e`: browser flows (Playwright) against a locally running stack.
 - `tests/smoke`: live checks, marker `live`, never run automatically.

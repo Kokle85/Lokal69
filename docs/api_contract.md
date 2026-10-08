@@ -32,13 +32,16 @@ with the same error for 5 seconds instead of each waiting on its own network att
 OAuth verifier uses the same throttled client (`api.auth.ThrottledJwksClient`).
 
 **Failed-authentication limiter.** Each client address has a small budget of failed
-authentications on `/api`, `/mcp` and `/v1/mail-workers` (`api.middleware.PreAuthLimiter`: 20 in
-a burst, then one per 3 seconds). A missing, malformed, wrongly signed, unknown, revoked or
+authentications (`api.middleware.PreAuthLimiter`: 20 in a burst, then one per 3 seconds), one
+budget shared by `/api` and `/v1/mail-workers` and one for `/mcp` (`McpOptions.preauth`; the
+mounted MCP app keeps its own unless one is passed). A missing, malformed, wrongly signed, unknown, revoked or
 expired credential takes one unit; while the budget is empty the client's requests are
 `429 RATE_LIMITED` (with `Retry-After`) BEFORE any signature check, key fetch or database lookup.
 Opaque credentials (`suvmcp_`, `suvdev_`, `suvmail_`) are checked by format, CPU-only, before any
-database lookup. Behind a reverse proxy run uvicorn with `--proxy-headers` and a trusted
-`--forwarded-allow-ips`, or every client shares the proxy's budget.
+database lookup. An IPv6 client is one `/64` network (a host rotating addresses inside its own
+prefix gets no new budget) and an IPv4-mapped IPv6 address is its IPv4 address
+(`api.middleware.limiter_key`). Behind a reverse proxy run uvicorn with `--proxy-headers` and a
+trusted `--forwarded-allow-ips`, or every client shares the proxy's budget.
 
 **Membership and workspace.** After verification the server sets `app.user_id` and resolves the
 user's *active* memberships (`app.memberships`). An authenticated user without an active
@@ -322,9 +325,9 @@ The MCP endpoint exposes exactly the tools in `mcp.schemas.TOOLS` (spec §21). T
 
 Mutations are idempotent through `idempotency_key`. `deals_request_recheck` is open-world because
 the queued job later contacts the registered source (within its budget and access decision).
-The three spec 37.8 seller-inquiry tools live in the separate `mcp.schemas.V11_TOOLS` registry
-(section 10.4); they are not in `TOOLS` and are not served until the inquiry package registers
-their handlers through `build_mcp(extra_tools=...)`.
+The three spec 37.8 seller-inquiry tools live in the separate `mcp.schemas.V11_TOOLS` table
+(section 10.4); they are not in `TOOLS` (the spec 21 catalogue stays exactly twelve tools) but the
+default registry serves them after the twelve (`mcp.tools.ToolRegistry.default`).
 
 Input schemas (`tool_input_schema`) are the spec §21 schema map, resolved: no `$ref`,
 `additionalProperties: false` on every object, JSON Schema 2020-12. They add only narrowing
@@ -358,7 +361,7 @@ text from `ResponseEnvelope.to_text()`.
 `schemas/valuation.schema.json` (`ValuationView`), `schemas/event.schema.json` and
 `schemas/tools/<tool>.json` (MCP `Tool` object with `inputSchema`, `outputSchema`,
 `annotations`, `requiredScope`, `paginated`, `idempotencyOperation` and `errorSchema`; the twelve
-`TOOLS` plus the three prepared `V11_TOOLS`) and `schemas/api/<route>.json` (one file per spec 37
+`TOOLS` plus the three served `V11_TOOLS`) and `schemas/api/<route>.json` (one file per spec 37
 route of section 10: `method`, `path`, `auth`, `requiredScope`, `requestLocation`, the `request`
 validation schema, the `response` serialization schema, `successStatus`, `errors`, `paginated`,
 `mcpTool`, `summary` and `idempotencyKeyHeader` (`required`, `optional` or `null`); the file
@@ -466,22 +469,27 @@ Every route also lists `UNAUTHENTICATED`, `FORBIDDEN`, `VALIDATION_ERROR`, `RATE
 - **Replies** are stored only for a valid, published, non-tombstoned binding of the worker's
   mailbox whose references corroborate the message; the backend inserts reply, ingest-dedup
   record and processing event atomically (and the minimal `seller.reply.received.v1` outbox
-  signal for a matched seller reply), and only then may the worker advance its acknowledged
-  checkpoint. A bounce/delivery notice may carry `returned_message_ids` (<= 20, normalised,
+  signal for a matched seller reply, plus the reply's `seller_reply_process` job for the owner
+  decision/opportunity check), and only then may the worker advance its acknowledged checkpoint.
+  A bounce/delivery notice may carry `returned_message_ids` (<= 20, normalised,
   bounce/delivery-notice types only): the returned original's Message-IDs the worker read from the
   RAW report before its sanitiser removed the quoted original. The server uses them for
   correlation (like the domain's own parse of the report body) only when its own classification
   of the uploaded fields is a delivery report too; the stored body is the uploaded one.
 - **Send intents** carry the composed message of an already authorized inquiry plus
-  `kill_switch_active`. An intent with `expired: true` is one whose attempt the server reaped
+  `kill_switch_active` (true while the workspace kill switch is on or its mode is not
+  `automatic`, and also while the serving process's own `SELLER_INQUIRY_MODE` is not `automatic`
+  or `SELLER_INQUIRY_KILL_SWITCH` is on). An intent with `expired: true` is one whose attempt the server reaped
   (its validity ended) although no worker ever claimed it and no report exists: the worker refuses
   it as `intent_expired` without a claim (never sends it), which proves non-submission and lets the
   backend reconcile the inquiry instead of holding it uncertain. **Claim** is a fresh server
   revalidation (kill switch, mode, suppression, cancellation, binding/authorization version,
   listing facts, recipient, cooldown, caps) immediately before `.Send` and answers
   `proceed: false` with a `refusal_reason` instead of an error for a business refusal:
-  `kill_switch` (kill switch on or mode not automatic; the worker reports a retryable
-  pre-submission refusal), `not_now` (rolling caps, seller cooldown or a paused source: the worker
+  `kill_switch` (kill switch on or mode not automatic, in the workspace controls or in the
+  serving process's settings: a process switch flipped after an intent was committed still stops
+  it here, audited with `SETTINGS_KILL_SWITCH_ACTIVE` / `SETTINGS_MODE_NOT_AUTOMATIC`; the worker
+  reports a retryable pre-submission refusal), `not_now` (rolling caps, seller cooldown or a paused source: the worker
   keeps the intent, claims again after 10 minutes while it is valid and reports `intent_expired`
   once its validity ends; nothing is reported for `not_now` itself), or a final reason
   (`intent_invalid`, `intent_expired`, `binding_mismatch`). **Report** records the submission
@@ -525,7 +533,7 @@ User-JWT routes like section 6, enveloped, with the same error conventions. Tabl
 | `GET /api/inquiries/{inquiry_id}` | `inquiries:read` | - | `InquiryView` | 200 | `NOT_FOUND` | `seller_inquiries_get` |
 | `GET /api/replies` | `inquiries:read` | query `ReplyListQuery` (`cursor`, `limit`, `inquiry_id`, `quarantined_only`) | `ReplyListView` of `ReplySummaryView` | 200 | - | - |
 | `GET /api/replies/{reply_id}` | `inquiries:read` | - | `ReplyView` | 200 | `NOT_FOUND` | `seller_replies_get` |
-| `GET /api/inquiry-control` | `inquiries:read` | - | `InquiryControlView` | 200 | - | - |
+| `GET /api/inquiry-control` | `inquiries:read` | - | `InquiryControlView` | 200 | `NOT_FOUND` (no controls row yet: `suv-deals inquiries authorize` creates it) | - |
 | `POST /api/inquiry-control/pause` | `inquiries:pause` | body `InquiryPauseRequest` | `InquiryPauseResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | `seller_inquiries_pause` |
 | `POST /api/inquiry-control/resume` | `config:admin` | body `InquiryResumeRequest` | `InquiryResumeResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
 | `GET /api/mail-workers/health` | `inquiries:read` | query `MailWorkerHealthQuery` (`include_revoked`) | `MailWorkerHealthView` of `MailboxHealthView` | 200 | - | - |
@@ -553,6 +561,13 @@ surface replays the same result); resume uses `inquiry_control_resume`.
   Macedonian summary, the verified sender identity, received/ingested times, extracted claims
   (a price quote is an `unaccepted_seller_quote`, never accepted), safe attachment metadata
   (no local reference) and the current valuation status. Lists never contain bodies.
+  A **quarantined** reply (an unverified possible match: forwarded, changed address, ambiguous,
+  conflicting upload) may be unrelated personal mail of the owner, so its text follows the
+  address rule: only `config:admin` holders (the owner, dashboard only) read it; everyone else, and
+  every MCP caller (`seller_replies_get`), gets its metadata and quarantine reason only:
+  `content_withheld: true`, empty `subject`/`sanitized_body`, no summary, claims or attachment
+  metadata (`views.inquiries.reply_content_visible`). Its text never reaches dot or a model
+  provider before the owner verified it.
 - **Inquiry control** shows the kill switch, mode, owner-reducible caps, current usage and
   `removable_suppressions`: how many active `kill_switch` suppressions (and, while the current
   standing authorization is effective, `authorization_revoked` ones) a resume could remove.
@@ -605,7 +620,8 @@ Input schemas are exactly the spec 37.8 JSON (`seller_inquiries_get`: `inquiry_i
 3-2000 characters, `idempotency_key` 8-128 characters), plus the printable-character `pattern`
 every idempotency key already has. The workspace comes from the token. Results return only the
 caller's workspace records and never a secret, an unrelated thread message or a signed external
-access credential. There is no send, reply or resume tool.
+access credential; a quarantined reply comes without its text (`content_withheld: true`). There is
+no send, reply or resume tool.
 
 ### 10.5 Database guard refusals
 

@@ -133,3 +133,78 @@ export function safeNextPath(value: string | null | undefined): string {
   }
   return value
 }
+
+/**
+ * A duration from whole seconds ("42 s", "5 min 10 s", "3 h 5 min", "2 days 4 h"). Display only;
+ * `null`/negative/non-finite input is "unknown" (never zero).
+ */
+export function durationText(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return 'unknown'
+  const total = Math.floor(seconds)
+  if (total < 60) return `${total} s`
+  const minutes = Math.floor(total / 60)
+  if (minutes < 60) {
+    const rest = total % 60
+    return rest ? `${minutes} min ${rest} s` : `${minutes} min`
+  }
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) {
+    const rest = minutes % 60
+    return rest ? `${hours} h ${rest} min` : `${hours} h`
+  }
+  const days = Math.floor(hours / 24)
+  const rest = hours % 24
+  return rest ? `${days} days ${rest} h` : `${days} days`
+}
+
+const RATIO = /^\+?(\d*)(?:\.(\d*))?$/
+
+/**
+ * A decimal ratio string ("0.8333") as a percentage ("83.3 %") by moving the decimal point in the
+ * digit string (no float arithmetic). Extra digits are cut, so coverage is never overstated.
+ */
+export function ratioPercentText(value: string | null | undefined): string {
+  if (value === null || value === undefined || value === '') return 'not applicable'
+  const match = RATIO.exec(value)
+  if (!match || (!match[1] && !match[2])) return value
+  const integer = match[1] ?? ''
+  const fraction = match[2] ?? ''
+  const shifted = `${integer}${fraction.padEnd(2, '0').slice(0, 2)}`.replace(/^0+(?=\d)/, '')
+  const tenth = fraction.slice(2, 3) || '0'
+  return `${shifted || '0'}.${tenth} %`
+}
+
+/** A byte count for attachment metadata ("820 B", "12.4 kB", "3.1 MB"); display only. */
+export function bytesText(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return 'unknown'
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(Math.floor((value * 10) / 1024) / 10).toFixed(1)} kB`
+  return `${(Math.floor((value * 10) / (1024 * 1024)) / 10).toFixed(1)} MB`
+}
+
+/** The first 12 hex digits of a hash or fingerprint, for display next to the full value's title. */
+export function shortHash(value: string | null | undefined): string {
+  if (!value) return 'none'
+  return value.length > 12 ? `${value.slice(0, 12)}…` : value
+}
+
+/** A count that is `null` when unknown: shown as "unknown", a real zero as "0". */
+export function countText(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'unknown'
+  return String(value)
+}
+
+/**
+ * Orders two RFC 3339 instants by time (for `sort`). The server omits a zero fraction
+ * (`...:00Z` next to `...:00.25Z`), so comparing the strings would put a whole second AFTER its
+ * own fractions; unparsable values sort last, in string order.
+ */
+export function compareInstants(a: string, b: string): number {
+  const left = Date.parse(a)
+  const right = Date.parse(b)
+  if (Number.isNaN(left) || Number.isNaN(right)) {
+    if (Number.isNaN(left) !== Number.isNaN(right)) return Number.isNaN(left) ? 1 : -1
+    return a < b ? -1 : a > b ? 1 : 0
+  }
+  return left - right
+}

@@ -358,11 +358,3 @@ describe('sources', () => {
     expect(screen.queryByRole('button', { name: 'Pause this source' })).toBeNull()
   })
 })
-
-describe('placeholder', () => {
-  it('marks seller inquiries as coming with v1.1 wiring', async () => {
-    const api = fakeApi({ 'GET /api/me': () => ok(me()) })
-    renderApp('/inquiries', { api })
-    expect(await screen.findByRole('heading', { name: 'Seller inquiries (coming with v1.1 wiring)' })).toBeInTheDocument()
-  })
-})
