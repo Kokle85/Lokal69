@@ -579,7 +579,7 @@ Advisor notes (2026-10-06):
   indexes only where real query plans need them (spec §11). Three "multiple permissive policies"
   warnings are the intended self-lookup policies for memberships, workspaces and API credentials.
 
-#### v1.1 migrations (applied 2026-10-07)
+#### v1.1 migrations (applied 2026-10-07 and 2026-10-08)
 
 | File | Recorded version | Stored text |
 |---|---|---|
@@ -591,6 +591,7 @@ Advisor notes (2026-10-06):
 | 20261007000100_v11_integration_foundation | 20261007202801 | byte-exact (sha256 `0f6ea83a…7fab`) |
 | 20261007000200_fixture_lineage_and_guards | 20261007220520 | byte-exact (sha256 `286f3de0…ed29`) |
 | 20261007000400_mail_worker_credential_kind | 20261007220534 | byte-exact (sha256 `44c614a4…437e`) |
+| 20261008000100_inquiry_quota_backstop | 20261008050157 | byte-exact (sha256 `c3c218ff…6fe8`) |
 
 Connector constraints found while applying, now enforced by `tests/unit/test_migrations_ascii.py`:
 
@@ -1041,7 +1042,7 @@ letter case, an unparseable key=value string) is refused rather than guessed at.
   ledger insert and before every `queued -> sending`, under the controls lock; released debits
   never count) stay. No table, column, grant or policy change; the security baseline is re-applied.
   Pure ASCII, no `DROP TRIGGER`. Tests: `tests/integration/v11_runtime/test_quota_backstop.py`
-  (PostgreSQL 16 and 17). Not yet listed in section 9: the lead applies it to the Supabase project.
+  (PostgreSQL 16 and 17). Applied to the Supabase project on 2026-10-08 (section 9, recorded version 20261008050157, byte-exact).
 - No further DDL in wave B2. The runtime (`workers.inquiry_handlers`, `workers.reply_handlers`,
   `workers.reconciliation`) uses only the recipes of 11.5 plus:
   - `inquiries_repo.mark_replied` (lock order: the inquiry row, then the binding publication, as
