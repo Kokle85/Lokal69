@@ -303,10 +303,9 @@ def build_health(
         except json.JSONDecodeError:
             pass
     intents = store.intents()
-    gaps = tuple(
-        GapReport(kind=g.kind, started_at=g.started_at, ended_at=g.ended_at)
-        for g in store.gaps(since=now - gap_window)
-    )[-50:]
+    gaps = tuple(GapReport.of(g.kind, g.started_at, g.ended_at) for g in store.gaps(since=now - gap_window))[
+        -50:
+    ]
     return HealthSnapshot(
         generated_at=now,
         worker=WorkerHealth(
@@ -421,7 +420,7 @@ def heartbeat_envelope(
         backlog_oldest_age_seconds=_age(now, stats.oldest_pending_created_at),
         unresolved_matching_gaps=store.outcome_counts().get(Outcome.MATCHING_GAP.value, 0),
         checkpoints=tuple(checkpoints),
-        gaps=tuple(GapReport(kind=g.kind, started_at=g.started_at, ended_at=g.ended_at) for g in reported),
+        gaps=tuple(GapReport.of(g.kind, g.started_at, g.ended_at) for g in reported),
     )
     return envelope, tuple(g.id for g in reported if g.ended_at is not None)
 

@@ -3370,6 +3370,56 @@ async def requalify(conn: Conn, actor: ActorContext, inquiry_id: UUID, *, reason
     return await _requalify(conn, actor, inquiry_id, reason=text, code="REQUALIFIED")
 
 
+async def mark_replied(
+    conn: Conn, actor: ActorContext, inquiry_id: UUID, *, reply_id: UUID
+) -> InquiryRecord | None:
+    """``accepted``/``no_reply_yet`` -> ``replied`` for a seller reply stored earlier (B2a addition).
+
+    A reply that arrived while the send was still ``sending``/``uncertain`` is stored without a
+    state step (``domain.replies`` has no reply transition from those states). Once the send is
+    reconciled as accepted, the seller-reply processing job applies the step here. Only an
+    unquarantined ``seller_reply`` of this very inquiry qualifies (the database evidence guard
+    repeats it). Returns the updated record, or ``None`` when no step applies.
+    """
+    require_inquiry_writer(actor)
+    record = await _lock_inquiry(conn, actor, inquiry_id)
+    if record.state not in (InquiryState.ACCEPTED, InquiryState.NO_REPLY_YET):
+        return None
+    async with mapped_errors():
+        reply = await fetch_one(
+            conn,
+            "select 1 as found from app.seller_replies where workspace_id = %(ws)s and id = %(reply)s"
+            " and inquiry_id = %(id)s and not quarantined and message_type = 'seller_reply'",
+            {"ws": actor.workspace_id, "reply": reply_id, "id": inquiry_id},
+        )
+    if reply is None:
+        return None
+    require_transition(record.state, InquiryState.REPLIED)
+    async with mapped_errors():
+        await conn.execute(
+            "update app.seller_inquiries set state = 'replied', state_reasons = %(reasons)s,"
+            " row_version = row_version + 1 where workspace_id = %(ws)s and id = %(id)s and state = %(from)s",
+            {
+                "ws": actor.workspace_id,
+                "id": inquiry_id,
+                "from": record.state.value,
+                "reasons": ["SELLER_REPLY_STORED_BEFORE_ACCEPTANCE"],
+            },
+        )
+    await audit.record(
+        conn,
+        actor,
+        "seller_inquiry.replied",
+        "seller_inquiry",
+        inquiry_id,
+        prior_version=record.row_version,
+        reason="seller reply stored before the send was reconciled",
+        metadata={"reply_id": str(reply_id), "from_state": record.state.value},
+    )
+    await _publish_binding(conn, actor, inquiry_id)
+    return await get_inquiry(conn, actor, inquiry_id)
+
+
 def require_message_approval_flag(value: object) -> bool:
     """``dispatch`` needs an explicit bool (``requires_message_approval(settings)``)."""
     if not isinstance(value, bool):
@@ -3407,6 +3457,7 @@ __all__ = [
     "get_controls",
     "get_inquiry",
     "list_attempts",
+    "mark_replied",
     "next_window_at",
     "open_inquiry",
     "pause",

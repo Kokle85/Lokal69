@@ -24,9 +24,11 @@ Order (outermost first; ``app.create_app`` builds it):
    refused.
 
 `PrincipalRateLimiter` is an in-memory token bucket per authenticated principal, with separate
-buckets for mutations and reads. It is per process: N replicas allow N times the budget, and a
-restart resets it. That is adequate for the single-owner MVP; a shared limiter (database or
-proxy) is the upgrade path when the API is replicated.
+buckets for mutations and reads; `PreAuthLimiter` is a per-client bucket of failed
+authentications that refuses a flooding client before any token verification. Both are per
+process: N replicas allow N times the budget, and a restart resets them. That is adequate for the
+single-owner MVP; a shared limiter (database or proxy) is the upgrade path when the API is
+replicated.
 """
 
 from __future__ import annotations
@@ -55,6 +57,8 @@ logger = logging.getLogger("suv_deals.api")
 
 REQUEST_ID_HEADER: Final = "X-Request-Id"
 API_PREFIX: Final = "/api"
+#: The mailbox-worker API (``api.mail_worker_routes``); no CORS, its own body limit.
+MAIL_WORKER_PATH_PREFIX: Final = "/v1/mail-workers"
 OPERATIONAL_PATHS: Final = frozenset({"/healthz", "/readyz", "/metrics"})
 CORS_ALLOWED_METHODS: Final = ("GET", "POST", "OPTIONS")
 CORS_ALLOWED_HEADERS: Final = (
@@ -89,8 +93,12 @@ def is_api_path(path: str) -> bool:
     return path == API_PREFIX or path.startswith(API_PREFIX + "/")
 
 
+def is_mail_worker_path(path: str) -> bool:
+    return path == MAIL_WORKER_PATH_PREFIX or path.startswith(MAIL_WORKER_PATH_PREFIX + "/")
+
+
 def _no_store_path(path: str) -> bool:
-    return is_api_path(path) or path in OPERATIONAL_PATHS
+    return is_api_path(path) or is_mail_worker_path(path) or path in OPERATIONAL_PATHS
 
 
 # --------------------------------------------------------------------------------------------
@@ -175,7 +183,7 @@ class RequestContextMiddleware:
             reset_log_context(tokens)
 
     def _observe(self, scope: Scope, path: str, status: int, elapsed: float) -> None:
-        if not (is_api_path(path) or path in OPERATIONAL_PATHS):
+        if not (is_api_path(path) or is_mail_worker_path(path) or path in OPERATIONAL_PATHS):
             return  # the mounted MCP endpoint records its own surface metrics
         route = scope.get("route")
         template = getattr(route, "path", None)
@@ -417,6 +425,96 @@ class PrincipalRateLimiter:
         raise RateLimited("Too many requests; slow down", retry_after_seconds=max(1, math.ceil(wait)))
 
 
+# --------------------------------------------------------------------------------------------
+# Per-client limiter for unauthenticated / invalid-credential requests
+# --------------------------------------------------------------------------------------------
+
+#: Failed authentications a client may cause before it is refused BEFORE verification: 20 in a
+#: burst, then one more every 3 seconds (20/minute).
+DEFAULT_PREAUTH_LIMIT: Final = RateLimit(capacity=20, per_seconds=3.0)
+UNKNOWN_CLIENT: Final = "unknown"
+
+
+def client_address(scope: Scope) -> str:
+    """The ASGI client host (the proxy's address unless the server trusts proxy headers)."""
+    client = scope.get("client")
+    host = client[0] if isinstance(client, list | tuple) and client else None
+    return host[:64] if isinstance(host, str) and host else UNKNOWN_CLIENT
+
+
+class PreAuthLimiter:
+    """Cheap per-client limiter in front of token verification (``/api``, ``/mcp``,
+    ``/v1/mail-workers``).
+
+    Each missing, malformed, wrongly signed, unknown, revoked or expired credential takes one
+    token from the client's bucket (`failed`); while a bucket is empty, `check` refuses the
+    client's requests with ``RATE_LIMITED`` BEFORE any signature check, key fetch or database
+    lookup, so a credential-guessing flood costs a dictionary lookup per request. A successful
+    authentication takes nothing. Like `PrincipalRateLimiter` it is per process, bounded in the
+    number of tracked clients, and keyed by the ASGI client address (behind a reverse proxy run
+    uvicorn with ``--proxy-headers`` and a trusted ``--forwarded-allow-ips``, or every client
+    shares the proxy's bucket).
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: RateLimit = DEFAULT_PREAUTH_LIMIT,
+        max_clients: int = 10_000,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_clients < 1:
+            raise ValueError("max_clients must be positive")
+        self._limit = limit
+        self._buckets: OrderedDict[str, _Bucket] = OrderedDict()
+        self._max = max_clients
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+
+    def _refill(self, client: str, now: float) -> _Bucket | None:
+        bucket = self._buckets.get(client)
+        if bucket is not None:
+            elapsed = max(now - bucket.updated, 0.0)
+            bucket.tokens = min(
+                float(self._limit.capacity), bucket.tokens + elapsed / self._limit.per_seconds
+            )
+            bucket.updated = now
+            if bucket.tokens >= float(self._limit.capacity):
+                del self._buckets[client]  # fully refilled: forget the client
+                return None
+        return bucket
+
+    def check(self, client: str) -> None:
+        """Refuse (``RATE_LIMITED``) a client that has no failed-authentication budget left."""
+        now = self._monotonic()
+        with self._lock:
+            bucket = self._refill(client, now)
+            if bucket is None or bucket.tokens >= 1.0:
+                return
+            wait = (1.0 - bucket.tokens) * self._limit.per_seconds
+        raise RateLimited(
+            "Too many failed authentication attempts; slow down", retry_after_seconds=max(1, math.ceil(wait))
+        )
+
+    def failed(self, client: str) -> None:
+        """Record one failed authentication of ``client`` (never raises)."""
+        now = self._monotonic()
+        with self._lock:
+            bucket = self._refill(client, now)
+            if bucket is None:
+                bucket = _Bucket(tokens=float(self._limit.capacity), updated=now)
+                self._buckets[client] = bucket
+                while len(self._buckets) > self._max:
+                    self._buckets.popitem(last=False)
+            else:
+                self._buckets.move_to_end(client)
+            bucket.tokens = max(bucket.tokens - 1.0, 0.0)
+
+    def tracked_clients(self) -> int:
+        with self._lock:
+            return len(self._buckets)
+
+
 __all__ = [
     "CORS_ALLOWED_HEADERS",
     "CORS_ALLOWED_METHODS",
@@ -424,13 +522,18 @@ __all__ = [
     "DEFAULT_API_BODY_LIMIT",
     "DEFAULT_MUTATION_LIMIT",
     "DEFAULT_OTHER_BODY_LIMIT",
+    "DEFAULT_PREAUTH_LIMIT",
     "DEFAULT_READ_LIMIT",
+    "MAIL_WORKER_PATH_PREFIX",
     "REQUEST_ID_HEADER",
     "ApiCorsMiddleware",
     "BodySizeLimitMiddleware",
     "InternalErrorMiddleware",
+    "PreAuthLimiter",
     "PrincipalRateLimiter",
     "RateLimit",
     "RequestContextMiddleware",
+    "client_address",
     "is_api_path",
+    "is_mail_worker_path",
 ]

@@ -18,7 +18,7 @@
   "request": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool).",
+    "description": "Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool).\n\n``remove_suppressions``: also remove (audited, one audit event per suppression) the active\n``kill_switch`` suppressions and, while the current standing authorization is effective and\nunrevoked, the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint,\nsender revoked, ...) are never removed here.",
     "properties": {
       "expected_version": {
         "minimum": 1,
@@ -36,6 +36,10 @@
         "maxLength": 2000,
         "minLength": 3,
         "type": "string"
+      },
+      "remove_suppressions": {
+        "default": false,
+        "type": "boolean"
       }
     },
     "required": [
@@ -77,6 +81,12 @@
             "format": "date-time",
             "type": "string"
           },
+          "suppressions_removed": {
+            "default": 0,
+            "description": "Suppressions removed with this resume (each one audited).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "version": {
             "description": "The new control version.",
             "minimum": 1,
@@ -87,7 +97,8 @@
           "version",
           "kill_switch",
           "mode",
-          "resumed_at"
+          "resumed_at",
+          "suppressions_removed"
         ],
         "title": "InquiryResumeResult",
         "type": "object"
@@ -174,5 +185,5 @@
     "type": "object"
   },
   "successStatus": 200,
-  "summary": "Owner-only: clear the kill switch against the expected control version."
+  "summary": "Owner-only: clear the kill switch against the expected control version; optionally remove kill-switch/authorization-revoked suppressions (each audited)."
 }

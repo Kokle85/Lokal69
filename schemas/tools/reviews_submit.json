@@ -281,6 +281,11 @@
             "format": "date-time",
             "type": "string"
           },
+          "decided_by_caller": {
+            "default": false,
+            "description": "True when the authenticated caller of this response recorded the decision.",
+            "type": "boolean"
+          },
           "decision_id": {
             "format": "uuid",
             "type": "string"
@@ -421,6 +426,7 @@
           "decided_at",
           "supersedes_decision_id",
           "is_fixture",
+          "decided_by_caller",
           "notice"
         ],
         "title": "ReviewDecisionView",

@@ -16,8 +16,12 @@
   "request": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "``GET /api/inquiries``: keyset page, optionally one state or only uncertain sends.",
+    "description": "``GET /api/inquiries``: a frozen snapshot page, optionally one state, only uncertain sends\nor only inquiries needing attention (uncertain, held for facts, suppressed, failed, stuck\nsending).",
     "properties": {
+      "attention_only": {
+        "default": false,
+        "type": "boolean"
+      },
       "cursor": {
         "default": null,
         "description": "Opaque next_cursor from the previous page; omit for the first page.",

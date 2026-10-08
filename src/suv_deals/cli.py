@@ -8,7 +8,7 @@ Commands (``suv-deals <command> --help`` for details)::
     sources set-technical-status | resume
                                    audited owner recovery actions (never enable a source; --yes)
     crawl once                     one bounded discovery through every gate (no URLs accepted)
-    worker | scheduler | dispatcher | reconcile
+    worker | scheduler | dispatcher | reconcile [--workspace]
                                    the runtime processes (one image, different commands)
     outbox inspect                 outbox counts and events needing attention
     reviews list                   review cases by state
@@ -20,6 +20,13 @@ Commands (``suv-deals <command> --help`` for details)::
     credentials create-mcp | revoke | list
                                    scoped MCP credentials (token shown once; --yes)
     bootstrap owner                link an existing Supabase Auth user as workspace owner (--yes)
+    mail-worker credential issue | revoke | list
+                                   the desktop mail worker's mailbox binding and credential
+                                   (token shown once; --yes)
+    sender-binding create | status the owner-authorized sending identity (secret by reference only)
+    inquiries status | pause | resume
+                                   seller-inquiry controls (reason + expected version; --yes)
+    evaluation report --days 15    the 15-day quality evaluation from stored evidence
 
 Design rules: secrets are never command-line arguments (environment / ``.env`` only); every
 state-changing command needs an explicit ``--yes``; network and notification switches cannot be
@@ -43,6 +50,7 @@ from suv_deals.cli_commands import (
     credentials,
     db,
     doctor,
+    inquiries,
     ops,
     processes,
     sources,
@@ -95,6 +103,10 @@ cli.add_command(tax.tax_rules_group)
 cli.add_command(db.db_group)
 cli.add_command(credentials.credentials_group)
 cli.add_command(bootstrap.bootstrap_group)
+cli.add_command(inquiries.mail_worker_group)
+cli.add_command(inquiries.sender_binding_group)
+cli.add_command(inquiries.inquiries_group)
+cli.add_command(inquiries.evaluation_group)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

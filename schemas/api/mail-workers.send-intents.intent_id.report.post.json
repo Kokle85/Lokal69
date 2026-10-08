@@ -77,6 +77,7 @@
           "outlook_not_classic",
           "mailbox_unavailable",
           "duplicate_intent",
+          "not_now",
           null
         ],
         "type": [

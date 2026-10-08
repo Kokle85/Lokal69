@@ -184,7 +184,15 @@ class ReviewDecisionView(ViewModel):
     decided_at: UtcDatetime
     supersedes_decision_id: UUID | None
     is_fixture: bool
+    decided_by_caller: bool = Field(
+        default=False,
+        description="True when the authenticated caller of this response recorded the decision.",
+    )
     notice: str = DECISION_NOTICE
+
+    def for_caller(self, principal_id: UUID) -> ReviewDecisionView:
+        """This decision with ``decided_by_caller`` set for the authenticated ``principal_id``."""
+        return self.model_copy(update={"decided_by_caller": self.actor.principal_id == principal_id})
 
     @model_validator(mode="after")
     def _versions(self) -> ReviewDecisionView:
@@ -257,6 +265,12 @@ class ReviewCaseView(ViewModel):
     is_fixture: bool
     created_at: UtcDatetime
     updated_at: UtcDatetime
+
+    def for_caller(self, principal_id: UUID) -> ReviewCaseView:
+        """This case with every decision's ``decided_by_caller`` set for ``principal_id``."""
+        return self.model_copy(
+            update={"decisions": tuple(d.for_caller(principal_id) for d in self.decisions)}
+        )
 
     @model_validator(mode="after")
     def _consistent(self) -> ReviewCaseView:

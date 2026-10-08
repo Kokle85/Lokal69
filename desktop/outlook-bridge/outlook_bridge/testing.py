@@ -51,10 +51,9 @@ from outlook_bridge.outlook_adapter import (
     PR_TRANSPORT_MESSAGE_HEADERS,
 )
 from outlook_bridge.sta_runtime import SessionContext
-from outlook_bridge.wire import WorkerSendIntent, message_body_hash
+from outlook_bridge.wire import ReplyUpload, WorkerSendIntent, message_body_hash
 from suv_deals.domain.replies import (
     InquiryBindingState,
-    ReplyIngestRequest,
     StoredReplyIngest,
     decide_ingest,
 )
@@ -703,6 +702,8 @@ class FakeBackend:
         self.store_then_timeout = 0
         self.intents: dict[UUID, WorkerSendIntent] = {}
         self.open_intents: list[UUID] = []
+        #: Open intents the server lists with ``expired: true`` (reaped before any claim).
+        self.expired_intents: set[UUID] = set()
         self.kill_switch = False
         self.claims: list[UUID] = []
         self.claim_refusal: str | None = None
@@ -771,6 +772,10 @@ class FakeBackend:
         self.intents[intent.intent_id] = intent
         self.open_intents.append(intent.intent_id)
 
+    def expire_intent(self, intent_id: UUID) -> None:
+        """List an open intent as ``expired`` (the backend reaped it before any worker claimed it)."""
+        self.expired_intents.add(intent_id)
+
     def revoke_token(self, token: str) -> None:
         self.tokens.discard(token)
 
@@ -818,7 +823,13 @@ class FakeBackend:
                 200,
                 json={
                     "schema_version": "1.0",
-                    "intents": [json.loads(self.intents[i].model_dump_json()) for i in self.open_intents],
+                    "intents": [
+                        {
+                            **json.loads(self.intents[i].model_dump_json()),
+                            "expired": i in self.expired_intents,
+                        }
+                        for i in self.open_intents
+                    ],
                     "kill_switch_active": self.kill_switch,
                 },
             )
@@ -883,7 +894,7 @@ class FakeBackend:
         if not key:
             return self._error(400, "VALIDATION_ERROR")
         try:
-            ingest = ReplyIngestRequest.model_validate(body)
+            ingest = ReplyUpload.model_validate(body)
         except ValidationError:
             return self._error(422, "VALIDATION_ERROR")
         if ingest.mailbox_binding_id != self.mailbox:

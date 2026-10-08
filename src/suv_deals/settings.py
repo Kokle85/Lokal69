@@ -147,6 +147,9 @@ class Settings(BaseSettings):
     metrics_enabled: bool = False
     metrics_bind: str = DEFAULT_METRICS_BIND
 
+    # Review claim lease of the dashboard and MCP ``reviews_claim`` (60 s to 1 h; default 5 min).
+    review_claim_duration_seconds: int = Field(default=300, ge=60, le=3600)
+
     scheduler_interval_seconds: int = Field(default=900, ge=60)
     source_network_enabled: bool = False
     allow_external_notifications: bool = False

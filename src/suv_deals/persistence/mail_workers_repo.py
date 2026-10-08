@@ -553,7 +553,10 @@ select i.id, i.state, i.sender_binding_id, i.sender_provider, i.rfc_message_id, 
  where i.workspace_id = %(ws)s and i.id = %(id)s
 """
 _ATTEMPTS_SQL: Final = """
-select rfc_message_id, outcome, reconciled_outcome, provider_message_id, provider_thread_id
+select rfc_message_id, outcome, reconciled_outcome, provider_message_id, provider_thread_id,
+       provider_response ->> 'observed_rfc_message_id' as observed_accepted,
+       provider_response -> 'worker_report' ->> 'observed_internet_message_id' as observed_report,
+       reconciliation_evidence -> 'worker_report' ->> 'observed_internet_message_id' as observed_reconciled
   from ops.email_delivery_attempts
  where workspace_id = %(ws)s and inquiry_id = %(id)s
  order by attempt_number
@@ -612,20 +615,21 @@ async def binding_payload(conn: Conn, workspace_id: UUID, inquiry: Mapping[str, 
         addresses = await fetch_all(conn, _SELLER_ADDRESSES_SQL, params)
     # Outbound: Message-IDs the provider accepted (or reconciliation proved accepted). Every other
     # send intent's Message-ID (an uncertain or unfinished hand-over) is published separately so
-    # a reply to it can resolve the uncertain send.
-    accepted = [
-        a["rfc_message_id"]
-        for a in attempts
-        if a["outcome"] == "accepted" or a["reconciled_outcome"] == "accepted"
-    ]
+    # a reply to it can resolve the uncertain send. A Message-ID the provider or the worker
+    # OBSERVED on the sent copy (a client may rewrite the header) is published next to the
+    # generated one, so a reply quoting it still correlates.
+    accepted: list[object] = []
+    others: list[object] = [inquiry["rfc_message_id"]]
+    for a in attempts:
+        observed = [a["observed_accepted"], a["observed_report"], a["observed_reconciled"]]
+        if a["outcome"] == "accepted" or a["reconciled_outcome"] == "accepted":
+            accepted.extend([a["rfc_message_id"], *observed])
+        else:
+            others.extend([a["rfc_message_id"], *observed])
     if inquiry["accepted_at"] is not None:
         accepted.insert(0, inquiry["rfc_message_id"])
     outbound = _message_ids(accepted)
-    intents = [
-        m
-        for m in _message_ids([inquiry["rfc_message_id"], *(a["rfc_message_id"] for a in attempts)])
-        if m not in outbound
-    ]
+    intents = [m for m in _message_ids(others) if m not in outbound]
     provider_ids = _texts([inquiry["provider_message_id"], *(a["provider_message_id"] for a in attempts)])
     threads = _texts([inquiry["provider_thread_id"], *(a["provider_thread_id"] for a in attempts)])
     aliases: list[str] = []

@@ -283,13 +283,17 @@ async def test_heartbeats_failing_past_the_lease_stop_the_handler(
 
 
 async def test_new_job_types_plug_into_the_registry(env: PipelineEnv) -> None:
-    """Extension point for later packages (e.g. seller-inquiry dispatch): register, then claim."""
+    """Extension point for later packages: register, then claim (spec v1.1 runtime is built in)."""
     registry = default_registry()
     assert set(registry.job_types()) == {
         JobType.DETAIL,
         JobType.DISCOVERY,
         JobType.RECHECK,
         JobType.VALUATION,
+        JobType.SELLER_INQUIRY_PLAN,
+        JobType.SELLER_INQUIRY_SEND,
+        JobType.SELLER_INQUIRY_RECONCILE,
+        JobType.SELLER_REPLY_PROCESS,
     }
     with pytest.raises(ValidationFailed):
         registry.register(JobType.VALUATION, succeed)  # replacing needs replace=True

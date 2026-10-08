@@ -403,7 +403,7 @@ def test_contract_doc_lists_every_route_scope_model_and_error() -> None:
     for name, spec in V11_TOOLS.items():
         assert f"| `{name}` | `{spec.scope.value}` |" in doc, name
         assert f"`{spec.output_model.__name__}`" in doc
-    assert "to be implemented by the API package" in doc
+    assert "served by default" in doc
     for phrase in (
         "Bearer",
         "CSRF",

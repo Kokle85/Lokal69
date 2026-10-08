@@ -1,0 +1,216 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/mail-workers/coverage-gaps",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /api/mail-workers/health`` and ``/coverage-gaps``: revoked workers only on request.",
+    "properties": {
+      "include_revoked": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "title": "MailWorkerHealthQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/mail-workers/coverage-gaps``: open gaps first, then the newest closed ones.",
+        "properties": {
+          "generated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One coverage gap with the mailbox it belongs to.",
+              "properties": {
+                "binding_state": {
+                  "enum": [
+                    "active",
+                    "revoked"
+                  ],
+                  "type": "string"
+                },
+                "gap": {
+                  "additionalProperties": false,
+                  "description": "A monitored coverage gap of a mailbox worker (reported by it or detected by the server).",
+                  "properties": {
+                    "detected_by": {
+                      "enum": [
+                        "worker",
+                        "server"
+                      ],
+                      "type": "string"
+                    },
+                    "ended_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "kind": {
+                      "maxLength": 64,
+                      "type": "string"
+                    },
+                    "open": {
+                      "type": "boolean"
+                    },
+                    "started_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "started_at",
+                    "ended_at",
+                    "open",
+                    "detected_by"
+                  ],
+                  "title": "MailCoverageGap",
+                  "type": "object"
+                },
+                "mailbox_binding_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "worker_label": {
+                  "maxLength": 120,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mailbox_binding_id",
+                "worker_label",
+                "binding_state",
+                "gap"
+              ],
+              "title": "MailCoverageGapItem",
+              "type": "object"
+            },
+            "maxItems": 5000,
+            "type": "array"
+          },
+          "open_gap_count": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generated_at",
+          "open_gap_count",
+          "items"
+        ],
+        "title": "MailCoverageGapListView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "mail-workers.coverage-gaps.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Mailbox coverage gaps (open first); a gap is never hidden."
+}

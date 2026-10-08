@@ -1,4 +1,6 @@
-"""MCP tool surface: ``tools/list`` and ``tools/call`` for the twelve spec 21 tools.
+"""MCP tool surface: ``tools/list`` and ``tools/call`` for the twelve spec 21 tools and the three
+spec 37.8 inquiry tools (``seller_inquiries_get``, ``seller_replies_get`` under ``inquiries:read``;
+``seller_inquiries_pause`` under ``inquiries:pause``).
 
 ``tools/list`` returns only the tools whose scope the caller holds, in the deterministic spec 21
 order, each with its exact resolved ``inputSchema`` (``additionalProperties: false`` everywhere),
@@ -30,9 +32,10 @@ Results are ``cacheScope: private`` with ``ttlMs: 0`` because the list depends o
    correlation id. Anything unexpected is logged server-side and returned as ``INTERNAL_ERROR``
    without details: no SQL, traces, tokens or submitted values.
 
-There is no purchase, seller-contact, payment, tax-approval, SQL or crawl tool. Later packages
-add tools through `ToolRegistry.with_tools` (for example the spec 37.8 inquiry tools); the
-forbidden names are refused there too.
+There is no purchase, seller-contact/send, payment, tax-approval, SQL or crawl tool: the inquiry
+tools read one inquiry/reply of the caller's workspace or activate the kill switch (never resume,
+never send). Later packages add tools through `ToolRegistry.with_tools`; the forbidden names are
+refused there too.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Final
 from uuid import uuid4
 
@@ -61,6 +64,7 @@ from suv_deals.mcp.auth import current_principal
 from suv_deals.mcp.schemas import (
     FORBIDDEN_TOOL_NAMES,
     TOOLS,
+    V11_TOOLS,
     DealsAddNoteInput,
     DealsGetCandidateInput,
     DealsGetComparablesInput,
@@ -72,6 +76,9 @@ from suv_deals.mcp.schemas import (
     ReviewsListPendingInput,
     ReviewsReleaseInput,
     ReviewsSubmitInput,
+    SellerInquiriesGetInput,
+    SellerInquiriesPauseInput,
+    SellerRepliesGetInput,
     SourcesPauseInput,
     SubmitRuleError,
     ToolInput,
@@ -82,8 +89,17 @@ from suv_deals.mcp.schemas import (
 )
 from suv_deals.observability.logging import log_context
 from suv_deals.observability.metrics import AppMetrics
-from suv_deals.persistence import listings_repo, notes_repo, queries, reviews_repo, sources_repo
+from suv_deals.persistence import (
+    idempotency,
+    inquiries_repo,
+    listings_repo,
+    notes_repo,
+    queries,
+    reviews_repo,
+    sources_repo,
+)
 from suv_deals.persistence.database import Conn, Database, db_now
+from suv_deals.persistence.errors_map import TransientConflict
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
 from suv_deals.views.common import (
@@ -94,6 +110,7 @@ from suv_deals.views.common import (
     is_valid_request_id,
     warning,
 )
+from suv_deals.views.inquiries import InquiryPauseResult
 from suv_deals.views.jsonschema import model_schema
 
 logger = logging.getLogger("suv_deals.mcp.tools")
@@ -101,10 +118,14 @@ logger = logging.getLogger("suv_deals.mcp.tools")
 TRANSACTION_ATTEMPTS: Final = 3
 TOOL_NAME_PATTERN: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 #: Single-object reads; every other tool (paginated reads, health, writes) is "expensive".
-CHEAP_TOOLS: Final = frozenset({"deals_get_candidate", "deals_get_valuation"})
+CHEAP_TOOLS: Final = frozenset(
+    {"deals_get_candidate", "deals_get_valuation", "seller_inquiries_get", "seller_replies_get"}
+)
 DEFAULT_EXPENSIVE_LIMIT: Final = RateLimit(capacity=30, per_seconds=2.0)  # 30 burst, 30/minute
 DEFAULT_CHEAP_LIMIT: Final = RateLimit(capacity=120, per_seconds=0.25)  # 120 burst, 240/minute
 _ARGUMENT_RE: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,79}$")
+#: Idempotency operation of ``seller_inquiries_pause`` (shared with ``POST /api/inquiry-control/pause``).
+PAUSE_OPERATION: Final = "seller_inquiries_pause"
 
 
 # --------------------------------------------------------------------------------------------
@@ -184,6 +205,40 @@ async def _mutation[T](call: ToolCall[Any], work: Callable[[Conn], Awaitable[T]]
 # --------------------------------------------------------------------------------------------
 
 
+def _replay_error(code: str) -> AppError:
+    try:
+        error_code = ErrorCode(code)
+    except ValueError:
+        error_code = ErrorCode.INTERNAL_ERROR
+    return AppError(error_code, "The original request with this idempotency key failed")
+
+
+async def pause_inquiries(
+    conn: Conn, actor: ActorContext, arguments: SellerInquiriesPauseInput
+) -> InquiryPauseResult:
+    """``seller_inquiries_pause`` (also the dashboard's pause route): idempotent per principal.
+
+    The same key and request replay the original result; another request under the key is
+    ``IDEMPOTENCY_CONFLICT``. ``inquiries_repo.pause`` checks ``inquiries:pause`` and the expected
+    control version; it never resumes anything.
+    """
+    request_hash = idempotency.request_hash_for(PAUSE_OPERATION, arguments)
+    started = await idempotency.begin(conn, actor, PAUSE_OPERATION, arguments.idempotency_key, request_hash)
+    if isinstance(started, idempotency.Replay):
+        return InquiryPauseResult.model_validate(started.result)
+    if isinstance(started, idempotency.ReplayError):
+        raise _replay_error(started.error_code)
+    if isinstance(started, idempotency.InProgress):
+        raise TransientConflict("The same request is still in progress; retry shortly")
+    result = await inquiries_repo.pause(
+        conn, actor, expected_version=arguments.expected_version, reason=arguments.reason
+    )
+    await idempotency.complete(
+        conn, actor, PAUSE_OPERATION, arguments.idempotency_key, result.model_dump(mode="json")
+    )
+    return result
+
+
 async def deals_health(call: ToolCall[DealsHealthInput]) -> ResponseEnvelope[Any]:
     services = call.services
     result = await queries.health_view(services.db, call.actor, services.settings, clock=services.clock)
@@ -242,7 +297,12 @@ async def reviews_claim(call: ToolCall[ReviewsClaimInput]) -> ResponseEnvelope[A
     view, as_of = await _mutation(
         call,
         lambda conn: reviews_repo.claim(
-            conn, call.actor, args.case_id, args.expected_version, args.idempotency_key
+            conn,
+            call.actor,
+            args.case_id,
+            args.expected_version,
+            args.idempotency_key,
+            duration=timedelta(seconds=call.services.settings.review_claim_duration_seconds),
         ),
     )
     return envelope(view, request_id=call.request_id, as_of=as_of)
@@ -266,7 +326,8 @@ async def reviews_submit(call: ToolCall[ReviewsSubmitInput]) -> ResponseEnvelope
         call, lambda conn: reviews_repo.submit(conn, call.actor, submission, dashboard_base_url=base_url)
     )
     warnings: list[ResponseWarning] = [warning(WarningCode.FIXTURE_DATA)] if view.is_fixture else []
-    return envelope(view, request_id=call.request_id, as_of=as_of, warnings=warnings)
+    mine = view.for_caller(call.actor.principal_id)
+    return envelope(mine, request_id=call.request_id, as_of=as_of, warnings=warnings)
 
 
 async def deals_request_recheck(call: ToolCall[DealsRequestRecheckInput]) -> ResponseEnvelope[Any]:
@@ -296,6 +357,31 @@ async def sources_pause(call: ToolCall[SourcesPauseInput]) -> ResponseEnvelope[A
     return envelope(
         view, request_id=call.request_id, as_of=as_of, warnings=[warning(WarningCode.SOURCE_PAUSED)]
     )
+
+
+async def seller_inquiries_get(call: ToolCall[SellerInquiriesGetInput]) -> ResponseEnvelope[Any]:
+    inquiry_id = call.arguments.inquiry_id
+    result = await call.in_transaction(lambda conn: queries.get_inquiry(conn, call.actor, inquiry_id))
+    return result.envelope(call.request_id)
+
+
+async def seller_replies_get(call: ToolCall[SellerRepliesGetInput]) -> ResponseEnvelope[Any]:
+    reply_id = call.arguments.reply_id
+    result = await call.in_transaction(lambda conn: queries.get_reply(conn, call.actor, reply_id))
+    return result.envelope(call.request_id)
+
+
+async def seller_inquiries_pause(call: ToolCall[SellerInquiriesPauseInput]) -> ResponseEnvelope[Any]:
+    view, as_of = await _mutation(call, lambda conn: pause_inquiries(conn, call.actor, call.arguments))
+    return envelope(view, request_id=call.request_id, as_of=as_of)
+
+
+#: The spec 37.8 inquiry tools (``mcp.schemas.V11_TOOLS``); served by default after the twelve.
+V11_HANDLERS: Final[Mapping[str, ToolHandler]] = {
+    "seller_inquiries_get": seller_inquiries_get,
+    "seller_replies_get": seller_replies_get,
+    "seller_inquiries_pause": seller_inquiries_pause,
+}
 
 
 CORE_HANDLERS: Final[Mapping[str, ToolHandler]] = {
@@ -382,7 +468,9 @@ def _register(spec: ToolSpec, handler: ToolHandler) -> RegisteredTool:
         raise ValueError("tool names must be 1-128 characters of [A-Za-z0-9_.-]")
     if spec.name in FORBIDDEN_TOOL_NAMES:
         raise ValueError(f"tool {spec.name!r} must never exist (spec 21)")
-    core = spec.name in TOOLS and TOOLS[spec.name] is spec
+    core = (spec.name in TOOLS and TOOLS[spec.name] is spec) or (
+        spec.name in V11_TOOLS and V11_TOOLS[spec.name] is spec
+    )
     if core:
         input_schema = tool_input_schema(spec.name)
         output_schema = tool_output_schema(spec.name)
@@ -415,8 +503,13 @@ class ToolRegistry:
 
     @classmethod
     def default(cls) -> ToolRegistry:
-        """The twelve spec 21 tools."""
-        return cls((TOOLS[name], CORE_HANDLERS[name]) for name in TOOLS)
+        """The twelve spec 21 tools, then the three spec 37.8 inquiry tools (no send tool)."""
+        return cls(
+            [
+                *((TOOLS[name], CORE_HANDLERS[name]) for name in TOOLS),
+                *((V11_TOOLS[name], V11_HANDLERS[name]) for name in V11_TOOLS),
+            ]
+        )
 
     def with_tools(self, extra: Iterable[tuple[ToolSpec, ToolHandler]]) -> ToolRegistry:
         """A registry with additional (extension) tools appended after the existing ones."""
@@ -555,8 +648,8 @@ class ToolDispatcher:
 
 
 def handler_for(name: str) -> ToolHandler:
-    """The built-in handler of one spec 21 tool (for composing registries)."""
-    return CORE_HANDLERS[name]
+    """The built-in handler of one spec 21 or spec 37.8 tool (for composing registries)."""
+    return CORE_HANDLERS.get(name) or V11_HANDLERS[name]
 
 
 def tool_names(registry: ToolRegistry | None = None) -> Sequence[str]:
@@ -568,6 +661,8 @@ __all__ = [
     "CORE_HANDLERS",
     "DEFAULT_CHEAP_LIMIT",
     "DEFAULT_EXPENSIVE_LIMIT",
+    "PAUSE_OPERATION",
+    "V11_HANDLERS",
     "RegisteredTool",
     "ToolCall",
     "ToolDispatcher",
@@ -577,6 +672,7 @@ __all__ = [
     "ToolServices",
     "error_result",
     "handler_for",
+    "pause_inquiries",
     "request_id_for",
     "success_result",
     "tool_names",

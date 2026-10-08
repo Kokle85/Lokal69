@@ -125,7 +125,7 @@
         "default": [],
         "items": {
           "additionalProperties": false,
-          "description": "A monitored coverage gap (== ``wire.GapReport``); never claimed coverage.",
+          "description": "A monitored coverage gap (== ``wire.GapReport``); never claimed coverage. A gap that ends\nbefore it starts is refused (``422``): it could never be shown, so it would be hidden.",
           "properties": {
             "ended_at": {
               "default": null,

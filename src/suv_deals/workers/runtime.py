@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID, uuid4
 
 import anyio
@@ -56,6 +56,9 @@ from suv_deals.persistence.jobs import ClaimedJob
 from suv_deals.persistence.sources_repo import SourceRecord
 from suv_deals.persistence.storage import SnapshotStore, snapshot_store_from_settings
 from suv_deals.settings import REPO_ROOT, Settings
+
+if TYPE_CHECKING:  # the inquiry workers import this module; avoid the cycle at runtime
+    from suv_deals.workers.inquiry_handlers import InquiryRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +167,9 @@ class RuntimeContext:
     crawler_ready: bool | None = None
     crawler_checked_at: datetime | None = None
     crawler_problems: tuple[str, ...] = ()
+    #: Seller-inquiry provider wiring (spec 37): `inquiry_handlers.InquiryRuntime`. Attached by
+    #: `build_runtime`; constructs no network client until an API provider is actually used.
+    inquiry_runtime: InquiryRuntime | None = None
     _closers: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
 
     @property
@@ -328,6 +334,13 @@ async def build_runtime(
         )
         profile_path = settings.config_dir / DEFAULT_COST_PROFILE
         ctx.cost_profile = load_cost_profile(profile_path) if profile_path.is_file() else None
+        # Seller-inquiry providers (SELLER_EMAIL_PROVIDER, default outlook_local): no client, token
+        # provider or secret is built here; `InquiryRuntime` creates them lazily, and a send needs
+        # SELLER_INQUIRY_MODE=automatic plus a verified sender (`seller_email.build_sender_provider`).
+        from suv_deals.workers.inquiry_handlers import InquiryRuntime  # noqa: PLC0415 - import cycle
+
+        ctx.inquiry_runtime = InquiryRuntime.from_settings(settings, db=db, clock=resolved_clock)
+        ctx.add_closer(ctx.inquiry_runtime.aclose)
         ctx.metrics.set_build_info(settings.build_id, settings.app_env)
     except BaseException:
         await ctx.aclose()

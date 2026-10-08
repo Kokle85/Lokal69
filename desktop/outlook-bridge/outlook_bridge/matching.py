@@ -37,7 +37,12 @@ from pydantic import ValidationError
 from outlook_bridge.errors import UploadBuildError
 from outlook_bridge.local_queue import message_id_hash, sha256_text
 from outlook_bridge.outlook_adapter import AttachmentDigest, MailSnapshot
-from outlook_bridge.wire import is_own_message_id_format
+from outlook_bridge.wire import (
+    DELIVERY_REPORT_TYPES,
+    MAX_RETURNED_MESSAGE_IDS,
+    ReplyUpload,
+    is_own_message_id_format,
+)
 from suv_deals.domain.enums import EmailProviderKind, MessageLanguage
 from suv_deals.domain.language import detect_text_language
 from suv_deals.domain.listings import sha256_json
@@ -65,6 +70,7 @@ from suv_deals.domain.replies import (
     is_processable_item,
     normalize_message_id,
     parse_address_list,
+    parse_delivery_report,
     safe_filename,
     sanitize_reply_body,
     unmatched_retention,
@@ -80,6 +86,7 @@ REQUEST_EXTENSION_DEFAULTS: Final[dict[str, Any]] = {
     "correlation_status": "matched",
     "correlation_reasons": [],
     "withheld_sensitive_attachments": 0,
+    "returned_message_ids": [],
 }
 _MAX_LOCATOR_CHARS: Final = 1024
 _FIT_REFERENCES: Final = 20
@@ -123,7 +130,7 @@ class LocalDecision:
 
 @dataclass(frozen=True)
 class PreparedUpload:
-    request: ReplyIngestRequest
+    request: ReplyUpload
     payload: dict[str, Any]
     body: bytes
     idempotency_key: str
@@ -155,7 +162,8 @@ def wire_payload(request: ReplyIngestRequest) -> dict[str, Any]:
     A matched seller reply is sent in exactly the spec's v1.0 shape. The optional domain
     extensions appear only when they carry information the backend cannot derive itself: a
     message type other than ``seller_reply`` (auto-reply, bounce, delivery notice), a quarantined
-    possible match with its reasons, and the count of withheld sensitive attachments. Correlation
+    possible match with its reasons, the count of withheld sensitive attachments and, for a
+    bounce/delivery notice, the returned original's Message-IDs (``wire.ReplyUpload``). Correlation
     reasons of a *matched* message are omitted: the backend re-derives the match from the
     headers and its own bindings and never trusts worker-supplied reasons.
     """
@@ -170,6 +178,22 @@ def wire_payload(request: ReplyIngestRequest) -> dict[str, Any]:
 
 def encode_payload(payload: Mapping[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def returned_message_ids(inbound: InboundMessage, request: ReplyIngestRequest) -> tuple[str, ...]:
+    """The returned original's Message-IDs of a bounce/delivery notice, read from the RAW body
+    before sanitising (the sanitiser removes the quoted original); empty for anything else."""
+    if request.message_type not in DELIVERY_REPORT_TYPES:
+        return ()
+    found = parse_delivery_report(inbound.body_text).original_message_ids
+    return tuple(dict.fromkeys(found))[:MAX_RETURNED_MESSAGE_IDS]
+
+
+def as_upload(request: ReplyIngestRequest, returned: tuple[str, ...] = ()) -> ReplyUpload:
+    """The validated wire upload (``wire.ReplyUpload``) of a domain ingest request."""
+    data = request.model_dump(mode="json", by_alias=True)
+    data["returned_message_ids"] = list(returned)
+    return ReplyUpload.model_validate(data)
 
 
 def idempotency_key_for(request: ReplyIngestRequest) -> str:
@@ -376,18 +400,22 @@ class LocalMatcher:
             raise UploadBuildError("an attachment without a computed digest cannot be uploaded")
         if request.mailbox_binding_id != self._mailbox or request.inquiry_id != correlation.inquiry_id:
             raise UploadBuildError("upload does not belong to this mailbox/inquiry")
-        payload = wire_payload(request)
+        try:
+            upload = as_upload(request, returned_message_ids(inbound, request))
+        except ValidationError:
+            raise UploadBuildError("correlated reply cannot be represented as a valid upload") from None
+        payload = wire_payload(upload)
         body = encode_payload(payload)
         if len(body) > MAX_REQUEST_BYTES:
             raise UploadBuildError("upload exceeds 128 KiB")
         return PreparedUpload(
-            request=request,
+            request=upload,
             payload=payload,
             body=body,
-            idempotency_key=idempotency_key_for(request),
-            inquiry_id=request.inquiry_id,
-            binding_version=request.binding_version,
-            quarantined=request.correlation_status == "quarantined",
+            idempotency_key=idempotency_key_for(upload),
+            inquiry_id=upload.inquiry_id,
+            binding_version=upload.binding_version,
+            quarantined=upload.correlation_status == "quarantined",
         )
 
     @staticmethod
@@ -457,8 +485,10 @@ __all__ = [
     "LocalKey",
     "LocalMatcher",
     "PreparedUpload",
+    "as_upload",
     "encode_payload",
     "idempotency_key_for",
+    "returned_message_ids",
     "semantics_versions",
     "wire_payload",
 ]

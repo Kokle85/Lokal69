@@ -1,10 +1,10 @@
 """MCP tool contracts: input models, output envelopes, the tool registry and exported schemas.
 
-The twelve tools of spec 21 (``TOOLS``, served today) plus the three spec 37.8 inquiry tools in
-the separate ``V11_TOOLS`` registry (``seller_inquiries_get``, ``seller_replies_get`` under
-``inquiries:read``; ``seller_inquiries_pause`` under ``inquiries:pause``). ``V11_TOOLS`` is not
-served until the inquiry package registers handlers through ``build_mcp(extra_tools=...)``;
-``tool_spec``/``validate_tool_input``/``tools_for_scopes`` deliberately cover ``TOOLS`` only.
+The twelve tools of spec 21 (``TOOLS``) plus the three spec 37.8 inquiry tools in the separate
+``V11_TOOLS`` table (``seller_inquiries_get``, ``seller_replies_get`` under ``inquiries:read``;
+``seller_inquiries_pause`` under ``inquiries:pause``). Both are served by the default registry
+(``mcp.tools.ToolRegistry.default``); ``tool_spec``/``validate_tool_input``/``tools_for_scopes``
+cover both, in that order.
 No purchase, seller-contact/send, payment, tax-approval, SQL or arbitrary-crawl tool exists
 (``FORBIDDEN_TOOL_NAMES`` is checked at import time); no tool accepts a recipient, an e-mail
 body or a sender account.
@@ -817,8 +817,8 @@ _V11_SPECS: Final[tuple[ToolSpec, ...]] = (
         idempotency_operation="seller_inquiries_pause",
     ),
 )
-#: Spec 37.8 inquiry tools. NOT served by the running server until handlers are registered
-#: through ``build_mcp(extra_tools=...)``; kept apart from ``TOOLS`` on purpose.
+#: Spec 37.8 inquiry tools (served after ``TOOLS``; kept in their own table so the spec 21
+#: catalogue stays exactly the twelve tools).
 V11_TOOLS: Final[Mapping[str, ToolSpec]] = MappingProxyType({spec.name: spec for spec in _V11_SPECS})
 V11_TOOL_NAMES: Final[tuple[str, ...]] = tuple(V11_TOOLS)
 
@@ -827,7 +827,7 @@ if FORBIDDEN_TOOL_NAMES & (set(TOOLS) | set(V11_TOOLS)) or set(TOOLS) & set(V11_
 
 
 def _documented_spec(name: str) -> ToolSpec:
-    """The spec of a served (``TOOLS``) or prepared (``V11_TOOLS``) tool, for schema export."""
+    """The spec of a ``TOOLS`` or ``V11_TOOLS`` tool, for schema export."""
     spec = TOOLS.get(name) or V11_TOOLS.get(name)
     if spec is None:
         raise ValidationFailed("Unknown tool", details={"tool": "unknown"})
@@ -835,16 +835,17 @@ def _documented_spec(name: str) -> ToolSpec:
 
 
 def tool_spec(name: str) -> ToolSpec:
-    try:
-        return TOOLS[name]
-    except KeyError:
-        raise ValidationFailed("Unknown tool", details={"tool": "unknown"}) from None
+    """The spec of a served tool (``TOOLS`` or ``V11_TOOLS``)."""
+    spec = TOOLS.get(name) or V11_TOOLS.get(name)
+    if spec is None:
+        raise ValidationFailed("Unknown tool", details={"tool": "unknown"})
+    return spec
 
 
 def tools_for_scopes(scopes: Iterable[Scope]) -> tuple[ToolSpec, ...]:
-    """Tools the caller may discover (unauthorized tools are hidden where supported)."""
+    """Tools the caller may discover (unauthorized tools are hidden), spec 21 order first."""
     granted = set(scopes)
-    return tuple(spec for spec in _SPECS if spec.scope in granted)
+    return tuple(spec for spec in (*_SPECS, *_V11_SPECS) if spec.scope in granted)
 
 
 def require_tool_scope(name: str, actor: ActorContext) -> ToolSpec:
@@ -903,7 +904,7 @@ def tool_error_schema() -> dict[str, Any]:
 
 
 def mcp_tool_definition(name: str) -> dict[str, Any]:
-    """The MCP ``Tool`` object (wire names) for ``tools/list`` (served or ``V11_TOOLS``)."""
+    """The MCP ``Tool`` object (wire names) for ``tools/list`` (``TOOLS`` or ``V11_TOOLS``)."""
     spec = _documented_spec(name)
     return {
         "name": spec.name,

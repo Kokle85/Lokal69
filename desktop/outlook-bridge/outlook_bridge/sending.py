@@ -12,7 +12,12 @@ executes a validated intent through the bound classic-Outlook account, under the
   that is not the bound Outlook account, the kill switch, a failed integrity check (body hash,
   header/markup injection, one canonical recipient) or Outlook not being classic.
 - Immediately before transmission the server re-validates the intent (``claim``); a transport
-  failure of the claim means nothing is sent now.
+  failure of the claim means nothing is sent now. A ``not_now`` claim answer (rolling caps,
+  seller cooldown, source pause) keeps the intent waiting: it is claimed again after
+  ``NOT_NOW_RETRY`` while it is valid, and reported ``intent_expired`` once its validity ends.
+- An intent the server lists with ``expired: true`` (its validity ended before any worker
+  claimed it) is refused and reported ``intent_expired`` whatever the local clock says, so the
+  backend can reconcile the inquiry instead of holding it uncertain forever.
 - Local defence-in-depth ceilings equal the spec's initial workspace caps (2 per rolling 24 h,
   5 per rolling 15 days). They are ceilings, never targets: above them an intent simply waits
   (and may expire); the server's transactional caps remain authoritative.
@@ -51,6 +56,9 @@ LOCAL_CEILING_24H: Final = 2
 LOCAL_CEILING_15D: Final = 5
 EVIDENCE_MARGIN: Final = timedelta(minutes=10)
 EVIDENCE_WINDOW: Final = timedelta(hours=72)
+#: Wait after a ``not_now`` claim answer before the same intent is claimed again.
+NOT_NOW_RETRY: Final = timedelta(minutes=10)
+_NOT_BEFORE_KEY: Final = "claim_not_before:"
 _LOG = get_logger("sending")
 _SUBMIT_REFUSALS: Final[dict[str, RefusalReason]] = {
     "account_mismatch": RefusalReason.ACCOUNT_MISMATCH,
@@ -118,6 +126,7 @@ class SendIntentProcessor:
     def _finish(
         self, intent: WorkerSendIntent, state: IntentState, report: WorkerSendReport, *, now: datetime
     ) -> None:
+        self._store.delete_runtime(_NOT_BEFORE_KEY + str(intent.intent_id))
         self._store.finish_intent(
             intent.intent_id,
             state=state,
@@ -208,7 +217,7 @@ class SendIntentProcessor:
         account = self._account_smtp()
         if kill_switch:
             return RefusalReason.KILL_SWITCH
-        if intent.expired(now):
+        if intent.is_expired(now):
             return RefusalReason.INTENT_EXPIRED
         if intent.mailbox_binding_id != self._config.mailbox_binding_id:
             return RefusalReason.BINDING_MISMATCH
@@ -259,7 +268,7 @@ class SendIntentProcessor:
             if row.intent_id in offered:
                 continue
             intent = WorkerSendIntent.model_validate_json(row.payload_json)
-            if not intent.expired(now):
+            if not intent.is_expired(now):
                 continue
             report = self._report(
                 intent, SubmissionState.REFUSED_BEFORE_SEND, now=now, refusal=RefusalReason.INTENT_EXPIRED
@@ -279,7 +288,7 @@ class SendIntentProcessor:
             )
         elif existing.state != IntentState.RECEIVED:
             return "already_handled"  # the stored report (re)tells the outcome; never a 2nd attempt
-        elif existing.payload_json != intent.model_dump_json():
+        elif not WorkerSendIntent.model_validate_json(existing.payload_json).same_intent(intent):
             report = self._report(
                 intent,
                 SubmissionState.REFUSED_BEFORE_SEND,
@@ -289,7 +298,7 @@ class SendIntentProcessor:
             )
             self._finish(intent, IntentState.REFUSED, report, now=now)
             return "refused"
-        if self._account_smtp() is None and not kill_switch and not intent.expired(now):
+        if self._account_smtp() is None and not kill_switch and not intent.is_expired(now):
             return "deferred_outlook_unavailable"  # nothing sent; retried while the intent is valid
         refusal = self._local_refusal(intent, kill_switch=kill_switch, now=now)
         if refusal is not None:
@@ -298,11 +307,21 @@ class SendIntentProcessor:
             return "refused"
         if self._ceiling_reached(now):
             return "deferred_ceiling"
+        not_before = self._store.get_runtime_time(_NOT_BEFORE_KEY + str(intent.intent_id))
+        if not_before is not None and now < not_before:
+            return "deferred_not_now"  # the server said "not now"; claim again later
         try:
             decision = self._api.claim_send_intent(intent.intent_id)
         except (BridgeApiError, CredentialError) as exc:
             self._api_failed(exc)
             return "claim_unavailable"  # nothing sent; retried while the intent is valid
+        if not decision.proceed and decision.refusal_reason == RefusalReason.NOT_NOW:
+            # A waiting condition (caps, cooldown, source pause): nothing is sent and nothing is
+            # reported; the intent stays waiting and expires honestly if the wait outlasts it.
+            self._store.set_runtime_time(
+                _NOT_BEFORE_KEY + str(intent.intent_id), min(now + NOT_NOW_RETRY, intent.not_after)
+            )
+            return "deferred_not_now"
         if not decision.proceed:
             report = self._report(
                 intent,
@@ -370,4 +389,10 @@ class SendIntentProcessor:
         return "submitted"
 
 
-__all__ = ["EVIDENCE_WINDOW", "LOCAL_CEILING_15D", "LOCAL_CEILING_24H", "SendIntentProcessor"]
+__all__ = [
+    "EVIDENCE_WINDOW",
+    "LOCAL_CEILING_15D",
+    "LOCAL_CEILING_24H",
+    "NOT_NOW_RETRY",
+    "SendIntentProcessor",
+]

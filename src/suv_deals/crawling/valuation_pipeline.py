@@ -34,7 +34,10 @@ network I/O.
    review case of every enabled profile (`reviews_repo.upsert_review_case`: a qualifying revision
    creates/updates the pending case and writes the ``review.pending`` outbox event in the SAME
    transaction -- blocked fixture events for fixture data; a revision that no longer qualifies
-   supersedes the open case) and the guarded job completion.
+   supersedes the open case), for an inquiry candidate (eligible screening) the ONE
+   ``seller_inquiry_plan`` job of this revision (`workers.inquiry_handlers.enqueue_plan_job`, spec
+   37.3: inquiry readiness is decided there, separately from profit readiness) and the guarded job
+   completion.
 """
 
 from __future__ import annotations
@@ -112,6 +115,7 @@ from suv_deals.persistence.reviews_repo import CaseUpsertResult
 from suv_deals.persistence.sources_repo import SourceRecord
 from suv_deals.persistence.transactions import job_unit_of_work, retry_transient, unit_of_work
 from suv_deals.persistence.valuation_repo import StoredCostProfile, StoredFxRate, StoredRuleSet
+from suv_deals.workers.inquiry_handlers import enqueue_plan_job, is_inquiry_candidate_state
 from suv_deals.workers.runtime import Disposition, JobExecution, JobOutcome, RuntimeContext, apply_disposition
 
 logger = logging.getLogger(__name__)
@@ -599,6 +603,13 @@ async def _value_and_commit(
                         dashboard_base_url=ctx.dashboard_base_url,
                         rank=rank if key == screening.profile else None,
                     )
+                )
+            if is_inquiry_candidate_state(screening.state):
+                # Spec 37.1/37.3: inquiry readiness is separate from profit readiness (a candidate
+                # without CoC or a confirmed price still qualifies; the hard price/mileage rules
+                # hold). ONE plan job per listing revision; it decides and reserves on its own.
+                await enqueue_plan_job(
+                    conn, actor, listing_id=reads.listing.id, revision_id=revision.id, reason="valuation"
                 )
             await apply_disposition(
                 conn,

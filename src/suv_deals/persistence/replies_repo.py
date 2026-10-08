@@ -73,7 +73,7 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict
 
-from suv_deals.api.schemas import MailWorkerBindingItem, MailWorkerReplyAck
+from suv_deals.api.schemas import MAX_RETURNED_MESSAGE_IDS, MailWorkerBindingItem, MailWorkerReplyAck
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import InquiryState, JobState, JobType, ReplyMessageType, SuppressionReason
@@ -107,6 +107,7 @@ from suv_deals.domain.replies import (
     decide_reply_processing,
     evaluate_attachments,
     extract_reply_claims,
+    normalize_message_id,
     parse_delivery_report,
     source_content_fingerprint,
 )
@@ -683,6 +684,24 @@ def _message(
     )
 
 
+def _worker_returned_ids(request: ReplyIngestRequest) -> tuple[str, ...]:
+    """``MailWorkerReplyRequest.returned_message_ids`` (normalised, at most 20; else empty)."""
+    values = getattr(request, "returned_message_ids", ())
+    result: list[str] = []
+    for value in values if isinstance(values, tuple | list) else ():
+        normalized = normalize_message_id(value) if isinstance(value, str) else None
+        if normalized and normalized not in result and len(result) < MAX_RETURNED_MESSAGE_IDS:
+            result.append(normalized)
+    return tuple(result)
+
+
+def _with_returned_ids(body: str, returned: Sequence[str]) -> str:
+    """The body for correlation only: one ``Original-Message-ID`` line per returned id, first (so a
+    bounded parse of a long body still sees them)."""
+    lines = "".join(f"Original-Message-ID: {message_id}\n" for message_id in returned)
+    return lines + body
+
+
 def _message_type(
     request: ReplyIngestRequest, message: InboundMessage
 ) -> tuple[ReplyMessageType, ReplyMessageType]:
@@ -870,6 +889,17 @@ async def _new(
     ]
     message = _message(worker, request, binding_item)
     mtype, server_type = _message_type(request, message)
+    returned_upload = (
+        _worker_returned_ids(request) if mtype in _DSN_TYPES and server_type in _DSN_TYPES else ()
+    )
+    if returned_upload:
+        # The worker read these returned-original Message-IDs from the RAW delivery report before
+        # its sanitiser removed the returned message; they link the report like the domain's own
+        # parse of the body would (``RETURNED_ORIGINAL_MATCH``). Only for a message the server
+        # itself classifies as a delivery report; the stored body stays the uploaded one.
+        message = message.model_copy(
+            update={"body_text": _with_returned_ids(message.body_text, returned_upload)}
+        )
     own = [
         a
         for a in (worker.account_address, inquiry["sender_from_address"], inquiry["sender_reply_to_address"])
@@ -926,7 +956,7 @@ async def _new(
     withheld = request.withheld_sensitive_attachments + sum(
         1 for d in decisions if d.action == AttachmentAction.QUARANTINE_SENSITIVE
     )
-    dsn = parse_delivery_report(body) if mtype in _DSN_TYPES else None
+    dsn = parse_delivery_report(message.body_text) if mtype in _DSN_TYPES else None
     claims: ReplyClaims | None = None
     processed: _Processed | None = None
     if mtype in (ReplyMessageType.SELLER_REPLY, ReplyMessageType.AMBIGUOUS):

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -85,32 +85,31 @@ def test_the_three_spec_tools_with_their_scopes() -> None:
         assert not any(word in name for word in ("send", "resume", "message", "admin", "enable"))
 
 
-def test_v11_tools_are_not_served_or_discoverable_yet() -> None:
-    assert not set(ToolRegistry.default().names) & set(V11_TOOLS)
-    owner = {spec.name for spec in tools_for_scopes(ROLE_SCOPES[Role.OWNER])}
-    assert not owner & set(V11_TOOLS)
-    with pytest.raises(ValidationFailed):
-        tool_spec("seller_inquiries_get")  # the served lookup is unchanged
-    with pytest.raises(ValidationFailed):
-        validate_tool_input("seller_inquiries_pause", {})
-
-
-def test_v11_tools_register_as_extensions() -> None:
-    async def handler(call: Any) -> Any:  # pragma: no cover - never invoked
-        raise AssertionError
-
-    registry = ToolRegistry.default().with_tools((spec, handler) for spec in V11_TOOLS.values())
-    assert registry.names[-3:] == V11_TOOL_NAMES
+def test_v11_tools_are_served_after_the_spec_21_tools() -> None:
+    registry = ToolRegistry.default()
+    assert registry.names == (*TOOLS, *V11_TOOL_NAMES)
     for name in V11_TOOL_NAMES:
         tool = registry.get(name)
         assert tool is not None
         assert tool.input_schema == tool_input_schema(name)
         assert tool.definition.output_schema == tool_output_schema(name)
+        assert tool_spec(name) is V11_TOOLS[name]
+    owner = [spec.name for spec in tools_for_scopes(ROLE_SCOPES[Role.OWNER])]
+    assert owner == [*TOOLS, *V11_TOOL_NAMES]
+    with pytest.raises(ValidationFailed):
+        validate_tool_input("seller_inquiries_pause", {})
+    assert validate_tool_input("seller_inquiries_get", {"inquiry_id": str(uuid4())})
+
+
+def test_v11_tools_are_scope_filtered() -> None:
+    registry = ToolRegistry.default()
     reviewer = {t.name for t in registry.visible(ROLE_SCOPES[Role.REVIEWER])}
     assert {"seller_inquiries_get", "seller_replies_get"} <= reviewer
     assert "seller_inquiries_pause" not in reviewer  # owner-only scope (narrowly grantable)
     viewer = {t.name for t in registry.visible(ROLE_SCOPES[Role.VIEWER])}
     assert not viewer & set(V11_TOOLS)
+    pause_only = {t.name for t in registry.visible([Scope.INQUIRIES_PAUSE])}
+    assert pause_only == {"seller_inquiries_pause"}
 
 
 def test_annotations_describe_real_behaviour() -> None:

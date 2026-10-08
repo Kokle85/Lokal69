@@ -229,12 +229,12 @@ def migrate(
     url = url_from_env(cli, url_env)
     settings = load_settings(cli)
     found = database_target(url)
-    directory = repo_root() / "supabase" / "migrations"
+    directory = settings.migrations_dir  # MIGRATIONS_DIR / SUV_DEALS_HOME aware (installed images)
     echo("Migration target (from the connection string; password never shown):")
     for line in found.lines():
         echo(line)
     echo(f"  APP_ENV  : {settings.app_env}")
-    echo(f"  files    : {len(migration_plan(directory))} in supabase/migrations")
+    echo(f"  files    : {len(migration_plan(directory))} in {directory.name}")
     if local_only and not found.is_local:
         refuse("--local-only: the target is not a loopback address or a local socket")
     if not dry_run and not yes:

@@ -70,7 +70,7 @@ TOKEN = "mw_contract_test_credential_0123456789"
 PAIRS: list[tuple[type[BaseModel], type[BaseModel]]] = [
     (api_client.BindingSyncItem, MailWorkerBindingItem),
     (api_client.BindingPage, MailWorkerBindingPage),
-    (ReplyIngestRequest, MailWorkerReplyRequest),
+    (wire.ReplyUpload, MailWorkerReplyRequest),
     (api_client.IngestAck, MailWorkerReplyAck),
     (wire.WorkerSendIntent, MailWorkerSendIntent),
     (wire.SendIntentBatch, MailWorkerSendIntentBatch),

@@ -63,7 +63,7 @@ from uuid import UUID
 
 import anyio.to_thread
 import jwt
-from jwt import PyJWK, PyJWKClient
+from jwt import PyJWK
 from jwt.exceptions import (
     ExpiredSignatureError,
     InvalidAudienceError,
@@ -76,7 +76,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from pydantic import BaseModel, ConfigDict
 
-from suv_deals.api.auth import SigningKeyResolver, StaticJwks, supabase_issuer
+from suv_deals.api.auth import SigningKeyResolver, StaticJwks, ThrottledJwksClient, supabase_issuer
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
 from suv_deals.domain.enums import Role, Scope
 from suv_deals.errors import AppError, DependencyUnavailable, ValidationFailed
@@ -105,7 +105,8 @@ DenialReason = Literal[
 
 #: Scopes that can be effective on the MCP surface (config:admin and mail:ingest never are).
 MCP_SCOPES: Final = credentials_repo.BEARER_SCOPES
-#: Scopes advertised in protected-resource metadata and challenges (the spec 20 MCP scopes).
+#: Scopes advertised in protected-resource metadata and challenges (the spec 20 MCP scopes plus
+#: the spec 37.8 ``inquiries:read`` / ``inquiries:pause``).
 ADVERTISED_SCOPES: Final[tuple[Scope, ...]] = (
     Scope.DEALS_READ,
     Scope.REVIEWS_READ,
@@ -114,6 +115,8 @@ ADVERTISED_SCOPES: Final[tuple[Scope, ...]] = (
     Scope.RECHECKS_REQUEST,
     Scope.NOTES_WRITE,
     Scope.SOURCES_PAUSE,
+    Scope.INQUIRIES_READ,
+    Scope.INQUIRIES_PAUSE,
 )
 JWT_ALGORITHMS: Final = ("ES256", "RS256")
 DEFAULT_LEEWAY: Final = timedelta(seconds=30)
@@ -380,7 +383,8 @@ class OAuthJwtVerifier:
         """The verifier for ``MCP_OAUTH_*`` and ``MCP_PUBLIC_URL`` (raises `McpAuthConfigError`).
 
         ``resolver``: a key resolver or JWK-set document (tests, pinned keys); default: the
-        cached ``PyJWKClient`` for ``MCP_OAUTH_JWKS_URL``.
+        cached, throttled ``ThrottledJwksClient`` for ``MCP_OAUTH_JWKS_URL`` (failure backoff and
+        unknown-``kid`` refresh cooldown also after a failed fetch).
         """
         problems = [
             p
@@ -406,7 +410,7 @@ class OAuthJwtVerifier:
             key_resolver = resolver
         else:
             assert settings.mcp_oauth_jwks_url is not None
-            key_resolver = PyJWKClient(
+            key_resolver = ThrottledJwksClient(
                 settings.mcp_oauth_jwks_url.strip(),
                 cache_jwk_set=True,
                 lifespan=JWKS_CACHE_SECONDS,

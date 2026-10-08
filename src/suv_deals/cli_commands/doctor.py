@@ -12,7 +12,10 @@ What it checks (and never does):
   (`Crawl4AIClient.inspect_contract`: unauthenticated probe, ``/config/dump`` dry runs). It never
   crawls a page and never restarts or reconfigures the crawler;
 - source activation gates from the YAML registry, offline OAuth/URL metadata checks, the
-  notification/event route and the seller-inquiry switches.
+  notification/event route and the seller-inquiry switches;
+- spec v1.1 readiness per active workspace (when the schema is present): inquiry mode and kill
+  switch, standing authorization, sender binding verification/alias/health and the desktop mail
+  worker's heartbeat age and monitoring state (states and ages only, never an address or token).
 
 It never prints a secret, URL or connection string, and it never creates accounts, keys or data.
 Exit code 1 when any check reports an error.
@@ -56,7 +59,7 @@ def _make_crawler_http() -> httpx.AsyncClient | None:
 
 
 def migration_files(root: Path | None = None) -> list[tuple[str, str]]:
-    """``(version, name)`` of every migration file in this checkout, in apply order."""
+    """``(version, name)`` of every migration file (``Settings.migrations_dir``), in apply order."""
     from suv_deals.settings import REPO_ROOT
 
     directory = root or (REPO_ROOT / "supabase" / "migrations")
@@ -116,7 +119,7 @@ async def database_findings(settings: Settings) -> list[Finding]:
         # Migration ledger (supabase_migrations.schema_migrations; see docs/schema.md section 9).
         # A dedicated login (e.g. a LOGIN member of suv_backend) may lack USAGE on that schema:
         # to_regclass() itself then raises, which must not abort the remaining checks.
-        files = migration_files()
+        files = migration_files(settings.migrations_dir)
         try:
             has_ledger = await scalar(
                 "select to_regclass('supabase_migrations.schema_migrations') is not null"
@@ -328,6 +331,122 @@ def source_findings(settings: Settings, verbose: bool) -> list[Finding]:
     return findings
 
 
+async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
+    """Spec v1.1 readiness per active workspace, from the database (read-only; no values).
+
+    Nothing is sent unless the mode is ``automatic``, the kill switch is off, the standing
+    authorization is active and the sender binding is verified; for ``outlook_local`` the desktop
+    worker must also be heartbeating. Only states, versions and ages are reported (never an
+    address, account id or token).
+    """
+    from suv_deals.cli_commands._common import active_workspaces, open_database, operator_actor
+    from suv_deals.errors import AppError
+    from suv_deals.persistence import inquiries_repo, mail_workers_repo, sender_bindings_repo
+    from suv_deals.persistence.database import db_now
+    from suv_deals.persistence.transactions import unit_of_work
+
+    area = "seller_inquiry"
+    if settings.database_url is None or not settings.database_url.get_secret_value():
+        return []
+    findings: list[Finding] = []
+    try:
+        async with open_database(settings, application_name="suv-deals-doctor") as db:
+            workspace_ids = await active_workspaces(db)
+            for ws in workspace_ids:
+                prefix = "" if len(workspace_ids) == 1 else f"{str(ws)[:8]}:"
+                actor = operator_actor(ws, "doctor")
+                async with unit_of_work(db, actor) as conn:
+                    if not await _v11_present(conn):
+                        return [Finding(area, "readiness", "info", "seller-inquiry tables not applied")]
+                    now = await db_now(conn)
+                    controls = await inquiries_repo.get_controls(conn, actor)
+                    authorization = await inquiries_repo.current_authorization(conn, actor)
+                    sender = await sender_bindings_repo.active_binding(conn, actor)
+                    boxes = await mail_workers_repo.list_mailbox_health(conn, ws)
+                findings.extend(
+                    _readiness(
+                        prefix,
+                        now,
+                        controls=controls,
+                        authorization=authorization,
+                        sender=sender,
+                        boxes=boxes,
+                    )
+                )
+    except AppError:
+        return [Finding(area, "readiness", "warn", "seller-inquiry readiness could not be read")]
+    return findings
+
+
+async def _v11_present(conn: Any) -> bool:
+    cur = await conn.execute("select to_regclass('app.seller_inquiry_controls') is not null as present")
+    row = await cur.fetchone()
+    return bool(row and row["present"])
+
+
+def _readiness(
+    prefix: str, now: Any, *, controls: Any, authorization: Any, sender: Any, boxes: Sequence[Any]
+) -> list[Finding]:
+    area = "seller_inquiry"
+    findings: list[Finding] = []
+    if controls is None:
+        findings.append(Finding(area, f"{prefix}controls", "info", "no control row yet (sending disabled)"))
+    else:
+        sending = controls.mode == "automatic" and not controls.kill_switch
+        findings.append(
+            Finding(
+                area,
+                f"{prefix}controls",
+                "ok" if sending else "info",
+                f"mode={controls.mode}, kill_switch={'on' if controls.kill_switch else 'off'}, "
+                f"caps={controls.max_per_24h}/24h {controls.max_per_15d}/15d"
+                + ("" if sending else " (nothing is sent)"),
+            )
+        )
+    if authorization is None:
+        findings.append(Finding(area, f"{prefix}authorization", "warn", "no standing authorization recorded"))
+    elif authorization.revoked_at is not None:
+        findings.append(
+            Finding(area, f"{prefix}authorization", "warn", f"version {authorization.version} revoked")
+        )
+    elif authorization.authorization.problems_at(now):
+        findings.append(
+            Finding(
+                area, f"{prefix}authorization", "warn", f"version {authorization.version} not effective now"
+            )
+        )
+    else:
+        findings.append(
+            Finding(area, f"{prefix}authorization", "ok", f"version {authorization.version} active")
+        )
+    if sender is None:
+        findings.append(Finding(area, f"{prefix}sender_binding", "warn", "no sender binding"))
+    else:
+        state = "usable" if sender.usable else ("verified" if sender.verified_at else "unverified")
+        detail = (
+            f"{sender.provider.value} v{sender.version}: {state}, alias "
+            f"{'verified' if sender.alias_verified else 'unverified'}, health {sender.health}"
+        )
+        findings.append(Finding(area, f"{prefix}sender_binding", "ok" if sender.usable else "warn", detail))
+    active = [b for b in boxes if b.binding_state == "active"]
+    if sender is not None and sender.provider.value == "outlook_local":
+        if not active:
+            findings.append(Finding(area, f"{prefix}mail_worker", "warn", "no desktop mail worker issued"))
+        for box in active:
+            age = "never" if box.heartbeat_age_seconds is None else f"{box.heartbeat_age_seconds}s ago"
+            findings.append(
+                Finding(
+                    area,
+                    f"{prefix}mail_worker",
+                    "ok" if box.monitoring_active else "warn",
+                    f"heartbeat {box.heartbeat_status} ({age}), monitoring "
+                    f"{'active' if box.monitoring_active else 'NOT active'}, "
+                    f"{box.open_gap_count} open gap(s)",
+                )
+            )
+    return findings
+
+
 def collect_offline(settings: Settings, processes: Sequence[str], verbose: bool) -> list[Finding]:
     from suv_deals.cli_commands import _checks
 
@@ -379,9 +498,17 @@ def doctor(
 
         if not no_db:
             try:
-                findings.extend(await database_findings(settings))
+                db_findings = await database_findings(settings)
+                findings.extend(db_findings)
             except Exception as exc:  # report and continue: doctor never aborts half-way
+                db_findings = []
                 findings.append(Finding("database", "check", "error", unexpected_error(exc)))
+            reachable = any(f.name == "schema" and f.status == "ok" for f in db_findings)
+            if reachable:
+                try:
+                    findings.extend(await seller_inquiry_readiness(settings))
+                except Exception as exc:
+                    findings.append(Finding("seller_inquiry", "readiness", "warn", unexpected_error(exc)))
         if crawler:
             try:
                 findings.extend(await crawler_findings(settings, _make_crawler_http()))

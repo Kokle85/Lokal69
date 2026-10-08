@@ -1,0 +1,530 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/evaluation",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /api/evaluation``: the 15-day quality evaluation (the window length is fixed).",
+    "properties": {
+      "days": {
+        "const": 15,
+        "default": 15,
+        "type": "integer"
+      }
+    },
+    "title": "EvaluationQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "properties": {
+          "auto_replies": {
+            "type": "integer"
+          },
+          "best_supported_economics": {
+            "additionalProperties": false,
+            "description": "Best *supported* economics: a research estimate, never a confirmed profit.",
+            "properties": {
+              "base_contribution": {
+                "additionalProperties": false,
+                "description": "An exact amount in one currency. Serialises the amount as a string.",
+                "properties": {
+                  "amount": {
+                    "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                    "type": "string"
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "amount",
+                  "currency"
+                ],
+                "title": "Money",
+                "type": "object"
+              },
+              "candidate_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "conservative_contribution": {
+                "additionalProperties": false,
+                "description": "An exact amount in one currency. Serialises the amount as a string.",
+                "properties": {
+                  "amount": {
+                    "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                    "type": "string"
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "amount",
+                  "currency"
+                ],
+                "title": "Money",
+                "type": "object"
+              },
+              "label": {
+                "default": "estimated contribution before business tax",
+                "type": "string"
+              },
+              "meets_approved_threshold": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "unknowns": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "valuation_state": {
+                "enum": [
+                  "not_started",
+                  "incomplete",
+                  "estimated",
+                  "quote_supported",
+                  "stale",
+                  "invalid"
+                ],
+                "type": "string"
+              },
+              "vehicle_cluster_id": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "candidate_id",
+              "vehicle_cluster_id",
+              "valuation_state",
+              "conservative_contribution",
+              "base_contribution",
+              "meets_approved_threshold",
+              "unknowns"
+            ],
+            "title": "EconomicsSummary",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "bounces": {
+            "type": "integer"
+          },
+          "coverage": {
+            "items": {
+              "additionalProperties": false,
+              "description": "Healthy coverage of one source inside a window, with every gap explained.",
+              "properties": {
+                "coverage_ratio": {
+                  "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "gaps": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "end": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "reason": {
+                        "maxLength": 120,
+                        "type": "string"
+                      },
+                      "start": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "subject": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "subject",
+                      "start",
+                      "end",
+                      "reason"
+                    ],
+                    "title": "CoverageGap",
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "healthy_seconds": {
+                  "type": "integer"
+                },
+                "intervals": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "end": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "scans": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "source_key": {
+                        "type": "string"
+                      },
+                      "start": {
+                        "format": "date-time",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "source_key",
+                      "start",
+                      "end",
+                      "scans"
+                    ],
+                    "title": "CoverageInterval",
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "source_key": {
+                  "type": "string"
+                },
+                "window_end": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "window_start": {
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source_key",
+                "window_start",
+                "window_end",
+                "intervals",
+                "gaps",
+                "healthy_seconds",
+                "coverage_ratio"
+              ],
+              "title": "SourceCoverage",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "delivery_notices": {
+            "type": "integer"
+          },
+          "eligible_vehicles": {
+            "type": "integer"
+          },
+          "excluded_synthetic_records": {
+            "type": "integer"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "inquiries": {
+            "additionalProperties": false,
+            "properties": {
+              "accepted": {
+                "default": 0,
+                "type": "integer"
+              },
+              "attempted": {
+                "default": 0,
+                "type": "integer"
+              },
+              "cancelled": {
+                "default": 0,
+                "type": "integer"
+              },
+              "failed_definite": {
+                "default": 0,
+                "type": "integer"
+              },
+              "held_for_facts": {
+                "default": 0,
+                "type": "integer"
+              },
+              "in_progress": {
+                "default": 0,
+                "type": "integer"
+              },
+              "suppressed": {
+                "default": 0,
+                "type": "integer"
+              },
+              "suppression_reasons": {
+                "default": [],
+                "items": {
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "prefixItems": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    }
+                  ],
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              "uncertain": {
+                "default": 0,
+                "type": "integer"
+              },
+              "with_seller_reply": {
+                "default": 0,
+                "type": "integer"
+              }
+            },
+            "title": "InquiryCounts",
+            "type": "object"
+          },
+          "missing_documents_resolved": {
+            "type": "integer"
+          },
+          "most_common_unknowns": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "optimises_for_volume": {
+            "const": false,
+            "default": false,
+            "type": "boolean"
+          },
+          "outcome": {
+            "enum": [
+              "coverage_not_established",
+              "deal_found",
+              "candidates_need_owner_judgement",
+              "no_suitable_deal_yet",
+              "no_suitable_deal"
+            ],
+            "type": "string"
+          },
+          "owner_judgement_candidate_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "qualifying_deal_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "seller_replies": {
+            "type": "integer"
+          },
+          "small_sample_matches": {
+            "type": "integer"
+          },
+          "sources_with_healthy_coverage": {
+            "type": "integer"
+          },
+          "vehicles_with_incomplete_economics": {
+            "type": "integer"
+          },
+          "version": {
+            "default": "evaluation/1.0.0",
+            "type": "string"
+          },
+          "well_matched_vehicles": {
+            "type": "integer"
+          },
+          "window_end": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_start": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_status": {
+            "enum": [
+              "not_started",
+              "in_progress",
+              "complete"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "generated_at",
+          "window_status",
+          "window_start",
+          "window_end",
+          "coverage",
+          "sources_with_healthy_coverage",
+          "eligible_vehicles",
+          "well_matched_vehicles",
+          "small_sample_matches",
+          "inquiries",
+          "seller_replies",
+          "auto_replies",
+          "bounces",
+          "delivery_notices",
+          "missing_documents_resolved",
+          "best_supported_economics",
+          "vehicles_with_incomplete_economics",
+          "most_common_unknowns",
+          "qualifying_deal_ids",
+          "owner_judgement_candidate_ids",
+          "outcome",
+          "reasons",
+          "excluded_synthetic_records"
+        ],
+        "title": "EvaluationReport",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "evaluation.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "The 15-day evaluation report from stored evidence (zero is reported as zero)."
+}

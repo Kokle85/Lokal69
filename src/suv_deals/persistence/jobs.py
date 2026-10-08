@@ -63,7 +63,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import JobState, JobType, Scope
-from suv_deals.errors import Forbidden, IdempotencyConflict, NotFound, ValidationFailed, VersionConflict
+from suv_deals.errors import (
+    EmailDeliveryUncertain,
+    Forbidden,
+    IdempotencyConflict,
+    NotFound,
+    ValidationFailed,
+    VersionConflict,
+)
 from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
@@ -75,6 +82,8 @@ INCOMPATIBLE_PAYLOAD_VERSION: Final = "incompatible_payload_version"
 LEASE_EXPIRED: Final = "LEASE_EXPIRED"
 ATTEMPTS_EXHAUSTED: Final = "ATTEMPTS_EXHAUSTED"
 CANCELLED: Final = "CANCELLED"
+#: Blocker of a send job whose e-mail may already have left (spec 37.5; `reap_expired`).
+EMAIL_DELIVERY_UNCERTAIN: Final = "EMAIL_DELIVERY_UNCERTAIN"
 
 OPEN_STATES: Final = (JobState.QUEUED, JobState.RUNNING, JobState.RETRY_WAIT, JobState.BLOCKED)
 WAITING_STATES: Final = (JobState.QUEUED, JobState.RETRY_WAIT)
@@ -788,15 +797,30 @@ async def cancel(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str |
     return JobRecord.model_validate(updated)
 
 
-async def unblock(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str) -> JobRecord:
+async def unblock(
+    conn: Conn,
+    actor: ActorContext,
+    job_id: UUID,
+    *,
+    reason: str,
+    acknowledge_uncertain_delivery: bool = False,
+) -> JobRecord:
     """Explicit operator action: move a ``blocked`` job back to ``queued`` (audited).
 
     The job always gets at least one attempt (``attempts`` is lowered to ``max_attempts - 1``
     when it was used up); otherwise it could never be claimed and reconciliation would
     dead-letter it at once, silently defeating the operator's decision.
+
+    A job blocked with ``EMAIL_DELIVERY_UNCERTAIN`` (a send whose e-mail may have left, spec
+    37.5) is refused (`EmailDeliveryUncertain`, ``details.reason =
+    uncertain_delivery_ack_required``) unless ``acknowledge_uncertain_delivery=True`` is passed
+    explicitly; the acknowledgement is recorded in the audit event. Even then the unblocked job
+    cannot transmit a second e-mail: its inquiry is no longer ``queued`` (the dispatch holds).
     """
     if actor.principal_kind != "system":
         actor.require(Scope.CONFIG_ADMIN)
+    if not isinstance(acknowledge_uncertain_delivery, bool):
+        raise ValidationFailed("acknowledge_uncertain_delivery must be a boolean")
     async with mapped_errors():
         row = await fetch_one(conn, _LOCK_FOR_ACTOR_SQL, {"workspace_id": actor.workspace_id, "id": job_id})
         if row is None:
@@ -804,6 +828,13 @@ async def unblock(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str)
         job = JobRecord.model_validate(row)
         if job.state != JobState.BLOCKED:
             raise VersionConflict("Only blocked jobs can be unblocked", current_state=job.state.value)
+        uncertain = job.blocker_code == EMAIL_DELIVERY_UNCERTAIN
+        if uncertain and not acknowledge_uncertain_delivery:
+            raise EmailDeliveryUncertain(
+                "This send job may already have handed an e-mail to the provider; unblocking it"
+                " needs an explicit acknowledgement",
+                details={"reason": "uncertain_delivery_ack_required"},
+            )
         updated = await fetch_one(
             conn,
             sql.SQL(
@@ -830,6 +861,7 @@ async def unblock(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str)
                 "blocker_code": job.blocker_code,
                 "attempts_before": job.attempts,
                 "attempts_after": int(updated["attempts"]),
+                "acknowledged_uncertain_delivery": uncertain,
             },
         )
     return JobRecord.model_validate(updated)

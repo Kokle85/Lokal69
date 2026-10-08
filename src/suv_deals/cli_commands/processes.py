@@ -23,6 +23,7 @@ import importlib
 import re
 from collections.abc import Callable
 from typing import Any
+from uuid import UUID
 
 import click
 
@@ -232,16 +233,26 @@ def dispatcher(cli: CliContext, once: bool) -> None:
 @click.command("reconcile")
 @click.option("--dry-run", is_flag=True, help="Report what one pass would do; everything is rolled back.")
 @click.option("--loop", is_flag=True, help="Run as a process: one pass every interval until SIGTERM.")
+@click.option(
+    "--workspace",
+    "workspace",
+    type=click.UUID,
+    default=None,
+    help="One pass for this (active) workspace only (default: every active workspace).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @pass_cli
-def reconcile(cli: CliContext, dry_run: bool, loop: bool, as_json: bool) -> None:
+def reconcile(cli: CliContext, dry_run: bool, loop: bool, workspace: UUID | None, as_json: bool) -> None:
     """Reapers, housekeeping, stale-detail and valuation sweeps (no network I/O)."""
     if dry_run and loop:
         fail("--dry-run and --loop cannot be combined", EXIT_USAGE)
+    if loop and workspace is not None:
+        fail("--workspace and --loop cannot be combined (the process covers every workspace)", EXIT_USAGE)
     settings = load_settings(cli)
 
     async def body() -> int:
-        from suv_deals.workers.reconciliation import run_reconciler, run_reconciliation
+        from suv_deals.cli_commands._common import resolve_workspaces
+        from suv_deals.workers.reconciliation import Reconciler, run_reconciler, run_reconciliation
         from suv_deals.workers.runtime import build_runtime
 
         if loop:
@@ -249,7 +260,12 @@ def reconcile(cli: CliContext, dry_run: bool, loop: bool, as_json: bool) -> None
             return 0
         ctx = await build_runtime(settings, application_name="suv-deals-reconciler", configure_logs=True)
         try:
-            reports = await run_reconciliation(ctx, dry_run=dry_run)
+            if workspace is None:
+                reports = await run_reconciliation(ctx, dry_run=dry_run)
+            else:
+                targets = await resolve_workspaces(ctx.db, workspace)
+                reconciler = Reconciler(ctx)
+                reports = [await reconciler.reconcile_workspace(ws, dry_run=dry_run) for ws in targets]
         finally:
             await ctx.aclose()
         data = [r.as_dict() for r in reports]

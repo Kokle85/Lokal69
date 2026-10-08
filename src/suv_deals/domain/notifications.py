@@ -1094,6 +1094,178 @@ def evaluate_quiet_hours(
 
 
 # =============================================================================================
+# Seller-reply owner alerts (spec 37.7)
+# =============================================================================================
+
+#: Internal outbox event type of an owner alert raised by a processed seller reply. Routed by
+#: the dispatcher through the ``owner_alert`` category (never through native MCP Events).
+SELLER_REPLY_OWNER_ALERT_EVENT_TYPE: Final = "seller_reply.owner_alert"
+SellerReplyAlertKind = Literal["decision_needed", "opportunity_supported"]
+SELLER_REPLY_ALERT_KINDS: Final[tuple[SellerReplyAlertKind, ...]] = (
+    "decision_needed",
+    "opportunity_supported",
+)
+#: Fixed status vocabulary of the alert (no seller text, amounts or contact data ever).
+SELLER_REPLY_ALERT_STATUS: Final[dict[str, str]] = {
+    "decision_needed": "seller reply: owner decision needed",
+    "opportunity_supported": "seller reply: evidence supports a researched opportunity",
+}
+#: Human wording of the escalation and materiality reason codes (owner-facing text).
+SELLER_REPLY_REASON_LABELS: Final[dict[str, str]] = {
+    "payment_request": "payment request",
+    "reservation_request": "reservation request",
+    "identity_document_request": "request for identity documents",
+    "appointment_request": "appointment request",
+    "commitment_request": "request for a commitment",
+    "price_acceptance_request": "request to accept a quoted price",
+    "sensitive_attachment_withheld": "sensitive attachment withheld",
+    "contradictory_reply": "contradictory availability statements",
+    **{reason.value.lower(): reason.value.lower().replace("_", " ") for reason in MaterialityReason},
+}
+_ALERT_REASON_RE: Final = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+MAX_SELLER_REPLY_ALERT_REASONS: Final = 12
+
+
+class SellerReplyOwnerAlertDraft(BaseModel):
+    """One ``ops.outbox`` row for an owner alert derived from a processed seller reply.
+
+    Only ids, a fixed-vocabulary status, typed reason codes and the authenticated dashboard link
+    of the reply: never the reply body, an address, a name, an amount or a credential. It is a
+    signal that a consequential decision (or a supported researched opportunity) needs the
+    owner's attention; it grants nothing and never accepts a seller's request.
+    """
+
+    model_config = _FROZEN
+
+    event_id: UUID
+    event_type: Literal["seller_reply.owner_alert"] = SELLER_REPLY_OWNER_ALERT_EVENT_TYPE
+    event_version: int = 1
+    aggregate_type: Literal["seller_inquiry"] = "seller_inquiry"
+    aggregate_id: UUID
+    kind: SellerReplyAlertKind
+    dedup_key: str
+    payload: dict[str, Any]
+    payload_hash: str
+    payload_bytes: int
+    is_fixture: bool
+    priority: Priority
+
+
+def seller_reply_alert_dedup_key(
+    kind: SellerReplyAlertKind,
+    *,
+    inquiry_id: UUID,
+    reasons: Sequence[str] = (),
+    valuation_id: UUID | None = None,
+) -> str:
+    """Business dedup key: one decision alert per inquiry and reason set (a seller repeating the
+    same request is not re-alerted); one opportunity alert per inquiry and valuation."""
+    if kind == "decision_needed":
+        return f"{SELLER_REPLY_OWNER_ALERT_EVENT_TYPE}:decision:{inquiry_id}:{'+'.join(sorted(set(reasons)))}"
+    if valuation_id is None:
+        raise ValidationFailed("an opportunity alert names the valuation it is based on")
+    return f"{SELLER_REPLY_OWNER_ALERT_EVENT_TYPE}:opportunity:{inquiry_id}:{valuation_id}"
+
+
+def build_seller_reply_owner_alert(
+    *,
+    event_id: UUID,
+    kind: SellerReplyAlertKind,
+    inquiry_id: UUID,
+    reply_id: UUID,
+    listing_id: UUID,
+    dashboard_url: str,
+    occurred_at: datetime,
+    reasons: Sequence[str],
+    valuation_id: UUID | None = None,
+    is_fixture: bool = False,
+) -> SellerReplyOwnerAlertDraft:
+    """The minimal owner-alert payload (see `SellerReplyOwnerAlertDraft`).
+
+    ``reasons`` are typed codes (``domain.replies.EscalationReason`` values for a decision,
+    lower-case ``MaterialityReason`` values for an opportunity). Fixture lineage is stored but
+    never routed (``fixture: true``; the outbox keeps it ``blocked``).
+    """
+    if kind not in SELLER_REPLY_ALERT_KINDS:
+        raise ValidationFailed("unknown seller-reply alert kind")
+    codes = list(dict.fromkeys(str(r) for r in reasons))
+    if not codes or len(codes) > MAX_SELLER_REPLY_ALERT_REASONS:
+        raise ValidationFailed("a seller-reply alert names 1-12 reason codes")
+    if any(not _ALERT_REASON_RE.fullmatch(code) for code in codes):
+        raise ValidationFailed("seller-reply alert reasons must be lower-case codes")
+    if kind == "opportunity_supported" and valuation_id is None:
+        raise ValidationFailed("an opportunity alert names the valuation it is based on")
+    problem = _link_problems(dashboard_url)
+    if problem:
+        raise ValidationFailed(
+            "dashboard URL is not a safe authenticated link", details={"problems": problem}
+        )
+    dedup = seller_reply_alert_dedup_key(
+        kind, inquiry_id=inquiry_id, reasons=codes, valuation_id=valuation_id
+    )
+    priority: Priority = "high" if kind == "decision_needed" else "normal"
+    payload: dict[str, Any] = {
+        "schema_version": PAYLOAD_SCHEMA_VERSION,
+        "event_id": str(event_id),
+        "type": SELLER_REPLY_OWNER_ALERT_EVENT_TYPE,
+        "occurred_at": _rfc3339(_aware(occurred_at)),
+        "kind": kind,
+        "reasons": codes,
+        "inquiry_id": str(inquiry_id),
+        "reply_id": str(reply_id),
+        "listing_id": str(listing_id),
+        "dashboard_url": dashboard_url,
+        "status": SELLER_REPLY_ALERT_STATUS[kind],
+        "priority": priority,
+        "deduplication_key": dedup,
+    }
+    if valuation_id is not None:
+        payload["valuation_id"] = str(valuation_id)
+    if is_fixture:
+        payload["fixture"] = True
+    size = guard_payload(payload)
+    return SellerReplyOwnerAlertDraft(
+        event_id=event_id,
+        aggregate_id=inquiry_id,
+        kind=kind,
+        dedup_key=dedup,
+        payload=payload,
+        payload_hash=sha256_json(payload),
+        payload_bytes=size,
+        is_fixture=is_fixture,
+        priority=priority,
+    )
+
+
+def render_seller_reply_alert_text(kind: str, reasons: Sequence[str]) -> str:
+    """Owner-facing plain wording of a seller-reply alert (no seller text, no amounts).
+
+    A decision alert names the consequential requests (payment, reservation, identity documents,
+    appointment, commitment, price acceptance) that only the owner may decide; nothing has been
+    accepted or answered. An opportunity alert says the recalculated evidence supports a
+    researched opportunity: estimated, not a binding agreement or a completed purchase.
+    """
+    labels = [SELLER_REPLY_REASON_LABELS.get(str(r), str(r).replace("_", " ")) for r in reasons][
+        :MAX_SELLER_REPLY_ALERT_REASONS
+    ]
+    if kind == "decision_needed":
+        text = (
+            "Seller reply needs your decision: "
+            + ", ".join(labels)
+            + ". Nothing was accepted or answered; no reply is sent automatically."
+        )
+    elif kind == "opportunity_supported":
+        text = (
+            "Seller reply evidence supports a researched opportunity (estimated; not a binding"
+            " agreement or a completed purchase). Changes: " + ", ".join(labels) + "."
+        )
+    else:
+        raise ValidationFailed("unknown seller-reply alert kind")
+    check_owner_wording(text)
+    return text
+
+
+# =============================================================================================
 # Helpers
 # =============================================================================================
 
@@ -1140,7 +1312,12 @@ __all__ = [
     "FORBIDDEN_PHRASES",
     "MATERIALITY_POLICY_VERSION",
     "MAX_PAYLOAD_BYTES",
+    "MAX_SELLER_REPLY_ALERT_REASONS",
     "MCP_EVENT_NAME",
+    "SELLER_REPLY_ALERT_KINDS",
+    "SELLER_REPLY_ALERT_STATUS",
+    "SELLER_REPLY_OWNER_ALERT_EVENT_TYPE",
+    "SELLER_REPLY_REASON_LABELS",
     "AlertState",
     "ComparableSummary",
     "EvidenceFlags",
@@ -1153,8 +1330,11 @@ __all__ = [
     "QuietHours",
     "QuietHoursDecision",
     "RiskLevel",
+    "SellerReplyAlertKind",
+    "SellerReplyOwnerAlertDraft",
     "assert_external_routing_allowed",
     "build_review_pending_event",
+    "build_seller_reply_owner_alert",
     "check_owner_wording",
     "dashboard_case_url",
     "derive_readiness",
@@ -1164,7 +1344,9 @@ __all__ = [
     "forbidden_phrases_in",
     "guard_payload",
     "render_owner_message",
+    "render_seller_reply_alert_text",
     "sanitize_seller_text",
+    "seller_reply_alert_dedup_key",
     "text_problems",
     "to_mcp_occurrence",
 ]

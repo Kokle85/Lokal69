@@ -36,8 +36,10 @@ detail job already waiting for the listing is returned as ``deduplicated: true``
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timedelta
 from typing import Any, Final, cast
 from uuid import UUID
 
@@ -100,6 +102,8 @@ from suv_deals.views.operations import (
     ReadinessView,
     WorkspaceView,
 )
+
+logger = logging.getLogger("suv_deals.api")
 
 router = APIRouter()
 
@@ -241,7 +245,8 @@ async def readiness_view(state: ApiState) -> ReadinessView:
     Cached for ``ApiOptions.readiness_cache_seconds`` so an unauthenticated caller cannot turn the
     endpoint into database load; refreshes are serialized, so a burst of concurrent probes shares
     ONE database check (and at most one pooled connection) instead of one each. No hostnames,
-    URLs, versions or secrets are reported.
+    URLs, versions or secrets are reported, and a failing check shows only its status and a
+    generic detail (the specific reason is logged server-side).
     """
     cached = _fresh_readiness(state)
     if cached is not None:
@@ -252,7 +257,7 @@ async def readiness_view(state: ApiState) -> ReadinessView:
             return cached
         database, schema = await _database_checks(state)
         config = _config_check(state)
-        checks = (database, schema, config)
+        checks = tuple(_public_check(check) for check in (database, schema, config))
         view = ReadinessView(
             ready=all(check.status == "ok" for check in checks),
             checks=checks,
@@ -260,6 +265,21 @@ async def readiness_view(state: ApiState) -> ReadinessView:
         )
         state.readiness_cache = (anyio.current_time(), view)
         return view
+
+
+#: The only detail ``/readyz`` (unauthenticated) shows for a failing check; the specific reason
+#: is logged server-side (`_public_check`).
+GENERIC_READINESS_DETAIL: Final = "not ready; see the server logs"
+
+
+def _public_check(check: ReadinessCheck) -> ReadinessCheck:
+    """The check as the public probe shows it: name and status, never the specific reason."""
+    if check.status == "ok":
+        return check
+    logger.warning(
+        "readiness check failing", extra={"check": check.name, "status": check.status, "reason": check.detail}
+    )
+    return ReadinessCheck(name=check.name, status=check.status, detail=GENERIC_READINESS_DETAIL)
 
 
 def _fresh_readiness(state: ApiState) -> ReadinessView | None:
@@ -403,7 +423,8 @@ async def get_review(request: Request, case_id: str, auth: Authenticated) -> Res
     no_query(request)
     target = path_id(case_id, "case_id")
     result = await _read(request, auth, lambda conn, actor: queries.get_review_case(conn, actor, target))
-    return _respond(REVIEW, result.envelope(auth.request_id))
+    mine = replace(result, data=result.data.for_caller(auth.actor.principal_id))
+    return _respond(REVIEW, mine.envelope(auth.request_id))
 
 
 @router.post("/api/reviews/{case_id}/claim")
@@ -414,10 +435,11 @@ async def post_claim(request: Request, case_id: str, auth: Authenticated) -> Res
     body = await body_model(request, ClaimRequest)
     check_idempotency_header(request, body.idempotency_key)
     tool = body.to_tool_input(target)
+    duration = timedelta(seconds=api_state(request).settings.review_claim_duration_seconds)
 
     async def work(conn: Conn, actor: ActorContext) -> tuple[Any, datetime]:
         view = await reviews_repo.claim(
-            conn, actor, tool.case_id, tool.expected_version, tool.idempotency_key
+            conn, actor, tool.case_id, tool.expected_version, tool.idempotency_key, duration=duration
         )
         return view, await _now(conn)
 
@@ -499,7 +521,8 @@ async def post_submit(request: Request, case_id: str, auth: Authenticated) -> Re
 
     view, as_of = await _read(request, auth, work)
     warnings = [warning(WarningCode.FIXTURE_DATA)] if view.is_fixture else []
-    return _respond(SUBMIT, _mutation_envelope(view, auth, as_of, warnings))
+    mine = view.for_caller(auth.actor.principal_id)
+    return _respond(SUBMIT, _mutation_envelope(mine, auth, as_of, warnings))
 
 
 # --------------------------------------------------------------------------------------------
@@ -601,7 +624,7 @@ async def get_outbox(request: Request, auth: Authenticated) -> Response:
 # --------------------------------------------------------------------------------------------
 
 _PROBE_METHODS: Final = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
-FALLBACK_PATHS: Final = ("/api", "/api/{rest:path}")
+FALLBACK_PATHS: Final = ("/api", "/api/{rest:path}", "/v1/mail-workers", "/v1/mail-workers/{rest:path}")
 
 
 def _allowed_methods(request: Request) -> list[str]:

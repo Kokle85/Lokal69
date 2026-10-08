@@ -95,6 +95,10 @@ DEFAULT_INTENT_TTL: Final = timedelta(hours=6)
 MAX_INTENT_TTL: Final = timedelta(hours=48)
 MAX_ACCOUNT_REPORT_AGE: Final = timedelta(minutes=15)
 HEARTBEAT_STALE_AFTER: Final = timedelta(minutes=5)
+#: Desktop wire limits (``outlook_bridge.wire.WorkerSendIntent``), enforced on the backend model.
+MAX_WIRE_ADDRESS_CHARS: Final = 254
+MAX_WIRE_MESSAGE_ID_CHARS: Final = 998
+MAX_WIRE_INQUIRY_REF_CHARS: Final = 64
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
 CAPABILITIES: Final = ProviderCapabilities(
@@ -134,7 +138,9 @@ class OutlookAccountReport(BaseModel):
     account_smtp_address: str = Field(max_length=254)
     account_display_name: str | None = Field(default=None, max_length=256)
     account_type: Literal["exchange", "imap", "pop3", "http", "other", "unknown"] = "unknown"
-    security_settings_unchanged: bool = True  # the worker never disables Trust Center / OOM guard
+    #: The worker never disables Trust Center / Object Model Guard / antivirus checks; a report
+    #: claiming otherwise is not representable (validation refuses it).
+    security_settings_unchanged: Literal[True] = True
 
     @field_validator("reported_at")
     @classmethod
@@ -168,6 +174,10 @@ class OutlookSendIntent(BaseModel):
     ``SendUsingAccount`` to that account only and never switch accounts after a failure; add
     exactly one ``To`` recipient; no CC/BCC, attachments, signature or tracking; plain-text
     body exactly as given; record ``rfc_message_id``/``inquiry_ref`` where Outlook allows.
+
+    The model carries the desktop wire limits itself (addresses <= 254, Message-ID <= 998,
+    ``inquiry_ref`` <= 64 characters and exactly ``inquiry-<inquiry_id>``), so an intent the
+    backend can build is always one the worker accepts (``outlook_bridge.wire.WorkerSendIntent``).
     """
 
     model_config = _FROZEN
@@ -181,14 +191,14 @@ class OutlookSendIntent(BaseModel):
     binding_id: UUID
     binding_version: int = Field(ge=1)
     account_id: str = Field(min_length=1, max_length=320)
-    from_address: str
+    from_address: str = Field(max_length=MAX_WIRE_ADDRESS_CHARS)
     from_display_name: str = Field(min_length=1, max_length=64)
-    to_address: str
-    reply_to_address: str | None = None
+    to_address: str = Field(max_length=MAX_WIRE_ADDRESS_CHARS)
+    reply_to_address: str | None = Field(default=None, max_length=MAX_WIRE_ADDRESS_CHARS)
     subject: str = Field(min_length=1, max_length=MAX_SUBJECT_CHARS)
     body_text: str = Field(min_length=1, max_length=MAX_BODY_CHARS)
-    rfc_message_id: str
-    inquiry_ref: str
+    rfc_message_id: str = Field(max_length=MAX_WIRE_MESSAGE_ID_CHARS)
+    inquiry_ref: str = Field(max_length=MAX_WIRE_INQUIRY_REF_CHARS)
     body_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     mime_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: datetime
@@ -204,6 +214,8 @@ class OutlookSendIntent(BaseModel):
         ref = parse_inquiry_message_id(self.rfc_message_id)
         if ref is None or ref.inquiry_id != self.inquiry_id or ref.attempt_number != self.attempt_number:
             raise ValueError("intent Message-ID does not belong to this inquiry attempt")
+        if self.inquiry_ref != f"inquiry-{self.inquiry_id}":
+            raise ValueError("inquiry reference does not belong to this inquiry")
         if not self.created_at < self.not_after <= self.created_at + MAX_INTENT_TTL:
             raise ValueError("intent validity window is invalid")
         for address in (self.from_address, self.to_address, self.reply_to_address):
@@ -270,6 +282,9 @@ class OutlookRefusalReason(StrEnum):
     OUTLOOK_NOT_CLASSIC = "outlook_not_classic"
     MAILBOX_UNAVAILABLE = "mailbox_unavailable"
     DUPLICATE_INTENT = "duplicate_intent"  # already attempted earlier: that result stands
+    #: A claim refusal that lifts on its own (rolling caps, seller cooldown, source pause): the
+    #: worker keeps the intent waiting and claims again later; nothing was sent.
+    NOT_NOW = "not_now"
 
 
 #: Refusals that say nothing against a later attempt of the same message from the same account
@@ -281,6 +296,7 @@ _RETRYABLE_REFUSALS: Final = frozenset(
         OutlookRefusalReason.OUTLOOK_NOT_CLASSIC,
         OutlookRefusalReason.MAILBOX_UNAVAILABLE,
         OutlookRefusalReason.KILL_SWITCH,
+        OutlookRefusalReason.NOT_NOW,
     }
 )
 
@@ -774,6 +790,9 @@ __all__ = [
     "DEFAULT_INTENT_TTL",
     "HEARTBEAT_STALE_AFTER",
     "MAX_ACCOUNT_REPORT_AGE",
+    "MAX_WIRE_ADDRESS_CHARS",
+    "MAX_WIRE_INQUIRY_REF_CHARS",
+    "MAX_WIRE_MESSAGE_ID_CHARS",
     "OUTLOOK_INTENT_SCHEMA_VERSION",
     "IntentNotStored",
     "OutlookAccountReport",

@@ -327,16 +327,12 @@ def password_free(url: str) -> tuple[str, str | None]:
 
 @asynccontextmanager
 async def open_database(settings: Settings, *, application_name: str) -> AsyncIterator[Database]:
-    """A small pool as ``DATABASE_SET_ROLE`` (normally ``suv_backend``; ADR 0001)."""
+    """A small pool as ``DATABASE_SET_ROLE`` (normally ``suv_backend``; ADR 0001), built by
+    ``Database.from_settings`` (``DATABASE_POOL_TIMEOUT_S`` applies)."""
     from suv_deals.persistence.database import Database
 
-    db = Database(
-        database_url(settings),
-        min_size=1,
-        max_size=2,
-        set_role=settings.database_set_role,
-        application_name=application_name,
-    )
+    database_url(settings)  # a clear usage error when DATABASE_URL is missing
+    db = Database.from_settings(settings, application_name=application_name, min_size=1, max_size=2)
     await db.open()
     try:
         yield db

@@ -72,9 +72,17 @@ class CursorPage(BaseModel):
     next_cursor: str | None
 
 
-def _require_read(actor: ActorContext) -> None:
-    if not (actor.has(Scope.REVIEWS_READ) or actor.has(Scope.DEALS_READ)):
-        raise Forbidden("Missing scope: reviews:read or deals:read")
+#: Snapshot queries of the spec 37.8 inquiry/reply lists (``persistence.queries.inquiries``):
+#: ``inquiries:read`` alone may page them.
+INQUIRY_QUERY_NAMES: Final = frozenset({"seller_inquiries", "seller_replies"})
+
+
+def _require_read(actor: ActorContext, query_name: str | None = None) -> None:
+    if actor.has(Scope.REVIEWS_READ) or actor.has(Scope.DEALS_READ):
+        return
+    if query_name in INQUIRY_QUERY_NAMES and actor.has(Scope.INQUIRIES_READ):
+        return
+    raise Forbidden("Missing scope: reviews:read or deals:read")
 
 
 def _query(query_name: str) -> str:
@@ -106,7 +114,7 @@ async def create_snapshot(  # noqa: PLR0917 - positional public contract (WP7a A
     query_name: str,
 ) -> UUID:
     """Freeze an ordered result (unique ids, one projection per id or none) for the principal."""
-    _require_read(actor)
+    _require_read(actor, query_name)
     ids = list(ordered_ids)
     if len(ids) > MAX_SNAPSHOT_IDS:
         raise ValidationFailed("a snapshot holds at most 10,000 results; narrow the filters")
@@ -177,7 +185,7 @@ async def page(
     filter_hash: str,
 ) -> SnapshotPage:
     """One page of a frozen snapshot, bound to principal + workspace + query + filter hash."""
-    _require_read(actor)
+    _require_read(actor, query_name)
     size = validate_limit(limit)
     if isinstance(ordinal_start, bool) or not 0 <= ordinal_start <= MAX_SNAPSHOT_ORDINAL:
         raise ValidationFailed("ordinal must be between 0 and 10,000")
@@ -307,7 +315,7 @@ async def next_page(
 ) -> CursorPage:
     """Verify a signed snapshot cursor (MAC, expiry, query/workspace/principal/filter binding)
     and return the next frozen page. Keyset cursors are rejected here."""
-    _require_read(actor)
+    _require_read(actor, query_name)
     now = ensure_utc(await db_now(conn))
     payload = decode_cursor(
         cursor,

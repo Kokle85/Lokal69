@@ -18,7 +18,7 @@
   "request": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Body of ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 + the worker's optional\nextensions; == ``domain.replies.ReplyIngestRequest``, which the desktop worker serialises).\n\nHeaders: ``Idempotency-Key`` (8-128 printable ASCII) is REQUIRED; the server checks it AND the\nstable source identity (``ReplyIngestRequest.dedup_key``), never one alone. Limits: request\n<= 128 KiB, ``sanitized_body_text`` <= 64 KiB, ``subject`` <= 512 characters, <= 20 attachment\nmetadata entries (safe filename, MIME type, byte count, SHA-256, opaque local ref; no URLs,\npaths or bytes).",
+    "description": "Body of ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 + the worker's optional\nextensions; == ``outlook_bridge.wire.ReplyUpload``, a ``domain.replies.ReplyIngestRequest``\nplus ``returned_message_ids``).\n\nHeaders: ``Idempotency-Key`` (8-128 printable ASCII) is REQUIRED; the server checks it AND the\nstable source identity (``ReplyIngestRequest.dedup_key``), never one alone. Limits: request\n<= 128 KiB, ``sanitized_body_text`` <= 64 KiB, ``subject`` <= 512 characters, <= 20 attachment\nmetadata entries (safe filename, MIME type, byte count, SHA-256, opaque local ref; no URLs,\npaths or bytes).\n\n``returned_message_ids`` (bounce/delivery notice only, at most 20): the returned original's\nMessage-IDs, which the worker reads before its sanitiser removes the quoted original. The\nserver uses them only when its own classification of the uploaded fields is a delivery report\ntoo; they are not part of the immutable source fingerprint.",
     "properties": {
       "attachments": {
         "default": [],
@@ -179,6 +179,14 @@
       "observed_at": {
         "format": "date-time",
         "type": "string"
+      },
+      "returned_message_ids": {
+        "default": [],
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
       },
       "sanitized_body_text": {
         "type": "string"

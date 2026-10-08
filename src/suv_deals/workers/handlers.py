@@ -4,11 +4,15 @@ Every entry declares the payload versions it understands; the worker passes them
 a job written by a newer producer is moved to ``blocked`` with ``incompatible_payload_version``
 instead of being misread or retried forever.
 
-Extension point: later packages register additional job types without touching the runner, e.g.
-the spec v1.1 seller-inquiry dispatch::
+The default registry also carries the spec v1.1 section 37 runtime: the bounded automatic seller
+inquiry (``seller_inquiry_plan`` / ``seller_inquiry_send`` / ``seller_inquiry_reconcile``,
+`workers.inquiry_handlers`) and the processing of stored seller replies (``seller_reply_process``,
+`workers.reply_handlers`). None of them has an approval wait.
+
+Extension point: later packages register additional job types without touching the runner::
 
     registry = default_registry()
-    registry.register(JobType.SELLER_INQUIRY, handle_seller_inquiry, payload_versions=(1,))
+    registry.register(JobType.REPROCESS, handle_reprocess, payload_versions=(1,))
 
 (a new ``JobType`` value also needs the ``ops.jobs.jobs_type_ck`` migration). Replacing an existing
 handler is refused unless ``replace=True`` is passed explicitly.
@@ -24,6 +28,12 @@ from suv_deals.crawling.discovery import handle_discovery
 from suv_deals.crawling.valuation_pipeline import handle_valuation
 from suv_deals.domain.enums import JobType
 from suv_deals.errors import NotFound, ValidationFailed
+from suv_deals.workers.inquiry_handlers import (
+    handle_seller_inquiry_plan,
+    handle_seller_inquiry_reconcile,
+    handle_seller_inquiry_send,
+)
+from suv_deals.workers.reply_handlers import handle_seller_reply_process
 from suv_deals.workers.runtime import JobHandler
 
 
@@ -80,12 +90,32 @@ class HandlerRegistry:
 
 
 def default_registry() -> HandlerRegistry:
-    """Discovery, detail/recheck and valuation (recompute) handlers of the core pipeline."""
+    """Core pipeline handlers plus the spec v1.1 seller inquiry / seller reply runtime."""
     registry = HandlerRegistry()
     registry.register(JobType.DISCOVERY, handle_discovery, description="search pages -> observations")
     registry.register(JobType.DETAIL, handle_detail, description="detail page -> revision and screening")
     registry.register(JobType.RECHECK, handle_detail, description="bounded availability/price recheck")
     registry.register(JobType.VALUATION, handle_valuation, description="valuation, ranking, review case")
+    registry.register(
+        JobType.SELLER_INQUIRY_PLAN,
+        handle_seller_inquiry_plan,
+        description="inquiry readiness; bounded automatic reservation",
+    )
+    registry.register(
+        JobType.SELLER_INQUIRY_SEND,
+        handle_seller_inquiry_send,
+        description="guarded dispatch: outlook_local intent or provider send",
+    )
+    registry.register(
+        JobType.SELLER_INQUIRY_RECONCILE,
+        handle_seller_inquiry_reconcile,
+        description="resolve an uncertain send with positive evidence only",
+    )
+    registry.register(
+        JobType.SELLER_REPLY_PROCESS,
+        handle_seller_reply_process,
+        description="seller reply: escalations, re-evaluation, owner alert",
+    )
     return registry
 
 

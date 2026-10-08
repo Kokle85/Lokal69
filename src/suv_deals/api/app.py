@@ -24,9 +24,12 @@
   the API keeps serving (metrics are optional).
 - **Database**: ``Database.from_settings`` (pool sizes, ``DATABASE_SET_ROLE`` and
   ``DATABASE_POOL_TIMEOUT_S``, so a database outage answers 503 quickly).
-- **Extension points**: ``extra_routers`` are included after the core routes and before the MCP
-  mount (the spec 37.8 mail-worker and inquiry routers plug in here, with their own
-  authentication dependency and, through ``ApiOptions.prefix_body_limits``, their own body limit).
+- **Spec 37 routes**: ``api.mail_worker_routes`` (``/v1/mail-workers``; mailbox-worker credential,
+  128 KiB body limit by default, no CORS) and ``api.inquiry_routes`` (dashboard inquiry, reply,
+  control, mail-worker health, lifecycle and evaluation routes) are included after the core routes.
+- **Extension points**: ``extra_routers`` are included after those and before the MCP mount
+  (with their own authentication dependency and, through ``ApiOptions.prefix_body_limits``, their
+  own body limit).
 - **MCP**: the ASGI app built by ``suv_deals.mcp.server.build_mcp`` is mounted at ``/`` LAST, so
   every ``/api`` route takes precedence (`build_app` imports it lazily and tolerates its absence).
 
@@ -58,7 +61,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp
 
 import suv_deals
-from suv_deals.api import routes
+from suv_deals.api import inquiry_routes, mail_worker_routes, routes
 from suv_deals.api.auth import SigningKeyResolver, StaticJwks, SupabaseJwtVerifier
 from suv_deals.api.deps import STATE_ATTRIBUTE, ApiOptions, ApiState
 from suv_deals.api.errors import install_exception_handlers
@@ -69,7 +72,13 @@ from suv_deals.api.middleware import (
     PrincipalRateLimiter,
     RequestContextMiddleware,
 )
-from suv_deals.api.schemas import ROUTES
+from suv_deals.api.schemas import (
+    MAIL_WORKER_BODY_LIMIT,
+    MAIL_WORKER_PREFIX,
+    MAIL_WORKER_ROUTES,
+    ROUTES,
+    V11_DASHBOARD_ROUTES,
+)
 from suv_deals.clock import Clock, SystemClock
 from suv_deals.domain.profiles import BusinessConfig, load_business_config
 from suv_deals.errors import AppError
@@ -331,7 +340,7 @@ def create_app(
             BodySizeLimitMiddleware,
             api_limit=opts.api_body_limit,
             default_limit=opts.other_body_limit,
-            prefix_limits=dict(opts.prefix_body_limits),
+            prefix_limits={MAIL_WORKER_PREFIX: MAIL_WORKER_BODY_LIMIT, **opts.prefix_body_limits},
             clock=app_clock,
             metrics=app_metrics,
         ),
@@ -348,6 +357,8 @@ def create_app(
     setattr(app.state, STATE_ATTRIBUTE, state)
     install_exception_handlers(app, clock=app_clock, metrics=app_metrics)
     app.include_router(routes.router)
+    app.include_router(mail_worker_routes.router)  # spec 37.8 mailbox-worker API
+    app.include_router(inquiry_routes.router)  # spec 37 dashboard inquiry/reply/health routes
     if opts.expose_metrics:
         app.add_api_route("/metrics", _metrics_route(app_metrics), methods=["GET"], include_in_schema=False)
     for extra in extra_routers:
@@ -381,9 +392,8 @@ def build_app(
 ) -> FastAPI:
     """Production factory: logging, database, the optional MCP mount and the API.
 
-    ``extra_routers``/``options`` are the extension hook for later packages (for example the
-    spec 37.8 mail-worker router with ``ApiOptions(prefix_body_limits={"/v1/mail-workers":
-    128 * 1024})``); a wrapper factory passes them and serves the result with ``--factory``.
+    ``extra_routers``/``options`` are the extension hook for later packages; a wrapper factory
+    passes them and serves the result with ``--factory``.
     """
     resolved = settings or get_settings()
     configure_logging(resolved)
@@ -399,8 +409,11 @@ def build_app(
     )
 
 
-#: Route keys this app serves (``api.schemas.ROUTES``); used by the contract tests.
-SERVED_ROUTE_KEYS: Final = frozenset(route.key for route in ROUTES)
+#: Route keys this app serves (``api.schemas.ROUTES`` plus the spec 37 tables); used by the
+#: contract tests.
+SERVED_ROUTE_KEYS: Final = frozenset(
+    route.key for route in (*ROUTES, *MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)
+)
 
 __all__ = [
     "SERVED_ROUTE_KEYS",

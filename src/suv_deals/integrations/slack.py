@@ -41,6 +41,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, ValidationError, field_validator
 
 from suv_deals.clock import Clock, ensure_utc
+from suv_deals.domain.notifications import (
+    MAX_SELLER_REPLY_ALERT_REASONS,
+    SELLER_REPLY_ALERT_STATUS,
+    SellerReplyAlertKind,
+    render_seller_reply_alert_text,
+)
+from suv_deals.domain.replies import ReplySignalStatus
 from suv_deals.errors import AppError, ErrorCode, Forbidden, ValidationFailed
 from suv_deals.integrations.event_bridge import (
     ActivationRoute,
@@ -531,6 +538,397 @@ async def reconcile_uncertain_post(
             return ReconcileResult(ReconcileState.NOT_FOUND, pages_read=pages)
         cursor = next_cursor[:512]
     # More history than the bounded window allows: we cannot claim it is absent.
+    return ReconcileResult(ReconcileState.UNKNOWN, pages_read=pages)
+
+
+# --------------------------------------------------------------------------- category signals
+#
+# Spec 37.6/37.7: the seller-reply signal (``seller.reply.received.v1``, category ``seller_reply``)
+# and owner alerts raised by a processed seller reply (category ``owner_alert``) use the Slack
+# route selected FOR THEIR CATEGORY (``bindings_repo.selected_route``), independently of the
+# candidate-discovery route: native MCP Events may stay the candidate route while seller replies
+# reach dot only through the private Slack channel (never both). These posts carry ids, a
+# fixed-vocabulary status and the authenticated dashboard link only: no mailbox body, address,
+# attachment, amount or credential. A 2xx/``ok`` is a provider receipt, never proof that dot
+# processed the signal.
+
+SIGNAL_CATEGORIES: Final = frozenset({"seller_reply", "owner_alert"})
+SELLER_REPLY_METADATA_EVENT_TYPE: Final = "suv_deals.seller_reply_received"
+OWNER_ALERT_METADATA_EVENT_TYPE: Final = "suv_deals.owner_alert"
+_SIGNAL_METADATA_TYPES: Final = frozenset(
+    {METADATA_EVENT_TYPE, SELLER_REPLY_METADATA_EVENT_TYPE, OWNER_ALERT_METADATA_EVENT_TYPE}
+)
+_SELLER_REPLY_STATUSES: Final = frozenset(s.value for s in ReplySignalStatus)
+_OWNER_ALERT_STATUSES: Final = frozenset(SELLER_REPLY_ALERT_STATUS.values())
+
+
+def signal_send_blockers(settings: Settings, config: SlackConfig | None, *, category: str) -> list[str]:
+    """Every reason a category signal must not be posted (empty list = allowed).
+
+    Unlike `send_blockers` this does not depend on the candidate-discovery activation route
+    (``NOTIFICATION_PROVIDER``/``EVENT_BRIDGE_PROVIDER``): the route of these categories is the
+    owner-approved, verified destination binding selected for the category itself.
+    """
+    blockers: list[str] = []
+    if category not in SIGNAL_CATEGORIES:
+        blockers.append("category is not routed through a Slack signal")
+    if not settings.allow_external_notifications:
+        blockers.append("allow_external_notifications is false")
+    if category == "seller_reply" and settings.seller_reply_signal_provider != "slack":
+        blockers.append("seller_reply_signal_provider is not slack")
+    if config is None:
+        blockers.append("slack is not configured")
+    else:
+        if not config.destination_approval_ref:
+            blockers.append("no destination binding approval reference")
+        if settings.slack_channel_id and settings.slack_channel_id != config.channel_id:
+            blockers.append("channel does not match the configured binding")
+    return blockers
+
+
+def ensure_signal_send_allowed(
+    settings: Settings, config: SlackConfig | None, *, category: str
+) -> SlackConfig:
+    blockers = signal_send_blockers(settings, config, category=category)
+    if blockers or config is None:
+        raise SlackSendBlocked(blockers)
+    return config
+
+
+class SlackSellerReplyNotice(BaseModel):
+    """Read view of the internal ``seller.reply.received.v1`` outbox payload (ids only)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    event_id: UUID
+    inquiry_id: UUID
+    reply_id: UUID
+    listing_id: UUID | None = None
+    vehicle_cluster_id: UUID | None = None
+    dashboard_url: str = Field(max_length=2048)
+    status: str = Field(max_length=120)
+    deduplication_key: str = Field(min_length=1, max_length=200)
+    canary: bool = False
+
+    @field_validator("dashboard_url")
+    @classmethod
+    def _https_dashboard(cls, value: str) -> str:
+        problem = dashboard_url_problem(value, allow_local_http=False)
+        if problem is not None:
+            raise ValueError(problem)
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def _fixed_status(cls, value: str) -> str:
+        if value not in _SELLER_REPLY_STATUSES:
+            raise ValueError("status is not a seller-reply signal status")
+        return value
+
+
+class SlackOwnerAlertNotice(BaseModel):
+    """Read view of a ``seller_reply.owner_alert`` outbox payload (ids and reason codes only)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    event_id: UUID
+    kind: SellerReplyAlertKind
+    reasons: tuple[str, ...] = Field(min_length=1, max_length=MAX_SELLER_REPLY_ALERT_REASONS)
+    inquiry_id: UUID
+    reply_id: UUID
+    listing_id: UUID
+    valuation_id: UUID | None = None
+    dashboard_url: str = Field(max_length=2048)
+    status: str = Field(max_length=120)
+    deduplication_key: str = Field(min_length=1, max_length=300)
+
+    @field_validator("dashboard_url")
+    @classmethod
+    def _https_dashboard(cls, value: str) -> str:
+        problem = dashboard_url_problem(value, allow_local_http=False)
+        if problem is not None:
+            raise ValueError(problem)
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def _fixed_status(cls, value: str) -> str:
+        if value not in _OWNER_ALERT_STATUSES:
+            raise ValueError("status is not an owner-alert status")
+        return value
+
+    @field_validator("reasons")
+    @classmethod
+    def _codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", code) for code in value):
+            raise ValueError("reasons must be lower-case codes")
+        return value
+
+
+def build_seller_reply_post_body(config: SlackConfig, notice: SlackSellerReplyNotice) -> dict[str, Any]:
+    """The minimal private signal: event, inquiry, reply and vehicle ids, the brief status and
+    the authenticated dashboard link. dot reads the reply itself through the MCP reply tool."""
+    ref = event_reference(notice.event_id)
+    vehicle = (
+        f"vehicle cluster {notice.vehicle_cluster_id}"
+        if notice.vehicle_cluster_id is not None
+        else (f"listing {notice.listing_id}" if notice.listing_id is not None else "vehicle unknown")
+    )
+    parts = [
+        f"{'[CANARY] ' if notice.canary else ''}Seller inquiry update: {escape_mrkdwn(notice.status)}.",
+        f"Event {notice.event_id}; inquiry {notice.inquiry_id}; reply {notice.reply_id}; {vehicle}.",
+        f"Dashboard (sign-in required): {escape_mrkdwn(notice.dashboard_url)}",
+        f"[ref {ref}]",
+    ]
+    text = " ".join(parts)[:MAX_TEXT_CHARS]
+    event_payload: dict[str, Any] = {
+        "event_ref": ref,
+        "dedup_key": notice.deduplication_key,
+        "event_id": str(notice.event_id),
+        "inquiry_id": str(notice.inquiry_id),
+        "reply_id": str(notice.reply_id),
+    }
+    if notice.listing_id is not None:
+        event_payload["listing_id"] = str(notice.listing_id)
+    if notice.vehicle_cluster_id is not None:
+        event_payload["vehicle_cluster_id"] = str(notice.vehicle_cluster_id)
+    return {
+        "channel": config.channel_id,
+        "text": text,
+        "unfurl_links": False,
+        "unfurl_media": False,
+        "metadata": {"event_type": SELLER_REPLY_METADATA_EVENT_TYPE, "event_payload": event_payload},
+    }
+
+
+def build_owner_alert_post_body(config: SlackConfig, notice: SlackOwnerAlertNotice) -> dict[str, Any]:
+    """An owner alert raised by a processed seller reply: the fixed wording of
+    `domain.notifications.render_seller_reply_alert_text`, ids and the dashboard link only."""
+    ref = event_reference(notice.event_id)
+    wording = render_seller_reply_alert_text(notice.kind, notice.reasons)
+    parts = [
+        escape_mrkdwn(wording),
+        f"Inquiry {notice.inquiry_id}; reply {notice.reply_id}; listing {notice.listing_id}.",
+        f"Dashboard (sign-in required): {escape_mrkdwn(notice.dashboard_url)}",
+        f"[ref {ref}]",
+    ]
+    text = " ".join(parts)[:MAX_TEXT_CHARS]
+    return {
+        "channel": config.channel_id,
+        "text": text,
+        "unfurl_links": False,
+        "unfurl_media": False,
+        "metadata": {
+            "event_type": OWNER_ALERT_METADATA_EVENT_TYPE,
+            "event_payload": {
+                "event_ref": ref,
+                "dedup_key": notice.deduplication_key[:200],
+                "event_id": str(notice.event_id),
+                "kind": notice.kind,
+            },
+        },
+    }
+
+
+def _parse_signal(model: type[BaseModel], raw: Mapping[str, Any]) -> Any:
+    try:
+        return model.model_validate(dict(raw))
+    except ValidationError as exc:
+        fields = sorted({".".join(str(p) for p in err["loc"]) for err in exc.errors()})
+        raise ValidationFailed("Invalid signal payload for Slack", details={"fields": fields}) from None
+
+
+async def _post_signal_body(
+    approved: SlackConfig,
+    body_dict: dict[str, Any],
+    ref: str,
+    *,
+    http: SafeHttp,
+    clock: Clock,
+) -> SlackPostOutcome:
+    """One ``chat.postMessage`` with the classification of `post_review_message`."""
+    body = canonical_json(body_dict).encode("utf-8")
+    attempted = ensure_utc(clock.now())
+    try:
+        response = await http.post(
+            POST_MESSAGE_URL,
+            content=body,
+            headers=_auth_headers(approved, json_body=True),
+            timeout_s=10.0,
+            max_response_bytes=64 * 1024,
+        )
+    except SafeHttpError as exc:
+        if exc.failure in {SafeHttpFailure.DESTINATION_REJECTED, SafeHttpFailure.REDIRECT_REFUSED}:
+            kind = SlackOutcomeKind.FAILED
+        elif exc.possibly_delivered:
+            kind = SlackOutcomeKind.UNCERTAIN
+        else:
+            kind = SlackOutcomeKind.RETRY
+        return SlackPostOutcome(
+            kind=kind, event_ref=ref, status_code=exc.status_code, send_attempted_at=attempted
+        )
+    status = response.status_code
+    now = ensure_utc(clock.now())
+    if status == 429:
+        return SlackPostOutcome(
+            kind=SlackOutcomeKind.RETRY,
+            event_ref=ref,
+            status_code=status,
+            slack_error="ratelimited",
+            retry_after=parse_retry_after(response.headers.get("retry-after"), now),
+            send_attempted_at=attempted,
+        )
+    if status >= 500:
+        return SlackPostOutcome(
+            kind=SlackOutcomeKind.UNCERTAIN, event_ref=ref, status_code=status, send_attempted_at=attempted
+        )
+    if not 200 <= status < 300:
+        return SlackPostOutcome(
+            kind=SlackOutcomeKind.FAILED, event_ref=ref, status_code=status, send_attempted_at=attempted
+        )
+    payload = _parse_slack_json(response)
+    if payload is None:
+        return SlackPostOutcome(
+            kind=SlackOutcomeKind.UNCERTAIN, event_ref=ref, status_code=status, send_attempted_at=attempted
+        )
+    if payload.get("ok") is True:
+        ts = payload.get("ts")
+        channel = payload.get("channel")
+        return SlackPostOutcome(
+            kind=SlackOutcomeKind.POSTED,
+            event_ref=ref,
+            status_code=status,
+            message_ts=ts if isinstance(ts, str) else None,
+            channel_id=channel if isinstance(channel, str) else None,
+            send_attempted_at=attempted,
+            provider_accepted_at=now,
+        )
+    error = _known_error(payload.get("error"))
+    if error in _UNCERTAIN_ERRORS:
+        kind = SlackOutcomeKind.UNCERTAIN
+    elif error in _RETRYABLE_ERRORS:
+        kind = SlackOutcomeKind.RETRY
+    else:
+        kind = SlackOutcomeKind.FAILED
+    return SlackPostOutcome(
+        kind=kind,
+        event_ref=ref,
+        status_code=status,
+        slack_error=error,
+        retry_after=parse_retry_after(response.headers.get("retry-after"), now),
+        send_attempted_at=attempted,
+    )
+
+
+async def post_seller_reply_signal(
+    notice: SlackSellerReplyNotice | Mapping[str, Any],
+    *,
+    config: SlackConfig | None,
+    settings: Settings,
+    http: SafeHttp,
+    clock: Clock,
+) -> SlackPostOutcome:
+    """Post one minimal seller-reply signal. Raises `SlackSendBlocked` unless activated."""
+    approved = ensure_signal_send_allowed(settings, config, category="seller_reply")
+    parsed: SlackSellerReplyNotice = (
+        notice
+        if isinstance(notice, SlackSellerReplyNotice)
+        else _parse_signal(SlackSellerReplyNotice, notice)
+    )
+    ref = event_reference(parsed.event_id)
+    return await _post_signal_body(
+        approved, build_seller_reply_post_body(approved, parsed), ref, http=http, clock=clock
+    )
+
+
+async def post_owner_alert(
+    notice: SlackOwnerAlertNotice | Mapping[str, Any],
+    *,
+    config: SlackConfig | None,
+    settings: Settings,
+    http: SafeHttp,
+    clock: Clock,
+) -> SlackPostOutcome:
+    """Post one owner alert raised by a processed seller reply. Raises `SlackSendBlocked`."""
+    approved = ensure_signal_send_allowed(settings, config, category="owner_alert")
+    parsed: SlackOwnerAlertNotice = (
+        notice if isinstance(notice, SlackOwnerAlertNotice) else _parse_signal(SlackOwnerAlertNotice, notice)
+    )
+    ref = event_reference(parsed.event_id)
+    return await _post_signal_body(
+        approved, build_owner_alert_post_body(approved, parsed), ref, http=http, clock=clock
+    )
+
+
+def _signal_has_ref(message: Mapping[str, Any], ref: str, config: SlackConfig) -> bool:
+    if not _message_is_ours(message, config):
+        return False
+    metadata = message.get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("event_type") in _SIGNAL_METADATA_TYPES:
+        payload = metadata.get("event_payload")
+        if isinstance(payload, Mapping) and payload.get("event_ref") == ref:
+            return True
+    text = message.get("text")
+    return isinstance(text, str) and ref in _EVENT_REF_RE.findall(text)
+
+
+async def reconcile_uncertain_signal_post(
+    event_ref: str,
+    *,
+    posted_after: datetime,
+    config: SlackConfig | None,
+    settings: Settings,
+    http: SafeHttp,
+    category: str,
+    max_pages: int = 3,
+) -> ReconcileResult:
+    """`reconcile_uncertain_post` for the category signals (seller replies, owner alerts).
+
+    Only a message authored by our own app/bot that carries the event reference counts; any
+    lookup failure (or more history than the bounded window) stays ``UNKNOWN`` (never a resend).
+    """
+    approved = ensure_signal_send_allowed(settings, config, category=category)
+    if not re.fullmatch(r"SDR-[0-9A-F]{12}", event_ref):
+        raise ValueError("invalid event reference")
+    oldest = ensure_utc(posted_after) - timedelta(minutes=1)
+    cursor: str | None = None
+    pages = 0
+    while pages < max_pages:
+        query: dict[str, str] = {
+            "channel": approved.channel_id,
+            "oldest": f"{oldest.timestamp():.6f}",
+            "include_all_metadata": "true",
+            "limit": "200",
+        }
+        if cursor:
+            query["cursor"] = cursor
+        try:
+            response = await http.get(
+                f"{HISTORY_URL}?{urlencode(query)}",
+                headers=_auth_headers(approved, json_body=False),
+                timeout_s=10.0,
+                max_response_bytes=1024 * 1024,
+            )
+        except SafeHttpError:
+            return ReconcileResult(ReconcileState.UNKNOWN, pages_read=pages)
+        pages += 1
+        payload = _parse_slack_json(response) if response.is_success else None
+        if payload is None or payload.get("ok") is not True:
+            return ReconcileResult(ReconcileState.UNKNOWN, pages_read=pages)
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return ReconcileResult(ReconcileState.UNKNOWN, pages_read=pages)
+        for message in messages:
+            if isinstance(message, Mapping) and _signal_has_ref(message, event_ref, approved):
+                ts = message.get("ts")
+                return ReconcileResult(
+                    ReconcileState.FOUND, message_ts=ts if isinstance(ts, str) else None, pages_read=pages
+                )
+        meta = payload.get("response_metadata")
+        next_cursor = meta.get("next_cursor") if isinstance(meta, Mapping) else None
+        if not payload.get("has_more") or not isinstance(next_cursor, str) or not next_cursor:
+            return ReconcileResult(ReconcileState.NOT_FOUND, pages_read=pages)
+        cursor = next_cursor[:512]
     return ReconcileResult(ReconcileState.UNKNOWN, pages_read=pages)
 
 

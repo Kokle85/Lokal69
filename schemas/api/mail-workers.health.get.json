@@ -1,0 +1,569 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/mail-workers/health",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /api/mail-workers/health`` and ``/coverage-gaps``: revoked workers only on request.",
+    "properties": {
+      "include_revoked": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "title": "MailWorkerHealthQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/mail-workers/health``: every mailbox worker's separate health dimensions.",
+        "properties": {
+          "any_monitoring_active": {
+            "type": "boolean"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "mailboxes": {
+            "items": {
+              "additionalProperties": false,
+              "description": "Separate health dimensions of one mailbox worker.",
+              "properties": {
+                "account_status": {
+                  "enum": [
+                    "unknown",
+                    "verified",
+                    "mismatch",
+                    "not_classic"
+                  ],
+                  "type": "string"
+                },
+                "backlog_age": {
+                  "additionalProperties": false,
+                  "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+                  "properties": {
+                    "configured_interval_seconds": {
+                      "description": "Context only; never an observed latency guarantee.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "name": {
+                      "enum": [
+                        "source_scan_lag",
+                        "detection_delay",
+                        "detail_freshness",
+                        "mail_reply_detection_lag",
+                        "notification_processing_lag",
+                        "mailbox_sync_lag",
+                        "backlog_age"
+                      ],
+                      "type": "string"
+                    },
+                    "note": {
+                      "maxLength": 500,
+                      "type": "string"
+                    },
+                    "reason": {
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "measured",
+                        "unknown",
+                        "inconsistent"
+                      ],
+                      "type": "string"
+                    },
+                    "value_seconds": {
+                      "description": "Only a measured lag has a value; never zero for unknown.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "status",
+                    "value_seconds",
+                    "reason",
+                    "configured_interval_seconds",
+                    "note"
+                  ],
+                  "title": "LagView",
+                  "type": "object"
+                },
+                "backlog_count": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "binding_state": {
+                  "enum": [
+                    "active",
+                    "revoked"
+                  ],
+                  "type": "string"
+                },
+                "coverage_gaps": {
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "A monitored coverage gap of a mailbox worker (reported by it or detected by the server).",
+                    "properties": {
+                      "detected_by": {
+                        "enum": [
+                          "worker",
+                          "server"
+                        ],
+                        "type": "string"
+                      },
+                      "ended_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "kind": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "open": {
+                        "type": "boolean"
+                      },
+                      "started_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "started_at",
+                      "ended_at",
+                      "open",
+                      "detected_by"
+                    ],
+                    "title": "MailCoverageGap",
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                },
+                "folders": {
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "One hashed store/folder checkpoint as reported by the worker.",
+                    "properties": {
+                      "backlog_count": {
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "backlog_oldest_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "folder_id_hash": {
+                        "maxLength": 128,
+                        "type": "string"
+                      },
+                      "folder_role": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "gap_reasons": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "maxItems": 50,
+                        "type": "array"
+                      },
+                      "heartbeat_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "last_complete_scan_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "last_scan_started_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "overlap_watermark": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "store_id_hash": {
+                        "maxLength": 128,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "store_id_hash",
+                      "folder_id_hash",
+                      "folder_role",
+                      "last_complete_scan_at",
+                      "last_scan_started_at",
+                      "overlap_watermark",
+                      "heartbeat_at",
+                      "backlog_count",
+                      "backlog_oldest_at",
+                      "gap_reasons"
+                    ],
+                    "title": "FolderCheckpointView",
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                },
+                "generated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "heartbeat_age_seconds": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "heartbeat_status": {
+                  "enum": [
+                    "healthy",
+                    "stale",
+                    "down",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "last_heartbeat_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_successful_reconciliation_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "mailbox_binding_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "mailbox_sync_lag": {
+                  "additionalProperties": false,
+                  "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+                  "properties": {
+                    "configured_interval_seconds": {
+                      "description": "Context only; never an observed latency guarantee.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "name": {
+                      "enum": [
+                        "source_scan_lag",
+                        "detection_delay",
+                        "detail_freshness",
+                        "mail_reply_detection_lag",
+                        "notification_processing_lag",
+                        "mailbox_sync_lag",
+                        "backlog_age"
+                      ],
+                      "type": "string"
+                    },
+                    "note": {
+                      "maxLength": 500,
+                      "type": "string"
+                    },
+                    "reason": {
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "measured",
+                        "unknown",
+                        "inconsistent"
+                      ],
+                      "type": "string"
+                    },
+                    "value_seconds": {
+                      "description": "Only a measured lag has a value; never zero for unknown.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "status",
+                    "value_seconds",
+                    "reason",
+                    "configured_interval_seconds",
+                    "note"
+                  ],
+                  "title": "LagView",
+                  "type": "object"
+                },
+                "mailbox_sync_ok": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "monitoring_active": {
+                  "type": "boolean"
+                },
+                "open_gap_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "outlook_status": {
+                  "enum": [
+                    "healthy",
+                    "stale",
+                    "down",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "provider": {
+                  "enum": [
+                    "outlook_local",
+                    "gmail_api",
+                    "microsoft_graph"
+                  ],
+                  "type": "string"
+                },
+                "reasons": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 50,
+                  "type": "array"
+                },
+                "reconciliation_status": {
+                  "enum": [
+                    "healthy",
+                    "stale",
+                    "down",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "sender_binding_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "unresolved_matching_gaps": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "worker_label": {
+                  "maxLength": 120,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mailbox_binding_id",
+                "sender_binding_id",
+                "provider",
+                "worker_label",
+                "binding_state",
+                "generated_at",
+                "last_heartbeat_at",
+                "heartbeat_age_seconds",
+                "heartbeat_status",
+                "outlook_status",
+                "mailbox_sync_ok",
+                "mailbox_sync_lag",
+                "last_successful_reconciliation_at",
+                "reconciliation_status",
+                "backlog_count",
+                "backlog_age",
+                "unresolved_matching_gaps",
+                "account_status",
+                "coverage_gaps",
+                "open_gap_count",
+                "folders",
+                "monitoring_active",
+                "reasons"
+              ],
+              "title": "MailboxHealthView",
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "type": "array"
+          },
+          "open_gap_count": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generated_at",
+          "mailboxes",
+          "any_monitoring_active",
+          "open_gap_count",
+          "notes"
+        ],
+        "title": "MailWorkerHealthView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "mail-workers.health.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Mailbox-worker health: heartbeat, Outlook, reconciliation, backlog, account, gaps."
+}

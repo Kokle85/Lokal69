@@ -32,7 +32,22 @@ short transaction, no network I/O:
    their recomputation is queued (`valuation_repo.mark_stale`); valuations that used an older reference
    FX observation than the newest stored one, or an older business configuration, are invalidated
    through reverse invalidation (`valuation_repo.invalidate_dependents`).
-5. **Metrics**: queue depth / oldest due age per job type, lease expirations and dead letters.
+5. **Seller inquiries** (spec 37.3-37.5, bounded, no network I/O):
+
+   - a ``seller_inquiry_plan`` job for current eligible, real-lineage listings that have no inquiry
+     record, once per (revision, current seller contact evidence): the valuation pipeline plans each
+     new revision itself; this catches a seller contact recorded after that plan found nobody to ask;
+   - a ``seller_inquiry_send`` job for a ``queued`` inquiry that has none (never for one with a
+     running attempt);
+   - a ``seller_inquiry_reconcile`` job (at most one per inquiry per hour) for every ``uncertain``
+     inquiry whose unreconciled uncertain attempt ended more than ``inquiry_reconcile_after`` and
+     less than ``inquiry_reconcile_horizon`` ago;
+   - the ONE ``seller_reply_process`` job of every recent, unquarantined seller reply that has none
+     (an ingest path that did not queue it).
+
+   The plan sweep and the configuration-dependent invalidation skip a workspace without a business
+   configuration.
+6. **Metrics**: queue depth / oldest due age per job type, lease expirations and dead letters.
 
 ``dry_run=True`` reports what a pass WOULD do: transactional steps run and are rolled back, the
 database-level reapers are replaced by read-only counts. Nothing is committed in a dry run.
@@ -54,7 +69,7 @@ from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import FxPurpose, JobType, Scope, SourceMode, TechnicalStatus
 from suv_deals.domain.valuation import InvalidationReason
-from suv_deals.errors import AppError, NotFound
+from suv_deals.errors import AppError, NotFound, ValidationFailed
 from suv_deals.persistence import (
     config_repo,
     idempotency,
@@ -71,9 +86,17 @@ from suv_deals.persistence import (
 )
 from suv_deals.persistence.database import Conn, db_now, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import mapped_errors
+from suv_deals.persistence.replies_repo import REPLY_PROCESS_PREFIX
 from suv_deals.persistence.sources_repo import SourceRecord
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
+from suv_deals.workers.inquiry_handlers import (
+    PLAN_PREFIX,
+    enqueue_plan_job,
+    enqueue_reconcile_job,
+    enqueue_send_job,
+)
+from suv_deals.workers.reply_handlers import enqueue_reply_process_job
 from suv_deals.workers.runtime import RuntimeContext, active_workspace_ids, build_runtime, system_actor
 
 logger = logging.getLogger(__name__)
@@ -105,6 +128,17 @@ class ReconcileOptions:
     #: Reference FX pairs (EUR/<currency>) checked for newer observations.
     fx_currencies: tuple[str, ...] = ("CHF", "MKD")
     interval_seconds: float = 300.0
+    #: Seller-inquiry sweeps: plan jobs per pass, send jobs per pass, reconcile jobs per pass.
+    inquiry_plan_limit: int = 50
+    inquiry_send_limit: int = 50
+    inquiry_reconcile_limit: int = 50
+    #: An uncertain send is reconciled once it is this old (the provider/worker may still report)...
+    inquiry_reconcile_after: timedelta = timedelta(minutes=15)
+    #: ...and no longer automatically after this long (it stays visibly uncertain).
+    inquiry_reconcile_horizon: timedelta = timedelta(days=30)
+    #: Seller replies of this age or younger get their processing job if none exists.
+    reply_process_horizon: timedelta = timedelta(days=7)
+    reply_process_limit: int = 50
 
     def __post_init__(self) -> None:
         if self.stale_detail_age < timedelta(hours=1):
@@ -137,6 +171,10 @@ class ReconcileReport:
     valuations_expired: int = 0
     valuations_invalidated: int = 0
     recompute_jobs: int = 0
+    inquiry_plan_jobs: int = 0
+    inquiry_send_jobs: int = 0
+    inquiry_reconcile_jobs: int = 0
+    reply_process_jobs: int = 0
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -246,6 +284,95 @@ select
 """
 
 
+#: Eligible real-lineage listings without an inquiry record whose CURRENT contact evidence has
+#: not been planned yet: one plan job per (listing revision, contact evidence row), so a seller
+#: contact recorded after the valuation's plan job (``seller_not_linked``) is still planned once.
+_PLAN_SWEEP_SQL: Final = """
+select l.id, l.current_revision_id, c.id as contact_id
+  from app.listings l
+  join lateral (select c.id from app.seller_contacts c
+                 where c.workspace_id = l.workspace_id and c.listing_id = l.id and c.status <> 'changed'
+                 order by (c.status = 'verified') desc, c.created_at desc, c.id desc
+                 limit 1) c on true
+ where l.workspace_id = %(ws)s
+   and l.eligibility_state in ('eligible_primary', 'eligible_manual_profile')
+   and not l.is_fixture and not l.quarantined and not l.identity_conflict
+   and l.current_revision_id is not null
+   and l.availability in ('available', 'reserved', 'unknown')
+   and not exists (select 1 from app.seller_inquiries i
+                    where i.workspace_id = l.workspace_id and i.qualification_listing_id = l.id)
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = l.workspace_id and j.listing_id = l.id
+                      and j.job_type = 'seller_inquiry_plan'
+                      and j.dedup_key = %(prefix)s || ':' || l.id::text || ':'
+                                        || l.current_revision_id::text || ':contact-' || c.id::text)
+ order by l.last_seen_at desc, l.id
+ limit %(limit)s
+"""
+
+_ORPHAN_QUEUED_SQL: Final = """
+select i.id, i.qualification_listing_id as listing_id,
+       (select count(*) from ops.email_delivery_attempts a
+         where a.workspace_id = i.workspace_id and a.inquiry_id = i.id) as attempts
+  from app.seller_inquiries i
+ where i.workspace_id = %(ws)s
+   and i.state = 'queued'
+   and not exists (select 1 from ops.email_delivery_attempts a
+                    where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
+                      and a.outcome = 'running')
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = i.workspace_id and j.job_type = 'seller_inquiry_send'
+                      and j.payload ->> 'inquiry_id' = i.id::text
+                      and j.state in ('queued', 'running', 'retry_wait', 'blocked'))
+ order by i.updated_at, i.id
+ limit %(limit)s
+"""
+
+_UNPROCESSED_REPLIES_SQL: Final = """
+select r.id, r.inquiry_id, i.qualification_listing_id as listing_id
+  from app.seller_replies r
+  join app.seller_inquiries i on i.workspace_id = r.workspace_id and i.id = r.inquiry_id
+ where r.workspace_id = %(ws)s
+   and not r.quarantined and r.message_type = 'seller_reply'
+   and r.ingested_at > clock_timestamp() - %(horizon)s::interval
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = r.workspace_id and j.job_type = 'seller_reply_process'
+                      and j.dedup_key = %(prefix)s || ':' || r.id::text)
+ order by r.ingested_at, r.id
+ limit %(limit)s
+"""
+
+_UNCERTAIN_SQL: Final = """
+select i.id, i.qualification_listing_id as listing_id,
+       to_char(clock_timestamp() at time zone 'UTC', 'YYYYMMDDHH24') as bucket
+  from app.seller_inquiries i
+ where i.workspace_id = %(ws)s
+   and i.state = 'uncertain'
+   and exists (select 1 from ops.email_delivery_attempts a
+                where a.workspace_id = i.workspace_id and a.inquiry_id = i.id and a.submission_uncertain
+                  and coalesce(a.finished_at, a.send_intent_committed_at)
+                      <= clock_timestamp() - %(after)s::interval
+                  and coalesce(a.finished_at, a.send_intent_committed_at)
+                      > clock_timestamp() - %(horizon)s::interval)
+   and not exists (select 1 from ops.jobs j
+                    where j.workspace_id = i.workspace_id and j.job_type = 'seller_inquiry_reconcile'
+                      and j.payload ->> 'inquiry_id' = i.id::text
+                      and j.state in ('queued', 'running', 'retry_wait'))
+ order by i.updated_at, i.id
+ limit %(limit)s
+"""
+
+
+async def _has_business_config(conn: Conn, actor: ActorContext) -> bool:
+    """Whether the workspace has a usable business configuration (a workspace without one --
+    or with a configuration revision that is not a business configuration -- is skipped)."""
+    try:
+        await config_repo.current_config(conn, actor)
+    except (NotFound, ValidationFailed):
+        return False
+    return True
+
+
 async def _stale_detail_candidates(
     conn: Conn, actor: ActorContext, source_id: UUID, age: timedelta, limit: int
 ) -> list[UUID]:
@@ -320,6 +447,7 @@ class Reconciler:
             ("watch_rechecks", self._watch_rechecks),
             ("stale_detail", self._stale_detail),
             ("valuations", self._valuations),
+            ("inquiries", self._inquiries),
             ("metrics", self._metrics),
         )
         for name, step in steps:
@@ -553,8 +681,8 @@ class Reconciler:
                     changes += [valuation_repo.DependencyChange.new_fx_rate(rate) for rate in latest]
             try:
                 record, _config = await config_repo.current_config(conn, actor)
-            except NotFound:
-                record = None
+            except (NotFound, ValidationFailed):
+                record = None  # no (business) configuration: nothing to invalidate against
             if record is not None:
                 changes.append(
                     valuation_repo.DependencyChange(
@@ -576,7 +704,97 @@ class Reconciler:
         report.valuations_invalidated = invalidated
         report.recompute_jobs = queued + created
 
-    # ------------------------------------------------------------------ 5 metrics
+    # ------------------------------------------------------------------ 5 seller inquiries
+
+    async def _inquiries(self, actor: ActorContext, report: ReconcileReport) -> None:
+        opts = self.options
+        ws = actor.workspace_id
+
+        async def plans(conn: Conn) -> int:
+            if not await _has_business_config(conn, actor):
+                return 0
+            async with mapped_errors():
+                rows = await fetch_all(
+                    conn, _PLAN_SWEEP_SQL, {"ws": ws, "prefix": PLAN_PREFIX, "limit": opts.inquiry_plan_limit}
+                )
+            created = 0
+            for row in rows:
+                job_id = await enqueue_plan_job(
+                    conn,
+                    actor,
+                    listing_id=row["id"],
+                    revision_id=row["current_revision_id"],
+                    reason="reconciliation_sweep",
+                    suffix=f"contact-{row['contact_id']}",
+                )
+                created += int(job_id is not None)
+            return created
+
+        async def sends(conn: Conn) -> int:
+            async with mapped_errors():
+                rows = await fetch_all(conn, _ORPHAN_QUEUED_SQL, {"ws": ws, "limit": opts.inquiry_send_limit})
+            created = 0
+            for row in rows:
+                job_id = await enqueue_send_job(
+                    conn,
+                    actor,
+                    inquiry_id=row["id"],
+                    listing_id=row["listing_id"],
+                    attempt_number=int(row["attempts"]) + 1,
+                )
+                created += int(job_id is not None)
+            return created
+
+        async def reconciles(conn: Conn) -> int:
+            async with mapped_errors():
+                rows = await fetch_all(
+                    conn,
+                    _UNCERTAIN_SQL,
+                    {
+                        "ws": ws,
+                        "after": opts.inquiry_reconcile_after,
+                        "horizon": opts.inquiry_reconcile_horizon,
+                        "limit": opts.inquiry_reconcile_limit,
+                    },
+                )
+            created = 0
+            for row in rows:
+                job_id = await enqueue_reconcile_job(
+                    conn, actor, inquiry_id=row["id"], listing_id=row["listing_id"], bucket=row["bucket"]
+                )
+                created += int(job_id is not None)
+            return created
+
+        async def replies(conn: Conn) -> int:
+            async with mapped_errors():
+                rows = await fetch_all(
+                    conn,
+                    _UNPROCESSED_REPLIES_SQL,
+                    {
+                        "ws": ws,
+                        "prefix": REPLY_PROCESS_PREFIX,
+                        "horizon": opts.reply_process_horizon,
+                        "limit": opts.reply_process_limit,
+                    },
+                )
+            created = 0
+            for row in rows:
+                job_id = await enqueue_reply_process_job(
+                    conn,
+                    actor,
+                    reply_id=row["id"],
+                    inquiry_id=row["inquiry_id"],
+                    listing_id=row["listing_id"],
+                )
+                created += int(job_id is not None)
+            return created
+
+        report.inquiry_plan_jobs = await _step(self.ctx, actor, plans, dry_run=report.dry_run)
+        report.inquiry_send_jobs = await _step(self.ctx, actor, sends, dry_run=report.dry_run)
+        report.inquiry_reconcile_jobs = await _step(self.ctx, actor, reconciles, dry_run=report.dry_run)
+        report.reply_process_jobs = await _step(self.ctx, actor, replies, dry_run=report.dry_run)
+
+    # ------------------------------------------------------------------ 6 metrics
 
     async def _metrics(self, actor: ActorContext, report: ReconcileReport) -> None:
         del report

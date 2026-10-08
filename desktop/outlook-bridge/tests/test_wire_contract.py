@@ -8,6 +8,7 @@ hashing/Message-ID helpers against the backend implementations.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -27,9 +28,15 @@ PAIRS = [
 ]
 
 
+#: Worker fields that are listing/transport state on the wire (``api.schemas`` models), not part of
+#: the backend provider model: ``expired`` is set by ``GET /send-intents`` for reaped intents.
+WIRE_ONLY_FIELDS = {wire.WorkerSendIntent: {"expired"}}
+
+
 @pytest.mark.parametrize(("worker_model", "backend_model"), PAIRS)
 def test_models_have_identical_fields(worker_model: type, backend_model: type) -> None:
-    assert set(worker_model.model_fields) == set(backend_model.model_fields)  # type: ignore[attr-defined]
+    extra = WIRE_ONLY_FIELDS.get(worker_model, set())
+    assert set(worker_model.model_fields) - extra == set(backend_model.model_fields)  # type: ignore[attr-defined]
 
 
 def test_enumerations_match() -> None:
@@ -41,10 +48,69 @@ def test_intent_round_trips_through_the_backend_model() -> None:
     intent = make_intent(
         inquiry_id=uuid4(), mailbox_binding_id=MAILBOX_ID, from_address=OWNER, created_at=START
     )
-    backend = outlook_local.OutlookSendIntent.model_validate_json(intent.model_dump_json())
+    backend = outlook_local.OutlookSendIntent.model_validate_json(intent.model_dump_json(exclude={"expired"}))
     again = wire.WorkerSendIntent.model_validate_json(backend.model_dump_json())
     assert again == intent
     assert wire.intent_integrity_problems(again) == ()
+    flagged = wire.WorkerSendIntent.model_validate({**intent.model_dump(), "expired": True})
+    assert flagged.same_intent(intent) and flagged.is_expired(START) and not intent.is_expired(START)
+
+
+def test_backend_intent_enforces_the_wire_limits() -> None:
+    intent = make_intent(
+        inquiry_id=uuid4(), mailbox_binding_id=MAILBOX_ID, from_address=OWNER, created_at=START
+    )
+    data = intent.model_dump(exclude={"expired"})
+    with pytest.raises(ValueError, match="inquiry reference"):
+        outlook_local.OutlookSendIntent.model_validate({**data, "inquiry_ref": f"inquiry-{uuid4()}"})
+    for field, value in (("inquiry_ref", "x" * 65), ("rfc_message_id", "<" + "a" * 998 + ">")):
+        with pytest.raises(ValueError, match=field):
+            outlook_local.OutlookSendIntent.model_validate({**data, field: value})
+
+
+def test_account_report_cannot_claim_weakened_security() -> None:
+    values = {
+        "mailbox_binding_id": str(MAILBOX_ID),
+        "worker_id": "desktop-1",
+        "reported_at": START.isoformat(),
+        "outlook_flavour": "classic",
+        "stable_account_key": "acct:9f2c1e7a",
+        "account_smtp_address": OWNER,
+    }
+    for model in (wire.WorkerAccountReport, outlook_local.OutlookAccountReport):
+        assert model.model_validate(values).security_settings_unchanged is True  # type: ignore[attr-defined]
+        with pytest.raises(ValueError, match="security_settings_unchanged"):
+            model.model_validate({**values, "security_settings_unchanged": False})  # type: ignore[attr-defined]
+
+
+def test_gap_reports_never_end_before_they_start() -> None:
+    with pytest.raises(ValueError, match="before it starts"):
+        wire.GapReport(kind="worker_offline", started_at=START, ended_at=START - timedelta(seconds=1))
+    clamped = wire.GapReport.of("worker_offline", START, START - timedelta(minutes=5))
+    assert clamped.ended_at == START
+    assert wire.GapReport.of("worker_offline", START, None).ended_at is None
+
+
+def test_not_now_refusal_is_a_retryable_pre_submission_failure() -> None:
+    intent = make_intent(
+        inquiry_id=uuid4(), mailbox_binding_id=MAILBOX_ID, from_address=OWNER, created_at=START
+    )
+    report = wire.WorkerSendReport(
+        intent_id=intent.intent_id,
+        inquiry_id=intent.inquiry_id,
+        mailbox_binding_id=MAILBOX_ID,
+        worker_id="desktop-1",
+        state=wire.SubmissionState.REFUSED_BEFORE_SEND,
+        refusal_reason=wire.RefusalReason.NOT_NOW,
+        reported_at=START,
+    )
+    outcome = outlook_local.map_outlook_report(
+        outlook_local.OutlookSendIntent.model_validate_json(intent.model_dump_json(exclude={"expired"})),
+        outlook_local.OutlookSendReport.model_validate_json(report.model_dump_json()),
+        observed_at=START,
+    )
+    assert type(outcome).__name__ == "SendDefiniteFailure"
+    assert outcome.pre_submission and outcome.retryable  # type: ignore[union-attr]
 
 
 def test_report_and_heartbeat_round_trip() -> None:
@@ -87,7 +153,7 @@ def test_refused_report_maps_to_a_pre_submission_failure_in_the_backend() -> Non
         reported_at=START,
     )
     outcome = outlook_local.map_outlook_report(
-        outlook_local.OutlookSendIntent.model_validate_json(intent.model_dump_json()),
+        outlook_local.OutlookSendIntent.model_validate_json(intent.model_dump_json(exclude={"expired"})),
         outlook_local.OutlookSendReport.model_validate_json(report.model_dump_json()),
         observed_at=START,
     )

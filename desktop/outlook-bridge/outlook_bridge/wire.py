@@ -23,8 +23,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
+from suv_deals.domain.enums import ReplyMessageType
 from suv_deals.domain.listings import sha256_json
-from suv_deals.domain.replies import canonical_address, normalize_message_id
+from suv_deals.domain.replies import ReplyIngestRequest, canonical_address, normalize_message_id
 from suv_deals.domain.seller_templates import (
     SCOPE_HASH,
     TEMPLATES,
@@ -35,6 +36,9 @@ from suv_deals.domain.seller_templates import (
 )
 
 WIRE_SCHEMA_VERSION: Final = "1.0"
+#: Returned original Message-IDs a bounce/delivery notice upload may carry.
+MAX_RETURNED_MESSAGE_IDS: Final = 20
+DELIVERY_REPORT_TYPES: Final = frozenset({ReplyMessageType.BOUNCE, ReplyMessageType.DELIVERY_NOTICE})
 MAX_INTENT_SUBJECT_CHARS: Final = 200  # mime_builder.MAX_SUBJECT_CHARS
 MAX_INTENT_BODY_CHARS: Final = 4_000  # mime_builder.MAX_BODY_CHARS
 MAX_INTENT_TTL: Final = timedelta(hours=48)
@@ -114,6 +118,10 @@ class WorkerSendIntent(BaseModel):
     mime_sha256: str = Field(pattern=_HEX64)
     created_at: datetime
     not_after: datetime
+    #: Set by the server for an intent whose validity ended before any worker claimed it (the
+    #: backend reaped it as uncertain): the worker must refuse it as ``intent_expired`` whatever
+    #: its own clock says, so the inquiry can be reconciled instead of staying uncertain.
+    expired: bool = False
 
     @field_validator("created_at", "not_after")
     @classmethod
@@ -132,8 +140,13 @@ class WorkerSendIntent(BaseModel):
             raise ValueError("intent validity window is invalid")
         return self
 
-    def expired(self, now: datetime) -> bool:
-        return _aware(now) >= self.not_after
+    def is_expired(self, now: datetime) -> bool:
+        """Past its validity (by the worker's clock) or flagged expired by the server."""
+        return self.expired or _aware(now) >= self.not_after
+
+    def same_intent(self, other: WorkerSendIntent) -> bool:
+        """The same message content (the server's ``expired`` flag is listing state, not content)."""
+        return self.model_dump(exclude={"expired"}) == other.model_dump(exclude={"expired"})
 
 
 _CONTROL_RE: Final = re.compile(
@@ -263,6 +276,9 @@ class RefusalReason(StrEnum):
     OUTLOOK_NOT_CLASSIC = "outlook_not_classic"
     MAILBOX_UNAVAILABLE = "mailbox_unavailable"
     DUPLICATE_INTENT = "duplicate_intent"
+    #: Claim answer only: a waiting condition (rolling caps, seller cooldown, source pause). The
+    #: worker keeps the intent waiting and claims it again later; it is never a local refusal.
+    NOT_NOW = "not_now"
 
 
 class Tristate(StrEnum):
@@ -349,6 +365,44 @@ class SendIntentBatch(BaseModel):
 
 
 # =============================================================================================
+# Reply upload
+# =============================================================================================
+
+
+class ReplyUpload(ReplyIngestRequest):
+    """``POST /v1/mail-workers/replies`` body: the spec 37.8 v1.0 request plus one optional
+    extension (mirror of the backend ``api.schemas.MailWorkerReplyRequest``).
+
+    ``returned_message_ids``: the Message-IDs of the returned original that a bounce or delivery
+    notice carries (DSN ``Original-Message-ID``/``Message-ID`` lines of the attached original).
+    The sanitiser removes the quoted original from the body, so without them the backend could not
+    verify the link and would store the notice quarantined. Allowed for ``bounce`` and
+    ``delivery_notice`` uploads only; at most 20; not part of the immutable source fingerprint (they
+    are derived from the message itself).
+    """
+
+    returned_message_ids: tuple[str, ...] = Field(default=(), max_length=MAX_RETURNED_MESSAGE_IDS)
+
+    @field_validator("returned_message_ids")
+    @classmethod
+    def _returned(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        result: list[str] = []
+        for item in value:
+            normalized = normalize_message_id(item)
+            if normalized is None:
+                raise ValueError("returned_message_ids must be valid RFC Message-IDs")
+            if normalized not in result:
+                result.append(normalized)
+        return tuple(result)
+
+    @model_validator(mode="after")
+    def _delivery_reports_only(self) -> ReplyUpload:
+        if self.returned_message_ids and self.message_type not in DELIVERY_REPORT_TYPES:
+            raise ValueError("returned_message_ids belong to a bounce or delivery notice only")
+        return self
+
+
+# =============================================================================================
 # Account report and heartbeat
 # =============================================================================================
 
@@ -417,13 +471,28 @@ class CheckpointReport(BaseModel):
 
 
 class GapReport(BaseModel):
-    """A monitored coverage gap; the worker never claims coverage it did not have."""
+    """A monitored coverage gap; the worker never claims coverage it did not have.
+
+    A gap never ends before it starts (the server refuses such a report with ``422``);
+    `GapReport.of` clamps a locally recorded end that precedes its start (clock steps).
+    """
 
     model_config = _FROZEN
 
     kind: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     started_at: datetime
     ended_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _ordered(self) -> GapReport:
+        if self.ended_at is not None and _aware(self.ended_at) < _aware(self.started_at):
+            raise ValueError("a coverage gap cannot end before it starts")
+        return self
+
+    @classmethod
+    def of(cls, kind: str, started_at: datetime, ended_at: datetime | None) -> GapReport:
+        end = None if ended_at is None else max(_aware(ended_at), _aware(started_at))
+        return cls(kind=kind, started_at=started_at, ended_at=end)
 
 
 class HeartbeatEnvelope(BaseModel):
@@ -460,8 +529,10 @@ class HeartbeatAck(BaseModel):
 
 
 __all__ = [
+    "DELIVERY_REPORT_TYPES",
     "MAX_INTENT_BODY_CHARS",
     "MAX_INTENT_SUBJECT_CHARS",
+    "MAX_RETURNED_MESSAGE_IDS",
     "WIRE_SCHEMA_VERSION",
     "AccountType",
     "CheckpointReport",
@@ -471,6 +542,7 @@ __all__ = [
     "HeartbeatAck",
     "HeartbeatEnvelope",
     "RefusalReason",
+    "ReplyUpload",
     "SendIntentBatch",
     "SubmissionState",
     "Tristate",

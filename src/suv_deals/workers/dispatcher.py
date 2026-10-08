@@ -52,6 +52,21 @@ Per workspace (``ops.active_workspace_ids()``, ADR 0001) and per claimed event (
    - ``slack`` (only when it is the selected route): `slack.post_review_message`, refused by the
      adapter itself unless every activation gate passes.
 
+Spec v1.1 category signals (section 37.6/37.7, ADR 0002) take their OWN path (`_handle_signal`):
+``seller.reply.received`` (category ``seller_reply``) and ``seller_reply.owner_alert`` (category
+``owner_alert``) are posted ONLY to the Slack route selected for their category in
+`bindings_repo` -- never to native MCP Events (candidate discovery only) and independent of the
+candidate activation route. External delivery needs ``ALLOW_EXTERNAL_NOTIFICATIONS`` (and
+``SELLER_REPLY_SIGNAL_PROVIDER=slack`` for seller replies) plus an enabled, approved and verified
+Slack destination binding; fixture lineage is never delivered. Each event is revalidated right
+before the post (`revalidate_signal`: the reply still exists and is not quarantined; an
+opportunity alert still cites the current, notifiable valuation). The post is minimal
+(`slack.build_seller_reply_post_body` / `build_owner_alert_post_body`: ids, a fixed-vocabulary
+status and the authenticated dashboard link; never a body, address, attachment or credential). A
+Slack 2xx is a provider receipt, never proof that dot processed the signal; retries and the
+uncertain follow-up keep the event id (and its ``SDR-`` reference), and an uncertain post is
+looked up in the channel history before any resend, so one reply never activates dot twice.
+
 5. **Uncertain follow-up** (never a blind resend): MCP Events has no lookup API, so the documented
    conservative rule applies (`event_bridge.decide_uncertain_followup`: hold, then at most one resend
    with the SAME event id, then stay visibly uncertain); Slack posts are looked up in the channel
@@ -75,11 +90,19 @@ from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
 import anyio
+from psycopg import sql
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Availability, EligibilityState, OutboxState, ReviewState, ValuationState
-from suv_deals.domain.notifications import QuietHours, Urgency, evaluate_quiet_hours
+from suv_deals.domain.notifications import (
+    FIXTURE_SUMMARY_PREFIX,
+    SELLER_REPLY_OWNER_ALERT_EVENT_TYPE,
+    QuietHours,
+    Urgency,
+    evaluate_quiet_hours,
+)
+from suv_deals.domain.replies import SELLER_REPLY_EVENT_TYPE
 from suv_deals.domain.valuation import InvalidationReason
 from suv_deals.errors import AppError, NotFound, ValidationFailed
 from suv_deals.integrations import event_bridge as eb
@@ -97,9 +120,9 @@ from suv_deals.persistence import (
     valuation_repo,
 )
 from suv_deals.persistence.bindings_repo import ActivationRouteSelection, DestinationBinding, EventCategory
-from suv_deals.persistence.database import Conn, db_now
-from suv_deals.persistence.errors_map import LeaseLost
-from suv_deals.persistence.outbox import ClaimedEvent, DeliveryOutcome, OutboxRecord
+from suv_deals.persistence.database import Conn, Database, db_now, fetch_all, fetch_one
+from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
+from suv_deals.persistence.outbox import OUTBOX_COLUMNS, ClaimedEvent, DeliveryOutcome, OutboxRecord
 from suv_deals.persistence.subscriptions_repo import ClaimedDelivery, DeliveryRecord, SubscriptionRecord
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
@@ -109,10 +132,16 @@ logger = logging.getLogger(__name__)
 
 PENDING_EVENT: Final = "review.pending"
 SHORTLIST_EVENT: Final = "review.shortlisted"
+SELLER_REPLY_EVENT: Final = SELLER_REPLY_EVENT_TYPE
+SELLER_REPLY_ALERT_EVENT: Final = SELLER_REPLY_OWNER_ALERT_EVENT_TYPE
 CATEGORY_BY_EVENT: Final[dict[str, EventCategory]] = {
     PENDING_EVENT: "candidate_discovery",
     SHORTLIST_EVENT: "owner_alert",
+    SELLER_REPLY_EVENT: "seller_reply",
+    SELLER_REPLY_ALERT_EVENT: "owner_alert",
 }
+#: Category signals posted only to the Slack route of their category (never MCP Events).
+SIGNAL_EVENTS: Final = frozenset({SELLER_REPLY_EVENT, SELLER_REPLY_ALERT_EVENT})
 #: Outbox states whose event may still be delivered (deliveries of other events are rechecked).
 _DELIVERABLE_EVENT_STATES: Final = frozenset(
     {
@@ -145,6 +174,8 @@ SOURCE_ALERTS_PAUSED: Final = "SOURCE_ALERTS_PAUSED"
 FIXTURE_CASE: Final = "FIXTURE_EVENT"
 INVALID_PAYLOAD: Final = "INVALID_EVENT_PAYLOAD"
 OWNER_ALERT_UNSUPPORTED: Final = "OWNER_ALERT_MESSAGE_UNAVAILABLE"
+SIGNAL_DISABLED: Final = "SELLER_REPLY_SIGNAL_DISABLED"
+SIGNAL_ROUTE_NOT_SLACK: Final = "SIGNAL_ROUTE_NOT_SLACK"
 #: Refusals that block an event (visible, needs an owner/operator change); every other refusal
 #: means the event is stale and is cancelled with that reason.
 _BLOCKING_REFUSALS: Final = frozenset(
@@ -159,6 +190,8 @@ _BLOCKING_REFUSALS: Final = frozenset(
         DESTINATION_NOT_VERIFIED,
         SECRETS_UNAVAILABLE,
         OWNER_ALERT_UNSUPPORTED,
+        SIGNAL_DISABLED,
+        SIGNAL_ROUTE_NOT_SLACK,
     }
 )
 
@@ -343,6 +376,136 @@ async def revalidate(
         raise StaleEvent(SOURCE_ALERTS_PAUSED)
 
 
+_SIGNAL_REPLY_SQL: Final = """
+select r.id, r.inquiry_id, r.quarantined, r.message_type, i.qualification_listing_id as listing_id,
+       coalesce(l.is_fixture, true) as is_fixture
+  from app.seller_replies r
+  join app.seller_inquiries i on i.workspace_id = r.workspace_id and i.id = r.inquiry_id
+  left join app.listings l on l.workspace_id = i.workspace_id and l.id = i.qualification_listing_id
+ where r.workspace_id = %(ws)s and r.id = %(reply)s
+"""
+
+
+async def revalidate_signal(
+    conn: Conn,
+    actor: ActorContext,
+    event: OutboxRecord,
+    *,
+    now: datetime,
+) -> None:
+    """Raise `StaleEvent` unless a category signal still describes the committed state.
+
+    ``seller.reply.received``: the reply exists, belongs to the named inquiry and is not
+    quarantined; fixture lineage (the inquiry's listing, frozen at ingest) is never delivered.
+    ``seller_reply.owner_alert``: the same, and an ``opportunity_supported`` alert must still cite
+    the listing's current valuation, which must still be notifiable (not stale, invalid or
+    expired) for an available, eligible, unquarantined listing whose source alerts are not paused.
+    """
+    payload = event.payload
+    if event.is_fixture or payload.get("fixture") is True:
+        raise StaleEvent(FIXTURE_CASE)
+    expected_aggregate = "seller_reply" if event.event_type == SELLER_REPLY_EVENT else "seller_inquiry"
+    if event.event_type not in SIGNAL_EVENTS or event.aggregate_type != expected_aggregate:
+        raise StaleEvent(UNROUTABLE_EVENT_TYPE)
+    reply_id = _payload_uuid(payload, "reply_id")
+    inquiry_id = _payload_uuid(payload, "inquiry_id")
+    row = await fetch_one(conn, _SIGNAL_REPLY_SQL, {"ws": actor.workspace_id, "reply": reply_id})
+    if row is None:
+        raise StaleEvent("STALE_REPLY_MISSING")
+    if row["inquiry_id"] != inquiry_id:
+        raise StaleEvent(INVALID_PAYLOAD)
+    if row["is_fixture"]:
+        raise StaleEvent(FIXTURE_CASE)
+    if row["quarantined"]:
+        raise StaleEvent("REPLY_QUARANTINED")
+    if event.event_type != SELLER_REPLY_ALERT_EVENT or payload.get("kind") != "opportunity_supported":
+        return
+    listing = await listings_repo.get_listing(conn, actor, row["listing_id"])
+    if listing.quarantined:
+        raise StaleEvent("LISTING_QUARANTINED")
+    if listing.availability in _UNAVAILABLE:
+        raise StaleEvent(f"LISTING_{listing.availability.value}".upper())
+    if listing.eligibility_state in (None, EligibilityState.REJECTED):
+        raise StaleEvent("LISTING_NOT_ELIGIBLE")
+    cited = _payload_uuid(payload, "valuation_id")
+    try:
+        current = await valuation_repo.current_valuation(conn, actor, listing.id)
+    except (NotFound, ValidationFailed):
+        current = None
+    if current is None or current.id != cited:
+        raise StaleEvent("STALE_VALUATION")
+    valuation = current.valuation
+    if valuation.state in _CLOSED_VALUATIONS or not valuation.can_notify:
+        raise StaleEvent("STALE_VALUATION")
+    if valuation.expires_at is not None and ensure_utc(valuation.expires_at) <= now:
+        await valuation_repo.mark_stale(
+            conn, actor, current.id, InvalidationReason.FRESHNESS_DEADLINE, detail="expired before dispatch"
+        )
+        raise StaleEvent("VALUATION_EXPIRED")
+    if await sources_repo.alert_pause_reason(conn, actor, listing.source_id) is not None:
+        raise StaleEvent(SOURCE_ALERTS_PAUSED)
+
+
+# The lease of `outbox.claim_events` for the category signals, with a NULL-safe fixture test.
+# `outbox.claim_events` evaluates its "looks like a fixture" predicate to NULL for a payload
+# without a ``summary`` (``jsonb_typeof(NULL) = 'string'`` is NULL), so a signal payload -- which
+# never carries a summary -- is neither leased nor refused there (see the foundation change
+# request). Same lease columns and semantics; fixture rows (flag, ``fixture`` marker, fixture
+# summary) are never leased here either.
+_SIGNAL_CLAIM_SQL: Final = sql.SQL(
+    """
+with picked as (
+  select o.id
+    from ops.outbox o
+   where o.workspace_id = %(workspace_id)s
+     and o.event_type = any(%(types)s)
+     and o.state in ('pending', 'retry_wait')
+     and not o.is_fixture
+     and o.attempts < o.max_attempts
+     and o.available_at <= now()
+     and coalesce(o.payload -> 'fixture', 'false'::jsonb) in ('false'::jsonb, 'null'::jsonb)
+     and not coalesce(pg_catalog.jsonb_typeof(o.payload -> 'summary') = 'string'
+                      and pg_catalog.starts_with(pg_catalog.upper(pg_catalog.regexp_replace(
+                            o.payload ->> 'summary', '^[[:space:]]+', '')), %(fixture_prefix)s), false)
+   order by o.available_at, o.id
+   for update of o skip locked
+   limit %(limit)s
+)
+update ops.outbox o
+   set state = 'sending',
+       lease_owner = %(owner)s,
+       lease_token = gen_random_uuid(),
+       lease_expires_at = now() + %(lease)s::interval,
+       last_heartbeat_at = now(),
+       attempts = o.attempts + 1
+  from picked
+ where o.id = picked.id
+   and o.workspace_id = %(workspace_id)s
+returning {columns}
+"""
+).format(columns=sql.SQL(", ").join(sql.Identifier("o", c) for c in OUTBOX_COLUMNS))
+
+
+async def claim_signal_events(
+    db: Database, workspace_id: UUID, dispatcher_id: str, lease_seconds: float, limit: int
+) -> list[ClaimedEvent]:
+    """Lease up to ``limit`` due category-signal events (one short transaction, SKIP LOCKED)."""
+    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
+        rows = await fetch_all(
+            conn,
+            _SIGNAL_CLAIM_SQL,
+            {
+                "workspace_id": workspace_id,
+                "types": sorted(SIGNAL_EVENTS),
+                "owner": dispatcher_id,
+                "lease": timedelta(seconds=float(lease_seconds)),
+                "limit": limit,
+                "fixture_prefix": FIXTURE_SUMMARY_PREFIX.upper(),
+            },
+        )
+    return sorted((ClaimedEvent.model_validate(r) for r in rows), key=lambda e: (e.available_at, e.id))
+
+
 class Dispatcher:
     """One dispatcher process. ``run_workspace`` handles one workspace once (tests, CLI)."""
 
@@ -429,14 +592,18 @@ class Dispatcher:
                 self.ctx.db, workspace_id, self.dispatcher_id, self.options.outbox_lease_seconds, 1
             )
             if not claimed:
+                # Category signals the generic claim cannot lease (see `claim_signal_events`).
+                claimed = await claim_signal_events(
+                    self.ctx.db, workspace_id, self.dispatcher_id, self.options.outbox_lease_seconds, 1
+                )
+            if not claimed:
                 break
             event = claimed[0]
             with log_context(event_id=event.event_id, request_id=actor.request_id):
                 report.events.append(await self._handle_event(actor, event, selected, refusal, report))
         if selected is not None and selected.route is eb.ActivationRoute.MCP_EVENTS:
             await self._deliver_due(actor, report, None, selected)
-        if selected is not None:
-            await self._follow_up_uncertain(actor, report, selected)
+        await self._follow_up_uncertain(actor, report, selected)
         await self._record_stats(actor)
         return report
 
@@ -472,6 +639,8 @@ class Dispatcher:
         category = CATEGORY_BY_EVENT.get(event.event_type)
         if category is None:
             return await self._transition(actor, event, OutboxState.BLOCKED, UNROUTABLE_EVENT_TYPE)
+        if event.event_type in SIGNAL_EVENTS:
+            return await self._handle_signal(actor, event, category)
         if selected is None:
             return await self._transition(actor, event, OutboxState.BLOCKED, refusal or EXTERNAL_DISABLED)
         try:
@@ -981,10 +1150,160 @@ class Dispatcher:
         await outbox.mark_dead_letter(conn, event, "SLACK_FAILED")
         return OutboxState.DEAD_LETTER
 
+    # ------------------------------------------------------------------ category signals (v1.1)
+
+    async def _handle_signal(
+        self, actor: ActorContext, event: ClaimedEvent, category: EventCategory
+    ) -> EventResult:
+        """A seller-reply signal or a seller-reply owner alert: Slack route of its category only."""
+        if not self.settings.allow_external_notifications:
+            return await self._transition(actor, event, OutboxState.BLOCKED, EXTERNAL_DISABLED)
+        if category == "seller_reply" and self.settings.seller_reply_signal_provider != "slack":
+            return await self._transition(actor, event, OutboxState.BLOCKED, SIGNAL_DISABLED)
+        try:
+            decision = await retry_transient(lambda: self._prepare_signal(actor, event, category))
+        except LeaseLost:
+            return EventResult(event.event_id, event.event_type, None)
+        except ValidationFailed:
+            return await self._transition(actor, event, OutboxState.BLOCKED, INVALID_PAYLOAD)
+        if isinstance(decision, _Done):
+            logger.info("event not dispatched", extra={"state": decision.state.value, "code": decision.code})
+            return EventResult(event.event_id, event.event_type, decision.state, decision.code)
+        return await self._send_signal(actor, event, category, decision.binding)
+
+    async def _signal_route(
+        self, conn: Conn, actor: ActorContext, event: OutboxRecord, category: EventCategory
+    ) -> tuple[str | None, ActivationRouteSelection | None, DestinationBinding | None]:
+        """The approved, enabled and verified Slack route of ``category`` (or a blocker code)."""
+        route = await bindings_repo.selected_route(conn, actor, category)
+        if route is None:
+            return NO_ACTIVE_ROUTE, None, None
+        if event.destination_binding_id is not None and event.destination_binding_id != route.binding_id:
+            return ROUTE_CHANGED, route, None
+        if route.provider != "slack":
+            return SIGNAL_ROUTE_NOT_SLACK, route, None  # never MCP Events (candidate discovery only)
+        binding = await bindings_repo.get_binding(conn, actor, route.binding_id)
+        if (
+            binding.provider != "slack"
+            or not binding.enabled
+            or binding.approved_at is None
+            or binding.verified_at is None
+        ):
+            return DESTINATION_NOT_VERIFIED, route, binding
+        return None, route, binding
+
+    async def _prepare_signal(
+        self, actor: ActorContext, event: ClaimedEvent, category: EventCategory
+    ) -> _Send | _Done:
+        """Revalidation and the route checks of one signal in ONE short transaction."""
+        async with unit_of_work(self.ctx.db, actor) as conn:
+            now = ensure_utc(await db_now(conn))
+            try:
+                await revalidate_signal(conn, actor, event, now=now)
+            except StaleEvent as stale:
+                if stale.code in _BLOCKING_REFUSALS:
+                    await outbox.mark_blocked(conn, event, stale.code)
+                    return _Done(OutboxState.BLOCKED, stale.code)
+                await outbox.cancel_stale(conn, actor, event.event_id, stale.code, lease=event)
+                return _Done(OutboxState.CANCELLED, stale.code)
+            problem, route, binding = await self._signal_route(conn, actor, event, category)
+            if problem is not None or route is None or binding is None:
+                code = problem or NO_ACTIVE_ROUTE
+                await outbox.mark_blocked(conn, event, code)
+                return _Done(OutboxState.BLOCKED, code)
+            deferred = self._quiet_hours(now, route.quiet_hours, event)
+            if deferred is not None:
+                await outbox.mark_retry(conn, event, deferred, "QUIET_HOURS")
+                return _Done(OutboxState.RETRY_WAIT, "QUIET_HOURS")
+            return _Send("slack", binding)
+
+    async def _send_signal(
+        self, actor: ActorContext, event: ClaimedEvent, category: EventCategory, binding: DestinationBinding
+    ) -> EventResult:
+        config = self._slack_config(binding)
+        if config is None or slack.signal_send_blockers(self.settings, config, category=category):
+            return await self._transition(actor, event, OutboxState.BLOCKED, SLACK_BLOCKED)
+        try:
+            async with unit_of_work(self.ctx.db, actor) as conn:
+                await outbox.begin_send(conn, event)
+        except LeaseLost:
+            return EventResult(event.event_id, event.event_type, None, provider="slack")
+        try:
+            if event.event_type == SELLER_REPLY_EVENT:
+                posted = await slack.post_seller_reply_signal(
+                    event.payload,
+                    config=config,
+                    settings=self.settings,
+                    http=self.http(),
+                    clock=self.ctx.clock,
+                )
+            else:
+                posted = await slack.post_owner_alert(
+                    event.payload,
+                    config=config,
+                    settings=self.settings,
+                    http=self.http(),
+                    clock=self.ctx.clock,
+                )
+        except AppError:
+            # Refused before any request (blocked or an invalid payload): nothing was sent.
+            return await self._transition(actor, event, OutboxState.BLOCKED, SLACK_BLOCKED)
+        self.ctx.metrics.record_delivery("slack", _slack_metric(posted.kind))
+
+        async def once() -> OutboxState:
+            async with unit_of_work(self.ctx.db, actor) as conn:
+                return await self._apply_slack(conn, event, posted)
+
+        try:
+            state = await retry_transient(once)
+        except LeaseLost:
+            return EventResult(event.event_id, event.event_type, None, provider="slack")
+        return EventResult(event.event_id, event.event_type, state, posted.slack_error, "slack")
+
+    async def _follow_up_signal(self, actor: ActorContext, event: OutboxRecord, now: datetime) -> str | None:
+        """An uncertain signal post: channel-history lookup first; only ``not_found`` re-queues
+        the SAME event (same id and ``SDR-`` reference) for one more post."""
+        category = CATEGORY_BY_EVENT.get(event.event_type)
+        if category is None or event.send_attempted_at is None:
+            return None
+        if now - event.updated_at < self.uncertain_policy.hold_for:
+            return None
+        if not self.settings.allow_external_notifications:
+            return None
+        async with unit_of_work(self.ctx.db, actor) as conn:
+            problem, _route, binding = await self._signal_route(conn, actor, event, category)
+        if problem is not None or binding is None:
+            return None  # a disabled/unapproved destination is not contacted, not even to look up
+        config = self._slack_config(binding)
+        if config is None or slack.signal_send_blockers(self.settings, config, category=category):
+            return None
+        found = await slack.reconcile_uncertain_signal_post(
+            slack.event_reference(event.event_id),
+            posted_after=event.send_attempted_at,
+            config=config,
+            settings=self.settings,
+            http=self.http(),
+            category=category,
+        )
+        if found.state is slack.ReconcileState.UNKNOWN:
+            return None
+        accepted = found.state is slack.ReconcileState.FOUND
+        async with unit_of_work(self.ctx.db, actor) as conn:
+            await outbox.reconcile_uncertain(
+                conn,
+                actor,
+                event.event_id,
+                provider="slack",
+                accepted=accepted,
+                receipt=f"{config.channel_id}:{found.message_ts}" if accepted and found.message_ts else None,
+                note="channel history lookup",
+            )
+        return "delivered" if accepted else "resend_scheduled"
+
     # ------------------------------------------------------------------ uncertain follow-up
 
     async def _follow_up_uncertain(
-        self, actor: ActorContext, report: DispatchReport, selected: eb.ActivationSelection
+        self, actor: ActorContext, report: DispatchReport, selected: eb.ActivationSelection | None
     ) -> None:
         async with unit_of_work(self.ctx.db, actor) as conn:
             attention = await outbox.list_attention(conn, actor, limit=self.options.reconcile_limit)
@@ -992,9 +1311,14 @@ class Dispatcher:
         for event in attention:
             if event.state != OutboxState.UNCERTAIN or event.is_fixture:
                 continue
+            is_signal = event.event_type in SIGNAL_EVENTS
+            if selected is None and not is_signal:
+                continue
             with log_context(event_id=event.event_id):
                 try:
-                    if selected.route is eb.ActivationRoute.MCP_EVENTS:
+                    if is_signal:
+                        outcome = await self._follow_up_signal(actor, event, now)
+                    elif selected is not None and selected.route is eb.ActivationRoute.MCP_EVENTS:
                         outcome = await self._follow_up_mcp(actor, event, now)
                     else:
                         outcome = await self._follow_up_slack(actor, event, now)
@@ -1154,13 +1478,16 @@ async def run_dispatcher(
 
 __all__ = [
     "CATEGORY_BY_EVENT",
+    "SIGNAL_EVENTS",
     "DeliveryResult",
     "DispatchReport",
     "Dispatcher",
     "DispatcherOptions",
     "EventResult",
     "StaleEvent",
+    "claim_signal_events",
     "default_dispatcher_id",
     "revalidate",
+    "revalidate_signal",
     "run_dispatcher",
 ]

@@ -25,8 +25,9 @@ seller's SURVIVING (merged) family, no (possibly) transmitted inquiry of that fa
 same or a plausibly same vehicle, the seller cooldown holds, the listing facts are still the
 qualification snapshot, the recipient is still the verified contact and the rolling caps (counted
 at the latest possible hand-over) still hold. A business refusal is ``proceed: false`` with a
-wire ``refusal_reason`` (never an error): waiting conditions answer ``kill_switch`` (retryable),
-a final refusal ``intent_invalid``. Claims change no state.
+wire ``refusal_reason`` (never an error): the kill switch answers ``kill_switch`` (retryable),
+a final refusal ``intent_invalid``; rolling caps, the seller cooldown and a source pause answer
+``not_now`` (the worker waits and claims again). Claims change no state.
 
 Report = ``map_outlook_report`` then ``inquiries_repo.record_outcome`` (a running attempt is
 finalised once: ``sent_items_confirmed`` -> accepted, ``submitted_to_outbox``/``send_call_failed``
@@ -114,6 +115,9 @@ class SendIntentBatch(BaseModel):
 
     intents: tuple[OutlookSendIntent, ...] = ()
     kill_switch_active: bool
+    #: Reaped, never-claimed, unreported intents of the mailbox (listed with ``expired: true`` so
+    #: the worker reports them ``intent_expired`` and the inquiry can be reconciled).
+    expired: tuple[OutlookSendIntent, ...] = ()
 
 
 class ClaimResult(BaseModel):
@@ -308,6 +312,28 @@ _PENDING_SQL: Final = (
 )
 
 
+#: Intents whose lease the reaper expired (``LEASE_EXPIRED``, inquiry ``uncertain``) that no
+#: worker ever claimed (no granted ``send_intent.claim`` audit) and that carry no worker report: the
+#: worker only calls ``.Send`` after a granted claim, so its ``intent_expired`` report proves
+#: non-submission. Only recent ones (``EXPIRED_INTENT_WINDOW``) are offered again.
+_EXPIRED_SQL: Final = (
+    "select a.attempt_id from ops.email_delivery_attempts a"
+    " join app.seller_inquiries i on i.workspace_id = a.workspace_id and i.id = a.inquiry_id"
+    " where a.workspace_id = %(ws)s and a.provider = 'outlook_local' and a.outcome = 'uncertain'"
+    " and a.error_code = %(code)s and a.lease_owner = %(owner)s and a.sender_binding_id = %(sender)s"
+    " and a.lease_expires_at > clock_timestamp() - %(window)s::interval and i.state = 'uncertain'"
+    " and not coalesce(a.provider_response, '{}'::jsonb) ? 'worker_report'"
+    " and not coalesce(a.reconciliation_evidence, '{}'::jsonb) ? 'worker_report'"
+    " and not exists (select 1 from ops.audit_events e"
+    "   where e.workspace_id = a.workspace_id and e.target_type = 'seller_inquiry'"
+    "     and e.target_id = a.inquiry_id and e.action = 'send_intent.claim'"
+    "     and e.metadata ->> 'intent_id' = a.attempt_id::text"
+    "     and coalesce(e.metadata ->> 'proceed', 'true') <> 'false')"
+    " order by a.lease_expires_at, a.id limit %(limit)s"
+)
+EXPIRED_INTENT_WINDOW: Final = timedelta(days=7)
+
+
 async def _kill_switch_active(conn: Conn, workspace_id: UUID) -> bool:
     row = await fetch_one(
         conn,
@@ -339,13 +365,35 @@ async def list_pending(
             },
         )
         kill = await _kill_switch_active(conn, worker.workspace_id)
+    intents = await _intents(conn, system, [r["attempt_id"] for r in rows])
+    room = max(1, min(limit, MAX_INTENTS_PAGE)) - len(rows)
+    expired: list[OutlookSendIntent] = []
+    if room > 0:
+        async with mapped_errors():
+            stale = await fetch_all(
+                conn,
+                _EXPIRED_SQL,
+                {
+                    "ws": worker.workspace_id,
+                    "owner": lease_owner_for(worker.mailbox_binding_id),
+                    "sender": worker.sender_binding_id,
+                    "code": inquiries_repo.LEASE_EXPIRED,
+                    "window": EXPIRED_INTENT_WINDOW,
+                    "limit": room,
+                },
+            )
+        expired = await _intents(conn, system, [r["attempt_id"] for r in stale])
+    return SendIntentBatch(intents=tuple(intents), kill_switch_active=kill, expired=tuple(expired))
+
+
+async def _intents(conn: Conn, system: ActorContext, attempt_ids: Sequence[UUID]) -> list[OutlookSendIntent]:
     intents: list[OutlookSendIntent] = []
-    for row in rows:
-        record, attempt = await _load(conn, system, row["attempt_id"])
+    for attempt_id in attempt_ids:
+        record, attempt = await _load(conn, system, attempt_id)
         intent = await _intent_of(conn, system, record, attempt)
         if intent is not None:
             intents.append(intent)
-    return SendIntentBatch(intents=tuple(intents), kill_switch_active=kill)
+    return intents
 
 
 async def _load(conn: Conn, actor: ActorContext, attempt_id: UUID) -> tuple[InquiryRecord, AttemptRecord]:
@@ -405,11 +453,12 @@ select l.current_revision_id, l.availability, l.quarantined, l.identity_conflict
   left join app.listing_revisions r on r.workspace_id = l.workspace_id and r.id = l.current_revision_id
 """
 
-#: Refusals that lift on their own (owner resume or mode change, rolling caps, seller cooldown,
-#: source resume) answer ``kill_switch``: the wire has no rate-limit reason, and only a
-#: ``kill_switch`` refusal is mapped to a RETRYABLE proven pre-submission failure (the next
-#: dispatch preflight decides when). ``intent_invalid`` is final for this message: it never leaves.
-_WAIT: Final = OutlookRefusalReason.KILL_SWITCH
+#: Refusals that lift on their own without an owner action (rolling caps, seller cooldown, source
+#: resume) answer ``not_now``: the worker keeps the intent and claims it again later while it is
+#: valid (it reports ``intent_expired`` once its validity ends). The kill switch / mode answers
+#: ``kill_switch`` (the worker reports a RETRYABLE proven pre-submission failure; the next dispatch
+#: preflight decides when). ``intent_invalid`` is final for this message: it never leaves.
+_WAIT: Final = OutlookRefusalReason.NOT_NOW
 
 
 async def _claim_refusal(

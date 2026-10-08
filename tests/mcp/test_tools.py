@@ -27,6 +27,8 @@ from suv_deals.mcp.schemas import (
     FORBIDDEN_TOOL_NAMES,
     TOOL_NAMES,
     TOOLS,
+    V11_TOOL_NAMES,
+    V11_TOOLS,
     DealsHealthInput,
     ToolSpec,
     tool_input_schema,
@@ -96,11 +98,12 @@ async def schema_check(h: DataHarness) -> SchemaCheck:
 async def test_tools_list_is_scope_filtered_deterministic_and_exact(data_mcp: DataHarness) -> None:
     client = data_mcp.client
     owner_tools = await client.tools(data_mcp.owner)
-    assert [t["name"] for t in owner_tools] == list(TOOL_NAMES)
-    assert [t["name"] for t in await client.tools(data_mcp.owner)] == list(TOOL_NAMES)  # stable order
+    served = [*TOOL_NAMES, *V11_TOOL_NAMES]  # spec 21 order, then the spec 37.8 inquiry tools
+    assert [t["name"] for t in owner_tools] == served
+    assert [t["name"] for t in await client.tools(data_mcp.owner)] == served  # stable order
     for tool in owner_tools:
         name = tool["name"]
-        spec = TOOLS[name]
+        spec = TOOLS.get(name) or V11_TOOLS[name]
         assert tool["inputSchema"] == tool_input_schema(name)
         assert tool["inputSchema"]["additionalProperties"] is False
         assert tool["outputSchema"] == tool_output_schema(name)
@@ -114,7 +117,11 @@ async def test_tools_list_is_scope_filtered_deterministic_and_exact(data_mcp: Da
         }
     assert not FORBIDDEN_TOOL_NAMES & {t["name"] for t in owner_tools}
     reviewer = [t["name"] for t in await client.tools(data_mcp.reviewer)]
-    assert reviewer == [n for n in TOOL_NAMES if n != "sources_pause"]
+    assert reviewer == [
+        *(n for n in TOOL_NAMES if n != "sources_pause"),
+        "seller_inquiries_get",
+        "seller_replies_get",
+    ]  # inquiries:read but never inquiries:pause
     viewer = [t["name"] for t in await client.tools(data_mcp.viewer)]
     assert viewer == [*READ_TOOLS, "reviews_list_pending"]
     listing = await client.result("tools/list", token=data_mcp.viewer)
@@ -880,7 +887,9 @@ def test_registry_refuses_forbidden_and_duplicate_tools() -> None:
         ToolRegistry.default().with_tools([(forbidden, lambda call: None)])  # type: ignore[arg-type,return-value]
     with pytest.raises(ValueError, match="registered twice"):
         ToolRegistry.default().with_tools([(TOOLS["deals_health"], lambda call: None)])  # type: ignore[arg-type,return-value]
-    assert ToolRegistry.default().names == TOOL_NAMES
+    assert ToolRegistry.default().names == (*TOOL_NAMES, *V11_TOOL_NAMES)
+    with pytest.raises(ValueError, match="registered twice"):
+        ToolRegistry.default().with_tools([(V11_TOOLS["seller_inquiries_pause"], lambda call: None)])  # type: ignore[arg-type,return-value]
 
 
 async def test_unauthenticated_principal_cannot_reach_any_tool_handler(keys: SigningKeys) -> None:

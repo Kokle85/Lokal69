@@ -4,9 +4,11 @@
   clock, options); ``app.create_app`` stores it on ``app.state.suv_api``.
 - `authenticate` (a FastAPI dependency) reads ONLY ``Authorization: Bearer`` (never cookies,
   query strings or bodies), verifies the Supabase access token, resolves the active membership
-  for ``X-Workspace-Id`` and builds the request's `ActorContext`. The per-principal rate limit
-  (mutations and reads have separate buckets) is applied right after token verification, before
-  the membership query. Denials are counted with a bounded reason label.
+  for ``X-Workspace-Id`` and builds the request's `ActorContext`. A client whose failed
+  authentications exhausted its `PreAuthLimiter` budget is refused before verification; the
+  per-principal rate limit (mutations and reads have separate buckets) is applied right after
+  token verification, before the membership query. Denials are counted with a bounded reason
+  label.
 - Input parsing never trusts FastAPI's implicit coercion: path ids are canonical UUID strings,
   query strings (at most 4 KiB) go through the closed ``api.schemas`` query models (unknown or
   repeated parameters are refused), and bodies must be ``application/json`` and validate against the
@@ -38,7 +40,7 @@ from suv_deals.api.auth import (
     resolve_principal,
 )
 from suv_deals.api.errors import request_id_of, safe_field_names, unsupported_media_type
-from suv_deals.api.middleware import PrincipalRateLimiter
+from suv_deals.api.middleware import PreAuthLimiter, PrincipalRateLimiter, RateLimit, client_address
 from suv_deals.clock import Clock
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Scope
@@ -52,6 +54,10 @@ from suv_deals.settings import Settings
 from suv_deals.views.operations import ReadinessView
 
 STATE_ATTRIBUTE: Final = "suv_api"
+#: Per mailbox-worker credential (``/v1/mail-workers``): a backlog drain may post bursts of
+#: replies/reports, polling reads are periodic.
+MAIL_WORKER_MUTATION_LIMIT: Final = RateLimit(capacity=120, per_seconds=0.5)  # 120 burst, 120/minute
+MAIL_WORKER_READ_LIMIT: Final = RateLimit(capacity=60, per_seconds=1.0)  # 60 burst, 60/minute
 TRANSACTION_ATTEMPTS: Final = 3
 MAX_QUERY_STRING_BYTES: Final = 4096
 _ID_ADAPTER: Final = TypeAdapter(Id)
@@ -84,6 +90,14 @@ class ApiState:
     options: ApiOptions
     fallback_config: BusinessConfig | None
     cursor_secret: Callable[[], bytes]
+    #: Failed-authentication budget per client, checked before any token verification.
+    preauth: PreAuthLimiter = field(default_factory=PreAuthLimiter)
+    #: Per mailbox-worker credential rate limits (keyed before the database lookup).
+    mail_worker_limiter: PrincipalRateLimiter = field(
+        default_factory=lambda: PrincipalRateLimiter(
+            mutations=MAIL_WORKER_MUTATION_LIMIT, reads=MAIL_WORKER_READ_LIMIT
+        )
+    )
     #: ``(loop time, view)`` of the last readiness probe (see ``routes.readiness_view``).
     readiness_cache: tuple[float, ReadinessView] | None = None
     #: Serializes readiness refreshes: concurrent probes share one database check.
@@ -123,6 +137,10 @@ def _workspace_header(request: Request) -> str | None:
 async def _authenticate(request: Request, *, allow_default_workspace: bool) -> AuthContext:
     state = api_state(request)
     request_id = request_id_of(request)
+    client = client_address(request.scope)
+    # A client that keeps presenting missing/invalid tokens is refused here, before any signature
+    # check, JWKS fetch or database query.
+    state.preauth.check(client)
     try:
         if state.verifier is None:
             raise DependencyUnavailable("Dashboard authentication is not configured")
@@ -138,7 +156,11 @@ async def _authenticate(request: Request, *, allow_default_workspace: bool) -> A
             request_id=request_id,
             allow_default_workspace=allow_default_workspace,
         )
-    except (AuthFailure, MembershipDenied) as exc:
+    except AuthFailure as exc:
+        state.preauth.failed(client)
+        state.metrics.record_auth_denial("api", exc.reason)
+        raise
+    except MembershipDenied as exc:
         state.metrics.record_auth_denial("api", exc.reason)
         raise
     return AuthContext(principal=principal, request_id=request_id)
@@ -212,7 +234,7 @@ def query_model[M: BaseModel](request: Request, model: type[M]) -> M:
     try:
         return model.model_validate(dict(params))
     except ValidationError as exc:
-        fields = validation_error_fields(exc, root="query")
+        fields = validation_error_fields(exc, root="query", model=model)
         raise ValidationFailed("Invalid query parameters", details={"fields": fields}) from None
 
 
@@ -241,7 +263,7 @@ async def body_model[M: BaseModel](request: Request, model: type[M]) -> M:
     try:
         return model.model_validate_json(raw)
     except ValidationError as exc:
-        fields = validation_error_fields(exc, root="body")
+        fields = validation_error_fields(exc, root="body", model=model)
         raise ValidationFailed("Invalid request body", details={"fields": fields}) from None
 
 
@@ -272,6 +294,8 @@ async def in_transaction[T](state: ApiState, actor: ActorContext, work: Callable
 
 
 __all__ = [
+    "MAIL_WORKER_MUTATION_LIMIT",
+    "MAIL_WORKER_READ_LIMIT",
     "MAX_QUERY_STRING_BYTES",
     "STATE_ATTRIBUTE",
     "ApiOptions",

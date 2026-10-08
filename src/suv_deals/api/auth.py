@@ -177,8 +177,9 @@ def supabase_issuer(supabase_url: str) -> str:
     return f"{supabase_url.strip().rstrip('/')}/auth/v1"
 
 
-class SupabaseJwksClient(PyJWKClient):
-    """``PyJWKClient`` that fails fast for a short backoff after a failed JWKS fetch.
+class ThrottledJwksClient(PyJWKClient):
+    """``PyJWKClient`` that fails fast for a short backoff after a failed JWKS fetch and throttles
+    unknown-``kid`` refreshes after failed fetches too.
 
     ``PyJWKClient`` holds one lock across its blocking fetch, so without a backoff an outage (or
     an empty/invalid key set) makes every verification queue behind its own network attempt of up
@@ -186,6 +187,13 @@ class SupabaseJwksClient(PyJWKClient):
     seconds re-raise the same error class without touching the network (an unreachable endpoint
     stays ``503``, an unusable key set stays ``401``); the first attempt after the backoff
     retries. Verification stays fail-closed: no expired key set is ever reused.
+
+    PyJWT starts the unknown-``kid`` refresh cooldown (``cooldown_duration``) only after a
+    SUCCESSFUL fetch, so tokens with random ``kid`` values could force a refresh attempt per
+    request whenever the endpoint fails. Here a failed refresh starts the same cooldown: during it
+    an unknown ``kid`` is an invalid token (``401``) without any network attempt, while known keys
+    keep verifying from the cached set. Used for the Supabase dashboard tokens and the MCP OAuth
+    authorization server alike.
     """
 
     def __init__(
@@ -211,9 +219,16 @@ class SupabaseJwksClient(PyJWKClient):
             data = super().fetch_data()
         except PyJWTError as exc:
             self._failure = (self._monotonic(), type(exc))
+            if self.jwk_set_cache is not None:
+                # PyJWT compares this with ``time.monotonic()`` for the unknown-kid cooldown.
+                self._last_successful_fetch = time.monotonic()
             raise
         self._failure = None
         return data
+
+
+class SupabaseJwksClient(ThrottledJwksClient):
+    """The Supabase project's JWKS client (see `ThrottledJwksClient`)."""
 
 
 def supabase_jwks_client(issuer: str) -> SupabaseJwksClient:
@@ -491,6 +506,7 @@ __all__ = [
     "StaticJwks",
     "SupabaseJwksClient",
     "SupabaseJwtVerifier",
+    "ThrottledJwksClient",
     "VerifiedUser",
     "actor_for",
     "bearer_token",

@@ -2,14 +2,15 @@
 
 This is the contract of the backend-for-frontend (BFF) used by the private dashboard and of the
 twelve MCP tools, plus the spec v1.1 (section 37) seller-inquiry contracts in section 10: the
-mailbox-worker API, the dashboard inquiry routes and three prepared MCP tools. All surfaces share
-one set of typed models:
+mailbox-worker API, the dashboard inquiry/reply/health/lifecycle/evaluation routes and the three
+inquiry MCP tools, all served by default. All surfaces share one set of typed models:
 
 | Module | Contents |
 |---|---|
 | `src/suv_deals/views/` | Read models (views), `ResponseEnvelope`, `AmountView`, `ErrorPayload`, JSON-schema helpers; `views/inquiries.py` holds the v1.1 inquiry/reply read models |
-| `src/suv_deals/mcp/schemas.py` | MCP tool input models, the `TOOLS` registry (served), the `V11_TOOLS` registry (prepared), `ToolError`, resolved schemas, schema export |
-| `src/suv_deals/api/schemas.py` | Dashboard request bodies/queries, `ApiErrorResponse`, the `ROUTES` table (served), the `MAIL_WORKER_ROUTES` and `V11_DASHBOARD_ROUTES` tables (contracts for the API package) |
+| `src/suv_deals/mcp/schemas.py` | MCP tool input models, the `TOOLS` table (spec 21) and the `V11_TOOLS` table (spec 37.8; both served), `ToolError`, resolved schemas, schema export |
+| `src/suv_deals/api/schemas.py` | Dashboard request bodies/queries, `ApiErrorResponse`, the `ROUTES` table and the `MAIL_WORKER_ROUTES` / `V11_DASHBOARD_ROUTES` tables (all served: `api.routes`, `api.mail_worker_routes`, `api.inquiry_routes`) |
+| `src/suv_deals/views/lifecycle.py`, `views/mail_workers.py` | Lifecycle/lag and mailbox-worker health views of the dashboard routes (mirrors of the read-service models) |
 | `src/suv_deals/persistence/errors_map.py` | Database guard refusals (`SV00x`) to typed errors with a stable `details.reason` |
 | `schemas/*.json`, `schemas/tools/*.json`, `schemas/api/*.json` | Generated snapshots (do not edit by hand) |
 
@@ -25,9 +26,19 @@ signature (project JWKS), issuer, audience (`authenticated`), expiry and not-bef
 malformed, expired or wrongly issued token is `401 UNAUTHENTICATED`. Tokens are never accepted
 in query strings or request bodies, and the user's token is never passed through to another
 service. The JWKS is cached for 10 minutes (an unknown `kid` forces at most one refresh per 30
-seconds); an unreachable JWKS endpoint is `503 DEPENDENCY_UNAVAILABLE`, never `401`, and after a
-failed fetch requests fail fast with the same error for 5 seconds instead of each waiting on its
-own network attempt.
+seconds, counted from the last fetch attempt whether it succeeded or failed); an unreachable JWKS
+endpoint is `503 DEPENDENCY_UNAVAILABLE`, never `401`, and after a failed fetch requests fail fast
+with the same error for 5 seconds instead of each waiting on its own network attempt. The MCP
+OAuth verifier uses the same throttled client (`api.auth.ThrottledJwksClient`).
+
+**Failed-authentication limiter.** Each client address has a small budget of failed
+authentications on `/api`, `/mcp` and `/v1/mail-workers` (`api.middleware.PreAuthLimiter`: 20 in
+a burst, then one per 3 seconds). A missing, malformed, wrongly signed, unknown, revoked or
+expired credential takes one unit; while the budget is empty the client's requests are
+`429 RATE_LIMITED` (with `Retry-After`) BEFORE any signature check, key fetch or database lookup.
+Opaque credentials (`suvmcp_`, `suvdev_`, `suvmail_`) are checked by format, CPU-only, before any
+database lookup. Behind a reverse proxy run uvicorn with `--proxy-headers` and a trusted
+`--forwarded-allow-ips`, or every client shares the proxy's budget.
 
 **Membership and workspace.** After verification the server sets `app.user_id` and resolves the
 user's *active* memberships (`app.memberships`). An authenticated user without an active
@@ -360,58 +371,76 @@ client must send).
 
 ## 10. Spec v1.1 seller-inquiry contracts (spec §37)
 
-The models and route tables below are the contract; the routes are **to be implemented by the API
-package** (they are not in `ROUTES`, so the served app is unchanged) and the tools are registered
-by the inquiry package. Owner decisions in force: one automatic initial inquiry per verified
-vehicle/seller pair, no per-message approval, hard caps of 2 inquiries per rolling 24 hours and 5
-per rolling 15 days (`SELLER_INQUIRY_MAX_PER_24H` / `SELLER_INQUIRY_MAX_PER_ROLLING_15D` can only
-lower them), default send path `outlook_local`, optional `gmail_api`. No route or tool accepts a
-recipient, an e-mail body or a sender account; the pipeline sends from validated domain records.
+The models and route tables below are the contract, and the routes and tools are served by default
+(`api.app.create_app` includes `api.mail_worker_routes.router` and `api.inquiry_routes.router`;
+`mcp.tools.ToolRegistry.default` serves `V11_TOOLS` after the twelve spec 21 tools). Owner decisions
+in force: one automatic initial inquiry per verified vehicle/seller pair, no per-message approval,
+hard caps of 2 inquiries per rolling 24 hours and 5 per rolling 15 days
+(`SELLER_INQUIRY_MAX_PER_24H` / `SELLER_INQUIRY_MAX_PER_ROLLING_15D` can only lower them), default
+send path `outlook_local`, optional `gmail_api`. Nothing is sent unless the mode is `automatic`,
+the kill switch is off, the standing authorization is active and the sender binding is verified.
+No route or tool accepts a recipient, an e-mail body or a sender account; the pipeline sends from
+validated domain records.
 
 ### 10.1 Mailbox-worker API (`/v1/mail-workers`)
 
 Used only by the Windows desktop worker (`desktop/outlook-bridge`). Table:
-`api.schemas.MAIL_WORKER_ROUTES`.
+`api.schemas.MAIL_WORKER_ROUTES`; handlers: `api.mail_worker_routes`.
 
-- **Authentication**: `Authorization: Bearer <worker credential>`, a revocable, narrow
-  `mail:ingest` credential bound to one workspace and one mailbox binding, kept in the operating
-  system's protected credential store after activation. It is never a dashboard user token, a
-  Supabase service-role key or a database credential. A revoked or expired credential is `401`
-  (the worker stops transmitting and keeps its backlog).
+- **Authentication**: `Authorization: Bearer suvmail_<64 hex>` (exactly one header), a revocable,
+  narrow `mail:ingest` credential bound to one workspace and one mailbox binding
+  (`ops.mail_worker_bindings`), kept in the operating system's protected credential store after
+  activation; issue it with `suv-deals mail-worker credential issue`. It is never a dashboard user
+  token, an MCP credential, a Supabase service-role key or a database credential: any other token
+  kind is `401` by format alone (no database lookup). The identity is resolved in a transaction
+  opened without a workspace (the credential alone names workspace and mailbox). A revoked or
+  expired credential is `401` with `details.reason = "mail_worker_credential_revoked"` (the
+  worker stops transmitting and keeps its backlog); an unknown token is `401`; a revoked mailbox
+  binding is `403` (`mailbox_binding_revoked`). Tokens are never accepted in URLs: every route
+  refuses unknown query parameters (`422`).
+- **Rate limits**: per credential (keyed by the token's SHA-256 before the database lookup):
+  mutations 120 in a burst then 2 per second, reads 60 in a burst then 1 per second; `429` with
+  `Retry-After`. Failed authentications also draw on the client's pre-auth budget (section 1).
 - **Server-derived scope**: the server derives workspace and mailbox from the credential only.
   No request selects a workspace, mailbox or account; ids in a body (`mailbox_binding_id`,
-  `inquiry_id`, `intent_id`) are checked against the credential's mailbox and a mismatch is
-  `403 FORBIDDEN` (`details.reason = "mailbox_binding_mismatch"`), never a silent reassignment.
+  `inquiry_id`, `intent_id`) are checked against the credential's mailbox and a mismatch (or an
+  unknown inquiry/intent) is `403 FORBIDDEN` (`details.reason = "mailbox_binding_mismatch"`),
+  never a silent reassignment and never an existence leak.
 - **Idempotency**: `POST /replies`, `POST /send-intents/{intent_id}/claim` and
-  `POST /send-intents/{intent_id}/report` REQUIRE an `Idempotency-Key` header (8-128 printable
-  ASCII; missing -> `400`). `POST /heartbeat` and `POST /account-report` carry none (the desktop
-  client sends none; both are latest-state reports) and must not require one. The rule is
+  `POST /send-intents/{intent_id}/report` REQUIRE an `Idempotency-Key` header (8-128 characters of
+  `A-Z a-z 0-9 . _ : -`; missing -> `400`, malformed or repeated -> `422`). `POST /heartbeat` and
+  `POST /account-report` carry none (latest-state reports). The rule is
   `ApiRoute.idempotency_header` (`idempotencyKeyHeader` in `schemas/api/*.json`). For
   `POST /replies` the server checks the key **and** the stable source identity
   (`ReplyIngestRequest.dedup_key`: internet message id, provider id or local store/entry
   locator) and never trusts one alone: the same key/message with the same immutable source
   content returns the existing `reply_id` with `duplicate: true` (also after a folder move; the
   changed locator goes to locator history), while different content under the same identity is
-  `409 IDEMPOTENCY_CONFLICT` and is quarantined, never overwritten. The worker uses
-  `claim-<intent>-<claim_attempt_id>` for claims (so a stored `proceed: true` can never be
-  replayed) and `report-<intent>-<state>` for reports; the same key with a different body is
-  `409 IDEMPOTENCY_CONFLICT`. The `{intent_id}` path segment must equal the body's `intent_id`
-  (`400 VALIDATION_ERROR` otherwise).
+  `409 IDEMPOTENCY_CONFLICT` and is quarantined, never overwritten. The claim key
+  (`claim-<intent>-<claim_attempt_id>`) is required but **never stored or replayed**: every claim
+  is evaluated fresh, so an earlier `proceed: true` can never come back. The report key
+  (`report-<intent>-<state>`) is stored with the request hash (`persistence.idempotency`,
+  operation `mail_worker.send_report`): the same key and report replay the acknowledgement,
+  another report under the same key is `409 IDEMPOTENCY_CONFLICT`. The `{intent_id}` path segment
+  must equal the body's `intent_id` (`422 VALIDATION_ERROR` otherwise).
 - **Bodies and responses** are top-level JSON objects with `schema_version: "1.0"` (no
   `ResponseEnvelope`), except the account-report body, which carries no `schema_version` (exactly
   like the desktop `WorkerAccountReport`; a server must not require one); they are closed
-  (unknown fields are `400/422`), and are the desktop wire models
-  exactly; `tests/contracts/test_mail_worker_contract.py` compares every pair field by field and
-  drives the real desktop client against them.
-- **Limits**: every request body <= 128 KiB (`MAIL_WORKER_BODY_LIMIT`, `413` above it);
-  `sanitized_body_text` <= 64 KiB, `subject` <= 512 characters, <= 20 attachment metadata
-  entries (safe filename, MIME type, byte count, SHA-256, opaque local reference; no URLs, paths
-  or bytes); binding pages <= 100 items, send-intent batches <= 50.
-- **Errors**: `ApiErrorResponse` bodies with typed codes: `400`/`422 VALIDATION_ERROR`, `401
-  UNAUTHENTICATED`, `403 FORBIDDEN`, `404 NOT_FOUND` (unknown intent of this mailbox), `409`
-  (`VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT`), `413`, `429 RATE_LIMITED` (with `Retry-After`)
-  and `503 DEPENDENCY_UNAVAILABLE`. Database guard refusals carry a stable `details.reason`
-  (section 10.5). The worker keeps its local queue on `429`/`5xx`/transport failures.
+  (unknown fields are `422`), and are the desktop wire models exactly;
+  `tests/contracts/test_mail_worker_contract.py` compares every pair field by field and
+  `tests/integration/mail_worker_e2e` drives the real desktop worker against the real app and
+  PostgreSQL.
+- **Limits**: every request body <= 128 KiB (`MAIL_WORKER_BODY_LIMIT`, applied by default to the
+  `/v1/mail-workers` prefix, `413` above it); `sanitized_body_text` <= 64 KiB, `subject` <= 512
+  characters, <= 20 attachment metadata entries (safe filename, MIME type, byte count, SHA-256,
+  opaque local reference; no URLs, paths or bytes); binding pages <= 100 items, send-intent
+  batches <= 50.
+- **Errors**: `ApiErrorResponse` bodies with typed codes: `400 VALIDATION_ERROR` (missing
+  `Idempotency-Key`), `422 VALIDATION_ERROR`, `401 UNAUTHENTICATED`, `403 FORBIDDEN`,
+  `409` (`VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT`), `413`, `429 RATE_LIMITED` (with
+  `Retry-After`) and `503 DEPENDENCY_UNAVAILABLE`. Database guard refusals carry a stable
+  `details.reason` (section 10.5). The worker keeps its local queue on `429`/`5xx`/transport
+  failures. Unknown paths under `/v1/mail-workers` are `404` API errors (never the MCP mount).
 
 | Route | Request | Response | Success | Extra errors |
 |---|---|---|---|---|
@@ -428,22 +457,42 @@ Every route also lists `UNAUTHENTICATED`, `FORBIDDEN`, `VALIDATION_ERROR`, `RATE
 
 - **Bindings** return changes of the worker's own mailbox, including uncertain sends with their
   send-intent message ids and tombstones/revocations (a tombstone carries identity, version and
-  state only). `next_cursor` is returned only after a complete page; the worker persists page and
-  cursor atomically.
+  state only). Besides the generated Message-IDs, a binding publishes every Message-ID the
+  provider or the worker OBSERVED on a sent copy (`observed_rfc_message_id` of an accepted
+  attempt, `observed_internet_message_id` of a worker report): under `outbound_message_ids` for an
+  accepted attempt, else under `send_intent_message_ids`, so a reply quoting a rewritten header
+  still correlates. `next_cursor` is an opaque signed position returned only after a complete
+  page; the worker persists page and cursor atomically.
 - **Replies** are stored only for a valid, published, non-tombstoned binding of the worker's
   mailbox whose references corroborate the message; the backend inserts reply, ingest-dedup
-  record and processing event atomically, and only then may the worker advance its acknowledged
-  checkpoint.
+  record and processing event atomically (and the minimal `seller.reply.received.v1` outbox
+  signal for a matched seller reply), and only then may the worker advance its acknowledged
+  checkpoint. A bounce/delivery notice may carry `returned_message_ids` (<= 20, normalised,
+  bounce/delivery-notice types only): the returned original's Message-IDs the worker read from the
+  RAW report before its sanitiser removed the quoted original. The server uses them for
+  correlation (like the domain's own parse of the report body) only when its own classification
+  of the uploaded fields is a delivery report too; the stored body is the uploaded one.
 - **Send intents** carry the composed message of an already authorized inquiry plus
-  `kill_switch_active`; **claim** is a fresh server revalidation (kill switch, suppression,
-  cancellation, binding version) immediately before `.Send` and answers `proceed: false` with a
-  `refusal_reason` instead of an error for a business refusal; **report** records the submission
+  `kill_switch_active`. An intent with `expired: true` is one whose attempt the server reaped
+  (its validity ended) although no worker ever claimed it and no report exists: the worker refuses
+  it as `intent_expired` without a claim (never sends it), which proves non-submission and lets the
+  backend reconcile the inquiry instead of holding it uncertain. **Claim** is a fresh server
+  revalidation (kill switch, mode, suppression, cancellation, binding/authorization version,
+  listing facts, recipient, cooldown, caps) immediately before `.Send` and answers
+  `proceed: false` with a `refusal_reason` instead of an error for a business refusal:
+  `kill_switch` (kill switch on or mode not automatic; the worker reports a retryable
+  pre-submission refusal), `not_now` (rolling caps, seller cooldown or a paused source: the worker
+  keeps the intent, claims again after 10 minutes while it is valid and reports `intent_expired`
+  once its validity ends; nothing is reported for `not_now` itself), or a final reason
+  (`intent_invalid`, `intent_expired`, `binding_mismatch`). **Report** records the submission
   evidence, and an uncertain outcome stays uncertain (`EMAIL_DELIVERY_UNCERTAIN` is never
   converted into a resend).
 - **Heartbeat** records worker/Outlook/mailbox health, hashed store/folder checkpoints, backlog
-  and coverage gaps (never claimed coverage); the acknowledgement may carry downstream health as
-  short codes. **Account report** is the classic-Outlook account verification (no credentials;
-  `security_settings_unchanged` is always `true`).
+  and coverage gaps (never claimed coverage; a gap that ends before it starts is `422`); the
+  acknowledgement carries downstream health as short codes. **Account report** is the
+  classic-Outlook account verification (no credentials; `security_settings_unchanged` is
+  `Literal[true]`, a report claiming weakened security is `422`); a refused report is recorded
+  first, then answered `409 VERSION_CONFLICT` (`mail_worker_account_mismatch`).
 
 Where the desktop wire contract (`outlook_bridge/wire.py`, `outlook_bridge/api_client.py`) and
 the spec 37.8 prose differ, the wire contract wins:
@@ -451,41 +500,51 @@ the spec 37.8 prose differ, the wire contract wins:
 1. `MailWorkerReplyAck.ingest_status` is `stored` **or `quarantined`** (spec names `stored`
    only); a quarantined reply is acknowledged so the worker does not resend it.
 2. The reply body accepts the worker's optional extensions `message_type`,
-   `correlation_status`, `correlation_reasons` and `withheld_sensitive_attachments`;
-   `detected_language` is `de`, `it`, `fr`, `en` or `null`.
+   `correlation_status`, `correlation_reasons`, `withheld_sensitive_attachments` and
+   `returned_message_ids` (omitted when default, so a matched seller reply is exactly the spec
+   v1.0 shape); `detected_language` is `de`, `it`, `fr`, `en` or `null`.
 3. Binding items carry `state` (`active`, `suppressed`, `uncertain`, `tombstoned`) instead of an
    active/suppressed flag, and a binding page carries `has_more`; the desktop client accepts up
    to 1000 items per page while the server sends at most `limit` (<= 100).
 4. Send intents, claims, reports, heartbeats and account reports are not described in the spec
    JSON; their shapes are the wire models (`intent_id`, `claim_attempt_id` (32 lower-case hex),
-   `mailbox_binding_id`, `worker_id` in the claim body; length limits 254/998/64 and
-   `inquiry_ref == "inquiry-<inquiry_id>"` on intents).
+   `mailbox_binding_id`, `worker_id` in the claim body; length limits 254/998/64,
+   `inquiry_ref == "inquiry-<inquiry_id>"` (checked on `OutlookSendIntent` itself) and the
+   listing-only `expired` flag on intents; the `not_now` refusal reason).
 5. The server models are closed (`extra="forbid"`) while the desktop models ignore unknown
    fields, so the backend can never send or accept a field the worker does not know.
 
 ### 10.2 Dashboard inquiry routes
 
 User-JWT routes like section 6, enveloped, with the same error conventions. Table:
-`api.schemas.V11_DASHBOARD_ROUTES` (**to be implemented by the API package**).
+`api.schemas.V11_DASHBOARD_ROUTES`; handlers: `api.inquiry_routes`.
 
 | Route | Scope | Request | Response `data` | Success | Extra errors | MCP tool |
 |---|---|---|---|---|---|---|
-| `GET /api/inquiries` | `inquiries:read` | query `InquiryListQuery` (`cursor`, `limit`, `state`, `uncertain_only`) | `InquiryListView` of `InquirySummaryView` | 200 | - | - |
+| `GET /api/inquiries` | `inquiries:read` | query `InquiryListQuery` (`cursor`, `limit`, `state`, `uncertain_only`, `attention_only`) | `InquiryListView` of `InquirySummaryView` | 200 | - | - |
 | `GET /api/inquiries/{inquiry_id}` | `inquiries:read` | - | `InquiryView` | 200 | `NOT_FOUND` | `seller_inquiries_get` |
 | `GET /api/replies` | `inquiries:read` | query `ReplyListQuery` (`cursor`, `limit`, `inquiry_id`, `quarantined_only`) | `ReplyListView` of `ReplySummaryView` | 200 | - | - |
 | `GET /api/replies/{reply_id}` | `inquiries:read` | - | `ReplyView` | 200 | `NOT_FOUND` | `seller_replies_get` |
 | `GET /api/inquiry-control` | `inquiries:read` | - | `InquiryControlView` | 200 | - | - |
 | `POST /api/inquiry-control/pause` | `inquiries:pause` | body `InquiryPauseRequest` | `InquiryPauseResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | `seller_inquiries_pause` |
 | `POST /api/inquiry-control/resume` | `config:admin` | body `InquiryResumeRequest` | `InquiryResumeResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
+| `GET /api/mail-workers/health` | `inquiries:read` | query `MailWorkerHealthQuery` (`include_revoked`) | `MailWorkerHealthView` of `MailboxHealthView` | 200 | - | - |
+| `GET /api/mail-workers/coverage-gaps` | `inquiries:read` | query `MailWorkerHealthQuery` | `MailCoverageGapListView` of `MailCoverageGapItem` | 200 | - | - |
+| `GET /api/lifecycle/lags` | `deals:read` | - | `CoverageLagsView` (`SourceLagView`, `LagView`) | 200 | - | - |
+| `GET /api/listings/{listing_id}/lifecycle` | `deals:read` | - | `ListingLifecycleView` | 200 | `NOT_FOUND` | - |
+| `GET /api/evaluation` | `inquiries:read` (+ `deals:read`) | query `EvaluationQuery` (`days` = 15) | `EvaluationReport` | 200 | - | - |
 
 Pause and resume take their `idempotency_key` in the body; an optional `Idempotency-Key` header must
-equal it (`idempotency_header="optional"`, as on the other dashboard mutations).
+equal it (`idempotency_header="optional"`, as on the other dashboard mutations). Pause uses the
+idempotency operation `seller_inquiries_pause` (shared with the MCP tool, so a retry on either
+surface replays the same result); resume uses `inquiry_control_resume`.
 
 - Inquiry views show state, qualification, authorization/template versions, the sender as a
   provider/binding reference (never an address or account id) and send-attempt summaries;
   `approval_required` is always `false` (no per-message approval). The recipient address is shown
   only to `config:admin` holders (`views.inquiries.recipient_address_visible`); others see its
-  domain and verification evidence. Lists never contain message text.
+  domain and verification evidence. Lists never contain message text. `attention_only` lists
+  uncertain, held, suppressed, failed and stuck-sending inquiries.
 - Languages: an inquiry's `language` is one of the four template languages (`de`, `it`, `fr`,
   `en`); a recipient contact's `language` and a reply's `original_language` are any ISO 639-1
   code (`^[a-z]{2}$`, as stored), because a contact may be in an unsupported language (the
@@ -494,9 +553,28 @@ equal it (`idempotency_header="optional"`, as on the other dashboard mutations).
   Macedonian summary, the verified sender identity, received/ingested times, extracted claims
   (a price quote is an `unaccepted_seller_quote`, never accepted), safe attachment metadata
   (no local reference) and the current valuation status. Lists never contain bodies.
+- **Inquiry control** shows the kill switch, mode, owner-reducible caps, current usage and
+  `removable_suppressions`: how many active `kill_switch` suppressions (and, while the current
+  standing authorization is effective, `authorization_revoked` ones) a resume could remove.
 - **Pause** activates the inquiry kill switch against the control `expected_version` with a
   reason (same rules as the MCP tool; pausing an already paused control answers
   `already_paused: true`). **Resume** is owner-only and dashboard-only; it is never an MCP tool.
+  With `remove_suppressions: true` it also removes those suppressions, one audited removal each
+  (`suppressions_removed` in the result); every other suppression (opt-out, bounce, complaint,
+  sender revoked, unresolved send, manual) needs its own explicit owner decision.
+- **Mail-worker health** reports each mailbox worker's separate dimensions (heartbeat, Outlook,
+  mailbox sync lag, last reconciliation, backlog age, unresolved matching gaps, account
+  verification) and its coverage gaps; monitoring is reported only while all of them are fresh.
+  Store/folder identities are hashes; no address, subject or body appears.
+- **Lifecycle/lags** show separate lags (source scan, detail freshness, detection delay,
+  notification processing, mail-reply detection); `unknown` and `inconsistent` carry no value,
+  never zero, and a configured interval is context only.
+- **Evaluation** is the 15-day quality report from stored evidence (`domain.evaluation`); zero
+  suitable deals is reported as zero, and the contribution threshold is used only when
+  `CONTRIBUTION_THRESHOLD_APPROVED=true` (otherwise a `THRESHOLD_PROPOSED` warning).
+- Review decisions (`ReviewDecisionView`, in `GET /api/reviews/{case_id}` and the submit result,
+  and the MCP `reviews_submit` result) carry `decided_by_caller`: whether the authenticated caller
+  recorded that decision. The review claim lease is `REVIEW_CLAIM_DURATION_SECONDS` (section 10.3).
 
 ### 10.3 Configuration
 
@@ -505,8 +583,16 @@ the owner caps. `API_ALLOWED_HOSTS` (comma separated host names, no wildcard) ex
 host check; `METRICS_ENABLED`/`METRICS_BIND` (default off, `127.0.0.1:9464`) start a private
 Prometheus listener separate from the API port; `DATABASE_POOL_TIMEOUT_S` (default 5) bounds the
 wait for a pooled connection (`503 DEPENDENCY_UNAVAILABLE` after it).
+`REVIEW_CLAIM_DURATION_SECONDS` (60-3600, default 300) is the review claim lease of the dashboard
+and the MCP `reviews_claim` tool. `MAIL_RECONCILE_INTERVAL_SECONDS` (default 120) is the expected
+worker reconciliation interval used by the health view (context only, never a latency claim).
+`/readyz` shows each failing check's name and status with a generic detail only; the specific
+reason is logged server-side.
 
 ### 10.4 MCP tools (`V11_TOOLS`)
+
+Served by default after the twelve spec 21 tools; `tools/list` shows each only to a caller holding
+its scope (reviewers see the two read tools; `seller_inquiries_pause` needs `inquiries:pause`).
 
 | Tool | Scope | Annotations (read-only / destructive / idempotent / open-world) | Result `data` |
 |---|---|---|---|
@@ -517,8 +603,9 @@ wait for a pooled connection (`503 DEPENDENCY_UNAVAILABLE` after it).
 Input schemas are exactly the spec 37.8 JSON (`seller_inquiries_get`: `inquiry_id`;
 `seller_replies_get`: `reply_id`; `seller_inquiries_pause`: `expected_version` >= 1, `reason`
 3-2000 characters, `idempotency_key` 8-128 characters), plus the printable-character `pattern`
-every idempotency key already has. Results return only the caller's workspace records and never a
-secret, an unrelated thread message or a signed external access credential.
+every idempotency key already has. The workspace comes from the token. Results return only the
+caller's workspace records and never a secret, an unrelated thread message or a signed external
+access credential. There is no send, reply or resume tool.
 
 ### 10.5 Database guard refusals
 

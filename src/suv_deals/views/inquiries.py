@@ -510,6 +510,11 @@ class InquiryControlView(ViewModel):
     used_15d: int = Field(ge=0)
     updated_at: UtcDatetime
     approval_required: Literal[False] = False
+    removable_suppressions: int = Field(
+        default=0,
+        ge=0,
+        description="Active kill-switch / authorization-revoked suppressions a resume can remove (audited).",
+    )
 
     @staticmethod
     def cooldown_seconds(cooldown: timedelta) -> int:
@@ -538,6 +543,9 @@ class InquiryResumeResult(ViewModel):
     kill_switch: Literal[False] = False
     mode: InquiryMode
     resumed_at: UtcDatetime
+    suppressions_removed: int = Field(
+        default=0, ge=0, description="Suppressions removed with this resume (each one audited)."
+    )
 
 
 __all__ = [

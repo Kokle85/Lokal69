@@ -78,6 +78,12 @@
             ],
             "type": "string"
           },
+          "removable_suppressions": {
+            "default": 0,
+            "description": "Active kill-switch / authorization-revoked suppressions a resume can remove (audited).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "seller_cooldown_seconds": {
             "maximum": 31536000,
             "minimum": 86400,
@@ -115,7 +121,8 @@
           "used_24h",
           "used_15d",
           "updated_at",
-          "approval_required"
+          "approval_required",
+          "removable_suppressions"
         ],
         "title": "InquiryControlView",
         "type": "object"

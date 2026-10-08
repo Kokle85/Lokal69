@@ -114,7 +114,8 @@ async def test_fixture_pipeline_end_to_end(env: PipelineEnv) -> None:
     assert all(not w.enqueued for w in raced.workspaces if w.workspace_id == env.workspace_id)
     assert len(jobs_of(env, JobType.DISCOVERY)) == 1
 
-    # 3. Worker: discovery -> 5 detail jobs -> 5 revisions -> screening -> 3 valuation jobs.
+    # 3. Worker: discovery -> 5 detail jobs -> 5 revisions -> screening -> 3 valuation jobs, and
+    #    ONE seller-inquiry plan job for the single inquiry candidate (eligible screening; spec 37.3).
     reports = await Worker(env.ctx, workspace_ids=[env.workspace_id], worker_id="worker-e2e").run_until_idle()
     by_type: dict[JobType, list[Any]] = {}
     for report in reports:
@@ -123,8 +124,20 @@ async def test_fixture_pipeline_end_to_end(env: PipelineEnv) -> None:
         JobType.DISCOVERY: 1,
         JobType.DETAIL: 5,
         JobType.VALUATION: 3,
+        JobType.SELLER_INQUIRY_PLAN: 1,
     }
     assert all(r.state == JobState.SUCCEEDED for r in reports), [(r.job_type, r.code) for r in reports]
+    # Fixture lineage (and no linked seller): nothing is ever reserved or sent.
+    assert (
+        env.scalar("select count(*) from ops.inquiry_quota_ledger where workspace_id = %s", env.workspace_id)
+        == 0
+    )
+    assert (
+        env.scalar(
+            "select count(*) from ops.email_delivery_attempts where workspace_id = %s", env.workspace_id
+        )
+        == 0
+    )
     assert by_type[JobType.DISCOVERY][0].details["completeness"] == "complete"
     crawl_runs = env.rows(
         "select outcome, pages_fetched, cards_seen, new_listings from ops.crawl_runs where workspace_id = %s",

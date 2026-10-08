@@ -17,7 +17,7 @@
   "request": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Body of ``POST /v1/mail-workers/account-report`` (== ``wire.WorkerAccountReport``; no\ncredentials; the worker never weakens Outlook security).",
+    "description": "Body of ``POST /v1/mail-workers/account-report`` (== ``wire.WorkerAccountReport``; no\ncredentials; ``security_settings_unchanged`` is ``Literal[True]`` on ``OutlookAccountReport``:\nthe worker never weakens Outlook security).",
     "properties": {
       "account_display_name": {
         "default": null,

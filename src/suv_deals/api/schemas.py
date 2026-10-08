@@ -11,8 +11,8 @@
 - Query models are the lax (string-parsing) counterparts of the MCP list inputs and convert to
   them before use, so the same constraints apply.
 
-Spec v1.1 section 37 contracts (implemented by the API package; NOT in ``ROUTES`` yet, so the
-served app is unchanged):
+Spec v1.1 section 37 contracts (served by ``api.mail_worker_routes`` and ``api.inquiry_routes``,
+which ``api.app.create_app`` includes by default; kept apart from ``ROUTES``, the v1.0 table):
 
 - ``MAIL_WORKER_ROUTES``: the mailbox-worker API under ``/v1/mail-workers`` used by the Windows
   desktop worker (``desktop/outlook-bridge``). Authentication is the worker's revocable
@@ -29,12 +29,14 @@ served app is unchanged):
   de/it/fr/en or null; binding items carry ``state`` (active/suppressed/uncertain/tombstoned) and
   a binding page carries ``has_more``.
 - ``V11_DASHBOARD_ROUTES``: inquiry/reply read models and the inquiry control (pause via the same
-  rules as the ``seller_inquiries_pause`` MCP tool; resume is owner-only, dashboard-only).
+  rules as the ``seller_inquiries_pause`` MCP tool; resume is owner-only, dashboard-only), the
+  mail-worker health and coverage-gap views, the lifecycle/lag views and the 15-day evaluation.
 """
 
 from __future__ import annotations
 
 import re
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,12 +47,21 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
-from suv_deals.domain.enums import EmailProviderKind, InquiryState, ProfileKey, ReviewOutcome, Scope
+from suv_deals.domain.enums import (
+    EmailProviderKind,
+    InquiryState,
+    ProfileKey,
+    ReplyMessageType,
+    ReviewOutcome,
+    Scope,
+)
+from suv_deals.domain.evaluation import EVALUATION_WINDOW_DAYS, EvaluationReport
 from suv_deals.domain.replies import (
     MAX_REQUEST_BYTES,
     InquiryBinding,
     InquiryBindingState,
     ReplyIngestRequest,
+    normalize_message_id,
 )
 from suv_deals.errors import HTTP_STATUS, AppError, ErrorCode, ValidationFailed
 from suv_deals.integrations.email_providers.outlook_local import (
@@ -112,6 +123,8 @@ from suv_deals.views.inquiries import (
     ReplyView,
 )
 from suv_deals.views.jsonschema import model_schema
+from suv_deals.views.lifecycle import CoverageLagsView, ListingLifecycleView
+from suv_deals.views.mail_workers import MailCoverageGapListView, MailWorkerHealthView
 from suv_deals.views.notes import NoteView, RecheckRequestResult
 from suv_deals.views.operations import (
     LivenessView,
@@ -290,12 +303,15 @@ class PauseSourceRequest(ToolInput):
 
 
 class InquiryListQuery(ApiQuery):
-    """``GET /api/inquiries``: keyset page, optionally one state or only uncertain sends."""
+    """``GET /api/inquiries``: a frozen snapshot page, optionally one state, only uncertain sends
+    or only inquiries needing attention (uncertain, held for facts, suppressed, failed, stuck
+    sending)."""
 
     cursor: Cursor = None
     limit: _LaxLimit = 25
     state: InquiryState | None = None
     uncertain_only: bool = False
+    attention_only: bool = False
 
     def filters(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude={"cursor", "limit"}, exclude_none=True)
@@ -325,11 +341,30 @@ class InquiryPauseRequest(ToolInput):
 
 
 class InquiryResumeRequest(ToolInput):
-    """Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool)."""
+    """Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool).
+
+    ``remove_suppressions``: also remove (audited, one audit event per suppression) the active
+    ``kill_switch`` suppressions and, while the current standing authorization is effective and
+    unrevoked, the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint,
+    sender revoked, ...) are never removed here.
+    """
 
     expected_version: Annotated[int, Field(ge=1, strict=True)]
     reason: Reason
     idempotency_key: IdempotencyKey
+    remove_suppressions: bool = False
+
+
+class MailWorkerHealthQuery(ApiQuery):
+    """``GET /api/mail-workers/health`` and ``/coverage-gaps``: revoked workers only on request."""
+
+    include_revoked: bool = False
+
+
+class EvaluationQuery(ApiQuery):
+    """``GET /api/evaluation``: the 15-day quality evaluation (the window length is fixed)."""
+
+    days: Literal[15] = EVALUATION_WINDOW_DAYS
 
 
 # --------------------------------------------------------------------------- spec 37.8 mail workers
@@ -426,16 +461,46 @@ class MailWorkerBindingPage(BaseModel):
         return value
 
 
+MAX_RETURNED_MESSAGE_IDS: Final = 20
+DELIVERY_REPORT_TYPES: Final = frozenset({ReplyMessageType.BOUNCE, ReplyMessageType.DELIVERY_NOTICE})
+
+
 class MailWorkerReplyRequest(ReplyIngestRequest):
     """Body of ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 + the worker's optional
-    extensions; == ``domain.replies.ReplyIngestRequest``, which the desktop worker serialises).
+    extensions; == ``outlook_bridge.wire.ReplyUpload``, a ``domain.replies.ReplyIngestRequest``
+    plus ``returned_message_ids``).
 
     Headers: ``Idempotency-Key`` (8-128 printable ASCII) is REQUIRED; the server checks it AND the
     stable source identity (``ReplyIngestRequest.dedup_key``), never one alone. Limits: request
     <= 128 KiB, ``sanitized_body_text`` <= 64 KiB, ``subject`` <= 512 characters, <= 20 attachment
     metadata entries (safe filename, MIME type, byte count, SHA-256, opaque local ref; no URLs,
     paths or bytes).
+
+    ``returned_message_ids`` (bounce/delivery notice only, at most 20): the returned original's
+    Message-IDs, which the worker reads before its sanitiser removes the quoted original. The
+    server uses them only when its own classification of the uploaded fields is a delivery report
+    too; they are not part of the immutable source fingerprint.
     """
+
+    returned_message_ids: tuple[str, ...] = Field(default=(), max_length=MAX_RETURNED_MESSAGE_IDS)
+
+    @field_validator("returned_message_ids")
+    @classmethod
+    def _returned(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        result: list[str] = []
+        for item in value:
+            normalized = normalize_message_id(item)
+            if normalized is None:
+                raise ValueError("returned_message_ids must be valid RFC Message-IDs")
+            if normalized not in result:
+                result.append(normalized)
+        return tuple(result)
+
+    @model_validator(mode="after")
+    def _delivery_reports_only(self) -> MailWorkerReplyRequest:
+        if self.returned_message_ids and self.message_type not in DELIVERY_REPORT_TYPES:
+            raise ValueError("returned_message_ids belong to a bounce or delivery notice only")
+        return self
 
 
 class MailWorkerReplyAck(BaseModel):
@@ -468,21 +533,22 @@ class MailWorkerSendIntentsQuery(ApiQuery):
     limit: Annotated[int, Field(ge=1, le=MAIL_WORKER_MAX_INTENTS_PAGE)] = 10
 
 
-class MailWorkerSendIntent(OutlookSendIntent):
-    """One pending ``outlook_local`` send intent (== ``wire.WorkerSendIntent``, including its
-    length limits and ``inquiry_ref == "inquiry-<inquiry_id>"``)."""
+with warnings.catch_warnings():
+    # The wire field ``expired`` deliberately replaces ``OutlookSendIntent.expired(now)`` on this
+    # transport model (the server never calls the method on it).
+    warnings.filterwarnings("ignore", message='Field name "expired"', category=UserWarning)
 
-    from_address: str = Field(max_length=254)
-    to_address: str = Field(max_length=254)
-    reply_to_address: str | None = Field(default=None, max_length=254)
-    rfc_message_id: str = Field(max_length=998)
-    inquiry_ref: str = Field(max_length=64)
+    class MailWorkerSendIntent(OutlookSendIntent):
+        """One ``outlook_local`` send intent (== ``wire.WorkerSendIntent``; the length limits and the
+        ``inquiry_ref == "inquiry-<inquiry_id>"`` check live on ``OutlookSendIntent`` itself).
 
-    @model_validator(mode="after")
-    def _ref(self) -> MailWorkerSendIntent:
-        if self.inquiry_ref != f"inquiry-{self.inquiry_id}":
-            raise ValueError("inquiry reference does not belong to this inquiry")
-        return self
+        ``expired``: the intent's validity ended before any worker claimed it (the backend reaped
+        the attempt as uncertain and no report exists). The worker refuses it as
+        ``intent_expired`` (never sends it), which lets the backend prove non-submission and
+        reconcile the inquiry.
+        """
+
+        expired: bool = False  # type: ignore[assignment]
 
 
 class MailWorkerSendIntentBatch(BaseModel):
@@ -560,13 +626,20 @@ class MailWorkerCheckpointReport(BaseModel):
 
 
 class MailWorkerGapReport(BaseModel):
-    """A monitored coverage gap (== ``wire.GapReport``); never claimed coverage."""
+    """A monitored coverage gap (== ``wire.GapReport``); never claimed coverage. A gap that ends
+    before it starts is refused (``422``): it could never be shown, so it would be hidden."""
 
     model_config = _WIRE
 
     kind: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     started_at: datetime
     ended_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _ordered(self) -> MailWorkerGapReport:
+        if self.ended_at is not None and ensure_utc(self.ended_at) < ensure_utc(self.started_at):
+            raise ValueError("a coverage gap cannot end before it starts")
+        return self
 
 
 class MailWorkerHeartbeatRequest(BaseModel):
@@ -607,9 +680,8 @@ class MailWorkerHeartbeatAck(BaseModel):
 
 class MailWorkerAccountReport(OutlookAccountReport):
     """Body of ``POST /v1/mail-workers/account-report`` (== ``wire.WorkerAccountReport``; no
-    credentials; the worker never weakens Outlook security)."""
-
-    security_settings_unchanged: Literal[True] = True
+    credentials; ``security_settings_unchanged`` is ``Literal[True]`` on ``OutlookAccountReport``:
+    the worker never weakens Outlook security)."""
 
 
 # --------------------------------------------------------------------------- errors
@@ -1071,11 +1143,56 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         "/api/inquiry-control/resume",
         InquiryResumeResult,
         scope=Scope.CONFIG_ADMIN,
-        summary="Owner-only: clear the kill switch against the expected control version.",
+        summary=(
+            "Owner-only: clear the kill switch against the expected control version; optionally"
+            " remove kill-switch/authorization-revoked suppressions (each audited)."
+        ),
         request=InquiryResumeRequest,
         location="body",
         errors=(ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
         idempotency_header="optional",
+    ),
+    _r(
+        "GET",
+        "/api/mail-workers/health",
+        MailWorkerHealthView,
+        scope=Scope.INQUIRIES_READ,
+        summary="Mailbox-worker health: heartbeat, Outlook, reconciliation, backlog, account, gaps.",
+        request=MailWorkerHealthQuery,
+        location="query",
+    ),
+    _r(
+        "GET",
+        "/api/mail-workers/coverage-gaps",
+        MailCoverageGapListView,
+        scope=Scope.INQUIRIES_READ,
+        summary="Mailbox coverage gaps (open first); a gap is never hidden.",
+        request=MailWorkerHealthQuery,
+        location="query",
+    ),
+    _r(
+        "GET",
+        "/api/lifecycle/lags",
+        CoverageLagsView,
+        scope=Scope.DEALS_READ,
+        summary="Separate scan, notification and mail-reply lags; unknown is never shown as zero.",
+    ),
+    _r(
+        "GET",
+        "/api/listings/{listing_id}/lifecycle",
+        ListingLifecycleView,
+        scope=Scope.DEALS_READ,
+        summary="One source listing's first/last seen, detail freshness and detection delay.",
+        errors=_NF,
+    ),
+    _r(
+        "GET",
+        "/api/evaluation",
+        EvaluationReport,
+        scope=Scope.INQUIRIES_READ,
+        summary="The 15-day evaluation report from stored evidence (zero is reported as zero).",
+        request=EvaluationQuery,
+        location="query",
     ),
 )
 V11_ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType(
@@ -1131,6 +1248,7 @@ __all__ = [
     "MAIL_WORKER_PREFIX",
     "MAIL_WORKER_ROUTES",
     "MAIL_WORKER_SCHEMA_VERSION",
+    "MAX_RETURNED_MESSAGE_IDS",
     "REQUEST_ID_HEADER",
     "ROUTES",
     "ROUTE_INDEX",
@@ -1144,6 +1262,7 @@ __all__ = [
     "CandidateListQuery",
     "ClaimRequest",
     "ComparablesQuery",
+    "EvaluationQuery",
     "IdempotencyHeader",
     "InquiryListQuery",
     "InquiryPauseRequest",
@@ -1157,6 +1276,7 @@ __all__ = [
     "MailWorkerClaimDecision",
     "MailWorkerClaimRequest",
     "MailWorkerGapReport",
+    "MailWorkerHealthQuery",
     "MailWorkerHeartbeatAck",
     "MailWorkerHeartbeatRequest",
     "MailWorkerReplyAck",

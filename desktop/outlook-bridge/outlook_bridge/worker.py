@@ -68,9 +68,9 @@ from outlook_bridge.matching import LocalMatcher, encode_payload, wire_payload
 from outlook_bridge.outlook_adapter import AccountInfo, ConnectionState, FolderRef, MailboxAdapter
 from outlook_bridge.reconciliation import ItemProcessor, Reconciler
 from outlook_bridge.sending import SendIntentProcessor
-from outlook_bridge.wire import WorkerAccountReport
+from outlook_bridge.wire import ReplyUpload, WorkerAccountReport
 from suv_deals.clock import Clock
-from suv_deals.domain.replies import InquiryBindingState, ReplyIngestRequest
+from suv_deals.domain.replies import InquiryBindingState
 
 EVENT_QUEUE_MAX: Final = 1000
 MAX_BINDING_PAGES_PER_SYNC: Final = 50
@@ -551,14 +551,14 @@ class BridgeWorker:
         fingerprint), so a newer version may be applied without changing the reply's identity.
         """
         data = json.loads(row.request_json)
-        request = ReplyIngestRequest.model_validate(data)
+        request = ReplyUpload.model_validate(data)
         if request.mailbox_binding_id != self._config.mailbox_binding_id:
             raise MailboxMismatch("a stored upload names another mailbox binding")
         if request.inquiry_id != row.inquiry_id:
             raise MailboxMismatch("a stored upload names another inquiry than its backlog entry")
         if request.binding_version == binding_version:
             return row.request_json.encode("utf-8")
-        rebound = ReplyIngestRequest.model_validate({**data, "binding_version": binding_version})
+        rebound = ReplyUpload.model_validate({**data, "binding_version": binding_version})
         body = encode_payload(wire_payload(rebound))
         self._store.update_upload_request(
             row.id, binding_version=binding_version, request_json=body.decode("utf-8")
