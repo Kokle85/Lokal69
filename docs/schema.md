@@ -579,7 +579,7 @@ Advisor notes (2026-10-06):
   indexes only where real query plans need them (spec §11). Three "multiple permissive policies"
   warnings are the intended self-lookup policies for memberships, workspaces and API credentials.
 
-#### v1.1 migrations (applied 2026-10-07 and 2026-10-08)
+#### v1.1 migrations (applied 2026-10-07 to 2026-10-10)
 
 | File | Recorded version | Stored text |
 |---|---|---|
@@ -592,6 +592,7 @@ Advisor notes (2026-10-06):
 | 20261007000200_fixture_lineage_and_guards | 20261007220520 | byte-exact (sha256 `286f3de0…ed29`) |
 | 20261007000400_mail_worker_credential_kind | 20261007220534 | byte-exact (sha256 `44c614a4…437e`) |
 | 20261008000100_inquiry_quota_backstop | 20261008050157 | byte-exact (sha256 `c3c218ff…6fe8`) |
+| 20261008000200_inquiry_hardening | 20261010054751 | byte-exact (sha256 `5729a0a9…59f4`) |
 
 Connector constraints found while applying, now enforced by `tests/unit/test_migrations_ascii.py`:
 
@@ -1065,7 +1066,7 @@ letter case, an unparseable key=value string) is refused rather than guessed at.
 ### 11.9 Migration 20261008000200 and the inquiry hardening (work package C1)
 
 - `20261008000200_inquiry_hardening` (forward-only, expand; pure ASCII, no `DROP TRIGGER`; applies
-  on PostgreSQL 16 and 17; not yet applied to the Supabase project - the lead applies it):
+  on PostgreSQL 16 and 17; applied to the Supabase project on 2026-10-10, recorded version 20261010054751, byte-exact - section 9):
   1. Seller cooldown floor. `seller_inquiry_controls_cooldown_ck` is tightened from 1..365 to
      **7..365 days** (name kept; `DROP` + `ADD ... NOT VALID` + `VALIDATE`). Backfill first: a row
      shortened below 7 days through the repository before this migration is raised to exactly
