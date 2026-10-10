@@ -518,6 +518,17 @@ def seller_inquiry_findings(settings: Settings) -> list[Finding]:
                 "(spec 37.1)",
             )
         )
+    if settings.seller_email_canary_send_enabled:
+        findings.append(
+            Finding(
+                "seller_inquiry",
+                "canary_send",
+                "warn",
+                "SELLER_EMAIL_CANARY_SEND_ENABLED=true: the owner's one-time activation canary step is"
+                " armed (`suv-deals canary send` still needs every switch and"
+                " --i-confirm-owner-controlled-address); set it back to false afterwards",
+            )
+        )
     if settings.seller_inquiry_mode == "automatic":
         for name in ("seller_email_provider", "seller_email_from", "seller_email_account_id"):
             if presence.get(name) != "set":

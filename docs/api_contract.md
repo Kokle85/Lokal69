@@ -169,7 +169,7 @@ presented); every invalid token gets the same message.
 | `UNAUTHENTICATED` | 401 | no | Missing, invalid or expired bearer token |
 | `FORBIDDEN` | 403 | no | No active membership, or the route's scope is missing |
 | `NOT_FOUND` | 404 | no | Missing or foreign-workspace object (indistinguishable) |
-| `VERSION_CONFLICT` | 409 | no | `expected_version`/revision/valuation is stale; reload |
+| `VERSION_CONFLICT` | 409 | no (yes for `details.reason` `busy` / `in_progress`) | `expected_version`/revision/valuation is stale; reload. A transient conflict is retryable with `Retry-After: 1`: `details.reason = busy` (lock timeout, serialization failure, deadlock, a lost race) or `in_progress` (an idempotent request with the same key is still running; retry later with the same key). The reason reaches the MCP tool error payload unchanged |
 | `ALREADY_CLAIMED` | 409 | no | Another reviewer holds an active claim |
 | `CLAIM_EXPIRED` | 409 | no | The caller's claim expired or the token is not current |
 | `IDEMPOTENCY_CONFLICT` | 409 | no | Same `idempotency_key` reused with a different request |
@@ -260,7 +260,11 @@ Route notes:
   `country` (seller country, `^[A-Z]{2}$`), `status` (`pending`, `needs_information`, `watch`,
   `shortlisted`, `rejected`), `changed_since` (RFC 3339 `date-time` with an offset, e.g.
   `2026-10-06T10:00:00Z`; epoch numbers, a space separator or `+0200` offsets are refused),
-  plus `cursor`/`limit`.
+  plus `cursor`/`limit`. `include_screening_rejected` (`true`/`false`, default `false`; dashboard
+  only, never part of the spec 21 `deals_list_candidates` input) is the audit filter: it also lists
+  the observations screening rejected (`eligibility: rejected`), which are kept for audit but are
+  not candidates. It is bound into the cursor's filter hash, so a cursor of one setting is refused
+  (`422`, `details.cursor = mismatch`) for the other.
 - **`/api/candidates/{listing_id}`** returns the current revision unless `revision` is given; an
   older revision adds a `REVISION_NOT_CURRENT` warning. It includes provenance (extraction
   confidence, not truth; the source URL only when it is a safe http(s) link), conflicts, availability and price history, screening reasons, the
@@ -399,11 +403,20 @@ Used only by the Windows desktop worker (`desktop/outlook-bridge`). Table:
   opened without a workspace (the credential alone names workspace and mailbox). A revoked or
   expired credential is `401` with `details.reason = "mail_worker_credential_revoked"` (the
   worker stops transmitting and keeps its backlog); an unknown token is `401`; a revoked mailbox
-  binding is `403` (`mailbox_binding_revoked`). Tokens are never accepted in URLs: every route
-  refuses unknown query parameters (`422`).
+  binding is `403` (`mailbox_binding_revoked`). A claim or report that waited for a concurrent
+  revocation is refused the same way after the row locks (`403`, `mailbox_binding_revoked`; no
+  claim is granted, so the worker never calls `.Send`). Tokens are never accepted in URLs: every
+  route refuses unknown query parameters (`422`).
 - **Rate limits**: per credential (keyed by the token's SHA-256 before the database lookup):
   mutations 120 in a burst then 2 per second, reads 60 in a burst then 1 per second; `429` with
-  `Retry-After`. Failed authentications also draw on the client's pre-auth budget (section 1).
+  `Retry-After`. `POST /replies` additionally has its own, tighter per-credential bucket
+  (`deps.MAIL_WORKER_REPLY_LIMIT`, PROPOSED: 30 in a burst then 10 per minute), checked before the
+  body is parsed, and the repository caps NEW stored replies per mailbox at 120 per rolling hour
+  (`replies_repo.MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR`, PROPOSED; `429` with `details.reason =
+  mail_worker_ingest_volume`; duplicates and replays store nothing and never count against that
+  hourly cap, but every upload, a replay too, draws on the per-credential bucket), and the worker
+  keeps its local backlog and retries after `Retry-After`. Failed authentications also draw on the
+  client's pre-auth budget (section 1).
 - **Server-derived scope**: the server derives workspace and mailbox from the credential only.
   No request selects a workspace, mailbox or account; ids in a body (`mailbox_binding_id`,
   `inquiry_id`, `intent_id`) are checked against the credential's mailbox and a mismatch (or an
@@ -552,7 +565,11 @@ surface replays the same result); resume uses `inquiry_control_resume`.
   `approval_required` is always `false` (no per-message approval). The recipient address is shown
   only to `config:admin` holders (`views.inquiries.recipient_address_visible`); others see its
   domain and verification evidence. Lists never contain message text. `attention_only` lists
-  uncertain, held, suppressed, failed and stuck-sending inquiries.
+  uncertain, held, suppressed, failed and stuck-sending inquiries plus every waiting inquiry. Each
+  list row AND the single inquiry (`GET /api/inquiries/{inquiry_id}`, MCP `seller_inquiries_get`)
+  carry `waiting_reason` (`UNCERTAIN_DELIVERY`, `NEEDS_FACTS`, `INQUIRIES_PAUSED`,
+  `SENDER_SETUP_INCOMPLETE`, `WORKER_OFFLINE`, `RATE_CAP_REACHED`, `SELLER_COOLDOWN`, `SEND_HELD`;
+  `null` = not waiting; docs/schema.md 11.9).
 - Languages: an inquiry's `language` is one of the four template languages (`de`, `it`, `fr`,
   `en`); a recipient contact's `language` and a reply's `original_language` are any ISO 639-1
   code (`^[a-z]{2}$`, as stored), because a contact may be in an unsupported language (the
@@ -567,20 +584,43 @@ surface replays the same result); resume uses `inquiry_control_resume`.
   every MCP caller (`seller_replies_get`), gets its metadata and quarantine reason only:
   `content_withheld: true`, empty `subject`/`sanitized_body`, no summary, claims or attachment
   metadata (`views.inquiries.reply_content_visible`). Its text never reaches dot or a model
-  provider before the owner verified it.
+  provider before the owner verified it. The rule is applied by the read query itself
+  (`queries.get_reply` / `list_replies`), so the dashboard routes, MCP and the CLI share one
+  implementation. Every reply carries `signal_status` (`emitted`, `coalesced` into a signal still
+  to be posted, `rate_limited` by the per-inquiry signal cap, `not_applicable`; `null` for older
+  rows).
 - **Inquiry control** shows the kill switch, mode, owner-reducible caps, current usage and
   `removable_suppressions`: how many active `kill_switch` suppressions (and, while the current
-  standing authorization is effective, `authorization_revoked` ones) a resume could remove.
+  standing authorization is effective, `authorization_revoked` ones) a resume could remove (up to
+  5,000). It also shows `authorization_status` (`active` / `missing` / `revoked` /
+  `not_effective`) and the readiness of the CONFIGURED sending identity (`sender_readiness`,
+  `sender_provider`, `sender_binding_version`, `sender_problems`): the binding of
+  `SELLER_EMAIL_PROVIDER` that is exactly `SELLER_EMAIL_ACCOUNT_ID` / `_FROM` / `_REPLY_TO`, never
+  merely the newest binding; without one it is `missing` with `sender_identity_*` codes (no values).
 - **Pause** activates the inquiry kill switch against the control `expected_version` with a
   reason (same rules as the MCP tool; pausing an already paused control answers
   `already_paused: true`). **Resume** is owner-only and dashboard-only; it is never an MCP tool.
   With `remove_suppressions: true` it also removes those suppressions, one audited removal each
   (`suppressions_removed` in the result); every other suppression (opt-out, bounce, complaint,
   sender revoked, unresolved send, manual) needs its own explicit owner decision.
+  `expected_removable_suppressions` (0-5,000, strict integer; optional for older clients, sent by
+  the CLI and by the dashboard with the count the owner ticked) is the `removable_suppressions` count the owner saw: it is compared after the controls
+  lock (kill-switch and authorization-revoked suppressions are only added under that lock) and a
+  different count refuses the WHOLE resume with `409 VERSION_CONFLICT`, `details = {reason:
+  suppressions_changed, expected_removable_suppressions, current_removable_suppressions}`; nothing
+  changes and the idempotency key is not consumed. Without `remove_suppressions` the count is not
+  checked.
 - **Mail-worker health** reports each mailbox worker's separate dimensions (heartbeat, Outlook,
   mailbox sync lag, last reconciliation, backlog age, unresolved matching gaps, account
   verification) and its coverage gaps; monitoring is reported only while all of them are fresh.
-  Store/folder identities are hashes; no address, subject or body appears.
+  Store/folder identities are hashes; no address, subject or body appears. It also lists each
+  listed worker's credential state (`credentials[]`: `credential_status` `active` / `expiring`
+  (within 14 days) / `expired` / `revoked`, `binding_state`, `expires_at`, `revoked_at`; never a
+  token, hash or prefix), counts revoked workers even when they are not listed
+  (`revoked_mailboxes`), and summarises the reply-signal flood control of the rolling 24 hours
+  (`reply_signals`: `emitted`, `coalesced`, `rate_limited`, `inquiries_at_cap`,
+  `cap_per_inquiry`). An expired or revoked credential of an active worker and any rate-limited
+  signal add a `COVERAGE_GAP` warning.
 - **Lifecycle/lags** show separate lags (source scan, detail freshness, detection delay,
   notification processing, mail-reply detection); `unknown` and `inconsistent` carry no value,
   never zero, and a configured interval is context only.
@@ -599,7 +639,12 @@ host check; `METRICS_ENABLED`/`METRICS_BIND` (default off, `127.0.0.1:9464`) sta
 Prometheus listener separate from the API port; `DATABASE_POOL_TIMEOUT_S` (default 5) bounds the
 wait for a pooled connection (`503 DEPENDENCY_UNAVAILABLE` after it).
 `REVIEW_CLAIM_DURATION_SECONDS` (60-3600, default 300) is the review claim lease of the dashboard
-and the MCP `reviews_claim` tool. `MAIL_RECONCILE_INTERVAL_SECONDS` (default 120) is the expected
+and the MCP `reviews_claim` tool; the business-config key `claim_duration_seconds`
+(`config/defaults.yaml`, `BusinessConfig`) is deprecated and ignored (kept only so stored
+configuration revisions keep their canonical hash). `SELLER_EMAIL_CANARY_SEND_ENABLED` (default
+`false`) arms the owner's one-time activation canary step (`suv-deals canary send`, which also
+needs every inquiry switch and `--i-confirm-owner-controlled-address`; docs/seller_email_activation.md
+section 8). `MAIL_RECONCILE_INTERVAL_SECONDS` (default 120) is the expected
 worker reconciliation interval used by the health view (context only, never a latency claim).
 `/readyz` shows each failing check's name and status with a generic detail only; the specific
 reason is logged server-side.

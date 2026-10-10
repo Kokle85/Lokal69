@@ -43,6 +43,62 @@
           "any_monitoring_active": {
             "type": "boolean"
           },
+          "credentials": {
+            "default": [],
+            "items": {
+              "additionalProperties": false,
+              "description": "The credential state of one listed mailbox worker (never a token, hash or prefix).",
+              "properties": {
+                "binding_state": {
+                  "enum": [
+                    "active",
+                    "revoked"
+                  ],
+                  "type": "string"
+                },
+                "credential_status": {
+                  "enum": [
+                    "active",
+                    "expiring",
+                    "expired",
+                    "revoked"
+                  ],
+                  "type": "string"
+                },
+                "expires_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "mailbox_binding_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "revoked_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "worker_label": {
+                  "maxLength": 120,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mailbox_binding_id",
+                "worker_label",
+                "binding_state",
+                "credential_status",
+                "expires_at",
+                "revoked_at"
+              ],
+              "title": "MailWorkerCredentialView",
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
           "generated_at": {
             "format": "date-time",
             "type": "string"
@@ -471,6 +527,59 @@
           "open_gap_count": {
             "minimum": 0,
             "type": "integer"
+          },
+          "reply_signals": {
+            "additionalProperties": false,
+            "default": null,
+            "description": "Reply signals (``seller.reply.received``) of the workspace in the rolling window: how many\nreplies emitted their own signal, were coalesced into one still to be posted, or hit the\nper-inquiry cap (``rate_limited``: stored and visible, but no new dot activation).",
+            "properties": {
+              "cap_per_inquiry": {
+                "description": "PROPOSED cap of emitted signals per inquiry and window.",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "coalesced": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "emitted": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "inquiries_at_cap": {
+                "description": "Inquiries whose emitted signals reached the cap.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "rate_limited": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_hours": {
+                "maximum": 168,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "window_hours",
+              "cap_per_inquiry",
+              "emitted",
+              "coalesced",
+              "rate_limited",
+              "inquiries_at_cap"
+            ],
+            "title": "ReplySignalSummaryView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "revoked_mailboxes": {
+            "default": 0,
+            "description": "Revoked mailbox workers (counted even when they are not listed).",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -478,7 +587,10 @@
           "mailboxes",
           "any_monitoring_active",
           "open_gap_count",
-          "notes"
+          "notes",
+          "revoked_mailboxes",
+          "credentials",
+          "reply_signals"
         ],
         "title": "MailWorkerHealthView",
         "type": "object"

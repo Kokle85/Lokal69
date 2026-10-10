@@ -55,6 +55,14 @@ All values live in the runtime `.env`/secret store, never in source control or c
 | `SELLER_EMAIL_REPLY_TO` | optional; must be a verified alias of the **same** account so replies reach the watched mailbox |
 | `SELLER_EMAIL_OAUTH_SECRET_REFERENCE` | API providers only: a *reference* such as `secretbox:ops.email_sender_bindings/<id>`; values that look like tokens (`ya29.`, `1//`, JWTs, `Bearer ...`) are refused |
 | `SELLER_REPLY_INGEST_MODE` | `local_classic_outlook` (chosen route) or `provider_api`; Gmail/Graph reply retrieval through the provider API runs **only** with `provider_api` (otherwise the backend never reads the mailbox through the API, so there is no second consumer) |
+| `SELLER_EMAIL_CANARY_SEND_ENABLED` | `false`. Only the owner sets it `true` for the one-time canary step of section 8 and back to `false` afterwards; `suv-deals canary send` refuses without it (and without every switch above) |
+
+`suv-deals doctor` checks, for an API provider, that `SELLER_EMAIL_OAUTH_SECRET_REFERENCE` names
+the ACTIVE binding that is the configured sender (`SELLER_EMAIL_FROM`) and holds a sealed grant
+(`seller_inquiry/secret_reference`: codes such as `SECRET_REFERENCE_FROM_MISMATCH`,
+`SECRET_REFERENCE_BINDING_REVOKED`, `SECRET_REFERENCE_NOT_THE_CONFIGURED_BINDING`,
+`SECRET_REFERENCE_NO_SEALED_GRANT`; an error in automatic mode). It never prints the reference or an
+address.
 
 `seller_email.build_sender_provider` refuses to construct a sending provider unless the mode is
 `automatic`, the kill switch is off, the binding is verified (provider, stable account id, From,
@@ -178,9 +186,10 @@ Run once per sender binding (and again after any account, alias or credential ch
    `FROM_ALIAS_PENDING`, `REPLY_TO_NOT_VERIFIED`, `CREDENTIALS_REVOKED`, `WORKER_REPORT_STALE`,
    `NEW_OUTLOOK_UNSUPPORTED`, `WORKER_OFFLINE`. Store the result via
    `sender_status_from_verification` (binding id/version, verified time, alias status, health).
-2. **Test message** (where the owner authorizes it): a synthetic canary inquiry addressed to an
-   **owner-controlled test address** (never a seller), marked as canary so it does not count as
-   a seller inquiry or one of the 15-day deals.
+2. **Test message** (where the owner authorizes it): the activation canary of section 8 - one
+   synthetic message to an **owner-controlled test address** (never a seller). It is recorded in
+   `ops.inquiry_activation_canaries`, never as a seller inquiry, so it never counts as a seller
+   inquiry or one of the 15-day deals.
 3. **Receipt reconciliation**: run `reconcile(...)` for the canary's Message-ID and confirm
    `found_sent` (Gmail `SENT` label, Graph non-draft copy, or Outlook Sent Items evidence).
    Record whether the provider kept the client Message-ID.
@@ -225,13 +234,53 @@ row is a one-time technical check, not a message approval.
 | 1 | Sender binding verified | `suv-deals sender-binding create` (runbook 10.1), desktop worker account report, `suv-deals sender-binding verify` (outlook_local) or the provider check (gmail_api, section 4) | `suv-deals sender-binding status` shows `verified`, `usable`, `healthy`; `suv-deals doctor` lists `seller_inquiry/sender_binding` OK |
 | 2 | Configured runtime | classic Outlook version (`python -m outlook_bridge check`), worker revision equals the backend revision, `suv-deals doctor` v1.1 readiness lines | heartbeat fresh, `monitoring active`, no open coverage gap (`GET /api/mail-workers/coverage-gaps`) |
 | 3 | Standing authorization active | `suv-deals inquiries status` | `authorization: active`, caps 2/24 h and 5/15 days (or lower), kill switch off only at the end |
-| 4 | Owner-controlled canary | a SYNTHETIC canary inquiry to an owner-controlled test address (never a seller) through the configured route, marked as canary | the canary never reserves a vehicle/seller pair, never debits the quota ledger and never counts as a seller inquiry or one of the 15-day deals (`domain.evaluation` excludes canary records and reports only their count). **Blocked today:** the canary representation of docs/schema.md section 10.10 is not implemented, so this row cannot be completed yet |
+| 4 | Owner-controlled canary | `suv-deals canary prepare` records it for the configured sender (target from `SUV_CANARY_TARGET_ADDRESS` or a hidden prompt, stored as a SHA-256 only); the owner then runs `suv-deals canary send <id> --i-confirm-owner-controlled-address --yes` (the canary flow below) | the canary never reserves a vehicle/seller pair, never debits the quota ledger and never counts as a seller inquiry or one of the 15-day deals (`domain.evaluation` excludes canary records and reports only their count); `suv-deals canary status` shows `accepted`. **Blocked today:** the record, the gates and the commands exist, but no route has a canary transport yet (`CANARY_TRANSPORT_UNAVAILABLE`, see below), so this row cannot be completed yet |
 | 5 | Receipt reconciliation | the canary's Message-ID found in Sent Items (outlook_local) or by the provider search (gmail_api) | `found_sent`; record whether the provider kept the client Message-ID (a rewritten one is published to the worker as an observed Message-ID) |
 | 6 | Correlated test reply | reply from the owner-controlled address; the desktop worker correlates it locally -> `POST /v1/mail-workers/replies` -> outbox `seller.reply.received.v1` -> private Slack signal -> dot -> MCP `seller_replies_get` | the reply is stored (`ingest_status: stored`), exactly one Slack signal, dot's tool call recorded; an unrelated personal message sent at the same time is NOT uploaded |
 | 7 | Stop works | dashboard/MCP/CLI pause, then the worker's next claim | the claim answers `kill_switch`; nothing leaves Outlook; resume by the owner |
 
-If row 4-6 cannot be completed (no canary representation, no classic-Outlook runtime, no verified
-Slack trigger), report the precise blocker and keep the mode at `disabled_until_sender_ready`;
-never claim monitoring or sending. After activation, real seller inquiries use the standing
+### Canary flow (rows 4-6; the owner's activation step)
+
+A canary is an e-mail outside the seller caps, so it has its own bounds: no canary is prepared
+while the kill switch is on, at most `MAX_CANARIES_PER_24H` (PROPOSED 5) per rolling 24 hours
+(cancelled ones count), its purpose never contains an address, and its target must not be a
+stored seller contact. Its Message-ID is `<canary-<id>@<sender domain>>` and can never correlate to
+a seller inquiry.
+
+1. Prepare (nothing is sent): `SUV_CANARY_TARGET_ADDRESS=<owner test address> suv-deals canary
+   prepare --purpose "activation route check" --yes`, or run it interactively and type the address
+   at the hidden prompt. The address is never echoed, logged or stored (SHA-256 only, shown to
+   nobody); unset the variable afterwards. `suv-deals canary status` / `suv-deals doctor`
+   (`seller_inquiry/activation_canary`) show the evidence state (`prepared`, `accepted`,
+   `uncertain`, `failed`, `complete`; `stale` after a sender-binding change).
+2. Send - THE OWNER runs this himself, once; an operator script, a test or an agent never does:
+   `suv-deals canary send <id> --i-confirm-owner-controlled-address --yes`. It refuses (exit 3,
+   every closed gate listed by code, nothing sent, nothing changed) unless ALL of these hold:
+   `SELLER_EMAIL_CANARY_SEND_ENABLED=true`, `SELLER_INQUIRY_MODE=automatic`,
+   `SELLER_INQUIRY_KILL_SWITCH=false`, `SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL=false`, the workspace
+   controls `automatic` with the kill switch off, the standing authorization active, the configured
+   sender binding usable and exactly the configured identity, the canary `prepared` for that
+   binding's current version, and the separate flag `--i-confirm-owner-controlled-address`. The
+   target is entered again and must hash to the stored one. Right before the transport the
+   controls row is locked, EVERY gate above is read again (a pause, a mode change, a revoked
+   authorization, sender binding or desktop worker committed after the first check stops it) and
+   the canary is committed `uncertain` (the attempt is durable before the external I/O, spec
+   37.5), so a crash or a second `canary send` can never send it twice; an `uncertain` canary is reconciled (row 5), never re-sent. While the switches are
+   on, hold real seller inquiries with `suv-deals inquiries set-limits --max-per-24h 0
+   --max-per-15d 0` (the caps never apply to a canary) and restore the caps after the evidence is
+   recorded.
+3. Reconcile the canary's Message-ID (row 5) and record the correlated test reply (row 6); `canary
+   status` then reports `complete` for the binding's current version.
+
+**Current blocker (precise):** no route has a canary transport. The seller-inquiry providers
+(`gmail_api`, `microsoft_graph`) refuse anything but the exact rendering of a registered seller
+template (`mime_builder.inquiry_scope_problems`), and the desktop worker (`outlook_local`) claims
+only inquiry send intents; correlating a canary reply on the desktop also needs a canary binding
+on the wire. Step 2 therefore ends with `CANARY_TRANSPORT_UNAVAILABLE` after every other gate, and
+rows 4-6 stay open. Keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false`.
+
+If row 4-6 cannot be completed (no canary transport, no classic-Outlook runtime, no verified Slack
+trigger), report the precise blocker and keep the mode at `disabled_until_sender_ready`; never
+claim monitoring or sending. After activation, real seller inquiries use the standing
 authorization without any further approval.
 

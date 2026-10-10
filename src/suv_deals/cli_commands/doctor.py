@@ -14,8 +14,10 @@ What it checks (and never does):
 - source activation gates from the YAML registry, offline OAuth/URL metadata checks, the
   notification/event route and the seller-inquiry switches;
 - spec v1.1 readiness per active workspace (when the schema is present): inquiry mode and kill
-  switch, standing authorization, sender binding verification/alias/health and the desktop mail
-  worker's heartbeat age and monitoring state (states and ages only, never an address or token).
+  switch, standing authorization, sender binding verification/alias/health, the desktop mail
+  worker's heartbeat age and monitoring state, for an API provider whether
+  ``SELLER_EMAIL_OAUTH_SECRET_REFERENCE`` names the active binding of ``SELLER_EMAIL_FROM``, and the
+  activation-canary evidence state (states, versions and codes only, never an address or token).
 
 It never prints a secret, URL or connection string, and it never creates accounts, keys or data.
 Exit code 1 when any check reports an error.
@@ -341,7 +343,7 @@ async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
     """
     from suv_deals.cli_commands._common import active_workspaces, open_database, operator_actor
     from suv_deals.errors import AppError
-    from suv_deals.persistence import inquiries_repo, mail_workers_repo
+    from suv_deals.persistence import canaries_repo, inquiries_repo, mail_workers_repo, sender_bindings_repo
     from suv_deals.persistence.database import db_now
     from suv_deals.persistence.transactions import unit_of_work
     from suv_deals.workers.inquiry_handlers import (
@@ -369,6 +371,14 @@ async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
                     # The binding the runtime would send from: the configured identity only.
                     sender = await configured_sender_binding(conn, actor, settings)
                     boxes = await mail_workers_repo.list_mailbox_health(conn, ws)
+                    bindings = await sender_bindings_repo.list_bindings(conn, actor, include_revoked=True)
+                    # Migration 20261008000200 may not be applied yet: report it, never fail.
+                    canaries = (
+                        await canaries_repo.list_canaries(conn, actor, limit=50)
+                        if await _canaries_present(conn)
+                        else None
+                    )
+                identity = configured_sender_problems(settings, sender) if sender else []
                 findings.extend(
                     _readiness(
                         prefix,
@@ -378,12 +388,21 @@ async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
                         sender=sender,
                         boxes=boxes,
                         process_open=automatic_sending_enabled(settings),
-                        identity_problems=configured_sender_problems(settings, sender) if sender else (),
+                        identity_problems=identity,
                     )
                 )
+                configured = None if sender is None or identity else sender
+                findings.extend(secret_reference_findings(prefix, settings, bindings, configured))
+                findings.append(canary_finding(prefix, settings, canaries, configured))
     except AppError:
         return [Finding(area, "readiness", "warn", "seller-inquiry readiness could not be read")]
     return findings
+
+
+async def _canaries_present(conn: Any) -> bool:
+    cur = await conn.execute("select to_regclass('ops.inquiry_activation_canaries') is not null as present")
+    row = await cur.fetchone()
+    return bool(row and row["present"])
 
 
 async def _v11_present(conn: Any) -> bool:
@@ -483,6 +502,102 @@ def _readiness(
                 )
             )
     return findings
+
+
+def secret_reference_findings(
+    prefix: str, settings: Settings, bindings: Sequence[Any], sender: Any
+) -> list[Finding]:
+    """API providers only: ``SELLER_EMAIL_OAUTH_SECRET_REFERENCE`` must name the ACTIVE binding that
+    is the configured sender (``SELLER_EMAIL_FROM``) and holds a sealed grant (codes only, never the
+    reference or an address). ``sender`` is the configured binding (``None`` when there is none).
+
+    The runtime refuses the same conditions (``SECRET_REFERENCE_BINDING_MISMATCH`` /
+    ``SECRET_BOX_NOT_CONFIGURED`` in `workers.inquiry_handlers.InquiryRuntime.token_provider`), so a
+    problem here means nothing is sent. ``outlook_local`` holds no provider secret: a reference set
+    for it is reported as unused.
+    """
+    from suv_deals.errors import ValidationFailed
+    from suv_deals.integrations.email_providers.base import canonical_or_none
+    from suv_deals.integrations.seller_email import API_PROVIDERS, secret_reference_problems
+    from suv_deals.persistence.sender_bindings_repo import parse_secret_reference
+    from suv_deals.workers.inquiry_handlers import configured_provider
+
+    area = "seller_inquiry"
+    name = f"{prefix}secret_reference"
+    provider = configured_provider(settings)
+    reference = settings.seller_email_oauth_secret_reference
+    if provider not in API_PROVIDERS:
+        if reference and reference.strip():
+            return [
+                Finding(
+                    area,
+                    name,
+                    "warn",
+                    f"SELLER_EMAIL_OAUTH_SECRET_REFERENCE is set but unused ({provider.value} holds no"
+                    " provider secret)",
+                )
+            ]
+        return []
+    problems = secret_reference_problems(reference)
+    if not problems and reference is not None:
+        try:
+            named = parse_secret_reference(reference)
+        except ValidationFailed:
+            problems = ["SECRET_REFERENCE_UNSUPPORTED"]
+        else:
+            binding = next((b for b in bindings if b.id == named), None)
+            if binding is None:
+                problems.append("SECRET_REFERENCE_BINDING_UNKNOWN")
+            else:
+                if binding.revoked:
+                    problems.append("SECRET_REFERENCE_BINDING_REVOKED")
+                if binding.provider != provider:
+                    problems.append("SECRET_REFERENCE_PROVIDER_MISMATCH")
+                if canonical_or_none(binding.from_address) != canonical_or_none(settings.seller_email_from):
+                    problems.append("SECRET_REFERENCE_FROM_MISMATCH")
+                if sender is None or binding.id != sender.id:
+                    problems.append("SECRET_REFERENCE_NOT_THE_CONFIGURED_BINDING")
+                if not binding.has_secret_envelope:
+                    problems.append("SECRET_REFERENCE_NO_SEALED_GRANT")
+    if not problems:
+        return [
+            Finding(
+                area,
+                name,
+                "ok",
+                "SELLER_EMAIL_OAUTH_SECRET_REFERENCE names the active configured binding (SELLER_EMAIL_FROM)",
+            )
+        ]
+    detail = "nothing is sent with this reference: " + ", ".join(problems)
+    if settings.seller_inquiry_mode == "automatic":
+        return [Finding(area, name, "error", detail)]
+    return [Finding(area, name, "warn", detail)]
+
+
+def canary_finding(prefix: str, settings: Settings, canaries: Sequence[Any] | None, sender: Any) -> Finding:
+    """The activation-canary evidence of the configured sender binding (`canary.canary_evidence`).
+
+    ``ok`` once a correlated test reply was recorded for the binding's current version; otherwise
+    ``info`` (``warn`` while ``SELLER_INQUIRY_MODE=automatic``: activation evidence row 4-6 of
+    docs/seller_email_activation.md is still open). ``canaries=None``: the canary table of migration
+    20261008000200 is not applied yet (reported, never an error). States and versions only.
+    """
+    from suv_deals.cli_commands.canary import canary_evidence
+
+    if canaries is None:
+        return Finding(
+            "seller_inquiry",
+            f"{prefix}activation_canary",
+            "info",
+            "activation canaries not available: migration 20261008000200 is not applied",
+        )
+    state, detail = canary_evidence(canaries, sender)
+    name, text = f"{prefix}activation_canary", f"{state}: {detail}"
+    if state == "complete":
+        return Finding("seller_inquiry", name, "ok", text)
+    if settings.seller_inquiry_mode == "automatic":
+        return Finding("seller_inquiry", name, "warn", text)
+    return Finding("seller_inquiry", name, "info", text)
 
 
 def collect_offline(settings: Settings, processes: Sequence[str], verbose: bool) -> list[Finding]:

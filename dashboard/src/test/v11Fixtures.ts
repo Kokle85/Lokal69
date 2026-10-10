@@ -9,7 +9,9 @@ import type {
   ListingLifecycleView,
   MailboxHealthView,
   MailCoverageGapListView,
+  MailWorkerCredentialView,
   MailWorkerHealthView,
+  ReplySignalSummaryView,
   ReplySummaryView,
   ReplyView,
 } from '../api/types'
@@ -50,6 +52,7 @@ export function inquirySummary(overrides: Partial<InquirySummaryView> = {}): Inq
     send_attempted_at: '2026-10-07T08:30:00Z',
     accepted_at: '2026-10-07T08:31:00Z',
     row_version: 4,
+    waiting_reason: null,
     ...overrides,
   }
 }
@@ -137,6 +140,7 @@ export function inquiry(overrides: Partial<InquiryView> = {}): InquiryView {
     },
     row_version: 4,
     approval_required: false,
+    waiting_reason: null,
     ...overrides,
   }
 }
@@ -153,6 +157,8 @@ export function replySummary(overrides: Partial<ReplySummaryView> = {}): ReplySu
     processing_state: 'stored',
     received_at: '2026-10-07T12:00:00Z',
     ingested_at: '2026-10-07T12:00:05Z',
+    signal_status: 'emitted',
+    content_withheld: false,
     ...overrides,
   }
 }
@@ -222,6 +228,7 @@ export function reply(overrides: Partial<ReplyView> = {}): ReplyView {
     withheld_sensitive_attachments: 1,
     valuation: { valuation_id: null, state: 'stale', stale_reason: 'seller reply received', recalculation_pending: true },
     content_withheld: false,
+    signal_status: 'emitted',
     ...overrides,
   }
 }
@@ -243,6 +250,12 @@ export function control(overrides: Partial<InquiryControlView> = {}): InquiryCon
     updated_at: '2026-10-07T08:00:00Z',
     approval_required: false,
     removable_suppressions: 0,
+    authorization_status: 'active',
+    authorization_version: 1,
+    sender_readiness: 'ready',
+    sender_provider: 'outlook_local',
+    sender_binding_version: 2,
+    sender_problems: [],
     ...overrides,
   }
 }
@@ -288,13 +301,43 @@ export function mailbox(overrides: Partial<MailboxHealthView> = {}): MailboxHeal
   }
 }
 
-export function health(mailboxes: MailboxHealthView[]): MailWorkerHealthView {
+export function credential(overrides: Partial<MailWorkerCredentialView> = {}): MailWorkerCredentialView {
+  return {
+    mailbox_binding_id: MAILBOX_ID,
+    worker_label: 'SYNTHETIC desktop worker',
+    binding_state: 'active',
+    credential_status: 'active',
+    expires_at: '2027-01-05T10:00:00Z',
+    revoked_at: null,
+    ...overrides,
+  }
+}
+
+export function replySignals(overrides: Partial<ReplySignalSummaryView> = {}): ReplySignalSummaryView {
+  return {
+    window_hours: 24,
+    cap_per_inquiry: 6,
+    emitted: 1,
+    coalesced: 0,
+    rate_limited: 0,
+    inquiries_at_cap: 0,
+    ...overrides,
+  }
+}
+
+export function health(mailboxes: MailboxHealthView[], overrides: Partial<MailWorkerHealthView> = {}): MailWorkerHealthView {
   return {
     generated_at: '2026-10-07T10:00:00Z',
     mailboxes,
     any_monitoring_active: mailboxes.some((box) => box.monitoring_active),
     open_gap_count: mailboxes.reduce((total, box) => total + box.open_gap_count, 0),
     notes: [],
+    revoked_mailboxes: 0,
+    credentials: mailboxes.map((box) =>
+      credential({ mailbox_binding_id: box.mailbox_binding_id, worker_label: box.worker_label, binding_state: box.binding_state }),
+    ),
+    reply_signals: replySignals(),
+    ...overrides,
   }
 }
 

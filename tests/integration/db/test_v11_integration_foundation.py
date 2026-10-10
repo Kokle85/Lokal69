@@ -883,6 +883,7 @@ def _list_params(ws: uuid.UUID) -> dict[str, Any]:
         "now": now,
         "as_of": now,
         "candidate_states": list(CANDIDATE_STATES),
+        "include_rejected": False,  # C2: the dashboard's screening-rejected audit filter
         "profile": None,
         "country": None,
         "status": None,
@@ -909,6 +910,8 @@ def test_candidate_list_uses_the_created_keyset_index(probe_db: tuple[str, uuid.
     with psycopg.connect(url, autocommit=True) as conn:
         plan = _plan(conn, big, _LIST_SQL, _list_params(big))
         assert '"Index Name": "listings_created_idx"' in plan, plan
+        audit = _plan(conn, big, _LIST_SQL, {**_list_params(big), "include_rejected": True})
+        assert '"Index Name": "listings_created_idx"' in audit, audit
         # Without the index the whole workspace is read and sorted for every page (the drop is
         # rolled back: psycopg.Rollback aborts the transaction block quietly).
         with conn.transaction():

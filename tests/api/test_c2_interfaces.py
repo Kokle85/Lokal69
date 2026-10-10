@@ -13,6 +13,7 @@ Real ASGI app, real PostgreSQL, locally signed Supabase-shaped JWTs, SYNTHETIC d
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -50,9 +51,10 @@ from tests.api.v11_support import (
     upload_reply,
 )
 from tests.integration.db.helpers import Seed
-from tests.integration.v11_inquiries.support import SENDER_ACCOUNT, SENDER_ADDRESS, World
+from tests.integration.v11_inquiries.support import SENDER_ACCOUNT, SENDER_ADDRESS, World, reserve_and_queue
 
 from suv_deals.api.deps import MAIL_WORKER_MUTATION_LIMIT, MAIL_WORKER_REPLY_LIMIT
+from suv_deals.api.errors import error_response
 from suv_deals.api.inquiry_routes import RESUME_OPERATION
 from suv_deals.api.mail_worker_routes import REPORT_OPERATION
 from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
@@ -64,6 +66,7 @@ from suv_deals.api.schemas import (
 )
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
 from suv_deals.domain.enums import EmailProviderKind, Role, SuppressionReason
+from suv_deals.errors import Forbidden
 from suv_deals.mcp.schemas import DealsListCandidatesInput, tool_input_schema
 from suv_deals.mcp.tools import PAUSE_OPERATION
 from suv_deals.observability.metrics import AppMetrics
@@ -72,9 +75,11 @@ from suv_deals.persistence import (
     inquiries_repo,
     mail_workers_repo,
     replies_repo,
+    send_intents_repo,
     sender_bindings_repo,
 )
 from suv_deals.persistence.database import Database
+from suv_deals.persistence.errors_map import TransientConflict
 from suv_deals.persistence.queries.inquiries import credential_status
 from suv_deals.persistence.transactions import unit_of_work
 
@@ -603,3 +608,74 @@ async def test_a_worker_report_still_being_recorded_answers_in_progress(control_
     assert response.status_code == 409, response.text
     error = error_of(response)
     assert error["retryable"] is True and error["details"] == {"reason": "in_progress"}
+
+
+# --------------------------------------------------------------------------- C2 resume: wiring follow-ups
+
+
+async def test_the_control_view_counts_every_removable_suppression(control_api: ControlHarness) -> None:
+    """The removable count, the count a resume compares and the rows it removes are one set: more
+    than the repository's default page (500) of kill-switch suppressions are all counted."""
+    api = control_api
+    api.seed.conn.execute(
+        "insert into ops.email_suppressions (workspace_id, scope, scope_key, reason, created_by_kind)"
+        " select %s, 'address', 'seller-' || g || '@synthetic-mail.example', 'kill_switch', 'system'"
+        " from generate_series(1, 501) g",
+        (api.world.workspace_id,),
+    )
+    view = _data(await api.get("/api/inquiry-control", api.users.owner))
+    assert view["removable_suppressions"] == 501
+
+
+async def test_a_claim_refused_for_a_revoked_mailbox_is_a_403_with_its_reason(
+    control_api: ControlHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claim that waited for a concurrent revocation is refused by the repository
+    (``Forbidden``, ``mailbox_binding_revoked``; C1 security review): the route answers it exactly
+    like the authentication pre-check (403 with the reason), so the worker never calls ``.Send``."""
+    api = control_api
+    _inquiry, intent = await dispatch_intent(api.db, api.world, api.worker.mailbox_id)
+
+    async def revoked_while_waiting(*_args: Any, **_kwargs: Any) -> Any:
+        raise Forbidden(
+            "The mailbox worker binding is revoked", details={"reason": "mailbox_binding_revoked"}
+        )
+
+    monkeypatch.setattr(send_intents_repo, "claim", revoked_while_waiting)
+    response = await api.client.post(
+        f"{MAIL}/send-intents/{intent.intent_id}/claim",
+        headers=api.worker.headers(f"claim-{intent.intent_id}-c2-revoked"),
+        json=claim_body(intent, api.worker.mailbox_id),
+    )
+    assert response.status_code == 403, response.text
+    error = error_of(response)
+    assert error["code"] == "FORBIDDEN" and error["details"] == {"reason": "mailbox_binding_revoked"}
+    assert "proceed" not in response.json()
+
+
+def test_a_busy_transient_conflict_reaches_the_api_error_body() -> None:
+    response = error_response(TransientConflict(), request_id="req-c2-busy")
+    assert response.status_code == 409 and response.headers["retry-after"] == "1"
+    body = json.loads(bytes(response.body))
+    assert body["error"]["code"] == "VERSION_CONFLICT" and body["error"]["retryable"] is True
+    assert body["error"]["details"] == {"reason": "busy"}
+
+
+async def test_waiting_reasons_reach_the_dashboard_list_and_detail(control_api: ControlHarness) -> None:
+    api = control_api
+    record = await reserve_and_queue(api.db, api.world)
+    pause = await api.post(
+        "/api/inquiry-control/pause",
+        api.users.owner,
+        {
+            "expected_version": await controls_version(api.db, api.world.workspace_id),
+            "reason": "Owner pause (synthetic)",
+            "idempotency_key": "c2-pause-waiting-01",
+        },
+    )
+    assert pause.status_code == 200, pause.text
+    listed = _data(await api.get("/api/inquiries?attention_only=true", api.users.reviewer))
+    item = next(i for i in listed["items"] if i["inquiry_id"] == str(record.id))
+    assert item["waiting_reason"] == "INQUIRIES_PAUSED"
+    detail = _data(await api.get(f"/api/inquiries/{record.id}", api.users.reviewer))
+    assert detail["waiting_reason"] == "INQUIRIES_PAUSED"

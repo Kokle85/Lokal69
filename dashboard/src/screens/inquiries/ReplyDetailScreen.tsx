@@ -4,7 +4,7 @@ import { Badge, EmptyState, ErrorPanel, KeyValues, LoadingState, Notice, Section
 import { bytesText, decimalText, label, shortHash, yesNo } from '../../format'
 import { useApiQuery } from '../../hooks/useApiQuery'
 import { useWorkspace } from '../../workspace/WorkspaceProvider'
-import { InquiryAreaNav, requestText, RequireScope, vehicleText } from './shared'
+import { InquiryAreaNav, requestText, RequireScope, SignalStatusBadge, signalStatusHelp, vehicleText } from './shared'
 
 export function ReplyDetailScreen() {
   return (
@@ -60,6 +60,13 @@ function ReplyDetailContent() {
           </span>
         </Notice>
       ) : null}
+      {reply.signal_status === 'rate_limited' ? (
+        <Notice tone="warn">
+          <span data-testid="signal-rate-limited">
+            {signalStatusHelp('rate_limited')} Read it here; the dot will not be woken for it again.
+          </span>
+        </Notice>
+      ) : null}
       <EscalationPanel claims={reply.claims} unverifiedSender={reply.quarantined || !reply.sender.matches_verified_recipient} />
 
       <Section title="Message" id="reply-message">
@@ -71,6 +78,7 @@ function ReplyDetailContent() {
             ['Observed by the worker', <Timestamp key="o" value={reply.observed_at} timeZone={timezone} />],
             ['Stored by the backend', <Timestamp key="i" value={reply.ingested_at} timeZone={timezone} />],
             ['Processing', <span key="p"><Badge value={reply.processing_state} /> <Timestamp value={reply.processed_at} timeZone={timezone} /></span>],
+            ['Dot signal', <SignalStatusBadge key="g" status={reply.signal_status} />],
           ]}
         />
         {reply.content_withheld ? null : (

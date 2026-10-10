@@ -1,10 +1,21 @@
 import { useState, type ReactNode } from 'react'
-import type { ComponentStatus, LagView, MailboxHealthView, MailCoverageGapItem } from '../../api/types'
+import type { ApiError } from '../../api/errors'
+import type {
+  ComponentStatus,
+  CredentialStatus,
+  InquiryControlView,
+  LagView,
+  MailboxHealthView,
+  MailCoverageGapItem,
+  MailWorkerCredentialView,
+  MailWorkerHealthView,
+  ReplySignalSummaryView,
+} from '../../api/types'
 import { Badge, EmptyState, ErrorPanel, KeyValues, LoadingState, Notice, Section, Timestamp, ViewMeta, Warnings } from '../../components/ui'
 import { countText, durationText, label, shortHash, yesNo } from '../../format'
 import { useApiQuery } from '../../hooks/useApiQuery'
 import { useWorkspace } from '../../workspace/WorkspaceProvider'
-import { InquiryAreaNav, LagValue, RequireScope } from './shared'
+import { authorizationText, InquiryAreaNav, LagValue, RequireScope, senderReadinessLabel, senderReadinessText } from './shared'
 
 export function MailWorkersScreen() {
   return (
@@ -14,11 +25,30 @@ export function MailWorkersScreen() {
   )
 }
 
+/** The credential the server lists for one worker (`null`: not reported). */
+function credentialOf(health: MailWorkerHealthView, box: MailboxHealthView): MailWorkerCredentialView | null {
+  return health.credentials.find((item) => item.mailbox_binding_id === box.mailbox_binding_id) ?? null
+}
+
+/**
+ * Whether a worker is monitoring NOW. The server's `monitoring_active` rests on fresh reports, and a
+ * heartbeat stays fresh for a while after its credential expired or was revoked although the worker
+ * can no longer upload a reply or claim a send: that worker is a coverage gap, never "monitoring".
+ */
+function monitoringNow(box: MailboxHealthView, credential: MailWorkerCredentialView | null): boolean {
+  return box.monitoring_active && !(box.binding_state === 'active' && credential !== null && credentialDead(credential.credential_status))
+}
+
+function anyMonitoringNow(health: MailWorkerHealthView): boolean {
+  return health.mailboxes.some((box) => monitoringNow(box, credentialOf(health, box)))
+}
+
 function MailWorkersContent() {
   const { timezone } = useWorkspace()
   const [includeRevoked, setIncludeRevoked] = useState(false)
   const health = useApiQuery((api, signal) => api.mailWorkerHealth({ include_revoked: includeRevoked }, { signal }), [includeRevoked])
   const gaps = useApiQuery((api, signal) => api.mailCoverageGaps({ include_revoked: includeRevoked }, { signal }), [includeRevoked])
+  const control = useApiQuery((api, signal) => api.inquiryControl({ signal }), [])
   return (
     <div className="screen">
       <h1>Mail workers and coverage</h1>
@@ -38,7 +68,7 @@ function MailWorkersContent() {
         <>
           <ViewMeta asOf={health.envelope.as_of} fetchedAt={health.fetchedAt} timeZone={timezone} onReload={health.reload} reloading={health.reloading} />
           <Warnings warnings={health.envelope.warnings} />
-          {health.data.any_monitoring_active ? (
+          {health.data.any_monitoring_active && anyMonitoringNow(health.data) ? (
             <Notice tone="ok">
               <span data-testid="monitoring-summary">
                 At least one mailbox is monitored right now. {health.data.open_gap_count} open coverage gap(s).
@@ -62,8 +92,17 @@ function MailWorkersContent() {
           {health.data.mailboxes.length === 0 ? (
             <EmptyState>No mail worker is registered for this workspace, so no replies can be detected.</EmptyState>
           ) : (
-            health.data.mailboxes.map((box) => <MailboxCard key={box.mailbox_binding_id} box={box} timeZone={timezone} />)
+            health.data.mailboxes.map((box) => (
+              <MailboxCard
+                key={box.mailbox_binding_id}
+                box={box}
+                credential={health.data ? credentialOf(health.data, box) : null}
+                timeZone={timezone}
+              />
+            ))
           )}
+          <CredentialsSection health={health.data} includeRevoked={includeRevoked} timeZone={timezone} />
+          <ReplySignalsSection signals={health.data.reply_signals} />
         </>
       ) : null}
       <Section title="Coverage gaps" id="coverage-gaps">
@@ -71,7 +110,246 @@ function MailWorkersContent() {
         {gaps.error ? <ErrorPanel error={gaps.error} onRetry={gaps.reload} /> : null}
         {gaps.data ? <GapTable items={gaps.data.items} timeZone={timezone} /> : null}
       </Section>
+      <ActivationSection
+        control={control.data}
+        controlError={control.error}
+        controlLoading={control.status === 'loading'}
+        health={health.data}
+      />
     </div>
+  )
+}
+
+const CREDENTIAL_TONE: Record<CredentialStatus, string> = { active: 'ok', expiring: 'warn', expired: 'bad', revoked: 'bad' }
+
+const CREDENTIAL_TEXT: Record<CredentialStatus, string> = {
+  active: 'active',
+  expiring: 'expiring within 14 days',
+  expired: 'expired',
+  revoked: 'revoked',
+}
+
+/** An expired or revoked credential can no longer upload replies or claim sends (the worker keeps its backlog). */
+function credentialDead(status: CredentialStatus): boolean {
+  return status === 'expired' || status === 'revoked'
+}
+
+function CredentialBadge({ status }: { status: CredentialStatus }) {
+  return (
+    <span data-testid="credential-status" data-status={status}>
+      <Badge tone={CREDENTIAL_TONE[status] ?? 'warn'}>{CREDENTIAL_TEXT[status] ?? status}</Badge>
+    </span>
+  )
+}
+
+/**
+ * Each listed worker's credential (never a token, hash or prefix) and the revoked workers, which are
+ * counted even when they are not listed.
+ */
+function CredentialsSection({
+  health,
+  includeRevoked,
+  timeZone,
+}: {
+  health: MailWorkerHealthView
+  includeRevoked: boolean
+  timeZone: string
+}) {
+  const dead = health.credentials.filter((item) => item.binding_state === 'active' && credentialDead(item.credential_status))
+  return (
+    <Section title="Worker credentials" id="worker-credentials">
+      {dead.length ? (
+        <Notice tone="bad">
+          <span data-testid="credentials-not-live">
+            {dead.length} active worker(s) hold an expired or revoked credential: they can no longer upload replies or claim sends
+            (they keep their backlog) until the owner issues a new credential (<code>suv-deals mail-worker credential</code>). That
+            time is a coverage gap.
+          </span>
+        </Notice>
+      ) : null}
+      {health.revoked_mailboxes > 0 ? (
+        <p className="muted small" data-testid="revoked-mailboxes">
+          {health.revoked_mailboxes} revoked mail worker(s){includeRevoked ? '' : ' are not listed (tick “include revoked workers” to show them)'}. A
+          revoked worker can never upload or send again.
+        </p>
+      ) : null}
+      {health.credentials.length === 0 ? (
+        <EmptyState>No worker credential is listed.</EmptyState>
+      ) : (
+        <table className="responsive-table" aria-label="Worker credentials">
+          <thead>
+            <tr>
+              <th scope="col">Worker</th>
+              <th scope="col">Worker binding</th>
+              <th scope="col">Credential</th>
+              <th scope="col">Expires</th>
+              <th scope="col">Revoked</th>
+            </tr>
+          </thead>
+          <tbody>
+            {health.credentials.map((item: MailWorkerCredentialView) => (
+              <tr key={item.mailbox_binding_id} data-testid="credential-row" data-status={item.credential_status}>
+                <td data-label="Worker">{item.worker_label}</td>
+                <td data-label="Worker binding">
+                  <Badge tone={item.binding_state === 'active' ? 'ok' : 'muted'}>{item.binding_state}</Badge>
+                </td>
+                <td data-label="Credential">
+                  <CredentialBadge status={item.credential_status} />
+                </td>
+                <td data-label="Expires">
+                  <Timestamp value={item.expires_at} timeZone={timeZone} />
+                </td>
+                <td data-label="Revoked">
+                  {item.revoked_at ? <Timestamp value={item.revoked_at} timeZone={timeZone} /> : <span className="muted">no</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Section>
+  )
+}
+
+/** Reply-signal flood control of the rolling window (counts only; never message content). */
+function ReplySignalsSection({ signals }: { signals: ReplySignalSummaryView | null }) {
+  return (
+    <Section title="Reply signals to dot" id="reply-signals">
+      {signals === null ? (
+        <p className="muted">The server reported no reply-signal summary.</p>
+      ) : (
+        <div data-testid="reply-signals">
+          {signals.rate_limited > 0 ? (
+            <Notice tone="warn">
+              <span data-testid="signals-rate-limited">
+                {signals.rate_limited} reply signal(s) hit the per-inquiry cap in the last {signals.window_hours} h: those replies are
+                stored and shown in Seller replies, but started no new dot activation. Review them there.
+              </span>
+            </Notice>
+          ) : null}
+          <KeyValues
+            items={[
+              ['Window', `last ${signals.window_hours} h`],
+              ['Signals emitted', String(signals.emitted)],
+              ['Coalesced into a pending signal', String(signals.coalesced)],
+              ['Stopped by the per-inquiry cap', String(signals.rate_limited)],
+              ['Inquiries at the cap', String(signals.inquiries_at_cap)],
+              [
+                'Cap per inquiry',
+                <span key="c" data-testid="signal-cap">
+                  {signals.cap_per_inquiry} per {signals.window_hours} h <Badge tone="warn">PROPOSED</Badge>
+                </span>,
+              ],
+            ]}
+          />
+        </div>
+      )}
+    </Section>
+  )
+}
+
+type EvidenceState = 'done' | 'open' | 'unknown'
+
+const EVIDENCE_TONE: Record<EvidenceState, string> = { done: 'ok', open: 'bad', unknown: 'warn' }
+
+/**
+ * The activation evidence of docs/seller_email_activation.md section 8, READ-ONLY. The dashboard
+ * shows what its API reports (sender readiness, worker monitoring, standing authorization); the
+ * owner-controlled canary rows (4-6) are not served by the dashboard API, so they are shown as
+ * "not shown here" with the CLI that reports them. There is no canary, test or send control here.
+ */
+function ActivationSection({
+  control,
+  controlError,
+  controlLoading,
+  health,
+}: {
+  control: InquiryControlView | null
+  controlError: ApiError | null
+  controlLoading: boolean
+  health: MailWorkerHealthView | null
+}) {
+  // A worker whose credential expired or was revoked is not monitoring, however fresh its last report.
+  const monitored = health !== null && health.any_monitoring_active && anyMonitoringNow(health)
+  const rows: Array<{ key: string; evidence: string; state: EvidenceState; detail: ReactNode }> = [
+    {
+      key: 'sender',
+      evidence: '1. Sender binding verified',
+      state: control === null ? 'unknown' : control.sender_readiness === 'ready' ? 'done' : 'open',
+      detail:
+        control === null ? (
+          'unknown: the inquiry controls could not be loaded'
+        ) : (
+          <>
+            {senderReadinessLabel(control.sender_readiness)}: {senderReadinessText(control.sender_readiness)}
+            {control.sender_provider ? ` · ${label(control.sender_provider)}` : ''}
+          </>
+        ),
+    },
+    {
+      key: 'runtime',
+      evidence: '2. Configured runtime monitoring',
+      state: health === null ? 'unknown' : monitored && health.open_gap_count === 0 ? 'done' : 'open',
+      detail:
+        health === null
+          ? 'unknown: the worker health could not be loaded'
+          : monitored
+            ? `a mailbox is monitored · ${health.open_gap_count} open coverage gap(s)`
+            : `no mailbox is monitored · ${health.open_gap_count} open coverage gap(s)`,
+    },
+    {
+      key: 'authorization',
+      evidence: '3. Standing authorization active',
+      state: control === null ? 'unknown' : control.authorization_status === 'active' ? 'done' : 'open',
+      detail:
+        control === null
+          ? 'unknown: the inquiry controls could not be loaded'
+          : `${authorizationText(control.authorization_status)}${control.authorization_version !== null ? ` (version ${control.authorization_version})` : ''}`,
+    },
+  ]
+  return (
+    <Section title="Activation evidence (read-only)" id="activation-evidence">
+      <p className="muted small">
+        The one-time technical activation checklist of the sending route (docs/seller_email_activation.md section 8). Each row is a
+        technical check, never a message approval. This page only shows evidence; it has no canary, test or send control.
+      </p>
+      {controlLoading ? <LoadingState label="Loading the sending readiness" /> : null}
+      {controlError && controlError.code !== 'NOT_FOUND' ? <ErrorPanel error={controlError} /> : null}
+      <table className="responsive-table" aria-label="Activation evidence">
+        <thead>
+          <tr>
+            <th scope="col">Evidence</th>
+            <th scope="col">State here</th>
+            <th scope="col">Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.key} data-testid="activation-row" data-evidence={row.key} data-state={row.state}>
+              <td data-label="Evidence">{row.evidence}</td>
+              <td data-label="State here">
+                <Badge tone={EVIDENCE_TONE[row.state]}>{row.state === 'done' ? 'shown as met' : row.state === 'open' ? 'open' : 'unknown'}</Badge>
+              </td>
+              <td data-label="Detail">{row.detail}</td>
+            </tr>
+          ))}
+          <tr data-testid="activation-row" data-evidence="canary" data-state="not_shown">
+            <td data-label="Evidence">4-6. Owner-controlled canary, receipt reconciliation, correlated test reply</td>
+            <td data-label="State here">
+              <Badge tone="warn">not shown here</Badge>
+            </td>
+            <td data-label="Detail">
+              <span data-testid="canary-evidence">
+                The dashboard API does not report the activation canary yet, so its evidence state (prepared, accepted, uncertain,
+                failed, complete, stale) is not shown here and is never assumed. Read it with <code>suv-deals canary status</code>{' '}
+                or <code>suv-deals doctor</code> (<code>seller_inquiry/activation_canary</code>). A canary is sent only by the owner
+                on the command line.
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </Section>
   )
 }
 
@@ -99,9 +377,18 @@ function Reported({ fresh, last, children }: { fresh: boolean; last: string; chi
   )
 }
 
-function MailboxCard({ box, timeZone }: { box: MailboxHealthView; timeZone: string }) {
-  const monitoring = box.monitoring_active
+function MailboxCard({
+  box,
+  credential,
+  timeZone,
+}: {
+  box: MailboxHealthView
+  credential: MailWorkerCredentialView | null
+  timeZone: string
+}) {
+  const monitoring = monitoringNow(box, credential)
   const fresh = box.heartbeat_status === 'healthy'
+  const credentialNotLive = box.binding_state === 'active' && credential !== null && credentialDead(credential.credential_status)
   const syncOk = box.mailbox_sync_ok === null ? 'unknown' : yesNo(box.mailbox_sync_ok)
   return (
     <Section
@@ -116,10 +403,27 @@ function MailboxCard({ box, timeZone }: { box: MailboxHealthView; timeZone: stri
       }
     >
       <div data-testid="mailbox-card" data-monitoring={monitoring ? 'yes' : 'no'}>
+        {box.binding_state === 'revoked' ? (
+          <Notice tone="bad">
+            <span data-testid="mailbox-revoked">
+              This worker was revoked: it can never upload replies or claim sends again. Its last reports are shown for the record.
+            </span>
+          </Notice>
+        ) : null}
+        {credentialNotLive && credential ? (
+          <Notice tone="bad">
+            <span data-testid="mailbox-credential-not-live">
+              Its credential is {CREDENTIAL_TEXT[credential.credential_status]}: the worker cannot upload replies or claim sends (it
+              keeps its backlog) until the owner issues a new credential. This is a coverage gap.
+            </span>
+          </Notice>
+        ) : null}
         {!monitoring ? (
           <Notice tone="bad">
             <span data-testid="mailbox-not-monitoring">
-              {box.heartbeat_status === 'healthy'
+              {credentialNotLive
+                ? 'Not monitoring: its last reports may still look fresh, but it can no longer upload replies with this credential.'
+                : box.heartbeat_status === 'healthy'
                 ? 'Not monitoring: a health dimension below is not fresh.'
                 : box.last_heartbeat_at
                   ? 'No fresh heartbeat: the PC may be off, asleep or offline, or Outlook is not running. Replies are not detected until it returns.'
@@ -133,6 +437,19 @@ function MailboxCard({ box, timeZone }: { box: MailboxHealthView; timeZone: stri
         <KeyValues
           items={[
             ['Route', `${label(box.provider)} · binding ${box.binding_state}`],
+            [
+              'Worker credential',
+              credential ? (
+                <span key="c">
+                  <CredentialBadge status={credential.credential_status} /> expires{' '}
+                  <Timestamp value={credential.expires_at} timeZone={timeZone} />
+                </span>
+              ) : (
+                <span key="c" className="muted">
+                  not reported
+                </span>
+              ),
+            ],
             [
               'Heartbeat',
               <span key="h">

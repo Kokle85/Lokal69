@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     seller_email_from: str | None = None
     seller_email_reply_to: str | None = None
     seller_email_oauth_secret_reference: str | None = None
+    # Owner-controlled activation canary (spec 37.10; docs/seller_email_activation.md section 8).
+    # OFF by default: `suv-deals canary send` refuses unless this switch AND every inquiry
+    # activation switch are on and the owner passes --i-confirm-owner-controlled-address.
+    seller_email_canary_send_enabled: bool = False
     seller_reply_ingest_mode: Literal["local_classic_outlook", "provider_api", "disabled"] = (
         "local_classic_outlook"
     )

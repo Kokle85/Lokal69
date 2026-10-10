@@ -9,14 +9,19 @@
 import type { ReactNode } from 'react'
 import { NavLink } from 'react-router'
 import type {
+  AuthorizationStatus,
   ContactStatus,
+  InquiryControlView,
   InquiryState,
   InquiryVehicleRef,
   LagView,
   ReplySummaryView,
   RequestKind,
   Scope,
+  SenderReadiness,
+  SignalStatus,
   SuppressionReason,
+  WaitingReason,
 } from '../../api/types'
 import { Badge, Notice } from '../../components/ui'
 import { durationText, label } from '../../format'
@@ -154,6 +159,163 @@ export function requestText(kind: RequestKind): string {
 }
 
 /**
+ * Why an inquiry waits (`waiting_reason`, typed by the server): a short label and the full
+ * explanation. None of these is an approval wait: there is no per-message approval (spec 37.1).
+ */
+const WAITING_REASON_TEXT: Record<WaitingReason, { label: string; help: string }> = {
+  UNCERTAIN_DELIVERY: {
+    label: 'uncertain delivery',
+    help: 'A send attempt may have reached the provider: held for reconciliation with positive evidence, never resent blindly.',
+  },
+  NEEDS_FACTS: {
+    label: 'needs facts',
+    help: 'Recipient, language or other facts are not established yet (technical checks, not an approval).',
+  },
+  INQUIRIES_PAUSED: {
+    label: 'inquiries paused',
+    help: 'The inquiry kill switch is on or the mode is paused: nothing is reserved or sent until the owner resumes.',
+  },
+  SENDER_SETUP_INCOMPLETE: {
+    label: 'sender setup incomplete',
+    help: 'The configured sending identity is not ready (technical setup of the account, not a message approval).',
+  },
+  WORKER_OFFLINE: {
+    label: 'mail worker offline',
+    help: "The desktop mail worker (classic Outlook on the owner's PC) is offline or its credential is not live: nothing is handed to Outlook until it is back.",
+  },
+  RATE_CAP_REACHED: {
+    label: 'rolling caps reached',
+    help: 'The hard caps (2 inquiries per rolling 24 hours, 5 per rolling 15 days, or lower) are used up: it waits for the window to free.',
+  },
+  SELLER_COOLDOWN: {
+    label: 'seller cooldown',
+    help: 'This seller was contacted recently: another inquiry to the same seller waits at least 7 days.',
+  },
+  SEND_HELD: {
+    label: 'send held',
+    help: 'The send is held until its window or a pre-send check allows it.',
+  },
+}
+
+export function waitingReasonLabel(reason: WaitingReason): string {
+  return WAITING_REASON_TEXT[reason]?.label ?? reason
+}
+
+export function waitingReasonHelp(reason: WaitingReason): string {
+  return WAITING_REASON_TEXT[reason]?.help ?? 'The server reports a waiting reason this dashboard does not know yet.'
+}
+
+/** The typed waiting reason of an inquiry (or "not waiting"). */
+export function WaitingReasonBadge({ reason }: { reason: WaitingReason | null }) {
+  if (reason === null) return <span className="muted small">not waiting</span>
+  return (
+    <span data-testid="waiting-reason" data-reason={reason} title={waitingReasonHelp(reason)}>
+      <Badge tone={reason === 'UNCERTAIN_DELIVERY' ? 'warn' : 'info'}>{waitingReasonLabel(reason)}</Badge>
+    </span>
+  )
+}
+
+const AUTHORIZATION_TEXT: Record<AuthorizationStatus, string> = {
+  active: 'active',
+  missing: 'not recorded',
+  not_effective: 'recorded, not effective now',
+  revoked: 'revoked',
+}
+
+export function authorizationText(status: AuthorizationStatus): string {
+  return AUTHORIZATION_TEXT[status] ?? status
+}
+
+const SENDER_READINESS_TEXT: Record<SenderReadiness, { label: string; help: string }> = {
+  ready: { label: 'ready', help: 'verified, alias verified, healthy and unrevoked' },
+  missing: { label: 'missing', help: 'no sender binding is exactly the configured sending identity' },
+  unverified: { label: 'not verified', help: 'the account verification has not succeeded' },
+  alias_unverified: { label: 'alias not verified', help: 'the From / Reply-To alias is not verified' },
+  unhealthy: { label: 'unhealthy', help: 'the account or its credential is not healthy' },
+  revoked: { label: 'revoked', help: 'the owner revoked this sending identity' },
+}
+
+/** A short readiness label (for badges). */
+export function senderReadinessLabel(readiness: SenderReadiness): string {
+  return SENDER_READINESS_TEXT[readiness]?.label ?? readiness
+}
+
+/** The readiness label with its meaning. */
+export function senderReadinessText(readiness: SenderReadiness): string {
+  const text = SENDER_READINESS_TEXT[readiness]
+  return text ? `${text.label} (${text.help})` : readiness
+}
+
+/** Readable meanings of the server's sender problem codes (codes only, never an address). */
+const SENDER_PROBLEM_TEXT: Record<string, string> = {
+  sender_binding_missing: 'no sender binding of the configured provider',
+  sender_binding_revoked: 'the sender binding is revoked',
+  sender_binding_unverified: 'the sender binding is not verified',
+  sender_alias_unverified: 'the From / Reply-To alias is not verified',
+  sender_binding_unhealthy: 'the sender account is not healthy',
+  sender_identity_provider_not_configured: 'SELLER_EMAIL_PROVIDER is not configured',
+  sender_identity_account_not_configured: 'SELLER_EMAIL_ACCOUNT_ID is not configured',
+  sender_identity_from_not_configured: 'SELLER_EMAIL_FROM is not configured',
+  sender_identity_reply_to_invalid: 'SELLER_EMAIL_REPLY_TO is invalid',
+  sender_identity_sender_binding_mismatch: 'the binding is not exactly the configured identity',
+}
+
+export function SenderProblemList({ codes }: { codes: string[] }) {
+  return (
+    <ul className="small plain-list">
+      {codes.map((code) => (
+        <li key={code} data-testid="sender-problem">
+          <code>{code}</code>
+          {SENDER_PROBLEM_TEXT[code] ? <span className="muted"> ({SENDER_PROBLEM_TEXT[code]})</span> : null}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** Why the controls cannot send now although they allow it (empty: authorization and sender ready). */
+export function sendingReadinessProblems(control: InquiryControlView): string[] {
+  const problems: string[] = []
+  if (control.authorization_status !== 'active') {
+    problems.push(`the standing authorization is ${authorizationText(control.authorization_status)}`)
+  }
+  if (control.sender_readiness !== 'ready') {
+    problems.push(`the configured sender is ${senderReadinessText(control.sender_readiness)}`)
+  }
+  return problems
+}
+
+/** What happened to a reply's `seller.reply.received` signal (dot activation route). */
+const SIGNAL_TEXT: Record<SignalStatus, { label: string; tone: string; help: string }> = {
+  emitted: { label: 'signal emitted', tone: 'ok', help: 'A private signal was queued for the dot activation route.' },
+  coalesced: {
+    label: 'coalesced',
+    tone: 'neutral',
+    help: 'A signal for this inquiry was still pending, so this reply rides on it (no second activation needed).',
+  },
+  rate_limited: {
+    label: 'signal cap reached',
+    tone: 'warn',
+    help: 'The per-inquiry signal cap was reached: the reply is stored and shown here, but it started no new dot activation.',
+  },
+  not_applicable: { label: 'no signal', tone: 'muted', help: 'Not a matched seller reply, so no signal is sent.' },
+}
+
+export function SignalStatusBadge({ status }: { status: SignalStatus | null }) {
+  if (status === null) return <span className="muted small">not recorded</span>
+  const text = SIGNAL_TEXT[status] ?? { label: status, tone: 'neutral', help: status }
+  return (
+    <span data-testid="signal-status" data-signal={status} title={text.help}>
+      <Badge tone={text.tone}>{text.label}</Badge>
+    </span>
+  )
+}
+
+export function signalStatusHelp(status: SignalStatus): string {
+  return SIGNAL_TEXT[status]?.help ?? status
+}
+
+/**
  * The availability a reply row states. A quarantined reply is an unverified possible match that may
  * be unrelated personal mail, so its text is the owner's only (`config:admin`, the server's
  * `views.inquiries.reply_content_visible` rule): a claim DERIVED from that text is withheld from
@@ -161,7 +323,7 @@ export function requestText(kind: RequestKind): string {
  */
 export function ReplyAvailability({ reply }: { reply: ReplySummaryView }) {
   const { can } = useWorkspace()
-  if (reply.quarantined && !can('config:admin')) {
+  if (reply.content_withheld || (reply.quarantined && !can('config:admin'))) {
     return (
       <span className="muted" data-testid="availability-withheld">
         withheld (unverified match)

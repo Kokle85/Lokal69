@@ -20,6 +20,39 @@ pipeline sends one initial inquiry per verified vehicle/seller pair from validat
 (mode `automatic`, kill switch off, authorization active, sender verified); the dashboard shows
 what happened and lets the owner pause or resume.
 
+What the v1.1 screens show beyond the raw states:
+
+- **Why an inquiry waits** (`waiting_reason`, typed by the server): every list row, the inquiry
+  detail and the attention section (one group per reason: rolling caps reached, seller cooldown,
+  inquiries paused, desktop mail worker offline, sender setup incomplete, send held; uncertain
+  delivery and missing facts keep their own groups). None of them is an approval wait.
+- **Sending readiness** on the inquiry control: the standing authorization (`active` / `not
+  recorded` / `not effective` / `revoked`) and the CONFIGURED sending identity's readiness with its
+  problem codes (never an address).
+- **Resume with suppression removal** sends `expected_removable_suppressions`, the count the owner
+  was shown and ticked. When the server counts differently (`409 VERSION_CONFLICT`,
+  `details.reason = suppressions_changed`, nothing changed) the controls are reloaded, the new count
+  is shown and must be confirmed again before anything can be resumed, even when the reloaded count
+  is the same number again (it need not be the same set); a count that moves on a plain reload also
+  un-confirms the tick, and it stays un-confirmed if the count later moves back.
+- **Transient conflicts** use `details.reason`: `busy` (this request was rolled back) and
+  `in_progress` (a request with the same key is still running, so the outcome stays unknown and only
+  a same-key retry is possible, also on a first send); `retryable` without a reason is the fallback.
+- **Replies** show their dot signal (`emitted`, `coalesced`, `rate_limited` by the per-inquiry cap:
+  stored and visible but no new dot activation, `not_applicable`).
+- **Mail workers** show each listed worker's credential (`active` / `expiring` within 14 days /
+  `expired` / `revoked`; an expired or revoked credential of an active worker is a coverage gap and
+  that worker is never shown as monitoring, in the summary, its card or the activation evidence,
+  however fresh its last heartbeat),
+  the revoked workers (counted even when not listed), the reply-signal flood control (counts, the
+  PROPOSED per-inquiry cap) and a read-only **activation evidence** table: sender readiness, runtime
+  monitoring and the standing authorization from the API; the owner-controlled canary (rows 4-6 of
+  docs/seller_email_activation.md) is not served by the dashboard API, so it is shown as "not shown
+  here" with the CLI that reports it, never assumed, and there is no canary or send control.
+- **Candidates** have the dashboard-only audit filter "include screening-rejected (audit)"
+  (`include_screening_rejected=true` in the URL and the query, kept for "load more"); such rows are
+  labelled "screening rejected (audit)" and are not candidates.
+
 All typed API shapes live in one module, [`src/api/types.ts`](src/api/types.ts), written by hand
 from the contract and the backend view models (`src/suv_deals/views/*`, `schemas/*.json`,
 `schemas/api/*.json` for the v1.1 routes of `api.schemas.V11_DASHBOARD_ROUTES`). The only HTTP
@@ -110,8 +143,16 @@ path the desktop reply worker uses): inquiry controls in `automatic` mode, the s
 authorization, a verified `outlook_local` sender, and inquiries that are `replied` (a seller reply
 with a final price and a deposit/reservation request, plus a quarantined possible match from
 another address), `uncertain` (handed to the Outbox without proof), `held_facts` (no resolvable
-language), `suppressed` (seller opt-out) and `qualifying` while the 24-hour cap is used up. The
-mail worker's heartbeat is moved 6 hours back so the owner's PC looks powered off. Every address is
+language), `suppressed` (seller opt-out), `sending` with an unclaimed desktop intent while the PC is
+off (`WORKER_OFFLINE`), the same dealer's second vehicle in its seller cooldown and another
+vehicle while the 24-hour cap is used up (both waiting on their REAL plan jobs, released with the
+plan handler's own wait codes), and a `kill_switch` suppression a resume can remove. There is a
+retired (revoked) mail worker and the active one, whose credential expires within 14 days; the
+active worker's heartbeat is moved 6 hours back so the owner's PC looks powered off. The E2E
+backend's configured sending identity is that synthetic sender (its mode stays
+`disabled_until_sender_ready`). The resume-conflict test records one concurrent `kill_switch`
+suppression through the real repository with `tests/e2e/v11_actions.py` (loopback `suv_e2e_*`
+databases only). Every address is
 `...@example.invalid`; the E2E backend runs no worker, so nothing is ever sent. Users: `owner@e2e.invalid`, `reviewer@e2e.invalid`, `reviewer2@e2e.invalid`,
 `viewer@e2e.invalid`, `expiring@e2e.invalid` (access tokens really live 6 s while the response
 advertises an hour, so the backend rejects them mid-review), `multi@e2e.invalid` (two workspaces)
@@ -145,7 +186,13 @@ open coverage gap (never "monitoring") whose last report is never shown as curre
 as unknown (never 0 s), detection delay unknown
 without a trusted source time, zero suitable deals as 0, owner pause with a lost response resolved
 by a same-key retry then resume, a reviewer seeing the controls read-only, and every v1.1 screen at
-375 px without horizontal scrolling.
+375 px without horizontal scrolling. Work package C3 adds: the typed waiting reasons in the list,
+detail and attention groups (worker offline, seller cooldown, caps; inquiries paused after a pause),
+the authorization and sender readiness, the dot-signal state of replies, worker credentials
+(expiring, revoked) and the reply-signal cap, the read-only activation evidence with the canary
+never assumed, the candidates audit filter, and a resume whose confirmed suppression count is
+refused by the real server after a concurrent change, shown and confirmed again before a second
+attempt.
 
 `tests/e2e/test_mock_auth.py` (run by `make e2e` first) checks that the backend's real
 `SupabaseJwtVerifier`, fed with the mock's JWKS, accepts the mock's tokens and refuses everything

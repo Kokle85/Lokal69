@@ -15,13 +15,15 @@ from uuid import UUID
 import psycopg
 import pytest
 
-from suv_deals.api.schemas import InquiryListQuery
+from suv_deals.api.inquiry_routes import removable_suppressions
+from suv_deals.api.schemas import CandidateListQuery, InquiryListQuery
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Role, Scope
-from suv_deals.persistence import queries
-from suv_deals.persistence.database import Database
+from suv_deals.persistence import inquiries_repo, queries
+from suv_deals.persistence.database import Database, fetch_one
 from suv_deals.persistence.transactions import unit_of_work
 from tests.db_harness import create_migrated_database, db_available, drop_database
+from tests.e2e import run_backend, v11_actions
 from tests.e2e.seed import seed_e2e
 
 pytestmark = pytest.mark.db
@@ -63,7 +65,16 @@ def _owner(manifest: dict[str, Any]) -> ActorContext:
 async def test_the_v11_world_has_every_state_the_specs_use(seeded: tuple[str, dict[str, Any]]) -> None:
     url, manifest = seeded
     v11 = manifest["v11"]
-    assert set(v11["inquiries"]) == {"suppressed", "replied", "uncertain", "held", "waiting"}
+    assert set(v11["inquiries"]) == {
+        "suppressed",
+        "offline",
+        "replied",
+        "cooldown",
+        "uncertain",
+        "held",
+        "waiting",
+        "killswitch",
+    }
     assert set(v11["replies"]) == {"seller", "quarantined"}
     actor = _owner(manifest)
     db = Database(url, set_role="suv_backend", min_size=1, max_size=2)
@@ -83,11 +94,31 @@ async def test_the_v11_world_has_every_state_the_specs_use(seeded: tuple[str, di
             assert "LANGUAGE_UNRESOLVED" in views["held"].state_reasons
             assert views["waiting"].state == "qualifying"
             assert "RATE_CAP_REACHED" in views["waiting"].state_reasons
+            # Typed waiting reasons, from the stored state and the REAL plan jobs' wait codes.
+            assert v11["wait_codes"] == {
+                "cooldown": "INQUIRY_WAIT_SELLER_COOLDOWN",
+                "waiting": "INQUIRY_WAIT_RATE_CAP_REACHED",
+            }
+            assert {key: view.waiting_reason for key, view in views.items()} == {
+                "suppressed": None,
+                "offline": "WORKER_OFFLINE",
+                "replied": None,
+                "cooldown": "SELLER_COOLDOWN",
+                "uncertain": "UNCERTAIN_DELIVERY",
+                "held": "NEEDS_FACTS",
+                "waiting": "RATE_CAP_REACHED",
+                "killswitch": None,
+            }
+            assert views["offline"].state == "sending" and not views["offline"].delivery_uncertain
+            assert views["killswitch"].state == "suppressed"
+            assert views["killswitch"].suppression_reason == "kill_switch"
+            assert views["cooldown"].seller_entity_id == views["replied"].seller_entity_id
             assert all(view.approval_required is False for view in views.values())
             assert views["replied"].message is not None
             assert views["replied"].message.preview_is_informational is True
 
             seller = (await queries.get_reply(conn, actor, UUID(v11["replies"]["seller"]))).data
+            assert seller.signal_status == "emitted"
             assert seller.claims is not None
             assert set(seller.claims.escalations) == {"payment", "reservation"}
             [quote] = seller.claims.price_quotes
@@ -104,7 +135,8 @@ async def test_the_v11_world_has_every_state_the_specs_use(seeded: tuple[str, di
                 conn, actor, InquiryListQuery(attention_only=True), secret=b"x" * 32, attention_only=True
             )
             assert {str(item.inquiry_id) for item in attention.data.items} >= {
-                v11["inquiries"][key] for key in ("suppressed", "uncertain", "held")
+                v11["inquiries"][key]
+                for key in ("suppressed", "offline", "cooldown", "uncertain", "held", "waiting", "killswitch")
             }
 
             health = await queries.mail_worker_health_view(
@@ -114,6 +146,38 @@ async def test_the_v11_world_has_every_state_the_specs_use(seeded: tuple[str, di
             assert box.worker_label == v11["worker_label"]
             assert box.monitoring_active is False  # the PC looks powered off: a gap, never healthy
             assert box.open_gap_count >= 1
+            [active] = health.data.credentials
+            assert (active.worker_label, active.credential_status) == (v11["worker_label"], "expiring")
+            assert health.data.revoked_mailboxes == 1
+            assert health.data.reply_signals is not None and health.data.reply_signals.emitted >= 1
+            listed = await queries.mail_worker_health_view(
+                conn, actor, include_revoked=True, reconcile_interval=timedelta(seconds=120)
+            )
+            statuses = {
+                c.worker_label: (c.binding_state, c.credential_status) for c in listed.data.credentials
+            }
+            assert statuses[v11["retired_worker_label"]] == ("revoked", "revoked")
+
+            row = await fetch_one(conn, "select now() as now")
+            assert row is not None
+            assert len(await removable_suppressions(conn, actor, row["now"])) == 1
+            control = await inquiries_repo.control_view(conn, actor)
+            assert (control.authorization_status, control.sender_readiness) == ("active", "ready")
+
+            # The screening-rejected audit listing is listed only with the dashboard's audit filter.
+            plain = await queries.list_candidates(
+                conn, actor, CandidateListQuery(limit=100).to_tool_input(), secret=b"x" * 32
+            )
+            audit = await queries.list_candidates(
+                conn,
+                actor,
+                CandidateListQuery(limit=100).to_tool_input(),
+                secret=b"x" * 32,
+                include_screening_rejected=True,
+            )
+            audit_id = UUID(manifest["listings"]["audit_rejected"])
+            assert audit_id not in {item.listing_id for item in plain.data.items}
+            assert audit_id in {item.listing_id for item in audit.data.items}
     finally:
         await db.close()
 
@@ -132,3 +196,72 @@ async def test_only_example_invalid_addresses_are_stored(seeded: tuple[str, dict
             " and state in ('sending', 'delivered', 'uncertain')"
         ).fetchone()
         assert delivered == (0,)
+
+
+async def test_the_kill_switch_action_adds_one_removable_suppression(
+    seeded: tuple[str, dict[str, Any]],
+) -> None:
+    """The Playwright resume-conflict test's concurrent change (``v11_actions``), via the REAL
+    repository: one more removable suppression, no inquiry changes state; a second call is
+    idempotent (per vehicle)."""
+    url, manifest = seeded
+    ws = UUID(manifest["workspace_id"])
+    listing = UUID(manifest["listings"]["rejected"])
+    first = await v11_actions.add_kill_switch_suppression(url, ws, listing)
+    assert first == {"created": True, "removable_suppressions": 2}
+    again = await v11_actions.add_kill_switch_suppression(url, ws, listing)
+    assert again == {"created": False, "removable_suppressions": 2}
+
+
+def test_the_actions_refuse_anything_but_a_loopback_e2e_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_DATABASE_ADMIN_URL", "postgresql://suv:suv@127.0.0.1:5432/postgres")
+    assert "dbname=suv_e2e_0123456789ab" in v11_actions.database_url("suv_e2e_0123456789ab")
+    for name in ("postgres", "suv_test_0123456789ab", "suv_e2e_0123456789ab; drop", "suv_e2e_XYZ"):
+        with pytest.raises(ValueError, match="not an E2E database"):
+            v11_actions.database_url(name)
+    monkeypatch.setenv("TEST_DATABASE_ADMIN_URL", "postgresql://suv:suv@db.example.invalid:5432/postgres")
+    with pytest.raises(ValueError, match="loopback"):
+        v11_actions.database_url("suv_e2e_0123456789ab")
+
+
+#: libpq connection strings that NAME a loopback host but connect elsewhere: ``hostaddr`` is the
+#: address libpq actually dials (``host`` is then only the TLS/auth name), a ``?host=`` query
+#: parameter overrides the URL authority, a service name loads the host from a service file, and a
+#: host list falls through to the next host.
+REDIRECTED_ADMIN_URLS = (
+    "postgresql://suv:suv@127.0.0.1:5432/postgres?hostaddr=10.0.0.5",
+    "postgresql://suv:suv@localhost:5432/postgres?hostaddr=192.0.2.10",
+    "postgresql://suv:suv@127.0.0.1:5432/postgres?host=db.example.invalid",
+    "postgresql://suv:suv@127.0.0.1:5432/postgres?service=suv_remote",
+    "postgresql://suv:suv@127.0.0.1:5432/postgres?servicefile=/tmp/pg_service.conf",
+    "postgresql://suv:suv@127.0.0.1,db.example.invalid:5432/postgres",
+    "host=127.0.0.1 hostaddr=10.0.0.5 dbname=postgres user=suv",
+)
+
+
+@pytest.mark.parametrize("url", REDIRECTED_ADMIN_URLS)
+def test_the_loopback_guards_refuse_a_url_that_connects_elsewhere(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C3 review: both E2E guards (the backend that creates and DROPS a database, and the TEST-ONLY
+    action) must judge where libpq really connects, never a substring of the URL."""
+    assert not v11_actions.loopback_url(url)
+    assert not run_backend._loopback(url)
+    monkeypatch.setenv("TEST_DATABASE_ADMIN_URL", url)
+    with pytest.raises(ValueError, match="loopback"):
+        v11_actions.database_url("suv_e2e_0123456789ab")
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "postgresql://suv:suv@127.0.0.1:5432/postgres",
+        "postgresql://suv:suv@127.0.0.1:5433/postgres",
+        "postgresql://suv:suv@localhost:5432/postgres",
+        "postgresql://suv:suv@127.0.0.1:5432/postgres?hostaddr=127.0.0.1",
+        "postgresql://suv:suv@[::1]:5432/postgres",
+    ),
+)
+def test_the_loopback_guards_accept_a_loopback_cluster(url: str) -> None:
+    assert v11_actions.loopback_url(url)
+    assert run_backend._loopback(url)

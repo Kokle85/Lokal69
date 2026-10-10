@@ -3,11 +3,11 @@
  * seller inquiries, replies, inquiry control, mail-worker health, lags and the 15-day evaluation.
  * Nothing is ever sent: the E2E backend runs no worker and every address is `example.invalid`.
  */
-import { expect, test } from '@playwright/test'
-import { expectNoApproveOrSendControl, expectNoHorizontalScroll, guard, manifest, signIn } from './helpers.ts'
+import { expect, test, type Request } from '@playwright/test'
+import { addKillSwitchSuppression, expectNoApproveOrSendControl, expectNoHorizontalScroll, guard, manifest, signIn } from './helpers.ts'
 
 test.describe('seller inquiries and replies', () => {
-  test('reviewer: attention groups, the caps wait and the list, with no approve or send control', async ({ page }) => {
+  test('reviewer: attention groups by typed waiting reason, the caps wait and the list, with no approve or send control', async ({ page }) => {
     const data = manifest()
     const { problems } = guard(page)
     await signIn(page, 'reviewer')
@@ -19,10 +19,29 @@ test.describe('seller inquiries and replies', () => {
     await expect(page.getByTestId('attention-held')).toContainText(data.v11.references.held)
     await expect(page.getByTestId('attention-suppressed')).toContainText(data.v11.references.suppressed)
     await expect(page.getByTestId('attention-suppressed')).toContainText('seller opted out')
-    const waiting = page.getByTestId('attention-waiting')
-    await expect(waiting).toContainText(data.v11.references.waiting)
-    await expect(waiting).toContainText('The rolling caps are reached (2 of 2 in 24 h')
+    await expect(page.getByTestId('attention-suppressed')).toContainText(data.v11.references.killswitch)
+    await expect(page.getByTestId('attention-suppressed')).toContainText('kill switch')
+    // C3: the server's typed waiting reasons, each its own group (real plan jobs and worker state).
+    const caps = page.getByTestId('attention-wait-RATE_CAP_REACHED')
+    await expect(caps).toContainText(data.v11.references.waiting)
+    await expect(caps).toContainText('The rolling caps are reached (2 of 2 in 24 h')
+    await expect(caps.getByTestId('waiting-reason')).toHaveAttribute('data-reason', 'RATE_CAP_REACHED')
+    const cooldown = page.getByTestId('attention-wait-SELLER_COOLDOWN')
+    await expect(cooldown).toContainText(data.v11.references.cooldown)
+    await expect(cooldown).toContainText('at least 7 days')
+    const offline = page.getByTestId('attention-wait-WORKER_OFFLINE')
+    await expect(offline).toContainText(data.v11.references.offline)
+    await expect(offline).toContainText("classic Outlook on the owner's PC")
+    // Each inquiry is listed once in the attention section (the offline one is waiting, not "stuck").
+    await expect(page.getByTestId('attention-failed')).toHaveCount(0)
+    const attention = page.locator('#attention')
+    for (const key of ['offline', 'cooldown', 'uncertain', 'held', 'waiting', 'killswitch', 'suppressed'] as const) {
+      await expect(attention.getByTestId('inquiry-row').filter({ hasText: data.v11.references[key] })).toHaveCount(1)
+    }
     const list = page.getByRole('table', { name: 'Seller inquiries' })
+    await expect(
+      list.getByTestId('inquiry-row').filter({ hasText: data.v11.references.offline }).getByTestId('waiting-reason'),
+    ).toHaveAttribute('data-reason', 'WORKER_OFFLINE')
     await expect(list.getByRole('link', { name: new RegExp(data.v11.references.replied) })).toBeVisible()
     await expectNoApproveOrSendControl(page)
 
@@ -140,9 +159,15 @@ test.describe('seller inquiries and replies', () => {
     expect(problems).toEqual([])
   })
 
-  test('held and uncertain inquiries explain themselves without any approval wait', async ({ page }) => {
+  test('held, uncertain and waiting inquiries explain themselves without any approval wait', async ({ page }) => {
     const data = manifest()
     await signIn(page, 'reviewer')
+    await page.goto(`/inquiries/${data.v11.inquiries.offline}`)
+    await expect(page.getByTestId('waiting-notice')).toHaveAttribute('data-reason', 'WORKER_OFFLINE')
+    await expect(page.getByTestId('waiting-notice')).toContainText('there is no approval to give and nothing to send by hand')
+    await page.goto(`/inquiries/${data.v11.inquiries.cooldown}`)
+    await expect(page.getByTestId('waiting-notice')).toHaveAttribute('data-reason', 'SELLER_COOLDOWN')
+    await expect(page.locator('#inquiry-status').getByTestId('waiting-reason')).toContainText('seller cooldown')
     await page.goto(`/inquiries/${data.v11.inquiries.held}`)
     await expect(page.getByText('This is not an approval request')).toBeVisible()
     await expect(page.locator('#inquiry-status')).toContainText('LANGUAGE_UNRESOLVED')
@@ -152,7 +177,23 @@ test.describe('seller inquiries and replies', () => {
     await expect(page.getByText('submission uncertain').first()).toBeVisible()
     await page.goto(`/inquiries/${data.v11.inquiries.waiting}`)
     await expect(page.locator('#inquiry-status')).toContainText('RATE_CAP_REACHED')
+    await expect(page.getByTestId('waiting-notice')).toHaveAttribute('data-reason', 'RATE_CAP_REACHED')
     await expectNoApproveOrSendControl(page)
+  })
+
+  test('replies show their dot-signal state (flood control), never message text in the list', async ({ page }) => {
+    const data = manifest()
+    const { problems } = guard(page)
+    await signIn(page, 'reviewer')
+    await page.goto('/replies')
+    const rows = page.getByRole('table', { name: 'Seller replies' }).getByTestId('reply-row')
+    await expect(rows).toHaveCount(2)
+    await expect(rows.getByTestId('signal-status').first()).toBeVisible()
+    await page.goto(`/replies/${data.v11.replies.seller}`)
+    await expect(page.locator('#reply-message').getByTestId('signal-status')).toHaveAttribute('data-signal', 'emitted')
+    await expect(page.getByTestId('signal-rate-limited')).toHaveCount(0)
+    await expectNoApproveOrSendControl(page)
+    expect(problems).toEqual([])
   })
 
   test('a viewer has no seller-inquiry area', async ({ page }) => {
@@ -191,6 +232,42 @@ test.describe('mail workers, lags and evaluation', () => {
     await expect(gap).toContainText('worker offline')
     await expect(gap).toContainText('still open')
     await expect(page.getByText(/^monitoring$/)).toHaveCount(0)
+    expect(problems).toEqual([])
+  })
+
+  test('health: worker credentials, revoked workers, the reply-signal cap and the read-only activation evidence', async ({ page }) => {
+    const data = manifest()
+    const { problems, apiRequests } = guard(page)
+    await signIn(page, 'reviewer')
+    await page.goto('/mail-workers')
+    // The active worker's credential expires within the 14-day notice; the retired one is counted.
+    const active = page.getByTestId('credential-row').filter({ hasText: data.v11.worker_label })
+    await expect(active).toHaveAttribute('data-status', 'expiring')
+    await expect(page.getByTestId('mailbox-card').getByTestId('credential-status')).toHaveAttribute('data-status', 'expiring')
+    await expect(page.getByTestId('revoked-mailboxes')).toContainText('1 revoked mail worker(s) are not listed')
+    await expect(page.getByTestId('credentials-not-live')).toHaveCount(0)
+    const signals = page.getByTestId('reply-signals')
+    await expect(signals.getByTestId('signal-cap')).toContainText('per 24 h PROPOSED')
+    await expect(signals).toContainText('Signals emitted')
+    // Activation evidence: what the API reports; the canary is never assumed and has no control.
+    await expect(page.locator('[data-testid="activation-row"][data-evidence="sender"]')).toHaveAttribute('data-state', 'done')
+    await expect(page.locator('[data-testid="activation-row"][data-evidence="authorization"]')).toHaveAttribute('data-state', 'done')
+    await expect(page.locator('[data-testid="activation-row"][data-evidence="runtime"]')).toHaveAttribute('data-state', 'open')
+    await expect(page.locator('[data-testid="activation-row"][data-evidence="canary"]')).toHaveAttribute('data-state', 'not_shown')
+    await expect(page.getByTestId('canary-evidence')).toContainText('never assumed')
+    const activation = page.locator('#activation-evidence')
+    await expect(activation.getByRole('button')).toHaveCount(0)
+    await expect(activation.getByRole('link')).toHaveCount(0)
+
+    // On request the revoked worker is listed, with its revoked credential.
+    await page.getByLabel(/include revoked/).check()
+    const retired = page.locator('section', { has: page.getByRole('heading', { name: data.v11.retired_worker_label }) })
+    await expect(retired.getByTestId('mailbox-revoked')).toContainText('can never upload replies or claim sends again')
+    await expect(page.getByTestId('credential-row').filter({ hasText: data.v11.retired_worker_label })).toHaveAttribute('data-status', 'revoked')
+    await expect(page.locator('main')).not.toContainText('suvmail_')
+    await expectNoApproveOrSendControl(page)
+    // Only reads.
+    expect(apiRequests.filter((request: Request) => request.method() !== 'GET')).toEqual([])
     expect(problems).toEqual([])
   })
 
@@ -267,6 +344,13 @@ test.describe('inquiry control', () => {
     await signIn(page, 'reviewer')
     await page.goto('/inquiry-control')
     await expect(page.getByTestId('control-approval')).toContainText('no per-message approval')
+    // C3: the readiness of the standing authorization and of the CONFIGURED sending identity.
+    await expect(page.getByTestId('authorization-status')).toHaveAttribute('data-status', 'active')
+    await expect(page.getByTestId('authorization-status')).toContainText('version 1')
+    await expect(page.getByTestId('sender-readiness')).toHaveAttribute('data-readiness', 'ready')
+    await expect(page.getByTestId('sender-readiness')).toContainText('outlook local')
+    await expect(page.getByTestId('sending-state')).toContainText('the standing authorization is active and the configured sender is ready')
+    await expect(page.locator('main')).not.toContainText('@example.invalid')
     await expect(page.getByText(/Your role cannot pause seller inquiries/)).toBeVisible()
     await expect(page.getByRole('button', { name: /Pause seller inquiries|Resume seller inquiries/ })).toHaveCount(0)
   })
@@ -310,11 +394,64 @@ test.describe('inquiry control', () => {
     // The inquiry list reflects the pause; resume is a separate owner decision.
     await page.goto('/inquiries')
     await expect(page.getByTestId('control-summary')).toContainText('kill switch on')
+    // Every untransmitted inquiry now waits for the owner's resume (typed by the server).
+    const paused = page.getByTestId('attention-wait-INQUIRIES_PAUSED')
+    await expect(paused).toContainText(manifest().v11.references.waiting)
+    await expect(paused).toContainText(manifest().v11.references.cooldown)
+    await expect(page.getByTestId('attention-wait-RATE_CAP_REACHED')).toHaveCount(0)
     await page.goto('/inquiry-control')
     await page.getByLabel(/Resume reason/).fill('SYNTHETIC E2E: check finished')
     await page.getByRole('button', { name: 'Resume seller inquiries' }).click()
     await expect(page.getByTestId('resume-confirmed')).toContainText('Seller inquiries resumed')
     await expect(page.getByTestId('sending-state')).toContainText('These controls allow automatic inquiries')
+    await expectNoApproveOrSendControl(page)
+    expect(problems).toEqual([])
+  })
+
+  test('owner: a resume removes only the suppressions the owner confirmed; a changed count is refused and shown first', async ({ page }) => {
+    const { problems } = guard(page)
+    const resumes: Array<{ key: string | undefined; body: Record<string, unknown> }> = []
+    page.on('request', (request) => {
+      if (request.url().endsWith('/api/inquiry-control/resume') && request.method() === 'POST') {
+        resumes.push({ key: request.headers()['idempotency-key'], body: JSON.parse(request.postData() ?? '{}') as Record<string, unknown> })
+      }
+    })
+    await signIn(page, 'owner')
+    await page.goto('/inquiry-control')
+    // Kill switch off, but kill-switch suppressions are still active: the owner can re-qualify.
+    const form = page.getByTestId('resume-form')
+    await expect(form).toBeVisible()
+    const box = form.getByRole('checkbox', { name: /Also remove the \d+ kill-switch/ })
+    const shown = Number(/Also remove the (\d+)/.exec((await form.locator('label.checkbox').textContent()) ?? '')?.[1])
+    expect(shown).toBeGreaterThan(0)
+    await form.getByLabel(/Resume reason/).fill('SYNTHETIC E2E: re-qualify what the kill switch stopped')
+    await box.check()
+
+    // Meanwhile one more kill-switch suppression is recorded on the server (real repository).
+    expect(addKillSwitchSuppression()).toBe(shown + 1)
+
+    await page.getByRole('button', { name: 'Re-qualify suppressed inquiries' }).click()
+    const rejected = page.getByTestId('mutation-rejected')
+    await expect(rejected).toContainText('The suppressions a resume would remove changed')
+    await expect(rejected).toContainText(`You confirmed removing ${shown} suppression(s), but the server now counts ${shown + 1}`)
+    await expect(rejected.getByTestId('error-reason')).toHaveText('suppressions_changed')
+    // The controls were reloaded: the NEW count is shown and must be confirmed before anything else.
+    await expect(page.getByTestId('suppressions-changed')).toContainText(`you confirmed ${shown}, the current count is ${shown + 1}`)
+    await expect(page.getByTestId('removal-count-moved')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Re-qualify suppressed inquiries' })).toBeDisabled()
+    await expect(form.locator('label.checkbox')).toContainText(`Also remove the ${shown + 1} kill-switch`)
+    expect(resumes).toHaveLength(1)
+
+    await box.uncheck()
+    await box.check()
+    await page.getByRole('button', { name: 'Re-qualify suppressed inquiries' }).click()
+    await expect(page.getByTestId('resume-confirmed')).toContainText(`${shown + 1} suppression(s) removed, each audited.`)
+    expect(resumes).toHaveLength(2)
+    expect(resumes[0]!.body).toMatchObject({ remove_suppressions: true, expected_removable_suppressions: shown })
+    expect(resumes[1]!.body).toMatchObject({ remove_suppressions: true, expected_removable_suppressions: shown + 1 })
+    expect(resumes[0]!.key).not.toBe(resumes[1]!.key)
+    // Nothing left to remove and the kill switch is off: no resume action remains.
+    await expect(page.getByTestId('resume-form')).toHaveCount(0)
     await expectNoApproveOrSendControl(page)
     expect(problems).toEqual([])
   })

@@ -16,7 +16,10 @@ answer with the shared ``ResponseEnvelope``.
   expected version, a reason and an idempotency key, and optionally removes (each one audited) the
   active ``kill_switch`` suppressions and, while the current standing authorization is effective,
   the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint, ...) are never
-  removed here.
+  removed here. ``expected_removable_suppressions`` (the count the owner saw in the control view)
+  is compared under the controls lock: a different count refuses the whole resume (``409
+  VERSION_CONFLICT``, ``details.reason = suppressions_changed``), so only the suppressions the owner
+  saw are removed. The control view's sender readiness describes the CONFIGURED sending identity.
 - Mail-worker health and coverage gaps (``inquiries:read``): separate health dimensions per
   mailbox worker; a gap is never hidden.
 - Lifecycle and lags (``deals:read``): separate scan/notification/mail lags; unknown is never zero.
@@ -47,6 +50,7 @@ from suv_deals.api.deps import (
 )
 from suv_deals.api.errors import JSON_MEDIA_TYPE
 from suv_deals.api.schemas import (
+    MAX_REMOVABLE_SUPPRESSIONS,
     V11_ROUTE_INDEX,
     ApiRoute,
     EvaluationQuery,
@@ -133,8 +137,11 @@ def _replay_error(code: str) -> AppError:
 
 async def removable_suppressions(conn: Conn, actor: ActorContext, now: datetime) -> list[SuppressionRow]:
     """Active suppressions a resume may remove: ``kill_switch`` ones, and ``authorization_revoked``
-    ones while the current standing authorization is effective (``inquiries:read``)."""
-    rows = await inquiries_repo.active_suppressions(conn, actor)
+    ones while the current standing authorization is effective (``inquiries:read``).
+
+    Listed up to ``MAX_REMOVABLE_SUPPRESSIONS`` (the repository's bound), so the count the control
+    view shows, the count a resume compares and the rows it removes are the same set."""
+    rows = await inquiries_repo.active_suppressions(conn, actor, limit=MAX_REMOVABLE_SUPPRESSIONS)
     authorization = await inquiries_repo.current_authorization(conn, actor)
     authorized = authorization is not None and not authorization.authorization.problems_at(now)
     return [

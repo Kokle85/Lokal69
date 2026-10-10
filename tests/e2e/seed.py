@@ -18,6 +18,8 @@
   ``xss``      eligible_primary whose title, description, fault list and provenance text are XSS /
                prompt-injection payloads (must render inert), pending case;
   ``rejected`` 200,000 km: rejected by screening (MILEAGE_TOO_HIGH) and by a reviewer decision;
+  ``audit_rejected`` rejected by screening only (no review case): not a candidate, listed only by
+               the dashboard's audit filter ``include_screening_rejected``;
   ``net_only`` net-only price: needs_facts (PRICE_BASIS_NET_ONLY, gross price missing);
   ``paused``   on the paused source with a ``watch`` decision;
 - the spec v1.1 world (``tests/e2e/seed_v11.py``): inquiry controls, standing authorization, a
@@ -103,6 +105,7 @@ TITLES = {
     "golf": "SYNTHETIC E2E Golf Trail 2.0 TDI",
     "xss": XSS_TITLE,
     "rejected": "SYNTHETIC E2E Rejected Trail 200,000 km",
+    "audit_rejected": "SYNTHETIC E2E Screening-rejected Trail (audit only)",
     "net_only": "SYNTHETIC E2E Net-only Trail (price excl. VAT)",
     "paused": "SYNTHETIC E2E Paused-source Trail",
 }
@@ -434,6 +437,19 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
         mileage="200000",
     )
     _screen(seed, data.workspace_id, rejected, _rejected_mileage(), now)
+    # Screening-rejected without a review case: kept for audit, never a candidate (spec 11).
+    audit_rejected, audit_rejected_revs = _listing(
+        seed,
+        data.workspace_id,
+        running,
+        running_key,
+        title=TITLES["audit_rejected"],
+        now=now,
+        created_at=created(45),
+        prices=((255000, "EUR"),),
+        mileage="200000",
+    )
+    _screen(seed, data.workspace_id, audit_rejected, _rejected_mileage(), now)
     net_only, net_revs = _listing(
         seed,
         data.workspace_id,
@@ -459,8 +475,10 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
         country="IT",
     )
     _screen(seed, data.workspace_id, paused, _eligible("2950.00"), now)
-    data.listings.update(rejected=rejected, net_only=net_only, paused=paused)
-    data.revisions.update(rejected=rejected_revs, net_only=net_revs, paused=paused_revs)
+    data.listings.update(rejected=rejected, audit_rejected=audit_rejected, net_only=net_only, paused=paused)
+    data.revisions.update(
+        rejected=rejected_revs, audit_rejected=audit_rejected_revs, net_only=net_revs, paused=paused_revs
+    )
 
     ws = data.workspace_id
     alpha, alpha_rev = data.listings["alpha"], data.revisions["alpha"][-1]

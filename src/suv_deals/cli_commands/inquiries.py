@@ -17,11 +17,14 @@
     Workspace controls. ``authorize`` creates the controls row and records the owner's versioned
     standing authorization (an audit record, never a message approval); ``set-mode`` and
     ``set-limits`` change mode and the owner-reducible ceilings (expected version, reason;
-    ``automatic`` only with an active authorization and a usable sender binding);
+    ``automatic`` only with an active authorization and a usable sender binding that is exactly
+    the configured identity);
     ``pause`` activates the kill switch (reason + expected version);
     ``resume`` clears it (owner action; optionally removing kill-switch/authorization-revoked
     suppressions, each audited, which needs ``--owner-user-id`` because suppressions are never
-    removed by a system principal).
+    removed by a system principal, and ``--expected-suppressions N``: the count the owner saw in
+    ``inquiries status``; a different current count refuses the whole resume, so only the
+    suppressions the owner saw are removed).
 ``evaluation report --days 15``
     The 15-day quality evaluation from stored evidence (zero is reported as zero).
 
@@ -34,7 +37,7 @@ than the one just issued, or prints a mailbox address (only its domain).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
 
 import click
@@ -55,6 +58,10 @@ from suv_deals.cli_commands._common import (
     workspace_option,
 )
 from suv_deals.cli_commands.credentials import parse_expires
+
+#: Upper bound of ``inquiries resume --expected-suppressions`` (equal to
+#: ``api.schemas.MAX_REMOVABLE_SUPPRESSIONS``; kept local so ``--help`` stays fast, a test pins it).
+MAX_REMOVABLE_SUPPRESSIONS: Final = 5000
 
 if TYPE_CHECKING:
     from suv_deals.domain.actor import ActorContext
@@ -651,37 +658,71 @@ def inquiries_set_mode(
     cli: CliContext, mode: str, *, workspace: UUID | None, reason: str, expected_version: int, yes: bool
 ) -> None:
     """Workspace mode. ``automatic`` lets the pipeline send under the standing authorization once
-    every technical prerequisite holds (the kill switch is a separate control)."""
+    every technical prerequisite holds (the kill switch is a separate control).
+
+    ``automatic`` is checked against the CONFIGURED sender binding (``SELLER_EMAIL_PROVIDER`` /
+    ``_ACCOUNT_ID`` / ``_FROM`` / ``_REPLY_TO``; `workers.inquiry_handlers.configured_sender_binding`),
+    never merely the newest binding: without a binding of the configured provider, or when that
+    provider's binding is not exactly the configured identity, it is refused (the identity codes are
+    the control view's ``sender_identity_*`` codes, never a value). Every missing technical
+    prerequisite is listed by code (`inquiries_repo.AutomaticModePrerequisitesMissing`; exit 3,
+    nothing changed)."""
     settings = load_settings(cli)
     require_yes(yes, "inquiries set-mode")
 
     async def body() -> int:
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
+        from suv_deals.clock import ensure_utc
         from suv_deals.persistence import inquiries_repo
+        from suv_deals.persistence.database import db_now
         from suv_deals.persistence.transactions import unit_of_work
+        from suv_deals.workers.inquiry_handlers import configured_sender_binding, configured_sender_problems
 
         async with open_database(settings, application_name="suv-deals-cli") as db:
             workspace_id = await resolve_workspace(db, workspace)
             actor = operator_actor(workspace_id, "inquiries-set-mode", admin=True)
-            async with unit_of_work(db, actor) as conn:
-                if mode == "automatic":
-                    data = await _status_data(conn, actor, settings)
-                    missing = [
-                        name
-                        for name, ok in (
-                            ("authorization", data["authorization"] == "active"),
-                            ("sender_binding", data["sender_binding"] == "usable"),
+            try:
+                async with unit_of_work(db, actor) as conn:
+                    sender = await configured_sender_binding(conn, actor, settings)
+                    if mode == "automatic":
+                        # No binding of the CONFIGURED provider (never fall back to another one), or
+                        # its binding is not exactly the configured identity (the runtime never
+                        # sends from it): refused like any other missing prerequisite, all named.
+                        identity = (
+                            ["sender_binding_missing"]
+                            if sender is None
+                            else [
+                                f"sender_identity_{code.lower()}"
+                                for code in configured_sender_problems(settings, sender)
+                                if code != "SENDER_BINDING_MISSING"
+                            ]
                         )
-                        if not ok
-                    ]
-                    if missing:
-                        fail(f"automatic needs a usable {' and '.join(missing)} first", EXIT_REFUSED)
-                controls = await inquiries_repo.set_mode(
-                    conn,
-                    actor,
-                    expected_version=expected_version,
-                    mode=cast("SenderMode", mode),
-                    reason=reason,
+                        if identity:
+                            now = ensure_utc(await db_now(conn))
+                            authorization = await inquiries_repo.current_authorization(conn, actor)
+                            others = [
+                                *([] if sender is None else inquiries_repo.sender_binding_problems(sender)),
+                                *inquiries_repo.authorization_problems(authorization, now),
+                            ]
+                            raise inquiries_repo.AutomaticModePrerequisitesMissing(
+                                list(dict.fromkeys([*identity, *others]))
+                            )
+                    controls = await inquiries_repo.set_mode(
+                        conn,
+                        actor,
+                        expected_version=expected_version,
+                        mode=cast("SenderMode", mode),
+                        reason=reason,
+                        sender_binding_id=None if sender is None else sender.id,
+                    )
+            except inquiries_repo.AutomaticModePrerequisitesMissing as exc:
+                missing = [str(code) for code in (exc.details or {}).get("missing", [])]
+                for code in missing:
+                    echo(f"  missing: {code}")
+                fail(
+                    "automatic needs every technical prerequisite first (nothing changed): "
+                    + ", ".join(missing),
+                    EXIT_REFUSED,
                 )
         switch = "on" if controls.kill_switch else "off"
         echo(f"Mode {controls.mode} (version {controls.version}); kill switch {switch}.")
@@ -764,7 +805,7 @@ def inquiries_set_limits(
     run_async(body)
 
 
-async def _owner_actor(conn: Conn, workspace_id: UUID, user_id: UUID, purpose: str) -> ActorContext:
+async def owner_actor_for(conn: Conn, workspace_id: UUID, user_id: UUID, purpose: str) -> ActorContext:
     """The signed-in owner's actor (``--owner-user-id`` must be an ACTIVE owner of the workspace)."""
     from uuid import uuid4
 
@@ -796,6 +837,16 @@ async def _owner_actor(conn: Conn, workspace_id: UUID, user_id: UUID, purpose: s
     help="Also remove kill-switch (and, while authorized, authorization-revoked) suppressions; each audited.",
 )
 @click.option(
+    "--expected-suppressions",
+    "expected_suppressions",
+    type=click.IntRange(0, MAX_REMOVABLE_SUPPRESSIONS),
+    default=None,
+    help=(
+        "Required with --remove-suppressions: the removable_suppressions count shown by"
+        " `inquiries status`. A different current count refuses the whole resume (nothing changes)."
+    ),
+)
+@click.option(
     "--owner-user-id",
     type=click.UUID,
     default=None,
@@ -810,49 +861,65 @@ def inquiries_resume(
     reason: str,
     expected_version: int,
     remove_suppressions: bool,
+    expected_suppressions: int | None,
     owner_user_id: UUID | None,
     yes: bool,
 ) -> None:
-    """Clear the kill switch (owner action); nothing is sent by the resume itself."""
+    """Clear the kill switch (owner action); nothing is sent by the resume itself.
+
+    With ``--remove-suppressions`` the owner names the count of removable suppressions they saw
+    (``--expected-suppressions``, from ``inquiries status``): the resume, the count check and every
+    removal run in ONE transaction after the controls lock (`api.inquiry_routes.resume_inquiries`,
+    the dashboard's rule), so only the suppressions the owner saw are ever removed."""
     if remove_suppressions and owner_user_id is None:
         fail(
             "--remove-suppressions needs --owner-user-id (suppressions are removed by the owner)", EXIT_USAGE
         )
+    if remove_suppressions and expected_suppressions is None:
+        fail(
+            "--remove-suppressions needs --expected-suppressions N (the removable_suppressions count"
+            " shown by `inquiries status`)",
+            EXIT_USAGE,
+        )
+    if expected_suppressions is not None and not remove_suppressions:
+        fail("--expected-suppressions only applies with --remove-suppressions", EXIT_USAGE)
     settings = load_settings(cli)
     require_yes(yes, "inquiries resume")
 
     async def body() -> int:
-        from suv_deals.api.inquiry_routes import removable_suppressions
+        from suv_deals.api.inquiry_routes import SuppressionsChanged, resume_inquiries
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
-        from suv_deals.clock import ensure_utc
-        from suv_deals.persistence import inquiries_repo
-        from suv_deals.persistence.database import db_now
         from suv_deals.persistence.transactions import unit_of_work
 
         async with open_database(settings, application_name="suv-deals-cli") as db:
             workspace_id = await resolve_workspace(db, workspace)
             system = operator_actor(workspace_id, "inquiries-resume", admin=True)
-            removed = 0
             async with unit_of_work(db, system) as conn:
                 actor = (
                     system
                     if owner_user_id is None
-                    else await _owner_actor(conn, workspace_id, owner_user_id, "inquiries-resume")
+                    else await owner_actor_for(conn, workspace_id, owner_user_id, "inquiries-resume")
                 )
-            async with unit_of_work(db, actor) as conn:
-                result = await inquiries_repo.resume(
-                    conn, actor, expected_version=expected_version, reason=reason
+            try:
+                async with unit_of_work(db, actor) as conn:
+                    result = await resume_inquiries(
+                        conn,
+                        actor,
+                        expected_version=expected_version,
+                        reason=reason,
+                        remove_suppressions=remove_suppressions,
+                        expected_removable=expected_suppressions,
+                    )
+            except SuppressionsChanged as exc:
+                current = (exc.details or {}).get("current_removable_suppressions")
+                fail(
+                    f"refused: {current} removable suppression(s) now, {expected_suppressions} expected;"
+                    " nothing changed (check `inquiries status` and decide again)",
+                    EXIT_PROBLEMS,
                 )
-                if remove_suppressions:
-                    now = ensure_utc(await db_now(conn))
-                    for row in await removable_suppressions(conn, actor, now):
-                        await inquiries_repo.remove_suppression(
-                            conn, actor, row.id, reason=f"resume: {reason}"
-                        )
-                        removed += 1
         echo(f"Resumed (version {result.version}, mode {result.mode}).")
         if remove_suppressions:
-            echo(f"Removed {removed} suppression(s) (each audited).")
+            echo(f"Removed {result.suppressions_removed} suppression(s) (each audited).")
         return 0
 
     run_async(body)
@@ -916,9 +983,11 @@ def evaluation_report(cli: CliContext, workspace: UUID | None, days: int, as_jso
 
 
 __all__ = [
+    "MAX_REMOVABLE_SUPPRESSIONS",
     "address_domain",
     "evaluation_group",
     "inquiries_group",
     "mail_worker_group",
+    "owner_actor_for",
     "sender_binding_group",
 ]

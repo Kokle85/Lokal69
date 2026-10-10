@@ -24,5 +24,7 @@ comparable_max_age_days: 90
 comparable_min_sample: 3
 # Negotiation discount from MK asking to realized proceeds: UNKNOWN until Vasko supplies one.
 negotiation_discount_pct: null
-# PROPOSED review claim duration.
+# DEPRECATED and IGNORED: the review claim lease is the process setting
+# REVIEW_CLAIM_DURATION_SECONDS (.env). Kept only so stored configuration revisions keep
+# their canonical hash; changing it here has no effect.
 claim_duration_seconds: 300

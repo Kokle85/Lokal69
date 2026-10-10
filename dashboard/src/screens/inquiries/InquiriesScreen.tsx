@@ -2,10 +2,12 @@ import { useState, type FormEvent } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import {
   INQUIRY_STATES,
+  WAITING_REASONS,
   type InquiryControlView,
   type InquiryListQuery,
   type InquiryState,
   type InquirySummaryView,
+  type WaitingReason,
 } from '../../api/types'
 import { Badge, EmptyState, ErrorPanel, LoadingState, Notice, Section, Timestamp, ViewMeta, Warnings } from '../../components/ui'
 import { label } from '../../format'
@@ -21,6 +23,9 @@ import {
   StandingAuthorizationNote,
   suppressionText,
   vehicleText,
+  WaitingReasonBadge,
+  waitingReasonHelp,
+  waitingReasonLabel,
 } from './shared'
 
 function filtersFrom(params: URLSearchParams): InquiryListQuery {
@@ -136,6 +141,7 @@ export function InquiryTable({ items, timeZone, caption }: { items: InquirySumma
         <tr>
           <th scope="col">Vehicle</th>
           <th scope="col">State</th>
+          <th scope="col">Waiting for</th>
           <th scope="col">Language</th>
           <th scope="col">Recipient</th>
           <th scope="col">Replies</th>
@@ -156,6 +162,9 @@ export function InquiryTable({ items, timeZone, caption }: { items: InquirySumma
               <InquiryStateBadge state={item.state} />
               {item.delivery_uncertain ? <Badge tone="warn">delivery uncertain</Badge> : null}
               {item.suppression_reason ? <span className="muted small"> {suppressionText(item.suppression_reason)}</span> : null}
+            </td>
+            <td data-label="Waiting for">
+              <WaitingReasonBadge reason={item.waiting_reason} />
             </td>
             <td data-label="Language">{item.language ?? <span className="muted">not resolved</span>}</td>
             <td data-label="Recipient">
@@ -185,34 +194,63 @@ interface AttentionGroup {
   items: InquirySummaryView[]
 }
 
+/** Waiting reasons shown in their own groups (uncertain delivery and missing facts have theirs). */
+const WAIT_GROUP_REASONS: readonly WaitingReason[] = WAITING_REASONS.filter(
+  (reason) => reason !== 'UNCERTAIN_DELIVERY' && reason !== 'NEEDS_FACTS',
+)
+
+function isUncertain(item: InquirySummaryView): boolean {
+  return item.state === 'uncertain' || item.delivery_uncertain || item.waiting_reason === 'UNCERTAIN_DELIVERY'
+}
+
+/**
+ * The attention list grouped by what the owner should know: an uncertain outcome first, then held
+ * for facts, then each typed waiting reason (caps, cooldown, pause, worker offline, sender setup,
+ * held send), suppressed, failed or stuck, and anything else the server flagged. Each inquiry is
+ * shown once.
+ */
 function attentionGroups(items: InquirySummaryView[]): AttentionGroup[] {
   const groups: AttentionGroup[] = [
     {
       key: 'uncertain',
       title: 'Uncertain send outcome',
       help: 'May have reached the provider: held for reconciliation with positive evidence, never resent blindly.',
-      items: items.filter((item) => item.state === 'uncertain' || item.delivery_uncertain),
+      items: items.filter(isUncertain),
     },
     {
       key: 'held',
       title: 'Held for facts or technical checks',
       help: 'Recipient, language or other facts are not established yet; this is not an approval wait.',
-      items: items.filter((item) => item.state === 'held_facts' && !item.delivery_uncertain),
+      items: items.filter((item) => !isUncertain(item) && (item.state === 'held_facts' || item.waiting_reason === 'NEEDS_FACTS')),
     },
+  ]
+  const placed = () => new Set(groups.flatMap((group) => group.items.map((item) => item.inquiry_id)))
+  for (const reason of WAIT_GROUP_REASONS) {
+    const taken = placed()
+    groups.push({
+      key: `wait-${reason}`,
+      title: `Waiting: ${waitingReasonLabel(reason)}`,
+      help: waitingReasonHelp(reason),
+      items: items.filter((item) => !taken.has(item.inquiry_id) && item.waiting_reason === reason),
+    })
+  }
+  const taken = placed()
+  groups.push(
     {
       key: 'suppressed',
       title: 'Suppressed',
       help: 'Will not be sent (opt-out, bounce, kill switch, contradictory availability, ...).',
-      items: items.filter((item) => item.state === 'suppressed' && !item.delivery_uncertain),
+      items: items.filter((item) => !taken.has(item.inquiry_id) && item.state === 'suppressed'),
     },
     {
       key: 'failed',
       title: 'Failed or stuck',
       help: 'Definite failures and attempts that are still marked as sending.',
-      items: items.filter((item) => (item.state === 'failed_definite' || item.state === 'sending') && !item.delivery_uncertain),
+      items: items.filter((item) => !taken.has(item.inquiry_id) && (item.state === 'failed_definite' || item.state === 'sending')),
     },
-  ]
-  const known = new Set(groups.flatMap((group) => group.items.map((item) => item.inquiry_id)))
+  )
+  const known = placed()
+  // Any waiting reason this dashboard does not know yet still shows in its own typed form.
   const other = items.filter((item) => !known.has(item.inquiry_id))
   if (other.length) groups.push({ key: 'other', title: 'Other', help: 'Other inquiries the server flagged for attention.', items: other })
   return groups
@@ -226,6 +264,9 @@ function AttentionSection({ timeZone }: { timeZone: string }) {
   const attention = useApiQuery((api, signal) => api.inquiries({ attention_only: true, limit: 100 }, { signal }), [])
   const waiting = useApiQuery((api, signal) => api.inquiries({ state: 'qualifying', limit: 100 }, { signal }), [])
   const control = useApiQuery((api, signal) => api.inquiryControl({ signal }), [])
+  // Qualified inquiries the attention list does not show already (no reported waiting reason).
+  const flagged = new Set((attention.data?.items ?? []).map((item) => item.inquiry_id))
+  const waitingUnlisted = (waiting.data?.items ?? []).filter((item) => !flagged.has(item.inquiry_id) && item.waiting_reason === null)
   return (
     <Section title="Needs attention" id="attention">
       <ControlSummary control={control.data} error={control.error} loading={control.status === 'loading'} />
@@ -233,7 +274,7 @@ function AttentionSection({ timeZone }: { timeZone: string }) {
       {attention.error ? <ErrorPanel error={attention.error} onRetry={attention.reload} /> : null}
       {attention.data ? (
         attention.data.items.length === 0 ? (
-          <EmptyState>No uncertain, held, suppressed, failed or stuck inquiries.</EmptyState>
+          <EmptyState>No uncertain, held, waiting, suppressed, failed or stuck inquiries.</EmptyState>
         ) : (
           attentionGroups(attention.data.items)
             .filter((group) => group.items.length > 0)
@@ -243,6 +284,15 @@ function AttentionSection({ timeZone }: { timeZone: string }) {
                   {group.title} ({group.items.length})
                 </h3>
                 <p className="muted small">{group.help}</p>
+                {group.key === 'wait-RATE_CAP_REACHED' && control.data && capsReached(control.data) ? (
+                  <Notice tone="warn">
+                    <span data-testid="caps-reached">
+                      The rolling caps are reached ({control.data.used_24h} of {control.data.max_per_24h} in 24 h,{' '}
+                      {control.data.used_15d} of {control.data.max_per_15d} in 15 days): these inquiries wait for the window to
+                      free. Nothing is sent until then, and the caps are ceilings, not targets.
+                    </span>
+                  </Notice>
+                ) : null}
                 <InquiryTable items={group.items} timeZone={timeZone} caption={group.title} />
               </div>
             ))
@@ -254,22 +304,18 @@ function AttentionSection({ timeZone }: { timeZone: string }) {
         </p>
       ) : null}
       {waiting.error ? <ErrorPanel error={waiting.error} onRetry={waiting.reload} /> : null}
-      {waiting.data && waiting.data.items.length > 0 ? (
+      {waitingUnlisted.length > 0 || waiting.envelope?.next_cursor ? (
         <div className="attention-group" data-testid="attention-waiting">
-          <h3>Qualified and waiting ({waiting.data.items.length})</h3>
-          {control.data && capsReached(control.data) ? (
-            <Notice tone="warn">
-              The rolling caps are reached ({control.data.used_24h} of {control.data.max_per_24h} in 24 h,{' '}
-              {control.data.used_15d} of {control.data.max_per_15d} in 15 days): these qualified inquiries wait for the window to
-              free. Nothing is sent until then, and the caps are ceilings, not targets.
-            </Notice>
+          <h3>Qualified, not reserved yet ({waitingUnlisted.length})</h3>
+          <p className="muted small">
+            Qualified inquiries without a reported waiting reason: they are reserved automatically once planning runs and the
+            rolling caps, the seller cooldown and the pause allow it.
+          </p>
+          {waitingUnlisted.length > 0 ? (
+            <InquiryTable items={waitingUnlisted} timeZone={timeZone} caption="Qualified, not reserved yet" />
           ) : (
-            <p className="muted small">
-              Qualified inquiries are reserved automatically once the rolling caps, the seller cooldown and the pause allow it;
-              the detail page names the exact waiting reason.
-            </p>
+            <p className="muted small">The qualified inquiries of this page are listed above with their waiting reason.</p>
           )}
-          <InquiryTable items={waiting.data.items} timeZone={timeZone} caption="Qualified and waiting" />
           {waiting.envelope?.next_cursor ? (
             <p className="muted small">
               More qualified inquiries are waiting: <Link to="/inquiries?state=qualifying">show them all</Link>.

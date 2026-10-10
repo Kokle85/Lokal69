@@ -132,7 +132,8 @@ def jobs_unblock(
     """Move a blocked job back to queued (audited; the uncertain-delivery case is an owner decision)."""
     if acknowledge_uncertain_delivery and owner_user_id is None:
         fail(
-            "--acknowledge-uncertain-delivery needs --owner-user-id (an owner decision, audited as the owner)",
+            "--acknowledge-uncertain-delivery needs --owner-user-id"
+            " (an owner decision, audited as the owner)",
             EXIT_USAGE,
         )
     settings = load_settings(cli)

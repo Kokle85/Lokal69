@@ -184,7 +184,7 @@ def normalized(
             gearbox=Gearbox.AUTOMATIC,
             drive=Drive.AWD,
             body_type=BodyType.SUV,
-            first_registration=PartialDate(value="2012-05", precision="month"),  # type: ignore[arg-type]
+            first_registration=PartialDate(value="2012-05", precision="month"),
             mileage_km=Decimal(mileage),
             mileage_claim=OdometerClaim.SELLER_REPORTED,
             engine_displacement_cm3=1995,
@@ -201,7 +201,7 @@ def normalized(
         source_published_at=SourceTimestamp(
             value=observed_at - timedelta(days=10),
             raw="SYNTHETIC published",
-            precision="day",  # type: ignore[arg-type]
+            precision="day",
         ),
         description_excerpt=INJECTION_TEXT,
         provenance={
@@ -547,7 +547,7 @@ def _observation(source_key: str, amount: str, *, model: str = "Trail") -> Marke
             fuel=Fuel.DIESEL,
             gearbox=Gearbox.AUTOMATIC,
             drive=Drive.AWD,
-            first_registration=PartialDate(value="2012", precision="year"),  # type: ignore[arg-type]
+            first_registration=PartialDate(value="2012", precision="year"),
             mileage_km=Decimal("180000"),
         ),
         local_registration_status="locally_registered",

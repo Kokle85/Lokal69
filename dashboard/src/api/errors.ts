@@ -115,6 +115,44 @@ export function guardReason(error: ApiError): string | null {
 }
 
 /**
+ * The typed reason of a TRANSIENT conflict (`errors_map.TransientConflict`, contract section 3):
+ * `busy` (lock timeout, serialization failure, deadlock or a lost race: this request was rolled
+ * back) or `in_progress` (a request with the SAME idempotency key is still running: its outcome is
+ * unknown). `null` for any other error.
+ */
+export type TransientReason = 'busy' | 'in_progress'
+
+export function transientReason(error: ApiError): TransientReason | null {
+  if (error.code !== 'VERSION_CONFLICT') return null
+  const reason = guardReason(error)
+  return reason === 'busy' || reason === 'in_progress' ? reason : null
+}
+
+/**
+ * Whether a refusal is transient (retry later): the typed `details.reason` first, then the
+ * server's `retryable` flag as the fallback for an answer without a reason.
+ */
+export function isTransient(error: ApiError): boolean {
+  return transientReason(error) !== null || error.retryable
+}
+
+/** `409 VERSION_CONFLICT`, `details.reason = suppressions_changed` (inquiry resume, contract 10.2). */
+export const SUPPRESSIONS_CHANGED = 'suppressions_changed'
+
+function countDetail(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null
+}
+
+/** The counts of a `suppressions_changed` refusal (`null` for any other error). */
+export function suppressionsChanged(error: ApiError): { expected: number | null; current: number | null } | null {
+  if (error.code !== 'VERSION_CONFLICT' || guardReason(error) !== SUPPRESSIONS_CHANGED) return null
+  return {
+    expected: countDetail(error.details?.expected_removable_suppressions),
+    current: countDetail(error.details?.current_removable_suppressions),
+  }
+}
+
+/**
  * User-facing wording per error code. The server message is shown too (it is safe by contract),
  * but the title/hint are fixed strings so the UI never depends on server wording.
  */
@@ -133,14 +171,37 @@ export function describeError(error: ApiError, options: DescribeOptions = {}): E
           'The claim handle is not the current one (it expired, was released, or the case was claimed again elsewhere). Nothing was saved.',
         hint: 'Reload the case and claim it again; your draft is kept.',
       }
-    case 'VERSION_CONFLICT':
-      if (error.retryable) {
-        // `errors_map.TransientConflict`: a lock timeout, serialization failure or deadlock, or the
-        // same request still in progress. Nothing changed; this request was rolled back.
+    case 'VERSION_CONFLICT': {
+      // `errors_map.TransientConflict`: the typed `details.reason` decides; `retryable` without a
+      // reason is the fallback (an older answer).
+      const transient = transientReason(error)
+      if (transient === 'in_progress') {
+        return {
+          title: 'The same request is still being processed',
+          message:
+            'The server is still processing an identical request with the same key. Its outcome is not known yet: it may still be applied.',
+          hint: 'Retry the same request in a moment; the server applies it at most once.',
+        }
+      }
+      if (transient === 'busy' || error.retryable) {
+        // A lock timeout, serialization failure, deadlock or lost race: this request was rolled back.
         return {
           title: 'The server was busy',
-          message: `The ${options.subject ?? 'record'} was busy (another operation held it, or the same request was still being processed). This request was not applied.`,
+          message:
+            transient === 'busy'
+              ? `The ${options.subject ?? 'record'} was busy (another operation held it). This request was not applied.`
+              : `The ${options.subject ?? 'record'} was busy (another operation held it, or the same request was still being processed). This request was not applied.`,
           hint: 'Try again in a moment.',
+        }
+      }
+      const changed = suppressionsChanged(error)
+      if (changed) {
+        const saw = changed.expected === null ? 'the count you saw' : `${changed.expected}`
+        const now = changed.current === null ? 'a different number' : `${changed.current}`
+        return {
+          title: 'The suppressions a resume would remove changed',
+          message: `You confirmed removing ${saw} suppression(s), but the server now counts ${now}. The whole resume was refused: nothing was resumed and no suppression was removed.`,
+          hint: 'The controls are reloaded: review the current count and confirm again.',
         }
       }
       if (options.subject) {
@@ -155,6 +216,7 @@ export function describeError(error: ApiError, options: DescribeOptions = {}): E
         message: `The data changed since you loaded it${conflictSuffix(error, 'case version')}. Nothing was saved.`,
         hint: 'Reload to see the current facts before deciding; your draft is kept.',
       }
+    }
     case 'EMAIL_DELIVERY_UNCERTAIN':
       return {
         title: 'Seller e-mail outcome uncertain',

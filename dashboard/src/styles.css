@@ -925,3 +925,17 @@ blockquote.untrusted {
   overflow-wrap: normal;
   word-break: normal;
 }
+
+.plain-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.plain-list > li {
+  overflow-wrap: anywhere;
+}
+
+.attention-subgroup {
+  margin: 0.5rem 0 1rem;
+}

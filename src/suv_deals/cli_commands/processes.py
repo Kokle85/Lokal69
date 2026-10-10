@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import importlib
 import re
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, Final
 from uuid import UUID
 
 import click
@@ -230,6 +230,59 @@ def dispatcher(cli: CliContext, once: bool) -> None:
 # --------------------------------------------------------------------------------------------
 
 
+#: ``ReconcileReport`` fields per output line of ``suv-deals reconcile`` (text mode). A field not
+#: listed here is still printed (under ``other``): nothing a pass did is ever hidden.
+RECONCILE_REPORT_GROUPS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    (
+        "queue",
+        (
+            "jobs_requeued",
+            "jobs_dead_lettered",
+            "jobs_blocked_uncertain",
+            "jobs_exhausted",
+            "stale_detail_jobs",
+        ),
+    ),
+    ("outbox", ("events_retry", "events_uncertain", "events_dead_lettered", "deliveries_uncertain")),
+    (
+        "inquiries",
+        (
+            "inquiry_plan_jobs",
+            "inquiry_replan_jobs",
+            "inquiry_send_jobs",
+            "inquiry_retry_jobs",
+            "inquiry_reconcile_jobs",
+            "inquiry_send_jobs_unblocked",
+            "send_attempts_uncertain",
+            "inquiries_marked_replied",
+        ),
+    ),
+    ("replies", ("reply_process_jobs",)),
+    ("valuations", ("valuations_expired", "valuations_invalidated", "recompute_jobs", "watch_rechecks")),
+    (
+        "housekeeping",
+        ("claims_expired", "crawl_runs_closed", "snapshots_deleted", "idempotency_deleted"),
+    ),
+)
+
+
+def reconcile_report_lines(report: Mapping[str, object]) -> list[str]:
+    """One ``group: name=value, ...`` line per `RECONCILE_REPORT_GROUPS` entry (``ReconcileReport``
+    counters without ``workspace_id`` / ``errors`` / ``dry_run``), then ``other:`` for any field no
+    group names, so a new counter is printed even before it is grouped."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for title, names in RECONCILE_REPORT_GROUPS:
+        present = [name for name in names if name in report]
+        seen.update(present)
+        if present:
+            lines.append(f"{title}: " + ", ".join(f"{name}={report[name]}" for name in present))
+    rest = [name for name in report if name not in seen]
+    if rest:
+        lines.append("other: " + ", ".join(f"{name}={report[name]}" for name in rest))
+    return lines
+
+
 @click.command("reconcile")
 @click.option("--dry-run", is_flag=True, help="Report what one pass would do; everything is rolled back.")
 @click.option("--loop", is_flag=True, help="Run as a process: one pass every interval until SIGTERM.")
@@ -277,7 +330,8 @@ def reconcile(cli: CliContext, dry_run: bool, loop: bool, workspace: UUID | None
                 echo(f"  workspace {item.pop('workspace_id')}:")
                 errors = item.pop("errors")
                 item.pop("dry_run", None)
-                echo("    " + ", ".join(f"{k}={v}" for k, v in item.items()))
+                for line in reconcile_report_lines(item):
+                    echo(f"    {line}")
                 for error in errors:
                     echo(f"    error: {error}")
             if not data:

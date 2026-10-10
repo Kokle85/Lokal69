@@ -130,15 +130,17 @@ smoke-local: ## Offline smoke: CLI, configuration, tax rules, fixture E2E pipeli
 # Quality gates
 # --------------------------------------------------------------------------------------------
 
-lint: ## ruff check + format check
-	$(UV) run ruff check src tests scripts
-	$(UV) run ruff format --check src tests scripts
+lint: ## ruff check + format check (backend, tests, scripts and the desktop Outlook bridge)
+	$(UV) run ruff check src tests scripts desktop/outlook-bridge
+	$(UV) run ruff format --check src tests scripts desktop/outlook-bridge
 
 format: ## Apply ruff formatting
-	$(UV) run ruff format src tests scripts
+	$(UV) run ruff format src tests scripts desktop/outlook-bridge
 
-typecheck: ## mypy --strict over src/suv_deals
+typecheck: ## mypy --strict over src/suv_deals, the E2E harness and the desktop Outlook bridge
 	$(UV) run mypy
+	$(UV) run mypy --strict tests/e2e
+	MYPYPATH=desktop/outlook-bridge $(UV) run mypy --strict -p outlook_bridge
 
 test: ## Every non-live test on the default PostgreSQL (16)
 	@TEST_DATABASE_ADMIN_URL="$(PG16_ADMIN_URL)" $(PYTEST) -q -m "$(NOT_LIVE)"

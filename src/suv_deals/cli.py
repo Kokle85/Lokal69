@@ -30,6 +30,15 @@ Commands (``suv-deals <command> --help`` for details)::
                                    seller-inquiry controls and the standing authorization record
                                    (reason + expected version; --yes; no message approval exists)
     evaluation report --days 15    the 15-day quality evaluation from stored evidence
+    jobs blocked | unblock | resolve-blocked
+                                   blocked queue jobs; an uncertain-delivery send job is unblocked
+                                   only with the owner's acknowledgement (--owner-user-id), resolved
+                                   only after its inquiry was reconciled (audited; --yes)
+    canary prepare | status | cancel | send
+                                   the owner-controlled activation canary (target address from
+                                   SUV_CANARY_TARGET_ADDRESS or a hidden prompt, stored as a hash);
+                                   send is the owner's activation step and refuses unless every
+                                   activation switch and --i-confirm-owner-controlled-address are set
 
 Design rules: secrets are never command-line arguments (environment / ``.env`` only); every
 state-changing command needs an explicit ``--yes``; network and notification switches cannot be
@@ -48,12 +57,14 @@ import click
 import suv_deals
 from suv_deals.cli_commands import (
     bootstrap,
+    canary,
     config_cmd,
     crawl,
     credentials,
     db,
     doctor,
     inquiries,
+    jobs,
     ops,
     processes,
     sources,
@@ -110,6 +121,8 @@ cli.add_command(inquiries.mail_worker_group)
 cli.add_command(inquiries.sender_binding_group)
 cli.add_command(inquiries.inquiries_group)
 cli.add_command(inquiries.evaluation_group)
+cli.add_command(jobs.jobs_group)
+cli.add_command(canary.canary_group)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

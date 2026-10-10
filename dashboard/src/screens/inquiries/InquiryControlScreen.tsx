@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router'
+import { suppressionsChanged } from '../../api/errors'
 import {
   LIMITS,
   type InquiryControlView,
@@ -22,7 +23,16 @@ import {
   writePendingControl,
   type PendingControlAction,
 } from './controlMarker'
-import { InquiryAreaNav, RequireScope, StandingAuthorizationNote } from './shared'
+import {
+  authorizationText,
+  InquiryAreaNav,
+  RequireScope,
+  sendingReadinessProblems,
+  SenderProblemList,
+  senderReadinessLabel,
+  senderReadinessText,
+  StandingAuthorizationNote,
+} from './shared'
 
 const SUBJECT = 'inquiry controls'
 
@@ -69,6 +79,7 @@ function InquiryControlContent() {
           <Warnings warnings={control.envelope.warnings} />
           {earlier ? <EarlierActionNotice marker={earlier} control={control.data} onReload={control.reload} /> : null}
           <ControlState control={control.data} timeZone={timezone} />
+          <ReadinessState control={control.data} />
           <ControlActions control={control.data} onChanged={control.reload} userId={userId ?? ''} />
         </>
       ) : null}
@@ -81,6 +92,7 @@ function sendingStopped(control: InquiryControlView): boolean {
 }
 
 function ControlState({ control, timeZone }: { control: InquiryControlView; timeZone: string }) {
+  const notReady = sendingReadinessProblems(control)
   return (
     <Section title="Current controls (read-only)" id="control-state">
       {sendingStopped(control) ? (
@@ -91,12 +103,18 @@ function ControlState({ control, timeZone }: { control: InquiryControlView; time
             work stays unsent; nothing already sent is recalled.
           </span>
         </Notice>
+      ) : notReady.length ? (
+        <Notice tone="warn">
+          <span data-testid="sending-state">
+            These controls allow automatic inquiries, but nothing can be sent now: {notReady.join('; ')}. This is technical setup,
+            never a message approval; see the readiness below.
+          </span>
+        </Notice>
       ) : (
         <Notice tone="info">
           <span data-testid="sending-state">
-            These controls allow automatic inquiries. A send still requires an effective standing authorization and a verified
-            sender binding (not reported in this view; see <code>suv-deals inquiries status</code>), and passes the rolling caps,
-            the seller cooldown and every guard again immediately before transmission.
+            These controls allow automatic inquiries: the standing authorization is active and the configured sender is ready. Each
+            send still passes the rolling caps, the seller cooldown and every guard again immediately before transmission.
           </span>
         </Notice>
       )}
@@ -133,6 +151,51 @@ function ControlState({ control, timeZone }: { control: InquiryControlView; time
       <p className="muted small">
         The caps are ceilings, not targets. The owner can lower them (CLI) but never raise them above 2 per 24 hours and 5 per
         rolling 15 days.
+      </p>
+    </Section>
+  )
+}
+
+/**
+ * The technical prerequisites of automatic sending (read-only): the standing authorization and the
+ * CONFIGURED sending identity's readiness. Neither is a message approval; the owner sets them up
+ * with the CLI.
+ */
+function ReadinessState({ control }: { control: InquiryControlView }) {
+  const authorized = control.authorization_status === 'active'
+  const senderReady = control.sender_readiness === 'ready'
+  return (
+    <Section title="Sending readiness (read-only)" id="control-readiness">
+      <KeyValues
+        items={[
+          [
+            'Standing authorization',
+            <span key="a" data-testid="authorization-status" data-status={control.authorization_status}>
+              <Badge tone={authorized ? 'ok' : 'bad'}>{authorizationText(control.authorization_status)}</Badge>
+              {control.authorization_version !== null ? <span className="muted"> version {control.authorization_version}</span> : null}
+            </span>,
+          ],
+          [
+            'Configured sender',
+            <span key="s" data-testid="sender-readiness" data-readiness={control.sender_readiness}>
+              <Badge tone={senderReady ? 'ok' : 'bad'}>{senderReadinessLabel(control.sender_readiness)}</Badge>
+              <span className="muted">
+                {' '}
+                {senderReadinessText(control.sender_readiness)} · {control.sender_provider ? label(control.sender_provider) : 'no provider'}
+                {control.sender_binding_version !== null ? ` · binding version ${control.sender_binding_version}` : ''}
+              </span>
+            </span>,
+          ],
+          [
+            'Sender problems',
+            control.sender_problems.length ? <SenderProblemList key="p" codes={control.sender_problems} /> : 'none',
+          ],
+        ]}
+      />
+      <p className="muted small">
+        These are technical prerequisites, never a message approval: the standing authorization covers one automatic initial
+        inquiry per verified vehicle/seller pair. The owner records the authorization with <code>suv-deals inquiries authorize</code>{' '}
+        and sets up the sending identity with <code>suv-deals sender-binding</code> (no address is shown here).
       </p>
     </Section>
   )
@@ -192,7 +255,23 @@ function ControlActions({ control, onChanged, userId }: { control: InquiryContro
   const { client, can, workspaceId } = useWorkspace()
   const [pauseReason, setPauseReason] = useState('')
   const [resumeReason, setResumeReason] = useState('')
-  const [removeSuppressions, setRemoveSuppressions] = useState(false)
+  // The removable-suppression count the owner CONFIRMED by ticking the box (`null`: no removal).
+  // It is sent as `expected_removable_suppressions`, so the server removes only the set the owner
+  // saw; when the shown count moves away from it, the owner must confirm the new count first.
+  const [confirmedRemoval, setConfirmedRemoval] = useState<number | null>(null)
+  // The tick no longer stands for what is removable now: the shown count moved away from it (even
+  // if it later comes back: the same NUMBER need not be the same suppressions), or the server
+  // refused the resume because the removable set changed. Only a new tick confirms again.
+  const [confirmationVoid, setConfirmationVoid] = useState(false)
+  // After a `suppressions_changed` refusal: the controls object that was refused. The resume stays
+  // locked until the reloaded controls (a new object) are on screen, so nothing is retried against
+  // the stale count.
+  const [refusedControl, setRefusedControl] = useState<InquiryControlView | null>(null)
+  const [refusedCounts, setRefusedCounts] = useState<{ expected: number | null; current: number | null } | null>(null)
+  const controlRef = useRef(control)
+  useEffect(() => {
+    controlRef.current = control
+  })
   const marker = (action: 'pause' | 'resume') => ({
     beforeSend: (attempt: { key: string; body: { expected_version: number } }) =>
       writePendingControl({
@@ -223,7 +302,20 @@ function ControlActions({ control, onChanged, userId }: { control: InquiryContro
         clearPendingControl(workspaceId)
         if ('envelope' in outcome) {
           setResumeReason('')
-          setRemoveSuppressions(false)
+          setConfirmedRemoval(null)
+          setConfirmationVoid(false)
+          setRefusedCounts(null)
+          setRefusedControl(null)
+          onChanged()
+          return
+        }
+        const changed = suppressionsChanged(outcome.error)
+        if (changed) {
+          // Nothing changed on the server: reload and show the CURRENT set before any new attempt.
+          // The owner's tick confirmed a set the server says is gone: it never counts again.
+          setConfirmationVoid(true)
+          setRefusedCounts(changed)
+          setRefusedControl(controlRef.current)
           onChanged()
         }
       },
@@ -234,6 +326,15 @@ function ControlActions({ control, onChanged, userId }: { control: InquiryContro
   const canResume = can('config:admin')
   const pauseValid = pauseReason.trim().length >= LIMITS.reasonMin
   const resumeValid = resumeReason.trim().length >= LIMITS.reasonMin
+  const awaitingReload = refusedControl !== null && refusedControl === control
+  const removalCount = control.removable_suppressions
+  const countMoved = confirmedRemoval !== null && confirmedRemoval !== removalCount
+  // Sticky (state adjusted while rendering, guarded): a count that moves away and back is not the
+  // set the owner ticked.
+  if (countMoved && !confirmationVoid) setConfirmationVoid(true)
+  // The tick no longer confirms what is shown (a reload, a refused resume, a count that moved).
+  const removalMoved = confirmedRemoval !== null && (countMoved || confirmationVoid)
+  const resumeBlocked = locked || awaitingReload || removalMoved
   const reloadOnConflict = (error: { code: string }) =>
     error.code === 'VERSION_CONFLICT' || error.code === 'IDEMPOTENCY_CONFLICT' ? (
       <button type="button" className="button secondary" onClick={onChanged}>
@@ -290,13 +391,17 @@ function ControlActions({ control, onChanged, userId }: { control: InquiryContro
           data-testid="resume-form"
           onSubmit={(event) => {
             event.preventDefault()
-            if (resumeValid && !locked) {
+            if (resumeValid && !resumeBlocked) {
               pause.reset() // an older pause result must not stay on screen next to this resume
-              void resume.submit({
+              const body: Omit<InquiryResumeRequest, 'idempotency_key'> = {
                 expected_version: control.version,
                 reason: resumeReason.trim(),
-                remove_suppressions: removeSuppressions,
-              })
+                remove_suppressions: confirmedRemoval !== null,
+              }
+              // Exactly the count the owner was shown and confirmed (compared under the controls lock).
+              if (confirmedRemoval !== null) body.expected_removable_suppressions = confirmedRemoval
+              setRefusedCounts(null)
+              void resume.submit(body)
             }
           }}
         >
@@ -321,22 +426,48 @@ function ControlActions({ control, onChanged, userId }: { control: InquiryContro
             onChange={(event) => setResumeReason(event.target.value)}
             disabled={locked}
           />
-          {control.removable_suppressions > 0 ? (
+          {awaitingReload ? (
+            <p className="muted small" role="status" data-testid="resume-awaiting-reload">
+              Reloading the controls to show the current suppressions before anything can be resumed…
+            </p>
+          ) : null}
+          {refusedCounts && !awaitingReload ? (
+            <Notice tone="warn">
+              <span data-testid="suppressions-changed">
+                The suppressions a resume would remove changed
+                {refusedCounts.expected !== null ? `: you confirmed ${refusedCounts.expected}` : ''}, the current count is{' '}
+                {removalCount}. Nothing was resumed or removed. Review the current count below and confirm it again.
+              </span>
+            </Notice>
+          ) : null}
+          {removalMoved && !awaitingReload ? (
+            <p className="form-error" role="alert" data-testid="removal-count-moved">
+              {countMoved
+                ? `You ticked the removal for ${confirmedRemoval} suppression(s); the current count is ${removalCount}.`
+                : `The removable suppressions changed after you ticked the removal; the current count is ${removalCount} again, but it may not be the same set.`}{' '}
+              Untick and tick the box again to confirm the current count
+              {removalCount === 0 ? ' (or untick it: there is nothing left to remove)' : ''}.
+            </p>
+          ) : null}
+          {removalCount > 0 || confirmedRemoval !== null ? (
             <label className="checkbox">
               <input
                 type="checkbox"
-                checked={removeSuppressions}
-                onChange={(event) => setRemoveSuppressions(event.target.checked)}
-                disabled={locked}
+                checked={confirmedRemoval !== null}
+                onChange={(event) => {
+                  setConfirmedRemoval(event.target.checked ? removalCount : null)
+                  setConfirmationVoid(false)
+                }}
+                disabled={locked || awaitingReload}
               />{' '}
-              Also remove the {control.removable_suppressions} kill-switch / revoked-authorization suppression(s), each with its own
-              audit record. Opt-outs, bounces, complaints and other suppressions are never removed here.
+              Also remove the {removalCount} kill-switch / revoked-authorization suppression(s), each with its own audit record.
+              Opt-outs, bounces, complaints and other suppressions are never removed here.
             </label>
           ) : (
             <p className="muted small">No suppression can be removed with this resume.</p>
           )}
           <div className="form-actions">
-            <button type="submit" className="button" disabled={locked || !resumeValid}>
+            <button type="submit" className="button" disabled={resumeBlocked || !resumeValid}>
               {resumeLabel}
             </button>
           </div>

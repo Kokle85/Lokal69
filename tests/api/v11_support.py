@@ -298,7 +298,7 @@ async def latest_binding_version(client: httpx.AsyncClient, worker: MailWorker, 
     response = await client.get(f"{MAIL}/inquiry-bindings", headers=worker.headers())
     assert response.status_code == 200, response.text
     versions = [i["binding_version"] for i in response.json()["items"] if i["inquiry_id"] == str(inquiry_id)]
-    return max(versions)
+    return int(max(versions))
 
 
 async def upload_reply(

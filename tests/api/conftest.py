@@ -186,7 +186,7 @@ def make_settings(**overrides: Any) -> Settings:
         "source_network_enabled": False,
     }
     values.update(overrides)
-    return Settings(_env_file=None, **values)  # type: ignore[call-arg]
+    return Settings(_env_file=None, **values)
 
 
 @pytest.fixture

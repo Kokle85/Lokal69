@@ -557,6 +557,21 @@
             "title": "ReplySenderView",
             "type": "object"
           },
+          "signal_status": {
+            "default": null,
+            "description": "The reply's seller.reply.received signal: emitted, coalesced (one was still pending for the inquiry), rate_limited (per-inquiry 24 h cap: stored, no new dot activation) or not_applicable; null before C1.",
+            "enum": [
+              "emitted",
+              "coalesced",
+              "rate_limited",
+              "not_applicable",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "subject": {
             "maxLength": 512,
             "type": "string"
@@ -693,7 +708,8 @@
           "attachments",
           "withheld_sensitive_attachments",
           "valuation",
-          "content_withheld"
+          "content_withheld",
+          "signal_status"
         ],
         "title": "ReplyView",
         "type": "object"

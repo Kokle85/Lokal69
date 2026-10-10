@@ -873,6 +873,25 @@
             ],
             "title": "InquiryVehicleRef",
             "type": "object"
+          },
+          "waiting_reason": {
+            "default": null,
+            "description": "Why the inquiry waits (null: not waiting); the same rule as the list rows.",
+            "enum": [
+              "UNCERTAIN_DELIVERY",
+              "NEEDS_FACTS",
+              "INQUIRIES_PAUSED",
+              "SENDER_SETUP_INCOMPLETE",
+              "WORKER_OFFLINE",
+              "RATE_CAP_REACHED",
+              "SELLER_COOLDOWN",
+              "SEND_HELD",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -898,7 +917,8 @@
           "latest_reply_id",
           "timestamps",
           "row_version",
-          "approval_required"
+          "approval_required",
+          "waiting_reason"
         ],
         "title": "InquiryView",
         "type": "object"

@@ -99,10 +99,13 @@ active subscription. If events are unavailable, evaluate the separately approved
 
 | Tool | Scope | Input (exactly spec 37.8) | Result `data` |
 |---|---|---|---|
-| `seller_inquiries_get` | `inquiries:read` | `inquiry_id` (uuid) | `InquiryView`: state, qualification, authorization/template versions, sender as provider/binding reference, recipient domain and verification evidence, send-attempt summary, `approval_required: false` |
-| `seller_replies_get` | `inquiries:read` | `reply_id` (uuid) | `ReplyView`: inquiry/vehicle ids, original language and sanitised body, Macedonian summary, sender identity (domain and correlation evidence), received/ingested times, extracted claims (a price is an `unaccepted_seller_quote`), safe attachment metadata, current valuation status. A quarantined (unverified) reply returns metadata only (`content_withheld: true`) |
+| `seller_inquiries_get` | `inquiries:read` | `inquiry_id` (uuid) | `InquiryView`: state, qualification, authorization/template versions, sender as provider/binding reference, recipient domain and verification evidence, send-attempt summary, `reply_count` / `latest_reply_id`, `waiting_reason` (why it waits: `UNCERTAIN_DELIVERY`, `INQUIRIES_PAUSED`, `SENDER_SETUP_INCOMPLETE`, `WORKER_OFFLINE`, `RATE_CAP_REACHED`, ...; `null` when not waiting), `approval_required: false` |
+| `seller_replies_get` | `inquiries:read` | `reply_id` (uuid) | `ReplyView`: inquiry/vehicle ids, original language and sanitised body, Macedonian summary, sender identity (domain and correlation evidence), received/ingested times, extracted claims (a price is an `unaccepted_seller_quote`), safe attachment metadata, current valuation status, `signal_status` (`emitted` / `coalesced` / `rate_limited`). A quarantined (unverified) reply returns metadata only (`content_withheld: true`) |
 | `seller_inquiries_pause` | `inquiries:pause` | `expected_version` (>= 1), `reason` (3-2000), `idempotency_key` (8-128) | `InquiryPauseResult` (kill switch on; `already_paused` when it already was) |
 
+- A retryable `VERSION_CONFLICT` tool error carries `details.reason`: `busy` (a lock timeout or a
+  lost race; retry) or `in_progress` (a `seller_inquiries_pause` with the same `idempotency_key` is
+  still running; retry later with the same key, never a new one).
 - The workspace always comes from the token; ids of another workspace are `NOT_FOUND`, exactly like
   unknown ids. `tools/list` shows a tool only to a caller holding its scope: reviewers get the two
   read tools, viewers none, and `inquiries:pause` is an owner scope (grant it to dot only on the
@@ -136,8 +139,22 @@ classic Outlook (owner's PC) -> desktop worker (local correlation only)
   `SLACK_CHANNEL_ID`: dot's Slack trigger must match only the message metadata `event_type`
   `suv_deals.seller_reply_received` (owner alerts carry `suv_deals.owner_alert`), see
   docs/notification_bridge.md section 5.1.
+- **dot trigger filter (required):** dot's Slack trigger fires ONLY for messages in
+  `SLACK_CHANNEL_ID` whose message metadata `event_type` is exactly
+  `suv_deals.seller_reply_received`. It must ignore `suv_deals.owner_alert` (for the owner),
+  `suv_deals.review_pending` (candidate discovery, which dot reaches through native MCP Events or
+  the review queue, never through this trigger) and any message without our metadata (text that
+  merely looks like a signal). Matching on text, on the channel alone or on every bot message would
+  start dot twice for one reply or let any channel member start it.
 - The Slack post carries no body, address or attachment; dot must call `seller_replies_get` to read
   the reply. A Slack 2xx is a provider receipt, never proof that dot processed the signal.
+- One signal can stand for several replies: a reply that arrives while the inquiry's previous
+  signal is still to be posted is `coalesced` into it, and after `MAX_SIGNALS_PER_INQUIRY_24H`
+  (PROPOSED 6) signals per inquiry and rolling 24 hours a reply is stored without its own signal
+  (`rate_limited`). On every signal dot therefore also reads `seller_inquiries_get(inquiry_id)`
+  (`reply_count`, `latest_reply_id`, `waiting_reason`) and reads the latest reply too; the
+  dashboard lists every reply. The cap and its effect are visible in
+  `GET /api/mail-workers/health` (`reply_signals`) and on each reply (`signal_status`).
 - Delivery needs `ALLOW_EXTERNAL_NOTIFICATIONS=true`, `SELLER_REPLY_SIGNAL_PROVIDER=slack` and an
   approved, enabled and verified Slack destination binding (docs/notification_bridge.md).
 

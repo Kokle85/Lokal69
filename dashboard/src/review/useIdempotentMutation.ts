@@ -6,8 +6,11 @@
  *                   -> unconfirmed          (network loss / 5xx after sending: outcome unknown)
  *   unconfirmed -> pending (retry)          (SAME idempotency key and SAME body)
  *   retry refused before evaluation         (401/403/429: stays unconfirmed, see NOT_EVALUATED_CODES)
- *   retry turned away as busy               (a `retryable` refusal, e.g. 409 VERSION_CONFLICT with
- *                                            `retryable: true`: stays unconfirmed, see stillUnknown)
+ *   retry turned away as busy               (a transient refusal, 409 VERSION_CONFLICT with
+ *                                            `details.reason` busy / in_progress, or `retryable:
+ *                                            true` without a reason: stays unconfirmed, see stillUnknown)
+ *   same key still in progress              (`details.reason = in_progress`, on ANY send: the
+ *                                            request with this key may still commit: unconfirmed)
  *
  * Guarantees:
  * - at most one request is in flight (a second click while pending is ignored, guarded by a ref so
@@ -20,7 +23,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { newIdempotencyKey, type ApiResponse } from '../api/client'
-import { ApiError, isApiError } from '../api/errors'
+import { ApiError, isApiError, isTransient, transientReason } from '../api/errors'
 import type { ResponseEnvelope } from '../api/types'
 
 export interface MutationAttempt<B> {
@@ -72,18 +75,23 @@ const NOT_EVALUATED_CODES = new Set<ApiError['code']>(['UNAUTHENTICATED', 'FORBI
 /**
  * Whether an attempt's outcome is still unknown after `error`.
  *
- * A RETRY that the server turns away as `retryable` (a transient refusal: `409 VERSION_CONFLICT`
- * with `retryable: true` after a lock timeout, a serialization failure or a deadlock, or while the
- * same idempotency key is still in progress) proves only that THIS retry was rolled back; the
- * original send may still commit. Settling it as "rejected" would unlock a new attempt with a new key
- * (a second note, recheck or re-qualifying resume once the original commits) and report "nothing was
- * saved" for a change that may apply, so the attempt stays unconfirmed: only another same-key retry
- * (or the owner's explicit discard after checking the server state) ends it. On a FIRST send a
- * retryable refusal is definitive: that transaction was rolled back and nothing else is in flight.
+ * `details.reason = in_progress` (contract section 3) says a request with this SAME idempotency
+ * key is still running on the server: whatever this send was, that request may still commit, so
+ * the attempt stays unconfirmed on ANY send (only a same-key retry can learn its result).
+ *
+ * A RETRY that the server turns away as transient (`409 VERSION_CONFLICT` with `details.reason =
+ * busy` after a lock timeout, a serialization failure, a deadlock or a lost race; `retryable: true`
+ * without a reason is the fallback) proves only that THIS retry was rolled back; the original send
+ * may still commit. Settling it as "rejected" would unlock a new attempt with a new key (a second
+ * note, recheck or re-qualifying resume once the original commits) and report "nothing was saved"
+ * for a change that may apply, so the attempt stays unconfirmed: only another same-key retry (or
+ * the owner's explicit discard after checking the server state) ends it. On a FIRST send a `busy`
+ * refusal is definitive: that transaction was rolled back and nothing else is in flight.
  */
 function stillUnknown(error: ApiError, viaRetry: boolean): boolean {
   if (error.outcomeUnknown) return true
-  return viaRetry && (NOT_EVALUATED_CODES.has(error.code) || error.retryable)
+  if (transientReason(error) === 'in_progress') return true
+  return viaRetry && (NOT_EVALUATED_CODES.has(error.code) || isTransient(error))
 }
 
 export function useIdempotentMutation<B extends { idempotency_key: string }, R>(

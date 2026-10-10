@@ -360,9 +360,11 @@ class InquiryResumeRequest(ToolInput):
     unrevoked, the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint,
     sender revoked, ...) are never removed here. ``expected_removable_suppressions`` closes the
     time-of-check/time-of-use gap between the control view the owner read and the resume: the
-    count is compared under the controls lock (suppressions are added only under that lock) and a
-    mismatch refuses the whole resume. It is optional for compatibility with older clients; the
-    dashboard and the CLI (``--expected-suppressions``, required there) send it.
+    count is compared under the controls lock (kill-switch and authorization-revoked suppressions
+    are added only under that lock) and a mismatch refuses the whole resume. It is optional for
+    compatibility with older clients: the CLI (``--expected-suppressions``, required there) and
+    the dashboard (the count the owner ticked) send it; a request without it is not protected by
+    this check.
     """
 
     expected_version: Annotated[int, Field(ge=1, strict=True)]

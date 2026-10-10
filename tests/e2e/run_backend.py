@@ -10,7 +10,11 @@
    only CORS origin, JWT leeway is 0 (so the short-lived E2E tokens expire on time), the review
    claim lease is the configurable ``REVIEW_CLAIM_DURATION_SECONDS`` minimum of 60 seconds (so a
    REAL server-side claim expiry can be tested; ``--claim-duration-seconds``) and the
-   per-principal rate limits are relaxed for the test burst;
+   per-principal rate limits are relaxed for the test burst; the configured sending identity
+   (``SELLER_EMAIL_PROVIDER`` / ``_ACCOUNT_ID`` / ``_FROM``) is the seed's SYNTHETIC
+   ``example.invalid`` sender binding, so the inquiry control shows the readiness the owner would
+   see after the technical setup. ``SELLER_INQUIRY_MODE`` stays at its default
+   (``disabled_until_sender_ready``) and no worker runs: nothing can be sent;
 4. drops the database on exit (SIGTERM/SIGINT from Playwright), unless ``--keep-db``.
 
 Nothing here touches a non-loopback service: network-facing workers, notifications and the event
@@ -40,6 +44,8 @@ from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
 from suv_deals.settings import Settings
 from tests.db_harness import admin_url, create_migrated_database, drop_database
 from tests.e2e.seed import seed_e2e
+from tests.e2e.seed_v11 import SENDER_ACCOUNT, SENDER_ADDRESS
+from tests.e2e.v11_actions import loopback_url
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = REPO / "dashboard" / "e2e" / ".generated" / "seed-manifest.json"
@@ -48,7 +54,9 @@ E2E_CURSOR_SECRET = "SYNTHETIC-e2e-cursor-signing-secret-0123456789abcdef"
 
 
 def _loopback(url: str) -> bool:
-    return "@127.0.0.1:" in url or "@localhost:" in url or "@127.0.0.1/" in url or "@localhost/" in url
+    """Where libpq really connects (``host`` / ``hostaddr`` / service), never a URL substring: this
+    backend creates and DROPS a database on that cluster."""
+    return loopback_url(url)
 
 
 def _exit_on_signal(signum: int, _frame: object) -> None:
@@ -104,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
             allow_external_notifications=False,
             event_bridge_enabled=False,
             review_claim_duration_seconds=args.claim_duration_seconds,
+            # The SYNTHETIC configured sending identity (example.invalid; never a real mailbox).
+            seller_email_provider="outlook_local",
+            seller_email_account_id=SENDER_ACCOUNT,
+            seller_email_from=SENDER_ADDRESS,
             log_level=os.environ.get("E2E_BACKEND_LOG_LEVEL", "WARNING"),
         )
         app = create_app(

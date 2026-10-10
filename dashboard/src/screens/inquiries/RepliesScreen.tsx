@@ -5,7 +5,7 @@ import { Badge, EmptyState, ErrorPanel, LoadingState, Timestamp, ViewMeta, Warni
 import { useApiQuery } from '../../hooks/useApiQuery'
 import { useMorePages } from '../../hooks/useMorePages'
 import { useWorkspace } from '../../workspace/WorkspaceProvider'
-import { InquiryAreaNav, LoadMore, ReplyAvailability, RequireScope, StandingAuthorizationNote, vehicleText } from './shared'
+import { InquiryAreaNav, LoadMore, ReplyAvailability, RequireScope, SignalStatusBadge, StandingAuthorizationNote, vehicleText } from './shared'
 
 function filtersFrom(params: URLSearchParams): ReplyListQuery {
   const query: ReplyListQuery = { limit: 25 }
@@ -40,7 +40,9 @@ function RepliesContent() {
       <StandingAuthorizationNote />
       <p className="muted small">
         Only replies correlated with this system&apos;s inquiries are stored. A quarantined reply is an unverified possible match
-        (forwarded, changed address, ambiguous); its text is shown to the owner only. No reply is ever sent automatically.
+        (forwarded, changed address, ambiguous); its text is shown to the owner only. No reply is ever sent automatically. The
+        dot signal column says whether a reply started a dot activation: a reply past the per-inquiry signal cap is stored and
+        shown here, but starts no new activation.
       </p>
       <ReplyFilters
         // Remounted per URL filter set, so Back/Forward never leaves the form showing other filters.
@@ -72,6 +74,7 @@ function RepliesContent() {
                   <th scope="col">Availability stated</th>
                   <th scope="col">Correlation</th>
                   <th scope="col">Processing</th>
+                  <th scope="col">Dot signal</th>
                 </tr>
               </thead>
               <tbody>
@@ -97,6 +100,9 @@ function RepliesContent() {
                     </td>
                     <td data-label="Processing">
                       <Badge value={reply.processing_state} />
+                    </td>
+                    <td data-label="Dot signal">
+                      <SignalStatusBadge status={reply.signal_status} />
                     </td>
                   </tr>
                 ))}

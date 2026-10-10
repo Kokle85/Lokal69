@@ -95,7 +95,7 @@ seller reply in the owner's mailbox
 | `integrations/*` | FX (ECB), MCP Events webhook delivery, Slack adapter | domain |
 | `observability/*` | JSON logging with redaction, Prometheus metrics, audit helpers | – |
 | `views/*` | Read models (pydantic) shared by the dashboard API and MCP tools; address/quarantined-text visibility rules (`views.inquiries`) | domain |
-| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`) | persistence, workers, api |
+| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`, `jobs` (blocked jobs: list, unblock, resolve), `canary` (owner-controlled activation canaries)) | persistence, workers, api |
 
 Spec v1.1 seller-inquiry and reply modules (section 37, ADR 0002):
 

@@ -18,8 +18,18 @@
   "request": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool).\n\n``remove_suppressions``: also remove (audited, one audit event per suppression) the active\n``kill_switch`` suppressions and, while the current standing authorization is effective and\nunrevoked, the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint,\nsender revoked, ...) are never removed here.",
+    "description": "Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool).\n\n``remove_suppressions``: also remove (audited, one audit event per suppression) the active\n``kill_switch`` suppressions and, while the current standing authorization is effective and\nunrevoked, the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint,\nsender revoked, ...) are never removed here. ``expected_removable_suppressions`` closes the\ntime-of-check/time-of-use gap between the control view the owner read and the resume: the\ncount is compared under the controls lock (kill-switch and authorization-revoked suppressions\nare added only under that lock) and a mismatch refuses the whole resume. It is optional for\ncompatibility with older clients: the CLI (``--expected-suppressions``, required there) and\nthe dashboard (the count the owner ticked) send it; a request without it is not protected by\nthis check.",
     "properties": {
+      "expected_removable_suppressions": {
+        "default": null,
+        "description": "With remove_suppressions: the removable_suppressions count the owner saw in GET /api/inquiry-control. When the current count differs, the resume is refused (409 VERSION_CONFLICT, details.reason = suppressions_changed) and nothing changes, so only the suppressions the owner saw are ever removed.",
+        "maximum": 5000,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
       "expected_version": {
         "minimum": 1,
         "type": "integer"

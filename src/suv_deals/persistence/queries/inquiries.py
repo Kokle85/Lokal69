@@ -401,6 +401,7 @@ def _inquiry_view(
             updated_at=ensure_utc(row["updated_at"]),
         ),
         row_version=int(row["row_version"]),
+        waiting_reason=waiting_reason(row),
     )
 
 

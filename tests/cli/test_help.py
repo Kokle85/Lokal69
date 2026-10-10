@@ -62,9 +62,17 @@ def test_spec_27_commands_exist() -> None:
         ("evaluation", "report"),
     ]
     assert set(v11) <= set(ALL_COMMANDS)
-    # No command sends, replies to or approves a seller e-mail (spec 37.1: no approve button).
-    words = {part for path in ALL_COMMANDS for name in path for part in name.split("-")}
+    # No command sends, replies to or approves a seller e-mail (spec 37.1: no approve button). The
+    # only "send" is the owner's activation canary to an OWNER-CONTROLLED address (never a seller,
+    # gated by every activation switch and --i-confirm-owner-controlled-address; work package C2).
+    seller_paths = [path for path in ALL_COMMANDS if path[0] != "canary"]
+    words = {part for path in seller_paths for name in path for part in name.split("-")}
     assert not words & {"send", "reply", "approve", "approval"}
+    canary_words = {
+        part for path in ALL_COMMANDS if path[0] == "canary" for part in "-".join(path).split("-")
+    }
+    assert not canary_words & {"reply", "approve", "approval"}
+    assert ("canary", "send") in ALL_COMMANDS
 
 
 def test_root_help(run_cli: Cli) -> None:

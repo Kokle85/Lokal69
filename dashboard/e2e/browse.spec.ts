@@ -59,6 +59,34 @@ test.describe('read-only screens', () => {
     expect(problems).toEqual([])
   })
 
+  test('candidates: the screening-rejected audit filter lists rejected observations only on request', async ({ page }) => {
+    const data = manifest()
+    const { problems, apiRequests } = guard(page)
+    await signIn(page, 'reviewer')
+    await page.goto('/candidates')
+    const table = page.getByRole('table', { name: 'Candidates' })
+    await expect(table.getByText(data.titles.alpha)).toBeVisible()
+    // Screening-rejected without a review case: not a candidate, so not listed by default.
+    await expect(table.getByText(data.titles.audit_rejected)).toHaveCount(0)
+    await page.getByLabel(/include screening-rejected \(audit\)/).check()
+    await page.getByRole('button', { name: 'Apply filters' }).click()
+    await expect(page).toHaveURL(/\/candidates\?include_screening_rejected=true$/)
+    await expect(page.getByTestId('audit-filter-notice')).toContainText('not candidates')
+    const row = table.getByTestId('candidate-row').filter({ hasText: data.titles.audit_rejected })
+    await expect(row).toHaveAttribute('data-screening-rejected', 'yes')
+    await expect(row.getByTestId('screening-rejected-badge')).toContainText('screening rejected (audit)')
+    await expect(row).toContainText('rejected')
+    expect(
+      apiRequests.some((request) => new URL(request.url()).searchParams.get('include_screening_rejected') === 'true'),
+    ).toBe(true)
+    // Back to the normal queue: the audit row is gone again.
+    await page.getByRole('button', { name: 'Clear' }).click()
+    await expect(page).toHaveURL(/\/candidates$/)
+    await expect(table.getByText(data.titles.alpha)).toBeVisible()
+    await expect(table.getByText(data.titles.audit_rejected)).toHaveCount(0)
+    expect(problems).toEqual([])
+  })
+
   test('candidate detail: safe source link, provenance as extraction confidence, history, checklist', async ({ page }) => {
     const data = manifest()
     await signIn(page, 'reviewer')

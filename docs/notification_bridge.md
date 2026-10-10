@@ -232,6 +232,21 @@ Slack route selected for their category, never through MCP Events:
   (`suv_deals.owner_alert`) are for the owner. Without that filter one escalating reply would
   start dot twice. Register both metadata types under `metadata.event_subscriptions` in the app
   manifest, like `suv_deals.review_pending`.
+- **dot trigger filter checklist** (record it with the activation evidence): the trigger's
+  channel is `SLACK_CHANNEL_ID`; its condition is the message metadata `event_type ==
+  suv_deals.seller_reply_received` (not message text, not "any bot message", not the channel
+  alone); `suv_deals.owner_alert` and `suv_deals.review_pending` messages do NOT fire it; a
+  hand-written message that imitates the text of a signal does NOT fire it (it carries no app
+  metadata); the action is "call `seller_replies_get` / `seller_inquiries_get` over MCP", never a
+  reply or a send.
+- Signal flood control (`replies_repo.ingest_reply`): a reply arriving while the inquiry's previous
+  signal is still to be posted (`pending`, `retry_wait`, `sending` before its attempt began) is
+  `coalesced` into it; at most `MAX_SIGNALS_PER_INQUIRY_24H` (PROPOSED 6) signals are emitted per
+  inquiry and rolling 24 hours, later replies are stored `rate_limited` without a signal. Both are
+  visible on the reply (`signal_status`) and in `GET /api/mail-workers/health`
+  (`reply_signals`: emitted / coalesced / rate_limited / inquiries at the cap, plus a coverage-gap
+  warning). A `blocked` signal (for example while `ALLOW_EXTERNAL_NOTIFICATIONS=false`) is terminal
+  and never swallows a newer reply.
 
 ## 6. Observability
 

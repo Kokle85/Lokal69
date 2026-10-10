@@ -16,6 +16,7 @@ itself, and nothing activates a source, notification route or seller email.
 | `ALLOW_EXTERNAL_NOTIFICATIONS` | `false` | The dispatcher records events as blocked; nothing leaves the system. The dashboard/MCP queue stays complete (pull mode). |
 | `EVENT_BRIDGE_ENABLED`, `MCP_EVENTS_ENABLED`, `NOTIFICATION_PROVIDER` | `false`, `false`, `disabled` | No activation route; `bridge_status=unavailable`. |
 | `SELLER_INQUIRY_MODE` | `disabled_until_sender_ready` | No seller e-mail. Even with `automatic`, nothing is sent unless the kill switch is off, the standing authorization is active and the sender binding is verified (section 10; `suv-deals inquiries status` shows `sending_possible`). |
+| `SELLER_EMAIL_CANARY_SEND_ENABLED` | `false` | `suv-deals canary send` refuses (the owner's one-time activation canary, section 10.6; it also needs every inquiry switch and `--i-confirm-owner-controlled-address`). |
 | `LLM_EXTRACTION_ENABLED` | `false` | No LLM calls; budget 0. |
 
 - Fixture data never notifies (fixture outbox rows are blocked at enqueue time).
@@ -199,12 +200,18 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `sender-binding verify ID --reason ... --yes` | `outlook_local` only: records the technical verification from the desktop worker's evidence (classic-Outlook account report of the bound address, fresh heartbeat, stable account key); refuses (exit 3) with problem codes otherwise. A prerequisite, never a message approval |
 | `sender-binding status [--all] [--json]` | verification, alias, health and secret presence (domains only) |
 | `inquiries authorize [--file PATH] --reason ... --yes` | creates the workspace controls (mode `disabled_until_sender_ready`) and records the owner's versioned standing authorization from `config/seller_inquiry_authorization.yaml` (idempotent for an identical latest version; an audit record, never a message approval) |
-| `inquiries set-mode disabled_until_sender_ready\|automatic\|paused --reason ... --expected-version N --yes` | workspace mode; `automatic` is refused (exit 3) without an active authorization and a usable sender binding |
+| `inquiries set-mode disabled_until_sender_ready\|automatic\|paused --reason ... --expected-version N --yes` | workspace mode; `automatic` is checked against the CONFIGURED sender binding (`SELLER_EMAIL_PROVIDER`/`_ACCOUNT_ID`/`_FROM`/`_REPLY_TO`, never merely the newest binding) and refused (exit 3, nothing changed) with every missing prerequisite listed by code (`missing: sender_binding_unverified`, `standing_authorization_missing`, ...); a binding of the configured provider that is not exactly the configured identity is refused too (`missing: sender_identity_sender_binding_mismatch`, `sender_identity_from_not_configured`, ...; the control view's codes, never a value) |
 | `inquiries set-limits --max-per-24h 0..2 --max-per-15d 0..5 [--cooldown-days 7..365] --reason ... --expected-version N --yes` | owner-reducible ceilings; never above 2/24 h and 5/15 days; the seller cooldown is never shorter than 7 days and is kept when `--cooldown-days` is omitted |
 | `inquiries status [--json]` | mode, kill switch, caps/usage, authorization, sender, mail workers, removable suppressions and `sending_possible` |
 | `inquiries pause --reason ... --expected-version N --yes` | activates the kill switch (never resumes) |
-| `inquiries resume --reason ... --expected-version N [--remove-suppressions --owner-user-id UID] --yes` | owner action: clears the kill switch; optionally removes kill-switch/authorization-revoked suppressions (each audited, as the owner) |
+| `inquiries resume --reason ... --expected-version N [--remove-suppressions --expected-suppressions K --owner-user-id UID] --yes` | owner action: clears the kill switch; optionally removes kill-switch/authorization-revoked suppressions (each audited, as the owner). `K` is the `removable_suppressions` count `inquiries status` showed: a different current count refuses the whole resume (exit 1, nothing changed), so only the suppressions the owner saw are removed |
+| `jobs blocked [--json]` | blocked queue jobs: id, type, blocker code, the inquiry id of a send job (read-only) |
+| `jobs unblock JOB_ID --reason ... [--acknowledge-uncertain-delivery --owner-user-id UID] --yes` | moves a blocked job back to `queued` (audited `job.unblock`). A send job blocked `EMAIL_DELIVERY_UNCERTAIN` is refused unless the OWNER acknowledges that its e-mail may already have left (`--acknowledge-uncertain-delivery` needs `--owner-user-id`; the audit names the owner). No second e-mail can follow: the inquiry is no longer `queued`, so the dispatch holds |
+| `jobs resolve-blocked JOB_ID --outcome succeeded\|cancelled --reason ... --yes` | closes a blocked `EMAIL_DELIVERY_UNCERTAIN` send job AFTER its inquiry was reconciled (audited `job.resolve_blocked`); refused while the inquiry is still `uncertain` or has an unresolved attempt; never re-queues anything |
+| `canary prepare --purpose ... --yes`, `canary status [--json]`, `canary cancel ID --reason ... --yes` | the owner-controlled activation canary of the configured sender (section 10.6); the test address comes from `SUV_CANARY_TARGET_ADDRESS` or a hidden prompt and is stored as a SHA-256 only; output never shows the address or its hash |
+| `canary send ID --i-confirm-owner-controlled-address --yes` | the OWNER's one-time activation step (section 10.6): refuses (exit 3, nothing sent, nothing changed) unless `SELLER_EMAIL_CANARY_SEND_ENABLED=true` and every inquiry activation switch is on; today it ends with `CANARY_TRANSPORT_UNAVAILABLE` |
 | `evaluation report --days 15 [--json]` | the 15-day quality evaluation from stored evidence (zero is reported as zero) |
+| `reconcile --workspace ID [--dry-run]` (text output) | one line per group: `queue`, `outbox`, `inquiries` (`inquiry_plan_jobs`, `inquiry_replan_jobs`, `inquiry_send_jobs`, `inquiry_retry_jobs`, `inquiry_reconcile_jobs`, `inquiry_send_jobs_unblocked`, `send_attempts_uncertain`, `inquiries_marked_replied`), `replies`, `valuations`, `housekeeping`; a counter without a group is printed under `other` |
 
 ## 6. Incidents (spec §30)
 
@@ -220,6 +227,11 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | Uncertain seller-inquiry send | Never resend, never cancel: an `uncertain` inquiry keeps its reservation and quota debit. Look: dashboard Inquiries (attention filter) or `GET /api/inquiries?uncertain_only=true`; `suv-deals inquiries status`. If the desktop worker is offline, start it (it reports Outbox / Sent Items evidence when it reconnects); a reply quoting the Message-ID also proves submission. If the cause is unclear, pause: `suv-deals inquiries pause --reason "uncertain send" --expected-version N --yes`. | The inquiry moves to `accepted` only on positive evidence (Sent Items / provider hit / correlated reply), or to `failed_definite` only on proof of non-submission (e.g. the worker refused an expired, never-claimed intent `intent_expired`). An empty Sent Items search proves nothing. |
 | Stale or offline desktop mail worker | `suv-deals mail-worker credential list` (heartbeat age, monitoring) or dashboard Mail workers; check the PC is awake, classic Outlook runs and the account syncs. Coverage gaps are recorded, never hidden. Replies keep arriving in Outlook; nothing is lost while the worker is off. | Heartbeat fresh, `monitoring=true`, gap closed in `GET /api/mail-workers/coverage-gaps`; the worker's local backlog drains (reconciliation over the overlap window recovers mail received while it was off). |
 | Lost or compromised desktop credential | `suv-deals mail-worker credential revoke MAILBOX_ID --reason ... --yes` (the worker stops at once and keeps its backlog), then issue a new binding (section 10.2) and store the new token on the PC. | New heartbeat with the new credential; old token `401` (`mail_worker_credential_revoked`). |
+| Revoked or expired worker credential (seen in health) | `GET /api/mail-workers/health` (`credentials[].credential_status` `expired`/`revoked`, `revoked_mailboxes`, warning "credential is expired or revoked") or `suv-deals mail-worker credential list --all`. Revoking a credential revokes its mailbox binding too: every published inquiry binding is tombstoned and a claim or report that was waiting for the revocation is refused `403` (`mailbox_binding_revoked`), so the worker never calls `.Send`. Nothing else to undo. | A new binding issued (10.2) and its first heartbeat; send jobs released `MAILBOX_WORKER_CREDENTIAL_NOT_LIVE` continue on their own; the revoked mailbox stays counted in health. |
+| Reply signal cap reached | Health `reply_signals.rate_limited` > 0 / warning "per-inquiry signal cap" and the reply's `signal_status = rate_limited` (PROPOSED cap `MAX_SIGNALS_PER_INQUIRY_24H` = 6 signals per inquiry per rolling 24 h; `coalesced` replies rode on a signal still to be posted). Every reply is stored and listed; only the extra dot activation is skipped. Read the inquiry's replies on the dashboard (Replies, filter by inquiry) or with `seller_inquiries_get` (`reply_count`, `latest_reply_id`). A worker uploading new replies beyond 120 per hour is answered `429` (`mail_worker_ingest_volume`) and keeps its backlog. | The window rolls on: the next reply after the 24 h window emits its own signal; investigate a seller or loop that keeps replying (pause the inquiries if needed). |
+| Uncertain after a contradicting worker report | A worker reported `refused_before_send` for an intent whose claim was GRANTED (`.Send` may have been called): the attempt is `uncertain` with `REFUSED_AFTER_GRANTED_CLAIM`, the inquiry keeps its reservation and quota debit, and the guarded retry refuses it (`claim_granted_before_refusal`). Never resend. Check classic Outlook on the PC (Outbox, Sent Items) for the inquiry's Message-ID; if the report cannot be explained, treat the worker credential as compromised (revoke it, row above). | Positive evidence (Sent Items report, a correlated reply) moves the inquiry to `accepted`; then close its blocked send job with `jobs resolve-blocked` (row below). Without evidence it stays `uncertain` (visible attention item). |
+| Blocked send job after reconciliation | `suv-deals jobs blocked` lists `EMAIL_DELIVERY_UNCERTAIN` send jobs. Once the inquiry left `uncertain` (accepted, or proven unsent and handled by the guarded retry): `suv-deals jobs resolve-blocked JOB_ID --outcome succeeded\|cancelled --reason ... --yes`. It refuses while the inquiry is still uncertain and never re-queues. Do NOT `jobs unblock` such a job unless the owner explicitly acknowledges the possible delivery (`--acknowledge-uncertain-delivery --owner-user-id`). | The job is `succeeded`/`cancelled` with `RESOLVED_AFTER_RECONCILIATION`, audited `job.resolve_blocked`. |
+| Activation canary | `suv-deals canary status` (evidence state) and `suv-deals doctor` (`seller_inquiry/activation_canary`). A canary is never a seller inquiry; the send is the owner's step (section 10.6). Keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false` outside that step. | `complete` (correlated test reply for the binding's current version) recorded in the activation log. |
 | Disk / memory pressure | Reduce concurrency: run one worker, stop optional snapshots (`SNAPSHOT_STORAGE=disabled`), restart the affected service. | Resource recovery without losing queue state: `outbox inspect`, `reconcile --dry-run`. |
 
 Readiness versus liveness: `/healthz` is process liveness only; `/readyz` includes database,
@@ -329,8 +341,10 @@ configuration and the database, never in the repository or a ticket.
    records the versioned standing authorization (spec 37.1) from
    `config/seller_inquiry_authorization.yaml`.
 2. After 10.1-10.3 and the activation evidence (docs/seller_email_activation.md section 8):
-   `suv-deals inquiries set-mode automatic --reason ... --expected-version N --yes` and set the
-   process setting `SELLER_INQUIRY_MODE=automatic` (both must be automatic; under Compose
+   `suv-deals inquiries set-mode automatic --reason ... --expected-version N --yes` (run it with
+   `SELLER_EMAIL_ACCOUNT_ID` / `SELLER_EMAIL_FROM` already set: a binding that is not exactly that
+   configured identity is refused, `sender_identity_*`) and set the process setting
+   `SELLER_INQUIRY_MODE=automatic` (both must be automatic; under Compose
    `SUV_DEALS_SELLER_INQUIRY_MODE`) for the worker AND the API process: the dispatcher plans
    nothing and the desktop worker's claim (served by the API) is refused `kill_switch` while the
    process setting is not `automatic` or `SELLER_INQUIRY_KILL_SWITCH=true`. `suv-deals inquiries
@@ -372,10 +386,13 @@ Follow `desktop/outlook-bridge/README.md` ("Installation"); in short:
   at the next guard (reservation, dispatch, the worker's claim right before `.Send`).
 - Resume is an owner action only: dashboard (`POST /api/inquiry-control/resume`) or
   `suv-deals inquiries resume --reason ... --expected-version N --yes`. With
-  `--remove-suppressions --owner-user-id <owner's user id>` (dashboard: `remove_suppressions`), the
-  kill-switch suppressions (and, while the authorization is effective, authorization-revoked ones)
-  are removed, each with its own audit event. Opt-out, bounce, complaint and other suppressions
-  need their own explicit owner decision.
+  `--remove-suppressions --expected-suppressions K --owner-user-id <owner's user id>` (dashboard:
+  `remove_suppressions` + `expected_removable_suppressions`), the kill-switch suppressions (and,
+  while the authorization is effective, authorization-revoked ones) are removed, each with its own
+  audit event. `K` is the `removable_suppressions` count the owner saw (`inquiries status`,
+  `GET /api/inquiry-control`): if it changed meanwhile the whole resume is refused (`409
+  VERSION_CONFLICT`, `suppressions_changed`; CLI exit 1) and nothing changes. Opt-out, bounce,
+  complaint and other suppressions need their own explicit owner decision.
 - The caps can only be lowered (`max_per_24h` 0..2, `max_per_15d` 0..5) and the seller cooldown only
   lengthened (7..365 days; omitted = unchanged). A claim refused for caps,
   seller cooldown or a paused source answers `not_now`: the worker keeps the intent and asks again
@@ -397,4 +414,38 @@ a body. The runtime codes of a `seller_inquiry_plan` / `seller_inquiry_send` job
 
 A proven pre-submission refusal (for example a claim refused while paused) leaves the inquiry
 `failed_definite`; the reconciliation pass enqueues one guarded-retry send job per attempt
-number (`inquiry_retry_jobs` in `suv-deals reconcile`), at most three attempts in total.
+number (`inquiry_retry_jobs` in `suv-deals reconcile`), at most three attempts in total. A
+refusal reported AFTER a granted claim is not such a proof (section 6, "Uncertain after a
+contradicting worker report").
+
+### 10.6 Activation canary (the owner's one-time step)
+
+The canary is the activation evidence of docs/seller_email_activation.md section 8 (rows 4-6): one
+synthetic message from the configured sender to an OWNER-CONTROLLED test address, never a seller.
+It is not a seller inquiry (no listing, seller, reservation or quota debit; never one of the
+15-day deals). At most 5 canaries per rolling 24 hours (PROPOSED), none while the kill switch is
+on (`canary prepare` refuses both with exit 3 and records nothing; the cap names the wait).
+
+1. `SUV_CANARY_TARGET_ADDRESS=<owner test address> suv-deals canary prepare --workspace W --purpose
+   "activation route check" --yes` (or omit the variable and type the address at the hidden
+   prompt). The address is never echoed and is stored only as its SHA-256; unset the variable
+   afterwards. The canary binds the configured sender binding's current version.
+2. `suv-deals canary status` shows the canaries and the evidence state (`prepared`, `accepted`,
+   `uncertain`, `failed`, `complete`, `stale` after a binding change); `doctor` reports the same.
+3. The send is the OWNER's step, never run by an operator script or an agent:
+   `suv-deals canary send <id> --i-confirm-owner-controlled-address --yes`. It refuses (exit 3,
+   nothing sent, nothing changed) unless `SELLER_EMAIL_CANARY_SEND_ENABLED=true`,
+   `SELLER_INQUIRY_MODE=automatic`, `SELLER_INQUIRY_KILL_SWITCH=false`, the workspace controls are
+   `automatic` with the kill switch off, the standing authorization is active, the configured sender
+   binding is usable and the canary is `prepared` for its current version (an `outlook_local`
+   canary's desktop worker still active); the address is entered again and must match; right
+   before the transport the controls are locked, EVERY gate is read again (a pause, a revoked
+   authorization, sender binding or desktop worker committed meanwhile stops it) and the canary is
+   committed `uncertain`, so a crash or a second `canary send` can never send it twice
+   (an `uncertain` canary is reconciled, never re-sent). Hold real seller inquiries meanwhile
+   with `inquiries set-limits --max-per-24h 0 --max-per-15d 0` (the caps do not apply to a
+   canary).
+4. **Current blocker:** no route has a canary transport yet (the providers send only registered
+   seller templates and the desktop worker claims only inquiry intents), so step 3 ends with
+   `CANARY_TRANSPORT_UNAVAILABLE` after every other gate. Rows 4-6 of the activation checklist stay
+   open; keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false` and report this blocker.

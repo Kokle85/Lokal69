@@ -1616,6 +1616,40 @@ export type LagName =
 export type LagStatus = 'measured' | 'unknown' | 'inconsistent'
 export type ComponentStatus = 'healthy' | 'stale' | 'down' | 'unknown'
 export type AccountStatus = 'unknown' | 'verified' | 'mismatch' | 'not_classic'
+/**
+ * Why an inquiry waits (`views.inquiries.WaitingReason`; docs/schema.md 11.9): the stored state
+ * first, then the open plan/send job's wait or blocker code. `null` = not waiting.
+ */
+export type WaitingReason =
+  | 'UNCERTAIN_DELIVERY'
+  | 'NEEDS_FACTS'
+  | 'INQUIRIES_PAUSED'
+  | 'SENDER_SETUP_INCOMPLETE'
+  | 'WORKER_OFFLINE'
+  | 'RATE_CAP_REACHED'
+  | 'SELLER_COOLDOWN'
+  | 'SEND_HELD'
+export const WAITING_REASONS: readonly WaitingReason[] = [
+  'UNCERTAIN_DELIVERY',
+  'NEEDS_FACTS',
+  'INQUIRIES_PAUSED',
+  'SENDER_SETUP_INCOMPLETE',
+  'WORKER_OFFLINE',
+  'RATE_CAP_REACHED',
+  'SELLER_COOLDOWN',
+  'SEND_HELD',
+]
+/**
+ * What happened to a reply's `seller.reply.received` signal at ingest (flood control):
+ * `rate_limited` = stored and visible, but no new dot activation (per-inquiry 24 h cap).
+ */
+export type SignalStatus = 'emitted' | 'coalesced' | 'rate_limited' | 'not_applicable'
+/** The workspace's latest standing authorization (spec 37.1). */
+export type AuthorizationStatus = 'missing' | 'active' | 'not_effective' | 'revoked'
+/** The CONFIGURED sender binding: `ready` = verified, alias-verified, healthy and unrevoked. */
+export type SenderReadiness = 'ready' | 'missing' | 'unverified' | 'alias_unverified' | 'unhealthy' | 'revoked'
+/** A mailbox worker's credential (`expiring`: within 14 days; `expired`/`revoked`: refused). */
+export type CredentialStatus = 'active' | 'expiring' | 'expired' | 'revoked'
 export type EvaluationOutcome =
   | 'coverage_not_established'
   | 'deal_found'
@@ -1749,6 +1783,8 @@ export interface InquiryView {
   timestamps: InquiryTimestamps
   row_version: number
   approval_required: false
+  /** Why the inquiry waits (`null`: not waiting); the same rule as the list rows. */
+  waiting_reason: WaitingReason | null
 }
 
 /** One row of `GET /api/inquiries` (no message text, no addresses). */
@@ -1767,6 +1803,8 @@ export interface InquirySummaryView {
   send_attempted_at: DateTimeString | null
   accepted_at: DateTimeString | null
   row_version: number
+  /** Why the inquiry waits (`null`: not waiting). Waiting inquiries are attention items. */
+  waiting_reason: WaitingReason | null
 }
 
 export interface InquiryListView {
@@ -1864,6 +1902,8 @@ export interface ReplyView {
   valuation: ValuationStatusView
   /** True when text, summary, claims and attachment metadata are withheld (quarantined, not the owner). */
   content_withheld: boolean
+  /** The reply's `seller.reply.received` signal (`null` for rows stored before flood control). */
+  signal_status: SignalStatus | null
 }
 
 /** One row of `GET /api/replies` (no body). */
@@ -1878,6 +1918,10 @@ export interface ReplySummaryView {
   processing_state: ProcessingState
   received_at: DateTimeString
   ingested_at: DateTimeString
+  /** The reply's `seller.reply.received` signal (`null` for rows stored before flood control). */
+  signal_status: SignalStatus | null
+  /** True when the claim-derived `availability` of a quarantined reply is withheld (owner only). */
+  content_withheld: boolean
 }
 
 export interface ReplyListView {
@@ -1905,6 +1949,15 @@ export interface InquiryControlView {
   approval_required: false
   /** Active kill-switch / authorization-revoked suppressions a resume could remove (audited). */
   removable_suppressions: number
+  /** The workspace's latest standing authorization (technical prerequisite, never an approval). */
+  authorization_status: AuthorizationStatus
+  authorization_version: number | null
+  /** Readiness of the CONFIGURED sending identity (never merely the newest binding). */
+  sender_readiness: SenderReadiness
+  sender_provider: EmailProviderKind | null
+  sender_binding_version: number | null
+  /** Why the configured sender is not ready (codes only, never an address). */
+  sender_problems: string[]
 }
 
 export interface InquiryPauseResult {
@@ -2030,6 +2083,30 @@ export interface MailboxHealthView {
   reasons: string[]
 }
 
+/** The credential state of one listed mailbox worker (never a token, hash or prefix). */
+export interface MailWorkerCredentialView {
+  mailbox_binding_id: Uuid
+  worker_label: string
+  binding_state: 'active' | 'revoked'
+  credential_status: CredentialStatus
+  expires_at: DateTimeString
+  revoked_at: DateTimeString | null
+}
+
+/**
+ * Reply signals of the rolling window: emitted, coalesced into one still to be posted, or stopped
+ * by the per-inquiry cap (`rate_limited`: stored and visible, but no new dot activation).
+ */
+export interface ReplySignalSummaryView {
+  window_hours: number
+  /** PROPOSED cap of emitted signals per inquiry and window. */
+  cap_per_inquiry: number
+  emitted: number
+  coalesced: number
+  rate_limited: number
+  inquiries_at_cap: number
+}
+
 /** `GET /api/mail-workers/health`. */
 export interface MailWorkerHealthView {
   generated_at: DateTimeString
@@ -2037,6 +2114,11 @@ export interface MailWorkerHealthView {
   any_monitoring_active: boolean
   open_gap_count: number
   notes: string[]
+  /** Revoked mailbox workers, counted even when they are not listed. */
+  revoked_mailboxes: number
+  /** The credential state of each listed worker. */
+  credentials: MailWorkerCredentialView[]
+  reply_signals: ReplySignalSummaryView | null
 }
 
 export interface MailCoverageGapItem {
@@ -2151,6 +2233,11 @@ export interface CandidateListQuery {
   status?: CandidateStatus
   /** RFC 3339 with an offset, e.g. `2026-10-06T10:00:00Z`. */
   changed_since?: DateTimeString
+  /**
+   * Dashboard-only audit filter: also list the observations screening REJECTED (kept for audit,
+   * not candidates). Bound into the cursor, so a cursor of one setting is refused for the other.
+   */
+  include_screening_rejected?: boolean
 }
 
 export interface ComparablesQuery {
@@ -2254,6 +2341,12 @@ export interface InquiryResumeRequest {
   idempotency_key: IdempotencyKey
   /** Also remove the active kill-switch / authorization-revoked suppressions (each audited). */
   remove_suppressions?: boolean
+  /**
+   * With `remove_suppressions`: the `removable_suppressions` count the owner was shown and
+   * confirmed. A different current count refuses the WHOLE resume (`409 VERSION_CONFLICT`,
+   * `details.reason = suppressions_changed`), so only the suppressions the owner saw are removed.
+   */
+  expected_removable_suppressions?: number
 }
 
 /** Request-body rules mirrored from the backend for early feedback (the server stays authoritative). */

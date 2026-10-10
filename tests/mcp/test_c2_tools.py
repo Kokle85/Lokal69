@@ -22,7 +22,7 @@ from suv_deals.persistence.errors_map import TransientConflict
 from suv_deals.persistence.transactions import unit_of_work
 from tests.api.v11_support import controls_version, outlook_world
 from tests.integration.db.helpers import Seed
-from tests.integration.v11_inquiries.support import World
+from tests.integration.v11_inquiries.support import World, reserve_and_queue
 from tests.mcp.conftest import (
     McpClient,
     SigningKeys,
@@ -102,3 +102,27 @@ def test_no_resume_tool_and_no_route_level_reply_filter() -> None:
     # The quarantine rule is applied by the read query (``queries.get_reply``) for every surface;
     # the MCP layer no longer carries its own copy of it.
     assert not hasattr(mcp_tools, "visible_reply")
+
+
+@pytest.mark.db
+async def test_seller_inquiries_get_names_why_the_inquiry_waits(c2_mcp: C2Mcp) -> None:
+    """dot reads the same waiting reason as the dashboard list (``INQUIRIES_PAUSED`` while the
+    kill switch holds a reserved/queued inquiry)."""
+    record = await reserve_and_queue(c2_mcp.db, c2_mcp.world)
+    owner_token = c2_mcp.tokens.for_role(c2_mcp.users.owner, Role.OWNER)
+    before = await c2_mcp.client.ok("seller_inquiries_get", {"inquiry_id": str(record.id)}, token=owner_token)
+    assert before["data"]["waiting_reason"] is None
+    await c2_mcp.client.ok(
+        "seller_inquiries_pause",
+        {
+            "expected_version": await controls_version(c2_mcp.db, c2_mcp.world.workspace_id),
+            "reason": "dot pauses (synthetic)",
+            "idempotency_key": "mcp-c2-waiting-0001",
+        },
+        token=owner_token,
+    )
+    reviewer_token = c2_mcp.tokens.for_role(c2_mcp.users.reviewer, Role.REVIEWER)
+    after = await c2_mcp.client.ok(
+        "seller_inquiries_get", {"inquiry_id": str(record.id)}, token=reviewer_token
+    )
+    assert after["data"]["waiting_reason"] == "INQUIRIES_PAUSED"

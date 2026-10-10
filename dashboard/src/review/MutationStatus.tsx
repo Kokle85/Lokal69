@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react'
-import { describeError } from '../api/errors'
+import { describeError, isTransient, transientReason } from '../api/errors'
 import { ErrorPanel } from '../components/ui'
 import type { MutationPhase } from './useIdempotentMutation'
 
@@ -58,7 +58,12 @@ export function MutationStatus<B, R>({
           <p>{describeError(phase.error, subject ? { subject } : {}).message}</p>
           {phase.error.code === 'RATE_LIMITED' || phase.error.code === 'FORBIDDEN' || phase.error.code === 'UNAUTHENTICATED' ? (
             <p>The last retry was refused before the server looked at it ({describeError(phase.error).title.toLowerCase()}), so the earlier send is still unconfirmed.{describeError(phase.error).hint ? ` ${describeError(phase.error).hint}` : ''}</p>
-          ) : phase.error.retryable && !phase.error.outcomeUnknown && phase.attempt.sends > 1 ? (
+          ) : transientReason(phase.error) === 'in_progress' ? (
+            <p data-testid="retry-in-progress">
+              The server is still processing a request with this same key, so the outcome is not known yet: it may still be
+              applied. Retry the same request in a moment; nothing new can be sent until it is resolved.
+            </p>
+          ) : isTransient(phase.error) && !phase.error.outcomeUnknown && phase.attempt.sends > 1 ? (
             <p data-testid="retry-busy">
               The last retry was turned away as busy, which says nothing about the earlier send: it is still unconfirmed and may
               still be applied. Retry again in a moment; nothing new can be sent until it is resolved.

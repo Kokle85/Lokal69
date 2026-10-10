@@ -99,7 +99,20 @@ class BusinessConfig(BaseModel):
     comparable_max_age_days: int = Field(default=90, ge=1, le=730)
     comparable_min_sample: int = Field(default=3, ge=1, le=50)
     negotiation_discount_pct: Decimal | None = None  # unknown until the owner supplies one
-    claim_duration_seconds: int = Field(default=300, ge=60, le=3600)
+    #: DEPRECATED and IGNORED: nothing reads it. The review claim lease of the dashboard and of the
+    #: MCP ``reviews_claim`` tool is the process setting ``REVIEW_CLAIM_DURATION_SECONDS``. The field
+    #: is kept (not removed) because every stored ``app.config_revisions`` row contains it and
+    #: ``config_repo.record_config_revision`` compares the stored hash with the hash of the
+    #: re-validated configuration: dropping it would refuse every later ``config apply``.
+    claim_duration_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=3600,
+        description=(
+            "Deprecated and ignored: the review claim lease is REVIEW_CLAIM_DURATION_SECONDS. Kept so"
+            " stored configuration revisions keep their canonical hash."
+        ),
+    )
 
     @model_validator(mode="after")
     def _baseline(self) -> BusinessConfig:

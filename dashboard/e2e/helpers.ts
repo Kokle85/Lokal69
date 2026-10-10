@@ -1,4 +1,5 @@
 /** Shared helpers for the E2E specs (SYNTHETIC users and data from tests/e2e/seed.py). */
+import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { expect, type Page, type Request } from '@playwright/test'
@@ -16,14 +17,20 @@ export interface Manifest {
   sources: Record<string, string>
   /** The SYNTHETIC spec v1.1 world (tests/e2e/seed_v11.py). */
   v11: {
-    inquiries: Record<'suppressed' | 'replied' | 'uncertain' | 'held' | 'waiting', string>
+    inquiries: Record<V11InquiryKey, string>
     replies: Record<'seller' | 'quarantined', string>
-    references: Record<'suppressed' | 'replied' | 'uncertain' | 'held' | 'waiting', string>
-    listings: Record<'suppressed' | 'replied' | 'uncertain' | 'held' | 'waiting', string>
+    references: Record<V11InquiryKey, string>
+    listings: Record<V11InquiryKey, string>
+    /** The REAL plan jobs' wait codes (`workers.inquiry_handlers._hold_code`). */
+    wait_codes: Record<'waiting' | 'cooldown', string>
     worker_label: string
+    retired_worker_label: string
     mailbox_id: string
+    retired_mailbox_id: string
   }
 }
+
+export type V11InquiryKey = 'suppressed' | 'offline' | 'replied' | 'cooldown' | 'uncertain' | 'held' | 'waiting' | 'killswitch'
 
 export type UserKey = 'owner' | 'reviewer' | 'reviewer2' | 'viewer' | 'expiring' | 'multi' | 'stranger'
 
@@ -114,6 +121,28 @@ export function hold(): { promise: Promise<void>; release: () => void } {
     holder.resolve = resolve
   })
   return { promise, release: () => holder.resolve?.() }
+}
+
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url))
+
+/**
+ * The concurrent change the owner did not see (TEST ONLY): one more `kill_switch` suppression is
+ * recorded in the running backend's SYNTHETIC database through the REAL repository
+ * (`tests/e2e/v11_actions.py`, loopback E2E databases only). Returns the new removable count.
+ */
+export function addKillSwitchSuppression(): number {
+  const output = execFileSync('uv', ['run', '--quiet', 'python', 'tests/e2e/v11_actions.py', 'add-kill-switch-suppression'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: 120_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const last = output.trim().split('\n').at(-1) ?? '{}'
+  const result = JSON.parse(last) as { created?: boolean; removable_suppressions?: number }
+  if (result.created !== true || typeof result.removable_suppressions !== 'number') {
+    throw new Error(`the SYNTHETIC suppression was not added: ${last}`)
+  }
+  return result.removable_suppressions
 }
 
 /**

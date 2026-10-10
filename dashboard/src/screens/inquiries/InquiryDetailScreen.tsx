@@ -25,9 +25,12 @@ import {
   recipientText,
   ReplyAvailability,
   RequireScope,
+  SignalStatusBadge,
   stateHelp,
   suppressionText,
   vehicleText,
+  WaitingReasonBadge,
+  waitingReasonHelp,
 } from './shared'
 
 export function InquiryDetailScreen() {
@@ -77,6 +80,7 @@ function InquiryDetailContent() {
           items={[
             ['State', <InquiryStateBadge key="s" state={inquiry.state} />],
             ['Meaning', stateHelp(inquiry.state)],
+            ['Waiting for', <WaitingReasonBadge key="w" reason={inquiry.waiting_reason} />],
             ['State reasons', inquiry.state_reasons.length ? inquiry.state_reasons.map((code) => <code key={code}>{code} </code>) : 'none'],
             ['Suppression', suppressionText(inquiry.suppression_reason)],
             ['Delivery uncertain', yesNo(inquiry.delivery_uncertain)],
@@ -227,6 +231,14 @@ function StatusNotices({ inquiry }: { inquiry: InquiryView }) {
           inquiry proceeds automatically once they are.
         </Notice>
       ) : null}
+      {inquiry.waiting_reason !== null && inquiry.waiting_reason !== 'UNCERTAIN_DELIVERY' && inquiry.waiting_reason !== 'NEEDS_FACTS' ? (
+        <Notice tone="info">
+          <span data-testid="waiting-notice" data-reason={inquiry.waiting_reason}>
+            Waiting: {waitingReasonHelp(inquiry.waiting_reason)} It proceeds automatically once that clears; there is no approval
+            to give and nothing to send by hand.
+          </span>
+        </Notice>
+      ) : null}
     </>
   )
 }
@@ -369,6 +381,7 @@ export function ReplyRows({ items, timeZone }: { items: ReplySummaryView[]; time
           <th scope="col">Availability stated</th>
           <th scope="col">Correlation</th>
           <th scope="col">Processing</th>
+          <th scope="col">Dot signal</th>
         </tr>
       </thead>
       <tbody>
@@ -391,6 +404,9 @@ export function ReplyRows({ items, timeZone }: { items: ReplySummaryView[]; time
             </td>
             <td data-label="Processing">
               <Badge value={reply.processing_state} />
+            </td>
+            <td data-label="Dot signal">
+              <SignalStatusBadge status={reply.signal_status} />
             </td>
           </tr>
         ))}

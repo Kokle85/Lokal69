@@ -329,16 +329,16 @@ def test_inquiries_status_pause_and_resume(
     _run(db_url, suppress)
     resume = ["inquiries", "resume", "--workspace", ws, "--reason", "Owner resume (synthetic)"]
     resume += ["--expected-version", str(version + 1)]
-    no_owner = run_cli(*resume, "--remove-suppressions", "--yes", env=db_env)
+    # C2: removal names the count the owner saw (`--expected-suppressions`, from `inquiries status`).
+    removal = ["--remove-suppressions", "--expected-suppressions", "1"]
+    no_owner = run_cli(*resume, *removal, "--yes", env=db_env)
     assert no_owner.exit_code == 2  # suppressions are never removed by a system principal
     stranger = seed.user()
-    not_owner = run_cli(
-        *resume, "--remove-suppressions", "--owner-user-id", str(stranger), "--yes", env=db_env
-    )
+    not_owner = run_cli(*resume, *removal, "--owner-user-id", str(stranger), "--yes", env=db_env)
     assert not_owner.exit_code == 1
     owner = seed.user()
     seed.membership(world.workspace_id, owner, "owner")
-    resumed = run_cli(*resume, "--remove-suppressions", "--owner-user-id", str(owner), "--yes", env=db_env)
+    resumed = run_cli(*resume, *removal, "--owner-user-id", str(owner), "--yes", env=db_env)
     assert resumed.exit_code == 0, resumed.output
     assert f"Resumed (version {version + 2}" in resumed.output
     assert "Removed 1 suppression(s)" in resumed.output

@@ -46,9 +46,10 @@ function inquiryApi(extra: Record<string, Parameters<typeof fakeApi>[0][string]>
       if (params.get('attention_only') === 'true') {
         return ok({
           items: [
-            inquirySummary({ inquiry_id: INQUIRY_ID_2, state: 'uncertain', delivery_uncertain: true }),
-            inquirySummary({ inquiry_id: INQUIRY_ID_3, state: 'held_facts', recipient_status: 'unverified', language: null, send_attempted_at: null, accepted_at: null }),
+            inquirySummary({ inquiry_id: INQUIRY_ID_2, state: 'uncertain', delivery_uncertain: true, waiting_reason: 'UNCERTAIN_DELIVERY' }),
+            inquirySummary({ inquiry_id: INQUIRY_ID_3, state: 'held_facts', recipient_status: 'unverified', language: null, send_attempted_at: null, accepted_at: null, waiting_reason: 'NEEDS_FACTS' }),
             inquirySummary({ inquiry_id: INQUIRY_ID_4, state: 'suppressed', suppression_reason: 'seller_opt_out', send_attempted_at: null, accepted_at: null }),
+            inquirySummary({ inquiry_id: '66666666-6666-4666-8666-66666666666b', state: 'qualifying', send_attempted_at: null, accepted_at: null, reserved_at: null, waiting_reason: 'RATE_CAP_REACHED' }),
           ],
         })
       }
@@ -74,9 +75,14 @@ describe('seller inquiries list', () => {
     expect(within(uncertain).getByText('delivery uncertain')).toBeInTheDocument()
     expect(within(screen.getByTestId('attention-held')).getByText('not verified')).toBeInTheDocument()
     expect(within(screen.getByTestId('attention-suppressed')).getByText(/seller opted out/)).toBeInTheDocument()
+    // The caps wait is its own typed group (C3: the server's waiting_reason), with the usage.
+    const caps = await screen.findByTestId('attention-wait-RATE_CAP_REACHED')
+    expect(caps).toHaveTextContent('The rolling caps are reached (2 of 2 in 24 h')
+    expect(caps).toHaveTextContent('Nothing is sent until then')
+    expect(within(caps).getByTestId('waiting-reason')).toHaveAttribute('data-reason', 'RATE_CAP_REACHED')
+    // A qualified inquiry without a reported reason is listed separately (never twice).
     const waiting = await screen.findByTestId('attention-waiting')
-    expect(waiting).toHaveTextContent('The rolling caps are reached (2 of 2 in 24 h')
-    expect(waiting).toHaveTextContent('Nothing is sent until then')
+    expect(within(waiting).getAllByTestId('inquiry-row')).toHaveLength(1)
     expect(screen.getByTestId('control-summary')).toHaveTextContent('24 h: 2 of 2 used')
     expect(screen.getByTestId('standing-authorization')).toHaveTextContent('no per-message approval')
     const table = await screen.findByRole('table', { name: 'Seller inquiries' })

@@ -10,7 +10,7 @@ import {
   type ResponseEnvelope,
   type CandidateListView,
 } from '../api/types'
-import { Amount, Badge, EmptyState, ErrorPanel, LoadingState, ViewMeta, Warnings } from '../components/ui'
+import { Amount, Badge, EmptyState, ErrorPanel, LoadingState, Notice, ViewMeta, Warnings } from '../components/ui'
 import { ageText, kmText, label, localInputToRfc3339, partialDateText, rfc3339ToLocalInput } from '../format'
 import { useApiQuery } from '../hooks/useApiQuery'
 import { useWorkspace } from '../workspace/WorkspaceProvider'
@@ -36,6 +36,8 @@ function filtersFrom(params: URLSearchParams): CandidateListQuery {
   if (country && LIMITS.countryPattern.test(country)) query.country = country
   const changed = params.get('changed_since')
   if (changed) query.changed_since = changed
+  // Dashboard-only audit filter (never an MCP input); bound into the server cursor.
+  if (params.get('include_screening_rejected') === 'true') query.include_screening_rejected = true
   return query
 }
 
@@ -91,9 +93,18 @@ export function CandidatesScreen() {
           if (next.status) search.set('status', next.status)
           if (next.country) search.set('country', next.country)
           if (next.changed_since) search.set('changed_since', next.changed_since)
+          if (next.include_screening_rejected) search.set('include_screening_rejected', 'true')
           setParams(search)
         }}
       />
+      {filters.include_screening_rejected ? (
+        <Notice tone="info">
+          <span data-testid="audit-filter-notice">
+            Audit view: observations that screening rejected are listed too. They are kept for audit only and are not candidates;
+            nothing is reviewed, valued or contacted because they appear here.
+          </span>
+        </Notice>
+      ) : null}
       {page.status === 'loading' ? <LoadingState label="Loading candidates" /> : null}
       {page.error ? <ErrorPanel error={page.error} onRetry={page.reload} /> : null}
       {page.envelope ? (
@@ -127,7 +138,7 @@ export function CandidatesScreen() {
               </thead>
               <tbody>
                 {items.map((item) => (
-                  <CandidateRow key={item.listing_id} item={item} />
+                  <CandidateRow key={item.listing_id} item={item} audit={Boolean(filters.include_screening_rejected)} />
                 ))}
               </tbody>
             </table>
@@ -146,9 +157,10 @@ export function CandidatesScreen() {
   )
 }
 
-function CandidateRow({ item }: { item: CandidateSummary }) {
+function CandidateRow({ item, audit }: { item: CandidateSummary; audit: boolean }) {
+  const screeningRejected = audit && item.eligibility === 'rejected'
   return (
-    <tr>
+    <tr data-testid="candidate-row" data-screening-rejected={screeningRejected ? 'yes' : 'no'}>
       <td data-label="Vehicle">
         <Link to={`/candidates/${item.listing_id}`} className="row-link">
           {modelText(item)}
@@ -160,6 +172,11 @@ function CandidateRow({ item }: { item: CandidateSummary }) {
         {item.is_fixture ? <Badge tone="muted">synthetic fixture</Badge> : null}
         {item.research_candidate ? <Badge tone="warn">research candidate</Badge> : null}
         {item.quarantined ? <Badge tone="bad">quarantined</Badge> : null}
+        {screeningRejected ? (
+          <span data-testid="screening-rejected-badge">
+            <Badge tone="muted">screening rejected (audit)</Badge>
+          </span>
+        ) : null}
       </td>
       <td data-label="Price (original)">
         <Amount value={item.price.payable} />
@@ -202,6 +219,7 @@ function FilterForm({ initial, onApply }: { initial: CandidateListQuery; onApply
   const [status, setStatus] = useState(initial.status ?? '')
   const [country, setCountry] = useState(initial.country ?? '')
   const [changed, setChanged] = useState(rfc3339ToLocalInput(initial.changed_since ?? null))
+  const [auditRejected, setAuditRejected] = useState(Boolean(initial.include_screening_rejected))
   const [problem, setProblem] = useState<string | null>(null)
 
   function submit(event: FormEvent) {
@@ -222,6 +240,7 @@ function FilterForm({ initial, onApply }: { initial: CandidateListQuery; onApply
     if (status) query.status = status as CandidateStatus
     if (normalizedCountry) query.country = normalizedCountry
     if (changedSince) query.changed_since = changedSince
+    if (auditRejected) query.include_screening_rejected = true
     onApply(query)
   }
 
@@ -264,6 +283,10 @@ function FilterForm({ initial, onApply }: { initial: CandidateListQuery; onApply
         <label htmlFor="filter-changed">Changed since</label>
         <input id="filter-changed" type="datetime-local" value={changed} onChange={(event) => setChanged(event.target.value)} />
       </div>
+      <label className="inline-check">
+        <input type="checkbox" checked={auditRejected} onChange={(event) => setAuditRejected(event.target.checked)} /> include
+        screening-rejected (audit)
+      </label>
       <div className="field field-actions">
         <button type="submit" className="button">
           Apply filters
@@ -276,6 +299,7 @@ function FilterForm({ initial, onApply }: { initial: CandidateListQuery; onApply
             setStatus('')
             setCountry('')
             setChanged('')
+            setAuditRejected(false)
             onApply({})
           }}
         >

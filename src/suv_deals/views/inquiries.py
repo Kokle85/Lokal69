@@ -320,6 +320,10 @@ class InquiryView(ViewModel):
     timestamps: InquiryTimestamps
     row_version: int = Field(ge=1)
     approval_required: Literal[False] = False
+    waiting_reason: WaitingReason | None = Field(
+        default=None,
+        description="Why the inquiry waits (null: not waiting); the same rule as the list rows.",
+    )
 
     @model_validator(mode="after")
     def _consistent(self) -> InquiryView:
