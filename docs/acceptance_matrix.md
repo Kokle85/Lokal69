@@ -7,8 +7,9 @@ and commands, with two judgements:
   means the automated tests pass on the working tree of 2026-10-10 (base `e5d47f4` plus the
   uncommitted waves D1-D3 and the final verification pass), on PostgreSQL 16 AND 17.11 wherever a
   database is involved (measured counts, and the D3 flaky test fixed since:
-  [qa_evidence.md](qa_evidence.md)). It is not an exact-build result: no release report on a
-  commit exists yet.
+  [qa_evidence.md](qa_evidence.md)). The same suites then passed on the exact commit `cee1a15`
+  (clean tree) through `scripts/verify_release.sh --with-e2e`, result **verified**
+  ([qa/cee1a15.../README.md](qa/cee1a15aaa87583d8e2847bb14253932273855d4/README.md)).
 - **Class**: *offline-verified* (fully covered by the automated tests here), *activation-pending*
   (the offline part is covered; the remaining evidence needs a live service or the owner's
   accounts, see [ACTIVATION_GATES.md](../ACTIVATION_GATES.md)), or *gap* (missing test or tool).
@@ -51,7 +52,7 @@ Dashboard: `cd dashboard && npm test` (Vitest) and `npx playwright test` (browse
 | Dashboard | **passed** | activation-pending | `dashboard/e2e/review.spec.ts` (double submit, expired claim, a new revision before submit), `dashboard/e2e/browse.spec.ts`, `dashboard/e2e/inquiries.spec.ts`, `dashboard/e2e/auth.spec.ts`, `dashboard/e2e/security.spec.ts`, `dashboard/src/test` | browser E2E runs against mock Supabase Auth and a local backend, never a deployed dashboard; the open process gate is not exercised in the browser |
 | Source adapter | **passed** (saved fixtures) / **blocked** (live smoke) | activation-pending | `tests/adapters` (search/detail variants, zero results, removed, login wall, CAPTCHA, malformed markup; `tests/adapters/test_fixture_manifests.py`), `tests/integration/pipeline/test_e2e_fixture_pipeline.py` | 12 of 14 sources have no adapter; no live smoke (gate `source_access`) |
 | Backup | **passed** (local round trip) / **not run** (restore report of the real project) | activation-pending | `tests/cli/test_ops_files.py` (backup of a synthetic database and isolated restore check with counts and hashes; no password in argv) | no restore drill of the hosted project; storage objects not covered by a database backup; the manifest covers v1.0 tables only (OPS-13) |
-| Deployment | **not run** | gap | `tests/cli/test_d2_release_verifier.py`, `tests/cli/test_ops_files.py`, `tests/integration/db/test_scripts.py` (forward-only migrations, rollback policy) | no release report on an exact commit, no clean install on a host, no rollback drill, no image digest (gate `hosting`) |
+| Deployment | **not run** | gap | `tests/cli/test_d2_release_verifier.py`, `tests/cli/test_ops_files.py`, `tests/integration/db/test_scripts.py` (forward-only migrations, rollback policy) | exact-build release report exists for `cee1a15` (offline verification only); no clean install on a host, no rollback drill, no image digest (gate `hosting`) |
 | Full pipeline | **blocked** | activation-pending | `tests/integration/pipeline/test_e2e_fixture_pipeline.py` (synthetic listing to DB to review: passed), `tests/integration/v11_runtime/test_e2e_runtime.py` | a live new/changed listing to an approved destination with dot's evidence (spec 31 "exact-build end-to-end acceptance") |
 
 ## Spec 37.10 required delta tests
@@ -90,7 +91,9 @@ Dashboard: `cd dashboard && npm test` (Vitest) and `npx playwright test` (browse
 
 ## Exact-build evidence
 
-`docs/qa/<commit>/` is empty: the D1-D3 work is not committed, so no `scripts/verify_release.sh
---with-e2e` report on an exact commit exists ([qa/README.md](qa/README.md)). After the commit, run
-it and copy `var/releases/<sha>_<ts>.txt` and the dashboard, desktop and E2E outputs into
-`docs/qa/<sha>/` (docs/runbook.md section 8).
+`scripts/verify_release.sh --with-e2e` ran on commit `cee1a15aaa87583d8e2847bb14253932273855d4`
+with a clean working tree on 2026-10-10: every step passed (lint, typecheck, schemas, tests without
+a database, database tests on PostgreSQL 16 and 17.11, desktop worker, dashboard ci/build/test/
+lint/audit, browser E2E on both PostgreSQL versions), result **verified**. The report and counts are
+in [qa/cee1a15.../README.md](qa/cee1a15aaa87583d8e2847bb14253932273855d4/README.md). Repeat it for
+every later release commit (docs/runbook.md section 8).

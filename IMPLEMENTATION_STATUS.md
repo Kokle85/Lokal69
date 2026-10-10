@@ -30,7 +30,7 @@ external effect is off by default.
 | M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 MCP tools, scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
 | M7 Notifications and optional activation bridge | done offline; activation **blocked** | MCP Events provider and subscriptions, Slack fallback and the selected Slack seller-reply route, destination bindings, dedup, uncertainty handling (`tests/integration/pipeline/test_dispatcher.py`, `tests/integration/v11_runtime`, `tests/mcp/test_events.py`) | delivery receipts and dot's processing evidence; an operator command for destination bindings (ACTIVATION_GATES.md section 19) |
 | M7a Bounded automatic seller inquiries | `integration_verified`; activation **blocked** | U1-U12 below; `tests/integration/v11_*`, `tests/integration/mail_worker_e2e`, `desktop/outlook-bridge/tests` | the owner's classic Outlook, the activation canary (rows 4-6) and the Slack -> dot leg; no actual seller e-mail is claimed |
-| M8 Release hardening | partial | independent reviews after every wave (security, spec acceptance, operations), the final review findings fixed in D1/D2, this acceptance matrix with passed/blocked/not-run rows | exact-build release report on a commit; restore and rollback drills; image digests |
+| M8 Release hardening | partial | independent reviews after every wave (security, spec acceptance, operations), the final review findings fixed in D1/D2, this acceptance matrix with passed/blocked/not-run rows | restore and rollback drills; image digests (the exact-build release report for `cee1a15` is verified: docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/) |
 
 ## Spec 37.10 upgrade items (U1-U12)
 
@@ -50,7 +50,7 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 | U9 | `integration_verified` (correlated replies, MCP retrieval); vehicle documents partial | tested offline; document contents not done (manual) | only inquiry-correlated replies are stored through the authenticated API (`tests/integration/v11_replies/test_reply_ingest.py`, `tests/api/test_mail_worker_routes.py`); scoped MCP `seller_replies_get` (`tests/mcp/test_v11_tools.py`); attachment metadata only, identity documents withheld | document contents (CoC, registration, CO2) are verified manually by the owner in the mailbox (docs/seller_email_activation.md section 9) |
 | U10 | `integration_verified` (code); live `blocked` | tested offline; activation-pending (Slack, dot) | Outlook -> backend -> outbox -> Slack signal (metadata `suv_deals.seller_reply_received`) with flood control and uncertain-post reconciliation; MCP Events stay candidate discovery only (`tests/integration/v11_runtime/test_signal_delivery.py`, `test_signal_gates.py`, `test_e2e_runtime.py`, `tests/integration/v11_replies/test_reply_signal_flood.py`) | Slack app/channel, destination binding, dot trigger and dot's processing evidence (gate `seller_reply_slack_route`) |
 | U11 | `integration_verified` | tested offline; activation-pending (tax and cost approvals) | Macedonian reply summary, deterministic claims (a price is an unaccepted seller quote), availability/evidence updates, valuation recalculation, owner alerts only for decisions or supported opportunities (`tests/unit/test_replies.py`, `tests/integration/v11_runtime/test_reply_escalation.py`, `test_opportunity_decision.py`) | approved tax rules and cost assumptions for evidence-supported recalculation; the Slack owner-alert route is not activated |
-| U12 | `blocked` | activation-pending (commit, release report, canary) | the extended suite passes on the working tree (counts in docs/qa_evidence.md); the 15-day evaluation reports zero as zero (`tests/unit/test_evaluation.py`, `suv-deals evaluation report --days 15`); runbook and status updated | an exact-build release report on a commit and the live activation canary |
+| U12 | `blocked` | activation-pending (live activation canary) | the extended suite passes on the exact commit `cee1a15` (`verify_release.sh --with-e2e`: verified, docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/); the 15-day evaluation reports zero as zero (`tests/unit/test_evaluation.py`, `suv-deals evaluation report --days 15`); runbook and status updated | the live activation canary |
 
 ## What is NOT done or NOT verified
 
@@ -81,8 +81,9 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
   freshness, the 7-day cooldown default, 3 send attempts, `MAX_SIGNALS_PER_INQUIRY_24H` = 6,
   `MAIL_WORKER_REPLY_LIMIT`, `MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR` = 120,
   `MAX_CANARIES_PER_24H` = 5, the 24 h canary window (ACTIVATION_GATES.md section 20).
-- **Exact-build release.** D1 to D3 are not committed, so no `scripts/verify_release.sh
-  --with-e2e` report exists for an exact commit; restore and rollback drills were not performed.
+- **Drills.** The exact-build release report exists for commit `cee1a15` (verified,
+  docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/); restore and rollback drills of the hosted
+  project were not performed.
 - **Activation tooling not built:** no command records a gate status change; no command creates,
   approves or verifies a destination binding; no command stores, approves or activates a tax rule
   set in the database; no command approves a cost profile; no command records the `gmail_api`
@@ -127,7 +128,7 @@ happened to each. "Fixed" items have tests that failed on the old code (wave D2 
 | F2 no MK comparable ingestion | real, high | fixed: `suv-deals market import` and `mk_comparable` routing |
 | F3 / OPS-04 no canary transport; automatic mode not gated on live evidence | real | fixed for `outlook_local` (transport, reservation gate `activation_canary_incomplete`); `gmail_api` / `microsoft_graph` have none |
 | F4 v1.1 gates missing / Slack reply route mislabelled | real | fixed: three gates seeded `blocked` (`tests/integration/pipeline/test_d2_activation_gates.py`) |
-| F5 / OPS-11 handoff documents missing | real | fixed in D2 and rewritten in D3; the exact-build evidence still needs a commit |
+| F5 / OPS-11 handoff documents missing | real | fixed in D2 and rewritten in D3; exact-build evidence recorded for `cee1a15` |
 | F6 / OPS-08 release verifier skipped desktop, dashboard, E2E | real | fixed (`tests/cli/test_d2_release_verifier.py`) |
 | F7 downtime catch-up untested | real, low | fixed (`tests/integration/repos_sources_listings/test_schedules.py`) |
 | F8 no browser test for a new revision before submit | real, low | fixed (`dashboard/e2e/review.spec.ts`) |
@@ -181,7 +182,7 @@ Still open:
 | Source registry with activation/access/parser coverage | docs/source_access_register.md, `config/sources/`, ACTIVATION_GATES.md section 4 |
 | JSON schemas and MCP tool contract exports | `schemas/tools/`, `schemas/api/` (`scripts/export_schemas.py --check`), docs/api_contract.md |
 | Dashboard and MCP URLs | none: nothing is deployed |
-| Test reports and exact-build E2E evidence | docs/qa_evidence.md (working tree), docs/acceptance_matrix.md; exact-build: not yet (docs/qa/README.md) |
+| Test reports and exact-build E2E evidence | docs/qa_evidence.md, docs/acceptance_matrix.md; exact-build: docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/ (verified) |
 | Configuration guide and secrets placement | `.env.example`, docs/runbook.md 2.1 and 3, SECURITY.md "Secrets" |
 | Tax-rule approval workflow and status | docs/tax_rule_approval.md; status: no approved rule set |
 | Notification/trigger setup and what was verified | docs/notification_bridge.md, docs/connect_mcp.md; verified only with fakes |

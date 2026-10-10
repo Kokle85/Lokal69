@@ -79,15 +79,18 @@ old failure modes; the product code was already correct and is unchanged.
 
 ## Not run here
 
-- `scripts/verify_release.sh --with-e2e`: needs a commit (a dirty tree is reported "not
-  releasable"); see "Exact-build release report".
 - Live tests: the `live` marker is declared but no live test exists; live source smoke, crawler
   health, mailbox, Slack, dot and MCP client checks are activation steps (ACTIVATION_GATES.md).
 - Restore drill of the hosted project, rollback drill, image build and digests.
 
 ## Exact-build release report
 
-After the working tree is committed, run on that exact commit:
+Done for commit `cee1a15aaa87583d8e2847bb14253932273855d4` (clean tree, 2026-10-10): every step
+passed, result **verified** -
+[qa/cee1a15.../README.md](qa/cee1a15aaa87583d8e2847bb14253932273855d4/README.md) (6341 tests
+without a database; database tests 1610 + 1 skipped on PostgreSQL 16 and 1611 on 17.11; desktop
+317; vitest 192; tests/e2e 36 and Playwright 46 on each PostgreSQL version). For every later
+release commit, run:
 
 ```bash
 export VITE_SUPABASE_URL=<the target's project URL> VITE_SUPABASE_PUBLISHABLE_KEY=<publishable key>
