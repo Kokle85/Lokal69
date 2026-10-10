@@ -47,6 +47,13 @@ DOCUMENTED_URLS = {
 }
 
 
+CONFIGURED_HOSTS = {
+    "mobile_de_public": "suchen.mobile.de",
+    "autoscout24_de": "www.autoscout24.de",
+    "autoscout24_it": "www.autoscout24.it",
+}
+
+
 def _adapter(source_key: str) -> SourceAdapter:
     return load_registry(REPO / "config").adapter(source_key)
 
@@ -54,21 +61,23 @@ def _adapter(source_key: str) -> SourceAdapter:
 @pytest.mark.parametrize("source_key", PLACEHOLDER_SOURCES)
 async def test_placeholders_raise_with_checklist_pointer(source_key: str, client: FixtureCrawlClient) -> None:
     adapter = _adapter(source_key)
+    # Sources with an owner decision (2026-10-10) carry robots-checked hosts; the rest none.
+    host = CONFIGURED_HOSTS.get(source_key, "placeholder.example")
     assert isinstance(adapter, PlaceholderAdapter)
     assert isinstance(adapter, SourceAdapter)
     assert adapter.adapter_version == "unimplemented"
     assert adapter.CAPABILITIES_VERIFIED is False
     profile = load_business_config(REPO / "config").profiles[ProfileKey.PRIMARY]
-    identity = adapter.canonicalize("https://placeholder.example/x?utm_source=a&id=7#f")
-    assert identity.canonical_url == "https://placeholder.example/x?id=7"
+    identity = adapter.canonicalize(f"https://{host}/x?utm_source=a&id=7#f")
+    assert identity.canonical_url == f"https://{host}/x?id=7"
     assert identity.identity_method == "canonical_url"
     with pytest.raises(AdapterUnimplemented, match="activation checklist"):
         adapter.build_search(profile, None)
     with pytest.raises(AdapterUnimplemented, match="activation checklist"):
-        adapter.parse_detail(raw_document("https://placeholder.example/x", "<html></html>"))
+        adapter.parse_detail(raw_document(f"https://{host}/x", "<html></html>"))
     with pytest.raises(AdapterUnimplemented, match="not verified"):
         await adapter.discover(
-            SearchRequest(source_key=source_key, profile_key="primary", url="https://placeholder.example/s"),
+            SearchRequest(source_key=source_key, profile_key="primary", url=f"https://{host}/s"),
             client,
         )
     with pytest.raises(AdapterUnimplemented):
@@ -76,9 +85,12 @@ async def test_placeholders_raise_with_checklist_pointer(source_key: str, client
     assert client.requests == []  # nothing was fetched
     health = adapter.assess_parser_health([])
     assert health.status == "insufficient_sample"
-    assert adapter.detect_access_state(raw_document("https://placeholder.example/x", None, status=403)) == (
+    assert adapter.detect_access_state(raw_document(f"https://{host}/x", None, status=403)) == (
         AccessState.ACCESS_BLOCKED
     )
+    if source_key in CONFIGURED_HOSTS:
+        with pytest.raises(ValidationFailed, match="host is not allowed"):
+            adapter.canonicalize("https://placeholder.example/x")
 
 
 @pytest.mark.parametrize(

@@ -44,7 +44,9 @@ def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli) -> None:
     )
     assert result.exit_code == 3
     assert "refused: source autoscout24_de is not active" in result.output
-    assert "terms decision is pending" in result.output
+    # The owner recorded a terms decision on 2026-10-10 (proceed_acknowledged); the source stays
+    # gated until its adapter is built and fixture-verified.
+    assert "adapter is unimplemented" in result.output
 
 
 def test_crawl_once_refuses_a_real_source_while_the_network_is_disabled(run_cli: Cli, tmp_path: Path) -> None:

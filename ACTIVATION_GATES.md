@@ -159,11 +159,17 @@ Each step only needs the steps above it; any step can stop without affecting the
   `fixture_verified` on synthetic pages. The other 12 sources have no adapter
   (`adapter_version: unimplemented`; `sources inspect` and `doctor` say "not activatable (no
   adapter)"), so configuration alone can never activate them.
-- **mobile.de and AutoScout24 are not crawled.** Building or running crawlers for them was denied
-  by an automated policy classifier during this build; it stays an owner decision (terms
-  restrictions are recorded in docs/source_access_register.md). Proceeding would need the
-  owner's decision, preferably a permission or agreement (`proceed_permitted`), and then the same
-  seven steps. The optional official mobile.de Search API is gate 5.
+- **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
+  path** (ADR 0002 addendum). `mobile_de_public`, `autoscout24_de`, `autoscout24_it` and
+  `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
+  record of the accepted terms risk, not legal permission) and the robots.txt facts checked on
+  2026-10-10; AutoScout24 Germany disallows detail pages for generic crawlers, so `autoscout24_de` is
+  `card_only`. They remain disabled because their adapters are not built: building the parsers needs
+  real, redacted page captures, and fetching those pages from the build environment was denied by
+  an automated policy classifier. The capture has to happen on the owner's side (or after the owner
+  grants that permission), then the adapters are built and fixture-verified (steps 1-7 of
+  docs/source_access_register.md). AutoScout24 Switzerland also needs its own terms identified.
+  The optional official mobile.de Search API is gate 5.
 - **Who:** owner records the terms decision; operator verifies routes, implements/configures the
   adapter, captures fixtures and runs the smoke; owner enables.
 - **Steps** (docs/source_access_register.md "Activation checklist", in order):
@@ -192,7 +198,7 @@ Each step only needs the steps above it; any step can stop without affecting the
 | Source | Adapter | Terms decision | What blocks it |
 |---|---|---|---|
 | `example_dealer_template_de`, `example_dealer_template_ch` | `schemaorg_dealer@1.1.0` (fixture_verified) | none (templates) | a real permitted dealer: copy, steps 1-7 |
-| `mobile_de_public`, `autoscout24_de`, `autoscout24_it`, `autoscout24_ch` | placeholder | pending | not crawled: owner decision; restrictive terms (CH terms not identified) |
+| `mobile_de_public`, `autoscout24_de`, `autoscout24_it`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; `autoscout24_de` card_only (robots); CH terms not identified |
 | `subito_it`, `automobile_it`, `carforyou_ch`, `tutti_ch`, `comparis_ch` | placeholder | pending | domain, terms, routes unverified; an adapter |
 | `pazar3_mk`, `reklama5_mk` (MK comparables) | placeholder | pending | terms and an adapter; until then MK evidence comes from `suv-deals market import` |
 | `mobile_de_api` | skeleton (raises until entitlement) | pending | gate 5 |
@@ -253,9 +259,10 @@ Each step only needs the steps above it; any step can stop without affecting the
 - **State:** `blocked`. Sender binding, verification, desktop worker, canary transport on
   `outlook_local` and the reservation gate `activation_canary_incomplete` are implemented and
   tested with fakes. No account is bound, no Windows PC was used, no canary was sent.
-- **Owner decisions in force:** default path `outlook_local` (classic Outlook on the owner's PC
-  with his Gmail account); optional `gmail_api`, which cannot be activated with this build (no
-  provider-verification command and no canary transport; OPS-09).
+- **Owner decisions in force:** `outlook_local` is THE path (owner decision 2026-10-10, ADR 0002
+  addendum): classic Outlook on the owner's PC with his Gmail account sends the inquiries and reads
+  the correlated replies. `gmail_api` / `microsoft_graph` stay in the code but are not part of the
+  activation plan.
 - **Prerequisites:** Supabase and hosting (the desktop worker needs an HTTPS backend URL), a
   Windows PC with classic Outlook (not "new Outlook") and the mailbox synchronising.
 - **Steps** (docs/runbook.md 10.1 to 10.6, docs/seller_email_activation.md sections 3 and 8):

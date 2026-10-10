@@ -25,7 +25,7 @@ external effect is off by default.
 | M1 Domain contracts and deterministic tests | done | `src/suv_deals/domain/`; `tests/unit`, `tests/property` (price EUR 2,500-3,000 inclusive, mileage strictly under 200,000 km, unknown is never zero) | - |
 | M2 Database and reliability foundation | done | 16 forward-only migrations, RLS on every `app`/`ops` table, durable jobs with leases, idempotency, outbox, audit; `tests/integration/db`, `tests/integration/persistence_core` on PostgreSQL 16 and 17.11 | - |
 | M3 Crawl4AI integration and first source | code done, exit **blocked** | Crawl4AI 0.9.4 REST client, URL policy, robots, rate limits, parser health, scheduler; generic dealer adapter `fixture_verified` (`tests/adapters`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`) | a permitted live search/detail smoke on one real source (gates `existing_crawler`, `source_access`) |
-| M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 12 of 14 sources have no adapter; mobile.de and AutoScout24 are not crawled (owner decision); no MK evidence in any real workspace |
+| M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 12 of 14 sources have no adapter; mobile.de and AutoScout24 are included by owner decision (2026-10-10) but their adapters still need real page captures; no MK evidence in any real workspace |
 | M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`) | an approved rule set (gate `tax_rules`), owner cost assumptions (gate `cost_assumptions`) |
 | M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 MCP tools, scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
 | M7 Notifications and optional activation bridge | done offline; activation **blocked** | MCP Events provider and subscriptions, Slack fallback and the selected Slack seller-reply route, destination bindings, dedup, uncertainty handling (`tests/integration/pipeline/test_dispatcher.py`, `tests/integration/v11_runtime`, `tests/mcp/test_events.py`) | delivery receipts and dot's processing evidence; an operator command for destination bindings (ACTIVATION_GATES.md section 19) |
@@ -56,10 +56,16 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 
 - **Live crawling.** No source was fetched live; no live smoke ever ran. 12 of the 14 registered
   sources have no adapter. No permitted dealer has been selected.
-- **mobile.de and AutoScout24 are not crawled.** Work on them was denied by an automated policy
-  classifier during this build; whether to pursue them (ideally with permission or an agreement)
-  remains the owner's decision. Their terms restrictions are recorded in
-  docs/source_access_register.md.
+- **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
+  path** (ADR 0002 addendum). `mobile_de_public`, `autoscout24_de`, `autoscout24_it` and
+  `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
+  record of the accepted terms risk, not legal permission) and the robots.txt facts checked on
+  2026-10-10; AutoScout24 Germany disallows detail pages for generic crawlers, so `autoscout24_de` is
+  `card_only`. They remain disabled because their adapters are not built: building the parsers needs
+  real, redacted page captures, and fetching those pages from the build environment was denied by
+  an automated policy classifier. The capture has to happen on the owner's side (or after the owner
+  grants that permission), then the adapters are built and fixture-verified (steps 1-7 of
+  docs/source_access_register.md). AutoScout24 Switzerland also needs its own terms identified.
 - **Crawl4AI service.** No crawler was reached; `doctor --crawler` and the firewall verification
   have not run against a real service.
 - **Real e-mail.** No account is bound or verified, no OAuth consent was granted, no message was
@@ -216,7 +222,8 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   `20261008000200`, docs/schema.md section 9) and serves nothing yet.
 - **Which sources are truly working?** None live. The generic dealer adapter is `fixture_verified`
   on synthetic pages; 12 of 14 registered sources have no adapter; mobile.de and AutoScout24 are
-  not crawled (owner decision).
+  included by owner decision (2026-10-10) but stay disabled until their adapters are built from
+  real page captures.
 - **When was each last checked?** No source has ever been checked live. The source register
   (docs/source_access_register.md) is dated 2026-10-06: terms were reviewed that day for
   `mobile_de_public`, `autoscout24_de` and `autoscout24_it` only (all restrictive) and every other

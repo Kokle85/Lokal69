@@ -14,14 +14,21 @@ technical_status: untested
 terms_status: restricted
 terms_url: https://www.autoscout24.com/company/agb/
 terms_reviewed_at: 2026-10-06T00:00:00Z
-terms_decision: pending
-terms_decision_actor: null
-terms_decision_note: null
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-10)"
+terms_decision_note: >-
+  Owner decision 2026-10-10: include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
 technical_denial_policy: stop_and_report
 robots_policy: obey
-allowed_hosts: []
-allowed_search_paths: []
-allowed_detail_paths: []
+robots_checked_at: 2026-10-10T00:00:00Z
+robots_summary: >-
+  robots.txt checked 2026-10-10 (fact, not permission): the 'User-agent: *' group disallows a query on the bare search path (/lst? and /lst/?), /ricerca-avanzata, dealer pages and API paths; it does not disallow /lst/<make>/<model> search pages or /annunci/ detail pages. No Crawl-delay.
+allowed_hosts:
+  - 'www.autoscout24.it'
+allowed_search_paths:
+  - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
+allowed_detail_paths:
+  - '^/annunci/[a-z0-9-]+$'
 search: {}
 notes: >-
   AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or Italy-specific (autoscout24.it) and business-use terms apply must be verified before a decision.

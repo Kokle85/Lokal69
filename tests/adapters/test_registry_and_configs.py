@@ -51,17 +51,30 @@ CH_MARKETPLACE_CANDIDATES = {
 }
 
 
+OWNER_DECIDED_SOURCES = frozenset({"mobile_de_public", "autoscout24_de", "autoscout24_it", "autoscout24_ch"})
+
+
 @pytest.mark.parametrize("path", CONFIG_FILES, ids=lambda p: p.name)
 def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
     config = SourceConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert path.stem == config.source_key
     assert config.enabled is False
     assert config.technical_status == TechnicalStatus.UNTESTED
-    assert config.terms_decision == TermsDecision.PENDING
-    assert config.terms_decision_actor is None
-    assert (
-        config.allowed_hosts == () and config.allowed_search_paths == () and config.allowed_detail_paths == ()
-    )
+    if config.source_key in OWNER_DECIDED_SOURCES:
+        # Owner decision 2026-10-10 (ADR 0002 addendum): an audited acknowledgement with an actor,
+        # never legal permission; the source stays disabled and gated (unimplemented adapter).
+        assert config.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
+        assert config.terms_decision_actor and "owner" in config.terms_decision_actor
+        assert config.robots_checked_at is not None and config.robots_summary
+        assert "adapter is unimplemented" in activation_problems(config)
+    else:
+        assert config.terms_decision == TermsDecision.PENDING
+        assert config.terms_decision_actor is None
+        assert (
+            config.allowed_hosts == ()
+            and config.allowed_search_paths == ()
+            and config.allowed_detail_paths == ()
+        )
     assert config.robots_policy == "obey" and config.technical_denial_policy == "stop_and_report"
     assert config.adapter in ADAPTERS
     assert activation_problems(config), "every candidate source must still be gated"
@@ -95,9 +108,9 @@ def test_autoscout_ch_is_reviewed_separately() -> None:
     assert cfg.notes is not None and "Swiss" in cfg.notes
     assert cfg.source_timezone == "Europe/Zurich"
     # The robots record is a fact, never permission; it does not open any gate.
-    assert cfg.robots_checked_at == datetime(2026, 10, 6, tzinfo=UTC)
+    assert cfg.robots_checked_at == datetime(2026, 10, 10, tzinfo=UTC)
     assert cfg.robots_summary is not None
-    assert "User-agent: *" in cfg.robots_summary and "NOT as permission" in cfg.robots_summary
+    assert "User-agent: *" in cfg.robots_summary and "fact, not permission" in cfg.robots_summary
     assert cfg.allowed_hosts == () and "adapter is unimplemented" in activation_problems(cfg)
 
 
