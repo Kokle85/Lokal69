@@ -1,0 +1,30 @@
+# Business defaults. Every change must be recorded as an app.config_revisions row
+# (actor, reason, before/after). PROPOSED values are engineering/business proposals
+# that Vasko has NOT approved; they stay labelled until an explicit approval is stored.
+destination_market: MK
+mk_resale_band:
+  # Asking-price research band for MK comparables. Not a proven realized sale price.
+  min_eur: "8000.00"
+  max_eur: "10000.00"
+  meaning: "asking-price research band; not a proven realized sale price"
+contribution_threshold:
+  # PROPOSED minimum estimated contribution before business tax. Unapproved.
+  amount_eur: "1500.00"
+  approval_status: unapproved
+  approved_by: null
+  approved_at: null
+# PROPOSED re-alert materiality (absolute EUR or percent). Requires owner selection.
+price_realert_abs_eur: "100"
+price_realert_pct: "5"
+price_realert_policy_approved: false
+# PROPOSED comparable matching windows (engineering defaults, not statistically validated).
+comparable_year_window: 1
+comparable_mileage_window_km: "30000"
+comparable_max_age_days: 90
+comparable_min_sample: 3
+# Negotiation discount from MK asking to realized proceeds: UNKNOWN until Vasko supplies one.
+negotiation_discount_pct: null
+# DEPRECATED and IGNORED: the review claim lease is the process setting
+# REVIEW_CLAIM_DURATION_SECONDS (.env). Kept only so stored configuration revisions keep
+# their canonical hash; changing it here has no effect.
+claim_duration_seconds: 300

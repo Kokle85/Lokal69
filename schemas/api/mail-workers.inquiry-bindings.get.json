@@ -1,0 +1,193 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": true,
+  "path": "/v1/mail-workers/inquiry-bindings",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /v1/mail-workers/inquiry-bindings?cursor=<opaque>&limit=<1..100>``.",
+    "properties": {
+      "cursor": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,1024}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": 100,
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "title": "MailWorkerBindingsQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of ``GET /v1/mail-workers/inquiry-bindings`` (== ``api_client.BindingPage``).\n\n``next_cursor`` is the opaque position after this complete page (the worker persists page and\ncursor atomically); ``has_more`` says whether another page is ready now. Items are at most\n``limit`` (<= 100) although the client accepts up to 1000.",
+    "properties": {
+      "has_more": {
+        "default": false,
+        "type": "boolean"
+      },
+      "items": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "description": "One binding change (== ``api_client.BindingSyncItem``). A tombstone carries identity,\nversion and state only; any other item satisfies the shared ``InquiryBinding`` rules.",
+          "properties": {
+            "binding_version": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "inquiry_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "is_canary": {
+              "default": false,
+              "type": "boolean"
+            },
+            "listing_id": {
+              "default": null,
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "listing_references": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "listing_urls": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "mailbox_binding_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "outbound_message_ids": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "provider": {
+              "default": null,
+              "enum": [
+                "outlook_local",
+                "gmail_api",
+                "microsoft_graph",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider_message_ids": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "provider_thread_ids": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "send_intent_message_ids": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "description": "Binding state as synced to the mailbox worker (spec 37.8 inquiry-bindings endpoint).",
+              "enum": [
+                "active",
+                "suppressed",
+                "uncertain",
+                "tombstoned"
+              ],
+              "type": "string"
+            },
+            "vehicle_cluster_id": {
+              "default": null,
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verified_seller_aliases": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "inquiry_id",
+            "binding_version",
+            "mailbox_binding_id",
+            "state"
+          ],
+          "title": "MailWorkerBindingItem",
+          "type": "object"
+        },
+        "maxItems": 1000,
+        "type": "array"
+      },
+      "next_cursor": {
+        "default": null,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "const": "1.0",
+        "type": "string"
+      }
+    },
+    "required": [
+      "schema_version"
+    ],
+    "title": "mail-workers.inquiry-bindings.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Binding changes for the worker's own mailbox, tombstones included (opaque cursor)."
+}

@@ -1,0 +1,30 @@
+source_key: fixture_dealer_ch
+designation: synthetic
+created: 2026-10-06
+parser_version: schemaorg_dealer@1.1.0
+description: >-
+  Hand-written SYNTHETIC pages for a fictional Swiss garage on the reserved example-style host
+  garage.example. Swiss number formatting (apostrophes, ".-" endings), CHF prices, a miles example
+  and Swiss export/MFK wording.
+files:
+  search_page.html: "Result page without JSON-LD: CHF 2'990.- / CHF 2'750.50 (typographic apostrophe) / leasing amount before the price; 150'000 km and 124'274 mi."
+  detail_chf.html: "CHF price 2990 with 'inkl. 8.1% MWST', mileage \"150'000\", displacement in litres, first registration 06.2012, zone-less dateModified, CO2 with WLTP."
+  detail_miles.html: "Mileage 124274 SMI (= 199999.616256 km, exact factor 1.609344), CHF 2750.50."
+  detail_export_ab_mfk.html: "CHF 2750 with Swiss wording 'Export ohne MWST' (export net price) and 'Occasion', 'Frisch ab MFK' (fresh-inspection seller claim)."
+  detail_ohne_mfk.html: "CHF 1950 'inkl. MWST' sold 'ab Platz ohne MFK' (not freshly inspected: never a positive roadworthy claim)."
+routes:
+  "https://garage.example/occasionen?kategorie=suv":
+    file: search_page.html
+    description: "search"
+  "https://garage.example/occasion/40101":
+    file: detail_chf.html
+    description: "detail CHF"
+  "https://garage.example/occasion/40102":
+    file: detail_miles.html
+    description: "detail miles"
+  "https://garage.example/occasion/40104":
+    file: detail_export_ab_mfk.html
+    description: "export net price and fresh MFK wording"
+  "https://garage.example/occasion/40105":
+    file: detail_ohne_mfk.html
+    description: "sold without MFK"

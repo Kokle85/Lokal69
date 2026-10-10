@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Secrets and local runtime state (never commit)
+.env
+.env.*
+!.env.example
+var/
+*.pem
+*.key
+
+# Node / dashboard
+node_modules/
+dashboard/dist/
+dashboard/test-results/
+dashboard/playwright-report/
+dashboard/.vite/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

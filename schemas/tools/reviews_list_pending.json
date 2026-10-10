@@ -1,0 +1,581 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "List pending reviews"
+  },
+  "description": "A stable page of the pending review queue (frozen snapshot) with eligibility, readiness and the case version that reviews_claim expects. Claim and submit always revalidate current versions.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": null,
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "cursor": {
+        "default": null,
+        "description": "Opaque next_cursor from the previous page; omit for the first page.",
+        "maxLength": 2048,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "include_needs_information": {
+        "default": true,
+        "description": "Also list cases waiting for more information.",
+        "type": "boolean"
+      },
+      "limit": {
+        "default": 25,
+        "description": "Page size (1-100).",
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "title": "reviews_list_pending",
+    "type": "object"
+  },
+  "name": "reviews_list_pending",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "A page of a frozen ``ops.query_snapshots`` projection; the cursor is in the envelope.",
+        "properties": {
+          "include_needs_information": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One pending-queue entry with eligibility/readiness and the case version (spec 21).",
+              "properties": {
+                "case_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "case_version": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "claim": {
+                  "additionalProperties": false,
+                  "description": "Claim status visible to every reader. No token, no hash, no other holder identity.",
+                  "properties": {
+                    "claimed": {
+                      "type": "boolean"
+                    },
+                    "expires_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "held_by_caller": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "claimed",
+                    "held_by_caller",
+                    "expires_at"
+                  ],
+                  "title": "ClaimStateView",
+                  "type": "object"
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "eligibility": {
+                  "enum": [
+                    "eligible_primary",
+                    "eligible_manual_profile",
+                    "needs_facts",
+                    "rejected",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "is_fixture": {
+                  "type": "boolean"
+                },
+                "listing_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "listing_revision": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "make": {
+                  "maxLength": 80,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "mileage_km": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "model": {
+                  "maxLength": 120,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "payable": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "payable_eur": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "priority": {
+                  "maximum": 100000,
+                  "minimum": -100000,
+                  "type": "integer"
+                },
+                "profile": {
+                  "enum": [
+                    "primary",
+                    "manual_4000",
+                    "below_target_watch"
+                  ],
+                  "type": "string"
+                },
+                "queue_label": {
+                  "maxLength": 120,
+                  "type": "string"
+                },
+                "rank": {
+                  "additionalProperties": false,
+                  "description": "Queue-ordering score. Never a probability of profit (spec 14).",
+                  "properties": {
+                    "is_probability": {
+                      "const": false,
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "label": {
+                      "default": "Ranking score for ordering the review queue only; it is not a probability of profit.",
+                      "type": "string"
+                    },
+                    "score": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": "string"
+                    },
+                    "scoring_version": {
+                      "maxLength": 80,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "score",
+                    "scoring_version",
+                    "is_probability",
+                    "label"
+                  ],
+                  "title": "RankSummary",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "readiness": {
+                  "pattern": "^[a-z][a-z0-9_]{0,79}$",
+                  "type": "string"
+                },
+                "research_candidate": {
+                  "type": "boolean"
+                },
+                "revision_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "seller_country": {
+                  "pattern": "^[A-Z]{2}$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "enum": [
+                    "pending",
+                    "claimed",
+                    "needs_information",
+                    "watch",
+                    "shortlisted",
+                    "rejected",
+                    "superseded"
+                  ],
+                  "type": "string"
+                },
+                "title": {
+                  "maxLength": 300,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "valuation_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "valuation_state": {
+                  "enum": [
+                    "not_started",
+                    "incomplete",
+                    "estimated",
+                    "quote_supported",
+                    "stale",
+                    "invalid"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "case_id",
+                "case_version",
+                "listing_id",
+                "revision_id",
+                "listing_revision",
+                "valuation_id",
+                "profile",
+                "queue_label",
+                "state",
+                "eligibility",
+                "readiness",
+                "valuation_state",
+                "priority",
+                "rank",
+                "claim",
+                "title",
+                "make",
+                "model",
+                "seller_country",
+                "payable",
+                "payable_eur",
+                "mileage_km",
+                "research_candidate",
+                "is_fixture",
+                "created_at",
+                "updated_at"
+              ],
+              "title": "ReviewQueueItem",
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "notice": {
+            "default": "Frozen queue projection for stable pagination; claim and submit revalidate current versions.",
+            "type": "string"
+          },
+          "snapshot_created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "snapshot_expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "total": {
+            "maximum": 10000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "snapshot_created_at",
+          "snapshot_expires_at",
+          "include_needs_information",
+          "notice"
+        ],
+        "title": "ReviewQueuePage",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "reviews_list_pending_result",
+    "type": "object"
+  },
+  "paginated": true,
+  "requiredScope": "reviews:read",
+  "title": "List pending reviews"
+}

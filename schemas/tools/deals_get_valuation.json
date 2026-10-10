@@ -1,0 +1,2350 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Get a valuation"
+  },
+  "description": "Versioned scenario breakdown (conservative/base/upside) with each line's status, unknowns (never zero), assumptions, threshold approval status, dependency fingerprint and expiry. Figures are estimated contributions before business tax, not net profit, and not probabilities.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": null,
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "valuation_id": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "valuation_id"
+    ],
+    "title": "deals_get_valuation",
+    "type": "object"
+  },
+  "name": "deals_get_valuation",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``schemas/valuation.schema.json`` and the ``deals_get_valuation`` result.",
+        "properties": {
+          "alert_eligible": {
+            "type": "boolean"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "comparable": {
+            "additionalProperties": false,
+            "description": "Reference to the MK comparable set used for proceeds (spec 15).",
+            "properties": {
+              "comparable_set_id": {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              "content_hash": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "fresh_until": {
+                "default": null,
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "is_fixture": {
+                "default": false,
+                "type": "boolean"
+              },
+              "quality": {
+                "enum": [
+                  "adequate",
+                  "small",
+                  "insufficient_comparables"
+                ],
+                "type": "string"
+              },
+              "sample_size": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "comparable_set_id",
+              "content_hash",
+              "sample_size",
+              "quality"
+            ],
+            "title": "ComparableReference",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "contribution_label": {
+            "const": "estimated contribution before business tax",
+            "default": "estimated contribution before business tax",
+            "type": "string"
+          },
+          "contributions": {
+            "additionalProperties": false,
+            "properties": {
+              "base": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "conservative": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "label": {
+                "const": "estimated contribution before business tax",
+                "default": "estimated contribution before business tax",
+                "type": "string"
+              },
+              "upside": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              }
+            },
+            "required": [
+              "conservative",
+              "base",
+              "upside",
+              "label"
+            ],
+            "title": "ContributionsView",
+            "type": "object"
+          },
+          "correlation_notes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "cost_lines": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One scenario input line with its status, bounds, evidence, expiry and scope (spec 18).",
+              "properties": {
+                "assumption_approved": {
+                  "type": "boolean"
+                },
+                "base": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "cash_before_sale": {
+                  "type": "boolean"
+                },
+                "category": {
+                  "enum": [
+                    "purchase",
+                    "bank_fx_charges",
+                    "travel_inspection",
+                    "transport",
+                    "export_plates_insurance",
+                    "customs_broker",
+                    "import_duty",
+                    "motor_vehicle_tax",
+                    "import_vat",
+                    "other_import_charges",
+                    "homologation_registration",
+                    "repairs",
+                    "preparation",
+                    "risk_reserve",
+                    "storage_holding",
+                    "selling_costs",
+                    "refundable_deposit"
+                  ],
+                  "type": "string"
+                },
+                "correlation_group": {
+                  "maxLength": 60,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "currency": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": "string"
+                },
+                "declared_status": {
+                  "enum": [
+                    "quoted",
+                    "estimated",
+                    "actual",
+                    "not_applicable",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "evidence_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 50,
+                  "type": "array"
+                },
+                "expires_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "high": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "label": {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                "low": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "provider": {
+                  "maxLength": 200,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "maxLength": 500,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "refund_confirmed": {
+                  "type": "boolean"
+                },
+                "refundable": {
+                  "type": "boolean"
+                },
+                "rule_supported": {
+                  "type": "boolean"
+                },
+                "scope": {
+                  "additionalProperties": false,
+                  "description": "What a quote/estimate covers. A quote for one city/condition never silently applies elsewhere.",
+                  "properties": {
+                    "destination_city": {
+                      "default": null,
+                      "maxLength": 120,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "listing_id": {
+                      "default": null,
+                      "maxLength": 100,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "origin_city": {
+                      "default": null,
+                      "maxLength": 120,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "origin_country": {
+                      "default": null,
+                      "pattern": "^[A-Z]{2}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "vehicle_running": {
+                      "default": null,
+                      "enum": [
+                        "running",
+                        "non_running",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "title": "CostScope",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "quoted",
+                    "estimated",
+                    "actual",
+                    "not_applicable",
+                    "unknown"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "category",
+                "label",
+                "status",
+                "declared_status",
+                "currency",
+                "low",
+                "base",
+                "high",
+                "evidence_ids",
+                "provider",
+                "expires_at",
+                "scope",
+                "reason",
+                "cash_before_sale",
+                "refundable",
+                "refund_confirmed",
+                "assumption_approved",
+                "rule_supported",
+                "correlation_group"
+              ],
+              "title": "CostLineView",
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "currency": {
+            "pattern": "^[A-Z]{3}$",
+            "type": "string"
+          },
+          "dependencies": {
+            "additionalProperties": false,
+            "description": "Exactly what a valuation was computed from. ``fingerprint()`` hashes all of it.",
+            "properties": {
+              "calculation_version": {
+                "default": "valuation/1.0.0",
+                "type": "string"
+              },
+              "comparable_hash": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "comparable_set_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "config_revision_id": {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              "cost_evidence_ids": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "cost_inputs_sha256": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "cost_profile": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "approval_status": {
+                    "enum": [
+                      "unapproved",
+                      "approved"
+                    ],
+                    "type": "string"
+                  },
+                  "is_fixture": {
+                    "type": "boolean"
+                  },
+                  "profile_key": {
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "type": "string"
+                  },
+                  "version": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "profile_key",
+                  "version",
+                  "sha256",
+                  "approval_status",
+                  "is_fixture"
+                ],
+                "title": "CostProfileRef",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "evidence_ids": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "fx": {
+                "default": [],
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "base": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "purpose": {
+                      "enum": [
+                        "reference",
+                        "customs",
+                        "payment"
+                      ],
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    },
+                    "rate": {
+                      "type": "string"
+                    },
+                    "rate_date": {
+                      "format": "date",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "base",
+                    "quote",
+                    "rate",
+                    "rate_date",
+                    "provider",
+                    "purpose"
+                  ],
+                  "title": "FxDependency",
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "listing_revision_id": {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              "tax_rule": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "is_fixture": {
+                    "type": "boolean"
+                  },
+                  "rule_set_id": {
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "draft",
+                      "under_review",
+                      "approved",
+                      "active",
+                      "superseded",
+                      "expired",
+                      "revoked",
+                      "unapproved"
+                    ],
+                    "type": "string"
+                  },
+                  "valid_from": {
+                    "format": "date",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "valid_to": {
+                    "format": "date",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "version": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rule_set_id",
+                  "version",
+                  "sha256",
+                  "status",
+                  "valid_from",
+                  "valid_to",
+                  "is_fixture"
+                ],
+                "title": "TaxRuleDependency",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "listing_revision_id",
+              "config_revision_id"
+            ],
+            "title": "ValuationDependencies",
+            "type": "object"
+          },
+          "dependency_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "eligibility": {
+            "enum": [
+              "eligible_primary",
+              "eligible_manual_profile",
+              "needs_facts",
+              "rejected"
+            ],
+            "type": "string"
+          },
+          "eligibility_profile": {
+            "enum": [
+              "primary",
+              "manual_4000",
+              "below_target_watch",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fixture_label": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_fixture": {
+            "type": "boolean"
+          },
+          "listing_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "listing_revision": {
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "listing_revision_id": {
+            "maxLength": 100,
+            "type": "string"
+          },
+          "material_support": {
+            "enum": [
+              "quote_supported",
+              "approved_assumptions",
+              "estimated",
+              "incomplete",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payable_eur": {
+            "additionalProperties": false,
+            "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+            "properties": {
+              "amount": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "currency": {
+                "pattern": "^[A-Z]{3}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "default": null,
+                "maxLength": 500,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "known",
+                  "unknown",
+                  "not_applicable"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "amount",
+              "currency",
+              "reason"
+            ],
+            "title": "AmountView",
+            "type": "object"
+          },
+          "proceeds": {
+            "additionalProperties": false,
+            "properties": {
+              "base": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "basis": {
+                "maxLength": 40,
+                "type": "string"
+              },
+              "comparable_set_id": {
+                "maxLength": 100,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "currency": {
+                "pattern": "^[A-Z]{3}$",
+                "type": "string"
+              },
+              "discount_status": {
+                "enum": [
+                  "unknown",
+                  "unapproved_assumption",
+                  "approved"
+                ],
+                "type": "string"
+              },
+              "evidence_ids": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 200,
+                "type": "array"
+              },
+              "evidence_kind": {
+                "description": "MK market evidence (spec section 15).",
+                "enum": [
+                  "asking_price",
+                  "seller_reported_sale",
+                  "verified_sale",
+                  "owner_estimate",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "high": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "label": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "low": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "negotiation_discount_pct": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "notice": {
+                "maxLength": 300,
+                "type": "string"
+              },
+              "sample_size": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "quoted",
+                  "estimated",
+                  "actual",
+                  "not_applicable",
+                  "unknown"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "basis",
+              "label",
+              "currency",
+              "low",
+              "base",
+              "high",
+              "evidence_kind",
+              "sample_size",
+              "negotiation_discount_pct",
+              "discount_status",
+              "comparable_set_id",
+              "evidence_ids",
+              "notice"
+            ],
+            "title": "ProceedsView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "purchase": {
+            "additionalProperties": false,
+            "properties": {
+              "amount": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "assumption_approved": {
+                "type": "boolean"
+              },
+              "basis": {
+                "maxLength": 200,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "deposit_refund_confirmed": {
+                "type": "boolean"
+              },
+              "evidence_ids": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              "included_refundable_deposit": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "label": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "quoted",
+                  "estimated",
+                  "actual",
+                  "not_applicable",
+                  "unknown"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "status",
+              "amount",
+              "basis",
+              "evidence_ids",
+              "included_refundable_deposit",
+              "deposit_refund_confirmed",
+              "assumption_approved"
+            ],
+            "title": "PurchaseView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "research_candidate": {
+            "type": "boolean"
+          },
+          "scenarios": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One coherent scenario (conservative/base/upside). Scenarios are not probabilities.",
+              "properties": {
+                "assumptions": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                },
+                "complete": {
+                  "type": "boolean"
+                },
+                "components": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "amount": {
+                        "additionalProperties": false,
+                        "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                        "properties": {
+                          "amount": {
+                            "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "currency": {
+                            "pattern": "^[A-Z]{3}$",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "reason": {
+                            "default": null,
+                            "maxLength": 500,
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "enum": [
+                              "known",
+                              "unknown",
+                              "not_applicable"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "amount",
+                          "currency",
+                          "reason"
+                        ],
+                        "title": "AmountView",
+                        "type": "object"
+                      },
+                      "label": {
+                        "maxLength": 200,
+                        "type": "string"
+                      },
+                      "term": {
+                        "maxLength": 60,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "term",
+                      "label",
+                      "amount"
+                    ],
+                    "title": "ScenarioTermView",
+                    "type": "object"
+                  },
+                  "maxItems": 12,
+                  "type": "array"
+                },
+                "contribution_before_business_tax": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "contribution_label": {
+                  "const": "estimated contribution before business tax",
+                  "default": "estimated contribution before business tax",
+                  "type": "string"
+                },
+                "currency": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": "string"
+                },
+                "expected_realized_proceeds": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "known_subtotal": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "known_subtotal_label": {
+                  "const": "known_subtotal",
+                  "default": "known_subtotal",
+                  "type": "string"
+                },
+                "proceeds_label": {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                "scenario": {
+                  "enum": [
+                    "conservative",
+                    "base",
+                    "upside"
+                  ],
+                  "type": "string"
+                },
+                "totals": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "amount": {
+                        "additionalProperties": false,
+                        "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                        "properties": {
+                          "amount": {
+                            "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "currency": {
+                            "pattern": "^[A-Z]{3}$",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "reason": {
+                            "default": null,
+                            "maxLength": 500,
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "enum": [
+                              "known",
+                              "unknown",
+                              "not_applicable"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "amount",
+                          "currency",
+                          "reason"
+                        ],
+                        "title": "AmountView",
+                        "type": "object"
+                      },
+                      "label": {
+                        "maxLength": 200,
+                        "type": "string"
+                      },
+                      "term": {
+                        "maxLength": 60,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "term",
+                      "label",
+                      "amount"
+                    ],
+                    "title": "ScenarioTermView",
+                    "type": "object"
+                  },
+                  "maxItems": 6,
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "unknown_lines": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "item": {
+                        "maxLength": 60,
+                        "type": "string"
+                      },
+                      "label": {
+                        "maxLength": 200,
+                        "type": "string"
+                      },
+                      "reason": {
+                        "maxLength": 500,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "item",
+                      "label",
+                      "reason"
+                    ],
+                    "title": "UnknownLineView",
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "scenario",
+                "complete",
+                "currency",
+                "proceeds_label",
+                "expected_realized_proceeds",
+                "components",
+                "totals",
+                "known_subtotal",
+                "known_subtotal_label",
+                "unknown_lines",
+                "contribution_before_business_tax",
+                "contribution_label",
+                "assumptions"
+              ],
+              "title": "ScenarioView",
+              "type": "object"
+            },
+            "maxItems": 3,
+            "type": "array"
+          },
+          "stale_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_reason": {
+            "maxLength": 500,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "enum": [
+              "not_started",
+              "incomplete",
+              "estimated",
+              "quote_supported",
+              "stale",
+              "invalid"
+            ],
+            "type": "string"
+          },
+          "tax": {
+            "additionalProperties": false,
+            "description": "Import-tax calculation under one versioned rule set. Unapproved rules are labelled.",
+            "properties": {
+              "approval_label": {
+                "maxLength": 300,
+                "type": "string"
+              },
+              "complete": {
+                "type": "boolean"
+              },
+              "components": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "amount": {
+                      "additionalProperties": false,
+                      "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                      "properties": {
+                        "amount": {
+                          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "currency": {
+                          "pattern": "^[A-Z]{3}$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "default": null,
+                          "maxLength": 500,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "enum": [
+                            "known",
+                            "unknown",
+                            "not_applicable"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "amount",
+                        "currency",
+                        "reason"
+                      ],
+                      "title": "AmountView",
+                      "type": "object"
+                    },
+                    "category": {
+                      "enum": [
+                        "purchase",
+                        "bank_fx_charges",
+                        "travel_inspection",
+                        "transport",
+                        "export_plates_insurance",
+                        "customs_broker",
+                        "import_duty",
+                        "motor_vehicle_tax",
+                        "import_vat",
+                        "other_import_charges",
+                        "homologation_registration",
+                        "repairs",
+                        "preparation",
+                        "risk_reserve",
+                        "storage_holding",
+                        "selling_costs",
+                        "refundable_deposit"
+                      ],
+                      "type": "string"
+                    },
+                    "component_id": {
+                      "maxLength": 64,
+                      "type": "string"
+                    },
+                    "inputs_used": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "name": {
+                            "maxLength": 100,
+                            "type": "string"
+                          },
+                          "value": {
+                            "maxLength": 500,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "value"
+                        ],
+                        "title": "TaxInputUsed",
+                        "type": "object"
+                      },
+                      "maxItems": 100,
+                      "type": "array"
+                    },
+                    "kind": {
+                      "maxLength": 40,
+                      "type": "string"
+                    },
+                    "label": {
+                      "maxLength": 200,
+                      "type": "string"
+                    },
+                    "missing_inputs": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "maxItems": 100,
+                      "type": "array"
+                    },
+                    "status": {
+                      "enum": [
+                        "resolved",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    },
+                    "warnings": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "maxItems": 100,
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "component_id",
+                    "label",
+                    "category",
+                    "kind",
+                    "status",
+                    "amount",
+                    "inputs_used",
+                    "missing_inputs",
+                    "warnings"
+                  ],
+                  "title": "TaxComponentView",
+                  "type": "object"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              "currency": {
+                "pattern": "^[A-Z]{3}$",
+                "type": "string"
+              },
+              "effective_date": {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              "engine_version": {
+                "maxLength": 80,
+                "type": "string"
+              },
+              "is_fixture": {
+                "type": "boolean"
+              },
+              "jurisdiction": {
+                "maxLength": 10,
+                "type": "string"
+              },
+              "known_subtotal": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "known_subtotal_label": {
+                "const": "known_subtotal",
+                "default": "known_subtotal",
+                "type": "string"
+              },
+              "missing_inputs": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              "production_ready": {
+                "type": "boolean"
+              },
+              "rule_set_id": {
+                "maxLength": 120,
+                "type": "string"
+              },
+              "rule_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rule_status": {
+                "enum": [
+                  "draft",
+                  "under_review",
+                  "approved",
+                  "active",
+                  "superseded",
+                  "expired",
+                  "revoked",
+                  "unapproved"
+                ],
+                "type": "string"
+              },
+              "total_import_cost": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "unknown_components": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              "version": {
+                "maxLength": 80,
+                "type": "string"
+              },
+              "warnings": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              }
+            },
+            "required": [
+              "rule_set_id",
+              "version",
+              "rule_status",
+              "rule_sha256",
+              "is_fixture",
+              "production_ready",
+              "approval_label",
+              "jurisdiction",
+              "currency",
+              "effective_date",
+              "engine_version",
+              "complete",
+              "total_import_cost",
+              "known_subtotal",
+              "known_subtotal_label",
+              "unknown_components",
+              "missing_inputs",
+              "components",
+              "warnings"
+            ],
+            "title": "TaxView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "terminology_note": {
+            "default": "Estimated contribution before business tax; not net profit. Business tax and accounting treatment are not modelled. Scenarios are not probabilities.",
+            "type": "string"
+          },
+          "threshold": {
+            "additionalProperties": false,
+            "description": "Minimum-contribution threshold. ``PROPOSED`` until the owner approves it (spec 18, 32).",
+            "properties": {
+              "alert_eligible": {
+                "type": "boolean"
+              },
+              "approval_status": {
+                "enum": [
+                  "unapproved",
+                  "approved"
+                ],
+                "type": "string"
+              },
+              "blockers": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              "label": {
+                "enum": [
+                  "PROPOSED",
+                  "APPROVED"
+                ],
+                "type": "string"
+              },
+              "proposed_only": {
+                "type": "boolean"
+              },
+              "threshold": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "would_meet": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "would_meet_by_scenario": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "scenario": {
+                      "enum": [
+                        "conservative",
+                        "base",
+                        "upside"
+                      ],
+                      "type": "string"
+                    },
+                    "would_meet": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "scenario",
+                    "would_meet"
+                  ],
+                  "title": "ScenarioCheck",
+                  "type": "object"
+                },
+                "maxItems": 3,
+                "type": "array"
+              }
+            },
+            "required": [
+              "threshold",
+              "approval_status",
+              "label",
+              "proposed_only",
+              "would_meet",
+              "would_meet_by_scenario",
+              "alert_eligible",
+              "blockers"
+            ],
+            "title": "ThresholdView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "unknowns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "unsupported_material": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "valuation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "versions": {
+            "additionalProperties": false,
+            "properties": {
+              "calculation_version": {
+                "maxLength": 80,
+                "type": "string"
+              },
+              "config_revision_id": {
+                "maxLength": 100,
+                "type": "string"
+              },
+              "cost_model_version": {
+                "maxLength": 80,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "cost_profile": {
+                "maxLength": 200,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tax_engine_version": {
+                "maxLength": 80,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tax_rule": {
+                "maxLength": 200,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "calculation_version",
+              "cost_model_version",
+              "tax_engine_version",
+              "tax_rule",
+              "cost_profile",
+              "config_revision_id"
+            ],
+            "title": "VersionsView",
+            "type": "object"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          }
+        },
+        "required": [
+          "valuation_id",
+          "listing_id",
+          "listing_revision_id",
+          "listing_revision",
+          "state",
+          "research_candidate",
+          "is_fixture",
+          "fixture_label",
+          "alert_eligible",
+          "currency",
+          "created_at",
+          "expires_at",
+          "stale_at",
+          "stale_reason",
+          "contribution_label",
+          "terminology_note",
+          "contributions",
+          "scenarios",
+          "purchase",
+          "proceeds",
+          "cost_lines",
+          "tax",
+          "threshold",
+          "material_support",
+          "unsupported_material",
+          "eligibility",
+          "eligibility_profile",
+          "payable_eur",
+          "comparable",
+          "unknowns",
+          "assumptions",
+          "warnings",
+          "correlation_notes",
+          "dependency_fingerprint",
+          "dependencies",
+          "versions"
+        ],
+        "title": "ValuationView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "deals_get_valuation_result",
+    "type": "object"
+  },
+  "paginated": false,
+  "requiredScope": "deals:read",
+  "title": "Get a valuation"
+}

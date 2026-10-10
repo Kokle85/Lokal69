@@ -1,0 +1,521 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Deal system health"
+  },
+  "description": "Build/version, service readiness (database, schema, configuration), per-source coverage and status, and activation blockers. Contains no secrets or credential-bearing URLs.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": null,
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "deals_health takes no arguments.",
+    "properties": {},
+    "title": "deals_health",
+    "type": "object"
+  },
+  "name": "deals_health",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``deals_health``: build, readiness, per-source coverage and activation blockers; no secrets.",
+        "properties": {
+          "activation_blockers": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One activation gate (``ops.activation_gates``, spec 32).",
+              "properties": {
+                "capability": {
+                  "pattern": "^[a-z][a-z0-9_.]{2,79}$",
+                  "type": "string"
+                },
+                "checked_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "dependency": {
+                  "maxLength": 500,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "next_action": {
+                  "maxLength": 2000,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "owner": {
+                  "maxLength": 200,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "required_evidence": {
+                  "maxLength": 2000,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "status": {
+                  "description": "Honest completion states (spec section 32).",
+                  "enum": [
+                    "not_requested",
+                    "implemented",
+                    "fixture_verified",
+                    "integration_verified",
+                    "live_verified",
+                    "active",
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "capability",
+                "dependency",
+                "required_evidence",
+                "status",
+                "owner",
+                "next_action",
+                "checked_at"
+              ],
+              "title": "GateView",
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "bridge_status": {
+            "enum": [
+              "unavailable",
+              "configured",
+              "verified"
+            ],
+            "type": "string"
+          },
+          "build": {
+            "additionalProperties": false,
+            "properties": {
+              "app_env": {
+                "enum": [
+                  "development",
+                  "test",
+                  "staging",
+                  "production"
+                ],
+                "type": "string"
+              },
+              "build_id": {
+                "pattern": "^[A-Za-z0-9._:+-]{1,120}$",
+                "type": "string"
+              },
+              "version": {
+                "pattern": "^[A-Za-z0-9._+-]{1,60}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "build_id",
+              "version",
+              "app_env"
+            ],
+            "title": "BuildInfo",
+            "type": "object"
+          },
+          "coverage_note": {
+            "default": "Coverage is limited to configured sources, profiles and page depths; search results are not all European inventory.",
+            "type": "string"
+          },
+          "notification_route": {
+            "enum": [
+              "none",
+              "mcp_events",
+              "slack"
+            ],
+            "type": "string"
+          },
+          "readiness": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "detail": {
+                  "maxLength": 300,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "enum": [
+                    "database",
+                    "schema",
+                    "config"
+                  ],
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "ok",
+                    "degraded",
+                    "unavailable",
+                    "not_configured",
+                    "unknown"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "status",
+                "detail"
+              ],
+              "title": "ReadinessCheck",
+              "type": "object"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "type": "array"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "source_network_enabled": {
+            "type": "boolean"
+          },
+          "sources": {
+            "items": {
+              "additionalProperties": false,
+              "description": "Per-source coverage and status: never scanned, blocked and unhealthy stay distinct.",
+              "properties": {
+                "country": {
+                  "pattern": "^[A-Z]{2}$",
+                  "type": "string"
+                },
+                "coverage_mode": {
+                  "enum": [
+                    "watermark",
+                    "rolling_pages",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "gap_reasons": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 50,
+                  "type": "array"
+                },
+                "incomplete_since": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_complete_traversal_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_successful_scan_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "paused": {
+                  "type": "boolean"
+                },
+                "role": {
+                  "enum": [
+                    "acquisition",
+                    "mk_comparable"
+                  ],
+                  "type": "string"
+                },
+                "source_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "source_key": {
+                  "maxLength": 80,
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "running",
+                    "paused",
+                    "disabled",
+                    "blocked",
+                    "parser_unhealthy",
+                    "not_scanned"
+                  ],
+                  "type": "string"
+                },
+                "technical_status": {
+                  "enum": [
+                    "untested",
+                    "fixture_tested",
+                    "live_smoke_passed",
+                    "degraded",
+                    "parser_unhealthy",
+                    "access_blocked"
+                  ],
+                  "type": "string"
+                },
+                "terms_decision": {
+                  "enum": [
+                    "pending",
+                    "proceed_acknowledged",
+                    "proceed_permitted",
+                    "do_not_use"
+                  ],
+                  "type": "string"
+                },
+                "terms_status": {
+                  "enum": [
+                    "unreviewed",
+                    "permitted",
+                    "no_restriction_found",
+                    "restricted"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source_id",
+                "source_key",
+                "country",
+                "role",
+                "state",
+                "enabled",
+                "paused",
+                "technical_status",
+                "terms_status",
+                "terms_decision",
+                "coverage_mode",
+                "last_successful_scan_at",
+                "last_complete_traversal_at",
+                "incomplete_since",
+                "gap_reasons"
+              ],
+              "title": "SourceCoverageView",
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          }
+        },
+        "required": [
+          "build",
+          "ready",
+          "readiness",
+          "source_network_enabled",
+          "bridge_status",
+          "notification_route",
+          "sources",
+          "activation_blockers",
+          "coverage_note"
+        ],
+        "title": "HealthView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "deals_health_result",
+    "type": "object"
+  },
+  "paginated": false,
+  "requiredScope": "deals:read",
+  "title": "Deal system health"
+}

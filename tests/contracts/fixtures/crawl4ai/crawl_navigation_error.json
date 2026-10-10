@@ -1,0 +1,73 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "success": true,
+    "results": [
+      {
+        "cache_status": "miss",
+        "cached_at": null,
+        "cleaned_html": null,
+        "console_messages": null,
+        "crawl_stats": {
+          "attempts": 1,
+          "retries": 0,
+          "proxies_used": [
+            {
+              "proxy": null,
+              "status_code": 200,
+              "blocked": false,
+              "reason": ""
+            }
+          ],
+          "fallback_fetch_used": false,
+          "resolved_by": "direct"
+        },
+        "dispatch_result": null,
+        "downloaded_files": null,
+        "error_message": "Unexpected error in _crawl_web at line 744 in _crawl_web (crawl4ai/async_crawler_strategy.py):\nError: Failed on navigating ACS-GOTO:\nPage.goto: net::ERR_NAME_NOT_RESOLVED at https://www.dealer-example.com/fahrzeug/12345\nCall log:\n  - navigating to \"https://www.dealer-example.com/fahrzeug/12345\", waiting until \"domcontentloaded\"\n",
+        "extracted_content": null,
+        "fit_html": null,
+        "head_fingerprint": null,
+        "html": "",
+        "js_execution_result": null,
+        "links": {
+          "internal": [],
+          "external": []
+        },
+        "markdown": null,
+        "media": {
+          "images": [],
+          "videos": [],
+          "audios": []
+        },
+        "metadata": null,
+        "mhtml": null,
+        "network_requests": null,
+        "pdf": null,
+        "redirected_status_code": null,
+        "redirected_url": null,
+        "response_headers": null,
+        "screenshot": null,
+        "session_id": null,
+        "ssl_certificate": null,
+        "status_code": null,
+        "success": false,
+        "tables": [],
+        "url": "https://www.dealer-example.com/fahrzeug/12345"
+      }
+    ],
+    "server_processing_time_s": 2.418,
+    "server_memory_delta_mb": 12.5,
+    "server_peak_memory_mb": 412.0
+  },
+  "note": "section 8: navigation/DNS error -> HTTP 200 with results[i].success=false"
+}

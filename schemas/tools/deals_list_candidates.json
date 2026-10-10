@@ -1,0 +1,793 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "List deal candidates"
+  },
+  "description": "Keyset-paginated candidate summaries filtered by profile, seller country, review status or change time. Pass next_cursor from the previous result to continue; a cursor only works with the same filters. Prices are decimal strings; unknown values are null, never 0.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": null,
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "changed_since": {
+        "description": "Only candidates changed at or after this RFC 3339 time.",
+        "format": "date-time",
+        "type": "string"
+      },
+      "country": {
+        "description": "Seller country (ISO 3166-1 alpha-2).",
+        "pattern": "^[A-Z]{2}$",
+        "type": "string"
+      },
+      "cursor": {
+        "default": null,
+        "description": "Opaque next_cursor from the previous page; omit for the first page.",
+        "maxLength": 2048,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": 25,
+        "description": "Page size (1-100).",
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "profile": {
+        "description": "Only candidates screened into this profile.",
+        "enum": [
+          "primary",
+          "manual_4000",
+          "below_target_watch"
+        ],
+        "type": "string"
+      },
+      "status": {
+        "description": "Review state of the candidate's case.",
+        "enum": [
+          "pending",
+          "needs_information",
+          "watch",
+          "shortlisted",
+          "rejected"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "deals_list_candidates",
+    "type": "object"
+  },
+  "name": "deals_list_candidates",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "A keyset-paginated page of candidate summaries; the cursor is in the envelope.",
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One row of the candidate queue (spec 23 screen 2).",
+              "properties": {
+                "availability": {
+                  "enum": [
+                    "available",
+                    "reserved",
+                    "removed",
+                    "sold_claimed",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "case_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "eligibility": {
+                  "enum": [
+                    "eligible_primary",
+                    "eligible_manual_profile",
+                    "needs_facts",
+                    "rejected",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "eligibility_profile": {
+                  "enum": [
+                    "primary",
+                    "manual_4000",
+                    "below_target_watch",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "first_registration": {
+                  "additionalProperties": false,
+                  "description": "A date known only to some precision. `2011-05` is never invented as 2011-05-01.",
+                  "properties": {
+                    "precision": {
+                      "default": "unknown",
+                      "enum": [
+                        "day",
+                        "month",
+                        "year",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "value": {
+                      "default": null,
+                      "pattern": "^\\d{4}(-\\d{2}(-\\d{2})?)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "title": "PartialDate",
+                  "type": "object"
+                },
+                "freshness": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "first_seen_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "flags": {
+                      "items": {
+                        "enum": [
+                          "detail_never_fetched",
+                          "detail_stale",
+                          "not_seen_recently",
+                          "availability_unchecked",
+                          "source_paused"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 5,
+                      "type": "array"
+                    },
+                    "last_availability_check_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_detail_success_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_seen_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "stale": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "first_seen_at",
+                    "last_seen_at",
+                    "last_detail_success_at",
+                    "last_availability_check_at",
+                    "stale",
+                    "flags"
+                  ],
+                  "title": "FreshnessView",
+                  "type": "object"
+                },
+                "generation": {
+                  "maxLength": 80,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "is_fixture": {
+                  "type": "boolean"
+                },
+                "listing_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "make": {
+                  "maxLength": 80,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "mileage_claim": {
+                  "enum": [
+                    "seller_reported",
+                    "documented",
+                    "verified",
+                    "estimated",
+                    "range_only",
+                    "conflicting",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "mileage_km": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "model": {
+                  "maxLength": 120,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "price": {
+                  "additionalProperties": false,
+                  "description": "Payable price in the advertised currency plus its EUR equivalent (rounded for display).",
+                  "properties": {
+                    "basis": {
+                      "enum": [
+                        "gross",
+                        "net",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "eur_equivalent": {
+                      "additionalProperties": false,
+                      "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                      "properties": {
+                        "amount": {
+                          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "currency": {
+                          "pattern": "^[A-Z]{3}$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "default": null,
+                          "maxLength": 500,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "enum": [
+                            "known",
+                            "unknown",
+                            "not_applicable"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "amount",
+                        "currency",
+                        "reason"
+                      ],
+                      "title": "AmountView",
+                      "type": "object"
+                    },
+                    "fx_rate": {
+                      "additionalProperties": false,
+                      "description": "A recorded FX observation with its explicit direction: 1 ``base`` = ``rate`` ``quote``.",
+                      "properties": {
+                        "base": {
+                          "pattern": "^[A-Z]{3}$",
+                          "type": "string"
+                        },
+                        "direction": {
+                          "maxLength": 120,
+                          "type": "string"
+                        },
+                        "provider": {
+                          "maxLength": 100,
+                          "type": "string"
+                        },
+                        "purpose": {
+                          "enum": [
+                            "reference",
+                            "customs",
+                            "payment"
+                          ],
+                          "type": "string"
+                        },
+                        "quote": {
+                          "pattern": "^[A-Z]{3}$",
+                          "type": "string"
+                        },
+                        "rate": {
+                          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                          "type": "string"
+                        },
+                        "rate_date": {
+                          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "base",
+                        "quote",
+                        "rate",
+                        "rate_date",
+                        "provider",
+                        "purpose",
+                        "direction"
+                      ],
+                      "title": "FxRateView",
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "negotiable": {
+                      "enum": [
+                        "yes",
+                        "no",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "original_currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "payable": {
+                      "additionalProperties": false,
+                      "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                      "properties": {
+                        "amount": {
+                          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "currency": {
+                          "pattern": "^[A-Z]{3}$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "default": null,
+                          "maxLength": 500,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "enum": [
+                            "known",
+                            "unknown",
+                            "not_applicable"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "amount",
+                        "currency",
+                        "reason"
+                      ],
+                      "title": "AmountView",
+                      "type": "object"
+                    },
+                    "price_type": {
+                      "enum": [
+                        "full_vehicle_asking",
+                        "instalment",
+                        "leasing",
+                        "deposit",
+                        "auction_start",
+                        "auction_current_bid",
+                        "export_net",
+                        "parts_or_damaged",
+                        "price_on_request",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "payable",
+                    "original_currency",
+                    "eur_equivalent",
+                    "fx_rate",
+                    "basis",
+                    "price_type",
+                    "negotiable"
+                  ],
+                  "title": "PriceSummary",
+                  "type": "object"
+                },
+                "quarantined": {
+                  "type": "boolean"
+                },
+                "queue_label": {
+                  "maxLength": 120,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "rank": {
+                  "additionalProperties": false,
+                  "description": "Queue-ordering score. Never a probability of profit (spec 14).",
+                  "properties": {
+                    "is_probability": {
+                      "const": false,
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "label": {
+                      "default": "Ranking score for ordering the review queue only; it is not a probability of profit.",
+                      "type": "string"
+                    },
+                    "score": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": "string"
+                    },
+                    "scoring_version": {
+                      "maxLength": 80,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "score",
+                    "scoring_version",
+                    "is_probability",
+                    "label"
+                  ],
+                  "title": "RankSummary",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "research_candidate": {
+                  "type": "boolean"
+                },
+                "review_state": {
+                  "enum": [
+                    "pending",
+                    "claimed",
+                    "needs_information",
+                    "watch",
+                    "shortlisted",
+                    "rejected",
+                    "superseded",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "revision_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "revision_number": {
+                  "minimum": 1,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "seller_country": {
+                  "pattern": "^[A-Z]{2}$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "source_country": {
+                  "pattern": "^[A-Z]{2}$",
+                  "type": "string"
+                },
+                "source_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "source_key": {
+                  "maxLength": 80,
+                  "type": "string"
+                },
+                "title": {
+                  "maxLength": 300,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "valuation_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "valuation_state": {
+                  "enum": [
+                    "not_started",
+                    "incomplete",
+                    "estimated",
+                    "quote_supported",
+                    "stale",
+                    "invalid"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "listing_id",
+                "revision_id",
+                "revision_number",
+                "source_id",
+                "source_key",
+                "source_country",
+                "seller_country",
+                "title",
+                "make",
+                "model",
+                "generation",
+                "price",
+                "mileage_km",
+                "mileage_claim",
+                "first_registration",
+                "availability",
+                "eligibility",
+                "eligibility_profile",
+                "queue_label",
+                "valuation_id",
+                "valuation_state",
+                "case_id",
+                "review_state",
+                "freshness",
+                "rank",
+                "research_candidate",
+                "quarantined",
+                "is_fixture"
+              ],
+              "title": "CandidateSummary",
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "CandidateListView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "deals_list_candidates_result",
+    "type": "object"
+  },
+  "paginated": true,
+  "requiredScope": "deals:read",
+  "title": "List deal candidates"
+}

@@ -1,0 +1,321 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "VERSION_CONFLICT",
+    "IDEMPOTENCY_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "required",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/replies",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/replies`` (spec 37.8 v1.0 + the worker's optional\nextensions; == ``outlook_bridge.wire.ReplyUpload``, a ``domain.replies.ReplyIngestRequest``\nplus ``returned_message_ids``).\n\nHeaders: ``Idempotency-Key`` (8-128 printable ASCII) is REQUIRED; the server checks it AND the\nstable source identity (``ReplyIngestRequest.dedup_key``), never one alone. Limits: request\n<= 128 KiB, ``sanitized_body_text`` <= 64 KiB, ``subject`` <= 512 characters, <= 20 attachment\nmetadata entries (safe filename, MIME type, byte count, SHA-256, opaque local ref; no URLs,\npaths or bytes).\n\n``returned_message_ids`` (bounce/delivery notice only, at most 20): the returned original's\nMessage-IDs, which the worker reads before its sanitiser removes the quoted original. The\nserver uses them only when its own classification of the uploaded fields is a delivery report\ntoo; they are not part of the immutable source fingerprint.",
+    "properties": {
+      "attachments": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "description": "Attachment *metadata* (spec 37.8): safe name, MIME type, size, SHA-256 and a local ref.\n\nNever bytes, URLs or paths: names containing path separators, control characters or\ntraversal and local references that look like URLs/paths are rejected.",
+          "properties": {
+            "byte_size": {
+              "maximum": 1099511627776,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "filename": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "local_ref": {
+              "default": null,
+              "maxLength": 256,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mime_type": {
+              "maxLength": 191,
+              "minLength": 3,
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "filename",
+            "mime_type",
+            "byte_size",
+            "sha256"
+          ],
+          "title": "AttachmentMeta",
+          "type": "object"
+        },
+        "maxItems": 20,
+        "type": "array"
+      },
+      "binding_version": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "correlation_reasons": {
+        "default": [],
+        "items": {
+          "enum": [
+            "HEADER_REFERENCE_MATCH",
+            "THREAD_MATCH",
+            "RETURNED_ORIGINAL_MATCH",
+            "SEND_INTENT_MATCH",
+            "SENDER_VERIFIED",
+            "REFERENCE_CORROBORATED",
+            "REFERENCE_NOT_FOUND",
+            "DSN_RECIPIENT_VERIFIED",
+            "RESOLVES_UNCERTAIN_SEND",
+            "FORWARDED",
+            "CHANGED_ADDRESS",
+            "AMBIGUOUS_SENDER",
+            "MULTIPLE_INQUIRIES",
+            "CONFLICTING_REFERENCE",
+            "THREAD_ONLY_UNCORROBORATED",
+            "SENDER_ONLY_NO_THREAD",
+            "DSN_RECIPIENT_MISMATCH",
+            "SPAM_MESSAGE",
+            "AMBIGUOUS_MESSAGE",
+            "NO_BINDING_MATCH",
+            "SUBJECT_ONLY",
+            "BINDING_REVOKED",
+            "OTHER_MAILBOX_BINDING",
+            "NON_MAIL_ITEM",
+            "OWN_MESSAGE"
+          ],
+          "type": "string"
+        },
+        "maxItems": 30,
+        "type": "array"
+      },
+      "correlation_status": {
+        "default": "matched",
+        "enum": [
+          "matched",
+          "quarantined"
+        ],
+        "type": "string"
+      },
+      "detected_language": {
+        "default": null,
+        "description": "Supported inquiry template languages. English only with positive evidence (spec 37.3).",
+        "enum": [
+          "de",
+          "it",
+          "fr",
+          "en",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "headers": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "maxLength": 320,
+            "type": "string"
+          },
+          "in_reply_to": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "references": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 200,
+            "type": "array"
+          }
+        },
+        "required": [
+          "from"
+        ],
+        "title": "IngestHeaders",
+        "type": "object"
+      },
+      "inquiry_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "mailbox_binding_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "message_type": {
+        "default": "seller_reply",
+        "enum": [
+          "seller_reply",
+          "auto_reply",
+          "bounce",
+          "delivery_notice",
+          "spam",
+          "ambiguous"
+        ],
+        "type": "string"
+      },
+      "observed_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "returned_message_ids": {
+        "default": [],
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+      },
+      "sanitized_body_text": {
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "type": "string"
+      },
+      "source_message": {
+        "additionalProperties": false,
+        "properties": {
+          "internet_message_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outlook_entry_id": {
+            "default": null,
+            "maxLength": 1024,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outlook_store_id": {
+            "default": null,
+            "maxLength": 1024,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_message_id": {
+            "default": null,
+            "maxLength": 512,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "received_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "received_at"
+        ],
+        "title": "IngestSourceMessage",
+        "type": "object"
+      },
+      "subject": {
+        "maxLength": 512,
+        "type": "string"
+      },
+      "withheld_sensitive_attachments": {
+        "default": 0,
+        "maximum": 200,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "schema_version",
+      "inquiry_id",
+      "binding_version",
+      "mailbox_binding_id",
+      "source_message",
+      "headers",
+      "subject",
+      "sanitized_body_text",
+      "observed_at"
+    ],
+    "title": "MailWorkerReplyRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Successful ``POST /v1/mail-workers/replies`` answer (== ``api_client.IngestAck``).\n\nThe same key/message with the same immutable content returns the existing ``reply_id`` with\n``duplicate: true`` (also after a folder move); only then may the worker advance its\nacknowledged checkpoint.",
+    "properties": {
+      "duplicate": {
+        "type": "boolean"
+      },
+      "ingest_status": {
+        "enum": [
+          "stored",
+          "quarantined"
+        ],
+        "type": "string"
+      },
+      "ingested_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "inquiry_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "reply_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "request_id": {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "type": "string"
+      }
+    },
+    "required": [
+      "schema_version",
+      "reply_id",
+      "inquiry_id",
+      "ingest_status",
+      "duplicate",
+      "request_id",
+      "ingested_at"
+    ],
+    "title": "mail-workers.replies.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Store one inquiry-correlated reply (Idempotency-Key + stable source identity)."
+}

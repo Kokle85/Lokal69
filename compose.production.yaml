@@ -1,0 +1,189 @@
+# =============================================================================
+# Production / VPS stack (spec sections 4, 24, 29, 30). Standalone file:
+#
+#   SUV_DEALS_IMAGE=<registry>/suv-deals@sha256:<release digest> \
+#   CRAWL4AI_IMAGE_DIGEST=sha256:<tested crawler digest> \
+#   docker compose -f compose.production.yaml up -d
+#
+# Deploy with every external switch OFF (the defaults below), smoke-test auth, data access and
+# queue processing, then enable only what passed its activation gate by exporting the switch
+# explicitly for that deployment, in the shell (never in an env file):
+#   SUV_DEALS_ENABLE_SOURCE_NETWORK=true, SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS=true,
+#   SUV_DEALS_ENABLE_EVENT_BRIDGE=true, SUV_DEALS_ENABLE_MCP_EVENTS=true,
+#   SUV_DEALS_NOTIFICATION_PROVIDER=slack|mcp_events, SUV_DEALS_ENABLE_FX_FETCH=true,
+#   SUV_DEALS_SELLER_INQUIRY_MODE=automatic.
+# An env file alone cannot enable them: "environment" wins over env_file, and the switches are
+# interpolated from these dedicated names, so even a .env next to this file that sets
+# SOURCE_NETWORK_ENABLED=true (Compose reads it for interpolation) changes nothing.
+#
+# Secrets: each application process reads ONLY its own root-owned 0600 env file under
+# /etc/suv-deals/ (outside the repository; never baked into the image; see docs/runbook.md for
+# which variables each process needs). The crawler token is a Docker secret file, read natively
+# by Crawl4AI from /run/secrets/api_token. The crawler receives no database or Supabase keys.
+#
+# Network: only 127.0.0.1-bound ports; the host's reverse proxy terminates HTTPS for /api and
+# /mcp. The crawler is on an internal network shared only with the worker plus its own egress
+# network (fixed bridge names br-suv-crawlint / br-suv-crawl); add the host firewall rules from
+# docs/runbook.md 3.2 - DOCKER-USER for routed egress AND INPUT for the host's own addresses - so
+# the crawler can reach neither the database endpoint, private ranges nor any host service.
+# No Docker socket, host home or privileged mode.
+# =============================================================================
+name: suv-deals
+
+x-app: &app
+  image: ${SUV_DEALS_IMAGE:?set SUV_DEALS_IMAGE to the released image digest (registry/suv-deals@sha256:...)}
+  environment: &prod-env
+    APP_ENV: production
+    CRAWL4AI_BASE_URL: http://crawl4ai:11235
+    DATABASE_SET_ROLE: suv_backend
+    SOURCE_NETWORK_ENABLED: ${SUV_DEALS_ENABLE_SOURCE_NETWORK:-false}
+    ALLOW_EXTERNAL_NOTIFICATIONS: ${SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS:-false}
+    EVENT_BRIDGE_ENABLED: ${SUV_DEALS_ENABLE_EVENT_BRIDGE:-false}
+    MCP_EVENTS_ENABLED: ${SUV_DEALS_ENABLE_MCP_EVENTS:-false}
+    NOTIFICATION_PROVIDER: ${SUV_DEALS_NOTIFICATION_PROVIDER:-disabled}
+    LLM_EXTRACTION_ENABLED: "false"
+    FX_FETCH_ENABLED: ${SUV_DEALS_ENABLE_FX_FETCH:-false}
+    SELLER_INQUIRY_MODE: ${SUV_DEALS_SELLER_INQUIRY_MODE:-disabled_until_sender_ready}
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 60s
+  networks:
+    - app
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 512m
+        pids: 256
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "10"
+
+x-no-http-healthcheck: &no-http-healthcheck
+  healthcheck:
+    disable: true
+
+services:
+  api:
+    <<: *app
+    env_file:
+      - /etc/suv-deals/api.env
+    command:
+      - suv-deals
+      - api
+      - serve
+      - --host
+      - 0.0.0.0
+      - --allow-non-loopback
+      - --port
+      - "8000"
+      - --forwarded-allow-ips
+      - 172.31.0.1
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/worker.env
+    # Every registered job type, the seller inquiry/reply types included (spec 37; a test keeps
+    # this in step with workers.handlers.default_registry and the CLI default).
+    command:
+      - suv-deals
+      - worker
+      - --queues
+      - discovery,detail,recheck,valuation,seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process
+    # Read-only root file system: retained evidence (SNAPSHOT_STORAGE=local) goes to this volume
+    # only; back it up separately (docs/runbook.md section 7).
+    volumes:
+      - snapshots:/app/var/snapshots
+    networks:
+      - app
+      - crawler
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+          pids: 256
+
+  scheduler:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/scheduler.env
+    command: ["suv-deals", "scheduler"]
+
+  reconciler:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/scheduler.env
+    command: ["suv-deals", "reconcile", "--loop"]
+
+  dispatcher:
+    <<: [*app, *no-http-healthcheck]
+    env_file:
+      - /etc/suv-deals/dispatcher.env
+    command: ["suv-deals", "dispatcher"]
+
+  crawl4ai:
+    # Tag plus the TESTED digest; never "latest" (spec 4). Compose refuses to start without it.
+    image: unclecode/crawl4ai:0.9.4@${CRAWL4AI_IMAGE_DIGEST:?set CRAWL4AI_IMAGE_DIGEST=sha256:<tested digest>}
+    secrets:
+      - source: crawl4ai_api_token
+        target: api_token
+    shm_size: 1g
+    networks:
+      - crawler
+      - crawler_egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+          pids: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+volumes:
+  snapshots: {}
+
+secrets:
+  crawl4ai_api_token:
+    file: /etc/suv-deals/secrets/crawl4ai_api_token
+
+networks:
+  app:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1
+  # Fixed bridge names (<= 15 characters) so the host firewall rules of docs/runbook.md 3.2 can
+  # name them: DOCKER-USER (FORWARD) for routed egress AND INPUT for traffic to the host's own
+  # addresses (bridge gateways, public IP), which never passes FORWARD. IPv6 stays off on both
+  # crawler networks, so no ip6tables rule is needed (a test keeps it off).
+  crawler:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawlint
+  crawler_egress:
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawl

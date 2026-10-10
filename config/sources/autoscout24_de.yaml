@@ -1,0 +1,34 @@
+# AutoScout24 Germany public listings (DE). Candidate acquisition source - DISABLED.
+# Each AutoScout24 country is registered and gated separately.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: autoscout24_de
+display_name: "AutoScout24 Germany public listings (DE)"
+country: DE
+role: acquisition
+mode: public_html
+adapter: autoscout24_public_de
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: restricted
+terms_url: https://www.autoscout24.com/company/agb/
+terms_reviewed_at: 2026-10-06T00:00:00Z
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-10)"
+terms_decision_note: >-
+  Owner decision 2026-10-10: include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
+technical_denial_policy: stop_and_report
+robots_policy: obey
+robots_checked_at: 2026-10-10T00:00:00Z
+robots_summary: >-
+  robots.txt checked 2026-10-10 (fact, not permission): the 'User-agent: *' group disallows detail pages (/angebote/), a query on the bare search path (/lst? and /lst/?), any URL with a 'cat=' parameter, /detailsuche and API paths. Search pages with make/model path segments (/lst/<make>/<model>?...) are not disallowed. Therefore this source is card_only: search-result cards only, no detail fetches.
+detail_mode: card_only
+allowed_hosts:
+  - 'www.autoscout24.de'
+allowed_search_paths:
+  - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
+allowed_detail_paths: []
+search: {}
+notes: >-
+  AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or country-specific (autoscout24.de) and business-use terms apply must be verified before a decision.

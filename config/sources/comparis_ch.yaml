@@ -1,0 +1,35 @@
+# comparis.ch (CH). Candidate acquisition source (comparison site / aggregator) - DISABLED, nothing verified.
+# Candidate domain (UNVERIFIED, not opened): www.comparis.ch
+# Exact domain(s), operator, terms, robots directives and public routes must be verified first.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: comparis_ch
+display_name: "comparis.ch car listings (CH, aggregator)"
+country: CH
+role: acquisition
+mode: public_html
+adapter: comparis_ch_public
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null            # exact terms page not yet identified/verified
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Zurich
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Swiss comparison site with a car-listings section (aggregator candidate). Candidate domain
+  www.comparis.ch is UNVERIFIED: nothing was fetched. An aggregator may republish third-party listings
+  (other marketplaces, dealers): its own terms and robots.txt AND the terms of the original source may
+  apply, so check both, record the original source attribution of every listing, prefer the original
+  source where it is permitted, and deduplicate the same vehicle seen on both. Also verify the exact
+  domain(s) and operator, whether public result and detail routes exist and may be used, and the
+  language versions (DE/FR/IT). No route, selector or listing-ID pattern is encoded.

@@ -1,0 +1,493 @@
+# SUV / off-road / crossover reference taxonomy used by domain/taxonomy.py and domain/filters.py.
+#
+# verification: unverified_reference
+#   Generation codes and year ranges are ENGINEERING REFERENCE DATA compiled from widely published
+#   public model histories. They have NOT been verified against manufacturer documents and must be
+#   reviewed by the owner before they are relied on for valuation. Year ranges are approximate
+#   production/market years; first-registration years near a boundary are deliberately treated as
+#   ambiguous by the matcher. Where a generation code or boundary was not known with confidence the
+#   generation is omitted (the matcher then reports the generation as unknown) rather than guessed.
+#
+# Classes: suv | offroad | crossover count as SUV identity; pickup | estate are listed only as
+#   explicit exclusions so that, e.g., a Nissan Navara or Subaru Outback is rejected as NOT_SUV
+#   instead of being treated as unknown. Marketplaces often file pickups and raised estates in an
+#   "SUV / off-road" category, so the common ones are listed as exclusions (no generation data).
+# Scope: models plausibly offered in DE/IT/CH at roughly EUR 2,500-3,000 (mostly model years
+#   ~2004-2014). Models missing from this file are UNKNOWN (never "not an SUV").
+verification: unverified_reference
+version: "2026-10-06.2"
+note: >-
+  Engineering reference data for owner review; not manufacturer-verified. Do not treat a
+  generation code from this file as verified evidence for comparables or tax classification.
+makes:
+  - canonical: Toyota
+    aliases: []
+    models:
+      - canonical: RAV4
+        aliases: ["RAV 4", "RAV-4"]
+        class: suv
+        generations:
+          - {code: XA20, label: "RAV4 II", from_year: 2000, to_year: 2005}
+          - {code: XA30, label: "RAV4 III", from_year: 2005, to_year: 2012}
+          - {code: XA40, label: "RAV4 IV", from_year: 2012, to_year: 2018}
+      - canonical: Land Cruiser
+        aliases: ["Landcruiser", "Land-Cruiser", "Land Cruiser Prado"]
+        class: offroad
+        generations:
+          - {code: J120, label: "Land Cruiser 120", from_year: 2002, to_year: 2009}
+          - {code: J150, label: "Land Cruiser 150", from_year: 2009, to_year: 2023}
+      # Listed separately so that "Land Cruiser V8" never inherits the J120/J150 generations.
+      - canonical: Land Cruiser V8
+        aliases: ["Landcruiser V8", "Land Cruiser 200", "Land-Cruiser V8"]
+        class: offroad
+        generations:
+          - {code: J200, label: "Land Cruiser 200", from_year: 2007, to_year: 2021}
+      - canonical: Hilux
+        aliases: ["Hi-Lux"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+  - canonical: Volkswagen
+    aliases: ["VW", "V.W."]
+    models:
+      - canonical: Tiguan
+        aliases: []
+        class: suv
+        generations:
+          - {code: 5N, label: "Tiguan I", from_year: 2007, to_year: 2016, facelift_year: 2011}
+      - canonical: Touareg
+        aliases: []
+        class: suv
+        generations:
+          - {code: 7L, label: "Touareg I", from_year: 2002, to_year: 2010}
+          - {code: 7P, label: "Touareg II", from_year: 2010, to_year: 2018}
+      - canonical: Amarok
+        aliases: []
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+  - canonical: BMW
+    aliases: []
+    models:
+      - canonical: X3
+        aliases: []
+        class: suv
+        generations:
+          - {code: E83, label: "X3 (E83)", from_year: 2003, to_year: 2010, facelift_year: 2006}
+          - {code: F25, label: "X3 (F25)", from_year: 2010, to_year: 2017}
+      - canonical: X5
+        aliases: []
+        class: suv
+        generations:
+          - {code: E53, label: "X5 (E53)", from_year: 1999, to_year: 2006}
+          - {code: E70, label: "X5 (E70)", from_year: 2006, to_year: 2013}
+          - {code: F15, label: "X5 (F15)", from_year: 2013, to_year: 2018}
+  - canonical: Audi
+    aliases: []
+    models:
+      - canonical: Q5
+        aliases: []
+        class: suv
+        generations:
+          - {code: 8R, label: "Q5 I", from_year: 2008, to_year: 2017, facelift_year: 2012}
+      - canonical: Q7
+        aliases: []
+        class: suv
+        generations:
+          - {code: 4L, label: "Q7 I", from_year: 2005, to_year: 2015, facelift_year: 2009}
+      - canonical: A6 allroad
+        aliases: ["A6 allroad quattro", "allroad", "allroad quattro"]
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
+      - canonical: A4 allroad
+        aliases: ["A4 allroad quattro"]
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
+  - canonical: Mercedes-Benz
+    aliases: ["Mercedes", "MB", "Mercedes Benz", "Merc"]
+    models:
+      - canonical: M-Class
+        aliases: ["ML", "M-Klasse", "M Klasse", "M-Class", "ML-Klasse", "Classe M", "Classe ML"]
+        class: suv
+        generations:
+          - {code: W163, label: "M-Class W163", from_year: 1997, to_year: 2005}
+          - {code: W164, label: "M-Class W164", from_year: 2005, to_year: 2011}
+          - {code: W166, label: "M-Class W166", from_year: 2011, to_year: 2015}
+      - canonical: GLK
+        aliases: ["GLK-Klasse", "GLK Klasse", "GLK-Class", "Classe GLK"]
+        class: suv
+        generations:
+          - {code: X204, label: "GLK X204", from_year: 2008, to_year: 2015, facelift_year: 2012}
+  - canonical: Hyundai
+    aliases: []
+    models:
+      - canonical: Santa Fe
+        aliases: ["SantaFe", "Santa-Fe"]
+        class: suv
+        generations:
+          - {code: SM, label: "Santa Fe I", from_year: 2000, to_year: 2006}
+          - {code: CM, label: "Santa Fe II", from_year: 2006, to_year: 2012, facelift_year: 2009}
+          - {code: DM, label: "Santa Fe III", from_year: 2012, to_year: 2018}
+      - canonical: Tucson
+        aliases: []
+        class: suv
+        generations:
+          - {code: JM, label: "Tucson I", from_year: 2004, to_year: 2010}
+          - {code: TL, label: "Tucson III", from_year: 2015, to_year: 2020}
+      - canonical: ix35
+        aliases: ["ix 35", "ix-35"]
+        class: suv
+        generations:
+          - {code: LM, label: "ix35", from_year: 2009, to_year: 2015}
+  - canonical: Kia
+    aliases: []
+    models:
+      - canonical: Sorento
+        aliases: []
+        class: suv
+        generations:
+          - {code: BL, label: "Sorento I", from_year: 2002, to_year: 2009}
+          - {code: XM, label: "Sorento II", from_year: 2009, to_year: 2014}
+          - {code: UM, label: "Sorento III", from_year: 2014, to_year: 2020}
+      - canonical: Sportage
+        aliases: []
+        class: suv
+        generations:
+          - {code: KM, label: "Sportage II", from_year: 2004, to_year: 2010}
+          - {code: SL, label: "Sportage III", from_year: 2010, to_year: 2015}
+          - {code: QL, label: "Sportage IV", from_year: 2015, to_year: 2021}
+  - canonical: Nissan
+    aliases: []
+    models:
+      - canonical: X-Trail
+        aliases: ["X Trail", "XTrail"]
+        class: suv
+        generations:
+          - {code: T30, label: "X-Trail I", from_year: 2001, to_year: 2007}
+          - {code: T31, label: "X-Trail II", from_year: 2007, to_year: 2014}
+          - {code: T32, label: "X-Trail III", from_year: 2014, to_year: 2022}
+      - canonical: Qashqai
+        aliases: ["Qashqai+2", "Qashqai +2"]
+        class: crossover
+        generations:
+          - {code: J10, label: "Qashqai I", from_year: 2006, to_year: 2013, facelift_year: 2010}
+          - {code: J11, label: "Qashqai II", from_year: 2013, to_year: 2021}
+      - canonical: Pathfinder
+        aliases: []
+        class: offroad
+        generations:
+          - {code: R51, label: "Pathfinder III", from_year: 2005, to_year: 2014}
+      - canonical: Navara
+        aliases: ["NP300", "NP300 Navara"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+  - canonical: Mitsubishi
+    aliases: []
+    models:
+      - canonical: Outlander
+        aliases: []
+        class: suv
+        generations:
+          - {code: CW, label: "Outlander II", from_year: 2006, to_year: 2012}
+          - {code: GF, label: "Outlander III", from_year: 2012, to_year: 2021}
+      - canonical: Pajero
+        aliases: ["Montero"]
+        class: offroad
+        generations:
+          - {code: V60, label: "Pajero III", from_year: 1999, to_year: 2006}
+          - {code: V80, label: "Pajero IV", from_year: 2006, to_year: 2021}
+      # Distinct models: listed (without generations) so that the longest-alias rule never files
+      # them under Pajero with a Pajero generation.
+      - canonical: Pajero Pinin
+        aliases: ["Pajero-Pinin", "Pinin"]
+        class: suv
+        generations: []
+      - canonical: Pajero Sport
+        aliases: ["Pajero-Sport"]
+        class: suv
+        generations: []
+      - canonical: L200
+        aliases: []
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+      - canonical: ASX
+        aliases: []
+        class: crossover
+        generations:
+          - {code: GA, label: "ASX", from_year: 2010, to_year: 2023}
+  - canonical: Honda
+    aliases: []
+    models:
+      - canonical: CR-V
+        aliases: ["CRV", "CR V"]
+        class: suv
+        generations:
+          - {code: RD, label: "CR-V II", from_year: 2001, to_year: 2006}
+          - {code: RE, label: "CR-V III", from_year: 2006, to_year: 2012}
+          - {code: RM, label: "CR-V IV", from_year: 2012, to_year: 2018}
+  - canonical: Mazda
+    aliases: []
+    models:
+      - canonical: CX-5
+        aliases: ["CX5", "CX 5"]
+        class: suv
+        generations:
+          - {code: KE, label: "CX-5 I", from_year: 2012, to_year: 2017}
+      - canonical: CX-7
+        aliases: ["CX7", "CX 7"]
+        class: suv
+        generations:
+          - {code: ER, label: "CX-7", from_year: 2006, to_year: 2012}
+      - canonical: BT-50
+        aliases: ["BT50"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+  - canonical: Volvo
+    aliases: []
+    models:
+      - canonical: XC60
+        aliases: ["XC 60", "XC-60"]
+        class: suv
+        generations:
+          - {code: "156", label: "XC60 I", from_year: 2008, to_year: 2017}
+      - canonical: XC90
+        aliases: ["XC 90", "XC-90"]
+        class: suv
+        generations:
+          - {code: "275", label: "XC90 I", from_year: 2002, to_year: 2014}
+      - canonical: XC70
+        aliases: ["XC 70", "XC-70"]
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
+  - canonical: Suzuki
+    aliases: []
+    models:
+      - canonical: Grand Vitara
+        aliases: ["GrandVitara", "Grand-Vitara"]
+        class: offroad
+        generations:
+          - {code: JT, label: "Grand Vitara II", from_year: 2005, to_year: 2015}
+      - canonical: SX4 S-Cross
+        aliases: ["S-Cross", "S Cross", "SX4 S Cross", "SX4 SCross"]
+        class: crossover
+        generations:
+          - {code: JY, label: "SX4 S-Cross", from_year: 2013, to_year: 2021}
+      - canonical: Jimny
+        aliases: []
+        class: offroad
+        generations:
+          - {code: FJ, label: "Jimny III", from_year: 1998, to_year: 2018}
+  - canonical: Subaru
+    aliases: []
+    models:
+      - canonical: Forester
+        aliases: []
+        class: suv
+        generations:
+          - {code: SG, label: "Forester II", from_year: 2002, to_year: 2008}
+          - {code: SH, label: "Forester III", from_year: 2008, to_year: 2012}
+          - {code: SJ, label: "Forester IV", from_year: 2012, to_year: 2018}
+      - canonical: Outback
+        aliases: []
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
+  - canonical: Dacia
+    aliases: []
+    models:
+      - canonical: Duster
+        aliases: []
+        class: suv
+        generations:
+          - {code: HS, label: "Duster I", from_year: 2010, to_year: 2017}
+          - {code: HM, label: "Duster II", from_year: 2017, to_year: 2024}
+  - canonical: Škoda
+    aliases: ["Skoda"]
+    models:
+      - canonical: Yeti
+        aliases: []
+        class: suv
+        generations:
+          - {code: 5L, label: "Yeti", from_year: 2009, to_year: 2017}
+      - canonical: Octavia Scout
+        aliases: []
+        class: estate
+        exclusion_reason: "raised estate car, not an SUV"
+        generations: []
+  - canonical: Ford
+    aliases: []
+    models:
+      - canonical: Kuga
+        aliases: []
+        class: suv
+        generations:
+          - {code: C394, label: "Kuga I", from_year: 2008, to_year: 2012}
+          - {code: C520, label: "Kuga II", from_year: 2012, to_year: 2019}
+      - canonical: Ranger
+        aliases: []
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+  - canonical: Opel
+    aliases: []
+    models:
+      - canonical: Antara
+        aliases: []
+        class: suv
+        generations: []
+  - canonical: Chevrolet
+    aliases: ["Chevy"]
+    models:
+      - canonical: Captiva
+        aliases: []
+        class: suv
+        generations:
+          - {code: C100, label: "Captiva C100", from_year: 2006, to_year: 2011}
+          - {code: C140, label: "Captiva C140", from_year: 2011, to_year: 2015}
+  - canonical: Jeep
+    aliases: []
+    models:
+      - canonical: Grand Cherokee
+        aliases: ["GrandCherokee", "Grand-Cherokee"]
+        class: offroad
+        generations:
+          - {code: WJ, label: "Grand Cherokee II", from_year: 1999, to_year: 2004}
+          - {code: WK, label: "Grand Cherokee III", from_year: 2005, to_year: 2010}
+          - {code: WK2, label: "Grand Cherokee IV", from_year: 2011, to_year: 2021}
+      - canonical: Compass
+        aliases: []
+        class: suv
+        generations:
+          - {code: MK, label: "Compass I", from_year: 2006, to_year: 2016}
+      - canonical: Cherokee
+        aliases: []
+        class: offroad
+        generations:
+          - {code: KJ, label: "Cherokee KJ", from_year: 2001, to_year: 2007}
+          - {code: KK, label: "Cherokee KK", from_year: 2008, to_year: 2012}
+  - canonical: Land Rover
+    aliases: ["Landrover", "Land-Rover", "LandRover"]
+    # Sellers often enter "Range Rover" as the make; the matcher then reads the model field as
+    # "Range Rover <model>" (e.g. make "Range Rover", model "Sport" -> Land Rover Range Rover Sport).
+    model_prefix_aliases: ["Range Rover", "Range-Rover", "RangeRover"]
+    models:
+      - canonical: Freelander
+        aliases: ["Freelander 2", "Freelander2"]
+        class: suv
+        generations:
+          - {code: L314, label: "Freelander I", from_year: 1997, to_year: 2006}
+          - {code: L359, label: "Freelander 2", from_year: 2006, to_year: 2014}
+      - canonical: Discovery
+        aliases: ["Discovery 3", "Discovery 4", "Discovery3", "Discovery4"]
+        class: offroad
+        generations:
+          - {code: L319, label: "Discovery 3/4", from_year: 2004, to_year: 2016, facelift_year: 2009}
+      # Listed (without generations) so that the longest-alias rule never files them under
+      # Discovery or Range Rover.
+      - canonical: Discovery Sport
+        aliases: []
+        class: suv
+        generations: []
+      - canonical: Range Rover Evoque
+        aliases: ["Evoque", "Range-Rover Evoque", "RangeRover Evoque"]
+        class: suv
+        generations:
+          - {code: L538, label: "Range Rover Evoque I", from_year: 2011, to_year: 2018}
+      - canonical: Range Rover Velar
+        aliases: ["Velar", "Range-Rover Velar", "RangeRover Velar"]
+        class: suv
+        generations: []
+      - canonical: Range Rover Sport
+        aliases: ["RR Sport", "Range-Rover Sport", "RangeRover Sport"]
+        class: suv
+        generations:
+          - {code: L320, label: "Range Rover Sport I", from_year: 2005, to_year: 2013}
+      - canonical: Range Rover
+        aliases: ["Range-Rover", "RangeRover"]
+        class: offroad
+        generations:
+          - {code: L322, label: "Range Rover III", from_year: 2002, to_year: 2012}
+  - canonical: Porsche
+    aliases: []
+    models:
+      - canonical: Cayenne
+        aliases: []
+        class: suv
+        generations:
+          - {code: 9PA, label: "Cayenne (955/957)", from_year: 2002, to_year: 2010, facelift_year: 2007}
+          - {code: 92A, label: "Cayenne (958)", from_year: 2010, to_year: 2017}
+  - canonical: Peugeot
+    aliases: []
+    models:
+      - canonical: "3008"
+        aliases: []
+        class: crossover
+        generations: []
+      - canonical: "4007"
+        aliases: []
+        class: suv
+        generations: []
+  - canonical: Citroën
+    aliases: ["Citroen"]
+    models:
+      - canonical: C-Crosser
+        aliases: ["C Crosser", "CCrosser"]
+        class: suv
+        generations: []
+  - canonical: Fiat
+    aliases: []
+    models:
+      - canonical: Sedici
+        aliases: []
+        class: crossover
+        generations: []
+  - canonical: SsangYong
+    aliases: ["Ssang Yong", "Ssang-Yong"]
+    models:
+      - canonical: Kyron
+        aliases: []
+        class: suv
+        generations: []
+      - canonical: Rexton
+        aliases: []
+        class: suv
+        generations: []
+  - canonical: Renault
+    aliases: []
+    models:
+      - canonical: Koleos
+        aliases: []
+        class: suv
+        generations: []
+  - canonical: Lexus
+    aliases: []
+    models:
+      - canonical: RX
+        aliases: ["RX 300", "RX 350", "RX 400h", "RX 450h"]
+        class: suv
+        generations:
+          - {code: XU30, label: "RX II", from_year: 2003, to_year: 2009}
+          - {code: AL10, label: "RX III", from_year: 2008, to_year: 2015}
+  - canonical: Isuzu
+    aliases: []
+    models:
+      - canonical: D-Max
+        aliases: ["DMax"]
+        class: pickup
+        exclusion_reason: "pickup truck, not an SUV"
+        generations: []
+  - canonical: Infiniti
+    aliases: []
+    models:
+      - canonical: FX
+        aliases: ["FX35", "FX37", "FX45", "FX50", "FX30d"]
+        class: suv
+        generations:
+          - {code: S50, label: "FX I", from_year: 2003, to_year: 2008}
+          - {code: S51, label: "FX II", from_year: 2008, to_year: 2013}

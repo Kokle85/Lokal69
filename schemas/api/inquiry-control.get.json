@@ -1,0 +1,341 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/inquiry-control",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "Workspace inquiry controls (``GET /api/inquiry-control``): kill switch, mode, caps.",
+        "properties": {
+          "activation_canary_complete": {
+            "default": false,
+            "description": "A correlated test reply (activation canary in state reply_correlated) exists for the configured sender binding's CURRENT version. Until then every real seller inquiry is refused at reservation (activation_canary_incomplete).",
+            "type": "boolean"
+          },
+          "approval_required": {
+            "const": false,
+            "default": false,
+            "type": "boolean"
+          },
+          "authorization_status": {
+            "default": "missing",
+            "description": "The workspace's latest standing authorization (spec 37.1).",
+            "enum": [
+              "missing",
+              "active",
+              "not_effective",
+              "revoked"
+            ],
+            "type": "string"
+          },
+          "authorization_version": {
+            "default": null,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "automatic_inquiries_possible": {
+            "default": false,
+            "description": "True only while EVERY gate is open: the process gate, the database mode automatic with the kill switch off, the standing authorization active, the configured sender ready with its activation canary complete and room under both rolling caps now (a cap of 0 holds every inquiry). Never a claim that anything was or will be sent.",
+            "type": "boolean"
+          },
+          "ceiling_per_15d": {
+            "const": 5,
+            "default": 5,
+            "type": "integer"
+          },
+          "ceiling_per_24h": {
+            "const": 2,
+            "default": 2,
+            "type": "integer"
+          },
+          "kill_switch": {
+            "type": "boolean"
+          },
+          "kill_switch_reason": {
+            "maxLength": 2000,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kill_switch_set_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_per_15d": {
+            "maximum": 5,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_per_24h": {
+            "maximum": 2,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "disabled_until_sender_ready",
+              "automatic",
+              "paused"
+            ],
+            "type": "string"
+          },
+          "process_blockers": {
+            "default": [],
+            "description": "Why the process-level gate is closed (empty: open).",
+            "items": {
+              "enum": [
+                "SELLER_INQUIRY_MODE_NOT_AUTOMATIC",
+                "SELLER_INQUIRY_KILL_SWITCH_ON",
+                "MESSAGE_APPROVAL_SETTING_ON"
+              ],
+              "type": "string"
+            },
+            "maxItems": 3,
+            "type": "array"
+          },
+          "process_kill_switch": {
+            "default": null,
+            "description": "SELLER_INQUIRY_KILL_SWITCH of the serving backend (null when not reported).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "process_message_approval_required": {
+            "default": null,
+            "description": "SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL (the owner's setting; it DISABLES automatic sending, never adds an approval wait). Null when not reported.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "process_mode": {
+            "default": null,
+            "description": "SELLER_INQUIRY_MODE of the serving backend (the process-level gate; null when not reported). Both this and the database mode must be automatic.",
+            "enum": [
+              "disabled_until_sender_ready",
+              "automatic",
+              "paused",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "removable_suppressions": {
+            "default": 0,
+            "description": "Active kill-switch / authorization-revoked suppressions a resume can remove (audited).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "seller_cooldown_seconds": {
+            "maximum": 31536000,
+            "minimum": 604800,
+            "type": "integer"
+          },
+          "sender_binding_version": {
+            "default": null,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sender_problems": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "sender_provider": {
+            "default": null,
+            "enum": [
+              "outlook_local",
+              "gmail_api",
+              "microsoft_graph",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_readiness": {
+            "default": "missing",
+            "description": "The configured sender binding: ready = verified, alias-verified, healthy, unrevoked.",
+            "enum": [
+              "ready",
+              "missing",
+              "unverified",
+              "alias_unverified",
+              "unhealthy",
+              "revoked"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "used_15d": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_24h": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "description": "Send as expected_version to pause or resume.",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "mode",
+          "kill_switch",
+          "kill_switch_reason",
+          "kill_switch_set_at",
+          "max_per_24h",
+          "max_per_15d",
+          "ceiling_per_24h",
+          "ceiling_per_15d",
+          "seller_cooldown_seconds",
+          "used_24h",
+          "used_15d",
+          "updated_at",
+          "approval_required",
+          "removable_suppressions",
+          "authorization_status",
+          "authorization_version",
+          "sender_readiness",
+          "sender_provider",
+          "sender_binding_version",
+          "sender_problems",
+          "process_mode",
+          "process_kill_switch",
+          "process_message_approval_required",
+          "process_blockers",
+          "activation_canary_complete",
+          "automatic_inquiries_possible"
+        ],
+        "title": "InquiryControlView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "inquiry-control.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Kill switch, mode, owner-reducible caps and current usage (NOT_FOUND until the workspace controls exist)."
+}

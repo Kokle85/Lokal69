@@ -1,0 +1,176 @@
+# =============================================================================
+# Local development / evaluation stack (spec sections 4, 24, 27).
+#
+#   docker compose build
+#   docker compose up -d crawl4ai api worker scheduler      # dispatcher only when needed
+#
+# - api, worker, scheduler, dispatcher and reconciler run the SAME image with different commands.
+# - Settings come from ./.env (never committed); the crawler gets ONLY its own token.
+# - Every published port is bound to 127.0.0.1. The API binds 0.0.0.0 inside its container only.
+# - Network and notification switches default to OFF here and cannot be turned on by .env alone.
+#   Compose also reads the project .env for ${...} interpolation, so the switches are interpolated
+#   from their OWN names, which the application .env does not contain (SOURCE_NETWORK_ENABLED=true
+#   in .env therefore changes nothing here). Enable one explicitly in the shell, never in .env,
+#   and only after the activation gates in docs/runbook.md passed:
+#     SUV_DEALS_ENABLE_SOURCE_NETWORK=true / SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS=true
+# - The application containers have a read-only root file system; the worker writes retained
+#   evidence (SNAPSHOT_STORAGE=local) to the "snapshots" volume only.
+# - Networks: "crawler" is internal and shared only by worker <-> crawl4ai; the crawler's own
+#   internet egress uses "crawler_egress", which no application service joins. The crawler has
+#   no database credentials and is not on the application network. Docker networks cannot stop
+#   the crawler from reaching a PUBLIC database endpoint over the internet or the HOST's own
+#   services through its bridge gateway: add the host firewall rules (DOCKER-USER and INPUT) from
+#   docs/runbook.md ("Crawler egress isolation") before any live crawl.
+# - No Docker socket, no host home directory and no privileged mode anywhere.
+# =============================================================================
+name: suv-deals
+
+x-app: &app
+  image: ${SUV_DEALS_IMAGE:-suv-deals:dev}
+  build:
+    context: .
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-env
+    APP_ENV: ${APP_ENV:-development}
+    CRAWL4AI_BASE_URL: http://crawl4ai:11235
+    DATABASE_SET_ROLE: suv_backend
+    SOURCE_NETWORK_ENABLED: ${SUV_DEALS_ENABLE_SOURCE_NETWORK:-false}
+    ALLOW_EXTERNAL_NOTIFICATIONS: ${SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS:-false}
+  # A database on the developer's host (e.g. the local PostgreSQL clusters) is reachable as
+  # host.docker.internal. The crawler does NOT get this name, but a missing name is no isolation:
+  # its bridge gateway IP still reaches every host service listening beyond loopback until the
+  # host INPUT rules of docs/runbook.md 3.2 (br-suv-crawl / br-suv-crawlint) drop it.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  restart: unless-stopped
+  networks:
+    - app
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 512m
+        pids: 256
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-no-http-healthcheck: &no-http-healthcheck
+  healthcheck:
+    disable: true
+
+services:
+  api:
+    <<: *app
+    command:
+      - suv-deals
+      - api
+      - serve
+      - --host
+      - 0.0.0.0
+      - --allow-non-loopback
+      - --port
+      - "8000"
+      - --forwarded-allow-ips
+      - 172.30.0.1
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    <<: [*app, *no-http-healthcheck]
+    # Every registered job type, the seller inquiry/reply types included (spec 37; a test keeps
+    # this in step with workers.handlers.default_registry and the CLI default).
+    command:
+      - suv-deals
+      - worker
+      - --queues
+      - discovery,detail,recheck,valuation,seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process
+    volumes:
+      - snapshots:/app/var/snapshots
+    networks:
+      - app
+      - crawler
+    depends_on:
+      crawl4ai:
+        condition: service_started
+
+  scheduler:
+    <<: [*app, *no-http-healthcheck]
+    command: ["suv-deals", "scheduler"]
+
+  reconciler:
+    <<: [*app, *no-http-healthcheck]
+    command: ["suv-deals", "reconcile", "--loop"]
+
+  dispatcher:
+    <<: [*app, *no-http-healthcheck]
+    command: ["suv-deals", "dispatcher"]
+    profiles: ["notifications"]
+
+  crawl4ai:
+    # Pinned tag; record and pin the tested digest (CRAWL4AI_IMAGE_DIGEST) before production use.
+    # Do not replace or restart an existing shared crawler: host processes (`make dev`) point
+    # CRAWL4AI_BASE_URL at it (http://127.0.0.1:11235) instead of starting this service. Its
+    # published port is the same 127.0.0.1:11235, so it cannot start next to a running one.
+    image: unclecode/crawl4ai:0.9.4
+    environment:
+      # Only the crawler's documented token setting is passed (spec 26); no database or Supabase keys.
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?set CRAWL4AI_API_TOKEN in the shell or .env for the crawler}
+    shm_size: 1g
+    ports:
+      - "127.0.0.1:11235:11235"
+    networks:
+      - crawler
+      - crawler_egress
+    read_only: false
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+          pids: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  snapshots: {}
+
+networks:
+  app:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+  # Fixed bridge names (<= 15 characters) so the host firewall rules of docs/runbook.md 3.2 can
+  # name them: DOCKER-USER (FORWARD) for routed egress AND INPUT for traffic to the host's own
+  # addresses (bridge gateways, public IP), which never passes FORWARD. IPv6 stays off on both
+  # crawler networks, so no ip6tables rule is needed (a test keeps it off).
+  crawler:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawlint
+  crawler_egress:
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawl

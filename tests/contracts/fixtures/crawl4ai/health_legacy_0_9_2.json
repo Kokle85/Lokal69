@@ -1,0 +1,16 @@
+{
+  "label": "shape from 0.9.2 documentation (section 13 drift table); live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "GET",
+    "path": "/health"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "status": "healthy",
+    "version": "0.9.2"
+  }
+}

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SYNTHETIC TEST FIXTURE. Structure follows the ECB eurofxref-daily.xml format
+     (gesmes Envelope, nested Cube elements, 1 EUR = rate units of currency).
+     Every rate and the date below are INVENTED for tests; they are not real ECB observations. -->
+<gesmes:Envelope xmlns:gesmes="http://www.gesmes.org/xml/2002-08-01" xmlns="http://www.ecb.int/vocabulary/2002-08-01/eurofxref">
+	<gesmes:subject>Reference rates</gesmes:subject>
+	<gesmes:Sender>
+		<gesmes:name>European Central Bank</gesmes:name>
+	</gesmes:Sender>
+	<Cube>
+		<Cube time='2026-10-05'>
+			<Cube currency='USD' rate='1.1234'/>
+			<Cube currency='JPY' rate='160.12'/>
+			<Cube currency='CZK' rate='24.321'/>
+			<Cube currency='DKK' rate='7.4612'/>
+			<Cube currency='GBP' rate='0.85670'/>
+			<Cube currency='HUF' rate='390.12'/>
+			<Cube currency='PLN' rate='4.2678'/>
+			<Cube currency='RON' rate='4.9765'/>
+			<Cube currency='SEK' rate='11.0123'/>
+			<Cube currency='CHF' rate='0.9400'/>
+			<Cube currency='NOK' rate='11.5432'/>
+			<Cube currency='TRY' rate='45.678'/>
+			<Cube currency='AUD' rate='1.6789'/>
+			<Cube currency='CAD' rate='1.5432'/>
+		</Cube>
+	</Cube>
+</gesmes:Envelope>

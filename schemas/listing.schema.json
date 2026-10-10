@@ -1,0 +1,1155 @@
+{
+  "$id": "urn:suv-deals:schema:1.0:listing",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "``schemas/listing.schema.json``: one normalized revision plus its listing identity (spec 7).",
+  "properties": {
+    "availability": {
+      "default": "unknown",
+      "enum": [
+        "available",
+        "reserved",
+        "removed",
+        "sold_claimed",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "canonical_url": {
+      "maxLength": 2048,
+      "minLength": 8,
+      "type": "string"
+    },
+    "co2": {
+      "additionalProperties": false,
+      "default": {
+        "cycle": "unknown",
+        "evidence_id": null,
+        "g_per_km": null
+      },
+      "properties": {
+        "cycle": {
+          "default": "unknown",
+          "enum": [
+            "nedc",
+            "nedc_correlated",
+            "wltp",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "evidence_id": {
+          "default": null,
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "g_per_km": {
+          "default": null,
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "Co2Info",
+      "type": "object"
+    },
+    "condition": {
+      "additionalProperties": false,
+      "default": {
+        "accident_free": "unknown",
+        "corrosion_free": "unknown",
+        "damaged_vehicle": "unknown",
+        "full_service_history": "unknown",
+        "mechanical_faults": [],
+        "roadworthy": "unknown",
+        "running": "unknown",
+        "warning_lights_off": "unknown"
+      },
+      "description": "Each field names a positive proposition; the ClaimStatus says how it is supported.",
+      "properties": {
+        "accident_free": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "corrosion_free": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "damaged_vehicle": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "full_service_history": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "mechanical_faults": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 30,
+          "type": "array"
+        },
+        "roadworthy": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "running": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "warning_lights_off": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "title": "ConditionClaims",
+      "type": "object"
+    },
+    "conflicts": {
+      "default": [],
+      "items": {
+        "additionalProperties": false,
+        "description": "Two or more supported values disagree; neither silently wins.\n\nFor numeric fields `values` are plain decimal strings in canonical units (e.g. km:\n``[\"187500\", \"87500\"]``; ranges as ``\"low-high\"``). Descriptive text belongs in `locations`.",
+        "properties": {
+          "field": {
+            "maxLength": 120,
+            "type": "string"
+          },
+          "locations": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "note": {
+            "default": null,
+            "maxLength": 500,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "default": "unresolved",
+            "maxLength": 200,
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "minItems": 2,
+            "type": "array"
+          }
+        },
+        "required": [
+          "field",
+          "values"
+        ],
+        "title": "FieldConflict",
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "description_excerpt": {
+      "default": null,
+      "maxLength": 4000,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "documentation": {
+      "additionalProperties": false,
+      "default": {
+        "coc_available": "unknown",
+        "emissions_class": null,
+        "inspection_expiry": {
+          "precision": "unknown",
+          "value": null
+        },
+        "origin_evidence": null,
+        "previous_owners": null,
+        "registration_documents": "unknown",
+        "vin": null,
+        "vin_format_valid": "unknown"
+      },
+      "properties": {
+        "coc_available": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "emissions_class": {
+          "default": null,
+          "maxLength": 40,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inspection_expiry": {
+          "additionalProperties": false,
+          "default": {
+            "precision": "unknown",
+            "value": null
+          },
+          "description": "A date known only to some precision. `2011-05` is never invented as 2011-05-01.",
+          "properties": {
+            "precision": {
+              "default": "unknown",
+              "enum": [
+                "day",
+                "month",
+                "year",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "default": null,
+              "pattern": "^\\d{4}(-\\d{2}(-\\d{2})?)?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "PartialDate",
+          "type": "object"
+        },
+        "origin_evidence": {
+          "default": null,
+          "maxLength": 300,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previous_owners": {
+          "default": null,
+          "maximum": 50,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "registration_documents": {
+          "default": "unknown",
+          "description": "Status of a seller/vehicle statement. Extraction confidence is separate.",
+          "enum": [
+            "verified",
+            "seller_claimed",
+            "seller_denied",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "vin": {
+          "default": null,
+          "pattern": "^[A-HJ-NPR-Z0-9]{17}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vin_format_valid": {
+          "default": "unknown",
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "title": "Documentation",
+      "type": "object"
+    },
+    "language": {
+      "default": null,
+      "maxLength": 10,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "listing_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "location": {
+      "additionalProperties": false,
+      "default": {
+        "approx_lat": null,
+        "approx_lon": null,
+        "city": null,
+        "coordinates_source": null,
+        "country": null,
+        "region": null
+      },
+      "properties": {
+        "approx_lat": {
+          "default": null,
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approx_lon": {
+          "default": null,
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "city": {
+          "default": null,
+          "maxLength": 120,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coordinates_source": {
+          "default": null,
+          "maxLength": 120,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "country": {
+          "default": null,
+          "pattern": "^[A-Z]{2}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "default": null,
+          "maxLength": 120,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "LocationInfo",
+      "type": "object"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "parser_version": {
+      "maxLength": 120,
+      "minLength": 1,
+      "type": "string"
+    },
+    "price": {
+      "additionalProperties": false,
+      "default": {
+        "amount_minor": null,
+        "basis": "unknown",
+        "currency": null,
+        "export_net_price_minor": null,
+        "gross_amount_minor": null,
+        "negotiable": "unknown",
+        "net_amount_minor": null,
+        "raw_text": null,
+        "refundable_deposit_minor": null,
+        "required_seller_fees_known": "unknown",
+        "required_seller_fees_minor": null,
+        "type": "unknown",
+        "vat_amount_minor": null,
+        "vat_rate_stated": null,
+        "vat_reclaimable": "unknown",
+        "vat_treatment": "unknown"
+      },
+      "description": "Acquisition price evidence. Keep gross/net/VAT/export/deposit values separate (spec 17).",
+      "properties": {
+        "amount_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "basis": {
+          "default": "unknown",
+          "enum": [
+            "gross",
+            "net",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "currency": {
+          "default": null,
+          "pattern": "^[A-Z]{3}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "export_net_price_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "gross_amount_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "negotiable": {
+          "default": "unknown",
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "net_amount_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "raw_text": {
+          "default": null,
+          "maxLength": 300,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refundable_deposit_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "required_seller_fees_known": {
+          "default": "unknown",
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "required_seller_fees_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "default": "unknown",
+          "enum": [
+            "full_vehicle_asking",
+            "instalment",
+            "leasing",
+            "deposit",
+            "auction_start",
+            "auction_current_bid",
+            "export_net",
+            "parts_or_damaged",
+            "price_on_request",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "vat_amount_minor": {
+          "default": null,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vat_rate_stated": {
+          "default": null,
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vat_reclaimable": {
+          "default": "unknown",
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "vat_treatment": {
+          "default": "unknown",
+          "description": "Seller-stated VAT wording only; never an inferred entitlement.",
+          "enum": [
+            "vat_shown",
+            "margin_scheme",
+            "private_sale",
+            "not_stated",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "title": "PriceInfo",
+      "type": "object"
+    },
+    "provenance": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "confidence": {
+            "description": "Extraction reliability. Says nothing about the truth of the seller claim.",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "json_ld",
+              "microdata",
+              "css",
+              "xpath",
+              "regex",
+              "api_field",
+              "llm_fallback",
+              "manual",
+              "derived"
+            ],
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "raw_text": {
+            "default": null,
+            "maxLength": 500,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selector": {
+            "default": null,
+            "maxLength": 300,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snapshot_id": {
+            "default": null,
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "default": null,
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transformation": {
+            "default": null,
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "method",
+          "confidence",
+          "observed_at"
+        ],
+        "title": "FieldProvenance",
+        "type": "object"
+      },
+      "type": "object"
+    },
+    "revision": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "type": "string"
+    },
+    "seller_type": {
+      "default": "unknown",
+      "enum": [
+        "dealer",
+        "private",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "source_key": {
+      "maxLength": 80,
+      "minLength": 1,
+      "type": "string"
+    },
+    "source_listing_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "type": "string"
+    },
+    "source_modified_at": {
+      "additionalProperties": false,
+      "default": {
+        "assumed_zone": null,
+        "precision": "unknown",
+        "raw": null,
+        "value": null,
+        "zone_assumed": false
+      },
+      "description": "A source-provided timestamp. Zone-less source dates carry an explicit assumption flag.",
+      "properties": {
+        "assumed_zone": {
+          "default": null,
+          "maxLength": 64,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "precision": {
+          "default": "unknown",
+          "enum": [
+            "day",
+            "month",
+            "year",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "raw": {
+          "default": null,
+          "maxLength": 100,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "default": null,
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "zone_assumed": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "title": "SourceTimestamp",
+      "type": "object"
+    },
+    "source_published_at": {
+      "additionalProperties": false,
+      "default": {
+        "assumed_zone": null,
+        "precision": "unknown",
+        "raw": null,
+        "value": null,
+        "zone_assumed": false
+      },
+      "description": "A source-provided timestamp. Zone-less source dates carry an explicit assumption flag.",
+      "properties": {
+        "assumed_zone": {
+          "default": null,
+          "maxLength": 64,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "precision": {
+          "default": "unknown",
+          "enum": [
+            "day",
+            "month",
+            "year",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "raw": {
+          "default": null,
+          "maxLength": 100,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "default": null,
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "zone_assumed": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "title": "SourceTimestamp",
+      "type": "object"
+    },
+    "title": {
+      "default": null,
+      "maxLength": 300,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "vehicle": {
+      "additionalProperties": false,
+      "default": {
+        "body_type": "unknown",
+        "drive": "unknown",
+        "engine_code": null,
+        "engine_displacement_cm3": null,
+        "facelift": "unknown",
+        "first_registration": {
+          "precision": "unknown",
+          "value": null
+        },
+        "fuel": "unknown",
+        "gearbox": "unknown",
+        "gearbox_subtype": null,
+        "generation": null,
+        "make": null,
+        "mileage_claim": "unknown",
+        "mileage_km": null,
+        "mileage_original": {
+          "amount": null,
+          "is_estimate": false,
+          "range_high": null,
+          "range_low": null,
+          "text": null,
+          "unit": "unknown"
+        },
+        "model": null,
+        "model_year": null,
+        "power_kw": null,
+        "production_year": null,
+        "seats": null,
+        "steering_side": "unknown",
+        "trim": null
+      },
+      "properties": {
+        "body_type": {
+          "default": "unknown",
+          "enum": [
+            "suv",
+            "offroad",
+            "crossover",
+            "pickup",
+            "estate",
+            "sedan",
+            "hatchback",
+            "van",
+            "other",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "drive": {
+          "default": "unknown",
+          "enum": [
+            "fwd",
+            "rwd",
+            "awd",
+            "4wd",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "engine_code": {
+          "default": null,
+          "maxLength": 40,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_displacement_cm3": {
+          "default": null,
+          "maximum": 10000,
+          "minimum": 50,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "facelift": {
+          "default": "unknown",
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "first_registration": {
+          "additionalProperties": false,
+          "default": {
+            "precision": "unknown",
+            "value": null
+          },
+          "description": "A date known only to some precision. `2011-05` is never invented as 2011-05-01.",
+          "properties": {
+            "precision": {
+              "default": "unknown",
+              "enum": [
+                "day",
+                "month",
+                "year",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "default": null,
+              "pattern": "^\\d{4}(-\\d{2}(-\\d{2})?)?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "PartialDate",
+          "type": "object"
+        },
+        "fuel": {
+          "default": "unknown",
+          "enum": [
+            "diesel",
+            "petrol",
+            "hybrid_petrol",
+            "hybrid_diesel",
+            "plugin_hybrid",
+            "lpg",
+            "cng",
+            "electric",
+            "other",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "gearbox": {
+          "default": "unknown",
+          "enum": [
+            "manual",
+            "automatic",
+            "semi_automatic",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "gearbox_subtype": {
+          "default": null,
+          "maxLength": 80,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "default": null,
+          "maxLength": 80,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "make": {
+          "default": null,
+          "maxLength": 80,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mileage_claim": {
+          "default": "unknown",
+          "enum": [
+            "seller_reported",
+            "documented",
+            "verified",
+            "estimated",
+            "range_only",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "mileage_km": {
+          "default": null,
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mileage_original": {
+          "additionalProperties": false,
+          "default": {
+            "amount": null,
+            "is_estimate": false,
+            "range_high": null,
+            "range_low": null,
+            "text": null,
+            "unit": "unknown"
+          },
+          "properties": {
+            "amount": {
+              "default": null,
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "is_estimate": {
+              "default": false,
+              "type": "boolean"
+            },
+            "range_high": {
+              "default": null,
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range_low": {
+              "default": null,
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "default": null,
+              "maxLength": 200,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "unit": {
+              "default": "unknown",
+              "enum": [
+                "km",
+                "mi",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "title": "MileageOriginal",
+          "type": "object"
+        },
+        "model": {
+          "default": null,
+          "maxLength": 120,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_year": {
+          "default": null,
+          "maximum": 2100,
+          "minimum": 1950,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "power_kw": {
+          "default": null,
+          "maximum": 2000,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "production_year": {
+          "default": null,
+          "maximum": 2100,
+          "minimum": 1950,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "seats": {
+          "default": null,
+          "maximum": 12,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "steering_side": {
+          "default": "unknown",
+          "enum": [
+            "left",
+            "right",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "trim": {
+          "default": null,
+          "maxLength": 200,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "VehicleSpec",
+      "type": "object"
+    },
+    "warnings": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "source_key",
+    "source_listing_id",
+    "canonical_url",
+    "observed_at",
+    "parser_version",
+    "listing_id",
+    "revision"
+  ],
+  "title": "ListingRevision",
+  "type": "object"
+}

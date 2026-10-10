@@ -1,0 +1,21 @@
+# SYNTHETIC fixture source for the generic schema.org dealer adapter (Italian wording).
+# concessionario.example is a reserved example-style name; nothing is fetched from a network.
+source_key: fixture_dealer_it
+display_name: "Synthetic fixture dealer (IT) - not a real source"
+country: IT
+role: acquisition
+mode: fixture
+adapter: schemaorg_dealer
+adapter_version: schemaorg_dealer@1.1.0
+enabled: false
+technical_status: fixture_tested
+terms_status: unreviewed
+terms_decision: pending
+source_timezone: Europe/Rome
+allowed_hosts: ["concessionario.example"]
+allowed_search_paths: ["/usato/ricerca"]
+allowed_detail_paths: ["/usato/auto/[a-z0-9-]{3,80}"]
+search:
+  search_url: "https://concessionario.example/usato/ricerca?categoria=suv"
+  detail_id_regex: "/usato/auto/[a-z0-9-]*-(?P<id>it[0-9]{3})$"
+notes: "SYNTHETIC fixture source (designation: synthetic, created 2026-10-06)."

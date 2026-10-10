@@ -1,0 +1,706 @@
+"""``suv-deals doctor``: presence-only readiness report (spec 26, 27, 30).
+
+What it checks (and never does):
+
+- configuration per process (api, worker, scheduler, dispatcher, reconciler, crawler): required
+  vs recommended vs optional settings, reported as ``set``/``missing`` only (`Settings.describe`);
+- the confirmed business baseline and the configuration files (shared with ``config validate``);
+- the database: reachability, server version, the migration ledger, the backend role
+  (``ops.backend_role_problems()`` when the login role may call it, ``SET ROLE``), required schema
+  markers (the same list ``/readyz`` uses) and active workspaces. Read-only;
+- the crawler, ONLY with ``--crawler``: ``GET /health`` and the read-only contract inspection
+  (`Crawl4AIClient.inspect_contract`: unauthenticated probe, ``/config/dump`` dry runs). It never
+  crawls a page and never restarts or reconfigures the crawler;
+- source activation gates from the YAML registry, offline OAuth/URL metadata checks, the
+  notification/event route and the seller-inquiry switches;
+- spec v1.1 readiness per active workspace (when the schema is present): inquiry mode and kill
+  switch, standing authorization, sender binding verification/alias/health, the desktop mail
+  worker's heartbeat age and monitoring state, for an API provider whether
+  ``SELLER_EMAIL_OAUTH_SECRET_REFERENCE`` names the active binding of ``SELLER_EMAIL_FROM``, and the
+  activation-canary evidence state (states, versions and codes only, never an address or token).
+
+It never prints a secret, URL or connection string, and it never creates accounts, keys or data.
+Exit code 1 when any check reports an error.
+"""
+
+# ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
+
+import click
+
+from suv_deals.cli_commands._checks import PROCESSES, Finding
+from suv_deals.cli_commands._common import (
+    EXIT_PROBLEMS,
+    EXIT_USAGE,
+    CliContext,
+    emit_json,
+    exit_with,
+    load_settings,
+    pass_cli,
+)
+
+if TYPE_CHECKING:
+    import httpx
+
+    from suv_deals.settings import Settings
+
+_MIGRATION_RE = re.compile(r"^([0-9]{14})_([a-z0-9_]+)\.sql$")
+TESTED_MAJORS = frozenset({16, 17})
+
+
+def _make_crawler_http() -> httpx.AsyncClient | None:
+    """Injection point for tests (an ``httpx.MockTransport`` client); ``None`` = the real client."""
+    return None
+
+
+def migration_files(root: Path | None = None) -> list[tuple[str, str]]:
+    """``(version, name)`` of every migration file (``Settings.migrations_dir``), in apply order."""
+    from suv_deals.settings import REPO_ROOT
+
+    directory = root or (REPO_ROOT / "supabase" / "migrations")
+    found: list[tuple[str, str]] = []
+    for path in sorted(directory.glob("*.sql")) if directory.is_dir() else []:
+        match = _MIGRATION_RE.match(path.name)
+        if match:
+            found.append((match.group(1), match.group(2)))
+    return found
+
+
+async def database_findings(settings: Settings) -> list[Finding]:
+    """Read-only database checks (see module docstring)."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    from suv_deals.errors import AppError
+
+    area = "database"
+    if settings.database_url is None or not settings.database_url.get_secret_value():
+        return [Finding(area, "connection", "skipped", "DATABASE_URL is missing")]
+    findings: list[Finding] = []
+    try:
+        conn = await psycopg.AsyncConnection.connect(
+            settings.database_url.get_secret_value(),
+            autocommit=True,
+            row_factory=dict_row,
+            prepare_threshold=None,
+            connect_timeout=5,
+            application_name="suv-deals-doctor",
+        )
+    except (psycopg.Error, OSError):
+        return [
+            Finding(area, "connection", "error", "database not reachable (check DATABASE_URL and network)")
+        ]
+    async with conn:
+
+        async def scalar(query: Any, params: Any = None) -> Any:
+            cur = await conn.execute(query, params)
+            row = await cur.fetchone()
+            return None if row is None else next(iter(row.values()))
+
+        findings.append(Finding(area, "connection", "ok", "reachable"))
+        version_num = int(await scalar("select current_setting('server_version_num')::int"))
+        major, minor = divmod(version_num, 10000)
+        version_text = f"PostgreSQL {major}.{minor}"
+        if major < 15:
+            findings.append(Finding(area, "server_version", "error", f"{version_text}: 15 or newer required"))
+        elif major not in TESTED_MAJORS:
+            findings.append(
+                Finding(area, "server_version", "warn", f"{version_text}: tested on 16.15 and 17.11")
+            )
+        else:
+            findings.append(Finding(area, "server_version", "ok", f"{version_text} (tested major version)"))
+
+        # Migration ledger (supabase_migrations.schema_migrations; see docs/schema.md section 9).
+        # A dedicated login (e.g. a LOGIN member of suv_backend) may lack USAGE on that schema:
+        # to_regclass() itself then raises, which must not abort the remaining checks.
+        files = migration_files(settings.migrations_dir)
+        try:
+            has_ledger = await scalar(
+                "select to_regclass('supabase_migrations.schema_migrations') is not null"
+            )
+            applied: set[str] | None = None
+            if has_ledger:
+                cur = await conn.execute("select version from supabase_migrations.schema_migrations")
+                applied = {str(r["version"]) for r in await cur.fetchall()}
+        except psycopg.errors.InsufficientPrivilege:
+            findings.append(Finding(area, "migration_ledger", "skipped", "no privilege to read the ledger"))
+        else:
+            if applied is not None:
+                known = {v for v, _ in files}
+                pending = [f"{v}_{n}" for v, n in files if v not in applied]
+                unknown = sorted(applied - known)
+                if pending:
+                    findings.append(
+                        Finding(
+                            area, "migration_ledger", "warn", f"{len(pending)} pending: {', '.join(pending)}"
+                        )
+                    )
+                else:
+                    findings.append(
+                        Finding(area, "migration_ledger", "ok", f"all {len(files)} files recorded")
+                    )
+                if unknown:
+                    findings.append(
+                        Finding(
+                            area,
+                            "migration_versions",
+                            "warn",
+                            f"{len(unknown)} ledger version(s) not in this checkout (connector-applied "
+                            "versions are recorded under their apply time; see docs/schema.md "
+                            "section 9)",
+                        )
+                    )
+            else:
+                findings.append(
+                    Finding(
+                        area,
+                        "migration_ledger",
+                        "info",
+                        "no supabase_migrations ledger (test harness or manual apply); "
+                        "the schema markers below decide",
+                    )
+                )
+
+        # Backend role (ADR 0001): owner-only function; skipped when the login role may not call it.
+        try:
+            problems = await scalar("select ops.backend_role_problems('suv_backend')")
+        except psycopg.errors.InsufficientPrivilege:
+            findings.append(
+                Finding(
+                    area,
+                    "backend_role",
+                    "skipped",
+                    "ops.backend_role_problems() is owner-only for this login",
+                )
+            )
+        except (psycopg.errors.UndefinedFunction, psycopg.errors.InvalidSchemaName):
+            findings.append(
+                Finding(area, "backend_role", "error", "schema not migrated (ops functions missing)")
+            )
+        else:
+            if problems:
+                findings.append(
+                    Finding(area, "backend_role", "error", "suv_backend is unsafe: " + ", ".join(problems))
+                )
+            else:
+                findings.append(Finding(area, "backend_role", "ok", "suv_backend has no unsafe attributes"))
+
+        role = settings.database_set_role
+        if role:
+            if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", role):
+                findings.append(
+                    Finding(area, "set_role", "error", "DATABASE_SET_ROLE is not a valid role name")
+                )
+                return findings
+            try:
+                await conn.execute(sql.SQL("set role {}").format(sql.Identifier(role)))
+            except psycopg.Error:
+                findings.append(
+                    Finding(area, "set_role", "error", "SET ROLE failed: the login role must be a member")
+                )
+                return findings
+            findings.append(Finding(area, "set_role", "ok", f"SET ROLE {role} works"))
+        else:
+            findings.append(
+                Finding(
+                    area, "set_role", "warn", "DATABASE_SET_ROLE is not set; the login role is used directly"
+                )
+            )
+
+        from suv_deals.persistence.queries.operations import SCHEMA_MARKERS, schema_markers_present
+
+        try:
+            present = await schema_markers_present(conn, SCHEMA_MARKERS)
+        except AppError:
+            findings.append(Finding(area, "schema", "error", "schema markers could not be read"))
+            return findings
+        missing = sorted({m.migration for m, ok in zip(SCHEMA_MARKERS, present, strict=True) if not ok})
+        if missing:
+            findings.append(Finding(area, "schema", "error", f"missing migrations: {', '.join(missing)}"))
+        else:
+            findings.append(Finding(area, "schema", "ok", "every required schema marker is present"))
+        v11 = await scalar("select to_regclass('app.seller_inquiries') is not null")
+        findings.append(
+            Finding(
+                area,
+                "schema_v11",
+                "ok" if v11 else "info",
+                "spec v1.1 seller-inquiry tables (migration 20261006001000) "
+                + ("present" if v11 else "not applied"),
+            )
+        )
+        try:
+            count = int(await scalar("select count(*) from ops.active_workspace_ids()"))
+        except psycopg.Error:
+            findings.append(Finding(area, "workspaces", "warn", "active workspaces could not be counted"))
+        else:
+            if count:
+                findings.append(Finding(area, "workspaces", "ok", f"{count} active workspace(s)"))
+            else:
+                findings.append(
+                    Finding(
+                        area, "workspaces", "warn", "no active workspace (run `suv-deals bootstrap owner`)"
+                    )
+                )
+    return findings
+
+
+def crawler_topology(base_url: str) -> str:
+    host = (urlsplit(base_url.strip()).hostname or "").lower()
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return "host-local loopback (a process on this host, e.g. 127.0.0.1:11235)"
+    if host == "crawl4ai":
+        return "Compose service DNS (crawl4ai:11235 on the private network)"
+    return "another host (verify the private network path)"
+
+
+async def crawler_findings(settings: Settings, http: httpx.AsyncClient | None = None) -> list[Finding]:
+    """Read-only crawler health and contract inspection (only with ``doctor --crawler``)."""
+    from suv_deals.adapters.crawl4ai_client import Crawl4AIClient
+
+    area = "crawler"
+    findings = [Finding(area, "topology", "info", crawler_topology(settings.crawl4ai_base_url))]
+    try:
+        client = Crawl4AIClient.from_settings(settings, http=http)
+    except ValueError:
+        return [
+            *findings,
+            Finding(area, "base_url", "error", "CRAWL4AI_BASE_URL is not a plain http(s) origin"),
+        ]
+    try:
+        report = await client.inspect_contract()
+    finally:
+        await client.aclose()
+    health = report.health
+    if health.ok:
+        findings.append(Finding(area, "health", "ok", f"healthy, version {health.version or 'unknown'}"))
+    elif health.reachable:
+        findings.append(
+            Finding(area, "health", "error", f"reachable but not healthy ({health.error or 'status'})")
+        )
+    else:
+        findings.append(Finding(area, "health", "error", "not reachable"))
+    if report.version_matches is True:
+        findings.append(Finding(area, "version", "ok", f"matches the pinned {report.expected_version}"))
+    elif report.version_matches is False:
+        findings.append(
+            Finding(area, "version", "error", f"does not match the pinned {report.expected_version}")
+        )
+    findings.append(
+        Finding(
+            area,
+            "token",
+            "ok" if report.token_configured else "error",
+            "CRAWL4AI_API_TOKEN: " + ("set" if report.token_configured else "missing"),
+        )
+    )
+    if report.auth_enforced is True:
+        findings.append(Finding(area, "auth", "ok", "unauthenticated requests are refused (401)"))
+    elif report.auth_enforced is False:
+        findings.append(Finding(area, "auth", "error", "the crawler accepts unauthenticated requests"))
+    if report.problems:
+        findings.append(Finding(area, "contract", "error", "problems: " + ", ".join(report.problems[:12])))
+    else:
+        findings.append(Finding(area, "contract", "ok", "read-only contract inspection passed"))
+    return findings
+
+
+def source_findings(settings: Settings, verbose: bool) -> list[Finding]:
+    from suv_deals.adapters.registry import load_registry
+    from suv_deals.errors import AppError
+
+    try:
+        registry = load_registry(settings.config_dir)
+    except AppError as exc:
+        return [Finding("sources", "registry", "error", exc.message)]
+    findings: list[Finding] = []
+    for gate in registry.gates():
+        if gate.active:
+            findings.append(Finding("sources", gate.source_key, "ok", f"active ({gate.mode})"))
+            continue
+        if not gate.activatable:
+            # OPS-03: no terms review, owner decision or switch can activate a source without an
+            # adapter; it is never "one decision away".
+            detail = f"not activatable (no adapter: {gate.adapter} {gate.adapter_version})"
+        else:
+            detail = f"not active: {len(gate.problems)} gate problem(s)"
+        if verbose:
+            detail += " - " + "; ".join(gate.problems)
+        findings.append(Finding("sources", gate.source_key, "info", detail))
+    findings.append(recipient_evidence_finding(settings, registry))
+    return findings
+
+
+def recipient_evidence_finding(settings: Settings, registry: Any) -> Finding:
+    """Which acquisition sources can yield an inquiry recipient (exact-ad seller-contact evidence,
+    spec 37.3; F1, wave D2). Listings of any other source stay ``seller_not_linked`` or
+    ``seller_email_unavailable`` and are never inquired."""
+    configured, active = registry.recipient_evidence_sources()
+    detail = (
+        f"recipient evidence producers: active {', '.join(active) or 'none'}; "
+        f"configured {', '.join(configured) or 'none'}"
+    )
+    if not active:
+        detail += " - no active acquisition source yields a seller e-mail address"
+        detail += ", so no listing can be inquired"
+    warn = not active and settings.seller_inquiry_mode == "automatic"
+    return Finding("sources", "recipient_evidence", "warn" if warn else "info", detail)
+
+
+async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
+    """Spec v1.1 readiness per active workspace, from the database (read-only; no values).
+
+    Nothing is sent unless the mode is ``automatic``, the kill switch is off, the standing
+    authorization is active and the sender binding is verified; for ``outlook_local`` the desktop
+    worker must also be heartbeating. Only states, versions and ages are reported (never an
+    address, account id or token).
+    """
+    from suv_deals.cli_commands._common import active_workspaces, open_database, operator_actor
+    from suv_deals.errors import AppError
+    from suv_deals.persistence import canaries_repo, inquiries_repo, mail_workers_repo, sender_bindings_repo
+    from suv_deals.persistence.database import db_now
+    from suv_deals.persistence.transactions import unit_of_work
+    from suv_deals.workers.inquiry_handlers import (
+        automatic_sending_enabled,
+        configured_sender_binding,
+        configured_sender_problems,
+    )
+
+    area = "seller_inquiry"
+    if settings.database_url is None or not settings.database_url.get_secret_value():
+        return []
+    findings: list[Finding] = []
+    try:
+        async with open_database(settings, application_name="suv-deals-doctor") as db:
+            workspace_ids = await active_workspaces(db)
+            for ws in workspace_ids:
+                prefix = "" if len(workspace_ids) == 1 else f"{str(ws)[:8]}:"
+                actor = operator_actor(ws, "doctor")
+                async with unit_of_work(db, actor) as conn:
+                    if not await _v11_present(conn):
+                        return [Finding(area, "readiness", "info", "seller-inquiry tables not applied")]
+                    now = await db_now(conn)
+                    controls = await inquiries_repo.get_controls(conn, actor)
+                    authorization = await inquiries_repo.current_authorization(conn, actor)
+                    # The binding the runtime would send from: the configured identity only.
+                    sender = await configured_sender_binding(conn, actor, settings)
+                    boxes = await mail_workers_repo.list_mailbox_health(conn, ws)
+                    bindings = await sender_bindings_repo.list_bindings(conn, actor, include_revoked=True)
+                    # Migration 20261008000200 may not be applied yet: report it, never fail.
+                    canaries = (
+                        await canaries_repo.list_canaries(conn, actor, limit=50)
+                        if await _canaries_present(conn)
+                        else None
+                    )
+                identity = configured_sender_problems(settings, sender) if sender else []
+                findings.extend(
+                    _readiness(
+                        prefix,
+                        now,
+                        controls=controls,
+                        authorization=authorization,
+                        sender=sender,
+                        boxes=boxes,
+                        process_open=automatic_sending_enabled(settings),
+                        identity_problems=identity,
+                    )
+                )
+                configured = None if sender is None or identity else sender
+                findings.extend(secret_reference_findings(prefix, settings, bindings, configured))
+                findings.append(canary_finding(prefix, settings, canaries, configured))
+    except AppError:
+        return [Finding(area, "readiness", "warn", "seller-inquiry readiness could not be read")]
+    return findings
+
+
+async def _canaries_present(conn: Any) -> bool:
+    cur = await conn.execute("select to_regclass('ops.inquiry_activation_canaries') is not null as present")
+    row = await cur.fetchone()
+    return bool(row and row["present"])
+
+
+async def _v11_present(conn: Any) -> bool:
+    cur = await conn.execute("select to_regclass('app.seller_inquiry_controls') is not null as present")
+    row = await cur.fetchone()
+    return bool(row and row["present"])
+
+
+def _readiness(
+    prefix: str,
+    now: Any,
+    *,
+    controls: Any,
+    authorization: Any,
+    sender: Any,
+    boxes: Sequence[Any],
+    process_open: bool = True,
+    identity_problems: Sequence[str] = (),
+) -> list[Finding]:
+    """``process_open``: this process's ``SELLER_INQUIRY_MODE`` is ``automatic``,
+    ``SELLER_INQUIRY_KILL_SWITCH`` is off and the owner's ``SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL``
+    switch is off (`workers.inquiry_handlers.automatic_sending_enabled`; all are part of the gate).
+    ``identity_problems``: codes why the binding is not exactly the configured sending identity
+    (``workers.inquiry_handlers.configured_sender_problems``); the runtime never sends from it."""
+    area = "seller_inquiry"
+    findings: list[Finding] = []
+    if controls is None:
+        findings.append(Finding(area, f"{prefix}controls", "info", "no control row yet (sending disabled)"))
+    else:
+        database_open = controls.mode == "automatic" and not controls.kill_switch
+        sending = database_open and process_open
+        note = ""
+        if not database_open:
+            note = " (nothing is sent)"
+        elif not process_open:
+            note = (
+                " (nothing is sent: the process settings SELLER_INQUIRY_MODE/KILL_SWITCH"
+                "/REQUIRE_MESSAGE_APPROVAL forbid it)"
+            )
+        findings.append(
+            Finding(
+                area,
+                f"{prefix}controls",
+                "ok" if sending else "info",
+                f"mode={controls.mode}, kill_switch={'on' if controls.kill_switch else 'off'}, "
+                f"caps={controls.max_per_24h}/24h {controls.max_per_15d}/15d" + note,
+            )
+        )
+    if authorization is None:
+        findings.append(Finding(area, f"{prefix}authorization", "warn", "no standing authorization recorded"))
+    elif authorization.revoked_at is not None:
+        findings.append(
+            Finding(area, f"{prefix}authorization", "warn", f"version {authorization.version} revoked")
+        )
+    elif authorization.authorization.problems_at(now):
+        findings.append(
+            Finding(
+                area, f"{prefix}authorization", "warn", f"version {authorization.version} not effective now"
+            )
+        )
+    else:
+        findings.append(
+            Finding(area, f"{prefix}authorization", "ok", f"version {authorization.version} active")
+        )
+    if sender is None:
+        findings.append(Finding(area, f"{prefix}sender_binding", "warn", "no sender binding"))
+    else:
+        state = "usable" if sender.usable else ("verified" if sender.verified_at else "unverified")
+        detail = (
+            f"{sender.provider.value} v{sender.version}: {state}, alias "
+            f"{'verified' if sender.alias_verified else 'unverified'}, health {sender.health}"
+        )
+        findings.append(Finding(area, f"{prefix}sender_binding", "ok" if sender.usable else "warn", detail))
+        if identity_problems:
+            findings.append(
+                Finding(
+                    area,
+                    f"{prefix}sender_identity",
+                    "warn",
+                    "not the configured sender (nothing is sent from it): " + ", ".join(identity_problems),
+                )
+            )
+    active = [b for b in boxes if b.binding_state == "active"]
+    if sender is not None and sender.provider.value == "outlook_local":
+        if not active:
+            findings.append(Finding(area, f"{prefix}mail_worker", "warn", "no desktop mail worker issued"))
+        for box in active:
+            age = "never" if box.heartbeat_age_seconds is None else f"{box.heartbeat_age_seconds}s ago"
+            findings.append(
+                Finding(
+                    area,
+                    f"{prefix}mail_worker",
+                    "ok" if box.monitoring_active else "warn",
+                    f"heartbeat {box.heartbeat_status} ({age}), monitoring "
+                    f"{'active' if box.monitoring_active else 'NOT active'}, "
+                    f"{box.open_gap_count} open gap(s)",
+                )
+            )
+    return findings
+
+
+def secret_reference_findings(
+    prefix: str, settings: Settings, bindings: Sequence[Any], sender: Any
+) -> list[Finding]:
+    """API providers only: ``SELLER_EMAIL_OAUTH_SECRET_REFERENCE`` must name the ACTIVE binding that
+    is the configured sender (``SELLER_EMAIL_FROM``) and holds a sealed grant (codes only, never the
+    reference or an address). ``sender`` is the configured binding (``None`` when there is none).
+
+    The runtime refuses the same conditions (``SECRET_REFERENCE_BINDING_MISMATCH`` /
+    ``SECRET_BOX_NOT_CONFIGURED`` in `workers.inquiry_handlers.InquiryRuntime.token_provider`), so a
+    problem here means nothing is sent. ``outlook_local`` holds no provider secret: a reference set
+    for it is reported as unused.
+    """
+    from suv_deals.errors import ValidationFailed
+    from suv_deals.integrations.email_providers.base import canonical_or_none
+    from suv_deals.integrations.seller_email import API_PROVIDERS, secret_reference_problems
+    from suv_deals.persistence.sender_bindings_repo import parse_secret_reference
+    from suv_deals.workers.inquiry_handlers import configured_provider
+
+    area = "seller_inquiry"
+    name = f"{prefix}secret_reference"
+    provider = configured_provider(settings)
+    reference = settings.seller_email_oauth_secret_reference
+    if provider not in API_PROVIDERS:
+        if reference and reference.strip():
+            return [
+                Finding(
+                    area,
+                    name,
+                    "warn",
+                    f"SELLER_EMAIL_OAUTH_SECRET_REFERENCE is set but unused ({provider.value} holds no"
+                    " provider secret)",
+                )
+            ]
+        return []
+    problems = secret_reference_problems(reference)
+    if not problems and reference is not None:
+        try:
+            named = parse_secret_reference(reference)
+        except ValidationFailed:
+            problems = ["SECRET_REFERENCE_UNSUPPORTED"]
+        else:
+            binding = next((b for b in bindings if b.id == named), None)
+            if binding is None:
+                problems.append("SECRET_REFERENCE_BINDING_UNKNOWN")
+            else:
+                if binding.revoked:
+                    problems.append("SECRET_REFERENCE_BINDING_REVOKED")
+                if binding.provider != provider:
+                    problems.append("SECRET_REFERENCE_PROVIDER_MISMATCH")
+                if canonical_or_none(binding.from_address) != canonical_or_none(settings.seller_email_from):
+                    problems.append("SECRET_REFERENCE_FROM_MISMATCH")
+                if sender is None or binding.id != sender.id:
+                    problems.append("SECRET_REFERENCE_NOT_THE_CONFIGURED_BINDING")
+                if not binding.has_secret_envelope:
+                    problems.append("SECRET_REFERENCE_NO_SEALED_GRANT")
+    if not problems:
+        return [
+            Finding(
+                area,
+                name,
+                "ok",
+                "SELLER_EMAIL_OAUTH_SECRET_REFERENCE names the active configured binding (SELLER_EMAIL_FROM)",
+            )
+        ]
+    detail = "nothing is sent with this reference: " + ", ".join(problems)
+    if settings.seller_inquiry_mode == "automatic":
+        return [Finding(area, name, "error", detail)]
+    return [Finding(area, name, "warn", detail)]
+
+
+def canary_finding(prefix: str, settings: Settings, canaries: Sequence[Any] | None, sender: Any) -> Finding:
+    """The activation-canary evidence of the configured sender binding (`canary.canary_evidence`).
+
+    ``ok`` once a correlated test reply was recorded for the binding's current version; otherwise
+    ``info`` (``warn`` while ``SELLER_INQUIRY_MODE=automatic``: activation evidence row 4-6 of
+    docs/seller_email_activation.md is still open), naming the reservation refusal
+    ``activation_canary_incomplete`` (F3/OPS-04: no real inquiry is reserved before it).
+    ``canaries=None``: the canary table of migration 20261008000200 is not applied yet (reported,
+    never an error). States and versions only.
+    """
+    from suv_deals.cli_commands.canary import canary_evidence
+    from suv_deals.workers.inquiry_handlers import ACTIVATION_CANARY_INCOMPLETE
+
+    if canaries is None:
+        return Finding(
+            "seller_inquiry",
+            f"{prefix}activation_canary",
+            "info",
+            "activation canaries not available: migration 20261008000200 is not applied",
+        )
+    state, detail = canary_evidence(canaries, sender)
+    name, text = f"{prefix}activation_canary", f"{state}: {detail}"
+    if state == "complete":
+        return Finding("seller_inquiry", name, "ok", text)
+    # F3/OPS-04 (wave D2): the reservation gate this evidence opens, by its refusal code.
+    text = f"{text}; {ACTIVATION_CANARY_INCOMPLETE}: no real seller inquiry is reserved until then"
+    if settings.seller_inquiry_mode == "automatic":
+        return Finding("seller_inquiry", name, "warn", text)
+    return Finding("seller_inquiry", name, "info", text)
+
+
+def collect_offline(settings: Settings, processes: Sequence[str], verbose: bool) -> list[Finding]:
+    from suv_deals.cli_commands import _checks
+
+    return [
+        *_checks.requirement_findings(settings, processes),
+        *_checks.baseline_findings(settings),
+        *_checks.config_file_findings(settings.config_dir, settings),
+        *source_findings(settings, verbose),
+        *_checks.auth_findings(settings),
+        *_checks.switch_findings(settings),
+        *_checks.notification_findings(settings),
+        *_checks.seller_inquiry_findings(settings),
+        *_checks.production_findings(settings),
+    ]
+
+
+@click.command("doctor")
+@click.option(
+    "--process",
+    "process_csv",
+    default=",".join(PROCESSES),
+    show_default=True,
+    help="Comma-separated processes whose configuration requirements are checked.",
+)
+@click.option("--no-db", is_flag=True, help="Skip the database checks.")
+@click.option("--crawler", is_flag=True, help="Also run the read-only crawler health/contract inspection.")
+@click.option("--verbose", "-v", is_flag=True, help="List every source gate problem.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@pass_cli
+def doctor(
+    cli: CliContext, *, process_csv: str, no_db: bool, crawler: bool, verbose: bool, as_json: bool
+) -> None:
+    """Report missing configuration and dependency health without printing any value."""
+    from suv_deals.cli_commands import _checks
+    from suv_deals.cli_commands._common import fail, parse_csv, run_async
+
+    processes = parse_csv(process_csv)
+    unknown = [p for p in processes if p not in PROCESSES]
+    if unknown or not processes:
+        fail(
+            f"unknown process(es): {', '.join(unknown) or '-'}; choose from {', '.join(PROCESSES)}",
+            EXIT_USAGE,
+        )
+    settings = load_settings(cli)
+    findings = collect_offline(settings, processes, verbose)
+
+    async def online() -> int:
+        from suv_deals.cli_commands._common import unexpected_error
+
+        if not no_db:
+            try:
+                db_findings = await database_findings(settings)
+                findings.extend(db_findings)
+            except Exception as exc:  # report and continue: doctor never aborts half-way
+                db_findings = []
+                findings.append(Finding("database", "check", "error", unexpected_error(exc)))
+            reachable = any(f.name == "schema" and f.status == "ok" for f in db_findings)
+            if reachable:
+                try:
+                    findings.extend(await seller_inquiry_readiness(settings))
+                except Exception as exc:
+                    findings.append(Finding("seller_inquiry", "readiness", "warn", unexpected_error(exc)))
+        if crawler:
+            try:
+                findings.extend(await crawler_findings(settings, _make_crawler_http()))
+            except Exception as exc:
+                findings.append(Finding("crawler", "check", "error", unexpected_error(exc)))
+        return 0
+
+    run_async(online)
+    ordered = _checks.sort_findings(findings)
+    if as_json:
+        emit_json({"app_env": settings.app_env, "findings": [f.as_dict() for f in ordered]})
+    else:
+        _checks.render(ordered, title=f"suv-deals doctor (APP_ENV={settings.app_env})")
+    if _checks.has_errors(ordered):
+        exit_with(EXIT_PROBLEMS)

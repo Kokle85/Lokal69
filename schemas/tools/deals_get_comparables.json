@@ -1,0 +1,1351 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Get MK comparables"
+  },
+  "description": "Selected (and optionally excluded) North Macedonian comparable evidence with match differences and exclusion reasons, paginated. Asking-price and sale statistics are reported separately; asking prices are not realized sale prices.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": null,
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "comparable_set_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "cursor": {
+        "default": null,
+        "description": "Opaque next_cursor from the previous page; omit for the first page.",
+        "maxLength": 2048,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "include_excluded": {
+        "default": false,
+        "description": "Also list excluded evidence.",
+        "type": "boolean"
+      },
+      "limit": {
+        "default": 25,
+        "description": "Page size (1-100).",
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "comparable_set_id"
+    ],
+    "title": "deals_get_comparables",
+    "type": "object"
+  },
+  "name": "deals_get_comparables",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "One reproducible comparable set with a page of its members (cursor in the envelope).",
+        "properties": {
+          "as_of": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "asking_price_stats": {
+            "additionalProperties": false,
+            "description": "Statistics for exactly one evidence kind, in EUR rounded to cents; points stay visible.",
+            "properties": {
+              "currency": {
+                "const": "EUR",
+                "default": "EUR",
+                "type": "string"
+              },
+              "date_from": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "date_to": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "evidence_kind": {
+                "description": "MK market evidence (spec section 15).",
+                "enum": [
+                  "asking_price",
+                  "seller_reported_sale",
+                  "verified_sale",
+                  "owner_estimate"
+                ],
+                "type": "string"
+              },
+              "evidence_note": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "match_quality": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "match_level": {
+                      "maxLength": 40,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "match_level",
+                    "count"
+                  ],
+                  "title": "MatchQualityCount",
+                  "type": "object"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              "max": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "median": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "min": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "n": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "points": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "amount_eur": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": "string"
+                    },
+                    "difference_codes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "maxItems": 50,
+                      "type": "array"
+                    },
+                    "match_level": {
+                      "enum": [
+                        "exact",
+                        "close",
+                        "widened"
+                      ],
+                      "type": "string"
+                    },
+                    "observation_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "observation_id",
+                    "amount_eur",
+                    "match_level",
+                    "observed_at",
+                    "difference_codes"
+                  ],
+                  "title": "StatPointView",
+                  "type": "object"
+                },
+                "maxItems": 5000,
+                "type": "array"
+              },
+              "q1": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "q3": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sample_label": {
+                "enum": [
+                  "single_observation",
+                  "small_sample",
+                  "adequate",
+                  "unverified_claims"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "evidence_kind",
+              "evidence_note",
+              "currency",
+              "n",
+              "sample_label",
+              "min",
+              "max",
+              "median",
+              "q1",
+              "q3",
+              "date_from",
+              "date_to",
+              "match_quality",
+              "points"
+            ],
+            "title": "EvidenceStatsView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "asking_vs_sale_notice": {
+            "default": "Asking prices are advertised amounts, not realized sale prices. Seller-reported sales are unverified claims; only verified sales document transaction prices.",
+            "type": "string"
+          },
+          "comparable_set_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "criteria": {
+            "additionalProperties": false,
+            "properties": {
+              "criteria_version": {
+                "default": "mk-comparables@1.1.0",
+                "type": "string"
+              },
+              "displacement_tolerance": {
+                "default": "0.10",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              "max_age_days": {
+                "type": "integer"
+              },
+              "max_mileage_window_km": {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              "max_year_window": {
+                "type": "integer"
+              },
+              "mileage_window_km": {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              "min_sample": {
+                "type": "integer"
+              },
+              "power_tolerance": {
+                "default": "0.15",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              "widening_order": {
+                "default": [
+                  "mileage",
+                  "year",
+                  "facelift"
+                ],
+                "items": {
+                  "enum": [
+                    "mileage",
+                    "year",
+                    "facelift"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "year_window": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "year_window",
+              "mileage_window_km",
+              "max_year_window",
+              "max_mileage_window_km",
+              "max_age_days",
+              "min_sample"
+            ],
+            "title": "MatchingCriteria",
+            "type": "object"
+          },
+          "criteria_version": {
+            "maxLength": 80,
+            "type": "string"
+          },
+          "excluded_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "include_excluded": {
+            "type": "boolean"
+          },
+          "is_fixture": {
+            "type": "boolean"
+          },
+          "listing_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "members": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One selected or excluded MK observation, with its match differences or exclusion reasons.\n\n``duplicate_cluster_id`` is the observation's duplicate cluster (spec 15); ``duplicate_of``\nnames the kept observation for a member excluded as a duplicate. ``url`` is null unless it\nis a safe absolute http(s) link.",
+              "properties": {
+                "advertised": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "amount_eur": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "availability": {
+                  "enum": [
+                    "available",
+                    "reserved",
+                    "removed",
+                    "sold_claimed",
+                    "unknown",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "differences": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "code": {
+                        "maxLength": 80,
+                        "type": "string"
+                      },
+                      "comparable": {
+                        "default": null,
+                        "maxLength": 200,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "dimension": {
+                        "maxLength": 40,
+                        "type": "string"
+                      },
+                      "severity": {
+                        "enum": [
+                          "info",
+                          "context",
+                          "unverified",
+                          "differs",
+                          "widened"
+                        ],
+                        "type": "string"
+                      },
+                      "target": {
+                        "default": null,
+                        "maxLength": 200,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "dimension",
+                      "code",
+                      "severity"
+                    ],
+                    "title": "MatchDifference",
+                    "type": "object"
+                  },
+                  "maxItems": 50,
+                  "type": "array"
+                },
+                "duplicate_cluster_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "duplicate_of": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "evidence_kind": {
+                  "description": "MK market evidence (spec section 15).",
+                  "enum": [
+                    "asking_price",
+                    "seller_reported_sale",
+                    "verified_sale",
+                    "owner_estimate"
+                  ],
+                  "type": "string"
+                },
+                "evidence_note": {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                "exclusion_details": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 30,
+                  "type": "array"
+                },
+                "exclusion_reasons": {
+                  "items": {
+                    "description": "Typed reasons a candidate is not in the selected set. Listed in spec 15 matching order.",
+                    "enum": [
+                      "WRONG_MARKET",
+                      "FIXTURE_MISMATCH",
+                      "NOT_COMPARABLE_EVIDENCE_KIND",
+                      "PRICE_MISSING",
+                      "CURRENCY_UNCONVERTIBLE",
+                      "OBSERVED_AFTER_AS_OF",
+                      "STALE",
+                      "DUPLICATE_OF_CLUSTER",
+                      "MODEL_UNKNOWN",
+                      "WRONG_MODEL",
+                      "WRONG_GENERATION",
+                      "FACELIFT_MISMATCH",
+                      "ENGINE_MISMATCH",
+                      "FUEL_MISMATCH",
+                      "FUEL_UNVERIFIED",
+                      "GEARBOX_MISMATCH",
+                      "GEARBOX_UNVERIFIED",
+                      "DRIVE_MISMATCH",
+                      "DRIVE_UNVERIFIED",
+                      "YEAR_UNKNOWN",
+                      "YEAR_OUT_OF_WINDOW",
+                      "MILEAGE_UNKNOWN",
+                      "MILEAGE_OUT_OF_WINDOW",
+                      "CONDITION_MISMATCH"
+                    ],
+                    "type": "string"
+                  },
+                  "maxItems": 30,
+                  "type": "array"
+                },
+                "generation": {
+                  "maxLength": 80,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "is_fixture": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "local_registration_status": {
+                  "enum": [
+                    "locally_registered",
+                    "imported_unregistered",
+                    "unknown",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "make": {
+                  "maxLength": 80,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "match_level": {
+                  "enum": [
+                    "exact",
+                    "close",
+                    "widened",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "mileage_km": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "model": {
+                  "maxLength": 120,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "observation_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "observed_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "ordinal": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "price_basis": {
+                  "enum": [
+                    "gross",
+                    "net",
+                    "unknown",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role": {
+                  "enum": [
+                    "selected",
+                    "excluded"
+                  ],
+                  "type": "string"
+                },
+                "seller_type": {
+                  "enum": [
+                    "dealer",
+                    "private",
+                    "unknown",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "source_key": {
+                  "maxLength": 80,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "url": {
+                  "maxLength": 2048,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "weight": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "widened_dimensions": {
+                  "items": {
+                    "enum": [
+                      "mileage",
+                      "year",
+                      "facelift"
+                    ],
+                    "type": "string"
+                  },
+                  "maxItems": 3,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "ordinal",
+                "observation_id",
+                "role",
+                "evidence_kind",
+                "evidence_note",
+                "match_level",
+                "weight",
+                "widened_dimensions",
+                "differences",
+                "exclusion_reasons",
+                "duplicate_of",
+                "duplicate_cluster_id",
+                "exclusion_details",
+                "advertised",
+                "amount_eur",
+                "price_basis",
+                "observed_at",
+                "source_key",
+                "url",
+                "make",
+                "model",
+                "generation",
+                "mileage_km",
+                "local_registration_status",
+                "seller_type",
+                "availability",
+                "is_fixture"
+              ],
+              "title": "ComparableMemberView",
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "mk_band": {
+            "additionalProperties": false,
+            "properties": {
+              "basis": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "fit": {
+                "enum": [
+                  "below",
+                  "within",
+                  "above",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "max_eur": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "meaning": {
+                "default": "MK asking-price research band; not a proven realized sale price",
+                "type": "string"
+              },
+              "min_eur": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "min_eur",
+              "max_eur",
+              "fit",
+              "basis",
+              "meaning"
+            ],
+            "title": "MkBandView",
+            "type": "object"
+          },
+          "research_needed": {
+            "type": "boolean"
+          },
+          "sample_quality": {
+            "enum": [
+              "adequate",
+              "small",
+              "insufficient"
+            ],
+            "type": "string"
+          },
+          "selected_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "seller_reported_sale_stats": {
+            "additionalProperties": false,
+            "description": "Statistics for exactly one evidence kind, in EUR rounded to cents; points stay visible.",
+            "properties": {
+              "currency": {
+                "const": "EUR",
+                "default": "EUR",
+                "type": "string"
+              },
+              "date_from": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "date_to": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "evidence_kind": {
+                "description": "MK market evidence (spec section 15).",
+                "enum": [
+                  "asking_price",
+                  "seller_reported_sale",
+                  "verified_sale",
+                  "owner_estimate"
+                ],
+                "type": "string"
+              },
+              "evidence_note": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "match_quality": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "match_level": {
+                      "maxLength": 40,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "match_level",
+                    "count"
+                  ],
+                  "title": "MatchQualityCount",
+                  "type": "object"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              "max": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "median": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "min": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "n": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "points": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "amount_eur": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": "string"
+                    },
+                    "difference_codes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "maxItems": 50,
+                      "type": "array"
+                    },
+                    "match_level": {
+                      "enum": [
+                        "exact",
+                        "close",
+                        "widened"
+                      ],
+                      "type": "string"
+                    },
+                    "observation_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "observation_id",
+                    "amount_eur",
+                    "match_level",
+                    "observed_at",
+                    "difference_codes"
+                  ],
+                  "title": "StatPointView",
+                  "type": "object"
+                },
+                "maxItems": 5000,
+                "type": "array"
+              },
+              "q1": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "q3": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sample_label": {
+                "enum": [
+                  "single_observation",
+                  "small_sample",
+                  "adequate",
+                  "unverified_claims"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "evidence_kind",
+              "evidence_note",
+              "currency",
+              "n",
+              "sample_label",
+              "min",
+              "max",
+              "median",
+              "q1",
+              "q3",
+              "date_from",
+              "date_to",
+              "match_quality",
+              "points"
+            ],
+            "title": "EvidenceStatsView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "adequate",
+              "small_sample",
+              "insufficient_comparables"
+            ],
+            "type": "string"
+          },
+          "target_revision_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "verified_sale_stats": {
+            "additionalProperties": false,
+            "description": "Statistics for exactly one evidence kind, in EUR rounded to cents; points stay visible.",
+            "properties": {
+              "currency": {
+                "const": "EUR",
+                "default": "EUR",
+                "type": "string"
+              },
+              "date_from": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "date_to": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "evidence_kind": {
+                "description": "MK market evidence (spec section 15).",
+                "enum": [
+                  "asking_price",
+                  "seller_reported_sale",
+                  "verified_sale",
+                  "owner_estimate"
+                ],
+                "type": "string"
+              },
+              "evidence_note": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "match_quality": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "match_level": {
+                      "maxLength": 40,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "match_level",
+                    "count"
+                  ],
+                  "title": "MatchQualityCount",
+                  "type": "object"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              "max": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "median": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "min": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": "string"
+              },
+              "n": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "points": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "amount_eur": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": "string"
+                    },
+                    "difference_codes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "maxItems": 50,
+                      "type": "array"
+                    },
+                    "match_level": {
+                      "enum": [
+                        "exact",
+                        "close",
+                        "widened"
+                      ],
+                      "type": "string"
+                    },
+                    "observation_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "observed_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "observation_id",
+                    "amount_eur",
+                    "match_level",
+                    "observed_at",
+                    "difference_codes"
+                  ],
+                  "title": "StatPointView",
+                  "type": "object"
+                },
+                "maxItems": 5000,
+                "type": "array"
+              },
+              "q1": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "q3": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sample_label": {
+                "enum": [
+                  "single_observation",
+                  "small_sample",
+                  "adequate",
+                  "unverified_claims"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "evidence_kind",
+              "evidence_note",
+              "currency",
+              "n",
+              "sample_label",
+              "min",
+              "max",
+              "median",
+              "q1",
+              "q3",
+              "date_from",
+              "date_to",
+              "match_quality",
+              "points"
+            ],
+            "title": "EvidenceStatsView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "widening_steps": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "adequacy_count_after": {
+                  "type": "integer"
+                },
+                "dimension": {
+                  "enum": [
+                    "mileage",
+                    "year",
+                    "facelift"
+                  ],
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "selected_count_after": {
+                  "type": "integer"
+                },
+                "step": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "step",
+                "dimension",
+                "label",
+                "selected_count_after",
+                "adequacy_count_after"
+              ],
+              "title": "WideningStep",
+              "type": "object"
+            },
+            "maxItems": 10,
+            "type": "array"
+          }
+        },
+        "required": [
+          "comparable_set_id",
+          "listing_id",
+          "target_revision_id",
+          "criteria_version",
+          "as_of",
+          "status",
+          "sample_quality",
+          "research_needed",
+          "is_fixture",
+          "criteria",
+          "widening_steps",
+          "mk_band",
+          "asking_price_stats",
+          "seller_reported_sale_stats",
+          "verified_sale_stats",
+          "asking_vs_sale_notice",
+          "selected_count",
+          "excluded_count",
+          "include_excluded",
+          "members",
+          "warnings"
+        ],
+        "title": "ComparableSetView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "deals_get_comparables_result",
+    "type": "object"
+  },
+  "paginated": true,
+  "requiredScope": "deals:read",
+  "title": "Get MK comparables"
+}

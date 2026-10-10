@@ -1,0 +1,38 @@
+# AutoScout24 Switzerland public listings (CH). Candidate acquisition source - DISABLED.
+# Each AutoScout24 country is registered and gated separately.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: autoscout24_ch
+display_name: "AutoScout24 Switzerland public listings (CH)"
+country: CH
+role: acquisition
+mode: public_html
+adapter: autoscout24_public_ch
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null
+terms_reviewed_at: null
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-10)"
+terms_decision_note: >-
+  Owner decision 2026-10-10: include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block. The Swiss operator's own terms are still to be identified and reviewed (terms_status stays unreviewed, which keeps the source gated).
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Zurich
+# Robots record (fact only, not permission). Re-checked 2026-10-10.
+robots_checked_at: 2026-10-10T00:00:00Z
+robots_summary: >-
+  robots.txt re-checked 2026-10-10 (fact, not permission): no 'User-agent: *' group (only Googlebot and grapeshot groups), so it sets no rules for our user agent (RFC 9309 2.2.1); robots silence is never permission. The Swiss site's search/detail routes have not been verified, so hosts and paths stay empty.
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Verify separately from other AutoScout24 markets (spec section 5). The autoscout24.com consumer
+  terms (https://www.autoscout24.com/company/agb/, checked 2026-10-06; sections 8.2-8.3 restrict
+  automated queries and the creation/commercial use of a derived database) are recorded for the
+  DE/IT sources. Whether they or separate Swiss terms govern AutoScout24 Switzerland has not been
+  reviewed, so terms_status stays unreviewed (a stricter gate than restricted) until the
+  CH-specific terms are identified and reviewed.

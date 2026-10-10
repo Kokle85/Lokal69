@@ -1,0 +1,25 @@
+# automobile.it (IT). Candidate acquisition source - DISABLED, nothing verified.
+source_key: automobile_it
+display_name: "automobile.it public listings (IT)"
+country: IT
+role: acquisition
+mode: public_html
+adapter: automobile_it_public
+adapter_version: unimplemented
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null            # exact terms page not yet identified/verified
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Candidate from spec section 5. Exact domains, terms and public routes are unverified;
+  no host, path or selector may be added until they are.

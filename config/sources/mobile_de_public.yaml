@@ -1,0 +1,38 @@
+# mobile.de public listings (DE). Candidate acquisition source - DISABLED.
+# Terms and technical status are recorded independently (spec section 5).
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: mobile_de_public
+display_name: "mobile.de public listings (DE)"
+country: DE
+role: acquisition
+mode: public_html
+adapter: mobile_de_public
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: restricted
+terms_url: https://www.mobile.de/service/agbPublic
+terms_reviewed_at: 2026-10-06T00:00:00Z
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-10)"
+terms_decision_note: >-
+  Owner decision 2026-10-10: include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
+technical_denial_policy: stop_and_report
+robots_policy: obey
+# Hosts and paths follow the robots.txt check of 2026-10-10; the runtime robots module re-checks every fetch.
+robots_checked_at: 2026-10-10T00:00:00Z
+robots_summary: >-
+  robots.txt checked 2026-10-10 (fact, not permission): the 'User-agent: *' group does not disallow /fahrzeuge/search.html or /fahrzeuge/details.html; it disallows /api/, print views, '?lang=' variants, 'pg:vip' and ',pgn:' pagination forms and several language-prefixed paths. No Crawl-delay.
+allowed_hosts:
+  - 'suchen.mobile.de'
+allowed_search_paths:
+  - '^/fahrzeuge/search\.html$'
+allowed_detail_paths:
+  - '^/fahrzeuge/details\.html$'
+search: {}
+notes: >-
+  Public terms (checked 2026-10-06) contain a scraping restriction in section 11.
+  Determine which terms apply to this project's use before any decision. Permission or a
+  suitable agreement is the lower-risk activation route. The optional official Search API is
+  tracked separately as source mobile_de_api.
