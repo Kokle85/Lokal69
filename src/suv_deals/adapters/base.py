@@ -15,7 +15,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
-from suv_deals.domain.enums import AccessState, Completeness, CoverageMode
+from suv_deals.domain.enums import AccessState, Completeness, CoverageMode, SellerType
 from suv_deals.domain.listings import NormalizedListing
 from suv_deals.domain.profiles import SearchProfile
 
@@ -39,6 +39,9 @@ class SourceCapabilities(BaseModel):
     countries: tuple[str, ...] = ()
     # False for placeholder adapters whose capabilities are conservative defaults, not established facts.
     verified: bool = False
+    # True when parse_detail reports exact-ad seller-contact evidence (ParsedListing.seller_contact;
+    # spec 37.3). Sources without it can never produce an inquiry recipient (wave D2, F1).
+    seller_contact_evidence: bool = False
 
 
 class SearchRequest(BaseModel):
@@ -169,6 +172,65 @@ class CanonicalIdentity(BaseModel):
     identity_hash: str = Field(min_length=64, max_length=64)
 
 
+#: Where an address was seen on the advertisement (``domain.seller_contacts.ExtractionLocation``).
+ShownEmailLocation = Literal["listing_contact_block", "listing_description"]
+AdTextFieldName = Literal["title", "description", "seller_note"]
+
+
+class ShownEmail(BaseModel):
+    """One e-mail address VISIBLE on the advertisement (never a guessed or hidden one)."""
+
+    model_config = _FROZEN
+
+    address: str = Field(min_length=3, max_length=320)
+    location: ShownEmailLocation
+    #: The visible text around the address on the page (bounded); it must show the address.
+    excerpt: str = Field(min_length=3, max_length=500)
+
+
+class AdText(BaseModel):
+    """Advertisement text for the inquiry-language decision (``domain.language.AdTextFragment``).
+
+    ``seller_written`` is False for platform labels and composed titles; ``machine_translated``
+    when the site marks the text as an automatic translation. Neither decides the language.
+    """
+
+    model_config = _FROZEN
+
+    field: AdTextFieldName
+    text: str = Field(min_length=1, max_length=4000)
+    seller_written: bool
+    machine_translated: bool = False
+    selector: str | None = Field(default=None, max_length=200)
+
+
+class SellerContactEvidence(BaseModel):
+    """What ONE advertisement shows about its seller and how to reach them (spec 37.3).
+
+    Kept OUT of ``NormalizedListing`` (stored revisions never carry contact data): the detail
+    pipeline turns it into a linked seller entity and one ``app.seller_contacts`` row
+    (``crawling.seller_evidence``). Addresses are only those visible on the page; a contact form
+    or a reveal restriction is reported as such, never bypassed or submitted.
+    """
+
+    model_config = _FROZEN
+
+    seller_type: SellerType = SellerType.UNKNOWN
+    seller_name: str | None = Field(default=None, max_length=200)
+    #: The site's own seller/dealer id shown or linked on the ad (marketplace seller id).
+    seller_reference: str | None = Field(default=None, max_length=200)
+    #: The seller's own website linked from the ad (or the dealer's own inventory site).
+    dealer_website: str | None = Field(default=None, max_length=2048)
+    emails: tuple[ShownEmail, ...] = Field(default=(), max_length=20)
+    #: Distinct addresses visible anywhere on the page (several -> no single recipient).
+    distinct_addresses: int = Field(default=0, ge=0, le=1000)
+    contact_form: bool = False
+    contact_reveal_restricted: bool = False
+    ad_texts: tuple[AdText, ...] = Field(default=(), max_length=10)
+    #: The page's declared language (site navigation; recorded, never decisive).
+    page_language: str | None = Field(default=None, max_length=20)
+
+
 class ParsedListing(BaseModel):
     model_config = _FROZEN
 
@@ -177,6 +239,9 @@ class ParsedListing(BaseModel):
     listing: NormalizedListing | None = None
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: Exact-ad seller-contact evidence (adapters with ``seller_contact_evidence``); never stored
+    #: with the revision. ``None`` = the adapter does not report it for this page.
+    seller_contact: SellerContactEvidence | None = None
 
     @model_validator(mode="after")
     def _shape(self) -> ParsedListing:

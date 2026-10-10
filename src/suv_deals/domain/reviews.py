@@ -98,7 +98,9 @@ REVIEW_RULES_VERSION: Final = "reviews@1.0.0"
 CLAIM_TOKEN_BYTES: Final = 32
 MIN_CLAIM_DURATION: Final = timedelta(seconds=60)
 MAX_CLAIM_DURATION: Final = timedelta(seconds=3600)
-#: PROPOSED default claim duration (spec 21); configurable via BusinessConfig.claim_duration_seconds.
+#: PROPOSED default claim duration (spec 21). The dashboard and the MCP ``reviews_claim`` tool use
+#: the process setting ``REVIEW_CLAIM_DURATION_SECONDS`` (``Settings.review_claim_duration_seconds``,
+#: 60-3600); ``BusinessConfig.claim_duration_seconds`` is deprecated and ignored.
 DEFAULT_CLAIM_DURATION: Final = timedelta(seconds=300)
 
 _TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9_-]{20,256}$")

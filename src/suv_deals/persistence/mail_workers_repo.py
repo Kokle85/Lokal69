@@ -61,7 +61,9 @@ Health (`mailbox_health`, `list_mailbox_health`)
     age, unresolved matching gaps, account check, per-folder checkpoints and every coverage gap
     (reported gaps plus a server-detected ``worker_offline`` gap since the last heartbeat) via
     ``domain.lifecycle.mail_worker_coverage``. ``monitoring_active`` is never claimed without a
-    fresh heartbeat, a connected Outlook and a fresh reconciliation. While the heartbeat is not
+    fresh heartbeat, a connected Outlook and a fresh reconciliation, nor while the active
+    binding's credential is expired or revoked (``CREDENTIAL_NOT_LIVE``: the worker's next upload
+    is refused, however fresh its last heartbeat). While the heartbeat is not
     ``healthy`` the worker-reported dimensions (sync ok, sync lag, backlog, backlog age, matching
     gaps) are reported UNKNOWN (``None`` / an ``unknown`` lag), never as the last stale values.
 
@@ -1442,8 +1444,10 @@ class MailboxHealth(BaseModel):
 
 
 _MAILBOXES_SQL: Final = """
-select m.id, m.sender_binding_id, m.provider, m.worker_label, m.state, m.created_at, m.revoked_at
+select m.id, m.sender_binding_id, m.provider, m.worker_label, m.state, m.created_at, m.revoked_at,
+       coalesce(c.revoked_at is null and c.expires_at > %(now)s, false) as credential_live
   from ops.mail_worker_bindings m
+  left join ops.api_credentials c on c.workspace_id = m.workspace_id and c.id = m.credential_id
  where m.workspace_id = %(ws)s and (%(box)s::uuid is null or m.id = %(box)s::uuid)
    and (%(include_revoked)s or m.state = 'active')
  order by (m.state = 'active') desc, m.created_at desc, m.id
@@ -1483,6 +1487,9 @@ def _server_gap(gap: CoverageGap, now: datetime) -> ReportedGap:
 
 #: Why worker-reported dimensions are shown as unknown (C1 item 8).
 HEARTBEAT_NOT_HEALTHY: Final = "worker heartbeat not healthy: worker-reported values are unknown"
+#: Why an active mailbox whose bound credential expired or was revoked is not monitoring (D1 item
+#: 2): its next upload is refused, so a still-fresh heartbeat proves nothing about replies.
+CREDENTIAL_NOT_LIVE: Final = "mailbox worker credential expired or revoked: replies cannot be uploaded"
 
 
 def _unknown_lag(lag: LagMeasurement) -> LagMeasurement:
@@ -1563,6 +1570,9 @@ def _health(
     revoked = mailbox["state"] != "active"
     if revoked:
         reasons.append("mailbox worker binding revoked")
+    credential_live = bool(mailbox["credential_live"])
+    if not revoked and not credential_live:
+        reasons.append(CREDENTIAL_NOT_LIVE)
     return MailboxHealth(
         mailbox_binding_id=mailbox["id"],
         sender_binding_id=mailbox["sender_binding_id"],
@@ -1601,6 +1611,7 @@ def _health(
         ),
         monitoring_active=report.monitoring_active
         and not revoked
+        and credential_live
         and open_gaps == 0
         and account_status != "mismatch",
         reasons=tuple(reasons),
@@ -1627,7 +1638,7 @@ async def list_mailbox_health(
         mailboxes = await fetch_all(
             conn,
             _MAILBOXES_SQL,
-            {"ws": workspace_id, "box": mailbox_binding_id, "include_revoked": include_revoked},
+            {"ws": workspace_id, "box": mailbox_binding_id, "include_revoked": include_revoked, "now": now},
         )
         rows = (
             await fetch_all(
@@ -1668,6 +1679,7 @@ async def mailbox_health(conn: Conn, worker: WorkerIdentity, **kwargs: Any) -> M
 
 __all__ = [
     "BINDING_STATE_FOR",
+    "CREDENTIAL_NOT_LIVE",
     "DEFAULT_HEARTBEAT_INTERVAL",
     "DEFAULT_RECONCILE_INTERVAL",
     "HEALTH_ROW_HASH",

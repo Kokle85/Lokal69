@@ -42,20 +42,23 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Final
+from typing import Any, Final
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
 
 from suv_deals.adapters.base import ParsedListing, RawDocument
+from suv_deals.crawling.mk_evidence import MK_COMPARABLE_ROLE, mk_observation
 from suv_deals.crawling.policy_client import BudgetRefused
 from suv_deals.crawling.rate_limits import Deny, DenyReason, Wait
+from suv_deals.crawling.seller_evidence import record_seller_evidence
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import AccessState, JobState
+from suv_deals.domain.identity import PromotionOutcome
 from suv_deals.errors import SourcePaused, ValidationFailed
 from suv_deals.observability.logging import log_context
-from suv_deals.persistence import jobs, listings_repo, sources_repo, storage
+from suv_deals.persistence import jobs, listings_repo, market_repo, sources_repo, storage
 from suv_deals.persistence.database import Conn
 from suv_deals.persistence.jobs import ClaimedJob
 from suv_deals.persistence.listings_repo import DetailSnapshotRef, IngestDetailResult, ListingRecord
@@ -204,7 +207,7 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
         stored = await _store_snapshot(ctx, job.workspace_id, document) if disposition is None else None
         observation_id = uuid4()  # fixed per fetch: a re-run commit is idempotent
 
-        async def commit() -> tuple[Disposition | None, JobState, IngestDetailResult | None]:
+        async def commit() -> tuple[Disposition | None, JobState, IngestDetailResult | dict[str, Any] | None]:
             execution.check_lease()
             async with job_unit_of_work(ctx.db, job) as (conn, _locked):
                 if disposition is not None and disposition.code == "access_blocked":
@@ -226,6 +229,13 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
                 if disposition is not None:
                     # The applied state, not the requested kind: an exhausted retry is a dead letter.
                     return disposition, await apply_disposition(conn, job, disposition), None
+                if source.role == MK_COMPARABLE_ROLE:
+                    # MK comparable evidence, never an acquisition revision (F2, wave D2).
+                    details = await _record_mk_evidence(
+                        conn, actor, source, listing, parsed, document, snapshot_id, adapter.adapter_version
+                    )
+                    await jobs.complete(conn, job, details)
+                    return None, JobState.SUCCEEDED, details
                 context = (
                     await listings_repo.load_screening_context(conn, actor, taxonomy=ctx.taxonomy)
                     if ctx.taxonomy is not None
@@ -254,7 +264,10 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
         applied, state, result = await retry_transient(commit)
     if applied is not None:
         return JobOutcome(state=state, code=applied.code, details={"listing_id": str(listing.id)})
+    if isinstance(result, dict):
+        return JobOutcome(state=JobState.SUCCEEDED, details=result)
     assert result is not None
+    seller_evidence = await _seller_evidence(ctx, actor, source, listing, parsed, result, document.fetched_at)
     return JobOutcome(
         state=JobState.SUCCEEDED,
         details={
@@ -263,8 +276,97 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
             "revision_id": None if result.revision_id is None else str(result.revision_id),
             "eligibility": None if result.eligibility_state is None else result.eligibility_state.value,
             "valuation_job_id": None if result.valuation_job_id is None else str(result.valuation_job_id),
+            "seller_evidence": seller_evidence,
         },
     )
+
+
+async def _seller_evidence(  # noqa: PLR0917 - private helper of handle_detail
+    ctx: RuntimeContext,
+    actor: ActorContext,
+    source: SourceRecord,
+    listing: ListingRecord,
+    parsed: ParsedListing,
+    result: IngestDetailResult,
+    observed_at: datetime,
+) -> str | None:
+    """Exact-ad seller/recipient/language evidence AFTER the detail commit (F1, wave D2).
+
+    Only for a listing page that produced a new current revision, or confirmed the unchanged
+    current one (a recheck re-verifies its evidence), never quarantined and without an identity
+    conflict; in its own transaction (`crawling.seller_evidence`).
+    """
+    contact = parsed.seller_contact
+    promoted = result.revision_id is not None and result.revision_number is not None
+    confirmed = result.outcome == PromotionOutcome.CONFIRM_UNCHANGED
+    if (
+        contact is None
+        or parsed.listing is None
+        or result.kind != "listing"
+        or not (promoted or confirmed)
+        or result.quarantined
+        or result.identity_conflict
+    ):
+        return None
+    return await record_seller_evidence(
+        ctx.db,
+        actor,
+        ctx.settings,
+        listing=listing,
+        source_key=source.source_key,
+        revision_id=result.revision_id if promoted else None,
+        revision_number=result.revision_number if promoted else None,
+        normalized=parsed.listing,
+        contact=contact,
+        observed_at=observed_at,
+    )
+
+
+async def _record_mk_evidence(  # noqa: PLR0917 - private helper of the commit
+    conn: Conn,
+    actor: ActorContext,
+    source: SourceRecord,
+    listing: ListingRecord,
+    parsed: ParsedListing,
+    document: RawDocument,
+    snapshot_id: UUID | None,
+    parser_version: str,
+) -> dict[str, Any]:
+    """One ``asking_price`` observation per new MK ad content (`crawling.mk_evidence`)."""
+    observation = mk_observation(
+        parsed,
+        workspace_id=actor.workspace_id,
+        listing_id=listing.id,
+        source_key=source.source_key,
+        canonical_url=listing.canonical_url,
+        observed_at=document.fetched_at,
+        is_fixture=listing.is_fixture,
+    )
+    if observation is None:
+        return {"listing_id": str(listing.id), "market_observation": "no_usable_price"}
+    known = await market_repo.get_market_observations(conn, actor, [observation.id])
+    created = False
+    if observation.id not in known:
+        _, created = await market_repo.insert_market_observation(
+            conn,
+            actor,
+            observation,
+            confidence="medium",
+            source_id=source.id,
+            listing_id=listing.id,
+            source_listing_id=listing.source_listing_id,
+            evidence={
+                "method": "mk_comparable_detail",
+                "parser_version": parser_version,
+                "raw_content_hash": document.raw_content_hash,
+            },
+            archived_snapshot_id=snapshot_id,
+        )
+    return {
+        "listing_id": str(listing.id),
+        "market_observation_id": str(observation.id),
+        "market_observation": "recorded" if created else "unchanged",
+    }
 
 
 async def _release_refused(

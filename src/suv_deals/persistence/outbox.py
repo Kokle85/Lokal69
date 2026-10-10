@@ -31,7 +31,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Final, Literal
@@ -335,7 +335,8 @@ def _resolve_event_id(event_id: UUID | None, payload: Mapping[str, Any]) -> UUID
 # It is NULL-SAFE (never NULL): ``jsonb_typeof(NULL) = 'string'`` is NULL for a payload without a
 # ``summary``, which used to make the whole OR NULL, so ``not {suspicious}`` excluded every such
 # row from the claim (it was neither leased nor refused: e.g. the category signals, whose payload
-# never carries a summary, had to be leased by a separate NULL-safe claim in the dispatcher).
+# never carries a summary, had to be leased by a separate NULL-safe claim in the dispatcher; that
+# duplicate was removed in D1 - the dispatcher now uses `claim_events(..., event_types=...)`).
 _SUSPICIOUS: Final = sql.SQL(
     "(o.is_fixture"
     " or (o.payload -> 'fixture' is not null"
@@ -380,6 +381,7 @@ with picked as (
     and o.attempts < o.max_attempts
     and o.available_at <= now()
     and not {suspicious}
+    and (%(types)s::text[] is null or o.event_type = any(%(types)s::text[]))
   order by o.available_at, o.id
   for update of o skip locked
   limit %(limit)s
@@ -477,12 +479,23 @@ def _fence(event: ClaimedEvent) -> dict[str, Any]:
 
 
 async def claim_events(
-    db: Database, workspace_id: UUID, dispatcher_id: str, lease_seconds: float, limit: int
+    db: Database,
+    workspace_id: UUID,
+    dispatcher_id: str,
+    lease_seconds: float,
+    limit: int,
+    *,
+    event_types: Collection[str] | None = None,
 ) -> list[ClaimedEvent]:
     """Lease up to ``limit`` due events (one short transaction, ``SKIP LOCKED``).
 
     Rows that look like fixtures are refused here and moved to ``blocked`` (``FIXTURE_EVENT``).
+    ``event_types`` restricts the lease to those types (the dispatcher leases the time-critical
+    category signals first); ``None`` leases any type.
     """
+    types = None if event_types is None else sorted(set(event_types))
+    if types is not None and not types:
+        raise ValidationFailed("event_types must name at least one type")
     if not isinstance(dispatcher_id, str) or not 1 <= len(dispatcher_id) <= 200:
         raise ValidationFailed("dispatcher_id must be 1-200 characters")
     if isinstance(lease_seconds, bool) or not 0.05 <= float(lease_seconds) <= 3600:
@@ -504,6 +517,7 @@ async def claim_events(
                 "lease": timedelta(seconds=float(lease_seconds)),
                 "limit": limit,
                 "fixture_prefix": prefix,
+                "types": types,
             },
         )
     events = [ClaimedEvent.model_validate(r) for r in rows]

@@ -156,7 +156,12 @@ classic Outlook (owner's PC) -> desktop worker (local correlation only)
   dashboard lists every reply. The cap and its effect are visible in
   `GET /api/mail-workers/health` (`reply_signals`) and on each reply (`signal_status`).
 - Delivery needs `ALLOW_EXTERNAL_NOTIFICATIONS=true`, `SELLER_REPLY_SIGNAL_PROVIDER=slack` and an
-  approved, enabled and verified Slack destination binding (docs/notification_bridge.md).
+  approved, enabled and verified Slack destination binding (docs/notification_bridge.md). The
+  dispatcher then needs `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID` and
+  `SLACK_DESTINATION_APPROVAL_REF` even when native MCP Events carry candidate discovery
+  (`suv-deals doctor --process dispatcher` reports them as required in that topology;
+  `SLACK_TEAM_ID` / `SLACK_BOT_USER_ID` are recommended). The route is gated by
+  `seller_reply_slack_route` (`ACTIVATION_GATES.md`).
 
 ### 6.3 What is verified and what is not
 

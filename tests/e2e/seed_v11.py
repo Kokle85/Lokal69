@@ -33,7 +33,12 @@ transport, the same path the desktop reply worker uses), exactly like the v1.1 A
   worker's heartbeat is moved 6 hours into the past afterwards: the owner's PC looks powered off,
   so the health view must show a coverage gap, never "monitoring".
 
-All listings are on one dedicated SYNTHETIC fixture source of the main workspace.
+All listings are on one dedicated SYNTHETIC source of the main workspace with REAL lineage
+(``tests.integration.v11_db.support.enabled_source``: a non-fixture source mode at ingest, so
+``app.listings.is_fixture = false`` and the inquiries reserve and dispatch like production ones;
+fixture lineage is refused by the reservation, the dispatch and the worker claim). Nothing is ever
+fetched from the synthetic host, and the E2E backend keeps ``SELLER_INQUIRY_MODE`` at its default,
+so its inquiry control reports the closed process gate (nothing can be sent).
 """
 
 from __future__ import annotations
@@ -76,6 +81,7 @@ from tests.integration.v11_inquiries.support import (
     World,
     alias,
     backdate,
+    complete_activation_canary,
     language_from,
     link,
     normalized,
@@ -235,10 +241,13 @@ async def _issue_worker(
 
 
 async def _retire_worker(db: Database, ws: UUID, sender_binding_id: UUID) -> UUID:
-    """An earlier desktop worker the owner revoked (e.g. an old PC): counted, never usable."""
+    """An earlier desktop worker the owner revoked (e.g. an old PC): counted, never usable. The
+    owner's activation canary ran on it before it was retired (F3/OPS-04, wave D2: nothing is
+    reserved without a completed canary of the current sender binding version)."""
     retired = await _issue_worker(
         db, ws, sender_binding_id, label=RETIRED_WORKER_LABEL, lifetime=timedelta(days=90)
     )
+    await complete_activation_canary(db, ws, sender_binding_id)
     actor = system(ws)
     async with unit_of_work(db, actor) as conn:
         revoked = await mail_workers_repo.revoke_mail_worker(
@@ -308,6 +317,9 @@ async def seed_v11(db: Database, seed: Seed, ws: UUID, now: datetime) -> dict[st
         workspace_id=ws, seed=seed, sender_binding_id=sender_binding_id, vehicle=vehicles["replied"]
     )
     actor = system(ws)
+    # One active mailbox per sender: the retired worker (which carried the owner's completed
+    # activation canary) is issued and revoked first.
+    retired_mailbox_id = await _retire_worker(db, ws, sender_binding_id)
     inquiries: dict[str, UUID] = {}
     replies: dict[str, UUID] = {}
     wait_codes: dict[str, str] = {}
@@ -326,8 +338,6 @@ async def seed_v11(db: Database, seed: Seed, ws: UUID, now: datetime) -> dict[st
         )
     inquiries["suppressed"] = suppressed.id
 
-    # One active mailbox per sender: the retired worker is issued and revoked first.
-    retired_mailbox_id = await _retire_worker(db, ws, sender_binding_id)
     async with mail_worker_api(db) as client:
         worker = await _issue_worker(
             db, ws, sender_binding_id, label=WORKER_LABEL, lifetime=ACTIVE_CREDENTIAL_LIFETIME

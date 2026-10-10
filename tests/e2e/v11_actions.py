@@ -8,6 +8,13 @@ not see: a resume the owner confirmed for the previous ``removable_suppressions`
 refused by the server (``409 VERSION_CONFLICT``, ``details.reason = suppressions_changed``).
 It prints the new removable count as JSON. Nothing is sent and nothing leaves 127.0.0.1.
 
+``add-listing-revision --listing KEY`` (spec 23 "new listing revision arriving before submit"; F8,
+wave D2) writes one new promoted detail observation and listing revision of the manifest's
+listing ``KEY`` (its current normalized document with a price EUR 25 lower and a fresh observation
+time), exactly as a detail recheck would leave them (`tests.integration.read_queries.dataset.
+add_revision`). A reviewer holding the listing's case then gets ``409 VERSION_CONFLICT`` on submit.
+It prints the new revision's id and number as JSON.
+
 Guards: the PostgreSQL admin URL (``TEST_DATABASE_ADMIN_URL``) must be loopback and the database
 must be an E2E database (``suv_e2e_<12 hex>``) named by the manifest ``run_backend.py`` wrote.
 """
@@ -31,10 +38,13 @@ import psycopg
 
 from suv_deals.api.inquiry_routes import removable_suppressions
 from suv_deals.domain.enums import SuppressionReason
+from suv_deals.domain.listings import NormalizedListing
 from suv_deals.persistence import inquiries_repo
 from suv_deals.persistence.database import Database, fetch_one
 from suv_deals.persistence.transactions import unit_of_work
 from tests.db_harness import admin_url
+from tests.integration.db.helpers import Seed
+from tests.integration.read_queries.dataset import add_revision
 from tests.integration.v11_inquiries.support import system
 
 REPO = Path(__file__).resolve().parents[2]
@@ -101,10 +111,38 @@ async def add_kill_switch_suppression(url: str, workspace_id: UUID, listing_id: 
         await db.close()
 
 
+#: The price change of the SYNTHETIC new revision (EUR 25, in minor units).
+REVISION_PRICE_STEP_MINOR = 2_500
+
+
+def add_listing_revision(url: str, workspace_id: UUID, listing_id: UUID) -> dict[str, Any]:
+    """One new promoted revision of ``listing_id`` (the next revision number, a changed price)."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        seed = Seed(conn)
+        row = conn.execute(
+            "select r.revision_number, r.normalized from app.listings l"
+            " join app.listing_revisions r on r.workspace_id = l.workspace_id"
+            " and r.id = l.current_revision_id where l.workspace_id = %s and l.id = %s",
+            (workspace_id, listing_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("the listing has no current revision")
+        number, document = int(row[0]), NormalizedListing.model_validate(row[1])
+        observed = conn.execute("select now()").fetchone()
+        assert observed is not None and document.price.amount_minor is not None
+        price = document.price.model_copy(
+            update={"amount_minor": document.price.amount_minor - REVISION_PRICE_STEP_MINOR}
+        )
+        changed = document.model_copy(update={"price": price, "observed_at": observed[0]})
+        revision_id = add_revision(seed, workspace_id, listing_id, number + 1, changed)
+    return {"revision_id": str(revision_id), "revision_number": number + 1}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TEST-ONLY actions on the SYNTHETIC E2E database")
-    parser.add_argument("action", choices=["add-kill-switch-suppression"])
+    parser.add_argument("action", choices=["add-kill-switch-suppression", "add-listing-revision"])
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--listing", default="hotel", help="manifest listing key (add-listing-revision)")
     args = parser.parse_args(argv)
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     if manifest.get("synthetic") is not True:
@@ -114,11 +152,16 @@ def main(argv: list[str] | None = None) -> int:
         url = database_url(dbname)
     except ValueError as exc:
         parser.error(str(exc))
-    result = asyncio.run(
-        add_kill_switch_suppression(
-            url, UUID(manifest["workspace_id"]), UUID(manifest["listings"]["rejected"])
+    workspace_id = UUID(manifest["workspace_id"])
+    if args.action == "add-listing-revision":
+        listings: dict[str, str] = manifest["listings"]
+        if args.listing not in listings:
+            parser.error(f"unknown manifest listing: {args.listing}")
+        result = add_listing_revision(url, workspace_id, UUID(listings[args.listing]))
+    else:
+        result = asyncio.run(
+            add_kill_switch_suppression(url, workspace_id, UUID(manifest["listings"]["rejected"]))
         )
-    )
     print(json.dumps(result), flush=True)
     return 0
 

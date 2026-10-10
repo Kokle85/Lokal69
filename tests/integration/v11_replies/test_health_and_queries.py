@@ -488,6 +488,44 @@ async def test_a_healthy_worker_is_reported_as_monitoring(db: Database, iw: Inqu
     assert report.heartbeat_status == "healthy" and report.reconciliation_status == "healthy"
 
 
+@pytest.mark.parametrize("dead", ["expired", "revoked"])
+async def test_a_dead_worker_credential_ends_monitoring_while_the_heartbeat_is_fresh(
+    db: Database, seed: Seed, iw: InquiryWorld, dead: str
+) -> None:
+    """D1 item 2 (spec 37.10: never imply monitoring that is not happening): the worker's last
+    heartbeat is still fresh, but its credential has expired (or was revoked underneath the still
+    active binding): it can no longer upload a reply, so the mailbox is NOT monitoring, in the
+    repository health, the dashboard/MCP health view and everything derived from them (``doctor``,
+    ``inquiries status``, ``mail-worker list``)."""
+    mw = await issue(db, iw)
+    await heartbeat(db, mw, beat(mw))
+    assert (await health(db, mw)).monitoring_active
+    # TEST ARRANGEMENT ONLY: the bound credential dies right after the (still fresh) heartbeat.
+    with seed.conn.transaction():
+        seed.conn.execute("set local session_replication_role = replica")
+        if dead == "expired":
+            seed.conn.execute(
+                "update ops.api_credentials set created_at = now() - interval '2 days',"
+                " expires_at = now() - interval '1 second' where id = %s",
+                (mw.worker.credential_id,),
+            )
+        else:
+            seed.conn.execute(
+                "update ops.api_credentials set revoked_at = now(), revoked_by = created_by,"
+                " revoke_reason = 'synthetic revocation' where id = %s",
+                (mw.worker.credential_id,),
+            )
+    report = await health(db, mw)
+    assert report.binding_state == "active" and report.heartbeat_status == "healthy"
+    assert not report.monitoring_active
+    assert mail_workers_repo.CREDENTIAL_NOT_LIVE in report.reasons
+    async with unit_of_work(db, reviewer(iw.workspace_id)) as conn:
+        view = await queries.mail_worker_health_view(conn, reviewer(iw.workspace_id))
+    (box,) = view.data.mailboxes
+    assert not box.monitoring_active and not view.data.any_monitoring_active
+    assert WarningCode.COVERAGE_GAP in {w.code for w in view.warnings}
+
+
 async def test_an_open_gap_is_never_evicted_by_newer_closed_gaps(
     db: Database, seed: Seed, iw: InquiryWorld
 ) -> None:

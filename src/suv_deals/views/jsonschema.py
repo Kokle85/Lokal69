@@ -7,7 +7,8 @@ published schemas are self-contained (clients need not resolve references), so:
 2. ``collapse_nullable`` rewrites ``anyOf [{type: X, ...}, {type: null}]`` to
    ``{type: [X, "null"], ...}`` (the spec 21 notation);
 3. ``close_objects`` sets ``additionalProperties: false`` on every object schema that does not
-   declare one (maps keep their value schema);
+   declare one (maps keep their value schema; ``if``/``then``/``else`` subschemas constrain the
+   enclosing object and stay as written);
 4. ``strip_titles`` removes generated ``title`` keywords except on object schemas.
 
 Only schema positions are walked; ``default``/``enum``/``const``/``examples`` values are data and
@@ -146,11 +147,31 @@ def _is_object(node: Schema) -> bool:
     return "properties" in node or kind == "object" or (isinstance(kind, list) and "object" in kind)
 
 
-def close_objects(schema: Schema) -> Schema:
-    """Set ``additionalProperties: false`` on object schemas that do not declare it."""
+#: Conditional applicators: their subschemas constrain the ENCLOSING object (the same instance),
+#: so they are never closed on their own (a closed ``if`` would be false for every real body).
+_CONDITIONAL_KEYWORDS: Final = ("if", "then", "else")
+
+
+def _conditional_nodes(schema: Schema) -> set[int]:
+    found: set[int] = set()
 
     def visit(node: Schema) -> None:
-        if _is_object(node) and "additionalProperties" not in node:
+        for key in _CONDITIONAL_KEYWORDS:
+            sub = node.get(key)
+            if isinstance(sub, dict):
+                found.add(id(sub))
+
+    walk(schema, visit)
+    return found
+
+
+def close_objects(schema: Schema) -> Schema:
+    """Set ``additionalProperties: false`` on object schemas that do not declare it (``if`` /
+    ``then`` / ``else`` subschemas excepted: they constrain the enclosing, closed object)."""
+    conditional = _conditional_nodes(schema)
+
+    def visit(node: Schema) -> None:
+        if id(node) not in conditional and _is_object(node) and "additionalProperties" not in node:
             node["additionalProperties"] = False
 
     walk(schema, visit)
@@ -185,11 +206,13 @@ def find_refs(schema: Schema) -> list[str]:
 
 
 def open_objects(schema: Schema) -> list[Schema]:
-    """Object schemas that allow undeclared properties (for contract tests)."""
+    """Object schemas that allow undeclared properties (for contract tests; ``if`` / ``then`` /
+    ``else`` subschemas constrain their enclosing object and are not objects of their own)."""
     found: list[Schema] = []
+    conditional = _conditional_nodes(schema)
 
     def visit(node: Schema) -> None:
-        if _is_object(node) and node.get("additionalProperties") is not False:
+        if id(node) not in conditional and _is_object(node) and node.get("additionalProperties") is not False:
             found.append(node)
 
     walk(schema, visit)

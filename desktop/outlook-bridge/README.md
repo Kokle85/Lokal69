@@ -98,7 +98,7 @@ the mailbox synchronising for timely detection; every other interval is a report
 | `GET /v1/mail-workers/inquiry-bindings?cursor=&limit=100` | spec 37.8 (normative) |
 | `POST /v1/mail-workers/replies` (+ `Idempotency-Key`) | spec 37.8 (normative), v1.0 JSON |
 | `GET /v1/mail-workers/send-intents?limit=` | served (`api.mail_worker_routes`); pending intents plus reaped, never-claimed ones flagged `expired: true` (refused locally as `intent_expired`, without a claim, so the backend can reconcile the inquiry) |
-| `POST /v1/mail-workers/send-intents/{id}/claim` | served: revalidation immediately before `.Send`; every claim carries a new `claim_attempt_id` (and Idempotency-Key) and is evaluated fresh, never answered from an idempotency replay. Refusals: `kill_switch` (reported as a retryable pre-submission refusal), `not_now` (rolling caps, seller cooldown, source pause: nothing is reported, the intent waits and is claimed again after 10 minutes while valid), or a final reason |
+| `POST /v1/mail-workers/send-intents/{id}/claim` | served: revalidation immediately before `.Send`; every claim carries a new `claim_attempt_id` (and Idempotency-Key) and is evaluated fresh, never answered from an idempotency replay. Refusals: `kill_switch` (reported as a retryable pre-submission refusal), `not_now` (rolling caps, seller cooldown, source pause: nothing is reported, the intent waits and is claimed again after 10 minutes while valid), or a final reason. The claim's `worker_id` is `<worker_id>.<store instance id>`: the instance id is random, written once when the local SQLite store is created, so a reinstall, a wiped store or a second `data_dir` claims as a different worker, and the backend grants a running intent to ONE worker id only (`intent_invalid` / `ALREADY_CLAIMED` for any other; that intent is then held `uncertain`, never resent). Choose a `worker_id` that starts with a letter |
 | `POST /v1/mail-workers/send-intents/{id}/report` | served: `OutlookSendReport` mirror (`Idempotency-Key: report-<intent>-<state>`); the observed Internet Message-ID of the sent copy is published back in the binding so replies to a rewritten header still correlate |
 | `POST /v1/mail-workers/heartbeat` | served: health, checkpoints, gaps (a gap never ends before it starts); answer carries Slack/MCP health |
 | `POST /v1/mail-workers/account-report` | served: `OutlookAccountReport` mirror (`security_settings_unchanged` is always `true`); a refused report is `409` |
@@ -179,10 +179,21 @@ follow-up.
    `HKCU\Software\Microsoft\Office\16.0\Outlook\Preferences\UseNewOutlook` - re-verify on the machine.
 2. `reconcile-once --dry-run` resolves the configured account and folders and shows plausible counts.
 3. With the backend endpoints deployed, `reconcile-once` then `run`; verify heartbeats, checkpoints
-   and gaps in the backend, and a correlated owner-controlled test reply through
-   Outlook -> backend -> Slack -> dot -> MCP (a synthetic canary is not a seller inquiry).
-4. For `outlook_local` sending: one authorised test message to an owner-controlled address; verify
-   Outbox -> Sent Items evidence for the account type actually used.
+   and gaps in the backend.
+4. For `outlook_local` sending, the activation canary (docs/seller_email_activation.md section 8;
+   the owner's one-time step): put the owner-controlled test address in `config.toml` as
+   `canary_target_address` (never the sending account itself; the backend keeps only its SHA-256,
+   and the worker sends a canary only to an address with exactly that hash) and keep
+   `send_intents_enabled = true`. After the owner's `suv-deals canary send`, the worker lists the
+   canary (`GET /v1/mail-workers/canary-intents`), claims it once, sends the fixed canary text once
+   and reports Outbox -> Sent Items evidence. It refuses before any `.Send` (and reports it) when the
+   target is missing, differs or is the sending account, the canary names another mailbox or
+   account, or its window ended; the kill switch only defers it. Reply to the canary from the test
+   mailbox: the worker uploads only that reply's headers and the sender's SHA-256 for a canary it
+   sent itself (`POST /v1/mail-workers/canary-intents/{id}/reply`); `suv-deals canary status` then
+   shows `complete`. A canary is never a seller inquiry and its reply never a seller reply, so the
+   Slack -> dot -> MCP leg is verified separately (gate `seller_reply_slack_route`). Comment
+   `canary_target_address` out again afterwards.
 
 Unverified until activation (UNKNOWN, not assumed): whether Outlook keeps a Message-ID set through
 `PropertyAccessor` on an unsent item for the account type in use (the worker then observes the

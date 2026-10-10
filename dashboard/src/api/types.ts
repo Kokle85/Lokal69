@@ -1958,6 +1958,69 @@ export interface InquiryControlView {
   sender_binding_version: number | null
   /** Why the configured sender is not ready (codes only, never an address). */
   sender_problems: string[]
+  /**
+   * The PROCESS-level gate of the serving backend (`SELLER_INQUIRY_MODE`; `null` when the server
+   * did not report it). Both this and the database `mode` must be `automatic`.
+   */
+  process_mode: InquiryMode | null
+  /** `SELLER_INQUIRY_KILL_SWITCH` of the serving backend (`null`: not reported). */
+  process_kill_switch: boolean | null
+  /** The owner's `SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL` setting: it disables automatic sending. */
+  process_message_approval_required: boolean | null
+  /** Why the process-level gate is closed (empty: open). */
+  process_blockers: ProcessBlocker[]
+  /**
+   * A correlated test reply (activation canary `reply_correlated`) exists for the configured sender
+   * binding's CURRENT version. Until then the server refuses every real seller inquiry at
+   * reservation (`activation_canary_incomplete`).
+   */
+  activation_canary_complete: boolean
+  /**
+   * `true` only while EVERY gate is open (process gate, database mode and kill switch,
+   * authorization, configured sender and its completed activation canary) and both rolling caps
+   * leave room now (a cap of 0 holds every inquiry). Never a claim that anything was or will be sent.
+   */
+  automatic_inquiries_possible: boolean
+}
+
+export type ProcessBlocker = 'SELLER_INQUIRY_MODE_NOT_AUTOMATIC' | 'SELLER_INQUIRY_KILL_SWITCH_ON' | 'MESSAGE_APPROVAL_SETTING_ON'
+
+/** Activation-canary evidence state of the configured sender (`GET /api/activation/canary-evidence`). */
+export type CanaryEvidenceState =
+  | 'complete'
+  | 'prepared'
+  | 'accepted'
+  | 'uncertain'
+  | 'failed'
+  | 'cancelled'
+  | 'stale'
+  | 'none'
+  | 'no_sender'
+
+export type CanaryState = 'prepared' | 'accepted' | 'uncertain' | 'failed' | 'reply_correlated' | 'cancelled'
+
+/** One owner-controlled activation canary: ids, state and times only (never the target or its hash). */
+export interface ActivationCanaryView {
+  id: Uuid
+  provider: EmailProviderKind
+  sender_binding_version: number
+  /** Bound to the configured sender binding's CURRENT version (older ones are stale). */
+  current_sender_version: boolean
+  state: CanaryState
+  created_at: DateTimeString
+  outcome_recorded_at: DateTimeString | null
+  accepted_at: DateTimeString | null
+  reply_recorded_at: DateTimeString | null
+}
+
+/** `GET /api/activation/canary-evidence` (owner only, read-only): activation rows 4-6. */
+export interface CanaryEvidenceView {
+  evidence: CanaryEvidenceState
+  detail: string
+  sender_provider: EmailProviderKind | null
+  sender_binding_version: number | null
+  canaries: ActivationCanaryView[]
+  notes: string[]
 }
 
 export interface InquiryPauseResult {
@@ -2342,9 +2405,10 @@ export interface InquiryResumeRequest {
   /** Also remove the active kill-switch / authorization-revoked suppressions (each audited). */
   remove_suppressions?: boolean
   /**
-   * With `remove_suppressions`: the `removable_suppressions` count the owner was shown and
-   * confirmed. A different current count refuses the WHOLE resume (`409 VERSION_CONFLICT`,
-   * `details.reason = suppressions_changed`), so only the suppressions the owner saw are removed.
+   * REQUIRED with `remove_suppressions: true` (the server answers `422` without it): the
+   * `removable_suppressions` count the owner was shown and confirmed. A different current count
+   * refuses the WHOLE resume (`409 VERSION_CONFLICT`, `details.reason = suppressions_changed`), so
+   * only the suppressions the owner saw are removed.
    */
   expected_removable_suppressions?: number
 }

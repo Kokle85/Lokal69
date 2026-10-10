@@ -146,6 +146,27 @@ export function addKillSwitchSuppression(): number {
 }
 
 /**
+ * A new revision of a SYNTHETIC listing arrives while a reviewer holds its case (TEST ONLY; spec 23
+ * "new listing revision arriving before submit"): `tests/e2e/v11_actions.py add-listing-revision`
+ * writes a promoted detail observation and revision (a changed price) into the running backend's
+ * SYNTHETIC database (loopback E2E databases only).
+ */
+export function addListingRevision(key: string): { revision_id: string; revision_number: number } {
+  const output = execFileSync('uv', ['run', '--quiet', 'python', 'tests/e2e/v11_actions.py', 'add-listing-revision', '--listing', key], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: 120_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const last = output.trim().split('\n').at(-1) ?? '{}'
+  const result = JSON.parse(last) as { revision_id?: string; revision_number?: number }
+  if (typeof result.revision_id !== 'string' || typeof result.revision_number !== 'number') {
+    throw new Error(`the SYNTHETIC listing revision was not added: ${last}`)
+  }
+  return { revision_id: result.revision_id, revision_number: result.revision_number }
+}
+
+/**
  * Spec 37.1 (standing authorization): no button or link anywhere offers to approve, send, resend or
  * answer a seller message.
  */

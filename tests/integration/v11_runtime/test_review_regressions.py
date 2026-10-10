@@ -30,6 +30,7 @@ from uuid import UUID
 
 import pytest
 from tests.integration.pipeline.support import PipelineEnv, run
+from tests.integration.v11_inquiries.support import complete_activation_canary
 from tests.integration.v11_runtime.support import (
     LIVE_KEY,
     WORKER_REQ,
@@ -50,6 +51,7 @@ from tests.integration.v11_runtime.support import (
     prepare_sender,
     runtime_settings,
     seller_replies,
+    show_seller_email,
     with_settings,
     work,
 )
@@ -77,12 +79,17 @@ def _row(env: PipelineEnv, query: str, *params: Any) -> dict[str, Any]:
     return rows[0]
 
 
-async def _queued(env: PipelineEnv, **sender_options: Any) -> tuple[Any, dict[str, Any]]:
+async def _queued(
+    env: PipelineEnv, *, page_contact: bool = False, **sender_options: Any
+) -> tuple[Any, dict[str, Any]]:
     """A verified sender, the eligible real-lineage listing with its seller, valuation + plan
-    only: one reserved and queued inquiry whose send job waits."""
+    only: one reserved and queued inquiry whose send job waits. ``page_contact``: the dealer's
+    page itself shows the e-mail address, so the detail pipeline records the verified contact
+    (and every re-fetch re-verifies it) instead of the test arrangement `link_seller`."""
     sender = await prepare_sender(env, **sender_options)
     listing = await eligible_live_listing(env)
-    await link_seller(env, listing)
+    if not page_contact:
+        await link_seller(env, listing)
     await work(env, JobType.VALUATION, JobType.SELLER_INQUIRY_PLAN)
     [inquiry] = inquiries_of(env)
     assert inquiry["state"] == InquiryState.QUEUED and debits_of(env) == 1
@@ -104,7 +111,10 @@ class _Recheck:
 async def test_price_change_while_queued_reserves_the_current_revision(
     env: PipelineEnv, tmp_path: Path
 ) -> None:
-    await _queued(env)
+    # The page shows the seller's address: the recheck's re-fetch re-verifies the same contact
+    # (wave D2; a contact-form page would now record the seller's e-mail as unavailable).
+    show_seller_email(tmp_path)
+    await _queued(env, page_contact=True)
     [listing] = env.rows(
         "select id, current_revision_id from app.listings where workspace_id = %s"
         " and source_listing_id = 'TEST-204'",
@@ -178,6 +188,17 @@ async def test_sender_reverification_cancellation_is_decided_again(env: Pipeline
     [inquiry] = inquiries_of(env)
     assert inquiry["state"] == InquiryState.CANCELLED and debits_of(env) == 0
 
+    # The new binding version has no activation evidence yet (F3/OPS-04, wave D2): decided again,
+    # nothing reserved, the named reason recorded.
+    report = await Reconciler(env.ctx).reconcile_workspace(env.workspace_id)
+    assert report.inquiry_replan_jobs == 1 and report.errors == []
+    reports = await work(env)
+    plans = [r for r in reports if r.job_type == JobType.SELLER_INQUIRY_PLAN]
+    assert [r.code for r in plans] == ["readiness_recorded"], plans
+    assert plans[0].details["reservation"] == "activation_canary_incomplete"
+    assert debits_of(env) == 0
+    # The owner's canary for the new version completes: the next pass reserves.
+    await complete_activation_canary(env.ctx.db, env.workspace_id, sender.binding_id)
     report = await Reconciler(env.ctx).reconcile_workspace(env.workspace_id)
     assert report.inquiry_replan_jobs == 1 and report.errors == []
     reports = await work(env)

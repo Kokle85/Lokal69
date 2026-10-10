@@ -23,6 +23,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
+from suv_deals.domain.canary import (
+    CanaryClaimDecision,
+    CanaryIntent,
+    CanaryIntentBatch,
+    CanaryReplyReport,
+    CanaryReport,
+)
 from suv_deals.domain.enums import ReplyMessageType
 from suv_deals.domain.listings import sha256_json
 from suv_deals.domain.replies import ReplyIngestRequest, canonical_address, normalize_message_id
@@ -528,6 +535,35 @@ class HeartbeatAck(BaseModel):
         }
 
 
+# =============================================================================================
+# Activation canaries (outlook_local transport; F3, wave D2)
+# =============================================================================================
+#
+# The canary wire models are the shared pure domain models themselves (``suv_deals.domain.canary``:
+# the fixed canary rendering, Message-ID and target hash are defined once for both sides).
+
+WorkerCanaryIntent = CanaryIntent
+CanaryBatch = CanaryIntentBatch
+CanaryDecision = CanaryClaimDecision
+WorkerCanaryReport = CanaryReport
+CanaryReplyUpload = CanaryReplyReport
+
+
+def canary_intent_problems(intent: CanaryIntent) -> tuple[str, ...]:
+    """Local checks of a canary before ``MailItem.Send`` (codes only; the fixed text, its hash
+    and the Message-ID are already proven by the model): plain canonical sender/Reply-To
+    addresses and a display name without control characters or markup."""
+    problems: list[str] = []
+    if _SUBJECT_FORBIDDEN_RE.search(intent.from_display_name) or _MARKUP_RE.search(intent.from_display_name):
+        problems.append("HEADER_INJECTION")
+    for address in (intent.from_address, intent.reply_to_address):
+        if address is not None and not _plain_address(address):
+            problems.append("ADDRESS_NOT_CANONICAL")
+    if normalize_message_id(intent.rfc_message_id) != intent.rfc_message_id:
+        problems.append("MESSAGE_ID_INVALID")
+    return tuple(dict.fromkeys(problems))
+
+
 __all__ = [
     "DELIVERY_REPORT_TYPES",
     "MAX_INTENT_BODY_CHARS",
@@ -535,6 +571,9 @@ __all__ = [
     "MAX_RETURNED_MESSAGE_IDS",
     "WIRE_SCHEMA_VERSION",
     "AccountType",
+    "CanaryBatch",
+    "CanaryDecision",
+    "CanaryReplyUpload",
     "CheckpointReport",
     "ClaimDecision",
     "FolderRoleWire",
@@ -547,9 +586,12 @@ __all__ = [
     "SubmissionState",
     "Tristate",
     "WorkerAccountReport",
+    "WorkerCanaryIntent",
+    "WorkerCanaryReport",
     "WorkerHeartbeat",
     "WorkerSendIntent",
     "WorkerSendReport",
+    "canary_intent_problems",
     "canonical_message",
     "intent_integrity_problems",
     "is_own_message_id_format",

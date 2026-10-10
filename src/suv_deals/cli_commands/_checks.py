@@ -95,6 +95,16 @@ def _slack(s: Settings) -> bool:
     return s.notification_provider == "slack" or s.event_bridge_provider == "slack"
 
 
+def _reply_signals(s: Settings) -> bool:
+    """Seller-reply signals go to the private Slack channel (spec 37.6; the owner's route),
+    independently of the candidate-discovery route (``slack.signal_send_blockers``)."""
+    return s.allow_external_notifications and s.seller_reply_signal_provider == "slack"
+
+
+def _slack_any(s: Settings) -> bool:
+    return _slack(s) or _reply_signals(s)
+
+
 def _events(s: Settings) -> bool:
     return s.mcp_events_enabled or s.event_bridge_provider == "mcp_events"
 
@@ -103,6 +113,10 @@ def _production(s: Settings) -> bool:
     return s.app_env == "production"
 
 
+_SLACK_WHEN: Final = (
+    "Slack is the candidate route or seller-reply signals use Slack "
+    "(ALLOW_EXTERNAL_NOTIFICATIONS=true and SELLER_REPLY_SIGNAL_PROVIDER=slack)"
+)
 _DB: Final = Requirement("database_url", "required", "PostgreSQL/Supabase connection (server-side secret)")
 _ROLE: Final = Requirement(
     "database_set_role", "recommended", "SET ROLE suv_backend on every connection (ADR 0001)"
@@ -176,15 +190,43 @@ PROCESS_REQUIREMENTS: Final[dict[str, tuple[Requirement, ...]]] = {
         _DB,
         _ROLE,
         Requirement("app_base_url", "required", "dashboard links in notifications"),
-        Requirement("slack_bot_token", "required", "Slack fallback", _slack, "Slack route selected"),
-        Requirement("slack_signing_secret", "required", "Slack fallback", _slack, "Slack route selected"),
-        Requirement("slack_channel_id", "required", "Slack fallback", _slack, "Slack route selected"),
+        Requirement(
+            "slack_bot_token", "required", "Slack fallback / seller-reply signal", _slack_any, _SLACK_WHEN
+        ),
+        Requirement(
+            "slack_signing_secret",
+            "required",
+            "Slack fallback / seller-reply signal",
+            _slack_any,
+            _SLACK_WHEN,
+        ),
+        Requirement(
+            "slack_channel_id",
+            "required",
+            "the private Slack channel (seller-reply signal)",
+            _slack_any,
+            _SLACK_WHEN,
+        ),
         Requirement(
             "slack_destination_approval_ref",
             "required",
-            "approved destination",
-            _slack,
-            "Slack route selected",
+            "approved destination (seller-reply signal)",
+            _slack_any,
+            _SLACK_WHEN,
+        ),
+        Requirement(
+            "slack_team_id",
+            "recommended",
+            "workspace pinning of the Slack seller-reply route",
+            _slack_any,
+            _SLACK_WHEN,
+        ),
+        Requirement(
+            "slack_bot_user_id",
+            "recommended",
+            "own-message loop protection (the bot's user id)",
+            _slack_any,
+            _SLACK_WHEN,
         ),
         Requirement(
             "mcp_event_subscription_secret_encryption_key",

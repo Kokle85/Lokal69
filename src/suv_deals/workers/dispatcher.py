@@ -90,14 +90,12 @@ from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
 import anyio
-from psycopg import sql
 from pydantic import ValidationError
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Availability, EligibilityState, OutboxState, ReviewState, ValuationState
 from suv_deals.domain.notifications import (
-    FIXTURE_SUMMARY_PREFIX,
     SELLER_REPLY_OWNER_ALERT_EVENT_TYPE,
     QuietHours,
     Urgency,
@@ -115,15 +113,16 @@ from suv_deals.persistence import (
     bindings_repo,
     listings_repo,
     outbox,
+    replies_repo,
     reviews_repo,
     sources_repo,
     subscriptions_repo,
     valuation_repo,
 )
 from suv_deals.persistence.bindings_repo import ActivationRouteSelection, DestinationBinding, EventCategory
-from suv_deals.persistence.database import Conn, Database, db_now, fetch_all, fetch_one
-from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
-from suv_deals.persistence.outbox import OUTBOX_COLUMNS, ClaimedEvent, DeliveryOutcome, OutboxRecord
+from suv_deals.persistence.database import Conn, db_now, fetch_one
+from suv_deals.persistence.errors_map import LeaseLost
+from suv_deals.persistence.outbox import ClaimedEvent, DeliveryOutcome, OutboxRecord
 from suv_deals.persistence.subscriptions_repo import ClaimedDelivery, DeliveryRecord, SubscriptionRecord
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
@@ -221,6 +220,8 @@ class DispatcherOptions:
     delivery_max_attempts: int = 5
     idle_poll_seconds: float = 10.0
     reconcile_limit: int = 50
+    #: Inquiries checked per cycle for replies muted by a dead or cancelled signal (D1 item 4).
+    reemit_per_cycle: int = 20
 
     def __post_init__(self) -> None:
         batch_seconds = self.deliveries_per_claim * eb.DEFAULT_RETRY_POLICY.request_timeout_s
@@ -255,6 +256,8 @@ class DispatchReport:
     events: list[EventResult] = field(default_factory=list)
     deliveries: list[DeliveryResult] = field(default_factory=list)
     reconciled: list[tuple[UUID, str]] = field(default_factory=list)
+    #: D1 item 4: signals re-emitted for replies muted by a dead or cancelled signal.
+    reemitted_signals: list[UUID] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,66 +450,6 @@ async def revalidate_signal(
         raise StaleEvent(SOURCE_ALERTS_PAUSED)
 
 
-# The lease of `outbox.claim_events` for the category signals, with a NULL-safe fixture test.
-# `outbox.claim_events` evaluates its "looks like a fixture" predicate to NULL for a payload
-# without a ``summary`` (``jsonb_typeof(NULL) = 'string'`` is NULL), so a signal payload -- which
-# never carries a summary -- is neither leased nor refused there (see the foundation change
-# request). Same lease columns and semantics; fixture rows (flag, ``fixture`` marker, fixture
-# summary) are never leased here either.
-_SIGNAL_CLAIM_SQL: Final = sql.SQL(
-    """
-with picked as (
-  select o.id
-    from ops.outbox o
-   where o.workspace_id = %(workspace_id)s
-     and o.event_type = any(%(types)s)
-     and o.state in ('pending', 'retry_wait')
-     and not o.is_fixture
-     and o.attempts < o.max_attempts
-     and o.available_at <= now()
-     and coalesce(o.payload -> 'fixture', 'false'::jsonb) in ('false'::jsonb, 'null'::jsonb)
-     and not coalesce(pg_catalog.jsonb_typeof(o.payload -> 'summary') = 'string'
-                      and pg_catalog.starts_with(pg_catalog.upper(pg_catalog.regexp_replace(
-                            o.payload ->> 'summary', '^[[:space:]]+', '')), %(fixture_prefix)s), false)
-   order by o.available_at, o.id
-   for update of o skip locked
-   limit %(limit)s
-)
-update ops.outbox o
-   set state = 'sending',
-       lease_owner = %(owner)s,
-       lease_token = gen_random_uuid(),
-       lease_expires_at = now() + %(lease)s::interval,
-       last_heartbeat_at = now(),
-       attempts = o.attempts + 1
-  from picked
- where o.id = picked.id
-   and o.workspace_id = %(workspace_id)s
-returning {columns}
-"""
-).format(columns=sql.SQL(", ").join(sql.Identifier("o", c) for c in OUTBOX_COLUMNS))
-
-
-async def claim_signal_events(
-    db: Database, workspace_id: UUID, dispatcher_id: str, lease_seconds: float, limit: int
-) -> list[ClaimedEvent]:
-    """Lease up to ``limit`` due category-signal events (one short transaction, SKIP LOCKED)."""
-    async with mapped_errors(), db.transaction(workspace_id=workspace_id) as conn, mapped_errors():
-        rows = await fetch_all(
-            conn,
-            _SIGNAL_CLAIM_SQL,
-            {
-                "workspace_id": workspace_id,
-                "types": sorted(SIGNAL_EVENTS),
-                "owner": dispatcher_id,
-                "lease": timedelta(seconds=float(lease_seconds)),
-                "limit": limit,
-                "fixture_prefix": FIXTURE_SUMMARY_PREFIX.upper(),
-            },
-        )
-    return sorted((ClaimedEvent.model_validate(r) for r in rows), key=lambda e: (e.available_at, e.id))
-
-
 class Dispatcher:
     """One dispatcher process. ``run_workspace`` handles one workspace once (tests, CLI)."""
 
@@ -590,10 +533,15 @@ class Dispatcher:
         selected, refusal = self.selection()
         for _ in range(self.options.events_per_cycle):
             # Category signals first (a seller reply is time-critical and rare: at most a few per
-            # day under the inquiry caps); the generic claim cannot lease them (see
-            # `claim_signal_events`) and also refuses fixture rows into ``blocked``.
-            claimed = await claim_signal_events(
-                self.ctx.db, workspace_id, self.dispatcher_id, self.options.outbox_lease_seconds, 1
+            # day under the inquiry caps). The same lease as every event (its NULL-safe fixture
+            # test refuses fixture rows into ``blocked``), restricted to the signal types.
+            claimed = await outbox.claim_events(
+                self.ctx.db,
+                workspace_id,
+                self.dispatcher_id,
+                self.options.outbox_lease_seconds,
+                1,
+                event_types=SIGNAL_EVENTS,
             )
             if not claimed:
                 claimed = await outbox.claim_events(
@@ -607,8 +555,45 @@ class Dispatcher:
         if selected is not None and selected.route is eb.ActivationRoute.MCP_EVENTS:
             await self._deliver_due(actor, report, None, selected)
         await self._follow_up_uncertain(actor, report, selected)
+        await self._reemit_muted_signals(actor, report)
         await self._record_stats(actor)
         return report
+
+    async def _reemit_muted_signals(self, actor: ActorContext, report: DispatchReport) -> None:
+        """D1 item 4: a ``seller.reply.received`` signal that ended ``dead_letter`` or
+        ``cancelled`` after newer replies were coalesced into it never posts, so dot would never
+        hear of those replies. Re-emit ONE new signal per such inquiry (bounded by
+        ``MAX_SIGNALS_PER_INQUIRY_24H``; `replies_repo.reemit_muted_signal`), one short transaction
+        each; it is dispatched like any signal in a later pass. Covers every path that ends a
+        signal (this dispatcher, the reaper's exhausted leases, an operator)."""
+
+        async def candidates() -> list[UUID]:
+            async with unit_of_work(self.ctx.db, actor) as conn:
+                return await replies_repo.muted_signal_inquiries(
+                    conn, actor, limit=self.options.reemit_per_cycle
+                )
+
+        try:
+            muted = await retry_transient(candidates)
+        except AppError as exc:
+            logger.warning("muted reply signals not checked", extra={"error_code": exc.code.value})
+            return
+        for inquiry_id in muted:
+
+            async def once(inquiry: UUID = inquiry_id) -> UUID | None:
+                async with unit_of_work(self.ctx.db, actor) as conn:
+                    return await replies_repo.reemit_muted_signal(
+                        conn, actor, inquiry, dashboard_base_url=self.ctx.dashboard_base_url
+                    )
+
+            try:
+                event_id = await retry_transient(once)
+            except AppError as exc:
+                logger.warning("reply signal not re-emitted", extra={"error_code": exc.code.value})
+                continue
+            if event_id is not None:
+                report.reemitted_signals.append(event_id)
+                logger.info("reply signal re-emitted", extra={"event_id": str(event_id)})
 
     # ------------------------------------------------------------------ one event
 
@@ -1492,7 +1477,6 @@ __all__ = [
     "DispatcherOptions",
     "EventResult",
     "StaleEvent",
-    "claim_signal_events",
     "default_dispatcher_id",
     "revalidate",
     "revalidate_signal",

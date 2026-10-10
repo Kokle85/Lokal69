@@ -32,11 +32,17 @@ async def db(db_url: str) -> AsyncIterator[Database]:
         await database.close()
 
 
-@pytest.fixture
-async def world(db: Database, seed: Seed) -> World:
-    return await build_world(db, seed, "B1a inquiries A")
+def _arranged_canary(request: pytest.FixtureRequest) -> bool:
+    """A completed activation canary is arranged (F3/OPS-04: nothing is reserved without it)
+    unless the test counts canaries itself (``@pytest.mark.no_arranged_canary``)."""
+    return request.node.get_closest_marker("no_arranged_canary") is None
 
 
 @pytest.fixture
-async def world_b(db: Database, seed: Seed) -> World:
-    return await build_world(db, seed, "B1a inquiries B")
+async def world(db: Database, seed: Seed, request: pytest.FixtureRequest) -> World:
+    return await build_world(db, seed, "B1a inquiries A", canary=_arranged_canary(request))
+
+
+@pytest.fixture
+async def world_b(db: Database, seed: Seed, request: pytest.FixtureRequest) -> World:
+    return await build_world(db, seed, "B1a inquiries B", canary=_arranged_canary(request))

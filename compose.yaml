@@ -18,8 +18,9 @@
 # - Networks: "crawler" is internal and shared only by worker <-> crawl4ai; the crawler's own
 #   internet egress uses "crawler_egress", which no application service joins. The crawler has
 #   no database credentials and is not on the application network. Docker networks cannot stop
-#   the crawler from reaching a PUBLIC database endpoint over the internet: on a VPS add the host
-#   egress firewall rule from docs/runbook.md ("Crawler egress isolation").
+#   the crawler from reaching a PUBLIC database endpoint over the internet or the HOST's own
+#   services through its bridge gateway: add the host firewall rules (DOCKER-USER and INPUT) from
+#   docs/runbook.md ("Crawler egress isolation") before any live crawl.
 # - No Docker socket, no host home directory and no privileged mode anywhere.
 # =============================================================================
 name: suv-deals
@@ -38,7 +39,9 @@ x-app: &app
     SOURCE_NETWORK_ENABLED: ${SUV_DEALS_ENABLE_SOURCE_NETWORK:-false}
     ALLOW_EXTERNAL_NOTIFICATIONS: ${SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS:-false}
   # A database on the developer's host (e.g. the local PostgreSQL clusters) is reachable as
-  # host.docker.internal; the crawler does NOT get this mapping.
+  # host.docker.internal. The crawler does NOT get this name, but a missing name is no isolation:
+  # its bridge gateway IP still reaches every host service listening beyond loopback until the
+  # host INPUT rules of docs/runbook.md 3.2 (br-suv-crawl / br-suv-crawlint) drop it.
   extra_hosts:
     - "host.docker.internal:host-gateway"
   read_only: true
@@ -87,7 +90,13 @@ services:
 
   worker:
     <<: [*app, *no-http-healthcheck]
-    command: ["suv-deals", "worker", "--queues", "discovery,detail,recheck,valuation"]
+    # Every registered job type, the seller inquiry/reply types included (spec 37; a test keeps
+    # this in step with workers.handlers.default_registry and the CLI default).
+    command:
+      - suv-deals
+      - worker
+      - --queues
+      - discovery,detail,recheck,valuation,seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process
     volumes:
       - snapshots:/app/var/snapshots
     networks:
@@ -152,6 +161,16 @@ networks:
       config:
         - subnet: 172.30.0.0/24
           gateway: 172.30.0.1
+  # Fixed bridge names (<= 15 characters) so the host firewall rules of docs/runbook.md 3.2 can
+  # name them: DOCKER-USER (FORWARD) for routed egress AND INPUT for traffic to the host's own
+  # addresses (bridge gateways, public IP), which never passes FORWARD. IPv6 stays off on both
+  # crawler networks, so no ip6tables rule is needed (a test keeps it off).
   crawler:
     internal: true
-  crawler_egress: {}
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawlint
+  crawler_egress:
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawl

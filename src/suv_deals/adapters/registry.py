@@ -37,7 +37,7 @@ from suv_deals.adapters.mobile_de_api import MobileDeSearchApiAdapter
 from suv_deals.adapters.mobile_de_public import MobileDePublicAdapter
 from suv_deals.domain.enums import TechnicalStatus, TermsDecision, TermsStatus
 from suv_deals.domain.sources import SourceConfig, activation_problems, load_source_configs
-from suv_deals.errors import NotFound, SourcePaused, ValidationFailed
+from suv_deals.errors import AppError, NotFound, SourcePaused, ValidationFailed
 
 AdapterClass = type[SchemaOrgDealerAdapter] | type[PlaceholderAdapter]
 
@@ -117,10 +117,19 @@ class SourceGateStatus:
     terms_reviewed_at: datetime | None
     robots_policy: str
     problems: tuple[str, ...]
+    #: The adapter reports exact-ad seller-contact evidence (spec 37.3): only such a source can
+    #: ever yield an inquiry recipient (wave D2, F1).
+    seller_contact_evidence: bool = False
 
     @property
     def gates_satisfied(self) -> bool:
         return not self.problems
+
+    @property
+    def activatable(self) -> bool:
+        """False when no adapter exists (``adapter_version: unimplemented`` or unregistered): no
+        terms review, owner decision or switch can activate such a source (OPS-03, wave D2)."""
+        return self.adapter_registered and self.adapter_implemented
 
     @property
     def active(self) -> bool:
@@ -146,8 +155,20 @@ class SourceGateStatus:
             "robots_policy": self.robots_policy,
             "gates_satisfied": self.gates_satisfied,
             "active": self.active,
+            "activatable": self.activatable,
+            "seller_contact_evidence": self.seller_contact_evidence,
             "problems": list(self.problems),
         }
+
+
+def adapter_reports_seller_contact(cfg: SourceConfig) -> bool:
+    """True when the configured, implemented adapter reports exact-ad seller-contact evidence."""
+    if cfg.adapter_version == UNIMPLEMENTED or registry_problems(cfg):
+        return False
+    try:
+        return build_adapter(cfg).capabilities().seller_contact_evidence
+    except AppError:
+        return False
 
 
 def gate_status(cfg: SourceConfig) -> SourceGateStatus:
@@ -172,6 +193,7 @@ def gate_status(cfg: SourceConfig) -> SourceGateStatus:
         terms_reviewed_at=cfg.terms_reviewed_at,
         robots_policy=cfg.robots_policy,
         problems=tuple(problems),
+        seller_contact_evidence=adapter_reports_seller_contact(cfg),
     )
 
 
@@ -200,6 +222,12 @@ class SourceRegistry:
 
     def active_source_keys(self) -> list[str]:
         return [g.source_key for g in self.gates() if g.active]
+
+    def recipient_evidence_sources(self) -> tuple[list[str], list[str]]:
+        """(configured, active) acquisition sources whose adapter reports exact-ad seller-contact
+        evidence: the only sources whose listings can ever get an inquiry recipient (F1, D2)."""
+        producers = [g for g in self.gates() if g.role == "acquisition" and g.seller_contact_evidence]
+        return [g.source_key for g in producers], [g.source_key for g in producers if g.active]
 
 
 def load_registry(config_dir: Path) -> SourceRegistry:

@@ -30,6 +30,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import stat
 from collections.abc import Iterable, Iterator, Sequence
@@ -47,6 +48,14 @@ from suv_deals.domain.enums import EmailProviderKind
 from suv_deals.domain.replies import InquiryBinding, InquiryBindingState, normalize_message_id
 
 SCHEMA_VERSION: Final = 1
+
+
+def new_store_instance_id() -> str:
+    """``s`` + 16 hex digits. The leading letter keeps every digit run preceded by a word
+    character, so the backend's audit redaction (phone-number rules) never rewrites it."""
+    return "s" + secrets.token_hex(8)
+
+
 _BUSY_TIMEOUT_MS: Final = 10_000
 
 _SCHEMA: Final = """
@@ -151,6 +160,19 @@ create table if not exists send_intents (
   report_acked integer not null default 0,
   observed_message_id text,
   error_code text
+);
+create table if not exists canaries (
+  canary_id text primary key,
+  payload_json text not null,
+  message_id_hash text not null,
+  state text not null check (state in (
+    'received', 'refused', 'attempting', 'send_failed', 'submitted', 'confirmed')),
+  received_at text not null,
+  attempt_started_at text,
+  report_json text,
+  report_acked integer not null default 0,
+  reply_json text,
+  reply_acked integer not null default 0
 );
 create table if not exists gaps (
   id integer primary key autoincrement,
@@ -352,6 +374,22 @@ class IntentRow:
 
 
 @dataclass(frozen=True, slots=True)
+class CanaryRow:
+    """One activation canary seen by this worker (F3, wave D2; same states as a send intent)."""
+
+    canary_id: UUID
+    payload_json: str
+    message_id_hash: str
+    state: IntentState
+    received_at: datetime
+    attempt_started_at: datetime | None
+    report_json: str | None
+    report_acked: bool
+    reply_json: str | None
+    reply_acked: bool
+
+
+@dataclass(frozen=True, slots=True)
 class GapRow:
     id: int
     kind: str
@@ -419,6 +457,14 @@ class LocalStore:
                 db.execute("insert or ignore into binding_sync (id) values (1)")
             elif row[0] != str(self._mailbox):
                 raise MailboxMismatch("the local store belongs to another mailbox binding")
+            # Written once per store (also added once to a store created before wave D2): the
+            # claim identity of this store (``api_client.claim_worker_id``). A new store - a
+            # reinstall, a wiped store or a second data_dir - is a different worker for the
+            # backend, which grants a running send intent to one worker id only (SEC-1).
+            db.execute(
+                "insert or ignore into meta (key, value) values ('store_instance_id', ?)",
+                (new_store_instance_id(),),
+            )
 
     def close(self) -> None:
         self._db.close()
@@ -426,6 +472,14 @@ class LocalStore:
     @property
     def mailbox_binding_id(self) -> UUID:
         return self._mailbox
+
+    @property
+    def store_instance_id(self) -> str:
+        """Random id of THIS store, created with it (see ``new_store_instance_id``)."""
+        row = self._db.execute("select value from meta where key = 'store_instance_id'").fetchone()
+        if row is None:  # pragma: no cover - written by _initialise
+            raise LocalStoreError("the local store has no instance id")
+        return str(row[0])
 
     def journal_mode(self) -> str:
         row = self._db.execute("pragma journal_mode").fetchone()
@@ -1262,6 +1316,108 @@ class LocalStore:
                 (str(intent_id), report_json),
             )
 
+    # ------------------------------------------------------------------ activation canaries
+
+    _CANARY_COLUMNS: Final = (
+        "canary_id, payload_json, message_id_hash, state, received_at, attempt_started_at,"
+        " report_json, report_acked, reply_json, reply_acked"
+    )
+
+    @staticmethod
+    def _canary_row(row: Sequence[Any]) -> CanaryRow:
+        return CanaryRow(
+            canary_id=UUID(row[0]),
+            payload_json=row[1],
+            message_id_hash=row[2],
+            state=IntentState(row[3]),
+            received_at=ensure_utc(datetime.fromisoformat(row[4])),
+            attempt_started_at=parse_ts(row[5]),
+            report_json=row[6],
+            report_acked=bool(row[7]),
+            reply_json=row[8],
+            reply_acked=bool(row[9]),
+        )
+
+    def canary(self, canary_id: UUID) -> CanaryRow | None:
+        row = self._db.execute(
+            f"select {self._CANARY_COLUMNS} from canaries where canary_id = ?",  # noqa: S608 - constant
+            (str(canary_id),),
+        ).fetchone()
+        return None if row is None else self._canary_row(row)
+
+    def canaries(self, states: Iterable[IntentState] | None = None) -> list[CanaryRow]:
+        rows = self._db.execute(
+            f"select {self._CANARY_COLUMNS} from canaries order by received_at, canary_id"  # noqa: S608
+        ).fetchall()
+        wanted = None if states is None else {s.value for s in states}
+        return [self._canary_row(r) for r in rows if wanted is None or r[3] in wanted]
+
+    def record_canary_received(
+        self, *, canary_id: UUID, payload_json: str, message_id: str, now: datetime
+    ) -> bool:
+        """Durably note a canary before anything else; ``False`` if it was already known."""
+        with self._tx() as db:
+            cursor = db.execute(
+                "insert into canaries (canary_id, payload_json, message_id_hash, state, received_at)"
+                " values (?, ?, ?, 'received', ?) on conflict (canary_id) do nothing",
+                (str(canary_id), payload_json, message_id_hash(message_id), ts(now)),
+            )
+            return cursor.rowcount == 1
+
+    def begin_canary_attempt(self, canary_id: UUID, now: datetime) -> bool:
+        """``received`` -> ``attempting`` (committed before ``.Send``); never a second attempt."""
+        with self._tx() as db:
+            cursor = db.execute(
+                "update canaries set state = 'attempting', attempt_started_at = ?"
+                " where canary_id = ? and state = 'received' and attempt_started_at is null",
+                (ts(now), str(canary_id)),
+            )
+            return cursor.rowcount == 1
+
+    def finish_canary(self, canary_id: UUID, *, state: IntentState, report_json: str) -> None:
+        """Forward-only, like `finish_intent` (a possibly submitted canary is never "refused")."""
+        if state in (IntentState.RECEIVED, IntentState.ATTEMPTING):
+            raise LocalStoreError("finish_canary needs a final or evidence state")
+        with self._tx() as db:
+            row = db.execute("select state from canaries where canary_id = ?", (str(canary_id),)).fetchone()
+            if row is None:
+                raise LocalStoreError("unknown canary")
+            current = IntentState(row[0])
+            if state not in _INTENT_TRANSITIONS[current]:
+                raise LocalStoreError(f"canary cannot move from {current.value} to {state.value}")
+            db.execute(
+                "update canaries set state = ?, report_json = ?, report_acked = 0 where canary_id = ?",
+                (state.value, report_json, str(canary_id)),
+            )
+
+    def mark_canary_report_acked(self, canary_id: UUID, report_json: str) -> None:
+        with self._tx() as db:
+            db.execute(
+                "update canaries set report_acked = 1 where canary_id = ? and report_json = ?",
+                (str(canary_id), report_json),
+            )
+
+    def sent_canary_message_hashes(self) -> dict[str, UUID]:
+        """``message_id_hash -> canary_id`` of canaries that reached (or may have reached) ``.Send``."""
+        rows = self._db.execute(
+            f"select message_id_hash, canary_id from canaries where state in {_ATTEMPTED_SQL}"  # noqa: S608
+        ).fetchall()
+        return {str(r[0]): UUID(r[1]) for r in rows}
+
+    def record_canary_reply(self, canary_id: UUID, reply_json: str) -> bool:
+        """Keep the FIRST correlated reply of a canary for upload; ``False`` if one is kept."""
+        with self._tx() as db:
+            cursor = db.execute(
+                "update canaries set reply_json = ?, reply_acked = 0"
+                " where canary_id = ? and reply_json is null",
+                (reply_json, str(canary_id)),
+            )
+            return cursor.rowcount == 1
+
+    def mark_canary_reply_acked(self, canary_id: UUID) -> None:
+        with self._tx() as db:
+            db.execute("update canaries set reply_acked = 1 where canary_id = ?", (str(canary_id),))
+
     @staticmethod
     def _attempted_count(db: sqlite3.Connection, since: datetime) -> int:
         """Intents that reached (or may have reached) ``.Send`` since ``since``.
@@ -1391,6 +1547,7 @@ __all__ = [
     "BacklogStats",
     "BindingApplyResult",
     "BindingRecord",
+    "CanaryRow",
     "FolderCheckpoint",
     "GapRow",
     "IntentRow",

@@ -15,6 +15,7 @@ import type {
   InquiryState,
   InquiryVehicleRef,
   LagView,
+  ProcessBlocker,
   ReplySummaryView,
   RequestKind,
   Scope,
@@ -273,14 +274,57 @@ export function SenderProblemList({ codes }: { codes: string[] }) {
   )
 }
 
-/** Why the controls cannot send now although they allow it (empty: authorization and sender ready). */
+/** Why the backend's PROCESS-level gate is closed, in plain words (server codes; never guessed). */
+export function processBlockerText(control: InquiryControlView, code: ProcessBlocker): string {
+  switch (code) {
+    case 'SELLER_INQUIRY_MODE_NOT_AUTOMATIC':
+      return `the backend process setting SELLER_INQUIRY_MODE is ${control.process_mode ? label(control.process_mode) : 'not reported'}, not automatic`
+    case 'SELLER_INQUIRY_KILL_SWITCH_ON':
+      return 'the backend process kill switch (SELLER_INQUIRY_KILL_SWITCH) is on'
+    case 'MESSAGE_APPROVAL_SETTING_ON':
+      return "the owner's setting SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL disables automatic sending"
+    default:
+      return `the backend process gate is closed (${String(code)})`
+  }
+}
+
+/**
+ * Why nothing can be sent now although the database controls allow it (empty: every gate is open).
+ * The PROCESS-level gate of the backend comes first: the database saying "automatic" is never
+ * enough, and automatic inquiries are claimed only when the server says they are possible.
+ */
 export function sendingReadinessProblems(control: InquiryControlView): string[] {
   const problems: string[] = []
+  if (control.process_mode === null || control.process_mode === undefined) {
+    problems.push('the backend did not report its process gate (SELLER_INQUIRY_MODE)')
+  }
+  for (const code of control.process_blockers ?? []) problems.push(processBlockerText(control, code))
   if (control.authorization_status !== 'active') {
     problems.push(`the standing authorization is ${authorizationText(control.authorization_status)}`)
   }
   if (control.sender_readiness !== 'ready') {
     problems.push(`the configured sender is ${senderReadinessText(control.sender_readiness)}`)
+  } else if (control.activation_canary_complete !== true) {
+    // F3/OPS-04: the server reserves no real inquiry before the owner's activation canary of the
+    // configured sender's CURRENT version has a correlated test reply.
+    problems.push(
+      'the activation canary of the configured sender is not complete (activation_canary_incomplete): no real seller inquiry is reserved until a correlated test reply is recorded',
+    )
+  }
+  // The owner's rolling caps (the server counts them in `automatic_inquiries_possible` too): a cap
+  // of 0 holds every real inquiry (e.g. during the activation canary step); a used-up window waits.
+  if (control.max_per_24h === 0 || control.max_per_15d === 0) {
+    problems.push("the owner's rolling caps are 0 (every seller inquiry is held)")
+  } else {
+    if (control.used_24h >= control.max_per_24h) {
+      problems.push(`the rolling 24-hour cap is used up (${control.used_24h} of ${control.max_per_24h})`)
+    }
+    if (control.used_15d >= control.max_per_15d) {
+      problems.push(`the rolling 15-day cap is used up (${control.used_15d} of ${control.max_per_15d})`)
+    }
+  }
+  if (!problems.length && control.automatic_inquiries_possible !== true) {
+    problems.push('the server does not report automatic inquiries as possible')
   }
   return problems
 }

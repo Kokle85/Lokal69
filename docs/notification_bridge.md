@@ -246,7 +246,10 @@ Slack route selected for their category, never through MCP Events:
   visible on the reply (`signal_status`) and in `GET /api/mail-workers/health`
   (`reply_signals`: emitted / coalesced / rate_limited / inquiries at the cap, plus a coverage-gap
   warning). A `blocked` signal (for example while `ALLOW_EXTERNAL_NOTIFICATIONS=false`) is terminal
-  and never swallows a newer reply.
+  and never swallows a newer reply. When a signal that replies were coalesced into ends
+  `dead_letter` or `cancelled` without posting, the dispatcher re-emits ONE new signal for the
+  inquiry (its newest coalesced reply; deduplicated, never repeated) so dot is not muted; the cap
+  counts these signal events too (`replies_repo.reemit_muted_signal`, docs/schema.md 11.12).
 
 ## 6. Observability
 
@@ -280,8 +283,14 @@ Slack route selected for their category, never through MCP Events:
 | Native MCP Events code | implemented, fixture_verified | – |
 | Native MCP Events activation | **blocked** | dot supports discovery/subscription for this plugin; approved scope; callback security; stored lifecycle; canary + unsubscribe |
 | Slack fallback code | implemented, fixture_verified | – |
-| Slack activation | **blocked / not_requested** | every checklist item in section 5 |
+| Slack as the candidate-discovery fallback (gate `slack_destination`) | **not_requested** (optional; native MCP Events are the candidate route) | every checklist item in section 5 |
+| Slack seller-reply route, category `seller_reply` (gate `seller_reply_slack_route`) | **selected by the owner, blocked** (code implemented, fixture/integration verified; nothing posted) | private channel id, approved `seller_reply` destination binding, `ALLOW_EXTERNAL_NOTIFICATIONS=true`, `SELLER_REPLY_SIGNAL_PROVIDER=slack`, the dispatcher's Slack settings (`doctor --process dispatcher`), the dot trigger filtered on `suv_deals.seller_reply_received` (docs/connect_mcp.md 6.2) and a correlated test reply Outlook -> backend -> Slack -> dot -> MCP with dot's processing evidence |
 | Automatic dot activation | **blocked** | one selected route + correlated canary (section 8) |
+
+The gates live in `ops.activation_gates`; the reconciler inserts any missing spec 32 gate into
+every active workspace (insert-only, recorded progress is never reset), and `deals_health` / the
+dashboard Overview list every gate that is neither `active` nor `not_requested` as a blocker.
+Per-gate owner actions: `ACTIVATION_GATES.md`.
 
 Smallest owner action to unblock native events: deploy the MCP server with events enabled on an
 approved HTTPS domain, add it as a plugin in a Work chat/dot, rescan, and ask dot to monitor the

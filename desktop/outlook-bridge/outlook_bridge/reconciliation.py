@@ -25,7 +25,7 @@ reconciliation scan of the configured folders over an overlapping received-time 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Final, Literal
@@ -99,11 +99,15 @@ class ItemProcessor:
         matcher: LocalMatcher,
         mailbox: MailboxAdapter,
         max_pending_locators: int,
+        on_new_item: Callable[..., bool] | None = None,
     ) -> None:
         self._store = store
         self._matcher = matcher
         self._mailbox = mailbox
         self._max_pending = max_pending_locators
+        #: Called with every newly processed item (``snapshot, now=``): the activation-canary reply
+        #: watcher (`canary.CanaryProcessor.on_item`; it never changes the item's outcome).
+        self._on_new_item = on_new_item
 
     def _record(
         self,
@@ -141,6 +145,8 @@ class ItemProcessor:
             return ItemOutcome("moved" if moved else "duplicate", key.key_hash)
         first_seen = existing.first_seen_at if existing is not None else now
         junk = folder.role == "junk"
+        if self._on_new_item is not None and existing is None:
+            self._on_new_item(snapshot, now=now)
         decision = self._matcher.evaluate(
             snapshot,
             self._store.bindings_for_matching(),

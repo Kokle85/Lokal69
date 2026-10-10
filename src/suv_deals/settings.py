@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import types
+import typing
 from collections.abc import Mapping
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Final, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -234,6 +236,21 @@ class Settings(BaseSettings):
     def _optional_path(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def _blank_optional_text_is_unset(cls, value: object, info: ValidationInfo) -> object:
+        """A blank or whitespace-only value of an optional text/secret setting means "unset".
+
+        ``.env.example`` ships ``NAME=`` placeholders and the runbook says ``cp .env.example .env``;
+        without this the placeholders loaded as ``''`` and broke consumers that treat ``None`` as
+        unset (the dispatcher's egress proxy, the Slack identity checks, the reply-to check).
+        """
+        if info.field_name in _OPTIONAL_TEXT_FIELDS:
+            text = value.get_secret_value() if isinstance(value, SecretStr) else value
+            if isinstance(text, str) and not text.strip():
+                return None
+        return value
+
     @field_validator("config_dir", "migrations_dir", "snapshot_local_dir", mode="before")
     @classmethod
     def _required_path(cls, value: object) -> object:
@@ -294,6 +311,21 @@ class Settings(BaseSettings):
             else:
                 report[name] = "set"
         return report
+
+
+def _optional_text_fields() -> frozenset[str]:
+    """``str | None`` / ``SecretStr | None`` settings: blank values of these mean "unset"."""
+    names: set[str] = set()
+    for name, info in Settings.model_fields.items():
+        if typing.get_origin(info.annotation) not in (typing.Union, types.UnionType):
+            continue
+        args = set(typing.get_args(info.annotation))
+        if type(None) in args and args & {str, SecretStr}:
+            names.add(name)
+    return frozenset(names)
+
+
+_OPTIONAL_TEXT_FIELDS: Final[frozenset[str]] = _optional_text_fields()
 
 
 @lru_cache(maxsize=1)

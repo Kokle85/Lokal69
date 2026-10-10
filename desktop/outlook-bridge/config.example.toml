@@ -39,6 +39,13 @@ unmatched_retry_hours = 24
 # Execute backend send intents for SELLER_EMAIL_PROVIDER=outlook_local (bounded inquiry only).
 send_intents_enabled = true
 
+# One-time activation canary (docs/seller_email_activation.md section 8): ANOTHER mailbox of the
+# owner (never a seller, never the sending account) that receives the fixed canary text and from
+# which the owner replies. Only this machine knows the address; the backend keeps its SHA-256 and
+# the worker sends a canary only to an address with the same hash. Leave it commented out after
+# the activation evidence is complete.
+# canary_target_address = "owner-test-mailbox@example.invalid"
+
 # The worker attaches to classic Outlook already running in the signed-in session. Set to true
 # only if it may start Outlook itself.
 start_outlook_if_not_running = false

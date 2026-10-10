@@ -103,6 +103,7 @@ class Desktop:
         account_address: str,
         tmp_path: Path,
         send_intents_enabled: bool = True,
+        canary_target_address: str | None = None,
     ) -> None:
         self.loop = loop
         self.mailbox_binding_id = mailbox_binding_id
@@ -119,6 +120,7 @@ class Desktop:
                 "account_smtp_address": account_address,
                 "folders": [{"role": "inbox"}, {"role": "junk"}],
                 "send_intents_enabled": send_intents_enabled,
+                **({"canary_target_address": canary_target_address} if canary_target_address else {}),
             }
         )
         self.token = token
@@ -146,7 +148,7 @@ class Desktop:
         self.api = BridgeApiClient(
             self.config.api_base_url,
             token_provider=lambda: credentials.token(self.clock.now()),
-            identity=ClientIdentity(self.mailbox_binding_id, WORKER_ID),
+            identity=ClientIdentity(self.mailbox_binding_id, WORKER_ID, store.store_instance_id),
             transport=self.transport,
         )
         session = OutlookComSession(

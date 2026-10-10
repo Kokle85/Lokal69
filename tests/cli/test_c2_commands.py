@@ -69,8 +69,9 @@ def _json(output: str) -> Any:
 
 
 @pytest.fixture
-def world(db_url: str, seed: Seed) -> Iterator[World]:
-    built = _run(db_url, lambda db: outlook_world(db, seed, "CLI C2"))
+def world(db_url: str, seed: Seed, request: pytest.FixtureRequest) -> Iterator[World]:
+    canary = request.node.get_closest_marker("no_arranged_canary") is None  # F3/OPS-04 arrangement
+    built = _run(db_url, lambda db: outlook_world(db, seed, "CLI C2", canary=canary))
     try:
         yield built
     finally:
@@ -372,6 +373,7 @@ def _prepare(run_cli: Cli, env: dict[str, str], ws: str) -> str:
     return line.split()[2]
 
 
+@pytest.mark.no_arranged_canary
 def test_canary_prepare_status_and_cancel_never_show_the_address(
     run_cli: Cli, configured: dict[str, str], db_url: str, world: World, seed: Seed
 ) -> None:
@@ -408,6 +410,7 @@ def test_canary_prepare_status_and_cancel_never_show_the_address(
     assert cancelled.exit_code == 0 and "cancelled" in cancelled.output
 
 
+@pytest.mark.no_arranged_canary
 def test_canary_send_is_impossible_unless_every_switch_and_the_flag_are_set(
     run_cli: Cli,
     configured: dict[str, str],
@@ -446,7 +449,9 @@ def test_canary_send_is_impossible_unless_every_switch_and_the_flag_are_set(
     )
     assert wrong.exit_code == 3 and "CANARY_TARGET_MISMATCH" in wrong.output
     assert "other@owner-test" not in wrong.output
-    # 4. Every gate open: no provider has a canary transport yet - the precise blocker, no send.
+    # 4. Every gate open but a provider without a canary transport (the API providers today;
+    # here outlook_local with its desktop transport switched off): the precise blocker, no send.
+    monkeypatch.setattr(canary_cli, "DESKTOP_CANARY_PROVIDERS", frozenset())
     unavailable = run_cli(*flagged, env=open_env)
     assert unavailable.exit_code == 3 and "CANARY_TRANSPORT_UNAVAILABLE" in unavailable.output
     assert TARGET not in unavailable.output
@@ -470,9 +475,46 @@ def test_canary_send_is_impossible_unless_every_switch_and_the_flag_are_set(
     assert again.exit_code == 3 and "CANARY_NOT_PREPARED" in again.output and len(calls) == 1
 
 
+@pytest.mark.no_arranged_canary
+def test_canary_send_publishes_an_outlook_local_canary_to_its_desktop_worker(
+    run_cli: Cli, configured: dict[str, str], db_url: str, world: World, seed: Seed
+) -> None:
+    """F3 (wave D2): on the default route the desktop mailbox worker is the transport. ``canary
+    send`` claims the canary and publishes it in ONE transaction; it never transmits anything
+    itself, never prints the address, and a second send finds nothing prepared."""
+    ws = str(world.workspace_id)
+    _run(db_url, lambda db: issue_worker(db, world))
+    canary_id = _prepare(run_cli, _canary_env(configured), ws)
+    open_env = _canary_env(
+        configured, SELLER_EMAIL_CANARY_SEND_ENABLED="true", SELLER_INQUIRY_MODE="automatic"
+    )
+    flagged = [
+        "canary",
+        "send",
+        canary_id,
+        "--workspace",
+        ws,
+        "--yes",
+        "--i-confirm-owner-controlled-address",
+    ]
+    sent = run_cli(*flagged, env=open_env)
+    assert sent.exit_code == 0, sent.output
+    assert "published to its desktop mailbox worker" in sent.output
+    assert TARGET not in sent.output and "CANARY_TRANSPORT_UNAVAILABLE" not in sent.output
+    state, evidence = seed.conn.execute(
+        "select state, outcome_evidence from ops.inquiry_activation_canaries where id = %s", (canary_id,)
+    ).fetchone()
+    assert state == "uncertain" and evidence["phase"] == "published" and evidence["published_at"]
+    again = run_cli(*flagged, env=open_env)
+    assert again.exit_code == 3 and "CANARY_NOT_PREPARED" in again.output
+    status = _json(run_cli("canary", "status", "--workspace", ws, "--json", env=configured).output)
+    assert status["evidence"] == "uncertain"
+
+
 # ---------------------------------------------------------------------------------- doctor
 
 
+@pytest.mark.no_arranged_canary
 def test_doctor_reports_the_canary_evidence_state(
     run_cli: Cli, configured: dict[str, str], db_url: str, world: World
 ) -> None:
@@ -580,6 +622,7 @@ def test_set_mode_automatic_refuses_a_binding_that_is_not_the_configured_identit
     assert status["mode"] == "paused" and status["version"] == version + 1  # nothing changed
 
 
+@pytest.mark.no_arranged_canary
 def test_canary_is_committed_uncertain_before_the_transport_runs(
     run_cli: Cli,
     configured: dict[str, str],
@@ -605,6 +648,8 @@ def test_canary_is_committed_uncertain_before_the_transport_runs(
         seen.append((str(row[0]), int(row[1])))
         raise RuntimeError("synthetic crash after the hand-over")
 
+    # The direct-transport path (the API providers' shape) on this outlook_local world.
+    monkeypatch.setattr(canary_cli, "DESKTOP_CANARY_PROVIDERS", frozenset())
     monkeypatch.setitem(canary_cli.CANARY_TRANSPORTS, "outlook_local", crashing_transport)
     open_env = _canary_env(
         configured, SELLER_EMAIL_CANARY_SEND_ENABLED="true", SELLER_INQUIRY_MODE="automatic"
@@ -622,6 +667,7 @@ def test_canary_is_committed_uncertain_before_the_transport_runs(
     assert len(seen) == 1 and TARGET not in first.output + again.output
 
 
+@pytest.mark.no_arranged_canary
 def test_canary_prepare_safety_refusals_are_refusals_with_the_wait(
     run_cli: Cli, configured: dict[str, str], db_url: str, world: World, seed: Seed
 ) -> None:

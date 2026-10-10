@@ -96,6 +96,7 @@ from suv_deals.domain.valuation import InvalidationReason
 from suv_deals.errors import AppError, NotFound, ValidationFailed
 from suv_deals.persistence import (
     config_repo,
+    gates,
     idempotency,
     inquiries_repo,
     jobs,
@@ -114,6 +115,7 @@ from suv_deals.persistence.replies_repo import REPLY_PROCESS_PREFIX
 from suv_deals.persistence.sources_repo import SourceRecord
 from suv_deals.persistence.transactions import retry_transient, unit_of_work
 from suv_deals.settings import Settings
+from suv_deals.workers.fx_refresh import FxRefresher
 from suv_deals.workers.inquiry_handlers import (
     PLAN_PREFIX,
     configured_provider,
@@ -210,6 +212,10 @@ class ReconcileReport:
     reply_process_jobs: int = 0
     inquiries_marked_replied: int = 0
     inquiry_send_jobs_unblocked: int = 0
+    #: Spec 32 gates inserted because the workspace did not have them yet (never overwritten).
+    gates_seeded: int = 0
+    #: New ECB reference rates recorded by this pass (``FX_FETCH_ENABLED``; at most every 6 h).
+    fx_rates_recorded: int = 0
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -347,8 +353,9 @@ select l.id, l.current_revision_id, c.id as contact_id
 
 #: Not-yet-reserved inquiries of current eligible real-lineage listings without an open plan job,
 #: with the fingerprint of everything that can turn their decision around (the inquiry's state,
-#: the listing's revision and availability, controls, authorization, senders, contacts, the UTC
-#: day). A NEVER-transmitted reservation that was cancelled because its bound facts went stale
+#: the listing's revision and availability, controls, authorization, senders, contacts, completed
+#: activation canaries (F3/OPS-04, wave D2), the UTC day). A NEVER-transmitted reservation that
+#: was cancelled because its bound facts went stale
 #: (dispatch preflight: changed listing, sender re-verification, availability...; its readiness
 #: is still ``inquiry_ready``) is a candidate again: the standing authorization is unused, so
 #: the current facts are decided anew (``record_readiness`` re-qualifies it; the database
@@ -356,7 +363,7 @@ select l.id, l.current_revision_id, c.id as contact_id
 _REPLAN_SQL: Final = """
 select distinct on (l.id) l.id, l.current_revision_id,
        pg_catalog.md5(pg_catalog.concat_ws('|', i.state, l.current_revision_id, l.availability,
-                      ctl.version, auth.version, snd.fp, con.fp,
+                      ctl.version, auth.version, snd.fp, con.fp, can.fp,
                       pg_catalog.to_char(clock_timestamp() at time zone 'UTC', 'YYYYMMDD'))) as fingerprint
   from app.seller_inquiries i
   join app.listings l on l.workspace_id = i.workspace_id and l.id = i.qualification_listing_id
@@ -369,6 +376,10 @@ select distinct on (l.id) l.id, l.current_revision_id,
   left join lateral (select string_agg(c.id::text || '.' || c.status, ',' order by c.id) as fp
                        from app.seller_contacts c
                       where c.workspace_id = l.workspace_id and c.listing_id = l.id) con on true
+  left join lateral (select string_agg(k.sender_binding_id::text || '.'
+                                       || k.sender_binding_version::text, ',' order by k.id) as fp
+                       from ops.inquiry_activation_canaries k
+                      where k.workspace_id = i.workspace_id and k.state = 'reply_correlated') can on true
  where i.workspace_id = %(ws)s
    and (i.state in ('candidate', 'qualifying', 'held_facts')
         or (i.state = 'cancelled' and i.readiness = 'inquiry_ready' and i.send_attempted_at is null
@@ -601,14 +612,29 @@ async def _expired_valuations(conn: Conn, actor: ActorContext, limit: int) -> li
 
 
 class Reconciler:
-    def __init__(self, ctx: RuntimeContext, options: ReconcileOptions | None = None) -> None:
+    def __init__(
+        self,
+        ctx: RuntimeContext,
+        options: ReconcileOptions | None = None,
+        *,
+        fx_refresher: FxRefresher | None = None,
+    ) -> None:
         self.ctx = ctx
         self.options = options or ReconcileOptions()
+        #: Gated ECB reference-rate refresh (``FX_FETCH_ENABLED``; OPS-06): at most every 6 h.
+        self.fx_refresher = fx_refresher or FxRefresher()
 
     async def run_once(self, *, dry_run: bool = False) -> list[ReconcileReport]:
         reports: list[ReconcileReport] = []
-        for workspace_id in await active_workspace_ids(self.ctx.db):
-            reports.append(await self.reconcile_workspace(workspace_id, dry_run=dry_run))
+        workspaces = await active_workspace_ids(self.ctx.db)
+        fx = None if dry_run else await self.fx_refresher.run(self.ctx.settings, self.ctx.db, workspaces)
+        for workspace_id in workspaces:
+            report = await self.reconcile_workspace(workspace_id, dry_run=dry_run)
+            if fx is not None:
+                report.fx_rates_recorded = fx.recorded.get(workspace_id, 0)
+            elif self.fx_refresher.last_error is not None and not dry_run:
+                report.errors.append(f"fx:{self.fx_refresher.last_error}")
+            reports.append(report)
         return reports
 
     async def run(self, stop: anyio.Event) -> None:
@@ -723,6 +749,13 @@ class Reconciler:
             lambda c: _close_orphan_runs(c, actor, opts.reap_limit),
             dry_run=report.dry_run,
         )
+        # The spec 32 gate list of every workspace (F4, wave D2): insert-only, so a gate with
+        # recorded progress is never reset and a later release can add gates to existing
+        # workspaces (deals_health / the dashboard list them as activation blockers).
+        seeded = await _step(
+            self.ctx, actor, lambda c: gates.seed_spec_gates(c, actor), dry_run=report.dry_run
+        )
+        report.gates_seeded = len(seeded)
 
     # ------------------------------------------------------------------ 3 stale-detail sweep
 

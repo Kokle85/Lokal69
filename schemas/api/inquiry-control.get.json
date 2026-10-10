@@ -29,6 +29,11 @@
         "additionalProperties": false,
         "description": "Workspace inquiry controls (``GET /api/inquiry-control``): kill switch, mode, caps.",
         "properties": {
+          "activation_canary_complete": {
+            "default": false,
+            "description": "A correlated test reply (activation canary in state reply_correlated) exists for the configured sender binding's CURRENT version. Until then every real seller inquiry is refused at reservation (activation_canary_incomplete).",
+            "type": "boolean"
+          },
           "approval_required": {
             "const": false,
             "default": false,
@@ -52,6 +57,11 @@
               "integer",
               "null"
             ]
+          },
+          "automatic_inquiries_possible": {
+            "default": false,
+            "description": "True only while EVERY gate is open: the process gate, the database mode automatic with the kill switch off, the standing authorization active, the configured sender ready with its activation canary complete and room under both rolling caps now (a cap of 0 holds every inquiry). Never a claim that anything was or will be sent.",
+            "type": "boolean"
           },
           "ceiling_per_15d": {
             "const": 5,
@@ -97,6 +107,50 @@
               "paused"
             ],
             "type": "string"
+          },
+          "process_blockers": {
+            "default": [],
+            "description": "Why the process-level gate is closed (empty: open).",
+            "items": {
+              "enum": [
+                "SELLER_INQUIRY_MODE_NOT_AUTOMATIC",
+                "SELLER_INQUIRY_KILL_SWITCH_ON",
+                "MESSAGE_APPROVAL_SETTING_ON"
+              ],
+              "type": "string"
+            },
+            "maxItems": 3,
+            "type": "array"
+          },
+          "process_kill_switch": {
+            "default": null,
+            "description": "SELLER_INQUIRY_KILL_SWITCH of the serving backend (null when not reported).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "process_message_approval_required": {
+            "default": null,
+            "description": "SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL (the owner's setting; it DISABLES automatic sending, never adds an approval wait). Null when not reported.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "process_mode": {
+            "default": null,
+            "description": "SELLER_INQUIRY_MODE of the serving backend (the process-level gate; null when not reported). Both this and the database mode must be automatic.",
+            "enum": [
+              "disabled_until_sender_ready",
+              "automatic",
+              "paused",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "removable_suppressions": {
             "default": 0,
@@ -190,7 +244,13 @@
           "sender_readiness",
           "sender_provider",
           "sender_binding_version",
-          "sender_problems"
+          "sender_problems",
+          "process_mode",
+          "process_kill_switch",
+          "process_message_approval_required",
+          "process_blockers",
+          "activation_canary_complete",
+          "automatic_inquiries_possible"
         ],
         "title": "InquiryControlView",
         "type": "object"

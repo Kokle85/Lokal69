@@ -96,7 +96,7 @@ async def test_spec_gates_are_seeded_honestly_and_never_overwritten(
             await gates.seed_spec_gates(conn, reviewer)
     async with db.transaction(owner) as conn:
         created = await gates.seed_spec_gates(conn, owner)
-    assert len(created) == len(gates.SPEC_GATES) == 14
+    assert len(created) == len(gates.SPEC_GATES) == 17  # 16 spec 32 rows + the Slack reply route
     statuses = {g.capability: g.status for g in created}
     assert set(statuses.values()) <= {GateStatus.IMPLEMENTED, GateStatus.BLOCKED, GateStatus.NOT_REQUESTED}
     assert statuses["tax_rules"] == GateStatus.BLOCKED
@@ -125,7 +125,7 @@ async def test_spec_gates_are_seeded_honestly_and_never_overwritten(
             " where workspace_id = %s and action like 'activation_gate.%%'",
             (ws,),
         )
-        == 15
+        == len(gates.SPEC_GATES) + 1  # every seeded gate plus the one recorded update
     )
 
 

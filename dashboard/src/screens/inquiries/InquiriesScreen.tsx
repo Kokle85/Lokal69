@@ -353,7 +353,7 @@ function ControlSummary({
       <Badge value={control.mode} /> {control.kill_switch ? <Badge tone="bad">kill switch on</Badge> : <Badge tone="ok">kill switch off</Badge>}{' '}
       <span className="muted">
         24 h: {control.used_24h} of {control.max_per_24h} used · 15 days: {control.used_15d} of {control.max_per_15d} used
-        {stopped ? ' · sending is stopped' : ''}
+        {stopped ? ' · sending is stopped' : control.automatic_inquiries_possible ? '' : ' · nothing can be sent now'}
       </span>{' '}
       <Link to="/inquiry-control">Inquiry control</Link>
     </p>

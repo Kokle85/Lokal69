@@ -19,6 +19,7 @@ import {
   type CandidateDetail,
   type CandidateListQuery,
   type CandidateListView,
+  type CanaryEvidenceView,
   type ClaimRequest,
   type ClaimResult,
   type ComparableSetView,
@@ -250,6 +251,10 @@ export class ApiClient {
   }
   async resumeInquiries(body: InquiryResumeRequest, options: RequestOptions = {}) {
     return this.post<InquiryResumeResult>('/api/inquiry-control/resume', body, options)
+  }
+  /** Owner only, read-only: the activation-canary evidence (no canary is prepared or sent here). */
+  async canaryEvidence(options: RequestOptions = {}) {
+    return this.get<CanaryEvidenceView>('/api/activation/canary-evidence', undefined, options)
   }
   async mailWorkerHealth(query: MailWorkerHealthQuery = {}, options: RequestOptions = {}) {
     return this.get<MailWorkerHealthView>('/api/mail-workers/health', { ...query }, options)

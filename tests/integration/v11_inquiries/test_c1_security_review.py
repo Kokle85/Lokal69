@@ -234,6 +234,7 @@ async def test_no_canary_while_the_kill_switch_is_on(db: Database, world: World)
     assert exc.value.details["reason"] == "kill_switch_active"
 
 
+@pytest.mark.no_arranged_canary
 async def test_canaries_are_bounded_per_rolling_day(db: Database, world: World) -> None:
     await _worker(db, world)
     boss = owner(world.workspace_id)
@@ -263,6 +264,7 @@ async def test_canary_free_text_never_carries_an_address(db: Database, world: Wo
             await canaries_repo.cancel_canary(conn, boss, record.id, reason=f"wrong target {TARGET}")
 
 
+@pytest.mark.no_arranged_canary
 async def test_the_target_hash_is_for_the_owner_only(db: Database, world: World) -> None:
     await _worker(db, world)
     record = await _canary(db, world)

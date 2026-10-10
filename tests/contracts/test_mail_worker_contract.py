@@ -34,6 +34,12 @@ from suv_deals.api.schemas import (
     MailWorkerBindingItem,
     MailWorkerBindingPage,
     MailWorkerBindingsQuery,
+    MailWorkerCanaryClaimDecision,
+    MailWorkerCanaryClaimRequest,
+    MailWorkerCanaryIntent,
+    MailWorkerCanaryIntentBatch,
+    MailWorkerCanaryReply,
+    MailWorkerCanaryReport,
     MailWorkerCheckpointReport,
     MailWorkerClaimDecision,
     MailWorkerClaimRequest,
@@ -57,7 +63,7 @@ if str(DESKTOP) not in sys.path:
 
 from outlook_bridge import api_client, wire  # noqa: E402
 from outlook_bridge.matching import encode_payload, idempotency_key_for, wire_payload  # noqa: E402
-from outlook_bridge.testing import inquiry_message_id, make_intent  # noqa: E402
+from outlook_bridge.testing import inquiry_message_id, make_canary, make_intent  # noqa: E402
 
 MAILBOX = UUID("77777777-7777-4777-8777-777777777777")
 INQUIRY = UUID("66666666-6666-4666-8666-666666666666")
@@ -81,6 +87,12 @@ PAIRS: list[tuple[type[BaseModel], type[BaseModel]]] = [
     (wire.HeartbeatEnvelope, MailWorkerHeartbeatRequest),
     (wire.HeartbeatAck, MailWorkerHeartbeatAck),
     (wire.WorkerAccountReport, MailWorkerAccountReport),
+    # Activation canaries (F3, wave D2): the shared domain models on both sides.
+    (wire.WorkerCanaryIntent, MailWorkerCanaryIntent),
+    (wire.CanaryBatch, MailWorkerCanaryIntentBatch),
+    (wire.CanaryDecision, MailWorkerCanaryClaimDecision),
+    (wire.WorkerCanaryReport, MailWorkerCanaryReport),
+    (wire.CanaryReplyUpload, MailWorkerCanaryReply),
 ]
 
 
@@ -134,6 +146,10 @@ def test_paths_limits_and_headers_match_the_client() -> None:
         f"GET {api_client.SEND_INTENTS_PATH}",
         f"POST {api_client.SEND_INTENTS_PATH}/{{intent_id}}/claim",
         f"POST {api_client.SEND_INTENTS_PATH}/{{intent_id}}/report",
+        f"GET {api_client.CANARY_INTENTS_PATH}",
+        f"POST {api_client.CANARY_INTENTS_PATH}/{{canary_id}}/claim",
+        f"POST {api_client.CANARY_INTENTS_PATH}/{{canary_id}}/report",
+        f"POST {api_client.CANARY_INTENTS_PATH}/{{canary_id}}/reply",
         f"POST {api_client.HEARTBEAT_PATH}",
         f"POST {api_client.ACCOUNT_REPORT_PATH}",
     }
@@ -201,6 +217,14 @@ class ContractServer:
                 inquiry_id=INQUIRY, mailbox_binding_id=MAILBOX, from_address=OWNER, created_at=NOW
             ).model_dump_json()
         )
+        self.canary = MailWorkerCanaryIntent.model_validate_json(
+            make_canary(
+                mailbox_binding_id=MAILBOX,
+                target_address="owner-test-box@example.invalid",
+                from_address=OWNER,
+                created_at=NOW,
+            ).model_dump_json()
+        )
 
     def _json(self, model: BaseModel) -> httpx.Response:
         return httpx.Response(200, content=model.model_dump_json().encode("utf-8"))
@@ -210,6 +234,7 @@ class ContractServer:
         self.seen.append((request.method, path))
         assert request.headers["Authorization"] == f"Bearer {TOKEN}"
         template = re.sub(r"/send-intents/[0-9a-f-]{36}/", "/send-intents/{intent_id}/", path)
+        template = re.sub(r"/canary-intents/[0-9a-f-]{36}/", "/canary-intents/{canary_id}/", template)
         self.idempotency[f"{request.method} {template}"] = IDEMPOTENCY_HEADER in request.headers
 
         def body[M: BaseModel](model: type[M]) -> M:
@@ -260,6 +285,8 @@ class ContractServer:
         if request.method == "GET" and path == api_client.SEND_INTENTS_PATH:
             MailWorkerSendIntentsQuery.model_validate(dict(request.url.params))
             return self._json(MailWorkerSendIntentBatch(intents=(self.intent,), kill_switch_active=False))
+        if path.startswith(api_client.CANARY_INTENTS_PATH):
+            return self._canary(request, path)
         if request.method == "POST" and path.endswith("/claim"):
             claim = body(MailWorkerClaimRequest)
             assert isinstance(claim, MailWorkerClaimRequest)
@@ -280,6 +307,27 @@ class ContractServer:
             return self._json(MailWorkerAccepted())
         return httpx.Response(404, json={})
 
+    def _canary(self, request: httpx.Request, path: str) -> httpx.Response:
+        if request.method == "GET":
+            assert path == api_client.CANARY_INTENTS_PATH and not request.url.params
+            return self._json(MailWorkerCanaryIntentBatch(intents=(self.canary,), kill_switch_active=False))
+        key = request.headers[IDEMPOTENCY_HEADER]
+        assert 8 <= len(key) <= 128
+        if path.endswith("/claim"):
+            claim = MailWorkerCanaryClaimRequest.model_validate_json(request.content)
+            assert path == f"{api_client.CANARY_INTENTS_PATH}/{claim.canary_id}/claim"
+            assert key == f"canary-claim-{claim.canary_id}-{claim.claim_attempt_id}"
+            return self._json(MailWorkerCanaryClaimDecision(canary_id=claim.canary_id, proceed=True))
+        if path.endswith("/report"):
+            report = MailWorkerCanaryReport.model_validate_json(request.content)
+            assert path == f"{api_client.CANARY_INTENTS_PATH}/{report.canary_id}/report"
+            return self._json(MailWorkerAccepted())
+        if path.endswith("/reply"):
+            reply = MailWorkerCanaryReply.model_validate_json(request.content)
+            assert path == f"{api_client.CANARY_INTENTS_PATH}/{reply.canary_id}/reply"
+            return self._json(MailWorkerAccepted())
+        return httpx.Response(404, json={})
+
 
 @pytest.fixture
 def server_and_client() -> tuple[ContractServer, api_client.BridgeApiClient]:
@@ -287,7 +335,9 @@ def server_and_client() -> tuple[ContractServer, api_client.BridgeApiClient]:
     client = api_client.BridgeApiClient(
         "https://api.example.invalid",
         token_provider=lambda: TOKEN,
-        identity=api_client.ClientIdentity(mailbox_binding_id=MAILBOX, worker_id="desktop-contract"),
+        identity=api_client.ClientIdentity(
+            mailbox_binding_id=MAILBOX, worker_id="desktop-contract", store_instance_id="s0000000000000c01"
+        ),
         transport=httpx.MockTransport(server.handle),
     )
     return server, client
@@ -356,7 +406,46 @@ def test_the_desktop_client_round_trips_every_route(
             account_smtp_address=OWNER,
         )
     )
-    assert [method for method, _ in server.seen] == ["GET", "POST", "GET", "POST", "POST", "POST", "POST"]
+    canaries = client.fetch_canary_intents()
+    assert canaries.intents[0].canary_id == server.canary.canary_id
+    assert wire.canary_intent_problems(canaries.intents[0]) == ()
+    assert client.claim_canary(server.canary.canary_id).proceed is True
+    client.post_canary_report(
+        wire.WorkerCanaryReport(
+            canary_id=server.canary.canary_id,
+            mailbox_binding_id=MAILBOX,
+            worker_id="desktop-contract",
+            state="sent_items_confirmed",
+            observed_internet_message_id=server.canary.rfc_message_id,
+            sent_items_present=True,
+            reported_at=NOW,
+            sent_at=NOW,
+        )
+    )
+    client.post_canary_reply(
+        wire.CanaryReplyUpload(
+            canary_id=server.canary.canary_id,
+            mailbox_binding_id=MAILBOX,
+            worker_id="desktop-contract",
+            internet_message_id="<owner-reply@example.invalid>",
+            in_reply_to=(server.canary.rfc_message_id,),
+            from_address_hash="c" * 64,
+            received_at=NOW,
+        )
+    )
+    assert [method for method, _ in server.seen] == [
+        "GET",
+        "POST",
+        "GET",
+        "POST",
+        "POST",
+        "POST",
+        "POST",
+        "GET",
+        "POST",
+        "POST",
+        "POST",
+    ]
     # The Idempotency-Key header rule of every route is exactly what the desktop client sends:
     # required on replies/claim/report, absent on heartbeat/account-report and the GET routes
     # (a server that required it there would refuse the worker's health reports).

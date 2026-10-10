@@ -338,6 +338,8 @@ async def test_resume_can_remove_kill_switch_suppressions_with_audit(dash: Inqui
                 "reason": "Owner clears the kill-switch suppressions",
                 "idempotency_key": "resume-remove-0001",
                 "remove_suppressions": True,
+                # Required with a removal (D1 item 1): the count the owner saw.
+                "expected_removable_suppressions": control["removable_suppressions"],
             },
         )
     )

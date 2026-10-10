@@ -1160,7 +1160,9 @@ letter case, an unparseable key=value string) is refused rather than guessed at.
   - `outbox.claim_events`: the fixture-suspicion predicate is NULL-safe
     (`coalesce(jsonb_typeof(payload -> 'summary') = 'string' and ..., false)`). Before, a payload
     without a string `summary` made the predicate NULL and the row was neither leased nor refused.
-  - Inquiry summaries carry `waiting_reason` (`UNCERTAIN_DELIVERY`, `NEEDS_FACTS`,
+  - Inquiry summaries (`InquirySummaryView.waiting_reason`, every list row) and the single inquiry
+    (`InquiryView.waiting_reason`: `GET /api/inquiries/{inquiry_id}`, MCP `seller_inquiries_get`)
+    carry `waiting_reason` (`UNCERTAIN_DELIVERY`, `NEEDS_FACTS`,
     `INQUIRIES_PAUSED`, `SENDER_SETUP_INCOMPLETE`, `WORKER_OFFLINE`, `RATE_CAP_REACHED`,
     `SELLER_COOLDOWN`, `SEND_HELD`): stored state first, then the controls (pre-send states only;
     see 11.10), then the open send/plan job's wait or blocker code
@@ -1253,3 +1255,122 @@ Corrections made by the second (safety, privacy, security) C1 review (tests on P
   and shown to `inquiries:read` readers). `CanaryRecord.target_address_hash` (an unsalted SHA-256
   that can confirm a guessed address) is returned to the owner (`config:admin`) and system
   principals only; `get_canary` / `list_canaries` give everyone else `None`.
+
+### 11.12 Work package D1: closing the open wave C review items (no migration)
+
+No schema change: every rule below is enforced by the repositories and the API on the existing
+tables (tests on PostgreSQL 16 and 17).
+
+- Resume count (`api.schemas.InquiryResumeRequest`): `expected_removable_suppressions` is REQUIRED
+  whenever `remove_suppressions` is true (`422 VALIDATION_ERROR`, `details.fields =
+  [expected_removable_suppressions]`); the committed snapshot states the rule as an `if`/`then`
+  (`views.jsonschema.close_objects` no longer closes `if`/`then`/`else` subschemas: they constrain
+  the enclosing, closed object). `api.inquiry_routes.resume_inquiries` (API and CLI) refuses a
+  removal without the count before anything changes (`tests/api/test_c2_interfaces.py`).
+- Mailbox health (`mail_workers_repo.list_mailbox_health`): an ACTIVE binding whose bound
+  credential (`ops.api_credentials`) is expired or revoked is never `monitoring_active`, however
+  fresh its last heartbeat (reason `CREDENTIAL_NOT_LIVE`); `any_monitoring_active`, the health
+  warning, `suv-deals doctor`, `inquiries status` and `mail-worker credential list` all follow
+  (`tests/integration/v11_replies/test_health_and_queries.py`,
+  `tests/cli/test_inquiry_commands.py`).
+- Activation canary claim (`canaries_repo.claim_for_send`): after the controls lock (`FOR
+  UPDATE`), ONE guarded `UPDATE ops.inquiry_activation_canaries` moves a `prepared` canary to
+  `uncertain` (evidence `phase = transport_started`, the one-time `send_token`) only while the
+  kill switch is off, the mode is `automatic`, the latest standing authorization is unrevoked
+  (its effective window evaluated under the controls lock), the bound sender binding is
+  unrevoked, verified and still at the canary's version, and, for a desktop canary, its mailbox
+  is active, of that sender and its credential live; the sender binding and mailbox rows are held
+  `FOR SHARE` by the same statement, so a racing revocation is either seen or waits. A refusal is
+  `CanaryClaimRefused` (`409 VERSION_CONFLICT`, `details.reason = canary_claim_refused`,
+  `details.problems` = codes) and changes nothing; the same token replays. `suv-deals canary
+  send` uses it (`tests/integration/v11_inquiries/test_d1_canary_claim.py`).
+- Muted reply signals (`replies_repo.muted_signal_inquiries` / `reemit_muted_signal`, called by
+  the dispatcher every cycle): when a `seller.reply.received` signal ended `dead_letter` or
+  `cancelled` after newer replies were `coalesced` into it, and no other signal of the inquiry is
+  still to be posted or began its post after the newest of them, ONE new signal is re-emitted for
+  the inquiry under the inquiry row lock (status `seller reply received`, naming the newest
+  coalesced reply; deduplicated by that reply, so it never repeats; fixture lineage stored
+  `blocked`; audited `seller_reply.signal_reemit`), within a 7-day lookback. It counts against
+  `MAX_SIGNALS_PER_INQUIRY_24H`, which now bounds the signal EVENTS of the inquiry in the rolling
+  24 hours as well as the emitting replies (the ingest gate counts both). The dispatcher's
+  separate `claim_signal_events` statement was redundant since the C1 NULL-safe outbox claim and
+  was removed: signals are leased first through `outbox.claim_events(..., event_types=...)`
+  (`tests/integration/v11_replies/test_d1_signal_reemit.py`,
+  `tests/integration/v11_runtime/test_d1_signal_reemit_dispatch.py`).
+- Fixture lineage at the persistence layer: `inquiries_repo.reserve` and `inquiries_repo.dispatch`
+  refuse a qualification listing with `app.listings.is_fixture` (or a missing listing) as their
+  first answer with `FixtureLineageRefused` (`VALIDATION_ERROR`, `details = {reason:
+  fixture_lineage, problems: [FIXTURE_LINEAGE]}`), before any quota debit, attempt or intent, so
+  an API provider (`gmail_api`, no worker claim step) has a persistence-level guard too; the
+  runtime and worker-claim guards stay (`tests/integration/v11_inquiries/test_d1_fixture_lineage.py`).
+- `GET /api/activation/canary-evidence` (owner only, read-only; `views.inquiries.CanaryEvidenceView`):
+  rows 4-6 of the activation checklist for the configured sender (`canaries_repo.evidence_state`,
+  shared with `suv-deals canary status` and `doctor`) and the newest canaries (ids, states,
+  times; never the target, its hash, the purpose or evidence text). `InquiryControlView` adds the
+  process-level gate of the serving backend (`process_mode`, `process_kill_switch`,
+  `process_message_approval_required`, `process_blockers`) and `automatic_inquiries_possible`
+  (`tests/api/test_d1_interfaces.py`). D1 review: `automatic_inquiries_possible` (and
+  `suv-deals inquiries status` `sending_possible`) also needs room under both rolling caps now
+  (`api.inquiry_routes.caps_leave_room`): a cap of 0, which the activation runbook uses to hold
+  real seller inquiries while the process gate is open for the canary, is never reported as
+  "possible".
+
+
+### 11.13 Work package D2: final-review findings (no migration)
+
+No schema change: every rule below runs on the existing tables (tests on PostgreSQL 16 and 17).
+
+- Outlook claim, one claimant (SEC-1): `send_intents_repo.claim` reads the granted
+  `send_intent.claim` audit rows of the attempt after the controls/inquiry/attempt locks and
+  refuses another `worker_id` with `INTENT_INVALID` / `ALREADY_CLAIMED` (an unparseable audit row
+  counts as a grant, failing safe); the same worker id is granted again (a lost answer). The
+  desktop sends `<worker_id>.<store_instance_id>` (a random id written once per local store), so a
+  reinstall or second data directory is another claimant (`tests/integration/v11_inquiries/test_d2_single_claimant.py`).
+- Seller evidence producer (F1): after each acquisition detail commit, in its own transaction,
+  `crawling.seller_evidence.record_seller_evidence` links the seller (`sellers_repo.link_seller`),
+  verifies the ad-shown recipient (`verify_recipient`), resolves the language from the
+  seller-written text and records ONE `app.seller_contacts` row (`seller_email_unavailable` /
+  `language_unresolved` recorded explicitly; a `confirm_unchanged` recheck re-verifies against the
+  current revision) (`tests/integration/v11_runtime/test_d2_seller_evidence_pipeline.py`).
+- MK evidence (F2): `suv-deals market import` (owner, audited, size-bounded, no seller contact
+  fields; `owner_estimate` needs a non-system `config:admin` actor) and `mk_comparable`-role detail
+  pages (`crawling.mk_evidence`) write `app.market_observations` (content-derived ids, append-only).
+- FX (OPS-06): `workers.fx_refresh` (gated ECB refresh by the reconciler, `suv-deals fx refresh`)
+  and `suv-deals fx record` write `app.fx_rates` through `valuation_repo.upsert_fx_rate`; a
+  different value for a stored observation is a conflict, never an overwrite.
+- Activation gates (F4): `persistence.gates.SPEC_GATES` adds `seller_email_sender`,
+  `seller_inquiry` and `seller_reply_slack_route` (all `blocked`); `seed_spec_gates` inserts
+  missing gates into existing workspaces and never overwrites a row.
+- Activation canary transport (F3/OPS-04, `outlook_local`): `ops.inquiry_activation_canaries`
+  rows keep their states; the transport phase lives in `outcome_evidence.phase`:
+  `transport_started` (`claim_for_send`) -> `published` (`canaries_repo.publish_for_desktop`, the
+  same transaction as the CLI claim) -> `desktop_claimed` (`claim_desktop_canary`, ONE worker id,
+  audited `inquiry_canary.desktop_claim`) -> `submitted` | `send_call_failed`; `sent_items_confirmed`
+  moves the canary to `accepted`, `refused_before_send` / `transport_rejected` to `failed`, and the
+  owner's reply (headers and the sender's SHA-256 only; `record_canary_reply` compares it with the
+  target hash) to `reply_correlated`. Wire: `GET /v1/mail-workers/canary-intents`,
+  `POST /v1/mail-workers/canary-intents/{canary_id}/claim|report|reply` (docs/api_contract.md)
+  (`tests/integration/mail_worker_e2e/test_d2_canary_e2e.py`).
+- Reservation gate (F3/OPS-04): `inquiries_repo.reserve` refuses (`ValidationFailed`,
+  `details.problems = [ACTIVATION_CANARY_INCOMPLETE]`, `details.reason =
+  activation_canary_incomplete`; nothing debited or changed) until a `reply_correlated` canary
+  exists for the sender binding's CURRENT version (`inquiries_repo.activation_canary_complete`).
+  The plan job records readiness with that reservation reason; the replan fingerprint
+  (`workers.reconciliation`) includes the completed canaries, so the pair is planned again once
+  one completes. `set_mode('automatic')` is NOT gated (the canary send needs automatic mode).
+  `InquiryControlView.activation_canary_complete` (and `automatic_inquiries_possible`), `suv-deals
+  inquiries status` (`activation_canary`, `sending_possible`) and `doctor`
+  (`seller_inquiry/activation_canary`) report it
+  (`tests/integration/v11_inquiries/test_d2_activation_canary_gate.py`,
+  `tests/api/test_d2_activation_canary_visibility.py`, `tests/cli/test_d2_canary_gate_status.py`).
+
+### 11.14 Wave D3: handoff documentation (no migration)
+
+No schema change; the applied state of section 9 is unchanged (every migration through
+`20261008000200`). Four tables are written by repository functions that no CLI command or API
+route calls yet, so the activation steps that depend on them are blocked on operator tooling
+(ACTIVATION_GATES.md sections 6, 7, 19 and "How to read this file"): `ops.activation_gates`
+(gate status changes; only the automatic source access-block path writes a row),
+`app.destination_bindings` (create, approve, enable, verify a delivery route),
+`app.tax_rule_sets` (store and move a rule set through review, approval and activation) and the
+approval of `app.cost_profiles`.

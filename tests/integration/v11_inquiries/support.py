@@ -90,7 +90,13 @@ from suv_deals.integrations.email_providers.base import (
     SendUncertain,
     UncertainReason,
 )
-from suv_deals.persistence import inquiries_repo, sellers_repo, sender_bindings_repo
+from suv_deals.persistence import (
+    canaries_repo,
+    inquiries_repo,
+    mail_workers_repo,
+    sellers_repo,
+    sender_bindings_repo,
+)
 from suv_deals.persistence.database import Database, fetch_one
 from suv_deals.persistence.inquiries_repo import (
     AttemptLease,
@@ -465,6 +471,64 @@ async def add_vehicle(
     return replace(vehicle, contact_id=contact.id)
 
 
+#: The SYNTHETIC owner-controlled address of the arranged activation canaries (never a seller).
+CANARY_TARGET = "owner-canary-test@example.invalid"
+
+
+async def complete_activation_canary(db: Database, workspace_id: UUID, sender_binding_id: UUID) -> UUID:
+    """TEST ARRANGEMENT of the owner's completed activation evidence for the sender binding's
+    CURRENT version (F3/OPS-04, wave D2: nothing is reserved without it): a canary recorded
+    through the repository (``prepared -> uncertain -> reply_correlated``). An ``outlook_local``
+    canary names an active mailbox worker of the sender; without one, a temporary worker is
+    issued for it and revoked again (the canary keeps naming it), so the world's mailbox state
+    is unchanged. The workspace controls must exist with the kill switch off."""
+    actor = ActorContext.system(workspace_id, "req-canary-arrangement")
+    async with unit_of_work(db, actor) as conn:
+        binding = await sender_bindings_repo.get_binding(conn, actor, sender_binding_id)
+        mailbox: UUID | None = None
+        temporary = False
+        if binding.provider == EmailProviderKind.OUTLOOK_LOCAL:
+            row = await fetch_one(
+                conn,
+                "select id from ops.mail_worker_bindings where workspace_id = %(ws)s"
+                " and sender_binding_id = %(sender)s and state = 'active'"
+                " order by created_at desc, id limit 1",
+                {"ws": workspace_id, "sender": binding.id},
+            )
+            if row is not None:
+                mailbox = row["id"]
+            else:
+                issued = await mail_workers_repo.issue_mail_worker(
+                    conn, actor, sender_binding_id=binding.id, label="Synthetic canary worker (retired)"
+                )
+                mailbox, temporary = issued.mailbox_binding_id, True
+        canary = await canaries_repo.create_canary(
+            conn,
+            actor,
+            sender_binding_id=binding.id,
+            target_address=CANARY_TARGET,
+            purpose="SYNTHETIC completed activation canary (test arrangement)",
+            mailbox_binding_id=mailbox,
+        )
+        if temporary and mailbox is not None:
+            await mail_workers_repo.revoke_mail_worker(
+                conn, actor, mailbox, reason="synthetic canary worker retired (test arrangement)"
+            )
+        await canaries_repo.record_canary_outcome(
+            conn, actor, canary.id, outcome="uncertain", evidence={"phase": "synthetic_arrangement"}
+        )
+        await canaries_repo.record_canary_reply(
+            conn,
+            actor,
+            canary.id,
+            reply_message_id=f"<owner-reply-{uuid.uuid4().hex}@example.invalid>",
+            in_reply_to=canary.rfc_message_id,
+            received_at=datetime.now(UTC),
+            from_address=CANARY_TARGET,
+        )
+    return canary.id
+
+
 async def build_world(
     db: Database,
     seed: Seed,
@@ -472,6 +536,7 @@ async def build_world(
     *,
     provider: EmailProviderKind = EmailProviderKind.OUTLOOK_LOCAL,
     automatic: bool = True,
+    canary: bool = True,
 ) -> World:
     ws = seed.workspace(name)
     seed.profile(ws, "primary")
@@ -504,6 +569,8 @@ async def build_world(
             await inquiries_repo.set_mode(
                 conn, actor, expected_version=controls.version, mode="automatic", reason="sender verified"
             )
+    if canary:
+        await complete_activation_canary(db, ws, binding.id)
     vehicle = await add_vehicle(db, seed, ws)
     return World(workspace_id=ws, seed=seed, sender_binding_id=binding.id, vehicle=vehicle)
 

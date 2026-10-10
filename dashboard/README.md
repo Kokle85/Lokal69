@@ -28,7 +28,15 @@ What the v1.1 screens show beyond the raw states:
   delivery and missing facts keep their own groups). None of them is an approval wait.
 - **Sending readiness** on the inquiry control: the standing authorization (`active` / `not
   recorded` / `not effective` / `revoked`) and the CONFIGURED sending identity's readiness with its
-  problem codes (never an address).
+  problem codes (never an address). Since D1 it also shows the backend's PROCESS-level gate
+  (`SELLER_INQUIRY_MODE`, the process kill switch, the owner's message-approval setting) and the
+  server's `automatic_inquiries_possible`: automatic inquiries are described as possible only when
+  the server says so, never because the database mode alone is `automatic` (nor while an owner
+  cap of 0 holds every inquiry, or a rolling cap is used up: those are named too); the inquiry
+  list's control summary says "nothing can be sent now" in that case. Since D2 the readiness also
+  shows the configured sender's activation canary ("Activation canary": complete / not complete,
+  `activation_canary_complete`): until it is complete the server reserves no real inquiry
+  (`activation_canary_incomplete`), and the sending state names that reason.
 - **Resume with suppression removal** sends `expected_removable_suppressions`, the count the owner
   was shown and ticked. When the server counts differently (`409 VERSION_CONFLICT`,
   `details.reason = suppressions_changed`, nothing changed) the controls are reloaded, the new count
@@ -47,8 +55,11 @@ What the v1.1 screens show beyond the raw states:
   the revoked workers (counted even when not listed), the reply-signal flood control (counts, the
   PROPOSED per-inquiry cap) and a read-only **activation evidence** table: sender readiness, runtime
   monitoring and the standing authorization from the API; the owner-controlled canary (rows 4-6 of
-  docs/seller_email_activation.md) is not served by the dashboard API, so it is shown as "not shown
-  here" with the CLI that reports it, never assumed, and there is no canary or send control.
+  docs/seller_email_activation.md) comes, for the owner only, from the read-only
+  `GET /api/activation/canary-evidence` (the same state as `suv-deals canary status`; shown as met
+  only when the server reports `complete`, unknown when it cannot be read) with the canaries' ids,
+  states and times (never the target); other roles never request it and see it as "owner only".
+  There is no canary, test or send control.
 - **Candidates** have the dashboard-only audit filter "include screening-rejected (audit)"
   (`include_screening_rejected=true` in the URL and the query, kept for "load more"); such rows are
   labelled "screening rejected (audit)" and are not candidates.
@@ -190,7 +201,9 @@ by a same-key retry then resume, a reviewer seeing the controls read-only, and e
 detail and attention groups (worker offline, seller cooldown, caps; inquiries paused after a pause),
 the authorization and sender readiness, the dot-signal state of replies, worker credentials
 (expiring, revoked) and the reply-signal cap, the read-only activation evidence with the canary
-never assumed, the candidates audit filter, and a resume whose confirmed suppression count is
+never assumed (D1: the owner's canary rows from the API, "owner only" for a reviewer), the
+process-level gate on the inquiry control (the E2E backend keeps `SELLER_INQUIRY_MODE` at its
+default, so "nothing can be sent now"), the candidates audit filter, and a resume whose confirmed suppression count is
 refused by the real server after a concurrent change, shown and confirmed again before a second
 attempt.
 

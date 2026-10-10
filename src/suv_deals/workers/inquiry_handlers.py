@@ -713,6 +713,11 @@ def _hold_code(reasons: Sequence[str], default: str) -> str:
 # =============================================================================================
 
 
+#: `reservation_refusal` code while the configured sender binding's current version has no complete
+#: activation canary (shown in ``inquiries status``, ``doctor`` and the dashboard control view).
+ACTIVATION_CANARY_INCOMPLETE: Final = "activation_canary_incomplete"
+
+
 def reservation_refusal(
     settings: Settings,
     listing: ListingRecord,
@@ -722,9 +727,11 @@ def reservation_refusal(
     """Why this run records readiness only (``None``: the reservation may be attempted).
 
     Process-level prerequisites (mode, kill switch, the owner's explicit approval setting that
-    DISABLES automatic sending instead of adding an approval wait), the configured send route and
-    fixture lineage. The domain decision covers controls, authorization, sender verification,
-    recipient, language, duplicates, suppressions, caps and cooldown.
+    DISABLES automatic sending instead of adding an approval wait), the configured send route,
+    fixture lineage and the activation evidence of the sender binding's current version
+    (``activation_canary_incomplete``: no complete canary yet; F3/OPS-04, wave D2). The domain
+    decision covers controls, authorization, sender verification, recipient, language,
+    duplicates, suppressions, caps and cooldown.
     """
     if listing.is_fixture:
         return "fixture_lineage"
@@ -742,6 +749,10 @@ def reservation_refusal(
         return "sender_identity_not_configured"
     if decision.readiness != InquiryReadiness.INQUIRY_READY:
         return f"readiness_{decision.readiness.value}"
+    if not snapshot.activation_canary_complete:
+        # F3/OPS-04 (wave D2): live test evidence for THIS sender binding version first (the
+        # owner's `canary send` and its correlated reply); the repository refuses it too.
+        return ACTIVATION_CANARY_INCOMPLETE
     return None
 
 
@@ -1656,6 +1667,7 @@ def _reconcile_provider(
 
 
 __all__ = [
+    "ACTIVATION_CANARY_INCOMPLETE",
     "CANDIDATE_STATES",
     "PLAN_PREFIX",
     "RECONCILE_PREFIX",

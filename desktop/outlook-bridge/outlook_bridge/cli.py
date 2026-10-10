@@ -242,6 +242,12 @@ def _check(args: argparse.Namespace, deps: CliDeps) -> int:
     return code
 
 
+def client_identity(config: BridgeConfig, store: LocalStore) -> ClientIdentity:
+    """The API identity of this installation: the configured worker id plus the local store's
+    instance id, which every send-intent claim carries (SEC-1: one running intent, one store)."""
+    return ClientIdentity(config.mailbox_binding_id, config.worker_id, store.store_instance_id)
+
+
 def _open_store(config: BridgeConfig, *, dry_run: bool) -> LocalStore:
     if dry_run:
         return LocalStore.in_memory(config.mailbox_binding_id)
@@ -324,7 +330,7 @@ def _run(config: BridgeConfig, deps: CliDeps, *, once: bool, dry_run: bool) -> i
             api = BridgeApiClient(
                 config.api_base_url,
                 token_provider=lambda: credentials.token(deps.clock.now()),
-                identity=ClientIdentity(config.mailbox_binding_id, config.worker_id),
+                identity=client_identity(config, store),
                 timeout_seconds=config.http_timeout_seconds,
                 transport=deps.transport,
             )

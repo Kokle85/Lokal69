@@ -44,7 +44,13 @@ from suv_deals.cli_commands._common import (
     warn,
 )
 
-DEFAULT_QUEUES = "discovery,detail,recheck,valuation"
+#: Every job type of ``workers.handlers.default_registry`` (the spec v1.1 seller inquiry / reply
+#: types included): a worker started without ``--queues`` processes the whole pipeline. A test
+#: keeps this, both compose files and the runbook in step with the registry.
+DEFAULT_QUEUES = (
+    "discovery,detail,recheck,valuation,"
+    "seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process"
+)
 DEFAULT_REGISTRY = "suv_deals.workers.handlers:default_registry"
 DEFAULT_APP_FACTORY = "suv_deals.api.app:build_app"
 _FACTORY_RE = re.compile(r"^(suv_deals(?:\.[a-z_][a-z0-9_]*)+):([A-Za-z_][A-Za-z0-9_]*)$")
@@ -258,10 +264,19 @@ RECONCILE_REPORT_GROUPS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
         ),
     ),
     ("replies", ("reply_process_jobs",)),
-    ("valuations", ("valuations_expired", "valuations_invalidated", "recompute_jobs", "watch_rechecks")),
+    (
+        "valuations",
+        (
+            "valuations_expired",
+            "valuations_invalidated",
+            "recompute_jobs",
+            "watch_rechecks",
+            "fx_rates_recorded",
+        ),
+    ),
     (
         "housekeeping",
-        ("claims_expired", "crawl_runs_closed", "snapshots_deleted", "idempotency_deleted"),
+        ("claims_expired", "crawl_runs_closed", "snapshots_deleted", "idempotency_deleted", "gates_seeded"),
     ),
 )
 

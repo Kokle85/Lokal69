@@ -262,7 +262,8 @@ def test_default_settings_close_the_canary_send_and_nothing_is_registered() -> N
     ):
         assert code in blockers
     assert len(blockers) == len(set(blockers))
-    assert canary_cli.CANARY_TRANSPORTS == {}  # no provider can transmit a canary yet
+    assert canary_cli.CANARY_TRANSPORTS == {}  # no API provider can transmit a canary yet
+    assert {"outlook_local"} == canary_cli.DESKTOP_CANARY_PROVIDERS  # F3: the desktop worker does
 
 
 def test_target_address_comes_from_the_environment_or_a_prompt_only() -> None:

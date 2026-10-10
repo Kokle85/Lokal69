@@ -22,7 +22,9 @@ itself, and nothing activates a source, notification route or seller email.
 - Fixture data never notifies (fixture outbox rows are blocked at enqueue time).
 - Secrets are never command-line arguments: they come from the environment or `.env` (local) or
   root-owned env files / Docker secrets (VPS). `suv-deals doctor` reports presence only.
-- Every state-changing CLI command needs `--yes`; `crawl once` cannot override a gate or take a URL.
+- Every state-changing administrative CLI command needs `--yes`; the process commands (`api serve`,
+  `worker`, `scheduler`, `reconcile`, `dispatcher`) and `crawl once` run without it, and `crawl
+  once` cannot override a gate, exceed the source budget or take a URL.
 - The `make db-*` targets (and `make dev`) only accept loopback targets and never read
   `DATABASE_URL` from `.env`. Their single guard is `suv-deals db target --local-only --url-env
   NAME`, which parses the connection string like libpq (every comma-separated host, `?host=` /
@@ -44,9 +46,9 @@ One image, one settings model, separate processes (spec §4):
 | Process | Command | Needs | Notes |
 |---|---|---|---|
 | API + MCP | `suv-deals api serve` | DB, auth config | `/api`, `/healthz` (liveness), `/readyz` (DB + schema + critical config), `/mcp`. Binds `127.0.0.1:8000` by default; containers bind `0.0.0.0` with `--allow-non-loopback` behind a `127.0.0.1`-only published port. HTTPS terminates at the reverse proxy. |
-| Worker | `suv-deals worker --queues discovery,detail,recheck,valuation` | DB; crawler when the network is enabled | Leases + heartbeats; SIGTERM finishes the current job. `--drain` processes due jobs and exits. |
+| Worker | `suv-deals worker --queues discovery,detail,recheck,valuation,seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process` (the default without `--queues`) | DB; crawler when the network is enabled; the sender route's key when `SELLER_EMAIL_PROVIDER=gmail_api` | Leases + heartbeats; SIGTERM finishes the current job. `--drain` processes due jobs and exits. It must claim the four `seller_*` types too: without them inquiries are never planned, sent or reconciled and seller replies are never processed (they stay `queued`). |
 | Scheduler | `suv-deals scheduler` | DB | One discovery job per due 15-minute slot; missed slots become coverage gaps, never bursts. `--once` for a single tick. |
-| Reconciler | `suv-deals reconcile --loop` | DB | Reapers, housekeeping, stale-detail and valuation sweeps; `--dry-run` reports a pass and rolls it back. |
+| Reconciler | `suv-deals reconcile --loop` | DB; HTTPS egress to `www.ecb.europa.eu` only when `FX_FETCH_ENABLED=true` | Reapers, housekeeping (incl. inserting missing spec 32 activation gates), stale-detail and valuation sweeps, and the gated ECB EUR->CHF refresh (at most every 6 h); `--dry-run` reports a pass and rolls it back (no FX fetch). |
 | Dispatcher | `suv-deals dispatcher` | DB; route secrets | Only the selected, verified route; `--once` for one pass. |
 | Crawler | `unclecode/crawl4ai:0.9.4` (pinned digest in production) | its own token | Private network; never receives database or Supabase keys. |
 
@@ -70,7 +72,8 @@ types) and `suv-deals api serve --app-factory suv_deals.<module>:<factory>` (a w
 | `MCP_PUBLIC_URL`, `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL` | required with `MCP_AUTH_MODE=oauth` | – | – | – | never |
 | `MCP_OAUTH_AUDIENCE` | optional (default: the resource URL) | – | – | – | never |
 | `CRAWL4AI_BASE_URL`, `CRAWL4AI_API_TOKEN` | – | required with `SOURCE_NETWORK_ENABLED=true` | – | – | token only |
-| `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `SLACK_DESTINATION_APPROVAL_REF` | – | – | – | required when Slack is the route | never |
+| `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`, `SLACK_DESTINATION_APPROVAL_REF` | – | – | – | required when Slack is the candidate route **or** seller-reply signals use Slack (`ALLOW_EXTERNAL_NOTIFICATIONS=true` and `SELLER_REPLY_SIGNAL_PROVIDER=slack`, its default: the owner's chosen reply route, even with native MCP Events for candidates) | never |
+| `SLACK_TEAM_ID`, `SLACK_BOT_USER_ID` (and `SLACK_APP_ID`, `SLACK_BOT_ID`) | – | – | – | recommended with either Slack use: workspace pinning and own-message loop protection; leave unset (blank = unset) rather than guessing | never |
 | `MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY` | required when MCP Events are on | – | – | required when MCP Events are on | never |
 | `LLM_API_KEY` | – | only `LLM_EXTRACTION_ENABLED=true` | – | – | never |
 
@@ -103,19 +106,49 @@ Supabase secret key unless evidence objects go to Supabase Storage.
 
 ### 3.2 Crawler egress isolation
 
-Docker networks keep the crawler off the application network, but its internet egress could
-still reach a public database endpoint. On the VPS add a host firewall rule for the crawler's
-egress network (example with iptables; adjust the bridge name shown by `docker network inspect
-suv-deals_crawler_egress`):
+Docker networks keep the crawler off the application network, but on their own they stop neither
+its internet egress to a public database endpoint nor its access to the HOST's own services: a
+packet from the crawler to an address the host owns (the `crawler_egress` bridge gateway, the app
+bridge gateway, the host's public IP) is delivered locally through the `INPUT` chain and never
+passes `FORWARD`, where Docker's `DOCKER-USER` chain hooks in. Chromium inside Crawl4AI loads
+hostile listing pages, so spec 24 ("the crawler network cannot reach host admin ports or
+secret-bearing internal services") needs BOTH rule sets. The compose files give the crawler
+networks fixed bridge names, `br-suv-crawl` (`crawler_egress`) and `br-suv-crawlint` (the internal
+`crawler` network), and keep IPv6 off on both (`enable_ipv6: false`), so only IPv4 rules are
+needed. On the VPS (and on any host whose services listen beyond loopback):
 
 ```bash
-# Block the crawler bridge from private ranges and the database endpoint; allow the rest.
-sudo iptables -I DOCKER-USER -i br-<crawler_egress_id> -d 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16 -j DROP
-sudo iptables -I DOCKER-USER -i br-<crawler_egress_id> -p tcp --dport 5432:6543 -j DROP
+# 1. Routed egress (FORWARD -> DOCKER-USER): no private ranges, no database ports.
+sudo iptables -I DOCKER-USER -i br-suv-crawl -d 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10 -j DROP
+sudo iptables -I DOCKER-USER -i br-suv-crawl -p tcp --dport 5432:6543 -j DROP
+# 2. The host itself (INPUT): no NEW connection from either crawler bridge to any host address.
+sudo iptables -I INPUT -i br-suv-crawl -m conntrack --ctstate NEW -j DROP
+sudo iptables -I INPUT -i br-suv-crawlint -m conntrack --ctstate NEW -j DROP
 ```
 
-Crawl4AI's own SSRF guard stays on (`CRAWL4AI_ALLOW_INTERNAL_URLS` unset = false). The
-application additionally enforces its URL policy, DNS checks and redirect validation per source.
+Container DNS keeps working: Docker's embedded resolver (127.0.0.11) answers inside the container
+namespace and forwards from the daemon's namespace. The worker <-> crawler traffic stays on the
+internal bridge and never targets a host address. Persist the rules with the host's firewall
+tooling (for example `iptables-save` / `netfilter-persistent`) and re-check them after a Docker
+upgrade. If IPv6 is ever enabled on a crawler network, add the same rules with `ip6tables` (with
+`fc00::/7`, `fe80::/10` and `::1/128` instead of the IPv4 private ranges) before using it.
+
+**Verification (part of the crawling activation gate, section 9)**: from inside the running
+crawler container, a TCP connect to each host address on a port the host really listens on
+beyond loopback (`ss -ltn`; 22 for sshd is typical) must FAIL (time out or be refused):
+
+```bash
+gw=$(docker network inspect suv-deals_crawler_egress -f '{{(index .IPAM.Config 0).Gateway}}')
+for target in "$gw:22" "172.31.0.1:22" "<host public IP>:22"; do
+  docker compose -f compose.production.yaml exec -T crawl4ai python3 -c \
+    "import socket,sys; h,p=sys.argv[1].rsplit(':',1); socket.create_connection((h,int(p)),3)" \
+    "$target" 2>/dev/null && echo "REACHABLE: $target - the crawling gate FAILS"
+done
+```
+
+Record the result with the release record. Crawl4AI's own SSRF guard stays on (`CRAWL4AI_ALLOW_INTERNAL_URLS` unset = false).
+The application additionally enforces its URL policy, DNS checks and redirect validation per
+source.
 
 ### 3.3 Supabase connection modes
 
@@ -196,7 +229,8 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `reconcile --workspace ID [--dry-run]` | one reconciliation pass for one active workspace (not with `--loop`) |
 | `mail-worker credential issue --sender-binding ID --label ... [--expires 90d] --yes` | binds the desktop mail worker to the sender binding's mailbox (`ops.mail_worker_bindings`) and prints its `suvmail_` token ONCE (only the hash is stored) |
 | `mail-worker credential revoke MAILBOX_ID --reason ... --yes`, `mail-worker credential list [--all]` | permanent revocation (the worker's next request is `401`, its local backlog is kept); health dimensions without tokens or addresses |
-| `sender-binding create --provider outlook_local\|gmail_api --account-id ... --from-address ... --display-name ... [--reply-to ...] [--vault-ref scheme:path] --reason ... --yes` | registers the owner-authorized sending identity, UNVERIFIED; a provider secret only as an external reference (never a value); output shows only the address domain |
+| `sender-binding create --provider outlook_local\|gmail_api --account-id ... --from-address ... --display-name ... [--reply-to ...] [--vault-ref scheme:path] --reason ... --yes` | registers the owner-authorized sending identity, UNVERIFIED; `--vault-ref` records an external reference only (the runtime does not read it); output shows only the address domain |
+| `sender-binding store-secret ID --client-id ... --expected-version N --reason ... --yes` | `gmail_api` only (OPS-09): seals the owner's OAuth grant into the binding with the server-side secret box (client secret / refresh token from `SUV_OAUTH_CLIENT_SECRET` / `SUV_OAUTH_REFRESH_TOKEN` for this one command or hidden prompts; never echoed) and prints `SELLER_EMAIL_OAUTH_SECRET_REFERENCE=secretbox:ops.email_sender_bindings/<id>`, the only form the runtime reads. The gmail_api provider verification and canary have no shipped command (docs/seller_email_activation.md section 9) |
 | `sender-binding verify ID --reason ... --yes` | `outlook_local` only: records the technical verification from the desktop worker's evidence (classic-Outlook account report of the bound address, fresh heartbeat, stable account key); refuses (exit 3) with problem codes otherwise. A prerequisite, never a message approval |
 | `sender-binding status [--all] [--json]` | verification, alias, health and secret presence (domains only) |
 | `inquiries authorize [--file PATH] --reason ... --yes` | creates the workspace controls (mode `disabled_until_sender_ready`) and records the owner's versioned standing authorization from `config/seller_inquiry_authorization.yaml` (idempotent for an identical latest version; an audit record, never a message approval) |
@@ -209,9 +243,11 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `jobs unblock JOB_ID --reason ... [--acknowledge-uncertain-delivery --owner-user-id UID] --yes` | moves a blocked job back to `queued` (audited `job.unblock`). A send job blocked `EMAIL_DELIVERY_UNCERTAIN` is refused unless the OWNER acknowledges that its e-mail may already have left (`--acknowledge-uncertain-delivery` needs `--owner-user-id`; the audit names the owner). No second e-mail can follow: the inquiry is no longer `queued`, so the dispatch holds |
 | `jobs resolve-blocked JOB_ID --outcome succeeded\|cancelled --reason ... --yes` | closes a blocked `EMAIL_DELIVERY_UNCERTAIN` send job AFTER its inquiry was reconciled (audited `job.resolve_blocked`); refused while the inquiry is still `uncertain` or has an unresolved attempt; never re-queues anything |
 | `canary prepare --purpose ... --yes`, `canary status [--json]`, `canary cancel ID --reason ... --yes` | the owner-controlled activation canary of the configured sender (section 10.6); the test address comes from `SUV_CANARY_TARGET_ADDRESS` or a hidden prompt and is stored as a SHA-256 only; output never shows the address or its hash |
-| `canary send ID --i-confirm-owner-controlled-address --yes` | the OWNER's one-time activation step (section 10.6): refuses (exit 3, nothing sent, nothing changed) unless `SELLER_EMAIL_CANARY_SEND_ENABLED=true` and every inquiry activation switch is on; today it ends with `CANARY_TRANSPORT_UNAVAILABLE` |
+| `canary send ID --i-confirm-owner-controlled-address --yes` | the OWNER's one-time activation step (section 10.6): refuses (exit 3, nothing sent, nothing changed) unless `SELLER_EMAIL_CANARY_SEND_ENABLED=true` and every inquiry activation switch is on; an `outlook_local` canary is then published to its desktop mailbox worker (exit 0), which sends it once to its locally configured `canary_target_address`; `gmail_api` / `microsoft_graph` end with `CANARY_TRANSPORT_UNAVAILABLE` |
+| `market import FILE --evidence-kind asking_price\|owner_estimate [--owner-user-id U] --reason ... [--dry-run] --yes` | MK market evidence recorded by the owner (spec 15; F2): a validated, size-bounded JSON file (`suv_deals.market_import/1`, docs: `domain/market_import.py`) of MK asking prices (each with its ad URL) or owner estimates (`--owner-user-id` of an active owner); no seller contact fields; audited and idempotent. Without any MK evidence every valuation is `insufficient_comparables` and nothing becomes `inquiry_ready` |
+| `fx status [--json]`, `fx refresh --yes`, `fx record --base EUR --quote CHF --rate D --date YYYY-MM-DD [--purpose reference\|payment\|customs] [--provider owner] --source-ref ... --reason ... --yes` | FX (spec 18): newest stored rate per pair/purpose and its age; one gated ECB fetch (`FX_FETCH_ENABLED=true`, else exit 1 and nothing fetched) recording EUR->CHF; an owner-entered rate (exact decimal, audited `fx_rate.record`, stored once; `ECB` reserved for fetched rows) |
 | `evaluation report --days 15 [--json]` | the 15-day quality evaluation from stored evidence (zero is reported as zero) |
-| `reconcile --workspace ID [--dry-run]` (text output) | one line per group: `queue`, `outbox`, `inquiries` (`inquiry_plan_jobs`, `inquiry_replan_jobs`, `inquiry_send_jobs`, `inquiry_retry_jobs`, `inquiry_reconcile_jobs`, `inquiry_send_jobs_unblocked`, `send_attempts_uncertain`, `inquiries_marked_replied`), `replies`, `valuations`, `housekeeping`; a counter without a group is printed under `other` |
+| `reconcile --workspace ID [--dry-run]` (text output) | one line per group: `queue`, `outbox`, `inquiries` (`inquiry_plan_jobs`, `inquiry_replan_jobs`, `inquiry_send_jobs`, `inquiry_retry_jobs`, `inquiry_reconcile_jobs`, `inquiry_send_jobs_unblocked`, `send_attempts_uncertain`, `inquiries_marked_replied`), `replies`, `valuations` (incl. `fx_rates_recorded`), `housekeeping` (incl. `gates_seeded`: missing spec 32 gates inserted, never overwritten); a counter without a group is printed under `other` |
 
 ## 6. Incidents (spec §30)
 
@@ -222,16 +258,16 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | Database outage | Processes back off on their own; stop schedulers if the outage is long: `docker compose stop scheduler dispatcher`. Do not delete leases or jobs. | After reconnect: `suv-deals reconcile --dry-run` then `suv-deals reconcile` (expired leases requeued, exhausted jobs dead-lettered visibly), `suv-deals outbox inspect`, `suv-deals doctor`. |
 | Worker crash | Nothing manual: the reaper requeues expired leases (`suv-deals reconcile`). | The same job completes once logically: `suv-deals worker --drain` then `outbox inspect`; no duplicate revisions (`evidence verify`). |
 | Notification uncertainty | Never resend blindly. `suv-deals outbox inspect` lists `uncertain` events; the dispatcher's follow-up rules (Slack lookup / single same-id resend for MCP Events) run on their own. | Provider receipt recorded or the event stays visibly `uncertain` with its reason. |
-| Stale tax/FX rules | Valuations are marked stale/incomplete automatically (`reconcile`). Validate candidate rule files: `suv-deals tax-rules validate config/tax_rules`. | An approved current rule set (docs/tax_rule_approval.md) and `suv-deals reconcile` recalculation. |
+| Stale tax/FX rules | Valuations are marked stale/incomplete automatically (`reconcile`). Validate candidate rule files: `suv-deals tax-rules validate config/tax_rules`. FX: `suv-deals fx status` shows the newest stored rate and its age. With `FX_FETCH_ENABLED=true` (`SUV_DEALS_ENABLE_FX_FETCH=true` under Compose) the reconciler fetches the ECB daily file at most every 6 h and records EUR->CHF (a failure is reported as `fx:DEPENDENCY_UNAVAILABLE` in the pass and retried after 1 h); `suv-deals fx refresh --yes` fetches once now. Without network access the owner records a rate by hand: `suv-deals fx record --base EUR --quote CHF --rate 0.94 --date YYYY-MM-DD --source-ref "..." --reason "..." --yes` (audited; `ECB` is reserved for fetched rows; never an MKD peg). | An approved current rule set (docs/tax_rule_approval.md), a current EUR/CHF rate (`fx status` age within the profile's FX freshness) and `suv-deals reconcile` recalculation. |
 | Secret exposure | Stop the affected integration (e.g. `docker compose stop dispatcher`, revoke MCP credentials: `suv-deals credentials revoke ID --reason ... --yes`), request controlled rotation from the owner. Run `uv run python scripts/redact_logs.py` on logs before sharing. | Old access revoked, new scoped credential tested, `suv-deals doctor` clean, logs reviewed. |
 | Uncertain seller-inquiry send | Never resend, never cancel: an `uncertain` inquiry keeps its reservation and quota debit. Look: dashboard Inquiries (attention filter) or `GET /api/inquiries?uncertain_only=true`; `suv-deals inquiries status`. If the desktop worker is offline, start it (it reports Outbox / Sent Items evidence when it reconnects); a reply quoting the Message-ID also proves submission. If the cause is unclear, pause: `suv-deals inquiries pause --reason "uncertain send" --expected-version N --yes`. | The inquiry moves to `accepted` only on positive evidence (Sent Items / provider hit / correlated reply), or to `failed_definite` only on proof of non-submission (e.g. the worker refused an expired, never-claimed intent `intent_expired`). An empty Sent Items search proves nothing. |
 | Stale or offline desktop mail worker | `suv-deals mail-worker credential list` (heartbeat age, monitoring) or dashboard Mail workers; check the PC is awake, classic Outlook runs and the account syncs. Coverage gaps are recorded, never hidden. Replies keep arriving in Outlook; nothing is lost while the worker is off. | Heartbeat fresh, `monitoring=true`, gap closed in `GET /api/mail-workers/coverage-gaps`; the worker's local backlog drains (reconciliation over the overlap window recovers mail received while it was off). |
 | Lost or compromised desktop credential | `suv-deals mail-worker credential revoke MAILBOX_ID --reason ... --yes` (the worker stops at once and keeps its backlog), then issue a new binding (section 10.2) and store the new token on the PC. | New heartbeat with the new credential; old token `401` (`mail_worker_credential_revoked`). |
-| Revoked or expired worker credential (seen in health) | `GET /api/mail-workers/health` (`credentials[].credential_status` `expired`/`revoked`, `revoked_mailboxes`, warning "credential is expired or revoked") or `suv-deals mail-worker credential list --all`. Revoking a credential revokes its mailbox binding too: every published inquiry binding is tombstoned and a claim or report that was waiting for the revocation is refused `403` (`mailbox_binding_revoked`), so the worker never calls `.Send`. Nothing else to undo. | A new binding issued (10.2) and its first heartbeat; send jobs released `MAILBOX_WORKER_CREDENTIAL_NOT_LIVE` continue on their own; the revoked mailbox stays counted in health. |
-| Reply signal cap reached | Health `reply_signals.rate_limited` > 0 / warning "per-inquiry signal cap" and the reply's `signal_status = rate_limited` (PROPOSED cap `MAX_SIGNALS_PER_INQUIRY_24H` = 6 signals per inquiry per rolling 24 h; `coalesced` replies rode on a signal still to be posted). Every reply is stored and listed; only the extra dot activation is skipped. Read the inquiry's replies on the dashboard (Replies, filter by inquiry) or with `seller_inquiries_get` (`reply_count`, `latest_reply_id`). A worker uploading new replies beyond 120 per hour is answered `429` (`mail_worker_ingest_volume`) and keeps its backlog. | The window rolls on: the next reply after the 24 h window emits its own signal; investigate a seller or loop that keeps replying (pause the inquiries if needed). |
+| Revoked or expired worker credential (seen in health) | `GET /api/mail-workers/health` (`credentials[].credential_status` `expired`/`revoked`, `revoked_mailboxes`, warning "credential is expired or revoked") or `suv-deals mail-worker credential list --all`. Such a mailbox is never reported as monitoring (health, `doctor`, `inquiries status`), however fresh its last heartbeat (reason "mailbox worker credential expired or revoked"). Revoking a credential revokes its mailbox binding too: every published inquiry binding is tombstoned and a claim or report that was waiting for the revocation is refused `403` (`mailbox_binding_revoked`), so the worker never calls `.Send`. Nothing else to undo. | A new binding issued (10.2) and its first heartbeat; send jobs released `MAILBOX_WORKER_CREDENTIAL_NOT_LIVE` continue on their own; the revoked mailbox stays counted in health. |
+| Reply signal cap reached | Health `reply_signals.rate_limited` > 0 / warning "per-inquiry signal cap" and the reply's `signal_status = rate_limited` (PROPOSED cap `MAX_SIGNALS_PER_INQUIRY_24H` = 6 signals per inquiry per rolling 24 h, counting emitting replies and signal events alike; `coalesced` replies rode on a signal still to be posted; when that signal ends `dead_letter` or `cancelled` without posting, the dispatcher re-emits ONE signal for the inquiry's newest coalesced reply within the cap, audited `seller_reply.signal_reemit`). Every reply is stored and listed; only the extra dot activation is skipped. Read the inquiry's replies on the dashboard (Replies, filter by inquiry) or with `seller_inquiries_get` (`reply_count`, `latest_reply_id`). A worker uploading new replies beyond 120 per hour is answered `429` (`mail_worker_ingest_volume`) and keeps its backlog. | The window rolls on: the next reply after the 24 h window emits its own signal; investigate a seller or loop that keeps replying (pause the inquiries if needed). |
 | Uncertain after a contradicting worker report | A worker reported `refused_before_send` for an intent whose claim was GRANTED (`.Send` may have been called): the attempt is `uncertain` with `REFUSED_AFTER_GRANTED_CLAIM`, the inquiry keeps its reservation and quota debit, and the guarded retry refuses it (`claim_granted_before_refusal`). Never resend. Check classic Outlook on the PC (Outbox, Sent Items) for the inquiry's Message-ID; if the report cannot be explained, treat the worker credential as compromised (revoke it, row above). | Positive evidence (Sent Items report, a correlated reply) moves the inquiry to `accepted`; then close its blocked send job with `jobs resolve-blocked` (row below). Without evidence it stays `uncertain` (visible attention item). |
 | Blocked send job after reconciliation | `suv-deals jobs blocked` lists `EMAIL_DELIVERY_UNCERTAIN` send jobs. Once the inquiry left `uncertain` (accepted, or proven unsent and handled by the guarded retry): `suv-deals jobs resolve-blocked JOB_ID --outcome succeeded\|cancelled --reason ... --yes`. It refuses while the inquiry is still uncertain and never re-queues. Do NOT `jobs unblock` such a job unless the owner explicitly acknowledges the possible delivery (`--acknowledge-uncertain-delivery --owner-user-id`). | The job is `succeeded`/`cancelled` with `RESOLVED_AFTER_RECONCILIATION`, audited `job.resolve_blocked`. |
-| Activation canary | `suv-deals canary status` (evidence state) and `suv-deals doctor` (`seller_inquiry/activation_canary`). A canary is never a seller inquiry; the send is the owner's step (section 10.6). Keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false` outside that step. | `complete` (correlated test reply for the binding's current version) recorded in the activation log. |
+| Activation canary | `suv-deals canary status` (evidence state), `suv-deals doctor` (`seller_inquiry/activation_canary`) or, for the owner, the dashboard Mail workers page (rows 4-6 from the read-only `GET /api/activation/canary-evidence`). `canary send` claims the canary through `canaries_repo.claim_for_send` (every database gate re-checked in the statement that commits it `uncertain`; a refusal lists the codes). A canary is never a seller inquiry; the send is the owner's step (section 10.6). Keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false` outside that step. | `complete` (correlated test reply for the binding's current version) recorded in the activation log. |
 | Disk / memory pressure | Reduce concurrency: run one worker, stop optional snapshots (`SNAPSHOT_STORAGE=disabled`), restart the affected service. | Resource recovery without losing queue state: `outbox inspect`, `reconcile --dry-run`. |
 
 Readiness versus liveness: `/healthz` is process liveness only; `/readyz` includes database,
@@ -277,10 +313,16 @@ RESTORE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres \
 
 Release (spec §29, §31):
 
-1. Commit; `scripts/verify_release.sh` on the exact commit (lint, mypy, schema snapshots, tests
-   without DB, DB tests on PostgreSQL 16 and 17, migration hashes, lock hashes, YAML configuration
-   hash, source adapter versions, MCP SDK/protocol) -> `var/releases/<sha>_<ts>.txt`. Add the
-   stored configuration revision of the target (`suv-deals config apply --dry-run`).
+1. Commit; `scripts/verify_release.sh --with-e2e` on the exact commit (lint and mypy including
+   the desktop worker and the E2E harness, schema snapshots, tests without DB, DB tests on
+   PostgreSQL 16 and 17, the desktop worker's tests, dashboard `npm ci`/build (with the target's
+   `VITE_SUPABASE_URL` / `VITE_SUPABASE_PUBLISHABLE_KEY` exported)/vitest/lint/audit,
+   the browser E2E on PostgreSQL 16 and 17, migration hashes, lock hashes, uv/Python/node/npm
+   versions, YAML configuration hash, source adapter versions, MCP SDK/protocol) ->
+   `var/releases/<sha>_<ts>.txt`, each step `passed` / `FAILED` / `NOT RUN`; only a clean tree with
+   every step passed is `result=verified` (without `--with-e2e` the E2E is NOT RUN). Copy the report
+   and the dashboard, desktop and E2E outputs to `docs/qa/<sha>/`. Add the stored configuration
+   revision of the target (`suv-deals config apply --dry-run`).
 2. Build the image with pinned base digests (Dockerfile header), record its digest
    (`RELEASE_IMAGE_DIGEST`) and the tested crawler digest (`CRAWL4AI_IMAGE_DIGEST`).
 3. Back up (section 7); apply expand-first migrations (section 4.1).
@@ -302,11 +344,27 @@ Rollback:
 
 ## 9. Activation checklist (spec §32)
 
-Each capability stays `implemented`/`fixture_verified` until its own evidence exists:
-crawler (`doctor --crawler` against the real runtime), each source (terms decision + robots +
-`crawl once` live smoke), Supabase (migrations + `doctor` + restore drill), MCP auth (real client,
-`docs/connect_mcp.md`), MCP Events / Slack (docs/notification_bridge.md canary), tax rules
-(docs/tax_rule_approval.md), seller email (docs/seller_email_activation.md).
+Each capability stays `implemented`/`fixture_verified` until its own evidence exists. The current
+state of every gate, its missing dependency and the smallest owner action are in
+`ACTIVATION_GATES.md`; the per-item implementation status (U1-U12) is in `IMPLEMENTATION_STATUS.md`.
+
+- **Crawler**: `doctor --crawler` against the real runtime, plus the host firewall rules of
+  section 3.2 (DOCKER-USER **and** INPUT) with the in-container verification showing every host
+  address unreachable. No live crawl before both are recorded.
+- **Each source**, in this order (`docs/source_access_register.md` steps 1-7): a terms decision
+  and robots handling; an **adapter implementation with a real `adapter_version`, verified routes
+  and saved fixtures** (12 of the 14 registered sources are `adapter_version: unimplemented`
+  today, both MK comparable sources included: `sources inspect <key>` and `doctor` report them as
+  "not activatable (no adapter)"; configuration alone can never activate them); then the gated
+  live smoke `suv-deals crawl once --source <key> --max-pages 1` with `SOURCE_NETWORK_ENABLED=true`
+  and its evidence record (register step 6).
+- **Supabase**: migrations + `doctor` + restore drill (section 7).
+- **MCP auth**: a real client (`docs/connect_mcp.md`).
+- **MCP Events / Slack**: the docs/notification_bridge.md canary; the Slack seller-reply route has
+  its own gate (`seller_reply_slack_route`).
+- **Tax rules**: docs/tax_rule_approval.md.
+- **Seller email**: docs/seller_email_activation.md (gates `seller_email_sender` and
+  `seller_inquiry`).
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 
@@ -324,8 +382,11 @@ configuration and the database, never in the repository or a ticket.
 1. `suv-deals sender-binding create --workspace W --provider outlook_local --account-id
    <stable Outlook account key> --from-address <the owner's mailbox> --display-name "<name used as
    signature>" --reason "owner-authorized sending identity" --yes` (unverified, health `unknown`).
-   For `gmail_api` add `--vault-ref <scheme:path>` naming the external secret store entry; never a
-   token value.
+   No shipped tool shows the stable account key before the worker's first account report (OPS-10,
+   open): use the account's SMTP address as `--account-id` (step 2 accepts it with the warning
+   `ACCOUNT_ID_IS_THE_SMTP_ADDRESS`). For `gmail_api` the grant is sealed afterwards with
+   `sender-binding store-secret` (section 5); `--vault-ref` only records an external reference the
+   runtime does not read. Never a token value on the command line.
 2. After the desktop worker runs (10.2, 10.3) and has sent its account report and heartbeat:
    `suv-deals sender-binding verify <id> --reason "technical verification" --yes`. It refuses with
    problem codes (`NO_ACTIVE_MAIL_WORKER`, `WORKER_ACCOUNT_MISMATCH`, `WORKER_ACCOUNT_NOT_CLASSIC`,
@@ -351,8 +412,10 @@ configuration and the database, never in the repository or a ticket.
    status` (run with the same environment) then shows `process_mode: automatic` and
    `sending_possible: true` once `SELLER_EMAIL_ACCOUNT_ID` / `SELLER_EMAIL_FROM` (and
    `SELLER_EMAIL_REPLY_TO`, if the binding has one) name exactly the verified binding
-   (`sender_identity_problems: []`; the runtime never sends from another identity, 10.5).
-   Lower the caps any time with `inquiries set-limits`.
+   (`sender_identity_problems: []`; the runtime never sends from another identity, 10.5) and
+   both rolling caps leave room (a cap of 0 holds every inquiry: `sending_possible: false`, also
+   in the dashboard's "Automatic inquiries possible now"). Lower the caps any time with
+   `inquiries set-limits`.
 
 ### 10.2 Issuing the mail-worker credential
 
@@ -387,9 +450,9 @@ Follow `desktop/outlook-bridge/README.md` ("Installation"); in short:
 - Resume is an owner action only: dashboard (`POST /api/inquiry-control/resume`) or
   `suv-deals inquiries resume --reason ... --expected-version N --yes`. With
   `--remove-suppressions --expected-suppressions K --owner-user-id <owner's user id>` (dashboard:
-  `remove_suppressions` + `expected_removable_suppressions`), the kill-switch suppressions (and,
-  while the authorization is effective, authorization-revoked ones) are removed, each with its own
-  audit event. `K` is the `removable_suppressions` count the owner saw (`inquiries status`,
+  `remove_suppressions` + `expected_removable_suppressions`, both required together), the
+  kill-switch suppressions (and, while the authorization is effective, authorization-revoked ones)
+  are removed, each with its own audit event. `K` is the `removable_suppressions` count the owner saw (`inquiries status`,
   `GET /api/inquiry-control`): if it changed meanwhile the whole resume is refused (`409
   VERSION_CONFLICT`, `suppressions_changed`; CLI exit 1) and nothing changes. Opt-out, bounce,
   complaint and other suppressions need their own explicit owner decision.
@@ -406,6 +469,7 @@ a body. The runtime codes of a `seller_inquiry_plan` / `seller_inquiry_send` job
 | Code | Where | Meaning and fix |
 |---|---|---|
 | `sender_identity_not_configured` (plan refusal) | plan | No verified binding of `SELLER_EMAIL_PROVIDER` is exactly the configured identity (`SELLER_EMAIL_ACCOUNT_ID`, `SELLER_EMAIL_FROM`, `SELLER_EMAIL_REPLY_TO`). Set them to the verified binding's values (`suv-deals doctor` requires them in automatic mode); another verified identity is never used. |
+| `activation_canary_incomplete` (plan readiness, reservation refused) | plan | No `complete` activation canary for the configured sender binding's CURRENT version (wave D2, F3/OPS-04): nothing is reserved or debited; the pair is planned again once `canary status` shows `complete` (10.6). |
 | `SENDER_SETUP_INCOMPLETE` (blocked) | send | The inquiry's binding is no longer the configured identity, or the sender secret is unusable: `SECRET_REFERENCE_BINDING_MISMATCH` (`SELLER_EMAIL_OAUTH_SECRET_REFERENCE` must name the bound binding itself), `SECRET_REFERENCE_UNSUPPORTED` (only `secretbox:` references), `SECRET_BOX_NOT_CONFIGURED` (the secret-box key is missing). Fix the setting; nothing was transmitted. |
 | `SEND_HELD_PAUSED` (released) | send | Kill switch on or mode not automatic; the job waits without consuming attempts. |
 | `MAILBOX_WORKER_MISSING`, `WORKER_HEARTBEAT_STALE` (released) | send, `outlook_local` | No active desktop worker for the sender, or it is offline; nothing was published. Start the worker (10.3). |
@@ -445,7 +509,36 @@ on (`canary prepare` refuses both with exit 3 and records nothing; the cap names
    (an `uncertain` canary is reconciled, never re-sent). Hold real seller inquiries meanwhile
    with `inquiries set-limits --max-per-24h 0 --max-per-15d 0` (the caps do not apply to a
    canary).
-4. **Current blocker:** no route has a canary transport yet (the providers send only registered
-   seller templates and the desktop worker claims only inquiry intents), so step 3 ends with
-   `CANARY_TRANSPORT_UNAVAILABLE` after every other gate. Rows 4-6 of the activation checklist stay
-   open; keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false` and report this blocker.
+4. **Transport.** `outlook_local` (the default route): the claimed canary is published to the
+   sender binding's desktop mailbox worker; the worker needs `send_intents_enabled = true` and the
+   SAME owner test address as `canary_target_address` in its local `config.toml`
+   (desktop/outlook-bridge/README.md). It refuses locally before any `.Send` (the canary fails;
+   prepare a new one) when that address is missing, hashes differently, is the sending account, or
+   the 24-hour publication window ended; otherwise it claims once, sends once and reports Sent
+   Items evidence (`accepted`, row 5). Reply to the canary from the test mailbox: the worker
+   uploads the reply's headers and the sender's hash only, and `canary status` shows `complete`
+   (row 6, Outlook -> backend; the Slack -> dot -> MCP leg is not exercised by a canary,
+   docs/seller_email_activation.md section 9). `gmail_api` / `microsoft_graph`: no canary transport
+   (they send only registered seller templates), so step 3 ends with `CANARY_TRANSPORT_UNAVAILABLE`
+   and rows 4-6 stay open on those routes. Keep `SELLER_EMAIL_CANARY_SEND_ENABLED=false` outside the
+   owner's step.
+5. **No real inquiry before it.** Until the configured sender binding's CURRENT version has a
+   `complete` canary, every real seller inquiry is refused at reservation with
+   `activation_canary_incomplete` (nothing debited; the plan job records the reason and plans the
+   pair again later). `inquiries status` (`activation_canary`), `doctor`
+   (`seller_inquiry/activation_canary`) and the dashboard inquiry control show it. A re-verified
+   sender (new binding version) needs a new canary.
+
+### 10.7 Known limitations (seller e-mail)
+
+- **Vehicle documents are verified manually (U9 partial, F10).** The desktop worker uploads
+  attachment metadata only (file name, MIME type, size, SHA-256, local reference); the bytes of a
+  CoC, registration document or any other attachment stay in the owner's mailbox. The owner reads
+  them there and records CoC, registration and CO2 / emissions facts as listing notes; no
+  automatic document verification exists. A separately scoped, size-limited upload with local
+  sensitivity filtering is a follow-up.
+- **The activation canary has a transport on `outlook_local` only**; `gmail_api` cannot be
+  activated with this build (no provider-verification command, no canary transport;
+  docs/seller_email_activation.md section 9).
+- **The canary reply does not travel Slack -> dot -> MCP**; that leg stays part of gate
+  `seller_reply_slack_route` (docs/notification_bridge.md section 7).

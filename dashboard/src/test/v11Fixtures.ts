@@ -256,6 +256,12 @@ export function control(overrides: Partial<InquiryControlView> = {}): InquiryCon
     sender_provider: 'outlook_local',
     sender_binding_version: 2,
     sender_problems: [],
+    process_mode: 'automatic',
+    process_kill_switch: false,
+    process_message_approval_required: false,
+    process_blockers: [],
+    activation_canary_complete: true,
+    automatic_inquiries_possible: true,
     ...overrides,
   }
 }

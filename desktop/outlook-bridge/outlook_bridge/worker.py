@@ -1,5 +1,6 @@
 """The reply worker loop: startup reconciliation, NewMailEx prompts, binding sync, uploads,
-send intents and heartbeats (spec 37.6-37.8).
+send intents, activation canaries (F3, wave D2: ``outlook_bridge.canary``) and heartbeats
+(spec 37.6-37.8).
 
 Order of operations at startup: record any offline gap, attach to the configured Outlook account
 and folders, subscribe ``NewMailEx`` (prompt only), sync bindings (tombstones included), reconcile
@@ -40,6 +41,7 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from outlook_bridge.api_client import ApiErrorKind, BridgeApiClient, BridgeApiError
+from outlook_bridge.canary import CanaryProcessor
 from outlook_bridge.compatibility import CompatibilityReport, OutlookFlavour
 from outlook_bridge.config import BridgeConfig
 from outlook_bridge.credentials import CredentialManager, CredentialState
@@ -129,11 +131,25 @@ class BridgeWorker:
             own_addresses=(config.account_smtp_address,),
         )
         self._monitor = CoverageMonitor(store)
+        self._canary: CanaryProcessor | None = None
+        if api is not None and config.send_intents_enabled and not dry_run:
+            self._canary = CanaryProcessor(
+                config=config,
+                store=store,
+                mailbox=mailbox,
+                api=api,
+                outlook_is_classic=lambda: (
+                    self._compat.flavour == OutlookFlavour.CLASSIC and self._compat.supported
+                ),
+                account_smtp=lambda: self._account.smtp_address if self._account is not None else None,
+                on_api_error=self._sender_api_failed,
+            )
         self._processor = ItemProcessor(
             store=store,
             matcher=self._matcher,
             mailbox=mailbox,
             max_pending_locators=config.max_pending_locators,
+            on_new_item=self._canary.on_item if self._canary is not None else None,
         )
         self._reconciler = Reconciler(
             config=config, store=store, mailbox=mailbox, processor=self._processor, monitor=self._monitor
@@ -610,6 +626,8 @@ class BridgeWorker:
         if not force and self._next_send_poll is not None and now < self._next_send_poll:
             return
         report.sends.update(self._sender.run_once(now))
+        if self._canary is not None:
+            report.sends.update({f"canary_{k}": v for k, v in self._canary.run_once(now).items()})
         self._next_send_poll = now + SEND_POLL_EVERY
 
     def _account_report(self, now: datetime) -> None:

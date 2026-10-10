@@ -100,6 +100,10 @@ class BridgeConfig(BaseModel):
     send_intents_enabled: bool = True
     start_outlook_if_not_running: bool = False
     data_dir: Path | None = None
+    #: The OWNER-CONTROLLED test address of the one-time activation canary (F3, wave D2): another
+    #: mailbox of the owner (never a seller, never the sending account). Only this machine knows
+    #: it; the backend keeps its SHA-256 and the worker sends a canary only when they match.
+    canary_target_address: str | None = Field(default=None, min_length=3, max_length=254)
 
     @field_validator("account_smtp_address")
     @classmethod
@@ -109,6 +113,13 @@ class BridgeConfig(BaseModel):
             raise ValueError("account_smtp_address must be a plain e-mail address")
         local, domain = text.split("@", 1)
         return f"{local}@{domain.lower().rstrip('.')}"
+
+    @field_validator("canary_target_address")
+    @classmethod
+    def _canary_target(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return cls._address(value)
 
     @field_validator("api_base_url")
     @classmethod
@@ -143,6 +154,11 @@ class BridgeConfig(BaseModel):
             raise ValueError("at most one junk folder may be configured")
         if self.max_catchup_days * 24 < self.unmatched_retry_hours:
             raise ValueError("max_catchup_days must cover the unmatched retry window")
+        if (
+            self.canary_target_address is not None
+            and self.canary_target_address.casefold() == self.account_smtp_address.casefold()
+        ):
+            raise ValueError("canary_target_address must be another mailbox than the sending account")
         return self
 
     # ------------------------------------------------------------------ derived values

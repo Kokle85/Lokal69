@@ -60,7 +60,9 @@ its consequences in ONE transaction (the caller's ``unit_of_work`` of the worker
    whose post may already have happened - ``uncertain`` or ``sending`` after its attempt began -
    or that can never post - ``blocked``, terminal - never swallows a newer reply), and at most
    ``MAX_SIGNALS_PER_INQUIRY_24H`` signal-emitting replies per inquiry in any rolling 24 hours
-   (``rate_limited`` beyond it). The
+   (``rate_limited`` beyond it; signal EVENTS of the inquiry count too). When a signal that newer
+   replies were coalesced into ends ``dead_letter``/``cancelled`` without posting, the dispatcher
+   re-emits ONE signal for the inquiry (`reemit_muted_signal`, D1 item 4). The
    reply is always stored and visible; ``app.seller_replies.signal_status`` records what happened
    (``emitted`` / ``coalesced`` / ``rate_limited`` / ``not_applicable``). Per mailbox credential,
    at most ``MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR`` new replies (incl. quarantined conflicts) are
@@ -93,6 +95,7 @@ from suv_deals.domain.enums import InquiryState, JobState, JobType, ReplyMessage
 from suv_deals.domain.inquiries import ReconciliationEvidence
 from suv_deals.domain.listings import canonical_json
 from suv_deals.domain.replies import (
+    CANARY_MARKER,
     FINGERPRINT_VERSION,
     MK_SUMMARY_VERSION,
     SANITIZER_VERSION,
@@ -109,6 +112,7 @@ from suv_deals.domain.replies import (
     ReplyClaims,
     ReplyIngestRequest,
     ReplyProcessingDecision,
+    ReplySignalStatus,
     ReplySourceContent,
     SourceMessageIdentity,
     StoredReplyIngest,
@@ -922,12 +926,19 @@ select exists (select 1 from ops.outbox o
                        or (o.state = 'sending' and o.send_attempted_at is null))) as pending,
        (select count(*) from app.seller_replies r
          where r.workspace_id = %(ws)s and r.inquiry_id = %(inquiry)s and r.signal_status = 'emitted'
-           and r.ingested_at > pg_catalog.clock_timestamp() - %(window)s::interval) as emitted
+           and r.ingested_at > pg_catalog.clock_timestamp() - %(window)s::interval) as emitted,
+       (select count(*) from ops.outbox s
+         where s.workspace_id = %(ws)s and s.event_type = %(event)s
+           and s.payload ->> 'inquiry_id' = %(inquiry)s::text
+           and s.created_at > pg_catalog.clock_timestamp() - %(window)s::interval) as signals
 """
 
 
 async def _signal_gate(conn: Conn, workspace_id: UUID, inquiry_id: UUID) -> SignalStatus:
     """Whether a new matched reply of ``inquiry_id`` may emit its ``seller.reply.received`` signal.
+
+    ``rate_limited`` once ``MAX_SIGNALS_PER_INQUIRY_24H`` replies emitted a signal, or that many
+    signal events of the inquiry (re-emits included) were created, in the rolling 24 hours.
 
     ``coalesced`` only into a signal that has not been posted yet (`UNDELIVERED_SIGNAL_STATES`,
     or ``sending`` before its send attempt began): its later post makes dot read this reply too.
@@ -950,9 +961,191 @@ async def _signal_gate(conn: Conn, workspace_id: UUID, inquiry_id: UUID) -> Sign
     assert row is not None
     if row["pending"]:
         return "coalesced"
-    if int(row["emitted"]) >= MAX_SIGNALS_PER_INQUIRY_24H:
+    # The cap bounds dot activations: emitting replies AND signal events (a re-emitted signal of
+    # `reemit_muted_signal` is an event without an emitting reply, D1 item 4).
+    if max(int(row["emitted"]), int(row["signals"])) >= MAX_SIGNALS_PER_INQUIRY_24H:
         return "rate_limited"
     return "emitted"
+
+
+# --------------------------------------------------------------------------------------------
+# Muted signals (D1 item 4)
+# --------------------------------------------------------------------------------------------
+
+#: How far back the dispatcher's sweep looks for coalesced replies muted by a dead signal.
+REEMIT_LOOKBACK: Final = timedelta(days=7)
+#: Terminal outbox states of a signal that never posted (its coalesced replies never reached dot).
+MUTING_SIGNAL_STATES: Final = ("dead_letter", "cancelled")
+
+#: Per inquiry, its NEWEST coalesced reply in the lookback window, when (a) a signal of the inquiry
+#: that it may have been coalesced into ended ``dead_letter``/``cancelled`` (created no later than
+#: the reply), (b) no signal of the inquiry covers it: none is still to be posted (it will make dot
+#: read every reply) and none began its post after the reply arrived (dot read the inquiry after
+#: it), and (c) it has no signal of its own yet (the re-emit's deduplication key).
+_MUTED_SQL: Final = """
+with newest as (
+  select distinct on (r.inquiry_id) r.inquiry_id, r.id as reply_id, r.ingested_at
+    from app.seller_replies r
+   where r.workspace_id = %(ws)s and r.signal_status = 'coalesced' and not r.quarantined
+     and r.ingested_at > pg_catalog.clock_timestamp() - %(lookback)s::interval
+     and (%(inquiry)s::uuid is null or r.inquiry_id = %(inquiry)s::uuid)
+   order by r.inquiry_id, r.ingested_at desc, r.id desc
+)
+select n.inquiry_id, n.reply_id, n.ingested_at,
+       (select count(*) from app.seller_replies c
+         where c.workspace_id = %(ws)s and c.inquiry_id = n.inquiry_id and c.signal_status = 'coalesced'
+           and not c.quarantined
+           and c.ingested_at >= (select max(d.created_at) from ops.outbox d
+                                  where d.workspace_id = %(ws)s and d.event_type = %(event)s
+                                    and d.payload ->> 'inquiry_id' = n.inquiry_id::text
+                                    and d.state = any(%(muting)s::text[])
+                                    and d.created_at <= n.ingested_at)) as coalesced_replies,
+       coalesce((select bool_or(d.payload -> %(canary)s = 'true'::jsonb) from ops.outbox d
+                  where d.workspace_id = %(ws)s and d.event_type = %(event)s
+                    and d.payload ->> 'inquiry_id' = n.inquiry_id::text), false) as is_canary,
+       (select count(*) from ops.outbox s
+         where s.workspace_id = %(ws)s and s.event_type = %(event)s
+           and s.payload ->> 'inquiry_id' = n.inquiry_id::text
+           and s.created_at > pg_catalog.clock_timestamp() - %(window)s::interval) as recent_signals
+  from newest n
+ where exists (select 1 from ops.outbox d
+                where d.workspace_id = %(ws)s and d.event_type = %(event)s
+                  and d.payload ->> 'inquiry_id' = n.inquiry_id::text
+                  and d.state = any(%(muting)s::text[]) and d.created_at <= n.ingested_at)
+   and not exists (select 1 from ops.outbox e
+                    where e.workspace_id = %(ws)s and e.event_type = %(event)s
+                      and e.payload ->> 'inquiry_id' = n.inquiry_id::text
+                      and (e.state = any(%(undelivered)s::text[])
+                           or (e.state = 'sending' and e.send_attempted_at is null)
+                           or (e.state in ('sending', 'uncertain', 'delivered')
+                               and e.send_attempted_at >= n.ingested_at)))
+   and not exists (select 1 from ops.outbox x
+                    where x.workspace_id = %(ws)s and x.dedup_key = %(event)s || ':' || n.reply_id::text)
+   and (select count(*) from ops.outbox s
+         where s.workspace_id = %(ws)s and s.event_type = %(event)s
+           and s.payload ->> 'inquiry_id' = n.inquiry_id::text
+           and s.created_at > pg_catalog.clock_timestamp() - %(window)s::interval) < %(cap)s
+ order by n.ingested_at, n.inquiry_id
+ limit %(limit)s
+"""
+_REEMIT_INQUIRY_SQL: Final = """
+select i.id, i.qualification_listing_id, i.vehicle_cluster_id, l.is_fixture
+  from app.seller_inquiries i
+  join app.listings l on l.workspace_id = i.workspace_id and l.id = i.qualification_listing_id
+ where i.workspace_id = %(ws)s and i.id = %(id)s
+   for update of i
+"""
+
+
+def _require_signal_writer(actor: ActorContext) -> None:
+    if actor.principal_kind != "system":
+        raise Forbidden("Only the dispatcher (a system principal) re-emits reply signals")
+
+
+async def _muted(
+    conn: Conn, workspace_id: UUID, *, inquiry_id: UUID | None, limit: int
+) -> list[dict[str, Any]]:
+    async with mapped_errors():
+        return await fetch_all(
+            conn,
+            _MUTED_SQL,
+            {
+                "ws": workspace_id,
+                "inquiry": inquiry_id,
+                "event": SELLER_REPLY_SIGNAL_EVENT,
+                "muting": list(MUTING_SIGNAL_STATES),
+                "undelivered": list(UNDELIVERED_SIGNAL_STATES),
+                "lookback": REEMIT_LOOKBACK,
+                "window": SIGNAL_WINDOW,
+                "canary": CANARY_MARKER,
+                "cap": MAX_SIGNALS_PER_INQUIRY_24H,
+                "limit": limit,
+            },
+        )
+
+
+async def muted_signal_inquiries(conn: Conn, actor: ActorContext, *, limit: int = 20) -> list[UUID]:
+    """Inquiries whose coalesced replies were muted by a ``dead_letter``/``cancelled`` signal and
+    that may get ONE re-emitted signal now (under ``MAX_SIGNALS_PER_INQUIRY_24H``; oldest first).
+
+    The dispatcher's sweep (system principal) calls `reemit_muted_signal` for each, one short
+    transaction per inquiry. No locks are taken here.
+    """
+    _require_signal_writer(actor)
+    if not 1 <= limit <= 100:
+        raise ValidationFailed("limit must be between 1 and 100")
+    return [r["inquiry_id"] for r in await _muted(conn, actor.workspace_id, inquiry_id=None, limit=limit)]
+
+
+async def reemit_muted_signal(
+    conn: Conn, actor: ActorContext, inquiry_id: UUID, *, dashboard_base_url: str
+) -> UUID | None:
+    """Re-emit ONE ``seller.reply.received`` signal for an inquiry whose coalesced replies were
+    muted by a signal that ended ``dead_letter`` or ``cancelled`` (D1 item 4); ``None`` when there
+    is nothing to do (covered meanwhile, already re-emitted, or at the per-inquiry cap).
+
+    Under the inquiry row lock (``ingest_reply`` takes the same lock first, so a reply ingested
+    concurrently is decided before or after this, never in between). The new signal names the
+    NEWEST coalesced reply (status ``seller reply received``; dot reads every reply of the inquiry
+    once it posts) and is deduplicated by that reply (``seller.reply.received:<reply id>``), so a
+    sweep that runs again, or a re-emitted signal that dies too, never re-emits for the same
+    replies twice. It counts against ``MAX_SIGNALS_PER_INQUIRY_24H`` like any signal (the ingest
+    gate counts signal events). Fixture lineage is stored ``blocked`` as at ingest. Audited
+    ``seller_reply.signal_reemit`` (ids and counts only).
+    """
+    _require_signal_writer(actor)
+    async with mapped_errors():
+        inquiry = await fetch_one(conn, _REEMIT_INQUIRY_SQL, {"ws": actor.workspace_id, "id": inquiry_id})
+    if inquiry is None:
+        return None
+    found = await _muted(conn, actor.workspace_id, inquiry_id=inquiry_id, limit=1)
+    if not found or int(found[0]["recent_signals"]) >= MAX_SIGNALS_PER_INQUIRY_24H:
+        return None
+    muted = found[0]
+    async with mapped_errors():
+        now_row = await fetch_one(conn, "select pg_catalog.clock_timestamp() as now")
+    assert now_row is not None
+    draft = build_seller_reply_signal(
+        event_id=uuid4(),
+        inquiry_id=inquiry_id,
+        reply_id=muted["reply_id"],
+        listing_id=inquiry["qualification_listing_id"],
+        dashboard_base_url=dashboard_base_url,
+        occurred_at=ensure_utc(now_row["now"]),
+        status=ReplySignalStatus.RECEIVED,
+        vehicle_cluster_id=inquiry["vehicle_cluster_id"],
+        is_fixture=bool(inquiry["is_fixture"]),
+        is_canary=bool(muted["is_canary"]),
+    )
+    event_id, created = await outbox.enqueue_event(
+        conn,
+        actor,
+        event_type=draft.event_type,
+        event_version=1,
+        aggregate_type=draft.aggregate_type,
+        aggregate_id=draft.aggregate_id,
+        aggregate_version=None,
+        payload=draft.payload,
+        dedup_key=draft.dedup_key,
+        is_fixture=draft.is_fixture,
+        event_id=draft.event_id,
+    )
+    if not created:
+        return None
+    await audit.record(
+        conn,
+        actor,
+        "seller_reply.signal_reemit",
+        "seller_reply",
+        muted["reply_id"],
+        reason="signal re-emitted: the signal the replies were coalesced into never posted",
+        metadata={
+            "inquiry_id": inquiry_id,
+            "outbox_event_id": event_id,
+            "coalesced_replies": int(muted["coalesced_replies"] or 0),
+        },
+    )
+    return event_id
 
 
 _INGEST_VOLUME_SQL: Final = """
@@ -1489,7 +1682,9 @@ __all__ = [
     "DEFAULT_INGEST_OPTIONS",
     "MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR",
     "MAX_SIGNALS_PER_INQUIRY_24H",
+    "MUTING_SIGNAL_STATES",
     "POSSIBLY_POSTED_SIGNAL_STATES",
+    "REEMIT_LOOKBACK",
     "REPLY_PROCESS_PREFIX",
     "SELLER_REPLY_SIGNAL_EVENT",
     "UNDELIVERED_SIGNAL_STATES",
@@ -1499,6 +1694,8 @@ __all__ = [
     "SignalStatus",
     "ingest",
     "ingest_reply",
+    "muted_signal_inquiries",
+    "reemit_muted_signal",
     "signal_payload_is_minimal",
     "stored_source_content",
 ]

@@ -510,6 +510,9 @@ class ReadinessSnapshot(BaseModel):
     sender_binding: SenderBindingRecord | None = None
     authorization_id: UUID
     vehicle_label: tuple[str | None, str | None, str | None] = (None, None, None)
+    #: A ``reply_correlated`` activation canary exists for the sender binding's CURRENT version
+    #: (F3/OPS-04, wave D2; `activation_canary_complete`): without it nothing is reserved.
+    activation_canary_complete: bool = False
 
 
 class DispatchResult(BaseModel):
@@ -764,6 +767,41 @@ async def granted_claims(conn: Conn, actor: ActorContext, inquiry_id: UUID) -> f
     return frozenset(claimed)
 
 
+_CLAIM_HOLDERS_SQL: Final = (
+    "select e.metadata ->> 'intent_id' as intent_id, e.metadata ->> 'worker_id' as worker_id"
+    " from ops.audit_events e"
+    " where e.workspace_id = %(ws)s and e.target_type = 'seller_inquiry' and e.target_id = %(id)s"
+    " and e.action = %(action)s and coalesce(e.metadata ->> 'proceed', 'true') <> 'false'"
+)
+
+
+async def granted_claim_workers(
+    conn: Conn, actor: ActorContext, inquiry_id: UUID, intent_id: UUID
+) -> frozenset[str | None]:
+    """The ``worker_id`` values that hold a GRANTED claim of one ``outlook_local`` intent.
+
+    The server grants a running intent to ONE desktop worker only (SEC-1, wave D2): the claim
+    refuses every other ``worker_id`` with ``ALREADY_CLAIMED``. Fail safe like `granted_claims`:
+    a granted claim audit whose intent id cannot be read counts for THIS intent, and one whose
+    worker id is missing is reported as ``None`` (never equal to a caller's id), so an unreadable
+    audit row can only ever refuse a claim, never let a second worker through.
+    """
+    require_inquiry_reader(actor)
+    params = {"ws": actor.workspace_id, "id": inquiry_id, "action": CLAIM_AUDIT_ACTION}
+    async with mapped_errors():
+        rows = await fetch_all(conn, _CLAIM_HOLDERS_SQL, params)
+    holders: set[str | None] = set()
+    for row in rows:
+        try:
+            matches = UUID(str(row["intent_id"])) == intent_id
+        except ValueError:
+            matches = True
+        if matches:
+            worker = row["worker_id"]
+            holders.add(worker if isinstance(worker, str) and worker else None)
+    return frozenset(holders)
+
+
 def _claimed_local_attempt(attempt: AttemptRecord, claimed: frozenset[UUID]) -> bool:
     return attempt.provider == EmailProviderKind.OUTLOOK_LOCAL and attempt.attempt_id in claimed
 
@@ -1014,7 +1052,9 @@ async def control_view(
     Also the standing-authorization status (``missing`` / ``active`` / ``not_effective`` /
     ``revoked``) and the configured sender's readiness: ``sender_binding_id`` is the configured
     sender binding (the caller resolves it from the settings; default: the newest unrevoked
-    binding), ``ready`` when it is verified, alias-verified, healthy and unrevoked.
+    binding), ``ready`` when it is verified, alias-verified, healthy and unrevoked, and whether its
+    CURRENT version has a completed activation canary (`activation_canary_complete`, the gate of
+    `reserve`).
     """
     controls = await get_controls(conn, actor)
     if controls is None:
@@ -1030,6 +1070,9 @@ async def control_view(
         else await active_binding(conn, actor)
     )
     sender_problems = sender_binding_problems(binding)
+    canary_complete = binding is not None and await activation_canary_complete(
+        conn, actor.workspace_id, binding.id, binding.version
+    )
     return InquiryControlView(
         version=controls.version,
         mode=controls.mode,
@@ -1048,6 +1091,7 @@ async def control_view(
         sender_provider=None if binding is None else binding.provider,
         sender_binding_version=None if binding is None else binding.version,
         sender_problems=tuple(sender_problems),
+        activation_canary_complete=canary_complete,
     )
 
 
@@ -2135,7 +2179,35 @@ async def read_readiness_inputs(
         sender_binding=binding,
         authorization_id=authorization.id,
         vehicle_label=(vehicle.make, vehicle.model, vehicle.generation),
+        activation_canary_complete=binding is not None
+        and await activation_canary_complete(conn, actor.workspace_id, binding.id, binding.version),
     )
+
+
+#: Reservation refusal (problem code / ``details.reason``) while the configured sender binding's
+#: current version has no complete activation canary (F3/OPS-04, wave D2).
+ACTIVATION_CANARY_INCOMPLETE: Final = "ACTIVATION_CANARY_INCOMPLETE"
+
+
+async def activation_canary_complete(
+    conn: Conn, workspace_id: UUID, sender_binding_id: UUID, sender_binding_version: int
+) -> bool:
+    """Whether the owner's activation evidence is complete for this sender binding VERSION.
+
+    Spec 32 / 37.10: live test evidence (the provider test message, its receipt reconciliation and
+    a correlated test reply) precedes the first real inquiry. An ``ops.inquiry_activation_canaries``
+    row of exactly this binding version in state ``reply_correlated`` is that evidence (it is
+    frozen once finished and never deleted). A re-verified (new version) sender needs a new one.
+    """
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select exists (select 1 from ops.inquiry_activation_canaries"
+            " where workspace_id = %(ws)s and sender_binding_id = %(sender)s"
+            " and sender_binding_version = %(version)s and state = 'reply_correlated') as complete",
+            {"ws": workspace_id, "sender": sender_binding_id, "version": sender_binding_version},
+        )
+    return bool(row and row["complete"])
 
 
 async def open_inquiry(
@@ -2332,6 +2404,35 @@ def _refuse(problem: str, message: str = "The reservation is refused") -> Valida
     return ValidationFailed(message, details={"problems": [problem]})
 
 
+#: Problem code of `FixtureLineageRefused` (the same code the worker claim reports).
+FIXTURE_LINEAGE: Final = "FIXTURE_LINEAGE"
+
+
+class FixtureLineageRefused(ValidationFailed):
+    """A fixture-lineage listing (``app.listings.is_fixture``, frozen at ingest) is never reserved
+    or dispatched (D1 item 5): ``VALIDATION_ERROR`` with ``details = {reason: fixture_lineage,
+    problems: [FIXTURE_LINEAGE]}``; nothing changed. The persistence-level guard behind the
+    runtime's own refusal, and the only one before an API provider (``gmail_api``), which has no
+    worker claim step."""
+
+    def __init__(self, step: Literal["reserve", "dispatch"]) -> None:
+        super().__init__(
+            f"Fixture lineage is never {'reserved' if step == 'reserve' else 'dispatched'}",
+            details={"reason": "fixture_lineage", "problems": [FIXTURE_LINEAGE]},
+        )
+
+
+async def _fixture_lineage(conn: Conn, workspace_id: UUID, listing_id: UUID) -> bool:
+    """Whether the qualification listing has fixture lineage (a missing listing counts as one)."""
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select is_fixture from app.listings where workspace_id = %(ws)s and id = %(id)s",
+            {"ws": workspace_id, "id": listing_id},
+        )
+    return row is None or bool(row["is_fixture"])
+
+
 async def _hold_errors(
     conn: Conn,
     actor: ActorContext,
@@ -2425,6 +2526,8 @@ async def reserve(
     binding, message, preview = prepared.binding, prepared.message, prepared.preview
     controls = await _locked_controls(conn, actor)
     record = await _lock_inquiry(conn, actor, inquiry_id)
+    if await _fixture_lineage(conn, ws, record.qualification_listing_id):
+        raise FixtureLineageRefused("reserve")  # the first, final answer (nothing changed)
     async with mapped_errors():
         now = await _now(conn)
     if record.state == InquiryState.RESERVED or record.state not in PRE_RESERVATION_STATES:
@@ -2469,6 +2572,12 @@ async def reserve(
     sender = await get_binding(conn, actor, binding.sender.binding_id)
     if sender.sender_binding() != binding.sender or not sender.usable:
         raise _refuse("SENDER_BINDING_CHANGED")
+    if not await activation_canary_complete(conn, ws, sender.id, sender.version):
+        # F3/OPS-04 (wave D2): no real inquiry is reserved before the route's activation evidence.
+        raise ValidationFailed(
+            "No complete activation canary exists for this sender binding version; nothing is reserved",
+            details={"problems": [ACTIVATION_CANARY_INCOMPLETE], "reason": "activation_canary_incomplete"},
+        )
     authorization = await current_authorization(conn, actor)
     if (
         authorization is None
@@ -2809,6 +2918,8 @@ async def dispatch(
     ws = actor.workspace_id
     controls = await _locked_controls(conn, actor)
     record = await _lock_inquiry(conn, actor, inquiry_id)
+    if await _fixture_lineage(conn, ws, record.qualification_listing_id):
+        raise FixtureLineageRefused("dispatch")  # before any attempt or intent (nothing changed)
     async with mapped_errors():
         now = await _now(conn)
         tx_now = await _tx_now(conn)
@@ -3722,7 +3833,9 @@ def require_message_approval_flag(value: object) -> bool:
 
 
 __all__ = [
+    "ACTIVATION_CANARY_INCOMPLETE",
     "CLAIM_AUDIT_ACTION",
+    "FIXTURE_LINEAGE",
     "LEASE_EXPIRED",
     "REFUSED_AFTER_GRANTED_CLAIM",
     "REQUALIFIED_AFTER_RESUME",
@@ -3731,6 +3844,7 @@ __all__ = [
     "AuthorizationRecord",
     "AutomaticModePrerequisitesMissing",
     "DispatchResult",
+    "FixtureLineageRefused",
     "InquiryControls",
     "InquiryRecord",
     "OutcomeResult",
@@ -3742,6 +3856,7 @@ __all__ = [
     "SuppressionAdded",
     "SuppressionRow",
     "WindowDecision",
+    "activation_canary_complete",
     "active_suppressions",
     "add_suppression",
     "authorization_problems",
@@ -3754,6 +3869,7 @@ __all__ = [
     "get_attempt",
     "get_controls",
     "get_inquiry",
+    "granted_claim_workers",
     "granted_claims",
     "list_attempts",
     "lock_attempt",

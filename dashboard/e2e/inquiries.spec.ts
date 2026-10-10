@@ -253,8 +253,10 @@ test.describe('mail workers, lags and evaluation', () => {
     await expect(page.locator('[data-testid="activation-row"][data-evidence="sender"]')).toHaveAttribute('data-state', 'done')
     await expect(page.locator('[data-testid="activation-row"][data-evidence="authorization"]')).toHaveAttribute('data-state', 'done')
     await expect(page.locator('[data-testid="activation-row"][data-evidence="runtime"]')).toHaveAttribute('data-state', 'open')
-    await expect(page.locator('[data-testid="activation-row"][data-evidence="canary"]')).toHaveAttribute('data-state', 'not_shown')
+    // D1: the canary evidence (rows 4-6) is the owner's; a reviewer never requests it.
+    await expect(page.locator('[data-testid="activation-row"][data-evidence="canary"]')).toHaveAttribute('data-state', 'owner_only')
     await expect(page.getByTestId('canary-evidence')).toContainText('never assumed')
+    expect(apiRequests.filter((request) => request.url().includes('/api/activation/canary-evidence'))).toEqual([])
     const activation = page.locator('#activation-evidence')
     await expect(activation.getByRole('button')).toHaveCount(0)
     await expect(activation.getByRole('link')).toHaveCount(0)
@@ -268,6 +270,28 @@ test.describe('mail workers, lags and evaluation', () => {
     await expectNoApproveOrSendControl(page)
     // Only reads.
     expect(apiRequests.filter((request: Request) => request.method() !== 'GET')).toEqual([])
+    expect(problems).toEqual([])
+  })
+
+  test('owner: the canary rows 4-6 show the evidence the server reports, read-only', async ({ page }) => {
+    const { problems, apiRequests } = guard(page)
+    await signIn(page, 'owner')
+    await page.goto('/mail-workers')
+    // D1: GET /api/activation/canary-evidence (owner only). D2 (F3/OPS-04): nothing is reserved
+    // without a completed canary of the current sender binding version, so the seed's owner ran
+    // one (on the since-retired desktop worker): the evidence is "complete", one correlated canary.
+    await expect(page.locator('[data-testid="activation-row"][data-evidence="canary"]')).toHaveAttribute('data-state', 'done')
+    await expect(page.getByTestId('canary-evidence')).toHaveAttribute('data-evidence-state', 'complete')
+    await expect(page.getByTestId('canary-evidence')).toContainText('outlook local sender binding')
+    await expect(page.getByTestId('canary-item')).toHaveCount(1)
+    await expect(page.getByTestId('canary-item').first()).toHaveAttribute('data-state', 'reply_correlated')
+    const activation = page.locator('#activation-evidence')
+    await expect(activation).toContainText('sent only by the owner on the command line')
+    await expect(activation.getByRole('button')).toHaveCount(0)
+    await expect(activation.getByRole('link')).toHaveCount(0)
+    expect(apiRequests.filter((request) => request.url().includes('/api/activation/canary-evidence')).length).toBeGreaterThan(0)
+    expect(apiRequests.filter((request: Request) => request.method() !== 'GET')).toEqual([])
+    await expect(page.locator('main')).not.toContainText('@example.invalid')
     expect(problems).toEqual([])
   })
 
@@ -349,7 +373,13 @@ test.describe('inquiry control', () => {
     await expect(page.getByTestId('authorization-status')).toContainText('version 1')
     await expect(page.getByTestId('sender-readiness')).toHaveAttribute('data-readiness', 'ready')
     await expect(page.getByTestId('sender-readiness')).toContainText('outlook local')
-    await expect(page.getByTestId('sending-state')).toContainText('the standing authorization is active and the configured sender is ready')
+    // D1: the E2E backend runs with SELLER_INQUIRY_MODE at its default: the database controls say
+    // automatic, but the process gate is closed, so the screen never claims anything can be sent.
+    await expect(page.getByTestId('sending-state')).toContainText('nothing can be sent now')
+    await expect(page.getByTestId('sending-state')).toContainText('SELLER_INQUIRY_MODE is disabled until sender ready, not automatic')
+    await expect(page.getByTestId('sending-state')).not.toContainText('the backend process gate is open')
+    await expect(page.getByTestId('process-gate')).toHaveAttribute('data-open', 'no')
+    await expect(page.getByTestId('automatic-possible')).toHaveAttribute('data-possible', 'no')
     await expect(page.locator('main')).not.toContainText('@example.invalid')
     await expect(page.getByText(/Your role cannot pause seller inquiries/)).toBeVisible()
     await expect(page.getByRole('button', { name: /Pause seller inquiries|Resume seller inquiries/ })).toHaveCount(0)

@@ -326,11 +326,33 @@ def source_findings(settings: Settings, verbose: bool) -> list[Finding]:
         if gate.active:
             findings.append(Finding("sources", gate.source_key, "ok", f"active ({gate.mode})"))
             continue
-        detail = f"not active: {len(gate.problems)} gate problem(s)"
+        if not gate.activatable:
+            # OPS-03: no terms review, owner decision or switch can activate a source without an
+            # adapter; it is never "one decision away".
+            detail = f"not activatable (no adapter: {gate.adapter} {gate.adapter_version})"
+        else:
+            detail = f"not active: {len(gate.problems)} gate problem(s)"
         if verbose:
             detail += " - " + "; ".join(gate.problems)
         findings.append(Finding("sources", gate.source_key, "info", detail))
+    findings.append(recipient_evidence_finding(settings, registry))
     return findings
+
+
+def recipient_evidence_finding(settings: Settings, registry: Any) -> Finding:
+    """Which acquisition sources can yield an inquiry recipient (exact-ad seller-contact evidence,
+    spec 37.3; F1, wave D2). Listings of any other source stay ``seller_not_linked`` or
+    ``seller_email_unavailable`` and are never inquired."""
+    configured, active = registry.recipient_evidence_sources()
+    detail = (
+        f"recipient evidence producers: active {', '.join(active) or 'none'}; "
+        f"configured {', '.join(configured) or 'none'}"
+    )
+    if not active:
+        detail += " - no active acquisition source yields a seller e-mail address"
+        detail += ", so no listing can be inquired"
+    warn = not active and settings.seller_inquiry_mode == "automatic"
+    return Finding("sources", "recipient_evidence", "warn" if warn else "info", detail)
 
 
 async def seller_inquiry_readiness(settings: Settings) -> list[Finding]:
@@ -579,10 +601,13 @@ def canary_finding(prefix: str, settings: Settings, canaries: Sequence[Any] | No
 
     ``ok`` once a correlated test reply was recorded for the binding's current version; otherwise
     ``info`` (``warn`` while ``SELLER_INQUIRY_MODE=automatic``: activation evidence row 4-6 of
-    docs/seller_email_activation.md is still open). ``canaries=None``: the canary table of migration
-    20261008000200 is not applied yet (reported, never an error). States and versions only.
+    docs/seller_email_activation.md is still open), naming the reservation refusal
+    ``activation_canary_incomplete`` (F3/OPS-04: no real inquiry is reserved before it).
+    ``canaries=None``: the canary table of migration 20261008000200 is not applied yet (reported,
+    never an error). States and versions only.
     """
     from suv_deals.cli_commands.canary import canary_evidence
+    from suv_deals.workers.inquiry_handlers import ACTIVATION_CANARY_INCOMPLETE
 
     if canaries is None:
         return Finding(
@@ -595,6 +620,8 @@ def canary_finding(prefix: str, settings: Settings, canaries: Sequence[Any] | No
     name, text = f"{prefix}activation_canary", f"{state}: {detail}"
     if state == "complete":
         return Finding("seller_inquiry", name, "ok", text)
+    # F3/OPS-04 (wave D2): the reservation gate this evidence opens, by its refusal code.
+    text = f"{text}; {ACTIVATION_CANARY_INCOMPLETE}: no real seller inquiry is reserved until then"
     if settings.seller_inquiry_mode == "automatic":
         return Finding("seller_inquiry", name, "warn", text)
     return Finding("seller_inquiry", name, "info", text)

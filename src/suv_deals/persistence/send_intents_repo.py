@@ -489,8 +489,18 @@ async def _fixture_lineage(conn: Conn, workspace_id: UUID, listing_id: UUID) -> 
     return row is None or bool(row["is_fixture"])
 
 
+#: Another desktop worker id already holds a granted claim of this running intent (SEC-1).
+ALREADY_CLAIMED: Final = "ALREADY_CLAIMED"
+
+
 async def _claim_refusal(
-    conn: Conn, worker: WorkerIdentity, record: InquiryRecord, attempt: AttemptRecord, request_id: str
+    conn: Conn,
+    worker: WorkerIdentity,
+    record: InquiryRecord,
+    attempt: AttemptRecord,
+    request_id: str,
+    *,
+    worker_id: str,
 ) -> tuple[OutlookRefusalReason, str] | None:
     ws = worker.workspace_id
     system = worker.system_actor(request_id)
@@ -534,6 +544,14 @@ async def _claim_refusal(
         return OutlookRefusalReason.INTENT_INVALID, "INTENT_CLOSED"
     if now >= attempt.lease_expires_at:
         return OutlookRefusalReason.INTENT_EXPIRED, "INTENT_EXPIRED"
+    # One running intent, one desktop worker (SEC-1, wave D2): the desktop's local store is per
+    # data_dir, so a second installation, a reinstall or a wiped store must not be granted the
+    # same intent again. The holder itself is re-granted (a lost claim answer); every other
+    # worker id - or an unreadable holder, fail safe - is refused for good. Its refusal report
+    # keeps the attempt uncertain (a granted claim exists), so the message is never resent.
+    holders = await inquiries_repo.granted_claim_workers(conn, system, record.id, attempt.attempt_id)
+    if any(holder != worker_id[:128] for holder in holders):
+        return OutlookRefusalReason.INTENT_INVALID, ALREADY_CLAIMED
     sender = await get_binding(conn, system, attempt.sender_binding_id)
     if sender.version != attempt.sender_binding_version or not sender.usable:
         return OutlookRefusalReason.BINDING_MISMATCH, "SENDER_BINDING_CHANGED"
@@ -608,7 +626,7 @@ async def claim(
     record, attempt = await _worker_attempt(conn, worker, intent_id, request_id)
     refusal: tuple[OutlookRefusalReason, str] | None
     if process_gate is None:
-        refusal = await _claim_refusal(conn, worker, record, attempt, request_id)
+        refusal = await _claim_refusal(conn, worker, record, attempt, request_id, worker_id=worker_id)
     elif await _fixture_lineage(conn, worker.workspace_id, record.qualification_listing_id):
         refusal = (OutlookRefusalReason.INTENT_INVALID, FIXTURE_LINEAGE)
     else:
@@ -892,6 +910,7 @@ class PersistentOutlookGateway:
 
 
 __all__ = [
+    "ALREADY_CLAIMED",
     "FIXTURE_LINEAGE",
     "LEASE_OWNER_PREFIX",
     "MAX_INTENTS_PAGE",

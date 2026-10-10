@@ -118,10 +118,11 @@ class Harness:
         self.store = LocalStore.in_memory(MAILBOX_ID)
         self.cred_store = InMemoryCredentialStore(WorkerCredential(token=TOKEN))
         self.credentials = CredentialManager(self.cred_store, self.store)
+        self.api_identity = ClientIdentity(MAILBOX_ID, self.config.worker_id, self.store.store_instance_id)
         self.api = BridgeApiClient(
             self.config.api_base_url,
             token_provider=lambda: self.credentials.token(self.clock.now()),
-            identity=ClientIdentity(MAILBOX_ID, self.config.worker_id),
+            identity=self.api_identity,
             transport=self.backend.transport(),
         )
         self.session = OutlookComSession(

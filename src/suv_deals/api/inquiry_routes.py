@@ -16,10 +16,15 @@ answer with the shared ``ResponseEnvelope``.
   expected version, a reason and an idempotency key, and optionally removes (each one audited) the
   active ``kill_switch`` suppressions and, while the current standing authorization is effective,
   the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint, ...) are never
-  removed here. ``expected_removable_suppressions`` (the count the owner saw in the control view)
-  is compared under the controls lock: a different count refuses the whole resume (``409
-  VERSION_CONFLICT``, ``details.reason = suppressions_changed``), so only the suppressions the owner
-  saw are removed. The control view's sender readiness describes the CONFIGURED sending identity.
+  removed here. ``expected_removable_suppressions`` (the count the owner saw in the control view;
+  REQUIRED with ``remove_suppressions``, ``422`` otherwise) is compared under the controls lock: a
+  different count refuses the whole resume (``409 VERSION_CONFLICT``, ``details.reason =
+  suppressions_changed``), so only the suppressions the owner saw are removed. The control view's
+  sender readiness describes the CONFIGURED sending identity, and its process gate (D1 item 7) the
+  serving backend's ``SELLER_INQUIRY_MODE``, kill switch and message-approval setting:
+  ``automatic_inquiries_possible`` only while every gate is open.
+- Activation canary evidence (owner only, ``config:admin``; read-only, D1 item 6): rows 4-6 of
+  the activation checklist for the configured sender and the newest canaries (never the target).
 - Mail-worker health and coverage gaps (``inquiries:read``): separate health dimensions per
   mailbox worker; a gap is never hidden.
 - Lifecycle and lags (``deals:read``): separate scan/notification/mail lags; unknown is never zero.
@@ -63,20 +68,30 @@ from suv_deals.api.schemas import (
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import SuppressionReason
+from suv_deals.domain.inquiries import requires_message_approval
 from suv_deals.domain.money import Money
-from suv_deals.errors import AppError, ErrorCode, VersionConflict
+from suv_deals.errors import AppError, ErrorCode, ValidationFailed, VersionConflict
 from suv_deals.mcp.tools import pause_inquiries
-from suv_deals.persistence import idempotency, inquiries_repo, queries
+from suv_deals.persistence import canaries_repo, idempotency, inquiries_repo, queries
 from suv_deals.persistence.database import Conn, db_now
 from suv_deals.persistence.errors_map import TransientConflict
 from suv_deals.persistence.inquiries_repo import SuppressionRow
 from suv_deals.persistence.queries import QueryResult
 from suv_deals.settings import Settings
 from suv_deals.views.common import ResponseEnvelope, envelope
-from suv_deals.views.inquiries import InquiryControlView, InquiryResumeResult
+from suv_deals.views.inquiries import (
+    ActivationCanaryView,
+    CanaryEvidenceView,
+    InquiryControlView,
+    InquiryResumeResult,
+)
 from suv_deals.views.lifecycle import CoverageLagsView, ListingLifecycleView
 from suv_deals.views.mail_workers import MailCoverageGapListView, MailWorkerHealthView
-from suv_deals.workers.inquiry_handlers import configured_sender_binding, configured_sender_problems
+from suv_deals.workers.inquiry_handlers import (
+    automatic_sending_enabled,
+    configured_sender_binding,
+    configured_sender_problems,
+)
 
 router = APIRouter()
 
@@ -99,6 +114,9 @@ REPLY: Final = _route("GET /api/replies/{reply_id}")
 CONTROL: Final = _route("GET /api/inquiry-control")
 PAUSE: Final = _route("POST /api/inquiry-control/pause")
 RESUME: Final = _route("POST /api/inquiry-control/resume")
+CANARY_EVIDENCE: Final = _route("GET /api/activation/canary-evidence")
+#: Canaries listed by the canary-evidence view (newest first).
+CANARY_EVIDENCE_LIMIT: Final = 20
 HEALTH: Final = _route("GET /api/mail-workers/health")
 GAPS: Final = _route("GET /api/mail-workers/coverage-gaps")
 LAGS: Final = _route("GET /api/lifecycle/lags")
@@ -229,6 +247,7 @@ async def configured_control_view(conn: Conn, actor: ActorContext, settings: Set
             "sender_provider": None,
             "sender_binding_version": None,
             "sender_problems": ("sender_binding_missing",),
+            "activation_canary_complete": False,
         }
     else:
         identity = [
@@ -238,9 +257,60 @@ async def configured_control_view(conn: Conn, actor: ActorContext, settings: Set
         ]
         if identity:
             problems = tuple(dict.fromkeys([*identity, *view.sender_problems]))[:10]
-            update = {"sender_readiness": "missing", "sender_problems": problems}
+            update = {
+                "sender_readiness": "missing",
+                "sender_problems": problems,
+                "activation_canary_complete": False,
+            }
     removable = await removable_suppressions(conn, actor, await _now(conn))
-    return view.model_copy(update={**update, "removable_suppressions": len(removable)})
+    gated = view.model_copy(update={**update, "removable_suppressions": len(removable)})
+    return gated.model_copy(update=process_gate(settings, gated))
+
+
+def caps_leave_room(view: InquiryControlView) -> bool:
+    """Whether the owner's rolling caps let an inquiry go out NOW: both caps above 0 (a cap of 0
+    holds every real seller inquiry, e.g. during the activation canary step,
+    docs/seller_email_activation.md section 8) and neither rolling window used up."""
+    return view.used_24h < view.max_per_24h and view.used_15d < view.max_per_15d
+
+
+def process_gate(settings: Settings, view: InquiryControlView) -> dict[str, Any]:
+    """The PROCESS-level gate of the serving backend next to the database controls (D1 item 7).
+
+    ``SELLER_INQUIRY_MODE``, ``SELLER_INQUIRY_KILL_SWITCH`` and the owner's
+    ``SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL`` setting (which disables automatic sending); the
+    blocker codes are those of ``suv-deals canary send``. ``automatic_inquiries_possible`` only when
+    every gate is open (process, database mode and kill switch, authorization, configured sender
+    and its completed activation canary) and the owner's rolling caps leave room now
+    (`caps_leave_room`), so the dashboard never claims automatic inquiries while any gate is
+    closed or the owner holds them with a cap of 0.
+    """
+    blockers: list[str] = []
+    if settings.seller_inquiry_mode != "automatic":
+        blockers.append("SELLER_INQUIRY_MODE_NOT_AUTOMATIC")
+    if settings.seller_inquiry_kill_switch:
+        blockers.append("SELLER_INQUIRY_KILL_SWITCH_ON")
+    if requires_message_approval(settings):
+        blockers.append("MESSAGE_APPROVAL_SETTING_ON")
+    possible = (
+        not blockers
+        and automatic_sending_enabled(settings)
+        and view.mode == "automatic"
+        and not view.kill_switch
+        and view.authorization_status == "active"
+        and view.sender_readiness == "ready"
+        # F3/OPS-04 (wave D2): `inquiries_repo.reserve` refuses every real inquiry
+        # (activation_canary_incomplete) until the sender's current version has a correlated canary.
+        and view.activation_canary_complete
+        and caps_leave_room(view)
+    )
+    return {
+        "process_mode": settings.seller_inquiry_mode,
+        "process_kill_switch": settings.seller_inquiry_kill_switch,
+        "process_message_approval_required": requires_message_approval(settings),
+        "process_blockers": tuple(blockers),
+        "automatic_inquiries_possible": possible,
+    }
 
 
 @router.get("/api/inquiry-control")
@@ -299,15 +369,22 @@ async def resume_inquiries(
 
     ``inquiries_repo.resume`` locks the controls row first and checks ``expected_version``; the
     removable suppressions are listed after that lock (``add_suppression`` takes the same lock, so
-    the set cannot grow underneath) and, with ``expected_removable``, a different count refuses
-    the WHOLE resume (`SuppressionsChanged`; the caller's transaction rolls back, nothing changes).
-    Only then is each one removed (one audited removal each). Nothing is sent by a resume.
+    the set cannot grow underneath) and a count different from ``expected_removable`` refuses the
+    WHOLE resume (`SuppressionsChanged`; the caller's transaction rolls back, nothing changes).
+    Only then is each one removed (one audited removal each). A removal without
+    ``expected_removable`` is refused before anything changes (``VALIDATION_ERROR``): only the set
+    the owner saw is ever removed. Nothing is sent by a resume.
     """
+    if remove_suppressions and expected_removable is None:
+        raise ValidationFailed(
+            "A resume that removes suppressions must name the removable count the owner saw",
+            details={"fields": ["expected_removable_suppressions"]},
+        )
     result = await inquiries_repo.resume(conn, actor, expected_version=expected_version, reason=reason)
     removed = 0
-    if remove_suppressions:
+    if remove_suppressions and expected_removable is not None:
         rows = await removable_suppressions(conn, actor, await _now(conn))
-        if expected_removable is not None and len(rows) != expected_removable:
+        if len(rows) != expected_removable:
             raise SuppressionsChanged(expected=expected_removable, current=len(rows))
         for row in rows:
             await inquiries_repo.remove_suppression(conn, actor, row.id, reason=f"resume: {reason}")
@@ -351,6 +428,61 @@ async def post_inquiry_resume(request: Request, auth: Authenticated) -> Response
 
     view, as_of = await _read(request, auth, work)
     return _respond(RESUME, envelope(view, request_id=auth.request_id, as_of=as_of))
+
+
+# --------------------------------------------------------------------------------------------
+# Activation canary evidence (owner only, read-only)
+# --------------------------------------------------------------------------------------------
+
+
+async def canary_evidence_view(conn: Conn, actor: ActorContext, settings: Settings) -> CanaryEvidenceView:
+    """Rows 4-6 of the activation evidence for the CONFIGURED sender (D1 item 6).
+
+    The same state as ``suv-deals canary status`` / ``doctor`` (`canaries_repo.evidence_state`);
+    without a usable configured identity (`configured_sender_problems`) it is ``no_sender``. Lists
+    the newest canaries with ids, states and times only (never the target, its hash, the purpose or
+    evidence text). Reads only: nothing is prepared, claimed or sent.
+    """
+    records = await canaries_repo.list_canaries(conn, actor, limit=CANARY_EVIDENCE_LIMIT)
+    sender = await configured_sender_binding(conn, actor, settings)
+    usable = sender if sender is not None and not configured_sender_problems(settings, sender) else None
+    state, detail = canaries_repo.evidence_state(records, usable)
+    return CanaryEvidenceView(
+        evidence=state,
+        detail=detail[:300],
+        sender_provider=None if usable is None else usable.provider,
+        sender_binding_version=None if usable is None else usable.version,
+        canaries=tuple(
+            ActivationCanaryView(
+                id=r.id,
+                provider=r.provider,
+                sender_binding_version=r.sender_binding_version,
+                current_sender_version=usable is not None
+                and r.sender_binding_id == usable.id
+                and r.sender_binding_version == usable.version,
+                state=r.state,
+                created_at=r.created_at,
+                outcome_recorded_at=r.outcome_recorded_at,
+                accepted_at=r.accepted_at,
+                reply_recorded_at=r.reply_recorded_at,
+            )
+            for r in records
+        ),
+    )
+
+
+@router.get("/api/activation/canary-evidence")
+async def get_canary_evidence(request: Request, auth: Authenticated) -> Response:
+    require_scope(request, auth, CANARY_EVIDENCE.scope)
+    no_query(request)
+    settings = api_state(request).settings
+
+    async def work(conn: Conn, actor: ActorContext) -> tuple[Any, datetime]:
+        view = await canary_evidence_view(conn, actor, settings)
+        return view, await _now(conn)
+
+    view, as_of = await _read(request, auth, work)
+    return _respond(CANARY_EVIDENCE, envelope(view, request_id=auth.request_id, as_of=as_of))
 
 
 # --------------------------------------------------------------------------------------------
@@ -443,11 +575,15 @@ async def get_evaluation(request: Request, auth: Authenticated) -> Response:
 
 
 __all__ = [
+    "CANARY_EVIDENCE_LIMIT",
     "RESUMABLE_REASONS",
     "RESUME_OPERATION",
     "SUPPRESSIONS_CHANGED",
     "SuppressionsChanged",
+    "canary_evidence_view",
+    "caps_leave_room",
     "configured_control_view",
+    "process_gate",
     "removable_suppressions",
     "resume_inquiries",
     "router",

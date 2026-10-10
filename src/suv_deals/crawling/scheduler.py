@@ -121,12 +121,17 @@ def _coverage_mode(source: SourceRecord) -> CoverageMode | None:
 async def ensure_schedules(
     db: Database, actor: ActorContext, sources: list[SourceRecord], interval_seconds: int
 ) -> int:
-    """Make sure a schedule row exists for every enabled acquisition source x enabled profile.
+    """Make sure a schedule row exists for every enabled acquisition or MK comparable source x
+    enabled profile.
 
     Idempotent (``ensure_schedule`` inserts with ``ON CONFLICT DO NOTHING``); returns the number of
     schedule rows ensured. A new row is due immediately but schedules nothing by itself.
     """
-    eligible = [s for s in sources if s.enabled and not s.paused and s.role == "acquisition"]
+    # MK comparable sources are crawled too (their detail pages become market evidence, never
+    # acquisition revisions: `crawling.mk_evidence`; F2, wave D2).
+    eligible = [
+        s for s in sources if s.enabled and not s.paused and s.role in ("acquisition", "mk_comparable")
+    ]
     if not eligible:
         return 0
     ensured = 0

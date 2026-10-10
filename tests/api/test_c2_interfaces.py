@@ -17,11 +17,14 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import httpx
+import jsonschema
 import pytest
+from pydantic import ValidationError
 from tests.api.conftest import (
     ApiHarness,
     DataHarness,
@@ -51,11 +54,17 @@ from tests.api.v11_support import (
     upload_reply,
 )
 from tests.integration.db.helpers import Seed
-from tests.integration.v11_inquiries.support import SENDER_ACCOUNT, SENDER_ADDRESS, World, reserve_and_queue
+from tests.integration.v11_inquiries.support import (
+    SENDER_ACCOUNT,
+    SENDER_ADDRESS,
+    World,
+    complete_activation_canary,
+    reserve_and_queue,
+)
 
 from suv_deals.api.deps import MAIL_WORKER_MUTATION_LIMIT, MAIL_WORKER_REPLY_LIMIT
 from suv_deals.api.errors import error_response
-from suv_deals.api.inquiry_routes import RESUME_OPERATION
+from suv_deals.api.inquiry_routes import RESUME_OPERATION, resume_inquiries
 from suv_deals.api.mail_worker_routes import REPORT_OPERATION
 from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
 from suv_deals.api.schemas import (
@@ -66,8 +75,8 @@ from suv_deals.api.schemas import (
 )
 from suv_deals.domain.actor import ROLE_SCOPES, ActorContext
 from suv_deals.domain.enums import EmailProviderKind, Role, SuppressionReason
-from suv_deals.errors import Forbidden
-from suv_deals.mcp.schemas import DealsListCandidatesInput, tool_input_schema
+from suv_deals.errors import Forbidden, ValidationFailed
+from suv_deals.mcp.schemas import DealsListCandidatesInput, tool_input_schema, validation_error_fields
 from suv_deals.mcp.tools import PAUSE_OPERATION
 from suv_deals.observability.metrics import AppMetrics
 from suv_deals.persistence import (
@@ -98,9 +107,11 @@ class ControlHarness(ApiHarness):
 async def control_api(
     db: Database, seed: Seed, keys: SigningKeys, tokens: TokenFactory
 ) -> AsyncIterator[ControlHarness]:
-    world = await outlook_world(db, seed, "C2 control")
+    world = await outlook_world(db, seed, "C2 control", canary=False)
     users: Users = add_members(seed, world.workspace_id)
     worker = await issue_worker(db, world)
+    # The owner's completed activation canary, on the worker just issued (F3/OPS-04).
+    await complete_activation_canary(db, world.workspace_id, world.sender_binding_id)
     metrics = AppMetrics(process_metrics=False)
     app = build_test_app(make_settings(seller_inquiry_mode="automatic"), keys, db, metrics=metrics)
     async with running_client(app) as client:
@@ -248,6 +259,79 @@ async def test_resume_count_is_validated_and_ignored_without_removal(control_api
     assert _active_suppressions(api) == ["kill_switch"]
     schema = InquiryResumeRequest.model_json_schema()
     assert "expected_removable_suppressions" in schema["properties"]
+
+
+async def test_a_resume_that_removes_suppressions_must_name_the_count_the_owner_saw(
+    control_api: ControlHarness,
+) -> None:
+    """D1 item 1: ``expected_removable_suppressions`` is REQUIRED with ``remove_suppressions``
+    (``422``, the field named); without the count a removal would remove whatever is removable at
+    that moment, which the owner never saw. Nothing changes; the key is not consumed."""
+    api = control_api
+    await _suppress(api, SuppressionReason.KILL_SWITCH)
+    seen = _data(await api.get("/api/inquiry-control", api.users.owner))
+    base = {
+        "expected_version": seen["version"],
+        "reason": "Owner resume without a count",
+        "idempotency_key": "d1-resume-0001",
+        "remove_suppressions": True,
+    }
+    for body in (base, {**base, "expected_removable_suppressions": None}):
+        refused = await api.post("/api/inquiry-control/resume", api.users.owner, body)
+        assert refused.status_code == 422, refused.text
+        error = error_of(refused)
+        assert error["code"] == "VALIDATION_ERROR"
+        assert error["details"]["fields"] == ["expected_removable_suppressions"]
+    assert _active_suppressions(api) == ["kill_switch"]
+    # The shared service (API and CLI) refuses the same way, before anything changes.
+    owner = await _member_actor(api, api.users.owner)
+    with pytest.raises(ValidationFailed) as caught:
+        async with unit_of_work(api.db, owner) as conn:
+            await resume_inquiries(
+                conn,
+                owner,
+                expected_version=seen["version"],
+                reason="Owner resume without a count",
+                remove_suppressions=True,
+                expected_removable=None,
+            )
+    assert caught.value.details == {"fields": ["expected_removable_suppressions"]}
+    assert _active_suppressions(api) == ["kill_switch"]
+    resumed = _data(
+        await api.post(
+            "/api/inquiry-control/resume",
+            api.users.owner,
+            {**base, "expected_removable_suppressions": seen["removable_suppressions"]},
+        )
+    )
+    assert resumed["suppressions_removed"] == 1
+    assert _active_suppressions(api) == []
+
+
+def test_the_resume_schema_requires_the_count_with_a_removal() -> None:
+    """The model and its committed JSON schema say the same thing: a removal needs the count; a
+    resume without a removal does not."""
+    common = {"expected_version": 1, "reason": "Owner resume", "idempotency_key": "d1-resume-0002"}
+    with pytest.raises(ValidationError) as caught:
+        InquiryResumeRequest.model_validate({**common, "remove_suppressions": True})
+    assert validation_error_fields(caught.value, root="body", model=InquiryResumeRequest) == [
+        "expected_removable_suppressions"
+    ]
+    InquiryResumeRequest.model_validate(common)
+    InquiryResumeRequest.model_validate(
+        {**common, "remove_suppressions": True, "expected_removable_suppressions": 0}
+    )
+    snapshot = json.loads(
+        (Path(__file__).resolve().parents[2] / "schemas/api/inquiry-control.resume.post.json").read_text()
+    )
+    validator = jsonschema.Draft202012Validator(snapshot["request"])
+    assert not validator.is_valid({**common, "remove_suppressions": True})
+    assert not validator.is_valid(
+        {**common, "remove_suppressions": True, "expected_removable_suppressions": None}
+    )
+    assert validator.is_valid({**common, "remove_suppressions": True, "expected_removable_suppressions": 2})
+    assert validator.is_valid(common)
+    assert validator.is_valid({**common, "remove_suppressions": False})
 
 
 async def test_a_resume_still_in_progress_answers_in_progress(control_api: ControlHarness) -> None:

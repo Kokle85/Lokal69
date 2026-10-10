@@ -102,9 +102,12 @@ class GateRecord(BaseModel):
         return None if value is None else ensure_utc(value)
 
 
-# Spec 32 gate list. Statuses are honest for this build: code exists for the first two;
-# everything that needs an owner decision, account or live evidence is blocked; optional
-# capabilities nobody asked for are not_requested. Nothing starts active.
+# Spec 32 gate list (all 16 rows) plus ``seller_reply_slack_route``, the owner-selected seller-reply
+# route of spec 37.6 (``slack_destination`` stays the optional candidate-discovery fallback).
+# Statuses are honest for this build: code exists for the first two; everything that needs an
+# owner decision, account or live evidence is blocked; optional capabilities nobody asked for are
+# not_requested. Nothing starts active. The reconciler inserts missing gates into every active
+# workspace on each pass (`seed_spec_gates`; existing rows are never overwritten).
 SPEC_GATES: Final[tuple[GateDefinition, ...]] = (
     GateDefinition(
         capability="implementation_environment",
@@ -175,6 +178,50 @@ SPEC_GATES: Final[tuple[GateDefinition, ...]] = (
         next_action="Confirm or change the proposed EUR 1,500 contribution threshold.",
     ),
     GateDefinition(
+        capability="seller_email_sender",
+        dependency="The owner's sending mailbox bound and verified (outlook_local by default)",
+        required_evidence=(
+            "Verified configured mailbox/alias, secure OAuth and minimum scopes, provider contract,"
+            " dedup/suppression and live test evidence; no message-approval gate"
+        ),
+        status=GateStatus.BLOCKED,
+        owner="owner",
+        next_action=(
+            "Bind and verify the sender (docs/seller_email_activation.md), then complete the"
+            " activation canary rows 4-6 (outlook_local only; real inquiries are refused"
+            " activation_canary_incomplete until then: ACTIVATION_GATES.md)."
+        ),
+    ),
+    GateDefinition(
+        capability="seller_inquiry",
+        dependency="A current qualifying candidate with exact-ad seller, address and language evidence",
+        required_evidence=(
+            "Current qualifying candidate, verified exact-ad seller/address and local language, unsent"
+            " vehicle/seller pair, safe template, rate budget and kill-switch checks"
+        ),
+        status=GateStatus.BLOCKED,
+        owner="owner",
+        next_action=(
+            "Needs a live source producing seller-contact evidence and MK comparables before any"
+            " listing can become inquiry_ready (ACTIVATION_GATES.md)."
+        ),
+    ),
+    GateDefinition(
+        capability="seller_reply_slack_route",
+        dependency="The owner-selected seller-reply route: local Outlook -> backend -> private Slack -> dot",
+        required_evidence=(
+            "Verified private Slack channel and destination binding for the seller_reply category,"
+            " the dot trigger filtered on the signal metadata, a correlated test reply through"
+            " Outlook/backend/Slack/dot/MCP and evidence that dot processed it (spec 37.6)"
+        ),
+        status=GateStatus.BLOCKED,
+        owner="owner",
+        next_action=(
+            "Name the private channel, approve the seller_reply destination binding, configure the"
+            " dot Slack trigger (docs/connect_mcp.md 6.2) and run the reply canary."
+        ),
+    ),
+    GateDefinition(
         capability="hosting",
         dependency="Approved hosting provider, region, budget and domain",
         required_evidence="Approved provider, region, budget, domain/TLS and deployment authority",
@@ -192,7 +239,7 @@ SPEC_GATES: Final[tuple[GateDefinition, ...]] = (
     ),
     GateDefinition(
         capability="slack_destination",
-        dependency="Verified private Slack channel (optional fallback)",
+        dependency="Verified private Slack channel (optional fallback for candidate discovery)",
         required_evidence="Verified private channel and approved event data/audience",
         status=GateStatus.NOT_REQUESTED,
         owner="owner",

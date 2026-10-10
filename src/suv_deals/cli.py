@@ -63,8 +63,10 @@ from suv_deals.cli_commands import (
     credentials,
     db,
     doctor,
+    fx,
     inquiries,
     jobs,
+    market,
     ops,
     processes,
     sources,
@@ -123,6 +125,8 @@ cli.add_command(inquiries.inquiries_group)
 cli.add_command(inquiries.evaluation_group)
 cli.add_command(jobs.jobs_group)
 cli.add_command(canary.canary_group)
+cli.add_command(fx.fx_group)
+cli.add_command(market.market_group)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

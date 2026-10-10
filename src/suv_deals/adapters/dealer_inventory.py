@@ -41,6 +41,7 @@ from suv_deals.adapters._access import (
     classify_document,
     has_empty_result_marker,
 )
+from suv_deals.adapters._contacts import extract_seller_contact, site_origin
 from suv_deals.adapters._extract import (
     Anchor,
     MileageMatch,
@@ -84,6 +85,7 @@ from suv_deals.adapters.base import (
     RawDocument,
     SearchObservation,
     SearchRequest,
+    SellerContactEvidence,
     SourceCapabilities,
 )
 from suv_deals.clock import Clock, SystemClock
@@ -687,6 +689,7 @@ class SchemaOrgDealerAdapter:
             exposes_source_modified_at=False,
             detail_required_for_price=False,
             countries=(self.config.country,),
+            seller_contact_evidence=True,
         )
 
     def build_search(self, profile: SearchProfile, cursor: str | None) -> SearchRequest:
@@ -823,6 +826,34 @@ class SchemaOrgDealerAdapter:
             access_state=AccessState.OK,
             listing=listing,
             warnings=tuple(listing.warnings) + extra,
+            seller_contact=self._seller_contact(page, vehicle, listing, source_url),
+        )
+
+    def _seller_contact(
+        self, page: PageView, vehicle: dict[str, Any], listing: NormalizedListing, source_url: str
+    ) -> SellerContactEvidence:
+        """Exact-ad contact evidence (F1, wave D2): visible addresses only (`adapters._contacts`).
+
+        This adapter crawls ONE dealer's own inventory website, so the seller's website is the
+        offer's ``seller.url`` when it is an http(s) URL, else the site the ad is on.
+        """
+        offers = _dicts(vehicle.get("offers"))
+        offer = next((o for o in offers if "AggregateOffer" not in local_type_names(o)), None)
+        seller = next(iter(_dicts(_get(offer, "seller", "offeredBy"))), None)
+        name = bounded(text_of(seller.get("name")), 200) if seller is not None else None
+        stated = text_of(seller.get("url")) if seller is not None else None
+        website = stated if stated and site_origin(stated) else site_origin(source_url)
+        microdata = html_to_text(page.microdata_description).text if page.microdata_description else None
+        return extract_seller_contact(
+            page,
+            seller_type=listing.seller_type,
+            seller_name=html_to_text(name).text if name else None,
+            seller_reference=None,
+            dealer_website=website,
+            description=listing.description_excerpt,
+            title=listing.title,
+            description_selector="json_ld:description|microdata:description",
+            seller_texts=tuple(t for t in (microdata,) if t),
         )
 
     def assess_parser_health(self, samples: list[ParseOutcome]) -> ParserHealth:

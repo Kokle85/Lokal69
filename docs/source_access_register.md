@@ -37,6 +37,13 @@ and this page must be corrected.
 
 Every source below is `enabled: false`. No source is live-verified or active.
 
+**Consequence for valuations (F2, wave D2).** Both MK comparable sources are placeholders, so no
+MK market evidence is crawled. Until the owner records some (`suv-deals market import FILE
+--evidence-kind asking_price|owner_estimate`, docs/runbook.md) or an MK adapter is implemented
+and activated, EVERY valuation is `insufficient_comparables` and no listing can become
+`inquiry_ready` (spec 37.2 check 2). An activated `mk_comparable` source would be scheduled and its
+detail pages stored as `asking_price` market observations, never as acquisition listings.
+
 | Source key | Country | Role | Mode | Adapter and status | Terms status | Terms decision | Terms URL | Terms reviewed | Technical status | Robots | What activation requires |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `mobile_de_public` | DE | acquisition | public_html | `mobile_de_public`: placeholder (`unimplemented`, raises `AdapterUnimplemented`) | restricted: the public terms contain a scraping restriction in section 11 | pending | https://www.mobile.de/service/agbPublic | 2026-10-06 | untested | obey | Steps 1 to 7. Establish which terms apply to this use first. Permission or an agreement is the lower-risk route. The optional official API is tracked separately as `mobile_de_api`. |
@@ -117,11 +124,16 @@ raises `SourcePaused` unless every gate passes. Placeholders raise `AdapterUnimp
    - a login wall, a CAPTCHA/block page and malformed or changed markup
 
    Once these tests pass, set `technical_status: fixture_tested`.
-6. **Live low-volume smoke.** Run this with `SOURCE_NETWORK_ENABLED` and within the source's
-   rate budget, using the `live` pytest marker (it never runs automatically). Fetch one search
-   page and one detail page. Confirm `access_state: ok` and healthy parser outcomes. Record the
-   commit, configuration and parser versions, source URL, observation time and the redacted
-   fetch outcome. Then set `technical_status: live_smoke_passed`.
+6. **Live low-volume smoke.** The owner runs it by hand, never automatically (there is no
+   `live` pytest test; the marker is only declared): with `SOURCE_NETWORK_ENABLED=true` and the
+   crawler reachable, `suv-deals crawl once --source <key> --max-pages 1` runs ONE bounded
+   discovery through every source and runtime gate (it refuses while any gate is closed), within
+   the source's rate budget; then let the worker fetch at most one detail page
+   (`suv-deals worker --drain --queues detail`). Confirm `access_state: ok` and healthy parser
+   outcomes (`suv-deals sources inspect <key>`, `doctor`). Record the spec 31 evidence fields:
+   commit SHA and image digest, configuration revision and `adapter_version`, source URL,
+   actual observation timestamp, crawl run and job ids with the redacted fetch outcome, and the
+   persisted listing/revision/evidence ids. Then set `technical_status: live_smoke_passed`.
 7. **Enable.** Set `enabled: true` through an auditable configuration revision.
 
 After activation:

@@ -38,7 +38,8 @@ from tests.integration.v11_runtime.support import (
 from suv_deals.domain.enums import OutboxState
 from suv_deals.integrations import event_bridge as eb
 from suv_deals.integrations.safe_http import SafeHttpClient
-from suv_deals.workers.dispatcher import Dispatcher, claim_signal_events
+from suv_deals.persistence import outbox
+from suv_deals.workers.dispatcher import SIGNAL_EVENTS, Dispatcher
 
 pytestmark = pytest.mark.db
 
@@ -182,7 +183,12 @@ async def test_fixture_marked_signals_are_never_claimed(env: PipelineEnv) -> Non
             " where workspace_id = %s and event_id = %s",
             (env.workspace_id, signal["event_id"]),
         )
-    assert await claim_signal_events(env.ctx.db, env.workspace_id, "dispatcher-b2a", 30, 5) == []
+    assert (
+        await outbox.claim_events(
+            env.ctx.db, env.workspace_id, "dispatcher-b2a", 30, 5, event_types=SIGNAL_EVENTS
+        )
+        == []
+    )
     live = with_settings(env, slack_signal_settings(_db_url(env)))
     await approve_slack_category(live, "seller_reply")
     api = FlakySlack(fail_posts=0, history_has_post=False)

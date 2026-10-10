@@ -1,0 +1,138 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "VERSION_CONFLICT",
+    "IDEMPOTENCY_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "required",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/canary-intents/{canary_id}/report",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/canary-intents/{canary_id}/report`` (no address).",
+    "properties": {
+      "canary_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "error_code": {
+        "default": null,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mailbox_binding_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "observed_internet_message_id": {
+        "default": null,
+        "maxLength": 998,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "refusal_reason": {
+        "default": null,
+        "enum": [
+          "intent_expired",
+          "account_mismatch",
+          "kill_switch",
+          "binding_mismatch",
+          "intent_invalid",
+          "outlook_not_classic",
+          "mailbox_unavailable",
+          "duplicate_intent",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "reported_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "sent_at": {
+        "default": null,
+        "format": "date-time",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "sent_items_present": {
+        "default": false,
+        "type": "boolean"
+      },
+      "state": {
+        "enum": [
+          "refused_before_send",
+          "send_call_failed",
+          "submitted_to_outbox",
+          "sent_items_confirmed",
+          "transport_rejected"
+        ],
+        "type": "string"
+      },
+      "worker_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "canary_id",
+      "mailbox_binding_id",
+      "worker_id",
+      "state",
+      "reported_at"
+    ],
+    "title": "MailWorkerCanaryReport",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of the report and account-report routes.",
+    "properties": {
+      "accepted": {
+        "const": true,
+        "default": true,
+        "type": "boolean"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "title": "mail-workers.canary-intents.canary_id.report.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Submission/Sent Items evidence of one activation canary."
+}

@@ -42,6 +42,12 @@ Routes (each runs ONE short transaction of the worker's workspace unless noted):
 - ``POST /send-intents/{intent_id}/report``: ``Idempotency-Key`` required; the same key and report
   replay the acknowledgement (``persistence.idempotency``), another report under the same key is
   ``409``. The path id must equal the body's ``intent_id``.
+- ``GET /canary-intents``, ``POST /canary-intents/{canary_id}/claim|report|reply`` (F3, wave
+  D2): the ``outlook_local`` activation canary (``canaries_repo``): the published canaries of the
+  worker's mailbox, a fresh claim (never stored or replayed; refused ``kill_switch`` while this
+  process's settings forbid sending), the Sent Items evidence and the owner's correlated test
+  reply (headers and the sender's hash only). ``Idempotency-Key`` is required on all three
+  POSTs; report and reply replay their acknowledgement like the send report.
 - ``POST /heartbeat`` and ``POST /account-report``: no ``Idempotency-Key``; the account report has
   no ``schema_version`` (wire shape). A refused account report is recorded, then ``409``.
 
@@ -71,6 +77,10 @@ from suv_deals.api.schemas import (
     MailWorkerAccepted,
     MailWorkerAccountReport,
     MailWorkerBindingsQuery,
+    MailWorkerCanaryClaimRequest,
+    MailWorkerCanaryIntentBatch,
+    MailWorkerCanaryReply,
+    MailWorkerCanaryReport,
     MailWorkerClaimDecision,
     MailWorkerClaimRequest,
     MailWorkerHeartbeatRequest,
@@ -84,6 +94,7 @@ from suv_deals.domain.reviews import validate_idempotency_key
 from suv_deals.errors import AppError, ErrorCode, Unauthenticated, ValidationFailed
 from suv_deals.integrations.email_providers.outlook_local import OutlookSendIntent
 from suv_deals.persistence import (
+    canaries_repo,
     credentials_repo,
     idempotency,
     mail_workers_repo,
@@ -99,6 +110,8 @@ from suv_deals.settings import Settings
 router = APIRouter()
 
 REPORT_OPERATION: Final = "mail_worker.send_report"
+CANARY_REPORT_OPERATION: Final = "mail_worker.canary_report"
+CANARY_REPLY_OPERATION: Final = "mail_worker.canary_reply"
 _WORKER_KIND: Final = "mail_worker"
 
 
@@ -351,6 +364,125 @@ async def post_report(request: Request, intent_id: str, ctx: Worker) -> Response
 
 
 # --------------------------------------------------------------------------------------------
+# Activation canaries (outlook_local transport; F3, wave D2; `canaries_repo`)
+# --------------------------------------------------------------------------------------------
+
+
+def _same_canary(path_value: UUID, body_value: UUID) -> None:
+    if path_value != body_value:
+        raise ValidationFailed(
+            "The body's canary_id must equal the path's canary_id", details={"fields": ["canary_id"]}
+        )
+
+
+@router.get(MAIL_WORKER_PREFIX + "/canary-intents")
+async def get_canary_intents(request: Request, ctx: Worker) -> Response:
+    no_query(request)
+    closed = process_gate(api_state(request).settings) is not None
+    batch = await _work(
+        request,
+        ctx,
+        lambda conn: canaries_repo.desktop_canary_intents(
+            conn, ctx.worker, request_id=ctx.request_id, process_closed=closed
+        ),
+    )
+    return _wire(MailWorkerCanaryIntentBatch.model_validate(batch.model_dump()))
+
+
+@router.post(MAIL_WORKER_PREFIX + "/canary-intents/{canary_id}/claim")
+async def post_canary_claim(request: Request, canary_id: str, ctx: Worker) -> Response:
+    no_query(request)
+    target = path_id(canary_id, "canary_id")
+    required_idempotency_key(request)  # never stored or replayed: a claim is always fresh
+    body = await body_model(request, MailWorkerCanaryClaimRequest)
+    _same_canary(target, body.canary_id)
+    ctx.worker.require_mailbox(body.mailbox_binding_id)
+    gate = process_gate(api_state(request).settings)
+    decision = await _work(
+        request,
+        ctx,
+        lambda conn: canaries_repo.claim_desktop_canary(
+            conn,
+            ctx.worker,
+            canary_id=target,
+            claim_attempt_id=body.claim_attempt_id,
+            worker_id=body.worker_id,
+            request_id=ctx.request_id,
+            process_gate=gate,
+        ),
+    )
+    return _wire(decision)
+
+
+async def _idempotent_canary_step(
+    request: Request,
+    ctx: WorkerContext,
+    *,
+    operation: str,
+    key: str,
+    body: BaseModel,
+    step: Callable[[Conn], Awaitable[object]],
+) -> None:
+    request_hash = idempotency.request_hash_for(operation, body)
+    actor = ctx.worker.actor(ctx.request_id)
+
+    async def work(conn: Conn) -> None:
+        started = await idempotency.begin(conn, actor, operation, key, request_hash)
+        if isinstance(started, idempotency.Replay):
+            return
+        if isinstance(started, idempotency.ReplayError):
+            raise _replay_error(started.error_code)
+        if isinstance(started, idempotency.InProgress):
+            raise TransientConflict.in_progress("The same request is still being recorded; retry shortly")
+        await step(conn)
+        await idempotency.complete(conn, actor, operation, key, {"accepted": True})
+
+    await _work(request, ctx, work)
+
+
+@router.post(MAIL_WORKER_PREFIX + "/canary-intents/{canary_id}/report")
+async def post_canary_report(request: Request, canary_id: str, ctx: Worker) -> Response:
+    no_query(request)
+    target = path_id(canary_id, "canary_id")
+    key = required_idempotency_key(request)
+    body = await body_model(request, MailWorkerCanaryReport)
+    _same_canary(target, body.canary_id)
+    ctx.worker.require_mailbox(body.mailbox_binding_id)
+    await _idempotent_canary_step(
+        request,
+        ctx,
+        operation=CANARY_REPORT_OPERATION,
+        key=key,
+        body=body,
+        step=lambda conn: canaries_repo.report_desktop_canary(
+            conn, ctx.worker, report=body, request_id=ctx.request_id
+        ),
+    )
+    return _wire(MailWorkerAccepted())
+
+
+@router.post(MAIL_WORKER_PREFIX + "/canary-intents/{canary_id}/reply")
+async def post_canary_reply(request: Request, canary_id: str, ctx: Worker) -> Response:
+    no_query(request)
+    target = path_id(canary_id, "canary_id")
+    key = required_idempotency_key(request)
+    body = await body_model(request, MailWorkerCanaryReply)
+    _same_canary(target, body.canary_id)
+    ctx.worker.require_mailbox(body.mailbox_binding_id)
+    await _idempotent_canary_step(
+        request,
+        ctx,
+        operation=CANARY_REPLY_OPERATION,
+        key=key,
+        body=body,
+        step=lambda conn: canaries_repo.record_desktop_canary_reply(
+            conn, ctx.worker, reply=body, request_id=ctx.request_id
+        ),
+    )
+    return _wire(MailWorkerAccepted())
+
+
+# --------------------------------------------------------------------------------------------
 # Health
 # --------------------------------------------------------------------------------------------
 
@@ -383,6 +515,8 @@ async def post_account_report(request: Request, ctx: Worker) -> Response:
 
 
 __all__ = [
+    "CANARY_REPLY_OPERATION",
+    "CANARY_REPORT_OPERATION",
     "GATE_KILL_SWITCH",
     "GATE_MODE",
     "REPORT_OPERATION",

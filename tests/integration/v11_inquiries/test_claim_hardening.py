@@ -3,7 +3,8 @@
 - Fixture lineage (``app.listings.is_fixture``, frozen at ingest) is a FINAL ``intent_invalid``
   refusal of the claim, ahead of every other answer (also while the kill switch is on), so a
   fixture listing can never leave even when an intent exists for it (plan and dispatch refuse it
-  in the runtime, ``tests/integration/v11_runtime/test_plan_and_send.py``).
+  in the runtime, ``tests/integration/v11_runtime/test_plan_and_send.py``, and reservation and
+  dispatch in the repository, ``test_d1_fixture_lineage.py``).
 - A ``refused_before_send`` report for an intent whose claim was GRANTED is no proof of
   non-submission (a stolen worker credential could report it after the real worker called
   ``.Send``): the attempt and the inquiry are held ``uncertain`` for owner reconciliation, the
@@ -14,6 +15,8 @@ Everything is synthetic; nothing is sent.
 """
 
 from __future__ import annotations
+
+from uuid import UUID
 
 import pytest
 from tests.integration.db.helpers import Seed
@@ -33,19 +36,31 @@ from suv_deals.integrations.email_providers.base import ReconcileProvenNotSubmit
 from suv_deals.integrations.email_providers.outlook_local import (
     OutlookLocalProvider,
     OutlookRefusalReason,
+    OutlookSendIntent,
     OutlookSubmissionState,
 )
 from suv_deals.persistence import inquiries_repo, send_intents_repo
 from suv_deals.persistence.database import Database
+from suv_deals.persistence.mail_workers_repo import WorkerIdentity
 from suv_deals.persistence.transactions import unit_of_work
 
 pytestmark = pytest.mark.db
 
 
-async def _fixture_world(db: Database, seed: Seed, world: World) -> World:
-    vehicle = await add_vehicle(db, seed, world.workspace_id, fixture=True)
+async def _fixture_intent(
+    db: Database, seed: Seed, world: World, worker: WorkerIdentity
+) -> tuple[UUID, OutlookSendIntent]:
+    """An intent whose listing has fixture lineage. Reservation and dispatch refuse fixture
+    lineage themselves (D1 item 5), so the intent is created on real lineage and the lineage is
+    then flipped (TEST ARRANGEMENT ONLY: it is frozen at ingest) to prove the claim, the LAST
+    guard before ``.Send``, still refuses it on its own."""
+    vehicle = await add_vehicle(db, seed, world.workspace_id)
+    inquiry_id, intent = await _intent(db, world.with_vehicle(vehicle), worker)
+    with seed.conn.transaction():
+        seed.conn.execute("set local session_replication_role = replica")
+        seed.conn.execute("update app.listings set is_fixture = true where id = %s", (vehicle.listing_id,))
     assert seed.scalar("select is_fixture from app.listings where id = %s", (vehicle.listing_id,)) is True
-    return world.with_vehicle(vehicle)
+    return inquiry_id, intent
 
 
 # ---------------------------------------------------------------------------------------------
@@ -54,9 +69,8 @@ async def _fixture_world(db: Database, seed: Seed, world: World) -> World:
 
 
 async def test_claim_refuses_fixture_lineage_as_final(db: Database, seed: Seed, world: World) -> None:
-    fixture_world = await _fixture_world(db, seed, world)
     worker = await _worker(db, world)
-    inquiry_id, intent = await _intent(db, fixture_world, worker)
+    inquiry_id, intent = await _fixture_intent(db, seed, world, worker)
     claim = await _claim(db, worker, intent.intent_id)
     assert not claim.proceed
     assert claim.refusal_reason == OutlookRefusalReason.INTENT_INVALID
@@ -80,9 +94,8 @@ async def test_fixture_refusal_precedes_the_retryable_kill_switch(
     db: Database, seed: Seed, world: World
 ) -> None:
     """While paused a real intent gets the retryable ``kill_switch``; a fixture one is closed."""
-    fixture_world = await _fixture_world(db, seed, world)
     worker = await _worker(db, world)
-    _, intent = await _intent(db, fixture_world, worker)
+    _, intent = await _fixture_intent(db, seed, world, worker)
     boss = owner(world.workspace_id)
     async with unit_of_work(db, boss) as conn:
         controls = await inquiries_repo.get_controls(conn, boss)

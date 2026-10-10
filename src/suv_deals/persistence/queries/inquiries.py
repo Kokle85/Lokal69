@@ -889,7 +889,7 @@ def credential_status(expires_at: datetime, revoked_at: datetime | None, now: da
 MAIL_HEALTH_NOTES: Final = (
     "A configured reconciliation interval is context only, never an observed latency guarantee.",
     "Monitoring is reported only while the worker heartbeat, Outlook connection and "
-    "reconciliation are fresh.",
+    "reconciliation are fresh and the worker's credential is neither expired nor revoked.",
 )
 
 

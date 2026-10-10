@@ -356,7 +356,8 @@ class ReviewsSubmitInput(ToolInput):
 
 
 class SubmitRuleError(ValueError):
-    """``reviews_submit`` broke a domain rule; ``fields`` names the fields (never their values)."""
+    """A request broke a cross-field rule (``reviews_submit``, the owner's inquiry resume);
+    ``fields`` names the fields (never their values)."""
 
     def __init__(self, fields: tuple[str, ...]) -> None:
         super().__init__(f"violates review submission rules: {', '.join(fields)}")

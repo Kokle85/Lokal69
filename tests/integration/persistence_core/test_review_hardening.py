@@ -121,9 +121,31 @@ async def test_the_claim_statement_itself_never_leases_a_fixture_looking_row(
                 "lease": timedelta(seconds=60),
                 "limit": 10,
                 "fixture_prefix": FIXTURE_SUMMARY_PREFIX.upper(),
+                "types": None,  # any event type (D1: the claim can be restricted to types)
             },
         )
         assert await cur.fetchall() == []
+
+
+async def test_the_claim_can_be_restricted_to_event_types(db: Database, world_a: World, seed: Seed) -> None:
+    """D1 item 4: the dispatcher leases the category signals first through the SAME claim
+    (`claim_events(..., event_types=...)`) instead of a duplicate statement of its own; a payload
+    without a ``summary`` (every signal) is leased, and an empty type list is refused."""
+    ws = world_a.workspace_id
+    review = seed.outbox(ws)
+    signal = seed.outbox(
+        ws,
+        event_type="seller.reply.received",
+        aggregate_type="seller_reply",
+        dedup_key=unique("seller.reply.received"),
+        payload={"schema_version": "1.0", "synthetic": True},
+    )
+    leased = await outbox.claim_events(db, ws, "dispatcher-1", 60, 10, event_types={"seller.reply.received"})
+    assert [e.id for e in leased] == [signal]
+    rest = await outbox.claim_events(db, ws, "dispatcher-1", 60, 10)
+    assert [e.id for e in rest] == [review]
+    with pytest.raises(ValidationFailed):
+        await outbox.claim_events(db, ws, "dispatcher-1", 60, 10, event_types=())
 
 
 async def test_a_fixture_event_cannot_swallow_a_real_events_dedup_key(db: Database, world_a: World) -> None:

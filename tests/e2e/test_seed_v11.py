@@ -213,6 +213,34 @@ async def test_the_kill_switch_action_adds_one_removable_suppression(
     assert again == {"created": False, "removable_suppressions": 2}
 
 
+async def test_the_listing_revision_action_makes_the_claimed_case_stale(
+    seeded: tuple[str, dict[str, Any]],
+) -> None:
+    """F8 (wave D2): the Playwright "new listing revision arriving before submit" test's concurrent
+    change (``v11_actions add-listing-revision``): the ``hotel`` listing gets a new PROMOTED
+    revision (next number, EUR 25 lower), so its pending case now cites a revision that is no
+    longer the listing's current one (the submit is refused ``VERSION_CONFLICT``)."""
+    url, manifest = seeded
+    ws, listing = UUID(manifest["workspace_id"]), UUID(manifest["listings"]["hotel"])
+    case = UUID(manifest["cases"]["hotel"])
+    query = (
+        "select l.current_revision_id, r.revision_number, r.asking_minor, c.revision_id as case_revision"
+        " from app.listings l join app.listing_revisions r on r.id = l.current_revision_id"
+        " join app.review_cases c on c.listing_id = l.id and c.id = %s"
+        " where l.workspace_id = %s and l.id = %s"
+    )
+    with psycopg.connect(url) as conn:
+        before = conn.execute(query, (case, ws, listing)).fetchone()
+    assert before is not None and before[0] == before[3]  # the case cites the current revision
+    result = v11_actions.add_listing_revision(url, ws, listing)
+    with psycopg.connect(url) as conn:
+        after = conn.execute(query, (case, ws, listing)).fetchone()
+    assert after is not None
+    assert result == {"revision_id": str(after[0]), "revision_number": before[1] + 1}
+    assert after[1] == before[1] + 1 and after[2] == before[2] - v11_actions.REVISION_PRICE_STEP_MINOR
+    assert after[3] == before[3] != after[0]  # the claimed case is now stale
+
+
 def test_the_actions_refuse_anything_but_a_loopback_e2e_database(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_DATABASE_ADMIN_URL", "postgresql://suv:suv@127.0.0.1:5432/postgres")
     assert "dbname=suv_e2e_0123456789ab" in v11_actions.database_url("suv_e2e_0123456789ab")

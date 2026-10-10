@@ -172,5 +172,11 @@ Spec v1.1 seller-inquiry and reply modules (section 37, ADR 0002):
   data only; nothing is ever sent).
 - `desktop/outlook-bridge/tests`: the desktop worker with in-memory fakes (`outlook_bridge.testing`).
 - `tests/adversarial`: SSRF, injection, signature forgery, XSS payloads.
-- `tests/e2e`: browser flows (Playwright) against a locally running stack.
-- `tests/smoke`: live checks, marker `live`, never run automatically.
+- `tests/e2e`: the browser-E2E harness (mock Supabase Auth, synthetic seeds, the backend runner)
+  and its self-tests; the Playwright specs themselves live in `dashboard/e2e` (`make e2e`).
+- `tests/smoke`: reserved for live checks (marker `live`, never run automatically); it holds no
+  test. The live source smoke is the gated, manual `suv-deals crawl once` procedure
+  (docs/source_access_register.md step 6).
+
+Handoff and status: `README.md`, `IMPLEMENTATION_STATUS.md`, `ACTIVATION_GATES.md`, `SECURITY.md`,
+`CHANGELOG.md`, `docs/acceptance_matrix.md` and `docs/qa_evidence.md` (spec 34).

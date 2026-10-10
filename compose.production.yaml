@@ -23,8 +23,10 @@
 #
 # Network: only 127.0.0.1-bound ports; the host's reverse proxy terminates HTTPS for /api and
 # /mcp. The crawler is on an internal network shared only with the worker plus its own egress
-# network; add the host egress firewall rule from docs/runbook.md so the crawler cannot reach the
-# database endpoint or private ranges. No Docker socket, host home or privileged mode.
+# network (fixed bridge names br-suv-crawlint / br-suv-crawl); add the host firewall rules from
+# docs/runbook.md 3.2 - DOCKER-USER for routed egress AND INPUT for the host's own addresses - so
+# the crawler can reach neither the database endpoint, private ranges nor any host service.
+# No Docker socket, host home or privileged mode.
 # =============================================================================
 name: suv-deals
 
@@ -93,7 +95,13 @@ services:
     <<: [*app, *no-http-healthcheck]
     env_file:
       - /etc/suv-deals/worker.env
-    command: ["suv-deals", "worker", "--queues", "discovery,detail,recheck,valuation"]
+    # Every registered job type, the seller inquiry/reply types included (spec 37; a test keeps
+    # this in step with workers.handlers.default_registry and the CLI default).
+    command:
+      - suv-deals
+      - worker
+      - --queues
+      - discovery,detail,recheck,valuation,seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process
     # Read-only root file system: retained evidence (SNAPSHOT_STORAGE=local) goes to this volume
     # only; back it up separately (docs/runbook.md section 7).
     volumes:
@@ -166,6 +174,16 @@ networks:
       config:
         - subnet: 172.31.0.0/24
           gateway: 172.31.0.1
+  # Fixed bridge names (<= 15 characters) so the host firewall rules of docs/runbook.md 3.2 can
+  # name them: DOCKER-USER (FORWARD) for routed egress AND INPUT for traffic to the host's own
+  # addresses (bridge gateways, public IP), which never passes FORWARD. IPv6 stays off on both
+  # crawler networks, so no ip6tables rule is needed (a test keeps it off).
   crawler:
     internal: true
-  crawler_egress: {}
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawlint
+  crawler_egress:
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-suv-crawl

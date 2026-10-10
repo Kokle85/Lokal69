@@ -6,12 +6,17 @@
     exactly ONCE (only its hash is stored); store it on the desktop with
     ``python -m outlook_bridge credential set``. ``revoke`` permanently revokes the worker binding
     and its credential (the worker's next request is ``401``; it keeps its backlog).
-``sender-binding create|verify|status``
+``sender-binding create|store-secret|verify|status``
     Register the owner-authorized sending identity (``outlook_local`` default, ``gmail_api``
-    optional). A provider secret is accepted only as an external REFERENCE (``scheme:path``),
-    never as a value. ``verify`` records the technical verification of an ``outlook_local``
-    binding from the desktop worker's evidence (classic-Outlook account report of the bound
-    address, fresh heartbeat, stable account key); it is a prerequisite, never a message approval.
+    optional). ``create --vault-ref`` records only an external REFERENCE (``scheme:path``), which
+    the runtime does not read; ``store-secret`` (OPS-09, wave D2) seals the owner's ``gmail_api``
+    OAuth grant into the binding (client secret and refresh token from ``SUV_OAUTH_CLIENT_SECRET``
+    / ``SUV_OAUTH_REFRESH_TOKEN`` for this one command, or hidden prompts; never echoed, logged or
+    printed) and prints the ``secretbox:`` reference the runtime accepts
+    (``SELLER_EMAIL_OAUTH_SECRET_REFERENCE``). ``verify`` records the technical verification of
+    an ``outlook_local`` binding from the desktop worker's evidence (classic-Outlook account
+    report of the bound address, fresh heartbeat, stable account key); it is a prerequisite, never
+    a message approval.
     ``status`` shows verification/alias/health without any address.
 ``inquiries authorize|status|set-mode|set-limits|pause|resume``
     Workspace controls. ``authorize`` creates the controls row and records the owner's versioned
@@ -54,6 +59,7 @@ from suv_deals.cli_commands._common import (
     pass_cli,
     require_yes,
     run_async,
+    stdin_is_tty,
     table,
     workspace_option,
 )
@@ -246,7 +252,10 @@ def sender_binding_group() -> None:
     "--vault-ref",
     "vault_ref",
     default=None,
-    help="gmail_api only: an external secret-store REFERENCE (scheme:path), never the secret itself.",
+    help=(
+        "gmail_api only: an external secret-store REFERENCE (scheme:path) kept for the record; the"
+        " runtime reads only a sealed grant (`sender-binding store-secret`)."
+    ),
 )
 @click.option("--reason", required=True, help="Why (audited).")
 @click.option("--yes", is_flag=True, help="Confirm creating the binding.")
@@ -367,6 +376,107 @@ async def outlook_verification_problems(
     return problems, warnings, record
 
 
+#: Where ``sender-binding store-secret`` reads the OAuth material (besides hidden prompts). NOT
+#: ``Settings`` fields, so they are never loaded from (or written to) ``.env``; set them for this one
+#: command only.
+OAUTH_CLIENT_SECRET_ENV: Final = "SUV_OAUTH_CLIENT_SECRET"  # noqa: S105 - an env var name
+OAUTH_REFRESH_TOKEN_ENV: Final = "SUV_OAUTH_REFRESH_TOKEN"  # noqa: S105 - an env var name
+
+
+def _oauth_value(env_name: str, prompt: str) -> str:
+    """One OAuth secret from ``env_name`` or a hidden prompt (never echoed, never in an error)."""
+    import os
+
+    value = (os.environ.get(env_name) or "").strip()
+    if value:
+        return value
+    if stdin_is_tty():
+        prompted = click.prompt(prompt, hide_input=True)
+        if isinstance(prompted, str) and prompted.strip():
+            return prompted.strip()
+    fail(f"no value: set {env_name} for this one command (then unset it) or run interactively", EXIT_USAGE)
+
+
+@sender_binding_group.command("store-secret")
+@click.argument("binding_id", type=click.UUID)
+@workspace_option
+@click.option("--client-id", required=True, help="The OAuth client id of the owner's project (not a secret).")
+@click.option(
+    "--expected-version", type=int, required=True, help="Binding version from `sender-binding status`."
+)
+@click.option("--reason", required=True, help="Why (audited).")
+@click.option("--yes", is_flag=True, help="Confirm sealing the grant into the binding.")
+@pass_cli
+def store_sender_secret(
+    cli: CliContext,
+    *,
+    binding_id: UUID,
+    workspace: UUID | None,
+    client_id: str,
+    expected_version: int,
+    reason: str,
+    yes: bool,
+) -> None:
+    """gmail_api: seal the owner's OAuth grant into the binding (the form the runtime reads).
+
+    The client secret and refresh token come from SUV_OAUTH_CLIENT_SECRET / SUV_OAUTH_REFRESH_TOKEN
+    (set for this one command, then unset) or hidden prompts; they are never echoed, logged or
+    printed. The grant is sealed with the server-side secret box (AES-256-GCM bound to the
+    workspace, binding, provider and account) and the binding version advances (verify it again).
+    """
+    settings = load_settings(cli)
+    require_yes(yes, "sender-binding store-secret")
+    from pydantic import SecretStr, ValidationError
+
+    from suv_deals.integrations.secret_box import SecretBox, SecretBoxError
+    from suv_deals.persistence import sender_bindings_repo
+
+    try:
+        box = SecretBox.from_settings(settings)
+    except SecretBoxError:
+        fail(
+            "SECRET_BOX_NOT_CONFIGURED: the server-side secret box"
+            " (MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY) is not configured; nothing changed",
+            EXIT_REFUSED,
+        )
+    secret = _oauth_value(OAUTH_CLIENT_SECRET_ENV, "OAuth client secret (input hidden)")
+    token = _oauth_value(OAUTH_REFRESH_TOKEN_ENV, "OAuth refresh token (input hidden)")
+    try:
+        grant = sender_bindings_repo.OAuthRefreshGrant(
+            client_id=client_id, client_secret=SecretStr(secret), refresh_token=SecretStr(token)
+        )
+    except ValidationError as exc:
+        fields = sorted({str(error["loc"][0]) for error in exc.errors() if error.get("loc")})
+        fail(f"invalid OAuth material ({', '.join(fields)}); nothing changed", EXIT_USAGE)
+
+    async def body() -> int:
+        from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
+        from suv_deals.persistence.transactions import unit_of_work
+
+        async with open_database(settings, application_name="suv-deals-cli") as db:
+            workspace_id = await resolve_workspace(db, workspace)
+            actor = operator_actor(workspace_id, "sender-binding-store-secret", admin=True)
+            async with unit_of_work(db, actor) as conn:
+                record = await sender_bindings_repo.store_secret(
+                    conn,
+                    actor,
+                    binding_id,
+                    grant=grant,
+                    box=box,
+                    expected_version=expected_version,
+                    reason=reason,
+                )
+        echo(f"Sealed the OAuth grant of sender binding {record.id} (version {record.version}).")
+        echo(
+            "Set SELLER_EMAIL_OAUTH_SECRET_REFERENCE="
+            f"{sender_bindings_repo.secret_reference_for(record.id)} for the dispatcher and worker,"
+            " then record the provider verification again (docs/seller_email_activation.md section 4)."
+        )
+        return 0
+
+    run_async(body)
+
+
 @sender_binding_group.command("verify")
 @click.argument("binding_id", type=click.UUID)
 @workspace_option
@@ -474,11 +584,12 @@ def inquiries_group() -> None:
 
 
 async def _status_data(conn: Conn, actor: ActorContext, settings: Settings) -> dict[str, Any]:
-    from suv_deals.api.inquiry_routes import removable_suppressions
+    from suv_deals.api.inquiry_routes import caps_leave_room, removable_suppressions
     from suv_deals.clock import ensure_utc
     from suv_deals.persistence import inquiries_repo, mail_workers_repo
     from suv_deals.persistence.database import db_now
     from suv_deals.workers.inquiry_handlers import (
+        ACTIVATION_CANARY_INCOMPLETE,
         automatic_sending_enabled,
         configured_sender_binding,
         configured_sender_problems,
@@ -500,6 +611,12 @@ async def _status_data(conn: Conn, actor: ActorContext, settings: Settings) -> d
     # closed; the dispatcher plans nothing): SELLER_INQUIRY_MODE, SELLER_INQUIRY_KILL_SWITCH and
     # the owner's SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL switch (which disables sending).
     process_open = automatic_sending_enabled(settings)
+    # F3/OPS-04 (wave D2): no real inquiry is reserved before a correlated activation canary of
+    # the configured sender's CURRENT version (`inquiries_repo.reserve`: activation_canary_incomplete).
+    usable_sender = sender if sender is not None and not identity_problems else None
+    canary_complete = usable_sender is not None and await inquiries_repo.activation_canary_complete(
+        conn, actor.workspace_id, usable_sender.id, usable_sender.version
+    )
     sending = (
         process_open
         and controls is not None
@@ -511,10 +628,14 @@ async def _status_data(conn: Conn, actor: ActorContext, settings: Settings) -> d
         and sender is not None
         and sender.usable
         and not identity_problems
+        and canary_complete
+        # The owner's rolling caps must leave room now: a cap of 0 holds every real inquiry
+        # (the activation canary step, docs/seller_email_activation.md section 8).
+        and caps_leave_room(controls)
     )
     return {
         # Nothing is sent unless ALL of these hold (process settings, mode, kill switch,
-        # authorization, sender).
+        # authorization, sender and its activation canary, room under the rolling caps).
         "sending_possible": sending,
         "process_mode": settings.seller_inquiry_mode,
         "process_kill_switch": settings.seller_inquiry_kill_switch,
@@ -540,10 +661,28 @@ async def _status_data(conn: Conn, actor: ActorContext, settings: Settings) -> d
         "sender_provider": None if sender is None else sender.provider.value,
         # Codes only (never an address): empty when the binding is the configured identity.
         "sender_identity_problems": identity_problems,
+        # complete | activation_canary_incomplete (the reservation refusal) | no_sender.
+        "activation_canary": "no_sender"
+        if usable_sender is None
+        else ("complete" if canary_complete else ACTIVATION_CANARY_INCOMPLETE),
         "mail_workers": len(boxes),
         "mail_workers_monitoring": sum(1 for b in boxes if b.monitoring_active),
         "removable_suppressions": len(removable),
+        # F1 (wave D2): only these ACTIVE acquisition sources yield an inquiry recipient.
+        "recipient_evidence_sources": _recipient_evidence_sources(settings),
     }
+
+
+def _recipient_evidence_sources(settings: Settings) -> list[str] | None:
+    """Active acquisition sources whose adapter reports exact-ad seller-contact evidence (from
+    the source YAML; ``None`` when it cannot be read)."""
+    from suv_deals.adapters.registry import load_registry
+    from suv_deals.errors import AppError
+
+    try:
+        return load_registry(settings.config_dir).recipient_evidence_sources()[1]
+    except AppError:
+        return None
 
 
 @inquiries_group.command("status")
@@ -551,8 +690,8 @@ async def _status_data(conn: Conn, actor: ActorContext, settings: Settings) -> d
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @pass_cli
 def inquiries_status(cli: CliContext, workspace: UUID | None, as_json: bool) -> None:
-    """Process settings, mode, kill switch, caps/usage, authorization, sender and worker readiness
-    (no addresses)."""
+    """Process settings, mode, kill switch, caps/usage, authorization, sender, activation-canary and
+    worker readiness (no addresses)."""
     settings = load_settings(cli)
 
     async def body() -> int:
@@ -569,7 +708,8 @@ def inquiries_status(cli: CliContext, workspace: UUID | None, as_json: bool) -> 
             return 0
         echo(f"Seller inquiries (workspace {workspace_id}):")
         for key, value in data.items():
-            echo(f"  {key:<24}: {'-' if value is None else value}")
+            shown = (", ".join(str(v) for v in value) or "none") if isinstance(value, list) else value
+            echo(f"  {key:<26}: {'-' if shown is None else shown}")
         return 0
 
     run_async(body)

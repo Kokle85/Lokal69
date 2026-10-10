@@ -292,3 +292,43 @@ async def test_failed_run_backs_off_and_finish_is_idempotent(db: Database, env: 
     assert replay.run.id == run.id and _schedule(seed, env.schedule_id)["consecutive_failures"] == 1
     with pytest.raises(VersionConflict):
         await _finish(db, env, run.id, RunOutcome(completeness=Completeness.COMPLETE))
+
+
+async def test_downtime_catchup_records_missed_slots_and_never_bursts(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """Spec 31 Scheduler row "downtime catchup" (F7, wave D2): after a scheduler outage of several
+    intervals the next advance enqueues ONE job for the current slot only (the missed slots are
+    never replayed as a burst) and records them as a coverage gap (``scheduler_missed_slots``)."""
+    first = await _advance(db, env, env.schedule_id)
+    assert first.outcome == "enqueued"
+    # Time travel: that slot's job ran three hours ago and the scheduler was down since then, so
+    # last_slot is twelve 15-minute intervals behind the current slot.
+    missed_from = first.slot - timedelta(hours=3)
+    seed.conn.execute(
+        "update ops.jobs set state = 'succeeded', completed_at = now(), scheduled_slot = %s,"
+        " dedup_key = dedup_key || ':earlier' where id = %s",
+        (missed_from, first.job_id),
+    )
+    seed.conn.execute(
+        "update ops.source_schedules set last_slot = %s, next_due_at = now() - interval '1 minute'"
+        " where id = %s",
+        (missed_from, env.schedule_id),
+    )
+    before = {row[0] for row in _slot_jobs(seed, env.schedule_id)}
+
+    caught_up = await _advance(db, env, env.schedule_id)
+
+    assert caught_up.outcome == "enqueued" and caught_up.job_id is not None
+    after = _slot_jobs(seed, env.schedule_id)
+    new = [row for row in after if row[0] not in before]
+    assert len(new) == 1  # exactly one job: no burst of replayed slots
+    assert new[0][1] == caught_up.slot and new[0][0] == caught_up.job_id
+    assert caught_up.slot >= first.slot  # the current wall-clock slot, nothing older
+    assert sorted(row[1] for row in after) == [missed_from, caught_up.slot]  # no replayed slot
+    row = _schedule(seed, env.schedule_id)
+    assert row["last_slot"] == caught_up.slot
+    assert row["next_due_at"] == caught_up.slot + timedelta(minutes=15)
+    gaps = [g for g in row["gap_reasons"] or [] if g.startswith("scheduler_missed_slots")]
+    assert len(gaps) == 1
+    assert missed_from.isoformat() in gaps[0] and caught_up.slot.isoformat() in gaps[0]

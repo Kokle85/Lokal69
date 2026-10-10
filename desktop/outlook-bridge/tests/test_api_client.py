@@ -24,6 +24,8 @@ from outlook_bridge.errors import CredentialUnusable, MailboxMismatch
 from outlook_bridge.testing import make_intent
 
 Handler = Callable[[httpx.Request], httpx.Response]
+#: A synthetic local-store instance id (``LocalStore.store_instance_id``).
+STORE_INSTANCE = "s00000000000000a1"
 
 
 def _client(
@@ -38,7 +40,7 @@ def _client(
     client = BridgeApiClient(
         "https://api.example.invalid",
         token_provider=token,
-        identity=ClientIdentity(MAILBOX_ID, "desktop-test-1"),
+        identity=ClientIdentity(MAILBOX_ID, "desktop-test-1", STORE_INSTANCE),
         transport=httpx.MockTransport(record),
     )
     return client, seen
@@ -309,7 +311,8 @@ def test_claim_answer_must_name_the_claimed_intent() -> None:
         "schema_version": "1.0",
         "intent_id": str(intent_id),
         "mailbox_binding_id": str(MAILBOX_ID),
-        "worker_id": "desktop-test-1",
+        # The claim names this local store as well (SEC-1, wave D2).
+        "worker_id": f"desktop-test-1.{STORE_INSTANCE}",
     }
     assert seen[0].headers["Idempotency-Key"] == f"claim-{intent_id}-{attempt}"
 

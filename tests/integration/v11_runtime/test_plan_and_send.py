@@ -165,14 +165,21 @@ async def test_fixture_lineage_never_reserves_or_sends(fixture_env: PipelineEnv)
     assert plan["result_reference"]["reservation"] == "fixture_lineage"
     assert debits_of(env) == 0 and jobs_of(env, JobType.SELLER_INQUIRY_SEND) == []
 
-    # A fixture-lineage inquiry that WAS queued (arranged through the repository) is never
-    # transmitted by the send job: it is cancelled before any intent exists.
-    vehicle = await add_vehicle(env.ctx.db, env.seed, env.workspace_id, fixture=True)
-    assert env.scalar("select is_fixture from app.listings where id = %s", vehicle.listing_id) is True
+    # A fixture-lineage inquiry that WAS queued is never transmitted by the send job: it is
+    # cancelled before any intent exists. The repository refuses to reserve fixture lineage
+    # itself (D1 item 5), so the inquiry is queued on real lineage and the lineage is then
+    # flipped (TEST ARRANGEMENT ONLY: it is frozen at ingest) to prove the send job's own guard.
+    vehicle = await add_vehicle(env.ctx.db, env.seed, env.workspace_id)
     world = World(
         workspace_id=env.workspace_id, seed=env.seed, sender_binding_id=sender.binding_id, vehicle=vehicle
     )
     queued = await reserve_and_queue(env.ctx.db, world, vehicle)
+    with env.seed.conn.transaction():
+        env.seed.conn.execute("set local session_replication_role = replica")
+        env.seed.conn.execute(
+            "update app.listings set is_fixture = true where id = %s", (vehicle.listing_id,)
+        )
+    assert env.scalar("select is_fixture from app.listings where id = %s", vehicle.listing_id) is True
     async with env.ctx.db.transaction(env.system) as conn:
         await enqueue_send_job(
             conn, env.system, inquiry_id=queued.id, listing_id=vehicle.listing_id, attempt_number=1
@@ -311,11 +318,22 @@ async def test_missing_desktop_worker_holds_the_send(env: PipelineEnv) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-async def test_one_plan_per_revision_and_the_contact_sweep(env: PipelineEnv, tmp_path: Path) -> None:
+async def test_one_plan_per_revision_and_the_contact_sweep(
+    env: PipelineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     del tmp_path
     sender = await prepare_sender(env)
     assert sender.worker is not None
+
+    # The seller-evidence step failed at ingest (it is logged and never fails the detail job;
+    # wave D2): the first plan finds nobody to ask, the contact arrives later.
+    async def evidence_failed(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        return "error:SYNTHETIC_FAILURE"
+
+    monkeypatch.setattr("suv_deals.crawling.detail.record_seller_evidence", evidence_failed)
     listing = await eligible_live_listing(env)
+    monkeypatch.undo()
     await work(env, JobType.VALUATION, JobType.SELLER_INQUIRY_PLAN)
     [plan] = jobs_of(env, JobType.SELLER_INQUIRY_PLAN)
     assert plan["result_reference"]["outcome"] == "seller_not_linked"

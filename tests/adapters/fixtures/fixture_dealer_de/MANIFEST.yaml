@@ -25,6 +25,7 @@ files:
   detail_malformed.html: "Known malformed markup: broken JSON-LD block."
   detail_markup_changed.html: "Changed markup: no structured data at all."
   detail_injection.html: "Seller description with a prompt-injection attempt and XSS payloads (script/img onerror), XSS in the name."
+  detail_seller_email.html: "Seller contact shown on the ad (wave D2): the dealer's one e-mail address in the contact block (mailto link on the reserved dealer.example domain), seller-written German description, seller url; no contact form."
   login_wall.html: "Login wall: password form plus sign-in wording."
   captcha.html: "CAPTCHA/challenge page ('kein Roboter', g-recaptcha)."
   empty_shell.html: "Empty JavaScript application shell."
@@ -160,3 +161,6 @@ routes:
     file: detail_normal.html
     final_url: "http://169.254.169.254/latest/meta-data/"
     description: "redirect to a metadata address; the fixture client refuses it like a real client"
+  "https://dealer.example/fahrzeug/TEST-224":
+    file: detail_seller_email.html
+    description: "seller e-mail shown on the advertisement (wave D2)"

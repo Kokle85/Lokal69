@@ -1,0 +1,254 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/activation/canary-evidence",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/activation/canary-evidence`` (owner only, read-only; D1 item 6): activation\nevidence rows 4-6 of docs/seller_email_activation.md section 8 for the CONFIGURED sender (the\nsame state ``suv-deals canary status`` and ``doctor`` report) and the newest canaries.",
+        "properties": {
+          "canaries": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One owner-controlled activation canary as the owner's dashboard shows it: ids, state and\ntimes only (never the target address, its hash, the purpose or any evidence text).",
+              "properties": {
+                "accepted_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "current_sender_version": {
+                  "description": "Bound to the configured sender binding's CURRENT version (older ones are stale).",
+                  "type": "boolean"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "outcome_recorded_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "provider": {
+                  "enum": [
+                    "outlook_local",
+                    "gmail_api",
+                    "microsoft_graph"
+                  ],
+                  "type": "string"
+                },
+                "reply_recorded_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "sender_binding_version": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "state": {
+                  "enum": [
+                    "prepared",
+                    "accepted",
+                    "uncertain",
+                    "failed",
+                    "reply_correlated",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "provider",
+                "sender_binding_version",
+                "current_sender_version",
+                "state",
+                "created_at",
+                "outcome_recorded_at",
+                "accepted_at",
+                "reply_recorded_at"
+              ],
+              "title": "ActivationCanaryView",
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "detail": {
+            "maxLength": 300,
+            "type": "string"
+          },
+          "evidence": {
+            "enum": [
+              "complete",
+              "prepared",
+              "accepted",
+              "uncertain",
+              "failed",
+              "cancelled",
+              "stale",
+              "none",
+              "no_sender"
+            ],
+            "type": "string"
+          },
+          "notes": {
+            "default": [
+              "Read-only: a canary is prepared and sent only by the owner on the command line (suv-deals canary).",
+              "complete: a correlated test reply was recorded for the configured sender binding's current version.",
+              "A canary is never a seller inquiry: no reservation, no quota debit, never one of the 15-day deals."
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sender_binding_version": {
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sender_provider": {
+            "description": "The configured sender binding's provider (null when no usable configured sender).",
+            "enum": [
+              "outlook_local",
+              "gmail_api",
+              "microsoft_graph",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "evidence",
+          "detail",
+          "sender_provider",
+          "sender_binding_version",
+          "canaries",
+          "notes"
+        ],
+        "title": "CanaryEvidenceView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "activation.canary-evidence.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only, read-only: activation-canary evidence (rows 4-6) of the configured sender and the newest canaries (ids, states, times; never the target or its hash)."
+}

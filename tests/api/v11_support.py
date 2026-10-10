@@ -77,9 +77,10 @@ async def mail_worker_api(db: Database) -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
-async def outlook_world(db: Database, seed: Seed, name: str) -> World:
-    """A workspace in ``automatic`` mode with a verified ``outlook_local`` sender and a vehicle."""
-    return await build_world(db, seed, name)
+async def outlook_world(db: Database, seed: Seed, name: str, *, canary: bool = True) -> World:
+    """A workspace in ``automatic`` mode with a verified ``outlook_local`` sender and a vehicle
+    (and, unless ``canary=False``, the owner's completed activation canary: F3/OPS-04)."""
+    return await build_world(db, seed, name, canary=canary)
 
 
 async def issue_worker(db: Database, world: World, *, label: str = "Synthetic desktop worker") -> MailWorker:

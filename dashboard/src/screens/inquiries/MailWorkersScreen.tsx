@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import type { ApiError } from '../../api/errors'
 import type {
+  CanaryEvidenceState,
   ComponentStatus,
   CredentialStatus,
   InquiryControlView,
@@ -44,7 +45,7 @@ function anyMonitoringNow(health: MailWorkerHealthView): boolean {
 }
 
 function MailWorkersContent() {
-  const { timezone } = useWorkspace()
+  const { timezone, can } = useWorkspace()
   const [includeRevoked, setIncludeRevoked] = useState(false)
   const health = useApiQuery((api, signal) => api.mailWorkerHealth({ include_revoked: includeRevoked }, { signal }), [includeRevoked])
   const gaps = useApiQuery((api, signal) => api.mailCoverageGaps({ include_revoked: includeRevoked }, { signal }), [includeRevoked])
@@ -115,6 +116,8 @@ function MailWorkersContent() {
         controlError={control.error}
         controlLoading={control.status === 'loading'}
         health={health.data}
+        isOwner={can('config:admin')}
+        timeZone={timezone}
       />
     </div>
   )
@@ -252,22 +255,101 @@ type EvidenceState = 'done' | 'open' | 'unknown'
 
 const EVIDENCE_TONE: Record<EvidenceState, string> = { done: 'ok', open: 'bad', unknown: 'warn' }
 
+const CANARY_EVIDENCE_TEXT: Record<CanaryEvidenceState, string> = {
+  complete: 'complete: a correlated test reply was recorded',
+  prepared: 'prepared: not sent yet',
+  accepted: 'accepted: no correlated test reply yet',
+  uncertain: 'uncertain: reconcile its Message-ID, never re-send',
+  failed: 'failed: prepare a new canary',
+  cancelled: 'cancelled',
+  stale: 'stale: only canaries of an older sender-binding version',
+  none: 'none: no canary recorded for the configured sender',
+  no_sender: 'no configured sender binding',
+}
+
+/**
+ * Rows 4-6 (owner-controlled canary, receipt reconciliation, correlated test reply) as the
+ * owner-only, read-only `GET /api/activation/canary-evidence` reports them: the same state as
+ * `suv-deals canary status`. Met only when the server says `complete`; anything it cannot report is
+ * unknown, never met. No canary is prepared or sent from here (the owner's CLI step).
+ */
+function CanaryEvidenceRow({ timeZone }: { timeZone: string }) {
+  const evidence = useApiQuery((api, signal) => api.canaryEvidence({ signal }), [])
+  const data = evidence.data
+  const state: EvidenceState = data === null ? 'unknown' : data.evidence === 'complete' ? 'done' : 'open'
+  return (
+    <tr data-testid="activation-row" data-evidence="canary" data-state={state}>
+      <td data-label="Evidence">4-6. Owner-controlled canary, receipt reconciliation, correlated test reply</td>
+      <td data-label="State here">
+        <Badge tone={EVIDENCE_TONE[state]}>{state === 'done' ? 'shown as met' : state === 'open' ? 'open' : 'unknown'}</Badge>
+      </td>
+      <td data-label="Detail">
+        {evidence.status === 'loading' ? <span className="muted">loading the canary evidence</span> : null}
+        {evidence.error ? (
+          <span data-testid="canary-evidence" data-evidence-state="unknown">
+            unknown: the canary evidence could not be loaded ({evidence.error.code}); read it with <code>suv-deals canary status</code>
+          </span>
+        ) : null}
+        {data ? (
+          <>
+            <span data-testid="canary-evidence" data-evidence-state={data.evidence}>
+              {CANARY_EVIDENCE_TEXT[data.evidence] ?? label(data.evidence)} ({data.detail})
+              {data.sender_provider ? ` · ${label(data.sender_provider)} sender binding v${data.sender_binding_version ?? '?'}` : ''}
+            </span>
+            {data.canaries.length ? (
+              <ul className="small plain-list">
+                {data.canaries.map((item) => (
+                  <li key={item.id} data-testid="canary-item" data-state={item.state}>
+                    <code>{shortHash(item.id)}</code> <Badge value={item.state} /> binding v{item.sender_binding_version}
+                    {item.current_sender_version ? '' : ' (older version)'} · prepared{' '}
+                    <Timestamp value={item.created_at} timeZone={timeZone} />
+                    {item.accepted_at ? (
+                      <>
+                        {' '}
+                        · accepted <Timestamp value={item.accepted_at} timeZone={timeZone} />
+                      </>
+                    ) : null}
+                    {item.reply_recorded_at ? (
+                      <>
+                        {' '}
+                        · test reply <Timestamp value={item.reply_recorded_at} timeZone={timeZone} />
+                      </>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <span className="muted small">
+              {' '}
+              A canary is prepared and sent only by the owner on the command line (<code>suv-deals canary</code>).
+            </span>
+          </>
+        ) : null}
+      </td>
+    </tr>
+  )
+}
+
 /**
  * The activation evidence of docs/seller_email_activation.md section 8, READ-ONLY. The dashboard
- * shows what its API reports (sender readiness, worker monitoring, standing authorization); the
- * owner-controlled canary rows (4-6) are not served by the dashboard API, so they are shown as
- * "not shown here" with the CLI that reports them. There is no canary, test or send control here.
+ * shows what its API reports (sender readiness, worker monitoring, standing authorization and, for
+ * the owner, the canary rows 4-6 from `GET /api/activation/canary-evidence`); other roles see that
+ * the canary evidence is the owner's. There is no canary, test or send control here.
  */
 function ActivationSection({
   control,
   controlError,
   controlLoading,
   health,
+  isOwner,
+  timeZone,
 }: {
   control: InquiryControlView | null
   controlError: ApiError | null
   controlLoading: boolean
   health: MailWorkerHealthView | null
+  isOwner: boolean
+  timeZone: string
 }) {
   // A worker whose credential expired or was revoked is not monitoring, however fresh its last report.
   const monitored = health !== null && health.any_monitoring_active && anyMonitoringNow(health)
@@ -333,20 +415,22 @@ function ActivationSection({
               <td data-label="Detail">{row.detail}</td>
             </tr>
           ))}
-          <tr data-testid="activation-row" data-evidence="canary" data-state="not_shown">
-            <td data-label="Evidence">4-6. Owner-controlled canary, receipt reconciliation, correlated test reply</td>
-            <td data-label="State here">
-              <Badge tone="warn">not shown here</Badge>
-            </td>
-            <td data-label="Detail">
-              <span data-testid="canary-evidence">
-                The dashboard API does not report the activation canary yet, so its evidence state (prepared, accepted, uncertain,
-                failed, complete, stale) is not shown here and is never assumed. Read it with <code>suv-deals canary status</code>{' '}
-                or <code>suv-deals doctor</code> (<code>seller_inquiry/activation_canary</code>). A canary is sent only by the owner
-                on the command line.
-              </span>
-            </td>
-          </tr>
+          {isOwner ? (
+            <CanaryEvidenceRow timeZone={timeZone} />
+          ) : (
+            <tr data-testid="activation-row" data-evidence="canary" data-state="owner_only">
+              <td data-label="Evidence">4-6. Owner-controlled canary, receipt reconciliation, correlated test reply</td>
+              <td data-label="State here">
+                <Badge tone="warn">owner only</Badge>
+              </td>
+              <td data-label="Detail">
+                <span data-testid="canary-evidence" data-evidence-state="owner_only">
+                  The canary evidence is shown to the owner only and is never assumed here. The owner reads it on this page or with{' '}
+                  <code>suv-deals canary status</code>; a canary is sent only by the owner on the command line.
+                </span>
+              </td>
+            </tr>
+          )}
         </tbody>
       </table>
     </Section>

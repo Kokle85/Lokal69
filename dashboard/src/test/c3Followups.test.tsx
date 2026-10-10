@@ -10,7 +10,8 @@
  *  3. transient conflicts use `details.reason` (`busy` / `in_progress`), `retryable` as fallback;
  *  4. the reply-signal cap and worker credential state on the reply and health screens;
  *  5. the candidates audit filter `include_screening_rejected`;
- *  6. the activation evidence (read-only; the canary state is not served by the API, never assumed).
+ *  6. the activation evidence (read-only; the canary state is never assumed; since D1 the owner's
+ *     canary rows come from `GET /api/activation/canary-evidence`, see d1Followups.test.tsx).
  *
  * There is still no approve, send or canary control anywhere.
  */
@@ -562,18 +563,19 @@ function activationStates(): Record<string, string | null> {
 }
 
 describe('6. activation evidence on the health screen (read-only)', () => {
-  it('shows the readiness rows from the API and the canary rows as not shown here, with no canary or send control', async () => {
+  it('shows the readiness rows from the API; the canary rows are unknown (never met) when their evidence cannot be read', async () => {
     const off = mailbox({ monitoring_active: false, heartbeat_status: 'down', open_gap_count: 1 })
+    // D1: the owner's canary evidence comes from GET /api/activation/canary-evidence (not served here).
     const api = ownerApi({
       'GET /api/mail-workers/health': () => ok(health([off])),
       'GET /api/mail-workers/coverage-gaps': () => ok(gaps([])),
       'GET /api/inquiry-control': () => ok(control({ authorization_status: 'not_effective', sender_readiness: 'ready' })),
     })
     renderApp('/mail-workers', { api })
-    await waitFor(() => expect(activationStates()).toEqual({ sender: 'done', runtime: 'open', authorization: 'open', canary: 'not_shown' }))
+    await waitFor(() => expect(activationStates()).toEqual({ sender: 'done', runtime: 'open', authorization: 'open', canary: 'unknown' }))
     const canary = screen.getByTestId('canary-evidence')
-    expect(canary).toHaveTextContent('does not report the activation canary yet')
-    expect(canary).toHaveTextContent('never assumed')
+    expect(canary).toHaveAttribute('data-evidence-state', 'unknown')
+    expect(canary).toHaveTextContent('could not be loaded')
     expect(canary).toHaveTextContent('suv-deals canary status')
     const section = screen.getByRole('region', { name: 'Activation evidence (read-only)' })
     expect(within(section).queryAllByRole('button')).toHaveLength(0)
@@ -590,7 +592,7 @@ describe('6. activation evidence on the health screen (read-only)', () => {
       'GET /api/inquiry-control': () => apiError(404, 'NOT_FOUND', 'Seller inquiry controls not found'),
     })
     renderApp('/mail-workers', { api })
-    await waitFor(() => expect(activationStates()).toEqual({ sender: 'unknown', runtime: 'done', authorization: 'unknown', canary: 'not_shown' }))
+    await waitFor(() => expect(activationStates()).toEqual({ sender: 'unknown', runtime: 'done', authorization: 'unknown', canary: 'unknown' }))
     await waitFor(() => expect(api.callsTo('GET /api/inquiry-control')).toHaveLength(1))
     expect(screen.queryByRole('alert', { name: /Not found/ })).toBeNull()
   })

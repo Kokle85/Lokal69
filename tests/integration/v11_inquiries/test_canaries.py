@@ -20,6 +20,7 @@ from tests.integration.db.helpers import SV_FROZEN, SV_MONOTONIC, SV_REFERENCE, 
 from tests.integration.v11_inquiries.support import (
     SENDER_ADDRESS,
     World,
+    complete_activation_canary,
     now_utc,
     owner,
     scalar,
@@ -42,7 +43,8 @@ from suv_deals.persistence import (
 from suv_deals.persistence.database import Database
 from suv_deals.persistence.transactions import unit_of_work
 
-pytestmark = pytest.mark.db
+# These tests count and walk canaries themselves: no arranged activation canary (F3/OPS-04).
+pytestmark = [pytest.mark.db, pytest.mark.no_arranged_canary]
 
 TARGET = "activation-canary@owner-test.example.invalid"
 OWNER_REPLY_ID = "<owner-reply-1@owner-test.example.invalid>"
@@ -169,6 +171,7 @@ async def test_canary_lifecycle_records_evidence_without_the_address(db: Databas
 
 async def test_canary_never_touches_the_quota_or_the_inquiries(db: Database, world: World) -> None:
     await _worker(db, world)
+    await complete_activation_canary(db, world.workspace_id, world.sender_binding_id)  # real sends need it
     real, _ = await send(db, world)  # one real (synthetic) seller inquiry, debited
     boss = owner(world.workspace_id)
     async with unit_of_work(db, boss) as conn:

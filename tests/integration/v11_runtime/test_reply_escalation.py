@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from uuid import UUID
 
@@ -51,6 +52,44 @@ PAYMENT_BODY = (
 ROUTINE_BODY = (
     "Guten Tag, das Fahrzeug ist noch verfügbar. Die Unterlagen liegen vor. Synthetic fixture reply."
 )
+
+
+#: Random ids and times inside an alert or a Slack post: canonical UUIDs (event, inquiry, reply and
+#: listing ids, also inside the dashboard link and the dedup key) and RFC 3339 timestamps.
+_RANDOM_IDS_AND_TIMES = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+    re.IGNORECASE,
+)
+
+
+def _seller_text_view(value: Any) -> str:
+    """``value`` as JSON text with non-ASCII kept literal and the random ids/times blanked.
+
+    A plain substring test against ``json.dumps`` output is wrong both ways: a short token such as
+    the deposit amount ``500`` occurs by chance inside a random UUID (``...fa50025ae``) or a
+    millisecond timestamp (a flaky failure), and ``ensure_ascii`` turns ``überweisen`` into
+    ``\\u00fcberweisen`` (a check that can never fail). The ids are asserted separately; what is
+    left must not carry any seller-supplied text.
+    """
+    return _RANDOM_IDS_AND_TIMES.sub("<id>", json.dumps(value, ensure_ascii=False))
+
+
+def test_seller_text_view_ignores_random_ids_but_keeps_seller_text() -> None:
+    reply_id = "1b0c2d3e-4f50-4a6b-8c7d-9e0fa50025ae"
+    payload = {
+        "reply_id": reply_id,
+        "occurred_at": "2026-10-10T10:00:00.500Z",
+        "dashboard_url": f"https://dashboard.example/inquiries/x/replies/{reply_id}",
+    }
+    # The former plain check `"500" not in json.dumps(payload)` failed on such a clean payload.
+    assert "500" in json.dumps(payload)
+    assert "500" not in _seller_text_view(payload)
+    # ... and could never catch a leaked non-ASCII word.
+    leaked = {"status": "Bitte überweisen Sie eine Anzahlung von 500 EUR"}
+    assert "überweisen" not in json.dumps(leaked)
+    view = _seller_text_view(leaked)
+    assert "überweisen" in view and "500" in view and "Anzahlung" in view
 
 
 def _db_url(env: PipelineEnv) -> str:
@@ -107,7 +146,7 @@ async def test_payment_request_alerts_once_and_routine_replies_never(env: Pipeli
     payload = alert["payload"]
     assert payload["kind"] == "decision_needed" and payload["reasons"] == ["payment_request"]
     assert payload["inquiry_id"] == str(inquiry["id"]) and payload["reply_id"] == str(first.reply_id)
-    rendered = json.dumps(payload)
+    rendered = _seller_text_view(payload)
     for private in ("Anzahlung", "500", "überweisen", seller.address, SENDER_ADDRESS):
         assert private not in rendered  # ids, codes and the dashboard link only
     [inquiry] = inquiries_of(env)
@@ -167,7 +206,7 @@ async def test_payment_request_alerts_once_and_routine_replies_never(env: Pipeli
     assert post["text"].startswith("Seller reply needs your decision: payment request.")
     assert "Nothing was accepted or answered; no reply is sent automatically." in post["text"]
     assert f"Inquiry {inquiry['id']}; reply {first.reply_id}" in post["text"]
-    posted = json.dumps(api.posts)
+    posted = _seller_text_view(api.posts)
     for private in ("Anzahlung", "überweisen", "Guten Tag", seller.address, SENDER_ADDRESS, "xoxb-"):
         assert private not in posted
     assert (

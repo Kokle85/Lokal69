@@ -112,6 +112,16 @@ WaitingReason = Literal[
 ]
 AuthorizationStatus = Literal["missing", "active", "not_effective", "revoked"]
 SenderReadiness = Literal["ready", "missing", "unverified", "alias_unverified", "unhealthy", "revoked"]
+#: Why the PROCESS-level gate of the serving backend is closed (D1 item 7; the same codes as
+#: ``suv-deals canary send`` reports).
+ProcessBlocker = Literal[
+    "SELLER_INQUIRY_MODE_NOT_AUTOMATIC", "SELLER_INQUIRY_KILL_SWITCH_ON", "MESSAGE_APPROVAL_SETTING_ON"
+]
+#: The activation-canary evidence of the configured sender (``canaries_repo.evidence_state``).
+CanaryEvidenceState = Literal[
+    "complete", "prepared", "accepted", "uncertain", "failed", "cancelled", "stale", "none", "no_sender"
+]
+CanaryStateLiteral = Literal["prepared", "accepted", "uncertain", "failed", "reply_correlated", "cancelled"]
 #: The 7-day seller-cooldown floor (``domain.inquiries.SELLER_COOLDOWN``) in seconds.
 MIN_SELLER_COOLDOWN_SECONDS: Final = 7 * 86_400
 AttachmentAction = Literal["allow_vehicle_document", "quarantine_sensitive", "reject"]
@@ -623,6 +633,44 @@ class InquiryControlView(ViewModel):
     sender_provider: EmailProviderKind | None = None
     sender_binding_version: int | None = Field(default=None, ge=1)
     sender_problems: tuple[ReasonCode, ...] = Field(default=(), max_length=10)
+    process_mode: InquiryMode | None = Field(
+        default=None,
+        description=(
+            "SELLER_INQUIRY_MODE of the serving backend (the process-level gate; null when not"
+            " reported). Both this and the database mode must be automatic."
+        ),
+    )
+    process_kill_switch: bool | None = Field(
+        default=None,
+        description="SELLER_INQUIRY_KILL_SWITCH of the serving backend (null when not reported).",
+    )
+    process_message_approval_required: bool | None = Field(
+        default=None,
+        description=(
+            "SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL (the owner's setting; it DISABLES automatic"
+            " sending, never adds an approval wait). Null when not reported."
+        ),
+    )
+    process_blockers: tuple[ProcessBlocker, ...] = Field(
+        default=(), max_length=3, description="Why the process-level gate is closed (empty: open)."
+    )
+    activation_canary_complete: bool = Field(
+        default=False,
+        description=(
+            "A correlated test reply (activation canary in state reply_correlated) exists for the"
+            " configured sender binding's CURRENT version. Until then every real seller inquiry is"
+            " refused at reservation (activation_canary_incomplete)."
+        ),
+    )
+    automatic_inquiries_possible: bool = Field(
+        default=False,
+        description=(
+            "True only while EVERY gate is open: the process gate, the database mode automatic with"
+            " the kill switch off, the standing authorization active, the configured sender"
+            " ready with its activation canary complete and room under both rolling caps now (a cap"
+            " of 0 holds every inquiry). Never a claim that anything was or will be sent."
+        ),
+    )
 
     @staticmethod
     def cooldown_seconds(cooldown: timedelta) -> int:
@@ -656,12 +704,56 @@ class InquiryResumeResult(ViewModel):
     )
 
 
+class ActivationCanaryView(ViewModel):
+    """One owner-controlled activation canary as the owner's dashboard shows it: ids, state and
+    times only (never the target address, its hash, the purpose or any evidence text)."""
+
+    id: UUID
+    provider: EmailProviderKind
+    sender_binding_version: int = Field(ge=1)
+    current_sender_version: bool = Field(
+        description="Bound to the configured sender binding's CURRENT version (older ones are stale)."
+    )
+    state: CanaryStateLiteral
+    created_at: UtcDatetime
+    outcome_recorded_at: UtcDatetime | None
+    accepted_at: UtcDatetime | None
+    reply_recorded_at: UtcDatetime | None
+
+
+#: Static, honest notes of the canary-evidence view (no state is invented).
+CANARY_EVIDENCE_NOTES: Final = (
+    "Read-only: a canary is prepared and sent only by the owner on the command line (suv-deals canary).",
+    "complete: a correlated test reply was recorded for the configured sender binding's current version.",
+    "A canary is never a seller inquiry: no reservation, no quota debit, never one of the 15-day deals.",
+)
+
+
+class CanaryEvidenceView(ViewModel):
+    """``GET /api/activation/canary-evidence`` (owner only, read-only; D1 item 6): activation
+    evidence rows 4-6 of docs/seller_email_activation.md section 8 for the CONFIGURED sender (the
+    same state ``suv-deals canary status`` and ``doctor`` report) and the newest canaries."""
+
+    evidence: CanaryEvidenceState
+    detail: str = Field(max_length=300)
+    sender_provider: EmailProviderKind | None = Field(
+        description="The configured sender binding's provider (null when no usable configured sender)."
+    )
+    sender_binding_version: int | None = Field(ge=1)
+    canaries: tuple[ActivationCanaryView, ...] = Field(max_length=50)
+    notes: tuple[str, ...] = CANARY_EVIDENCE_NOTES
+
+
 __all__ = [
+    "CANARY_EVIDENCE_NOTES",
     "INQUIRY_PURPOSE",
     "MAX_PER_15D_CEILING",
     "MAX_PER_24H_CEILING",
     "MIN_SELLER_COOLDOWN_SECONDS",
+    "ActivationCanaryView",
     "AuthorizationStatus",
+    "CanaryEvidenceState",
+    "CanaryEvidenceView",
     "DocumentClaimView",
     "InquiryAuthorizationRef",
     "InquiryControlView",
@@ -677,6 +769,7 @@ __all__ = [
     "InquiryView",
     "LanguageCode",
     "PriceQuoteView",
+    "ProcessBlocker",
     "RecipientView",
     "ReplyAttachmentView",
     "ReplyClaimsView",

@@ -13,8 +13,10 @@
   ``alpha``    eligible_primary, two revisions (price drop), INCOMPLETE valuation with UNKNOWN cost
                lines (transport, customs broker, all import taxes: no approved rule set), MK
                comparables, field evidence, a note, availability events and a PENDING review case;
-  ``bravo``, ``charlie``, ``delta``, ``echo``, ``foxtrot``, ``golf``  eligible_primary with pending
-               cases (one per mutating E2E test; ``golf`` is the real server-side claim-expiry case);
+  ``bravo``, ``charlie``, ``delta``, ``echo``, ``foxtrot``, ``golf``, ``hotel``  eligible_primary
+               with pending cases (one per mutating E2E test; ``golf`` is the real server-side
+               claim-expiry case; ``hotel`` gets a new listing revision while it is claimed,
+               ``tests/e2e/v11_actions.py add-listing-revision``);
   ``xss``      eligible_primary whose title, description, fault list and provenance text are XSS /
                prompt-injection payloads (must render inert), pending case;
   ``rejected`` 200,000 km: rejected by screening (MILEAGE_TOO_HIGH) and by a reviewer decision;
@@ -103,6 +105,7 @@ TITLES = {
     "echo": "SYNTHETIC E2E Echo Trail 2.0 TDI",
     "foxtrot": "SYNTHETIC E2E Foxtrot Trail 2.0 TDI",
     "golf": "SYNTHETIC E2E Golf Trail 2.0 TDI",
+    "hotel": "SYNTHETIC E2E Hotel Trail 2.0 TDI",
     "xss": XSS_TITLE,
     "rejected": "SYNTHETIC E2E Rejected Trail 200,000 km",
     "audit_rejected": "SYNTHETIC E2E Screening-rejected Trail (audit only)",
@@ -405,6 +408,7 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
         "echo": 2600,
         "foxtrot": 2650,
         "golf": 2675,
+        "hotel": 2725,
         "xss": 2700,
     }
     for offset, (key, eur) in enumerate(eligible.items()):
@@ -503,7 +507,7 @@ async def _seed(seed: Seed, db: Database, now: datetime) -> dict[str, Any]:
     data.valuations["alpha"] = valuation_id
 
     data.cases["alpha"] = _case(seed, ws, alpha, alpha_rev, valuation_id=valuation_id, priority=50)
-    for key in ("bravo", "charlie", "delta", "echo", "foxtrot", "golf", "xss"):
+    for key in ("bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "xss"):
         data.cases[key] = _case(seed, ws, data.listings[key], data.revisions[key][-1], priority=40)
 
     for key, outcome, reasons, summary in (

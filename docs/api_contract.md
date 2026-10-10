@@ -422,8 +422,8 @@ Used only by the Windows desktop worker (`desktop/outlook-bridge`). Table:
   `inquiry_id`, `intent_id`) are checked against the credential's mailbox and a mismatch (or an
   unknown inquiry/intent) is `403 FORBIDDEN` (`details.reason = "mailbox_binding_mismatch"`),
   never a silent reassignment and never an existence leak.
-- **Idempotency**: `POST /replies`, `POST /send-intents/{intent_id}/claim` and
-  `POST /send-intents/{intent_id}/report` REQUIRE an `Idempotency-Key` header (8-128 characters of
+- **Idempotency**: `POST /replies`, `POST /send-intents/{intent_id}/claim`,
+  `POST /send-intents/{intent_id}/report` and the three canary POSTs REQUIRE an `Idempotency-Key` header (8-128 characters of
   `A-Z a-z 0-9 . _ : -`; missing -> `400`, malformed or repeated -> `422`). `POST /heartbeat` and
   `POST /account-report` carry none (latest-state reports). The rule is
   `ApiRoute.idempotency_header` (`idempotencyKeyHeader` in `schemas/api/*.json`). For
@@ -434,11 +434,35 @@ Used only by the Windows desktop worker (`desktop/outlook-bridge`). Table:
   changed locator goes to locator history), while different content under the same identity is
   `409 IDEMPOTENCY_CONFLICT` and is quarantined, never overwritten. The claim key
   (`claim-<intent>-<claim_attempt_id>`) is required but **never stored or replayed**: every claim
-  is evaluated fresh, so an earlier `proceed: true` can never come back. The report key
+  is evaluated fresh, so an earlier `proceed: true` can never come back. One running intent is
+  granted to ONE `worker_id` (wave D2, SEC-1): the first granted claim pins it, the same
+  `worker_id` is granted again (a lost answer), and every other `worker_id` - or a holder the
+  server cannot read, fail safe - is refused `intent_invalid` with detail `ALREADY_CLAIMED`;
+  that worker's `refused_before_send` report keeps the attempt `uncertain` (a granted claim
+  exists), so the message is never resent. The desktop worker sends
+  `<config worker_id>.<local store instance id>` as the claim's `worker_id`, so a reinstall, a
+  wiped store or a second data_dir is a different worker. The report key
   (`report-<intent>-<state>`) is stored with the request hash (`persistence.idempotency`,
   operation `mail_worker.send_report`): the same key and report replay the acknowledgement,
   another report under the same key is `409 IDEMPOTENCY_CONFLICT`. The `{intent_id}` path segment
   must equal the body's `intent_id` (`422 VALIDATION_ERROR` otherwise).
+- **Activation canaries** (`outlook_local`; spec 37.10; F3, wave D2; `canaries_repo`): the owner's
+  `suv-deals canary send` claims a prepared canary and publishes it to its desktop mailbox worker
+  in one transaction. `GET /canary-intents` lists the worker's published canaries (at most 10;
+  the fixed canary text of `domain.canary`, the sender identity and the owner-controlled target
+  as its SHA-256 only - the worker sends to the address configured on the owner's machine with
+  that hash; a canary past its 24-hour publication window or whose sender binding changed is
+  listed `expired: true`). `POST /canary-intents/{canary_id}/claim` (key
+  `canary-claim-<id>-<attempt>`, required, never stored or replayed) re-checks the kill switch,
+  mode, standing authorization, sender binding version and window under the controls lock and is
+  granted to ONE `worker_id` (another is refused `intent_invalid`). `.../report` (key
+  `canary-report-<id>-<state>`, operation `mail_worker.canary_report`) records the evidence:
+  `sent_items_confirmed` -> `accepted`, `refused_before_send`/`transport_rejected` -> `failed`,
+  `submitted_to_outbox`/`send_call_failed` stay `uncertain`; transmission evidence needs a granted
+  claim (`409` `canary_not_claimed` otherwise). `.../reply` (key `canary-reply-<id>-<digest>`,
+  operation `mail_worker.canary_reply`) records the owner's reply that names the canary
+  Message-ID, with the reply's headers and the sender's SHA-256 only -> `reply_correlated`
+  (complete activation evidence). Another mailbox's canary is `403 mailbox_binding_mismatch`.
 - **Bodies and responses** are top-level JSON objects with `schema_version: "1.0"` (no
   `ResponseEnvelope`), except the account-report body, which carries no `schema_version` (exactly
   like the desktop `WorkerAccountReport`; a server must not require one); they are closed
@@ -465,6 +489,10 @@ Used only by the Windows desktop worker (`desktop/outlook-bridge`). Table:
 | `GET /v1/mail-workers/send-intents` | query `MailWorkerSendIntentsQuery` (`limit` 1-50) | `MailWorkerSendIntentBatch` of `MailWorkerSendIntent` | 200 | - |
 | `POST /v1/mail-workers/send-intents/{intent_id}/claim` | body `MailWorkerClaimRequest` | `MailWorkerClaimDecision` | 200 | `NOT_FOUND`, `VERSION_CONFLICT` |
 | `POST /v1/mail-workers/send-intents/{intent_id}/report` | body `MailWorkerSendReport` | `MailWorkerAccepted` | 200 | `NOT_FOUND`, `VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT` |
+| `GET /v1/mail-workers/canary-intents` | - | `MailWorkerCanaryIntentBatch` of `MailWorkerCanaryIntent` | 200 | - |
+| `POST /v1/mail-workers/canary-intents/{canary_id}/claim` | body `MailWorkerCanaryClaimRequest` | `MailWorkerCanaryClaimDecision` | 200 | `NOT_FOUND`, `VERSION_CONFLICT` |
+| `POST /v1/mail-workers/canary-intents/{canary_id}/report` | body `MailWorkerCanaryReport` | `MailWorkerAccepted` | 200 | `NOT_FOUND`, `VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT` |
+| `POST /v1/mail-workers/canary-intents/{canary_id}/reply` | body `MailWorkerCanaryReply` | `MailWorkerAccepted` | 200 | `NOT_FOUND`, `VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT` |
 | `POST /v1/mail-workers/heartbeat` | body `MailWorkerHeartbeatRequest` (`MailWorkerCheckpointReport`, `MailWorkerGapReport`) | `MailWorkerHeartbeatAck` | 200 | - |
 | `POST /v1/mail-workers/account-report` | body `MailWorkerAccountReport` | `MailWorkerAccepted` | 200 | `VERSION_CONFLICT` |
 
@@ -549,6 +577,7 @@ User-JWT routes like section 6, enveloped, with the same error conventions. Tabl
 | `GET /api/inquiry-control` | `inquiries:read` | - | `InquiryControlView` | 200 | `NOT_FOUND` (no controls row yet: `suv-deals inquiries authorize` creates it) | - |
 | `POST /api/inquiry-control/pause` | `inquiries:pause` | body `InquiryPauseRequest` | `InquiryPauseResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | `seller_inquiries_pause` |
 | `POST /api/inquiry-control/resume` | `config:admin` | body `InquiryResumeRequest` | `InquiryResumeResult` | 200 | `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
+| `GET /api/activation/canary-evidence` | `config:admin` | - | `CanaryEvidenceView` of `ActivationCanaryView` | 200 | - | - |
 | `GET /api/mail-workers/health` | `inquiries:read` | query `MailWorkerHealthQuery` (`include_revoked`) | `MailWorkerHealthView` of `MailboxHealthView` | 200 | - | - |
 | `GET /api/mail-workers/coverage-gaps` | `inquiries:read` | query `MailWorkerHealthQuery` | `MailCoverageGapListView` of `MailCoverageGapItem` | 200 | - | - |
 | `GET /api/lifecycle/lags` | `deals:read` | - | `CoverageLagsView` (`SourceLagView`, `LagView`) | 200 | - | - |
@@ -597,22 +626,54 @@ surface replays the same result); resume uses `inquiry_control_resume`.
   `sender_provider`, `sender_binding_version`, `sender_problems`): the binding of
   `SELLER_EMAIL_PROVIDER` that is exactly `SELLER_EMAIL_ACCOUNT_ID` / `_FROM` / `_REPLY_TO`, never
   merely the newest binding; without one it is `missing` with `sender_identity_*` codes (no values).
+  Next to the database controls it reports the PROCESS-level gate of the serving backend (D1):
+  `process_mode` (`SELLER_INQUIRY_MODE`), `process_kill_switch` (`SELLER_INQUIRY_KILL_SWITCH`),
+  `process_message_approval_required` (`SELLER_INQUIRY_REQUIRE_MESSAGE_APPROVAL`, the owner's
+  setting that disables automatic sending), `process_blockers` (`SELLER_INQUIRY_MODE_NOT_AUTOMATIC`,
+  `SELLER_INQUIRY_KILL_SWITCH_ON`, `MESSAGE_APPROVAL_SETTING_ON`; empty = open) and
+  `automatic_inquiries_possible`: `true` only while every gate is open (process gate, database
+  mode `automatic` with the kill switch off, standing authorization `active`, configured sender
+  `ready` with `activation_canary_complete`) and both rolling caps leave room now (`used_24h <
+  max_per_24h` and `used_15d < max_per_15d`; a cap of 0, as during the activation canary step,
+  holds every inquiry). `activation_canary_complete` (D2, F3/OPS-04): a `reply_correlated`
+  activation canary exists for the configured sender binding's CURRENT version; until then the
+  reservation of every real seller inquiry is refused (`activation_canary_incomplete`). It is
+  never a claim that anything was or will be sent; each process (scheduler, worker) still checks
+  its own settings (`suv-deals doctor --process ...`). `suv-deals inquiries status`
+  (`sending_possible`, `activation_canary`) applies the same rule.
+- **Activation canary evidence** (`GET /api/activation/canary-evidence`, owner only, read-only;
+  D1): rows 4-6 of docs/seller_email_activation.md section 8 for the CONFIGURED sender. `evidence`
+  is the state `suv-deals canary status` and `doctor` report (`canaries_repo.evidence_state`:
+  `complete` = a correlated test reply was recorded for the binding's current version;
+  otherwise the newest current-version canary's `prepared` / `accepted` / `uncertain` / `failed` /
+  `cancelled`, `stale` (only older versions), `none`, or `no_sender` without a usable configured
+  identity), with `detail`, the configured sender's `sender_provider` / `sender_binding_version`
+  and the newest 20 canaries (`ActivationCanaryView`: id, provider, binding version,
+  `current_sender_version`, state, created/outcome/accepted/reply times). The target address, its
+  hash, the purpose and evidence text are never part of it. There is no prepare, claim or send
+  route: a canary is prepared and sent only by the owner with `suv-deals canary`.
 - **Pause** activates the inquiry kill switch against the control `expected_version` with a
   reason (same rules as the MCP tool; pausing an already paused control answers
   `already_paused: true`). **Resume** is owner-only and dashboard-only; it is never an MCP tool.
   With `remove_suppressions: true` it also removes those suppressions, one audited removal each
   (`suppressions_removed` in the result); every other suppression (opt-out, bounce, complaint,
   sender revoked, unresolved send, manual) needs its own explicit owner decision.
-  `expected_removable_suppressions` (0-5,000, strict integer; optional for older clients, sent by
-  the CLI and by the dashboard with the count the owner ticked) is the `removable_suppressions` count the owner saw: it is compared after the controls
-  lock (kill-switch and authorization-revoked suppressions are only added under that lock) and a
+  `expected_removable_suppressions` (0-5,000, strict integer; REQUIRED whenever
+  `remove_suppressions` is true, otherwise `422 VALIDATION_ERROR` with `details.fields =
+  [expected_removable_suppressions]`, and the snapshot states the same rule as an `if`/`then`;
+  the CLI and the dashboard send the count the owner saw or ticked) is the
+  `removable_suppressions` count the owner saw: it is compared after the controls lock (kill-switch and authorization-revoked suppressions are only added under that lock) and a
   different count refuses the WHOLE resume with `409 VERSION_CONFLICT`, `details = {reason:
   suppressions_changed, expected_removable_suppressions, current_removable_suppressions}`; nothing
   changes and the idempotency key is not consumed. Without `remove_suppressions` the count is not
   checked.
 - **Mail-worker health** reports each mailbox worker's separate dimensions (heartbeat, Outlook,
   mailbox sync lag, last reconciliation, backlog age, unresolved matching gaps, account
-  verification) and its coverage gaps; monitoring is reported only while all of them are fresh.
+  verification) and its coverage gaps; monitoring is reported only while all of them are fresh
+  AND the active binding's credential is neither expired nor revoked (a dead credential cannot
+  upload a reply, so `monitoring_active` is false at once, however fresh the last heartbeat, with
+  the reason `mailbox worker credential expired or revoked: replies cannot be uploaded`; the same
+  flag feeds `any_monitoring_active`, `suv-deals doctor` and `suv-deals inquiries status`).
   Store/folder identities are hashes; no address, subject or body appears. It also lists each
   listed worker's credential state (`credentials[]`: `credential_status` `active` / `expiring`
   (within 14 days) / `expired` / `revoked`, `binding_state`, `expires_at`, `revoked_at`; never a

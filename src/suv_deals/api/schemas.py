@@ -47,6 +47,14 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
+from suv_deals.domain.canary import (
+    CanaryClaimDecision,
+    CanaryClaimRequest,
+    CanaryIntent,
+    CanaryIntentBatch,
+    CanaryReplyReport,
+    CanaryReport,
+)
 from suv_deals.domain.enums import (
     EmailProviderKind,
     InquiryState,
@@ -97,6 +105,7 @@ from suv_deals.mcp.schemas import (
     SellerInquiriesPauseInput,
     SourcesPauseInput,
     SourceVersion,
+    SubmitRuleError,
     SummaryText,
     ToolInput,
     ValuationIdRef,
@@ -114,6 +123,7 @@ from suv_deals.views.common import (
 )
 from suv_deals.views.comparables import ComparableSetView
 from suv_deals.views.inquiries import (
+    CanaryEvidenceView,
     InquiryControlView,
     InquiryListView,
     InquiryPauseResult,
@@ -361,11 +371,26 @@ class InquiryResumeRequest(ToolInput):
     sender revoked, ...) are never removed here. ``expected_removable_suppressions`` closes the
     time-of-check/time-of-use gap between the control view the owner read and the resume: the
     count is compared under the controls lock (kill-switch and authorization-revoked suppressions
-    are added only under that lock) and a mismatch refuses the whole resume. It is optional for
-    compatibility with older clients: the CLI (``--expected-suppressions``, required there) and
-    the dashboard (the count the owner ticked) send it; a request without it is not protected by
-    this check.
+    are added only under that lock) and a mismatch refuses the whole resume. It is REQUIRED
+    whenever ``remove_suppressions`` is true (``422 VALIDATION_ERROR`` naming the field
+    otherwise), so a removal only ever removes the set the owner saw; the CLI
+    (``--expected-suppressions``) and the dashboard (the count the owner ticked) send it. Without
+    a removal it names nothing and is not checked.
     """
+
+    model_config = ConfigDict(
+        **ToolInput.model_config,
+        json_schema_extra={
+            "if": {
+                "properties": {"remove_suppressions": {"const": True}},
+                "required": ["remove_suppressions"],
+            },
+            "then": {
+                "properties": {"expected_removable_suppressions": {"type": "integer"}},
+                "required": ["expected_removable_suppressions"],
+            },
+        },
+    )
 
     expected_version: Annotated[int, Field(ge=1, strict=True)]
     reason: Reason
@@ -374,12 +399,18 @@ class InquiryResumeRequest(ToolInput):
     expected_removable_suppressions: _RemovableCount | None = Field(
         default=None,
         description=(
-            "With remove_suppressions: the removable_suppressions count the owner saw in"
+            "Required with remove_suppressions: the removable_suppressions count the owner saw in"
             " GET /api/inquiry-control. When the current count differs, the resume is refused"
             " (409 VERSION_CONFLICT, details.reason = suppressions_changed) and nothing changes,"
             " so only the suppressions the owner saw are ever removed."
         ),
     )
+
+    @model_validator(mode="after")
+    def _count_with_removal(self) -> InquiryResumeRequest:
+        if self.remove_suppressions and self.expected_removable_suppressions is None:
+            raise SubmitRuleError(("expected_removable_suppressions",))
+        return self
 
 
 class MailWorkerHealthQuery(ApiQuery):
@@ -625,6 +656,35 @@ class MailWorkerClaimDecision(BaseModel):
 class MailWorkerSendReport(OutlookSendReport):
     """Body of ``POST /v1/mail-workers/send-intents/{intent_id}/report`` (== ``wire.WorkerSendReport``;
     ``Idempotency-Key: report-<intent>-<state>``)."""
+
+
+class MailWorkerCanaryIntent(CanaryIntent):
+    """One published ``outlook_local`` activation canary (== ``wire.WorkerCanaryIntent``; F3, wave
+    D2): the fixed canary rendering, the sender identity and the owner-controlled target as its
+    SHA-256 only (the worker sends to the address configured on the owner's machine)."""
+
+
+class MailWorkerCanaryIntentBatch(CanaryIntentBatch):
+    """Response of ``GET /v1/mail-workers/canary-intents`` (== ``wire.CanaryIntentBatch``)."""
+
+    intents: tuple[MailWorkerCanaryIntent, ...] = Field(default=(), max_length=10)
+
+
+class MailWorkerCanaryClaimRequest(CanaryClaimRequest):
+    """Body of ``POST /v1/mail-workers/canary-intents/{canary_id}/claim`` (never replayed)."""
+
+
+class MailWorkerCanaryClaimDecision(CanaryClaimDecision):
+    """Response of the canary claim (== ``wire.CanaryClaimDecision``)."""
+
+
+class MailWorkerCanaryReport(CanaryReport):
+    """Body of ``POST /v1/mail-workers/canary-intents/{canary_id}/report`` (no address)."""
+
+
+class MailWorkerCanaryReply(CanaryReplyReport):
+    """Body of ``POST /v1/mail-workers/canary-intents/{canary_id}/reply`` (headers only; the
+    reply's sender as its target hash)."""
 
 
 class MailWorkerAccepted(BaseModel):
@@ -1089,6 +1149,42 @@ MAIL_WORKER_ROUTES: Final[tuple[ApiRoute, ...]] = (
         idempotency_header="required",
     ),
     _mw(
+        "GET",
+        "/canary-intents",
+        MailWorkerCanaryIntentBatch,
+        summary="Published outlook_local activation canaries of the worker's mailbox (F3).",
+    ),
+    _mw(
+        "POST",
+        "/canary-intents/{canary_id}/claim",
+        MailWorkerCanaryClaimDecision,
+        summary="Fresh server revalidation immediately before the canary's .Send (never replayed).",
+        request=MailWorkerCanaryClaimRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="required",
+    ),
+    _mw(
+        "POST",
+        "/canary-intents/{canary_id}/report",
+        MailWorkerAccepted,
+        summary="Submission/Sent Items evidence of one activation canary.",
+        request=MailWorkerCanaryReport,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT),
+        idempotency_header="required",
+    ),
+    _mw(
+        "POST",
+        "/canary-intents/{canary_id}/reply",
+        MailWorkerAccepted,
+        summary="The owner's correlated test reply to an activation canary (headers only).",
+        request=MailWorkerCanaryReply,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.VERSION_CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT),
+        idempotency_header="required",
+    ),
+    _mw(
         "POST",
         "/heartbeat",
         MailWorkerHeartbeatAck,
@@ -1183,6 +1279,16 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         location="body",
         errors=(ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
         idempotency_header="optional",
+    ),
+    _r(
+        "GET",
+        "/api/activation/canary-evidence",
+        CanaryEvidenceView,
+        scope=Scope.CONFIG_ADMIN,
+        summary=(
+            "Owner-only, read-only: activation-canary evidence (rows 4-6) of the configured sender"
+            " and the newest canaries (ids, states, times; never the target or its hash)."
+        ),
     ),
     _r(
         "GET",
@@ -1305,6 +1411,12 @@ __all__ = [
     "MailWorkerBindingItem",
     "MailWorkerBindingPage",
     "MailWorkerBindingsQuery",
+    "MailWorkerCanaryClaimDecision",
+    "MailWorkerCanaryClaimRequest",
+    "MailWorkerCanaryIntent",
+    "MailWorkerCanaryIntentBatch",
+    "MailWorkerCanaryReply",
+    "MailWorkerCanaryReport",
     "MailWorkerCheckpointReport",
     "MailWorkerClaimDecision",
     "MailWorkerClaimRequest",

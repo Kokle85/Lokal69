@@ -51,6 +51,7 @@ from tests.integration.pipeline.support import (
     system,
     user_actor,
 )
+from tests.integration.v11_inquiries.support import complete_activation_canary
 
 from suv_deals.clock import SystemClock
 from suv_deals.domain.comparables import MarketObservation
@@ -167,14 +168,36 @@ def slack_signal_settings(db_url: str, **overrides: Any) -> Settings:
     return runtime_settings(db_url, **values)
 
 
-def live_fixture_dir(tmp_path: Path) -> Path:
-    """A copy of the synthetic dealer pages registered under the live (non-fixture) source key."""
+def live_fixture_dir(tmp_path: Path, page_overrides: Mapping[str, str] | None = None) -> Path:
+    """A copy of the synthetic dealer pages registered under the live (non-fixture) source key.
+
+    ``page_overrides`` replaces copied page files (file name -> SYNTHETIC html) in the copy only.
+    """
     target = tmp_path / LIVE_KEY
     shutil.copytree(DEALER_DE, target)
+    for name, html in (page_overrides or {}).items():
+        (target / name).write_text(html, encoding="utf-8")
     manifest = yaml.safe_load((target / "MANIFEST.yaml").read_text(encoding="utf-8"))
     manifest["source_key"] = LIVE_KEY
     (target / "MANIFEST.yaml").write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
     return target
+
+
+#: The one address the SYNTHETIC seller-email page shows (reserved example domain).
+SELLER_PAGE_ADDRESS = "verkauf@dealer.example"
+
+
+def seller_email_page() -> str:
+    """The eligible car's page (TEST-204, same facts and price) as the dealer shows it WITH its
+    one e-mail address and a German seller text (``detail_seller_email.html``, re-labelled): the
+    detail pipeline itself records a verified contact and the language (F1, wave D2)."""
+    html = (DEALER_DE / "detail_seller_email.html").read_text(encoding="utf-8")
+    return html.replace("TEST-224", ELIGIBLE_REF).replace("XXXSYNTH000000224", "XXXSYNTH000000204")
+
+
+def show_seller_email(tmp_path: Path) -> None:
+    """From the next fetch on, the live TEST-204 page shows the seller's e-mail address."""
+    (tmp_path / LIVE_KEY / "detail_normal.html").write_text(seller_email_page(), encoding="utf-8")
 
 
 def live_source_config() -> Any:
@@ -193,10 +216,18 @@ def with_settings(env: PipelineEnv, settings: Settings) -> PipelineEnv:
 
 
 async def build_live_env(
-    db_url: str, seed: Seed, tmp_path: Path, *, settings: Settings | None = None, name: str = "Runtime"
+    db_url: str,
+    seed: Seed,
+    tmp_path: Path,
+    *,
+    settings: Settings | None = None,
+    name: str = "Runtime",
+    market: bool = True,
+    page_overrides: Mapping[str, str] | None = None,
 ) -> PipelineEnv:
     """A workspace with an owner, the business config, the LIVE-mode synthetic source and a runtime
-    whose network client is the in-memory page store (see the module docstring)."""
+    whose network client is the in-memory page store (see the module docstring). ``market=False``
+    leaves the MK comparables and the EUR/MKD rate out (a test records its own)."""
     ws = seed.workspace(f"{name} {uuid.uuid4().hex[:6]}")
     owner_id = seed.user()
     seed.membership(ws, owner_id, "owner")
@@ -207,7 +238,7 @@ async def build_live_env(
         application_name="suv-deals-runtime-test",
         clock=SystemClock(),
         options=RuntimeOptions(job_lease_seconds=120, heartbeat_seconds=40),
-        fixture_dirs=[live_fixture_dir(tmp_path)],
+        fixture_dirs=[live_fixture_dir(tmp_path, page_overrides)],
         taxonomy=synthetic_taxonomy(),
     )
     # The in-memory pages ARE the "network" of this runtime: no crawler client, no DNS.
@@ -246,7 +277,8 @@ async def build_live_env(
         return (await sources_repo.get_source_by_key(conn, actor, LIVE_KEY)).id
 
     env.source_id = await run(ctx, actor, sync)
-    await seed_live_market(env)
+    if market:
+        await seed_live_market(env)
     return env
 
 
@@ -325,9 +357,12 @@ async def prepare_sender(
     automatic: bool = True,
     desktop_worker: bool = True,
     box: SecretBox | None = None,
+    canary: bool = True,
 ) -> Sender:
     """Controls row, the standing authorization, a VERIFIED sender binding (and, for
-    ``outlook_local``, an issued desktop worker with a fresh heartbeat)."""
+    ``outlook_local``, an issued desktop worker with a fresh heartbeat) and, unless
+    ``canary=False``, the owner's completed activation canary for that binding version (F3/OPS-04:
+    nothing is reserved without it)."""
     actor = env.system
     account = GMAIL_ACCOUNT if provider == EmailProviderKind.GMAIL_API else SENDER_ACCOUNT
 
@@ -388,6 +423,8 @@ async def prepare_sender(
                 conn, issued.credential.token.get_secret_value()
             )
         await heartbeat(env, sender.worker)
+    if canary:
+        await complete_activation_canary(env.ctx.db, env.workspace_id, binding_id)
     return sender
 
 
@@ -492,8 +529,11 @@ class SellerLink:
 async def link_seller(
     env: PipelineEnv, listing: Mapping[str, Any], *, source_key: str = LIVE_KEY
 ) -> SellerLink:
-    """TEST ARRANGEMENT of what a seller-extraction step would record (no pipeline step does yet):
-    the dealer's marketplace alias and the e-mail address printed on the advertisement."""
+    """TEST ARRANGEMENT of seller evidence the page itself does not show (the live TEST-204 page
+    has a contact form only; the detail pipeline records it as ``unavailable``, wave D2): the
+    dealer's marketplace alias and an e-mail address "printed on the advertisement". A verified
+    contact outranks the unavailable one until the page is fetched again (a re-fetch records the
+    page's own evidence, which supersedes it); `show_seller_email` makes the page show one."""
     actor = env.system
     reference = str(listing["source_listing_id"])
     url = str(listing["canonical_url"])
@@ -912,6 +952,7 @@ __all__ = [
     "DASHBOARD",
     "ELIGIBLE_REF",
     "LIVE_KEY",
+    "SELLER_PAGE_ADDRESS",
     "SENDER_ADDRESS",
     "GmailApi",
     "SellerLink",
@@ -940,7 +981,9 @@ __all__ = [
     "pull_kill_switch",
     "results",
     "runtime_settings",
+    "seller_email_page",
     "seller_replies",
+    "show_seller_email",
     "slack_signal_settings",
     "with_settings",
     "work",

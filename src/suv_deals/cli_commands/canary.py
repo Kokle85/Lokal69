@@ -29,13 +29,20 @@ seller, reservation or quota debit, never one of the 15-day deals (`persistence.
     ``--i-confirm-owner-controlled-address`` is given (and an ``outlook_local`` canary's desktop
     mailbox worker is still active). The target address is entered again (same variable or
     prompt) and must hash to the stored one; immediately before the transport the controls row is
-    locked, EVERY gate is read again and the canary is committed ``uncertain`` (spec 37.5: the
+    locked, EVERY gate is read again and the canary is committed ``uncertain`` by the repository's
+    atomic claim (`canaries_repo.claim_for_send`: the database gates are re-checked in the same
+    statement that moves it, the sender binding and mailbox rows held ``FOR SHARE``; spec 37.5: the
     attempt is durable BEFORE the external I/O, so a crash or a second ``canary send`` can never
     transmit it twice). Only then is the provider's canary transport (`CANARY_TRANSPORTS`) called
-    once and its outcome recorded. No provider has a canary transport
-    yet (the seller-inquiry providers only send registered seller templates, and the desktop
-    worker only claims inquiry intents), so today the command ends with the precise blocker
-    ``CANARY_TRANSPORT_UNAVAILABLE`` after every other gate: nothing is sent and nothing changes.
+    once and its outcome recorded. ``outlook_local`` (the default route; F3, wave D2): the claimed
+    canary is published to its desktop mailbox worker in the same transaction
+    (``canaries_repo.publish_for_desktop``); the worker claims it again immediately before
+    ``.Send``, sends the fixed canary text ONCE to the owner-controlled address configured on the
+    owner's machine (``canary_target_address``, checked against the stored hash), reports Sent
+    Items evidence (``accepted``) and later the owner's reply that names the canary Message-ID
+    (``reply_correlated``: complete activation evidence). ``gmail_api`` and ``microsoft_graph``
+    have no canary transport yet: the command ends with the precise blocker
+    ``CANARY_TRANSPORT_UNAVAILABLE`` after every other gate (nothing sent, nothing changed).
 
 Every state-changing command needs ``--yes``. Output never contains an address, a hash or a token.
 """
@@ -85,11 +92,16 @@ MAX_STATUS_ROWS: Final = 200
 #: and committed the canary ``uncertain`` before calling it; the transport re-checks nothing itself
 #: and must never log or return the address.
 CanaryTransport = Callable[["CanaryRecord", str], Awaitable[tuple["CanaryOutcome", dict[str, Any]]]]
-#: Canary transports per provider (``EmailProviderKind`` value). EMPTY on purpose: the
-#: seller-inquiry providers refuse anything but a registered seller template
-#: (``mime_builder.inquiry_scope_problems``) and the desktop worker only claims inquiry intents, so
-#: a canary cannot be transmitted yet (``CANARY_TRANSPORT_UNAVAILABLE``).
+#: Direct canary transports per provider (``EmailProviderKind`` value). EMPTY on purpose: the API
+#: providers (``gmail_api``, ``microsoft_graph``) refuse anything but a registered seller template
+#: (``mime_builder.inquiry_scope_problems``), so their canary cannot be transmitted yet
+#: (``CANARY_TRANSPORT_UNAVAILABLE``). ``outlook_local`` uses the desktop worker
+#: (`DESKTOP_CANARY_PROVIDERS`).
 CANARY_TRANSPORTS: dict[str, CanaryTransport] = {}
+#: Providers whose canary is transmitted by the desktop mailbox worker (F3, wave D2): ``canary send``
+#: publishes the claimed canary to it (``canaries_repo.publish_for_desktop``) instead of calling a
+#: transport.
+DESKTOP_CANARY_PROVIDERS: Final = frozenset({"outlook_local"})
 
 
 # --------------------------------------------------------------------------------------------
@@ -98,31 +110,11 @@ CANARY_TRANSPORTS: dict[str, CanaryTransport] = {}
 
 
 def canary_evidence(canaries: Sequence[CanaryRecord], sender: SenderBindingRecord | None) -> tuple[str, str]:
-    """``(state, detail)`` of the activation-canary evidence for the configured sender binding.
+    """``(state, detail)`` of the activation-canary evidence for the configured sender binding
+    (`persistence.canaries_repo.evidence_state`, shared with ``doctor`` and the dashboard API)."""
+    from suv_deals.persistence.canaries_repo import evidence_state
 
-    ``complete``: a correlated test reply was recorded for a canary of the binding's CURRENT
-    version (an identity change needs a new canary); otherwise the newest canary's state of that
-    version (``prepared`` / ``accepted`` / ``uncertain`` / ``failed`` / ``cancelled``), ``stale``
-    (only older versions), ``none`` or ``no_sender``. ``canaries`` are newest first.
-    """
-    if sender is None:
-        return "no_sender", "no configured sender binding"
-    mine = [c for c in canaries if c.sender_binding_id == sender.id]
-    if not mine:
-        return "none", "no canary recorded for the configured sender binding"
-    current = [c for c in mine if c.sender_binding_version == sender.version]
-    if any(c.correlated for c in current):
-        return "complete", f"correlated test reply recorded (sender binding v{sender.version})"
-    if not current:
-        return (
-            "stale",
-            f"canaries exist only for older versions of the sender binding (now v{sender.version})",
-        )
-    latest = current[0]
-    return (
-        latest.state,
-        f"newest canary {latest.state} (sender binding v{sender.version}); no correlated reply",
-    )
+    return evidence_state(canaries, sender)
 
 
 def canary_send_blockers(
@@ -448,7 +440,6 @@ def canary_send(
         from uuid import uuid4
 
         from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
-        from suv_deals.errors import VersionConflict
         from suv_deals.persistence import canaries_repo
         from suv_deals.persistence.sellers_repo import lock_controls
         from suv_deals.persistence.transactions import unit_of_work
@@ -468,8 +459,9 @@ def canary_send(
             # locked and EVERY gate is read again (`_send_gates`): a pause, a mode change, a revoked
             # authorization, sender binding or desktop mailbox, or a cancel committed since the
             # first read stops it; a pause or authorization change racing this transaction waits
-            # for the lock. Then the canary moves ``prepared -> uncertain`` with a one-time send
-            # token (spec 37.5: the attempt is durably committed BEFORE the external I/O). A crash
+            # for the lock. Then `canaries_repo.claim_for_send` moves the canary
+            # ``prepared -> uncertain`` with a one-time send token in one guarded statement (spec
+            # 37.5: the attempt is durably committed BEFORE the external I/O). A crash
             # in or after the hand-over therefore leaves it ``uncertain`` (never re-sent: only a
             # ``prepared`` canary passes the gates), and a second ``canary send`` racing this one
             # finds another token and is refused.
@@ -482,26 +474,43 @@ def canary_send(
                     _refuse(again or ["CANARY_NOT_FOUND"], "an activation gate closed meanwhile")
                 if fresh.target_address_hash != canary.target_address_hash:  # pragma: no cover - frozen
                     _refuse(["CANARY_TARGET_MISMATCH"], "the canary changed meanwhile")
+                desktop = canary.provider.value in DESKTOP_CANARY_PROVIDERS
                 transport = CANARY_TRANSPORTS.get(canary.provider.value)
-                if transport is None:
+                if transport is None and not desktop:
                     _refuse(
                         ["CANARY_TRANSPORT_UNAVAILABLE"],
                         f"every other gate is open, but {canary.provider.value} has no canary transport"
                         " yet (docs/seller_email_activation.md section 8)",
                     )
+                # The repository's atomic claim (D1 item 3) re-checks every database gate (kill
+                # switch, mode, authorization, sender binding version/verification/revocation,
+                # desktop mailbox) in the SAME statement that moves the canary to ``uncertain``.
                 try:
-                    claimed: CanaryRecord | None = await canaries_repo.record_canary_outcome(
-                        conn,
-                        actor,
-                        canary.id,
-                        outcome="uncertain",
-                        evidence={"phase": "transport_started", "send_token": send_token},
-                        expected_version=canary.version,
+                    claimed = await canaries_repo.claim_for_send(
+                        conn, actor, canary.id, expected_version=canary.version, send_token=send_token
                     )
-                except VersionConflict:
-                    claimed = None  # cancelled or changed since the gates were read
-                if claimed is None or claimed.outcome_evidence.get("send_token") != send_token:
-                    _refuse(["CANARY_NOT_PREPARED"], "the canary changed meanwhile (another send, a cancel)")
+                except canaries_repo.CanaryClaimRefused as exc:
+                    _refuse(
+                        list(exc.problems), "the canary could not be claimed (another send, a cancel, a gate)"
+                    )
+                if desktop:
+                    # outlook_local: the desktop mailbox worker is the transport. The claimed
+                    # canary is published to it in the SAME transaction (never claimed without
+                    # being published, never published without the claim); the worker claims it
+                    # again immediately before ``.Send`` and reports Sent Items evidence.
+                    published = await canaries_repo.publish_for_desktop(
+                        conn, actor, claimed.id, send_token=send_token
+                    )
+            if desktop:
+                echo(
+                    f"Canary {published.id}: {published.state}, published to its desktop mailbox worker."
+                    " The worker sends it at its next send poll to the owner-controlled address set as"
+                    " canary_target_address in its configuration (same hash), then reports Sent Items"
+                    " evidence. Reply to it from that mailbox to complete the activation evidence"
+                    " (`suv-deals canary status`)."
+                )
+                return 0
+            assert transport is not None
             try:
                 outcome, evidence = await transport(claimed, target)
             except Exception:
@@ -522,6 +531,7 @@ __all__ = [
     "CANARY_TARGET_ENV",
     "CANARY_TRANSPORTS",
     "CONFIRM_FLAG",
+    "DESKTOP_CANARY_PROVIDERS",
     "CanaryTransport",
     "canary_evidence",
     "canary_group",

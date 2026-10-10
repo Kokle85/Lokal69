@@ -113,8 +113,9 @@ function ControlState({ control, timeZone }: { control: InquiryControlView; time
       ) : (
         <Notice tone="info">
           <span data-testid="sending-state">
-            These controls allow automatic inquiries: the standing authorization is active and the configured sender is ready. Each
-            send still passes the rolling caps, the seller cooldown and every guard again immediately before transmission.
+            These controls allow automatic inquiries: the backend process gate is open, the standing authorization is active and the
+            configured sender is ready with its activation canary complete. Each send still passes the rolling caps, the seller
+            cooldown and every guard again immediately before transmission.
           </span>
         </Notice>
       )}
@@ -134,6 +135,28 @@ function ControlState({ control, timeZone }: { control: InquiryControlView; time
             ),
           ],
           ['Kill switch reason', control.kill_switch_reason ? <span key="r" className="untrusted">{control.kill_switch_reason}</span> : 'none'],
+          [
+            'Backend process gate',
+            <span key="pg" data-testid="process-gate" data-open={control.process_blockers?.length === 0 && control.process_mode !== null ? 'yes' : 'no'}>
+              SELLER_INQUIRY_MODE {control.process_mode ? <Badge value={control.process_mode} /> : <Badge tone="warn">not reported</Badge>} · process
+              kill switch{' '}
+              {control.process_kill_switch === null ? (
+                <Badge tone="warn">not reported</Badge>
+              ) : control.process_kill_switch ? (
+                <Badge tone="bad">on</Badge>
+              ) : (
+                <Badge tone="ok">off</Badge>
+              )}
+              {control.process_message_approval_required ? ' · the message-approval setting is on (automatic sending disabled)' : ''}
+            </span>,
+          ],
+          [
+            'Automatic inquiries possible now',
+            <span key="ap" data-testid="automatic-possible" data-possible={control.automatic_inquiries_possible ? 'yes' : 'no'}>
+              <Badge tone={control.automatic_inquiries_possible ? 'ok' : 'bad'}>{control.automatic_inquiries_possible ? 'yes' : 'no'}</Badge>
+              <span className="muted"> (as reported by the server: every process and database gate)</span>
+            </span>,
+          ],
           [
             'Approval',
             <span key="a" data-testid="control-approval">
@@ -189,6 +212,18 @@ function ReadinessState({ control }: { control: InquiryControlView }) {
           [
             'Sender problems',
             control.sender_problems.length ? <SenderProblemList key="p" codes={control.sender_problems} /> : 'none',
+          ],
+          [
+            'Activation canary',
+            <span key="c" data-testid="activation-canary-gate" data-complete={control.activation_canary_complete ? 'yes' : 'no'}>
+              <Badge tone={control.activation_canary_complete ? 'ok' : 'bad'}>{control.activation_canary_complete ? 'complete' : 'not complete'}</Badge>
+              <span className="muted">
+                {' '}
+                {control.activation_canary_complete
+                  ? 'a correlated test reply is recorded for the current sender version'
+                  : 'no real seller inquiry is reserved until a correlated test reply is recorded for the current sender version (activation_canary_incomplete)'}
+              </span>
+            </span>,
           ],
         ]}
       />

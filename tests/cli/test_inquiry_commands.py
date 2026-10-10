@@ -56,8 +56,11 @@ def _run[T](db_url: str, work: Callable[[Database], Awaitable[T]]) -> T:
 
 
 @pytest.fixture
-def world(db_url: str, seed: Seed) -> Iterator[World]:
-    built = _run(db_url, lambda db: outlook_world(db, seed, "CLI inquiries"))
+def world(db_url: str, seed: Seed, request: pytest.FixtureRequest) -> Iterator[World]:
+    # F3/OPS-04 (wave D2): the world carries the owner's completed activation canary unless the
+    # test is marked ``no_arranged_canary`` (arranging it issues and revokes a temporary worker).
+    canary = request.node.get_closest_marker("no_arranged_canary") is None
+    built = _run(db_url, lambda db: outlook_world(db, seed, "CLI inquiries", canary=canary))
     try:
         yield built
     finally:
@@ -210,6 +213,7 @@ def test_sender_binding_verify_uses_the_desktop_workers_evidence(
 # ---------------------------------------------------------------------------------- mail-worker credential
 
 
+@pytest.mark.no_arranged_canary
 def test_mail_worker_credential_issue_list_and_revoke(
     run_cli: Cli, db_env: dict[str, str], world: World, seed: Seed
 ) -> None:
@@ -421,6 +425,97 @@ def test_doctor_reports_v11_readiness_without_values(
     assert worker.token not in out and SENDER_ADDRESS not in out
     assert SENDER_ADDRESS not in opened.output and SENDER_ADDRESS not in matched.output
     del db_conn
+
+
+def test_a_dead_worker_credential_is_never_reported_as_monitoring(
+    run_cli: Cli, db_env: dict[str, str], db_url: str, world: World, seed: Seed
+) -> None:
+    """D1 item 2: ``doctor``, ``inquiries status`` and ``mail-worker credential list`` stop
+    reporting monitoring as soon as the active binding's credential expired, even while the
+    worker's last heartbeat is still fresh."""
+    ws = str(world.workspace_id)
+
+    async def beat(db: Database) -> UUID:
+        worker = await issue_worker(db, world)
+        async with db.transaction() as conn:
+            identity = await mail_workers_repo.resolve_worker(conn, worker.token)
+        async with unit_of_work(db, identity.actor("req-cli-beat")) as conn:
+            await mail_workers_repo.record_heartbeat(
+                conn,
+                identity,
+                MailWorkerHeartbeatRequest.model_validate(heartbeat_body(identity.mailbox_binding_id)),
+                request_id="req-cli-beat",
+            )
+        return identity.credential_id
+
+    credential_id = _run(db_url, beat)
+
+    def signals() -> tuple[int, list[bool], list[str]]:
+        status = _json(run_cli("inquiries", "status", "--workspace", ws, "--json", env=db_env).output)
+        listed = _json(
+            run_cli("mail-worker", "credential", "list", "--workspace", ws, "--json", env=db_env).output
+        )
+        doctor = run_cli("doctor", "--process", "scheduler", env=db_env).output
+        # Only this workspace's lines (other tests' workspaces may be listed too).
+        prefix = str(world.workspace_id)[:8]
+        doctor_lines = doctor.splitlines()
+        single = sum(1 for line in doctor_lines if "seller_inquiry/" in line and "authorization" in line) == 1
+        tag = "seller_inquiry/mail_worker" if single else f"seller_inquiry/{prefix}:mail_worker"
+        lines = [line for line in doctor_lines if tag in line and "heartbeat" in line]
+        return status["mail_workers_monitoring"], [r["monitoring"] for r in listed], lines
+
+    monitoring, listed, lines = signals()
+    assert monitoring == 1 and listed == [True]
+    assert lines and all("monitoring active" in line for line in lines)
+    # TEST ARRANGEMENT ONLY: the credential expires right after the (still fresh) heartbeat.
+    with seed.conn.transaction():
+        seed.conn.execute("set local session_replication_role = replica")
+        seed.conn.execute(
+            "update ops.api_credentials set created_at = now() - interval '2 days',"
+            " expires_at = now() - interval '1 second' where id = %s",
+            (credential_id,),
+        )
+    monitoring, listed, lines = signals()
+    assert monitoring == 0 and listed == [False]
+    assert lines and all("monitoring NOT active" in line for line in lines)
+
+
+def test_status_never_claims_sending_while_the_owner_caps_hold_inquiries(
+    run_cli: Cli, db_env: dict[str, str], world: World
+) -> None:
+    """D1 review: the activation runbook (docs/seller_email_activation.md section 8) holds real
+    seller inquiries with ``set-limits --max-per-24h 0 --max-per-15d 0`` while the process gate is
+    open for the canary step. ``inquiries status`` must then not report ``sending_possible``."""
+    ws = str(world.workspace_id)
+    env = {
+        **db_env,
+        "SELLER_INQUIRY_MODE": "automatic",
+        "SELLER_EMAIL_ACCOUNT_ID": SENDER_ACCOUNT,
+        "SELLER_EMAIL_FROM": SENDER_ADDRESS,
+    }
+    before = _json(run_cli("inquiries", "status", "--workspace", ws, "--json", env=env).output)
+    assert before["sending_possible"] is True
+    held = run_cli(
+        "inquiries",
+        "set-limits",
+        "--workspace",
+        ws,
+        "--reason",
+        "owner holds real inquiries during the canary step (synthetic)",
+        "--max-per-24h",
+        "0",
+        "--max-per-15d",
+        "0",
+        "--expected-version",
+        str(before["version"]),
+        "--yes",
+        env=env,
+    )
+    assert held.exit_code == 0, held.output
+    after = _json(run_cli("inquiries", "status", "--workspace", ws, "--json", env=env).output)
+    assert after["max_per_24h"] == 0 and after["max_per_15d"] == 0
+    assert after["mode"] == "automatic" and after["process_mode"] == "automatic"
+    assert after["sending_possible"] is False
 
 
 def test_inquiries_authorize_set_mode_and_set_limits(

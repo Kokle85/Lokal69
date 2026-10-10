@@ -1,0 +1,148 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/v1/mail-workers/canary-intents",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of ``GET /v1/mail-workers/canary-intents`` (== ``wire.CanaryIntentBatch``).",
+    "properties": {
+      "intents": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "description": "One published ``outlook_local`` activation canary (== ``wire.WorkerCanaryIntent``; F3, wave\nD2): the fixed canary rendering, the sender identity and the owner-controlled target as its\nSHA-256 only (the worker sends to the address configured on the owner's machine).",
+          "properties": {
+            "account_id": {
+              "maxLength": 320,
+              "minLength": 1,
+              "type": "string"
+            },
+            "binding_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "binding_version": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "body_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "body_text": {
+              "maxLength": 2000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "canary_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "created_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "expired": {
+              "default": false,
+              "type": "boolean"
+            },
+            "from_address": {
+              "maxLength": 254,
+              "minLength": 3,
+              "type": "string"
+            },
+            "from_display_name": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "mailbox_binding_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "not_after": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "reply_to_address": {
+              "default": null,
+              "maxLength": 254,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rfc_message_id": {
+              "maxLength": 998,
+              "type": "string"
+            },
+            "schema_version": {
+              "const": "1.0",
+              "default": "1.0",
+              "type": "string"
+            },
+            "subject": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target_address_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "canary_id",
+            "mailbox_binding_id",
+            "binding_id",
+            "binding_version",
+            "account_id",
+            "from_address",
+            "from_display_name",
+            "target_address_hash",
+            "subject",
+            "body_text",
+            "rfc_message_id",
+            "body_hash",
+            "created_at",
+            "not_after"
+          ],
+          "title": "MailWorkerCanaryIntent",
+          "type": "object"
+        },
+        "maxItems": 10,
+        "type": "array"
+      },
+      "kill_switch_active": {
+        "type": "boolean"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "required": [
+      "kill_switch_active"
+    ],
+    "title": "mail-workers.canary-intents.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Published outlook_local activation canaries of the worker's mailbox (F3)."
+}

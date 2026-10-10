@@ -52,6 +52,7 @@ from suv_deals.domain.comparables import (
 )
 from suv_deals.domain.enums import Confidence, EvidenceKind, Scope
 from suv_deals.domain.listings import sha256_json
+from suv_deals.domain.market_import import MarketImport, import_evidence, to_observation
 from suv_deals.domain.valuation import ComparableReference
 from suv_deals.errors import AppError, ErrorCode, Forbidden, NotFound, ValidationFailed
 from suv_deals.persistence import audit
@@ -250,6 +251,65 @@ async def insert_market_observation(
             retryable=False,
         )
     return observation.id, False
+
+
+class MarketImportReport(BaseModel):
+    """What one owner import recorded (ids in file order; ``unchanged`` = already recorded)."""
+
+    model_config = _FROZEN
+
+    evidence_kind: EvidenceKind
+    created: int
+    unchanged: int
+    observation_ids: tuple[UUID, ...]
+
+
+async def import_observations(
+    conn: Conn, actor: ActorContext, parsed: MarketImport, *, file_sha256: str, reason: str
+) -> MarketImportReport:
+    """Record a validated owner import (``domain.market_import``) in ONE transaction (F2, wave D2).
+
+    Every row goes through `insert_market_observation` (its own audit event; an owner estimate
+    needs a NON-system owner actor there), with the row's provenance and the file hash as
+    evidence; the batch is audited once more (``market.import``: kind, counts, file hash).
+    Re-importing the same file records nothing new (content-derived ids).
+    """
+    require_writer(actor)
+    if not 3 <= len(reason.strip()) <= 500:
+        raise ValidationFailed("reason must be 3-500 characters")
+    kind = parsed.evidence_kind
+    confidence: ObservationConfidence = "medium" if kind == EvidenceKind.ASKING_PRICE else "low"
+    created = 0
+    ids: list[UUID] = []
+    for row in parsed.observations:
+        observation = to_observation(row, kind)
+        observation_id, new = await insert_market_observation(
+            conn,
+            actor,
+            observation,
+            confidence=confidence,
+            evidence=import_evidence(row, file_sha256=file_sha256),
+        )
+        ids.append(observation_id)
+        created += int(new)
+    await audit.record(
+        conn,
+        actor,
+        "market.import",
+        "market_import",
+        None,
+        reason=reason.strip(),
+        metadata={
+            "evidence_kind": kind.value,
+            "rows": len(ids),
+            "created": created,
+            "unchanged": len(ids) - created,
+            "file_sha256": file_sha256,
+        },
+    )
+    return MarketImportReport(
+        evidence_kind=kind, created=created, unchanged=len(ids) - created, observation_ids=tuple(ids)
+    )
 
 
 def _observation_from_row(row: Mapping[str, Any]) -> StoredMarketObservation:
@@ -719,6 +779,7 @@ def _aware(value: datetime) -> datetime:
 __all__ = [
     "COMPARABLE_DOCUMENT_FORMAT",
     "OBSERVATION_DOCUMENT_FORMAT",
+    "MarketImportReport",
     "StoredComparableSet",
     "StoredMarketObservation",
     "comparable_content_sha256",
@@ -726,6 +787,7 @@ __all__ = [
     "comparable_sets_with_observation",
     "get_comparable_set_view",
     "get_market_observations",
+    "import_observations",
     "insert_market_observation",
     "list_candidate_comparables",
     "load_comparable_set",

@@ -1,5 +1,5 @@
 import { expect, test, type Request } from '@playwright/test'
-import { claimCase, fillWatchDecision, guard, hold, manifest, signIn } from './helpers.ts'
+import { addListingRevision, claimCase, fillWatchDecision, guard, hold, manifest, signIn } from './helpers.ts'
 
 const SUBMIT = '**/api/reviews/*/submit'
 
@@ -207,6 +207,40 @@ test.describe('review workflow', () => {
     await expect(page.getByTestId('decision-saved')).toContainText('Decision saved: watch')
     await expect(page.getByTestId('decision-entry')).toHaveCount(1)
     await expect(page.getByTestId('decision-entry')).toContainText('by you')
+    expect(problems).toEqual([])
+  })
+
+  test('a new listing revision arriving before submit: VERSION_CONFLICT, the draft is kept, nothing is saved, reload works', async ({ page }) => {
+    // Spec 23 required interaction (F8, wave D2): the REAL backend sees a new revision of the case's
+    // listing (written by the E2E harness while the reviewer holds the claim) and refuses the submit.
+    const data = manifest()
+    const { problems } = guard(page)
+    await signIn(page, 'reviewer')
+    await page.goto(`/reviews/${data.cases.hotel}`)
+    await claimCase(page)
+    const summary = 'SYNTHETIC E2E: written while the seller changed the advertisement.'
+    await fillWatchDecision(page, summary)
+    const revision = addListingRevision('hotel')
+    expect(revision.revision_number).toBeGreaterThan(1)
+    const refused = page.waitForResponse((response) => response.url().endsWith('/submit'))
+    await page.getByRole('button', { name: 'Submit decision' }).click()
+    const response = await refused
+    expect(response.status()).toBe(409)
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('VERSION_CONFLICT')
+    await expect(page.getByText('The case or listing changed')).toBeVisible()
+    await expect(page.getByTestId('correlation-id').first()).not.toBeEmpty()
+    await expect(page.getByTestId('decision-saved')).toHaveCount(0)
+    await expect(page.getByLabel(/^Summary/)).toHaveValue(summary)
+    // "Reload the case" fetches the case again from the real backend; still nothing was saved.
+    const caseUrl = `/api/reviews/${data.cases.hotel}`
+    const reloaded = page.waitForResponse(
+      (reload) => reload.request().method() === 'GET' && new URL(reload.url()).pathname === caseUrl,
+    )
+    await page.getByRole('button', { name: 'Reload the case' }).click()
+    expect((await reloaded).status()).toBe(200)
+    await expect(page.getByTestId('decision-entry')).toHaveCount(0)
+    await expect(page.getByLabel(/^Summary/)).toHaveValue(summary)
+    await expect(page.locator('#case')).toBeVisible()
     expect(problems).toEqual([])
   })
 

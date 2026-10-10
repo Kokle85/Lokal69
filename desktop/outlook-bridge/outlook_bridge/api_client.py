@@ -8,6 +8,10 @@ from the credential):
 ``GET  /v1/mail-workers/send-intents?limit=``               pending ``outlook_local`` send intents
 ``POST /v1/mail-workers/send-intents/{id}/claim``           revalidation immediately before ``.Send``
 ``POST /v1/mail-workers/send-intents/{id}/report``          submission/evidence report
+``GET  /v1/mail-workers/canary-intents``                    published activation canaries (F3)
+``POST /v1/mail-workers/canary-intents/{id}/claim``         revalidation immediately before ``.Send``
+``POST /v1/mail-workers/canary-intents/{id}/report``        canary submission/evidence report
+``POST /v1/mail-workers/canary-intents/{id}/reply``         the owner's correlated test reply
 ``POST /v1/mail-workers/heartbeat``                         health, checkpoints and coverage gaps
 ``POST /v1/mail-workers/account-report``                    classic-Outlook account verification
 
@@ -25,6 +29,7 @@ responses are size-capped, request bodies of ``POST /replies`` are capped at 128
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -43,11 +48,15 @@ from outlook_bridge.credentials import credential_fingerprint
 from outlook_bridge.errors import MailboxMismatch
 from outlook_bridge.local_queue import BindingRecord
 from outlook_bridge.wire import (
+    CanaryBatch,
+    CanaryDecision,
+    CanaryReplyUpload,
     ClaimDecision,
     HeartbeatAck,
     HeartbeatEnvelope,
     SendIntentBatch,
     WorkerAccountReport,
+    WorkerCanaryReport,
     WorkerSendReport,
 )
 from suv_deals.clock import ensure_utc
@@ -57,6 +66,7 @@ from suv_deals.domain.replies import MAX_REQUEST_BYTES, InquiryBinding, InquiryB
 BINDINGS_PATH: Final = "/v1/mail-workers/inquiry-bindings"
 REPLIES_PATH: Final = "/v1/mail-workers/replies"
 SEND_INTENTS_PATH: Final = "/v1/mail-workers/send-intents"
+CANARY_INTENTS_PATH: Final = "/v1/mail-workers/canary-intents"
 HEARTBEAT_PATH: Final = "/v1/mail-workers/heartbeat"
 ACCOUNT_REPORT_PATH: Final = "/v1/mail-workers/account-report"
 MAX_RESPONSE_BYTES: Final = 2 * 1024 * 1024
@@ -211,10 +221,31 @@ class IngestAck(BaseModel):
         return ensure_utc(value)
 
 
+_MAX_WORKER_ID: Final = 128
+
+
+def claim_worker_id(worker_id: str, store_instance_id: str) -> str:
+    """The ``worker_id`` a send-intent claim carries: ``<config.worker_id>.<store instance>``.
+
+    The backend grants a running intent to ONE worker id (SEC-1, wave D2); the store instance
+    makes a reinstall, a wiped store or a second data_dir a different worker, so it is refused
+    instead of sending the same inquiry again. The configured part is shortened when needed so
+    the result stays within the wire's 128 characters.
+    """
+    suffix = "." + store_instance_id
+    return worker_id[: _MAX_WORKER_ID - len(suffix)] + suffix
+
+
 @dataclass(frozen=True, slots=True)
 class ClientIdentity:
     mailbox_binding_id: UUID
     worker_id: str
+    #: The local store's instance id (``LocalStore.store_instance_id``); part of every claim.
+    store_instance_id: str
+
+    @property
+    def claim_worker_id(self) -> str:
+        return claim_worker_id(self.worker_id, self.store_instance_id)
 
 
 # =============================================================================================
@@ -462,7 +493,7 @@ class BridgeApiClient:
                 "intent_id": str(intent_id),
                 "claim_attempt_id": attempt,
                 "mailbox_binding_id": str(self._identity.mailbox_binding_id),
-                "worker_id": self._identity.worker_id,
+                "worker_id": self._identity.claim_worker_id,
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -482,6 +513,53 @@ class BridgeApiClient:
         key = f"report-{report.intent_id}-{report.state.value}"
         self._request("POST", path, body=body, idempotency_key=key[:128])
 
+    # ------------------------------------------------------------------ activation canaries
+
+    def fetch_canary_intents(self) -> CanaryBatch:
+        data, request_id = self._request("GET", CANARY_INTENTS_PATH)
+        batch = self._parse(CanaryBatch, data, request_id)
+        for intent in batch.intents:
+            if intent.mailbox_binding_id != self._identity.mailbox_binding_id:
+                raise BridgeApiError(
+                    ApiErrorKind.PROTOCOL, "canary for another mailbox", request_id=request_id
+                )
+        return batch
+
+    def claim_canary(self, canary_id: UUID) -> CanaryDecision:
+        """Fresh server revalidation immediately before the canary's ``.Send`` (never replayed)."""
+        path = f"{CANARY_INTENTS_PATH}/{quote(str(canary_id))}/claim"
+        attempt = uuid4().hex
+        body = json.dumps(
+            {
+                "schema_version": "1.0",
+                "canary_id": str(canary_id),
+                "claim_attempt_id": attempt,
+                "mailbox_binding_id": str(self._identity.mailbox_binding_id),
+                "worker_id": self._identity.claim_worker_id,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        data, request_id = self._request(
+            "POST", path, body=body, idempotency_key=f"canary-claim-{canary_id}-{attempt}"[:128]
+        )
+        decision = self._parse(CanaryDecision, data, request_id)
+        if decision.canary_id != canary_id:
+            raise BridgeApiError(
+                ApiErrorKind.PROTOCOL, "claim answer names another canary", request_id=request_id
+            )
+        return decision
+
+    def post_canary_report(self, report: WorkerCanaryReport) -> None:
+        path = f"{CANARY_INTENTS_PATH}/{quote(str(report.canary_id))}/report"
+        key = f"canary-report-{report.canary_id}-{report.state}"
+        self._request("POST", path, body=report.model_dump_json().encode("utf-8"), idempotency_key=key[:128])
+
+    def post_canary_reply(self, reply: CanaryReplyUpload) -> None:
+        path = f"{CANARY_INTENTS_PATH}/{quote(str(reply.canary_id))}/reply"
+        digest = hashlib.sha256(reply.internet_message_id.encode("utf-8")).hexdigest()[:32]
+        key = f"canary-reply-{reply.canary_id}-{digest}"
+        self._request("POST", path, body=reply.model_dump_json().encode("utf-8"), idempotency_key=key[:128])
+
     # ------------------------------------------------------------------ health
 
     def post_heartbeat(self, envelope: HeartbeatEnvelope) -> HeartbeatAck:
@@ -497,6 +575,7 @@ class BridgeApiClient:
 __all__ = [
     "ACCOUNT_REPORT_PATH",
     "BINDINGS_PATH",
+    "CANARY_INTENTS_PATH",
     "HEARTBEAT_PATH",
     "MAX_RESPONSE_BYTES",
     "REPLIES_PATH",
@@ -509,4 +588,5 @@ __all__ = [
     "BridgeApiError",
     "ClientIdentity",
     "IngestAck",
+    "claim_worker_id",
 ]

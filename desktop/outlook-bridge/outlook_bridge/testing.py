@@ -51,7 +51,21 @@ from outlook_bridge.outlook_adapter import (
     PR_TRANSPORT_MESSAGE_HEADERS,
 )
 from outlook_bridge.sta_runtime import SessionContext
-from outlook_bridge.wire import ReplyUpload, WorkerSendIntent, message_body_hash
+from outlook_bridge.wire import (
+    CanaryReplyUpload,
+    ReplyUpload,
+    WorkerCanaryIntent,
+    WorkerCanaryReport,
+    WorkerSendIntent,
+    message_body_hash,
+)
+from suv_deals.domain.canary import (
+    canary_body,
+    canary_body_hash,
+    canary_message_id,
+    canary_subject,
+    canary_target_hash,
+)
 from suv_deals.domain.replies import (
     InquiryBindingState,
     StoredReplyIngest,
@@ -707,9 +721,19 @@ class FakeBackend:
         self.kill_switch = False
         self.claims: list[UUID] = []
         self.claim_refusal: str | None = None
+        #: Like the backend (SEC-1): a running intent is granted to ONE claim worker id.
+        self.claim_holders: dict[UUID, str] = {}
+        self.claim_details: list[str | None] = []
         self.reports: list[dict[str, Any]] = []
         self.heartbeats: list[dict[str, Any]] = []
         self.account_reports: list[dict[str, Any]] = []
+        #: Activation canaries (F3, wave D2): published, claimed by one worker id, reported.
+        self.canaries: dict[UUID, WorkerCanaryIntent] = {}
+        self.open_canaries: list[UUID] = []
+        self.canary_claims: list[UUID] = []
+        self.canary_holders: dict[UUID, str] = {}
+        self.canary_reports: list[dict[str, Any]] = []
+        self.canary_replies: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ scenario helpers
 
@@ -772,6 +796,10 @@ class FakeBackend:
         self.intents[intent.intent_id] = intent
         self.open_intents.append(intent.intent_id)
 
+    def add_canary(self, intent: WorkerCanaryIntent) -> None:
+        self.canaries[intent.canary_id] = intent
+        self.open_canaries.append(intent.canary_id)
+
     def expire_intent(self, intent_id: UUID) -> None:
         """List an open intent as ``expired`` (the backend reaped it before any worker claimed it)."""
         self.expired_intents.add(intent_id)
@@ -833,12 +861,22 @@ class FakeBackend:
                     "kill_switch_active": self.kill_switch,
                 },
             )
+        if path.startswith("/v1/mail-workers/canary-intents"):
+            return self._canary(request, path)
         if request.method == "POST" and path.endswith("/claim"):
             intent_id = UUID(path.split("/")[-2])
             self.claims.append(intent_id)
             refusal = "kill_switch" if self.kill_switch else self.claim_refusal
+            detail: str | None = None
             if intent_id not in self.open_intents and refusal is None:
                 refusal = "intent_invalid"
+            claimant = str(json.loads(request.content).get("worker_id", ""))
+            holder = self.claim_holders.get(intent_id)
+            if refusal is None and holder is not None and holder != claimant:
+                refusal, detail = "intent_invalid", "ALREADY_CLAIMED"
+            if refusal is None:
+                self.claim_holders[intent_id] = claimant
+            self.claim_details.append(detail)
             return httpx.Response(
                 200,
                 json={
@@ -846,6 +884,7 @@ class FakeBackend:
                     "intent_id": str(intent_id),
                     "proceed": refusal is None,
                     "refusal_reason": refusal,
+                    "detail": detail,
                 },
             )
         if request.method == "POST" and path.endswith("/report"):
@@ -867,6 +906,54 @@ class FakeBackend:
             )
         if request.method == "POST" and path == "/v1/mail-workers/account-report":
             self.account_reports.append(json.loads(request.content))
+            return httpx.Response(200, json={"schema_version": "1.0", "accepted": True})
+        return self._error(404, "NOT_FOUND")
+
+    def _canary(self, request: httpx.Request, path: str) -> httpx.Response:
+        """The four canary routes with the backend's single-claimant rule."""
+        if request.method == "GET" and path == "/v1/mail-workers/canary-intents":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "1.0",
+                    "intents": [json.loads(self.canaries[c].model_dump_json()) for c in self.open_canaries],
+                    "kill_switch_active": self.kill_switch,
+                },
+            )
+        if not request.headers.get("Idempotency-Key"):
+            return self._error(400, "VALIDATION_ERROR")
+        canary_id = UUID(path.split("/")[-2])
+        body = json.loads(request.content)
+        if path.endswith("/claim"):
+            self.canary_claims.append(canary_id)
+            claimant = str(body.get("worker_id", ""))
+            refusal: str | None = "kill_switch" if self.kill_switch else None
+            if refusal is None and canary_id not in self.open_canaries:
+                refusal = "intent_invalid"
+            holder = self.canary_holders.get(canary_id)
+            if refusal is None and holder is not None and holder != claimant:
+                refusal = "intent_invalid"
+            if refusal is None:
+                self.canary_holders[canary_id] = claimant
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "1.0",
+                    "canary_id": str(canary_id),
+                    "proceed": refusal is None,
+                    "refusal_reason": refusal,
+                },
+            )
+        if path.endswith("/report"):
+            report = WorkerCanaryReport.model_validate(body)
+            self.canary_reports.append(body)
+            final = report.state in ("refused_before_send", "sent_items_confirmed", "transport_rejected")
+            if final and canary_id in self.open_canaries:
+                self.open_canaries.remove(canary_id)
+            return httpx.Response(200, json={"schema_version": "1.0", "accepted": True})
+        if path.endswith("/reply"):
+            CanaryReplyUpload.model_validate(body)
+            self.canary_replies.append(body)
             return httpx.Response(200, json={"schema_version": "1.0", "accepted": True})
         return self._error(404, "NOT_FOUND")
 
@@ -962,6 +1049,36 @@ class FakeBackend:
 # =============================================================================================
 
 
+def make_canary(
+    *,
+    mailbox_binding_id: UUID,
+    target_address: str,
+    from_address: str,
+    created_at: datetime,
+    canary_id: UUID | None = None,
+    ttl: timedelta = timedelta(hours=12),
+    display_name: str = "Synthetic Sender",
+) -> WorkerCanaryIntent:
+    """A published activation canary exactly as the backend renders it (synthetic values)."""
+    cid = canary_id or uuid.uuid4()
+    return WorkerCanaryIntent(
+        canary_id=cid,
+        mailbox_binding_id=mailbox_binding_id,
+        binding_id=uuid.uuid4(),
+        binding_version=1,
+        account_id="synthetic-owner-account",
+        from_address=from_address,
+        from_display_name=display_name,
+        target_address_hash=canary_target_hash(target_address),
+        subject=canary_subject(cid),
+        body_text=canary_body(cid),
+        rfc_message_id=canary_message_id(cid, from_address),
+        body_hash=canary_body_hash(cid),
+        created_at=created_at,
+        not_after=created_at + ttl,
+    )
+
+
 def inquiry_message_id(inquiry_id: UUID, attempt: int = 1, domain: str = "sender.example.invalid") -> str:
     return f"<inquiry-{inquiry_id}.{attempt}@{domain}>"
 
@@ -1046,6 +1163,7 @@ __all__ = [
     "FakeMailItem",
     "FakeOutlook",
     "inquiry_message_id",
+    "make_canary",
     "make_intent",
     "rendered_inquiry",
 ]

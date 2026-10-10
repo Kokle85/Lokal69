@@ -96,5 +96,6 @@ markers = [
   "live: touches a live external source; never run automatically",
   "e2e: browser end-to-end tests (Playwright)",
   "slow: slow tests",
+  "no_arranged_canary: the test world gets no completed activation canary (canary-counting tests)",
 ]
 filterwarnings = ["error::pydantic.warnings.PydanticDeprecatedSince20"]

@@ -33,6 +33,11 @@ seller, a forwarder or a customs broker before it is used.
   - a rate older than `fx_max_age_days` (7 in the primary profile) makes the result `needs_facts`
     when the EUR value is within `fx_boundary_margin_pct` (3 %) of a band boundary. Far from a
     boundary it is only a warning.
+- **Where the rate comes from** (wave D2): with `FX_FETCH_ENABLED=true` the reconciler records
+  the ECB EUR->CHF reference rate at most every 6 hours (`workers/fx_refresh.py`);
+  `suv-deals fx refresh --yes` fetches once, `suv-deals fx record ...` stores an owner-entered
+  rate (audited) and `suv-deals fx status` shows the newest rate and its age. While the switch
+  is off and no rate was recorded, every CH listing stays `needs_facts` (`fx:CHF/EUR`).
 - **Search ceilings on Swiss sources.** If a Swiss source is ever searched with a CHF price
   filter, the filter must never drop a car that is EUR 3,000 or less after conversion. Compute
   the CHF ceiling from the current rate **with headroom** (at least the boundary margin), round it

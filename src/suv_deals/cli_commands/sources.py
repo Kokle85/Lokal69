@@ -185,6 +185,21 @@ def inspect(
         f"min delay {budget.min_delay_seconds}s"
     )
     echo(f"active            : {str(gate.active).lower()}")
+    if not gate.activatable:
+        echo(
+            f"activatable       : no (no adapter: {config.adapter} {config.adapter_version}; no terms"
+            " review or switch can activate it)"
+        )
+    else:
+        echo("activatable       : yes (every gate below must still pass)")
+    echo(
+        "seller evidence   : "
+        + (
+            "yes (detail pages report the seller's e-mail/contact evidence)"
+            if gate.seller_contact_evidence
+            else "no (its listings can never get an inquiry recipient)"
+        )
+    )
     if gate.problems:
         echo("gate problems     :")
         for problem in gate.problems:
