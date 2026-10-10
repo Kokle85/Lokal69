@@ -35,13 +35,23 @@ the laptop was off is the common case). Retryable refusals (expired intent, Outl
 mailbox unavailable, kill switch) then go through the domain's guarded retry with a *new* intent
 from the same account; the refused intent itself is never sent by the worker.
 
+A refusal is proof only while the server never GRANTED a claim for that intent: the worker calls
+``.Send`` only after a granted claim, so after one a ``refused_before_send`` report (e.g. from a
+stolen worker credential, after the real worker had sent) proves nothing. ``map_outlook_report``
+maps it to ``uncertain`` (``claim_granted=True``; provider error
+``REFUSED_AFTER_GRANTED_CLAIM``) and ``reconcile_from_reports`` never counts a claimed intent
+(``claimed_intent_ids``, from ``OutlookWorkerGateway.claimed_intents``) as proven unsent: the
+inquiry is held ``uncertain`` for the owner's reconciliation, never retried automatically. A
+refusal at claim time (claim not granted) or before any claim (e.g. a pre-claim expiry) stays
+proof.
+
 ``IntentNotStored`` is the only gateway error that proves the intent was not stored (so the
 worker can never pick it up); every other publish error is treated as an uncertain hand-over.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Final, Literal, Protocol
@@ -99,6 +109,9 @@ HEARTBEAT_STALE_AFTER: Final = timedelta(minutes=5)
 MAX_WIRE_ADDRESS_CHARS: Final = 254
 MAX_WIRE_MESSAGE_ID_CHARS: Final = 998
 MAX_WIRE_INQUIRY_REF_CHARS: Final = 64
+#: ``provider_error`` of a pre-send refusal reported for an intent whose claim was GRANTED: no
+#: proof of non-submission (the worker calls ``.Send`` only after a granted claim).
+REFUSED_AFTER_GRANTED_CLAIM: Final = "refused_after_granted_claim"
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
 CAPABILITIES: Final = ProviderCapabilities(
@@ -354,9 +367,19 @@ def _report_problems(intent: OutlookSendIntent, report: OutlookSendReport) -> li
 
 
 def map_outlook_report(
-    intent: OutlookSendIntent, report: OutlookSendReport, *, observed_at: datetime
+    intent: OutlookSendIntent,
+    report: OutlookSendReport,
+    *,
+    observed_at: datetime,
+    claim_granted: bool = False,
 ) -> SendAccepted | SendDefiniteFailure | SendUncertain:
-    """Map a worker report onto the shared send outcome (see the module table)."""
+    """Map a worker report onto the shared send outcome (see the module table).
+
+    ``claim_granted``: the server granted a claim for this intent (the worker may have called
+    ``.Send``), so a ``refused_before_send`` report is ``uncertain``
+    (``REFUSED_AFTER_GRANTED_CLAIM``), never a proven pre-submission failure. The persistence layer
+    passes it from the audited claims; it re-checks the same rule itself (defence in depth).
+    """
     problems = _report_problems(intent, report)
     if problems:
         raise ValidationFailed("worker report does not belong to this intent", details={"problems": problems})
@@ -383,6 +406,15 @@ def map_outlook_report(
         )
     if report.state == OutlookSubmissionState.REFUSED_BEFORE_SEND:
         reason = report.refusal_reason
+        if claim_granted:
+            return SendUncertain.model_validate(
+                {
+                    **common,
+                    "reason": UncertainReason.LOCAL_WORKER_NO_RESULT,
+                    "provider_error": REFUSED_AFTER_GRANTED_CLAIM,
+                    "outbox_pending": report.outbox_pending,
+                }
+            )
         if reason == OutlookRefusalReason.DUPLICATE_INTENT:
             return SendUncertain.model_validate(
                 {
@@ -446,14 +478,20 @@ def map_outlook_report(
     )
 
 
-def _definitive_refusal(intent: OutlookSendIntent, reports: Sequence[OutlookSendReport]) -> str | None:
+def _definitive_refusal(
+    intent: OutlookSendIntent, reports: Sequence[OutlookSendReport], *, claimed: bool = False
+) -> str | None:
     """The refusal reason when the intent's own worker definitively refused it before ``.Send``.
 
     ``None`` unless at least one report from the intent's mailbox binding is a non-duplicate
     ``refused_before_send`` and no report for the intent (from any mailbox) indicates that
     ``.Send`` may have been called or that a copy may sit in the Outbox. A ``duplicate_intent``
     refusal only says that an *earlier* attempt of this intent exists, whose result is unknown.
+    A ``claimed`` intent (the server granted a claim, so ``.Send`` may have been called) is never
+    definitively refused.
     """
+    if claimed:
+        return None
     own = [r for r in reports if r.intent_id == intent.intent_id and r.inquiry_id == intent.inquiry_id]
     if any(
         r.state != OutlookSubmissionState.REFUSED_BEFORE_SEND
@@ -475,14 +513,17 @@ def reconcile_from_reports(
     *,
     worker_online: bool,
     intents: Sequence[OutlookSendIntent] = (),
+    claimed_intent_ids: Collection[UUID] = (),
 ) -> ReconcileOutcome:
     """Sent Items evidence or proven refusal from worker reports; absence never proves anything.
 
     ``intents`` are every send intent stored for the inquiry (all attempts). Non-submission is
     proven only when each of them was definitively refused by its own worker and every searched
     Message-ID belongs to one of them (an attempt whose intent may or may not have been stored
-    is never assumed unsent).
+    is never assumed unsent). ``claimed_intent_ids`` are the intents a claim was GRANTED for (the
+    worker may have called ``.Send``): a refusal reported for one of them proves nothing.
     """
+    claimed = frozenset(claimed_intent_ids)
     ids = normalize_search_ids(rfc_message_ids)
     relevant = [r for r in reports if r.inquiry_id == inquiry_id]
     for report in relevant:
@@ -501,7 +542,10 @@ def reconcile_from_reports(
     own_intents = list({i.intent_id: i for i in intents if i.inquiry_id == inquiry_id}.values())
     covered = {normalize_message_id(i.rfc_message_id) for i in own_intents}
     if own_intents and len(own_intents) <= MAX_RECONCILE_MESSAGE_IDS and set(ids) <= covered:
-        reasons = [_definitive_refusal(intent, relevant) for intent in own_intents]
+        reasons = [
+            _definitive_refusal(intent, relevant, claimed=intent.intent_id in claimed)
+            for intent in own_intents
+        ]
         if all(reason is not None for reason in reasons):
             return ReconcileProvenNotSubmitted(
                 provider=EmailProviderKind.OUTLOOK_LOCAL,
@@ -546,6 +590,10 @@ class OutlookWorkerGateway(Protocol):
 
     async def intents_for(self, inquiry_id: UUID) -> Sequence[OutlookSendIntent]:
         """Every intent ever stored for the inquiry (all attempts, any state)."""
+        ...
+
+    async def claimed_intents(self, inquiry_id: UUID) -> frozenset[UUID]:
+        """The intents of the inquiry a claim was GRANTED for (``.Send`` may have been called)."""
         ...
 
 
@@ -739,9 +787,15 @@ class OutlookLocalProvider:
         del window, provider_message_ids
         reports = await self._gateway.reports_for(inquiry_id)
         intents = await self._gateway.intents_for(inquiry_id)
+        claimed = await self._gateway.claimed_intents(inquiry_id)
         online, _heartbeat = await self._worker_online()
         return reconcile_from_reports(
-            inquiry_id, rfc_message_ids, reports, worker_online=online, intents=intents
+            inquiry_id,
+            rfc_message_ids,
+            reports,
+            worker_online=online,
+            intents=intents,
+            claimed_intent_ids=claimed,
         )
 
     async def fetch_correlated_replies(
@@ -794,6 +848,7 @@ __all__ = [
     "MAX_WIRE_INQUIRY_REF_CHARS",
     "MAX_WIRE_MESSAGE_ID_CHARS",
     "OUTLOOK_INTENT_SCHEMA_VERSION",
+    "REFUSED_AFTER_GRANTED_CLAIM",
     "IntentNotStored",
     "OutlookAccountReport",
     "OutlookHeartbeat",

@@ -68,6 +68,7 @@ from suv_deals.integrations.email_providers.microsoft_graph import (
     normalize_permissions,
 )
 from suv_deals.integrations.email_providers.outlook_local import (
+    REFUSED_AFTER_GRANTED_CLAIM,
     IntentNotStored,
     OutlookAccountReport,
     OutlookHeartbeat,
@@ -1552,6 +1553,7 @@ class FakeGateway:
         self.account: OutlookAccountReport | None = None
         self.heartbeat: OutlookHeartbeat | None = None
         self.reports: list[OutlookSendReport] = []
+        self.claimed: set[UUID] = set()
 
     async def publish_intent(self, intent: OutlookSendIntent) -> None:
         if self.fail is not None:
@@ -1569,6 +1571,11 @@ class FakeGateway:
 
     async def intents_for(self, inquiry_id: UUID) -> Sequence[OutlookSendIntent]:
         return [i for i in self.intents if i.inquiry_id == inquiry_id]
+
+    async def claimed_intents(self, inquiry_id: UUID) -> frozenset[UUID]:
+        return frozenset(
+            i.intent_id for i in self.intents if i.inquiry_id == inquiry_id and i.intent_id in self.claimed
+        )
 
 
 def outlook(gateway: FakeGateway, **kwargs: Any) -> OutlookLocalProvider:
@@ -2917,6 +2924,60 @@ async def test_outlook_provider_reconcile_proves_refusal_of_its_own_intents() ->
         inquiry_id=INQUIRY_ID, rfc_message_ids=[built.rfc_message_id], window=WINDOW
     )
     assert isinstance(pending, ReconcileNotFoundYet) and pending.pending_in_drafts_or_outbox == Tristate.YES
+
+
+@pytest.mark.parametrize("reason", [r for r in OutlookRefusalReason if r != OutlookRefusalReason.NOT_NOW])
+def test_outlook_refusal_after_a_granted_claim_is_uncertain(reason: OutlookRefusalReason) -> None:
+    """C1 item 4: the worker calls .Send only after a granted claim, so a refusal reported after
+    one (e.g. by a stolen worker credential) is never a proven pre-submission failure."""
+    intent = intent_for()
+    outcome = map_outlook_report(intent, refused(intent, reason), observed_at=WHEN, claim_granted=True)
+    assert isinstance(outcome, SendUncertain)
+    assert outcome.reason == UncertainReason.LOCAL_WORKER_NO_RESULT
+    assert outcome.provider_error == REFUSED_AFTER_GRANTED_CLAIM
+    assert attempt_outcome(outcome).outcome == SendAttemptOutcome.UNCERTAIN
+
+
+def test_outlook_claimed_intent_is_never_proven_unsent() -> None:
+    intent = intent_for()
+    expired = refused(intent, OutlookRefusalReason.INTENT_EXPIRED)
+    ids = [intent.rfc_message_id]
+    online = reconcile_from_reports(
+        INQUIRY_ID,
+        ids,
+        [expired],
+        worker_online=True,
+        intents=[intent],
+        claimed_intent_ids={intent.intent_id},
+    )
+    assert isinstance(online, ReconcileNotFoundYet)
+    assert reconcile_uncertain(reconciliation_evidence(online)).next_state is None
+    offline = reconcile_from_reports(
+        INQUIRY_ID,
+        ids,
+        [expired],
+        worker_online=False,
+        intents=[intent],
+        claimed_intent_ids=[intent.intent_id],
+    )
+    assert not isinstance(offline, ReconcileProvenNotSubmitted)
+    # Without a granted claim the same refusal stays proof (a refusal at or before the claim).
+    unclaimed = reconcile_from_reports(INQUIRY_ID, ids, [expired], worker_online=False, intents=[intent])
+    assert isinstance(unclaimed, ReconcileProvenNotSubmitted)
+
+
+async def test_outlook_provider_reconcile_respects_granted_claims() -> None:
+    gateway = FakeGateway()
+    provider = outlook(gateway)
+    built = message()
+    await provider.send(built, inquiry_id=INQUIRY_ID, attempt_id=ATTEMPT_ID, idempotency_key=KEY)
+    intent = gateway.intents[0]
+    gateway.reports = [refused(intent, OutlookRefusalReason.INTENT_EXPIRED)]
+    gateway.claimed.add(intent.intent_id)
+    result = await provider.reconcile(
+        inquiry_id=INQUIRY_ID, rfc_message_ids=[built.rfc_message_id], window=WINDOW
+    )
+    assert not isinstance(result, ReconcileProvenNotSubmitted)
 
 
 async def test_outlook_reports_of_another_mailbox_never_vouch_for_this_one() -> None:

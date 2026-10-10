@@ -17,15 +17,19 @@ tests) is the only database identifier exposed, in `details`, for check/not-null
 | `23503` foreign_key_violation | referenced row missing or in another workspace | `NotFound` |
 | `23514` check / `23502` not null / `22xxx` data | invalid value | `ValidationFailed` |
 | `42501` insufficient_privilege (RLS/grants) | row outside the workspace or missing grant | `Forbidden` |
-| `40001` / `40P01` serialization / deadlock | retry the whole transaction | `TransientConflict` (retryable) |
-| `55P03` lock_not_available (lock_timeout) | row busy | `TransientConflict` (retryable) |
+| `40001` / `40P01` serialization / deadlock | retry the whole transaction | `TransientConflict` (``busy``) |
+| `55P03` lock_not_available (lock_timeout) | row busy | `TransientConflict` (``busy``) |
 | `57014` query_canceled (statement_timeout) | too slow | `StatementTimeout` (retryable) |
 | `25P02` in_failed_sql_transaction | an earlier error was swallowed | `TransactionAborted` (not retryable) |
 | `08xxx` / OperationalError | connection lost | `DependencyUnavailable` (retryable) |
 | anything else | unexpected | `AppError(INTERNAL_ERROR)` |
 
 Only `TransientConflict` and `StatementTimeout` prove that the transaction was rolled back, so
-only they may re-run a whole unit of work automatically (`transactions.retry_transient`). A lost
+only they may re-run a whole unit of work automatically (`transactions.retry_transient`).
+`TransientConflict` keeps ``VERSION_CONFLICT`` + retryable and carries a stable
+``details.reason``: ``busy`` (lock timeout, serialization failure, deadlock, a concurrent writer won
+a race) or ``in_progress`` (the same idempotent request is still running: `TransientConflict.
+in_progress`). Real version conflicts (`VersionConflict`) keep their own reasons. A lost
 connection (`DependencyUnavailable`) is ambiguous when it happens during COMMIT: the commit may
 have succeeded, so it is never retried blindly.
 
@@ -67,7 +71,7 @@ import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import psycopg
 
@@ -132,11 +136,38 @@ class TransactionAborted(AppError):
         super().__init__(ErrorCode.INTERNAL_ERROR, message, retryable=False)
 
 
-class TransientConflict(AppError):
-    """Serialization failure, deadlock or lock timeout: retry the whole transaction."""
+TransientReason = Literal["busy", "in_progress"]
+TRANSIENT_BUSY: Final = "busy"
+TRANSIENT_IN_PROGRESS: Final = "in_progress"
 
-    def __init__(self, message: str = "Concurrent update; retry the request") -> None:
-        super().__init__(ErrorCode.VERSION_CONFLICT, message, retryable=True, retry_after_seconds=1)
+
+class TransientConflict(AppError):
+    """Serialization failure, deadlock or lock timeout: retry the whole transaction.
+
+    ``details.reason`` is ``busy`` (the default: lock timeout, serialization failure, deadlock or a
+    lost concurrent race) or ``in_progress`` (an idempotent request with the same key is still
+    running; `in_progress`). The code stays ``VERSION_CONFLICT`` and the error retryable.
+    """
+
+    def __init__(
+        self, message: str = "Concurrent update; retry the request", *, reason: TransientReason = "busy"
+    ) -> None:
+        if reason not in (TRANSIENT_BUSY, TRANSIENT_IN_PROGRESS):
+            raise ValueError("unknown transient conflict reason")
+        super().__init__(
+            ErrorCode.VERSION_CONFLICT,
+            message,
+            retryable=True,
+            retry_after_seconds=1,
+            details={"reason": reason},
+        )
+
+    @classmethod
+    def in_progress(
+        cls, message: str = "The same request is still in progress; retry shortly"
+    ) -> TransientConflict:
+        """The same idempotent request is still being processed (``details.reason = in_progress``)."""
+        return cls(message, reason=TRANSIENT_IN_PROGRESS)
 
 
 class StatementTimeout(AppError):

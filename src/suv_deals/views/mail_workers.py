@@ -7,7 +7,10 @@ keeps the field sets identical.
 
 Health dimensions are separate (heartbeat, Outlook, reconciliation, backlog, account): monitoring
 is reported only while all of them are fresh, and coverage gaps are never hidden. Store and folder
-ids appear only as hashes; no address, subject or body is part of these views.
+ids appear only as hashes; no address, subject or body is part of these views. The health view also
+names each listed worker's credential state (``expired`` / ``revoked`` credentials are ``401`` for
+the worker), counts revoked workers even when they are not listed, and summarises the reply-signal
+flood control of the last 24 hours (emitted / coalesced / rate-limited, inquiries at the cap).
 """
 
 from __future__ import annotations
@@ -23,8 +26,36 @@ from suv_deals.views.lifecycle import LagView
 
 ComponentStatus = Literal["healthy", "stale", "down", "unknown"]
 AccountStatus = Literal["unknown", "verified", "mismatch", "not_classic"]
+#: A mailbox worker's ``suvmail_`` credential: ``expiring`` within `CREDENTIAL_EXPIRY_NOTICE_DAYS`;
+#: an ``expired`` or ``revoked`` credential is ``401`` for the worker (it keeps its backlog).
+CredentialStatus = Literal["active", "expiring", "expired", "revoked"]
 
 MAX_MAILBOXES = 50
+CREDENTIAL_EXPIRY_NOTICE_DAYS = 14
+
+
+class MailWorkerCredentialView(ViewModel):
+    """The credential state of one listed mailbox worker (never a token, hash or prefix)."""
+
+    mailbox_binding_id: UUID
+    worker_label: str = Field(max_length=120)
+    binding_state: Literal["active", "revoked"]
+    credential_status: CredentialStatus
+    expires_at: UtcDatetime
+    revoked_at: UtcDatetime | None
+
+
+class ReplySignalSummaryView(ViewModel):
+    """Reply signals (``seller.reply.received``) of the workspace in the rolling window: how many
+    replies emitted their own signal, were coalesced into one still to be posted, or hit the
+    per-inquiry cap (``rate_limited``: stored and visible, but no new dot activation)."""
+
+    window_hours: int = Field(ge=1, le=168)
+    cap_per_inquiry: int = Field(ge=1, description="PROPOSED cap of emitted signals per inquiry and window.")
+    emitted: int = Field(ge=0)
+    coalesced: int = Field(ge=0)
+    rate_limited: int = Field(ge=0)
+    inquiries_at_cap: int = Field(ge=0, description="Inquiries whose emitted signals reached the cap.")
 
 
 class MailCoverageGap(ViewModel):
@@ -88,6 +119,11 @@ class MailWorkerHealthView(ViewModel):
     any_monitoring_active: bool
     open_gap_count: int = Field(ge=0)
     notes: tuple[str, ...] = Field(max_length=20)
+    revoked_mailboxes: int = Field(
+        default=0, ge=0, description="Revoked mailbox workers (counted even when they are not listed)."
+    )
+    credentials: tuple[MailWorkerCredentialView, ...] = Field(default=(), max_length=MAX_MAILBOXES)
+    reply_signals: ReplySignalSummaryView | None = None
 
 
 class MailCoverageGapItem(ViewModel):
@@ -123,12 +159,16 @@ class MailCoverageGapListView(ViewModel):
 
 
 __all__ = [
+    "CREDENTIAL_EXPIRY_NOTICE_DAYS",
     "AccountStatus",
     "ComponentStatus",
+    "CredentialStatus",
     "FolderCheckpointView",
     "MailCoverageGap",
     "MailCoverageGapItem",
     "MailCoverageGapListView",
+    "MailWorkerCredentialView",
     "MailWorkerHealthView",
     "MailboxHealthView",
+    "ReplySignalSummaryView",
 ]

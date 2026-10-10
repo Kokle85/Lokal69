@@ -53,6 +53,19 @@ its consequences in ONE transaction (the caller's ``unit_of_work`` of the worker
    inquiry id, reply id, listing/cluster id, safe dashboard URL, brief status: no body, address,
    name or price; a fixture listing's signal is stored ``blocked``). Optionally a
    ``seller_reply_process`` job for follow-up processing (``ReplyIngestOptions``).
+7. **Flood control** (C1) - a seller (or a stolen worker credential) cannot trigger unbounded dot
+   activations: at most ONE not-yet-posted ``seller.reply.received`` signal per inquiry at a time
+   (a newer reply while one is pending, retrying or leased before its send attempt is
+   ``coalesced``: dot reads every reply of the inquiry through MCP once it is posted; a signal
+   whose post may already have happened - ``uncertain`` or ``sending`` after its attempt began -
+   or that can never post - ``blocked``, terminal - never swallows a newer reply), and at most
+   ``MAX_SIGNALS_PER_INQUIRY_24H`` signal-emitting replies per inquiry in any rolling 24 hours
+   (``rate_limited`` beyond it). The
+   reply is always stored and visible; ``app.seller_replies.signal_status`` records what happened
+   (``emitted`` / ``coalesced`` / ``rate_limited`` / ``not_applicable``). Per mailbox credential,
+   at most ``MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR`` new replies (incl. quarantined conflicts) are
+   stored per rolling hour; beyond it the upload is ``RATE_LIMITED`` (429, nothing stored; the
+   worker keeps its local queue and retries).
 
 Lock order: ``app.seller_inquiries`` -> ``ops.mail_ingest_dedup`` -> ``app.seller_replies`` ->
 ``ops.email_delivery_attempts`` -> ``app.listings`` -> ``app.valuations`` -> ``ops.jobs`` ->
@@ -66,7 +79,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
@@ -112,7 +125,14 @@ from suv_deals.domain.replies import (
     source_content_fingerprint,
 )
 from suv_deals.domain.valuation import InvalidationReason
-from suv_deals.errors import AppError, Forbidden, IdempotencyConflict, ValidationFailed, VersionConflict
+from suv_deals.errors import (
+    AppError,
+    Forbidden,
+    IdempotencyConflict,
+    RateLimited,
+    ValidationFailed,
+    VersionConflict,
+)
 from suv_deals.persistence import audit, availability_repo, jobs, mail_workers_repo, outbox, valuation_repo
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import TransientConflict, mapped_errors
@@ -125,8 +145,31 @@ MAX_CLAIM_ITEMS: Final = 20
 MAX_CLAIMS_BYTES: Final = 60_000
 MAX_SUMMARY_BYTES: Final = 32_000
 REPLY_PROCESS_PREFIX: Final = "seller_reply.process"
+SELLER_REPLY_SIGNAL_EVENT: Final = "seller.reply.received"
+#: PROPOSED engineering default (C1): at most this many signal-emitting replies per inquiry in any
+#: rolling 24 hours (on top of "one undelivered signal per inquiry at a time").
+MAX_SIGNALS_PER_INQUIRY_24H: Final = 6
+SIGNAL_WINDOW: Final = timedelta(hours=24)
+#: PROPOSED engineering default (C1): new replies (incl. quarantined conflicts) a mailbox worker
+#: credential may store per rolling hour. Correlated seller replies are rare (at most 5 inquiries
+#: per 15 days); an upload beyond it is RATE_LIMITED and stays in the worker's local queue.
+MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR: Final = 120
+INGEST_WINDOW: Final = timedelta(hours=1)
+#: Outbox states of a signal that has NOT activated dot yet and WILL still post: a newer reply is
+#: coalesced into it, because dot reads every reply of the inquiry once that post happens.
+#: ``sending`` counts only while its send attempt has not begun. ``blocked`` is NOT one of them:
+#: a blocked event is terminal (nothing moves it back to ``pending``; e.g. blocked while external
+#: notifications were still off), so coalescing into it would mute dot for the inquiry for good
+#: (C1 security review r2). A newer reply then emits its own signal, bounded by the 24 h cap.
+UNDELIVERED_SIGNAL_STATES: Final = ("pending", "retry_wait")
+#: A signal whose Slack post may already have happened (``uncertain``; ``sending`` after its send
+#: attempt began) may have let dot read the replies BEFORE the newer one existed, and the
+#: dispatcher reconciles a found post as delivered without re-posting it: a newer reply is never
+#: coalesced into it (it emits its own signal, still bounded by the per-inquiry 24 h cap).
+POSSIBLY_POSTED_SIGNAL_STATES: Final = ("sending", "uncertain")
 
 IngestStatus = Literal["stored", "quarantined"]
+SignalStatus = Literal["emitted", "coalesced", "rate_limited", "not_applicable"]
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 _UPGRADE_TYPES: Final = frozenset({ReplyMessageType.SELLER_REPLY})
@@ -200,6 +243,7 @@ class ReplyIngestOutcome(BaseModel):
     recompute_job_ids: tuple[UUID, ...] = ()
     outbox_event_id: UUID | None = None
     processing_job_id: UUID | None = None
+    signal_status: SignalStatus | None = None
 
     def ack(self) -> MailWorkerReplyAck:
         """The wire acknowledgement (``POST /v1/mail-workers/replies`` 200 body)."""
@@ -619,6 +663,7 @@ async def _conflict(
         {"ws": worker.workspace_id, "original": original_id, "fp": fingerprint},
     )
     if existing is None:
+        await _require_ingest_volume(conn, worker)
         mtype = request.message_type
         existing = await _insert_reply(
             conn,
@@ -793,14 +838,15 @@ insert into app.seller_replies (workspace_id, inquiry_id, mailbox_binding_id, bi
   subject, sanitized_body, body_sanitizer_version, source_fingerprint, fingerprint_version, received_at,
   observed_at, message_type, correlation_status, correlation_reasons, detected_language, attachments,
   withheld_sensitive_attachments, mk_summary, mk_summary_version, mk_summary_generated_at, claims,
-  claims_version, processing_state, processed_at, quarantined, quarantine_reason, conflict_of_reply_id)
+  claims_version, processing_state, processed_at, quarantined, quarantine_reason, conflict_of_reply_id,
+  signal_status)
 values (%(ws)s, %(inquiry)s, %(box)s, %(version)s, %(mid)s, %(pmid)s, %(from)s, %(irt)s, %(refs)s,
   %(returned)s, %(subject)s, %(body)s, %(sanitizer)s, %(fp)s, %(fp_version)s, %(received)s, %(observed)s,
   %(type)s, %(status)s, %(reasons)s, %(language)s, %(attachments)s, %(withheld)s, %(summary)s,
   %(summary_version)s, case when %(summary)s::text is null then null else clock_timestamp() end,
   %(claims)s, %(claims_version)s, %(processing)s,
   case when %(processing)s = 'stored' then null else clock_timestamp() end,
-  %(quarantined)s, %(quarantine)s, %(conflict_of)s)
+  %(quarantined)s, %(quarantine)s, %(conflict_of)s, %(signal_status)s)
 returning id, quarantined, ingested_at, header_linked, thread_linked
 """
 
@@ -821,6 +867,7 @@ async def _insert_reply(
     withheld: int,
     processed: _Processed | None,
     conflict_of: UUID | None = None,
+    signal_status: SignalStatus = "not_applicable",
 ) -> Mapping[str, Any]:
     source = request.source_message
     row = await fetch_one(
@@ -860,10 +907,82 @@ async def _insert_reply(
             "quarantined": quarantined,
             "quarantine": quarantine_reason,
             "conflict_of": conflict_of,
+            "signal_status": signal_status,
         },
     )
     assert row is not None
     return row
+
+
+_SIGNAL_GATE_SQL: Final = """
+select exists (select 1 from ops.outbox o
+                where o.workspace_id = %(ws)s and o.event_type = %(event)s
+                  and o.payload ->> 'inquiry_id' = %(inquiry)s::text
+                  and (o.state = any(%(undelivered)s::text[])
+                       or (o.state = 'sending' and o.send_attempted_at is null))) as pending,
+       (select count(*) from app.seller_replies r
+         where r.workspace_id = %(ws)s and r.inquiry_id = %(inquiry)s and r.signal_status = 'emitted'
+           and r.ingested_at > pg_catalog.clock_timestamp() - %(window)s::interval) as emitted
+"""
+
+
+async def _signal_gate(conn: Conn, workspace_id: UUID, inquiry_id: UUID) -> SignalStatus:
+    """Whether a new matched reply of ``inquiry_id`` may emit its ``seller.reply.received`` signal.
+
+    ``coalesced`` only into a signal that has not been posted yet (`UNDELIVERED_SIGNAL_STATES`,
+    or ``sending`` before its send attempt began): its later post makes dot read this reply too.
+    A possibly posted signal (`POSSIBLY_POSTED_SIGNAL_STATES`) or a ``blocked`` one (terminal: it
+    never posts) never swallows a newer reply.
+    Runs under the inquiry row lock taken by `ingest_reply`, so replies of one inquiry are decided
+    one after the other (two concurrent uploads cannot both see "no pending signal").
+    """
+    row = await fetch_one(
+        conn,
+        _SIGNAL_GATE_SQL,
+        {
+            "ws": workspace_id,
+            "inquiry": inquiry_id,
+            "event": SELLER_REPLY_SIGNAL_EVENT,
+            "undelivered": list(UNDELIVERED_SIGNAL_STATES),
+            "window": SIGNAL_WINDOW,
+        },
+    )
+    assert row is not None
+    if row["pending"]:
+        return "coalesced"
+    if int(row["emitted"]) >= MAX_SIGNALS_PER_INQUIRY_24H:
+        return "rate_limited"
+    return "emitted"
+
+
+_INGEST_VOLUME_SQL: Final = """
+select count(*) as stored, min(ingested_at) as oldest
+  from app.seller_replies
+ where workspace_id = %(ws)s and mailbox_binding_id = %(box)s
+   and ingested_at > pg_catalog.clock_timestamp() - %(window)s::interval
+"""
+
+
+async def _require_ingest_volume(conn: Conn, worker: WorkerIdentity) -> None:
+    """Per mailbox worker credential: at most ``MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR`` NEW stored
+    replies per rolling hour (duplicates and replays store nothing and are never limited)."""
+    row = await fetch_one(
+        conn,
+        _INGEST_VOLUME_SQL,
+        {"ws": worker.workspace_id, "box": worker.mailbox_binding_id, "window": INGEST_WINDOW},
+    )
+    assert row is not None
+    if int(row["stored"]) < MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR:
+        return
+    now = await fetch_one(conn, "select clock_timestamp() as now")
+    assert now is not None
+    oldest = row["oldest"]
+    wait = 60 if oldest is None else max(1, int((oldest + INGEST_WINDOW - now["now"]).total_seconds()) + 1)
+    raise RateLimited(
+        "Too many new replies from this mailbox worker in the last hour; the upload stays queued",
+        wait,
+        details={"reason": "mail_worker_ingest_volume"},
+    )
 
 
 async def _new(
@@ -957,6 +1076,7 @@ async def _new(
         1 for d in decisions if d.action == AttachmentAction.QUARANTINE_SENSITIVE
     )
     dsn = parse_delivery_report(message.body_text) if mtype in _DSN_TYPES else None
+    await _require_ingest_volume(conn, worker)
     claims: ReplyClaims | None = None
     processed: _Processed | None = None
     if mtype in (ReplyMessageType.SELLER_REPLY, ReplyMessageType.AMBIGUOUS):
@@ -970,6 +1090,12 @@ async def _new(
         processed = _Processed(
             claims=_claims_document(claims), summary=_bounded_text(summary.text, MAX_SUMMARY_BYTES)
         )
+    decision: ReplyProcessingDecision | None = None
+    signal_status: SignalStatus = "not_applicable"
+    if not quarantined:
+        decision = decide_reply_processing(correlation, claims, attachments=decisions, bounce=dsn)
+        if decision.emit_signal and options.emit_signal and decision.signal_status is not None:
+            signal_status = await _signal_gate(conn, worker.workspace_id, request.inquiry_id)
     reply = await _insert_reply(
         conn,
         worker,
@@ -984,6 +1110,7 @@ async def _new(
         attachments=_attachment_documents(request.attachments, decisions),
         withheld=withheld,
         processed=processed,
+        signal_status=signal_status,
     )
     reply_id: UUID = reply["id"]
     await conn.execute(
@@ -1007,8 +1134,7 @@ async def _new(
     )
     await _record_locator(conn, worker, request, reply_id)
     effects: dict[str, Any] = {}
-    if not quarantined:
-        decision = decide_reply_processing(correlation, claims, attachments=decisions, bounce=dsn)
+    if decision is not None:
         effects = await _apply_effects(
             conn,
             worker,
@@ -1020,6 +1146,7 @@ async def _new(
             now=now,
             request_id=request_id,
             options=options,
+            emit_signal=signal_status == "emitted",
         )
     await audit.record(
         conn,
@@ -1034,6 +1161,7 @@ async def _new(
             "quarantined": quarantined,
             "quarantine_reason": reason,
             "transitions": [s.value for s in effects.get("transitions", ())],
+            "signal_status": signal_status,
         },
     )
     return _outcome(
@@ -1045,6 +1173,7 @@ async def _new(
         correlation_outcome=correlation.outcome,
         message_type=mtype,
         quarantine_reason=reason,
+        signal_status=signal_status,
         **effects,
     )
 
@@ -1066,6 +1195,7 @@ async def _apply_effects(
     now: datetime,
     request_id: str,
     options: ReplyIngestOptions,
+    emit_signal: bool,
 ) -> dict[str, Any]:
     system = worker.system_actor(request_id)
     current = InquiryState(inquiry["state"])
@@ -1111,7 +1241,7 @@ async def _apply_effects(
         result["recompute_job_ids"] = recompute
     if transitions:
         await mail_workers_repo.publish_inquiry_binding(conn, system, inquiry["id"])
-    if decision.emit_signal and options.emit_signal and decision.signal_status is not None:
+    if emit_signal and decision.emit_signal and options.emit_signal and decision.signal_status is not None:
         draft = build_seller_reply_signal(
             event_id=uuid4(),
             inquiry_id=inquiry["id"],
@@ -1357,10 +1487,16 @@ def signal_payload_is_minimal(payload: Mapping[str, Any]) -> bool:
 __all__ = [
     "DEFAULT_DASHBOARD_BASE_URL",
     "DEFAULT_INGEST_OPTIONS",
+    "MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR",
+    "MAX_SIGNALS_PER_INQUIRY_24H",
+    "POSSIBLY_POSTED_SIGNAL_STATES",
     "REPLY_PROCESS_PREFIX",
+    "SELLER_REPLY_SIGNAL_EVENT",
+    "UNDELIVERED_SIGNAL_STATES",
     "IngestStatus",
     "ReplyIngestOptions",
     "ReplyIngestOutcome",
+    "SignalStatus",
     "ingest",
     "ingest_reply",
     "signal_payload_is_minimal",

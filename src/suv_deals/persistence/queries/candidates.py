@@ -197,7 +197,8 @@ select l.id as listing_id, l.source_id, s.source_key, s.country as source_countr
 
 _LIST_FILTERS: Final = """
    and l.created_at <= %(as_of)s
-   and (l.eligibility_state = any(%(candidate_states)s::text[]) or c.id is not null)
+   and (l.eligibility_state = any(%(candidate_states)s::text[]) or c.id is not null
+        or (%(include_rejected)s::boolean and l.eligibility_state = 'rejected'))
    and (%(profile)s::text is null or l.eligibility_profile = %(profile)s::text)
    and (%(country)s::text is null or r.seller_country = %(country)s::text)
    and (%(status)s::text is null or c.status = %(status)s::text)
@@ -370,12 +371,27 @@ async def list_candidates(
     query: DealsListCandidatesInput,
     *,
     secret: CursorSecret,
+    include_screening_rejected: bool = False,
 ) -> QueryResult[CandidateListView]:
-    """One keyset page of candidate summaries plus the signed cursor for the next page."""
+    """One keyset page of candidate summaries plus the signed cursor for the next page.
+
+    ``include_screening_rejected`` (the dashboard's audit filter; never the MCP tool) also lists
+    listings that screening rejected (``eligibility_state = 'rejected'``), which are kept for audit
+    but are not candidates (spec 11). The flag is bound into the cursor's filter hash, so a cursor
+    issued for one setting is refused (``mismatch``) for the other; with the default ``False`` the
+    hash is exactly the spec 21 filter hash (existing cursors stay valid).
+    """
     actor.require(Scope.DEALS_READ)
+    if not isinstance(include_screening_rejected, bool):
+        raise ValidationFailed(
+            "include_screening_rejected must be a boolean", details={"fields": ["include_screening_rejected"]}
+        )
     keys = require_secret(secret)
     limit = validate_limit(query.limit)
-    filters_hash = filter_hash(query.filters())
+    filters = query.filters()
+    if include_screening_rejected:
+        filters = {**filters, "include_screening_rejected": True}
+    filters_hash = filter_hash(filters)
     now = await db_now(conn)
     after_created: datetime | None = None
     after_id: UUID | None = None
@@ -397,6 +413,7 @@ async def list_candidates(
         "now": now,
         "as_of": as_of,
         "candidate_states": list(CANDIDATE_STATES),
+        "include_rejected": include_screening_rejected,
         "profile": None if query.profile is None else query.profile.value,
         "country": query.country,
         "status": query.status,

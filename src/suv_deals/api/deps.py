@@ -58,6 +58,12 @@ STATE_ATTRIBUTE: Final = "suv_api"
 #: replies/reports, polling reads are periodic.
 MAIL_WORKER_MUTATION_LIMIT: Final = RateLimit(capacity=120, per_seconds=0.5)  # 120 burst, 120/minute
 MAIL_WORKER_READ_LIMIT: Final = RateLimit(capacity=60, per_seconds=1.0)  # 60 burst, 60/minute
+#: PROPOSED: ``POST /v1/mail-workers/replies`` per credential, on top of the mutation bucket and
+#: tighter than it (a reply upload is the heaviest worker request: correlation, storage, outbox
+#: signal and processing job in one transaction). A backlog drain waits for ``Retry-After`` and
+#: keeps its local queue. The repository additionally caps NEW stored replies per mailbox at
+#: ``replies_repo.MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR`` (120).
+MAIL_WORKER_REPLY_LIMIT: Final = RateLimit(capacity=30, per_seconds=6.0)  # 30 burst, 10/minute
 TRANSACTION_ATTEMPTS: Final = 3
 MAX_QUERY_STRING_BYTES: Final = 4096
 _ID_ADAPTER: Final = TypeAdapter(Id)
@@ -96,6 +102,12 @@ class ApiState:
     mail_worker_limiter: PrincipalRateLimiter = field(
         default_factory=lambda: PrincipalRateLimiter(
             mutations=MAIL_WORKER_MUTATION_LIMIT, reads=MAIL_WORKER_READ_LIMIT
+        )
+    )
+    #: Per mailbox-worker credential bucket of ``POST /v1/mail-workers/replies`` only.
+    mail_worker_reply_limiter: PrincipalRateLimiter = field(
+        default_factory=lambda: PrincipalRateLimiter(
+            mutations=MAIL_WORKER_REPLY_LIMIT, reads=MAIL_WORKER_READ_LIMIT
         )
     )
     #: ``(loop time, view)`` of the last readiness probe (see ``routes.readiness_view``).
@@ -296,6 +308,7 @@ async def in_transaction[T](state: ApiState, actor: ActorContext, work: Callable
 __all__ = [
     "MAIL_WORKER_MUTATION_LIMIT",
     "MAIL_WORKER_READ_LIMIT",
+    "MAIL_WORKER_REPLY_LIMIT",
     "MAX_QUERY_STRING_BYTES",
     "STATE_ATTRIBUTE",
     "ApiOptions",

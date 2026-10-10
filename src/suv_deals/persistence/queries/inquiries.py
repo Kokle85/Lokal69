@@ -15,8 +15,15 @@ Read models are the shared views of ``views.inquiries`` (the exact output of the
   page stores the ordered membership and the summary projections, bound to principal, workspace,
   query and filters; later pages read the snapshot only, so state changes between pages never
   shuffle or duplicate rows). Filters: one state, ``uncertain_only`` and the dashboard's
-  ``attention_only`` (uncertain, held for facts, suppressed, failed, stuck sending); replies of one
-  inquiry and ``quarantined_only``. Lists never contain message text or addresses. The first page
+  ``attention_only`` (uncertain, held for facts, suppressed, failed, stuck sending, and every
+  inquiry with a ``waiting_reason``); replies of one inquiry and ``quarantined_only``. Each inquiry
+  summary names WHY it waits (``waiting_reason``: uncertain delivery, missing facts, paused
+  workspace, incomplete sender setup, offline desktop worker, rolling cap, seller cooldown, other
+  hold), derived from the stored state, the workspace controls, the open plan/send job's wait or
+  blocker code and the sender mailbox's heartbeat. Lists never contain message text or addresses.
+  A quarantined reply's text (``get_reply``) and claim-derived list fields (``availability``) are
+  withheld from everyone but the owner here, so every surface inherits the rule
+  (`views.inquiries.reply_content_visible`). The first page
   WRITES its snapshot (run inside ``transactions.unit_of_work``); the snapshot layer lets
   ``inquiries:read`` alone page these two queries (``query_snapshots.INQUIRY_QUERY_NAMES``),
   every other snapshot query still needs ``deals:read`` or ``reviews:read``.
@@ -37,6 +44,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Final
+from uuid import uuid5
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -70,10 +78,11 @@ from suv_deals.domain.listings import sha256_json
 from suv_deals.domain.money import Money
 from suv_deals.domain.replies import DocumentClaimStatus, ReplyClaims
 from suv_deals.errors import NotFound, ValidationFailed
-from suv_deals.persistence import mail_workers_repo, query_snapshots
+from suv_deals.integrations.email_providers.outlook_local import HEARTBEAT_STALE_AFTER
+from suv_deals.persistence import mail_workers_repo, query_snapshots, replies_repo
 from suv_deals.persistence.database import Conn, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import mapped_errors
-from suv_deals.persistence.mail_workers_repo import MailboxHealth
+from suv_deals.persistence.mail_workers_repo import HEALTH_ROW_HASH, MailboxHealth
 from suv_deals.persistence.queries._common import (
     CursorSecret,
     QueryResult,
@@ -107,7 +116,14 @@ from suv_deals.views.inquiries import (
     SendAttemptsView,
     SenderRef,
     ValuationStatusView,
+    WaitingReason,
     recipient_address_visible,
+)
+from suv_deals.views.mail_workers import (
+    CREDENTIAL_EXPIRY_NOTICE_DAYS,
+    CredentialStatus,
+    MailWorkerCredentialView,
+    ReplySignalSummaryView,
 )
 
 INQUIRIES_QUERY: Final = "seller_inquiries"
@@ -121,6 +137,37 @@ ATTENTION_STATES: Final = (
     InquiryState.FAILED_DEFINITE,
     InquiryState.SENDING,
 )
+#: States an inquiry may WAIT in (beyond the attention states): planned, reserved, queued or a
+#: proven-unsent failure waiting for its guarded retry.
+WAITING_STATES: Final = (
+    InquiryState.QUALIFYING,
+    InquiryState.RESERVED,
+    InquiryState.QUEUED,
+    InquiryState.FAILED_DEFINITE,
+    InquiryState.SENDING,
+)
+#: Waiting states before any transmission attempt: the workspace controls decide first.
+_PRE_SEND_WAITING_STATES: Final = frozenset(
+    {InquiryState.QUALIFYING, InquiryState.RESERVED, InquiryState.QUEUED}
+)
+#: The open plan/send job's wait (``last_error_code`` of a released job) or blocker code ->
+#: the summary's waiting reason (codes of ``workers.inquiry_handlers``).
+WAIT_CODES: Final[Mapping[str, WaitingReason]] = {
+    "INQUIRY_WAIT_RATE_CAP_REACHED": "RATE_CAP_REACHED",
+    "INQUIRY_WAIT_SELLER_COOLDOWN": "SELLER_COOLDOWN",
+    "INQUIRY_WAIT_KILL_SWITCH_ACTIVE": "INQUIRIES_PAUSED",
+    "INQUIRY_WAIT_INQUIRIES_PAUSED": "INQUIRIES_PAUSED",
+    "SEND_HELD_PAUSED": "INQUIRIES_PAUSED",
+    "MAILBOX_WORKER_MISSING": "WORKER_OFFLINE",
+    "MAILBOX_WORKER_CREDENTIAL_NOT_LIVE": "WORKER_OFFLINE",
+    "WORKER_HEARTBEAT_STALE": "WORKER_OFFLINE",
+    "SENDER_SETUP_INCOMPLETE": "SENDER_SETUP_INCOMPLETE",
+    "SENDER_PROVIDER_NOT_CONFIGURED": "SENDER_SETUP_INCOMPLETE",
+    "EMAIL_DELIVERY_UNCERTAIN": "UNCERTAIN_DELIVERY",
+    "RECONCILE_PROVIDER_UNAVAILABLE": "UNCERTAIN_DELIVERY",
+    "INQUIRY_WAIT_WINDOW": "SEND_HELD",
+    "SEND_HELD_PREFLIGHT": "SEND_HELD",
+}
 DEFAULT_EVALUATION_LOOKBACK: Final = timedelta(days=90)
 MAX_EVALUATION_ROWS: Final = 20_000
 
@@ -176,13 +223,50 @@ select i.id, i.identity_key, i.seller_entity_id, i.vehicle_kind, i.vehicle_clust
          order by r.received_at desc, r.id desc limit 1) as latest_reply_id,
        exists (select 1 from ops.email_delivery_attempts a
                 where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
-                  and a.submission_uncertain) as attempt_uncertain
+                  and a.submission_uncertain) as attempt_uncertain,
+       exists (select 1 from ops.email_delivery_attempts a
+                where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
+                  and a.outcome = 'running' and a.provider = 'outlook_local') as local_intent_running,
+       ctl.mode as controls_mode, ctl.kill_switch as controls_kill_switch,
+       ctl.max_per_24h as controls_max_per_24h, ctl.max_per_15d as controls_max_per_15d,
+       sj.code as send_job_code, pj.code as plan_job_code,
+       wb.box_id as worker_box_id,
+       coalesce(wb.heartbeat_at > pg_catalog.clock_timestamp() - %(stale_after)s::interval, false)
+         as worker_fresh
   from app.seller_inquiries i
   join app.listings l on l.workspace_id = i.workspace_id and l.id = i.qualification_listing_id
   join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
   left join app.seller_contacts c on c.workspace_id = i.workspace_id and c.id = i.recipient_contact_id
+  left join app.seller_inquiry_controls ctl on ctl.workspace_id = i.workspace_id
+  left join lateral (
+    select case when j.state = 'blocked' then j.blocker_code else j.last_error_code end as code
+      from ops.jobs j
+     where j.workspace_id = i.workspace_id and j.listing_id = i.qualification_listing_id
+       and j.job_type = 'seller_inquiry_send' and j.payload ->> 'inquiry_id' = i.id::text
+       and j.state in ('queued', 'retry_wait', 'blocked')
+     order by j.created_at desc, j.id desc limit 1) sj on true
+  left join lateral (
+    select case when j.state = 'blocked' then j.blocker_code else j.last_error_code end as code
+      from ops.jobs j
+     where j.workspace_id = i.workspace_id and j.listing_id = i.qualification_listing_id
+       and j.job_type = 'seller_inquiry_plan' and j.state in ('queued', 'retry_wait', 'blocked')
+     order by j.created_at desc, j.id desc limit 1) pj on true
+  left join lateral (
+    select m.id as box_id, k.heartbeat_at
+      from ops.mail_worker_bindings m
+      left join ops.mail_worker_checkpoints k
+        on k.workspace_id = m.workspace_id and k.mailbox_binding_id = m.id
+       and k.store_id_hash = %(health_hash)s and k.folder_id_hash = %(health_hash)s
+     where m.workspace_id = i.workspace_id and m.sender_binding_id = i.sender_binding_id
+       and m.state = 'active'
+     order by m.created_at desc, m.id limit 1) wb on true
  where i.workspace_id = %(ws)s
 """
+#: Bound in every ``_INQUIRY_SELECT`` read (worker freshness for the waiting reason).
+_WAIT_PARAMS: Final[Mapping[str, Any]] = {
+    "stale_after": HEARTBEAT_STALE_AFTER,
+    "health_hash": HEALTH_ROW_HASH,
+}
 _ATTEMPTS_SQL: Final = """
 select attempt_number, provider, outcome, send_intent_committed_at, finished_at, reconciled_outcome,
        reconciled_at, submission_uncertain, error_code
@@ -320,10 +404,49 @@ def _inquiry_view(
     )
 
 
+def waiting_reason(row: Mapping[str, Any]) -> WaitingReason | None:
+    """Why an inquiry waits, from its stored state, the controls, the open job and the worker.
+
+    ``uncertain`` -> ``UNCERTAIN_DELIVERY``; ``held_facts`` -> ``NEEDS_FACTS``; a pre-send state
+    (qualifying, reserved, queued) while the kill switch is on or the mode is ``paused`` ->
+    ``INQUIRIES_PAUSED``, while the mode is ``disabled_until_sender_ready`` (the initial mode) ->
+    ``SENDER_SETUP_INCOMPLETE``; else the open send job's (then plan job's) wait or blocker code
+    (`WAIT_CODES`); a pre-send inquiry under a rolling cap the owner set to 0 (a plan job finishes
+    "held" when no end is known) -> ``RATE_CAP_REACHED``. A ``failed_definite`` inquiry waits only
+    while a send job holds its guarded retry (its job code decides; a definite rejection is final,
+    never a wait). A ``sending`` inquiry whose desktop intent is still running while no fresh
+    heartbeat of its sender's mailbox worker exists -> ``WORKER_OFFLINE``. ``None`` = not waiting.
+    """
+    state = InquiryState(row["state"])
+    if state == InquiryState.UNCERTAIN:
+        return "UNCERTAIN_DELIVERY"
+    if state == InquiryState.HELD_FACTS:
+        return "NEEDS_FACTS"
+    if state not in WAITING_STATES:
+        return None
+    pre_send = state in _PRE_SEND_WAITING_STATES
+    if pre_send and (row["controls_kill_switch"] or row["controls_mode"] == "paused"):
+        return "INQUIRIES_PAUSED"
+    if pre_send and row["controls_mode"] != "automatic":
+        # ``disabled_until_sender_ready`` (or no controls row yet): the owner never paused anything.
+        return "SENDER_SETUP_INCOMPLETE"
+    if state != InquiryState.SENDING:
+        for code in (row["send_job_code"], row["plan_job_code"]):
+            mapped = WAIT_CODES.get(str(code or ""))
+            if mapped is not None:
+                return mapped
+        if pre_send and (row["controls_max_per_24h"] == 0 or row["controls_max_per_15d"] == 0):
+            return "RATE_CAP_REACHED"
+        return None
+    if row["local_intent_running"] and (row["worker_box_id"] is None or not row["worker_fresh"]):
+        return "WORKER_OFFLINE"
+    return None
+
+
 async def get_inquiry(conn: Conn, actor: ActorContext, inquiry_id: Any) -> QueryResult[InquiryView]:
     """``seller_inquiries_get`` / ``GET /api/inquiries/{inquiry_id}``."""
     _require_inquiries(actor)
-    params = {"ws": actor.workspace_id, "id": inquiry_id}
+    params = {"ws": actor.workspace_id, "id": inquiry_id, **_WAIT_PARAMS}
     async with mapped_errors():
         row = await fetch_one(conn, _INQUIRY_SELECT + " and i.id = %(id)s", params)
         if row is None:
@@ -347,7 +470,7 @@ select r.id, r.inquiry_id, r.message_type, r.detected_language, r.subject, r.san
        r.mk_summary_version, r.mk_summary_generated_at, r.from_address, r.correlation_status,
        r.correlation_reasons, r.header_linked, r.thread_linked, r.received_at, r.observed_at, r.ingested_at,
        r.processing_state, r.processed_at, r.claims, r.quarantined, r.quarantine_reason, r.attachments,
-       r.withheld_sensitive_attachments,
+       r.withheld_sensitive_attachments, r.signal_status,
        i.seller_entity_id, i.vehicle_kind, i.vehicle_cluster_id, i.qualification_listing_id,
        i.recipient_address, s.source_key, l.source_listing_id, l.canonical_url,
        l.is_fixture as listing_fixture,
@@ -481,6 +604,7 @@ async def get_reply(conn: Conn, actor: ActorContext, reply_id: Any) -> QueryResu
             quarantine_reason=row["quarantine_reason"],
             attachments=_attachments(row["attachments"]),
             withheld_sensitive_attachments=int(row["withheld_sensitive_attachments"]),
+            signal_status=row["signal_status"],
             valuation=ValuationStatusView(
                 valuation_id=None if valuation is None else valuation["id"],
                 state=None if valuation is None else enum_or_none(ValuationState, valuation["state"]),
@@ -490,8 +614,11 @@ async def get_reply(conn: Conn, actor: ActorContext, reply_id: Any) -> QueryResu
                 recalculation_pending=bool(valuation and valuation["pending"]),
             ),
         )
+    # A quarantined reply's text is for the owner only: withheld HERE, so every surface (API,
+    # MCP, CLI) inherits the rule (`views.inquiries.reply_content_visible`).
+    view = view.for_scopes(actor.scopes)
     warnings: list[ResponseWarning] = []
-    if claims is not None:
+    if view.claims is not None:
         warnings.append(warning(WarningCode.SELLER_CLAIMS_UNVERIFIED))
     if view.valuation.state == ValuationState.STALE:
         warnings.append(warning(WarningCode.VALUATION_STALE))
@@ -538,10 +665,11 @@ def _inquiry_summary(row: Mapping[str, Any]) -> InquirySummaryView:
         send_attempted_at=utc_or_none(row["send_attempted_at"]),
         accepted_at=utc_or_none(row["accepted_at"]),
         row_version=int(row["row_version"]),
+        waiting_reason=waiting_reason(row),
     )
 
 
-def _reply_summary(row: Mapping[str, Any]) -> ReplySummaryView:
+def _reply_summary(row: Mapping[str, Any], actor: ActorContext) -> ReplySummaryView:
     claims = _claims(row["claims"])
     return ReplySummaryView(
         reply_id=row["id"],
@@ -554,7 +682,8 @@ def _reply_summary(row: Mapping[str, Any]) -> ReplySummaryView:
         processing_state=row["processing_state"],
         received_at=ensure_utc(row["received_at"]),
         ingested_at=ensure_utc(row["ingested_at"]),
-    )
+        signal_status=row["signal_status"],
+    ).for_scopes(actor.scopes)
 
 
 async def _snapshot_page(
@@ -615,12 +744,16 @@ async def list_inquiries(
                     "state": None if query.state is None else query.state.value,
                     "uncertain": query.uncertain_only,
                     "attention": attention_only,
-                    "attention_states": [s.value for s in ATTENTION_STATES],
+                    # Attention = the attention states plus every WAITING inquiry (decided below).
+                    "attention_states": sorted({s.value for s in (*ATTENTION_STATES, *WAITING_STATES)}),
                     "limit": MAX_SNAPSHOT_ROWS,
+                    **_WAIT_PARAMS,
                 },
             )
         with rendering("seller inquiry list"):
             summaries = [_inquiry_summary(r) for r in rows]
+        if attention_only:
+            summaries = [s for s in summaries if s.state in ATTENTION_STATES or s.waiting_reason is not None]
         return [s.inquiry_id for s in summaries], [s.model_dump(mode="json") for s in summaries]
 
     page = await _snapshot_page(
@@ -664,7 +797,7 @@ async def list_replies(
                 },
             )
         with rendering("seller reply list"):
-            summaries = [_reply_summary(r) for r in rows]
+            summaries = [_reply_summary(r, actor) for r in rows]
         return [s.reply_id for s in summaries], [s.model_dump(mode="json") for s in summaries]
 
     page = await _snapshot_page(
@@ -679,7 +812,10 @@ async def list_replies(
     )
     now = await db_now(conn)
     with rendering("seller reply list"):
-        items = tuple(ReplySummaryView.model_validate(p) for p in page.page.projections)
+        # Re-applied on every page: the principal's scopes decide, not the snapshot's first page.
+        items = tuple(
+            ReplySummaryView.model_validate(p).for_scopes(actor.scopes) for p in page.page.projections
+        )
     warnings = [warning(WarningCode.FROZEN_QUEUE_PROJECTION)]
     if page.page.total >= MAX_SNAPSHOT_ROWS:
         warnings.append(warning(WarningCode.PARTIAL_RESULTS))
@@ -694,7 +830,12 @@ async def list_replies(
 
 
 class MailWorkerHealthView(BaseModel):
-    """Every mailbox worker's separate health dimensions (``GET`` dashboard/doctor read)."""
+    """Every mailbox worker's separate health dimensions (``GET`` dashboard/doctor read).
+
+    Also each listed worker's credential state (an ``expired`` / ``revoked`` credential is ``401``
+    for the worker), the number of revoked workers (counted even when they are not listed) and the
+    reply-signal flood control of the rolling 24 hours (`ReplySignalSummaryView`).
+    """
 
     model_config = _FROZEN
 
@@ -703,6 +844,45 @@ class MailWorkerHealthView(BaseModel):
     any_monitoring_active: bool
     open_gap_count: int
     notes: tuple[str, ...]
+    revoked_mailboxes: int = 0
+    credentials: tuple[MailWorkerCredentialView, ...] = ()
+    reply_signals: ReplySignalSummaryView | None = None
+
+
+_CREDENTIALS_SQL: Final = """
+select m.id, m.worker_label, m.state, c.expires_at, c.revoked_at
+  from ops.mail_worker_bindings m
+  join ops.api_credentials c on c.workspace_id = m.workspace_id and c.id = m.credential_id
+ where m.workspace_id = %(ws)s and (%(include_revoked)s or m.state = 'active')
+ order by (m.state = 'active') desc, m.created_at desc, m.id
+ limit 50
+"""
+_REVOKED_MAILBOXES_SQL: Final = """
+select count(*) as revoked from ops.mail_worker_bindings where workspace_id = %(ws)s and state <> 'active'
+"""
+_REPLY_SIGNALS_SQL: Final = """
+with recent as (
+  select inquiry_id, signal_status from app.seller_replies
+   where workspace_id = %(ws)s and ingested_at > now() - %(window)s::interval
+)
+select count(*) filter (where signal_status = 'emitted') as emitted,
+       count(*) filter (where signal_status = 'coalesced') as coalesced,
+       count(*) filter (where signal_status = 'rate_limited') as rate_limited,
+       (select count(*) from (select inquiry_id from recent where signal_status = 'emitted'
+                               group by inquiry_id having count(*) >= %(cap)s) capped) as at_cap
+  from recent
+"""
+
+
+def credential_status(expires_at: datetime, revoked_at: datetime | None, now: datetime) -> CredentialStatus:
+    """``revoked`` / ``expired`` / ``expiring`` (within the notice period) / ``active``."""
+    if revoked_at is not None:
+        return "revoked"
+    if expires_at <= now:
+        return "expired"
+    if expires_at <= now + timedelta(days=CREDENTIAL_EXPIRY_NOTICE_DAYS):
+        return "expiring"
+    return "active"
 
 
 MAIL_HEALTH_NOTES: Final = (
@@ -730,17 +910,68 @@ async def mail_worker_health_view(
         reconcile_interval=reconcile_interval,
     )
     now = await db_now(conn)
+    params = {
+        "ws": actor.workspace_id,
+        "include_revoked": include_revoked,
+        "window": replies_repo.SIGNAL_WINDOW,
+        "cap": replies_repo.MAX_SIGNALS_PER_INQUIRY_24H,
+    }
+    async with mapped_errors():
+        credential_rows = await fetch_all(conn, _CREDENTIALS_SQL, params)
+        revoked_row = await fetch_one(conn, _REVOKED_MAILBOXES_SQL, params)
+        signal_row = await fetch_one(conn, _REPLY_SIGNALS_SQL, params)
+    credentials = tuple(
+        MailWorkerCredentialView(
+            mailbox_binding_id=row["id"],
+            worker_label=str(row["worker_label"])[:120],
+            binding_state="active" if row["state"] == "active" else "revoked",
+            credential_status=credential_status(
+                ensure_utc(row["expires_at"]), utc_or_none(row["revoked_at"]), now
+            ),
+            expires_at=ensure_utc(row["expires_at"]),
+            revoked_at=utc_or_none(row["revoked_at"]),
+        )
+        for row in credential_rows
+    )
+    signals = ReplySignalSummaryView(
+        window_hours=int(replies_repo.SIGNAL_WINDOW.total_seconds() // 3600),
+        cap_per_inquiry=replies_repo.MAX_SIGNALS_PER_INQUIRY_24H,
+        emitted=int(signal_row["emitted"]) if signal_row else 0,
+        coalesced=int(signal_row["coalesced"]) if signal_row else 0,
+        rate_limited=int(signal_row["rate_limited"]) if signal_row else 0,
+        inquiries_at_cap=int(signal_row["at_cap"]) if signal_row else 0,
+    )
     view = MailWorkerHealthView(
         generated_at=now,
         mailboxes=tuple(mailboxes),
         any_monitoring_active=any(m.monitoring_active for m in mailboxes),
         open_gap_count=sum(m.open_gap_count for m in mailboxes),
         notes=MAIL_HEALTH_NOTES,
+        revoked_mailboxes=int(revoked_row["revoked"]) if revoked_row else 0,
+        credentials=credentials,
+        reply_signals=signals,
     )
     warnings: list[ResponseWarning] = []
     if not mailboxes or any(not m.monitoring_active for m in mailboxes):
         warnings.append(
             warning(WarningCode.COVERAGE_GAP, "The mailbox worker is not demonstrably monitoring.")
+        )
+    unusable = ("expired", "revoked")
+    if any(c.binding_state == "active" and c.credential_status in unusable for c in credentials):
+        warnings.append(
+            warning(
+                WarningCode.COVERAGE_GAP,
+                "A mailbox worker's credential is expired or revoked: it can no longer upload replies"
+                " or claim sends until a new credential is issued.",
+            )
+        )
+    if signals.rate_limited:
+        warnings.append(
+            warning(
+                WarningCode.COVERAGE_GAP,
+                "Some seller replies reached the per-inquiry signal cap: they are stored and listed,"
+                " but did not activate dot again.",
+            )
         )
     return QueryResult(data=view, as_of=now, warnings=tuple(warnings))
 
@@ -816,6 +1047,46 @@ select r.id, r.inquiry_id, r.message_type, r.received_at, r.quarantined, r.claim
  order by r.received_at, r.id
  limit %(limit)s
 """
+
+#: Owner-controlled activation canaries (``ops.inquiry_activation_canaries``; C1 item 12). They are
+#: never seller inquiries: the evaluation receives them as ``is_canary`` records, which
+#: ``domain.evaluation`` excludes from every metric and reports only as an excluded count.
+_EVAL_CANARIES_SQL: Final = """
+select id, state, created_at, reply_received_at
+  from ops.inquiry_activation_canaries
+ where workspace_id = %(ws)s and created_at >= %(since)s
+ order by created_at, id
+ limit %(limit)s
+"""
+_CANARY_STATES: Final[Mapping[str, InquiryState]] = {
+    "prepared": InquiryState.QUEUED,
+    "accepted": InquiryState.ACCEPTED,
+    "uncertain": InquiryState.UNCERTAIN,
+    "failed": InquiryState.FAILED_DEFINITE,
+    "reply_correlated": InquiryState.REPLIED,
+    "cancelled": InquiryState.CANCELLED,
+}
+
+
+def _canary_inquiry(row: Mapping[str, Any]) -> EvaluationInquiry:
+    return EvaluationInquiry(
+        inquiry_id=row["id"],
+        state=_CANARY_STATES.get(str(row["state"]), InquiryState.CANCELLED),
+        created_at=ensure_utc(row["created_at"]),
+        is_canary=True,
+    )
+
+
+def _canary_reply(row: Mapping[str, Any]) -> EvaluationReply | None:
+    if row["reply_received_at"] is None:
+        return None
+    return EvaluationReply(
+        reply_id=uuid5(row["id"], "canary-reply"),
+        inquiry_id=row["id"],
+        message_type=ReplyMessageType.SELLER_REPLY,
+        received_at=ensure_utc(row["reply_received_at"]),
+        is_canary=True,
+    )
 
 
 def _scan(row: Mapping[str, Any]) -> ScanRecord:
@@ -909,6 +1180,10 @@ async def evaluation_inputs(
 ) -> EvaluationInputs:
     """The 15-day evaluation inputs of the actor's workspace (``deals:read`` and ``inquiries:read``).
 
+    Owner-controlled activation canaries (``ops.inquiry_activation_canaries``) and their correlated
+    test replies are included as ``is_canary`` records: ``domain.evaluation`` excludes them from
+    every metric and only counts them (``excluded_synthetic_records``).
+
     ``approved_threshold`` is the OWNER-APPROVED contribution threshold only (``None`` when the
     proposed EUR 1,500 is not approved: then no candidate can be a "deal found").
     """
@@ -923,6 +1198,7 @@ async def evaluation_inputs(
         candidates = await fetch_all(conn, _CANDIDATES_SQL, params)
         inquiries = await fetch_all(conn, _EVAL_INQUIRIES_SQL, params)
         replies = await fetch_all(conn, _EVAL_REPLIES_SQL, params)
+        canaries = await fetch_all(conn, _EVAL_CANARIES_SQL, params)
     if activations is None:
         activations = tuple(
             SourceActivation(
@@ -952,7 +1228,8 @@ async def evaluation_inputs(
                     suppression_reason=enum_or_none(SuppressionReason, r["suppression_reason"]),
                 )
                 for r in inquiries
-            ),
+            )
+            + tuple(_canary_inquiry(c) for c in canaries),
             replies=tuple(
                 EvaluationReply(
                     reply_id=r["id"],
@@ -962,7 +1239,8 @@ async def evaluation_inputs(
                     matched=not r["quarantined"],
                 )
                 for r in replies
-            ),
+            )
+            + tuple(reply for c in canaries if (reply := _canary_reply(c)) is not None),
             document_resolutions=tuple(documents),
         )
 
@@ -1002,6 +1280,8 @@ __all__ = [
     "INQUIRIES_QUERY",
     "MAX_SNAPSHOT_ROWS",
     "REPLIES_QUERY",
+    "WAITING_STATES",
+    "WAIT_CODES",
     "EvaluationInputs",
     "MailWorkerHealthView",
     "evaluation_inputs",
@@ -1011,4 +1291,5 @@ __all__ = [
     "list_inquiries",
     "list_replies",
     "mail_worker_health_view",
+    "waiting_reason",
 ]

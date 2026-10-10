@@ -34,6 +34,25 @@
             "default": false,
             "type": "boolean"
           },
+          "authorization_status": {
+            "default": "missing",
+            "description": "The workspace's latest standing authorization (spec 37.1).",
+            "enum": [
+              "missing",
+              "active",
+              "not_effective",
+              "revoked"
+            ],
+            "type": "string"
+          },
+          "authorization_version": {
+            "default": null,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "ceiling_per_15d": {
             "const": 5,
             "default": 5,
@@ -87,8 +106,50 @@
           },
           "seller_cooldown_seconds": {
             "maximum": 31536000,
-            "minimum": 86400,
+            "minimum": 604800,
             "type": "integer"
+          },
+          "sender_binding_version": {
+            "default": null,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sender_problems": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "sender_provider": {
+            "default": null,
+            "enum": [
+              "outlook_local",
+              "gmail_api",
+              "microsoft_graph",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_readiness": {
+            "default": "missing",
+            "description": "The configured sender binding: ready = verified, alias-verified, healthy, unrevoked.",
+            "enum": [
+              "ready",
+              "missing",
+              "unverified",
+              "alias_unverified",
+              "unhealthy",
+              "revoked"
+            ],
+            "type": "string"
           },
           "updated_at": {
             "format": "date-time",
@@ -123,7 +184,13 @@
           "used_15d",
           "updated_at",
           "approval_required",
-          "removable_suppressions"
+          "removable_suppressions",
+          "authorization_status",
+          "authorization_version",
+          "sender_readiness",
+          "sender_provider",
+          "sender_binding_version",
+          "sender_problems"
         ],
         "title": "InquiryControlView",
         "type": "object"

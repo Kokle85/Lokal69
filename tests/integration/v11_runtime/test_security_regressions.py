@@ -201,8 +201,9 @@ async def test_seller_cannot_fan_out_owner_alerts_by_varying_requests(env: Pipel
     assert len(alerts) == 3, [a["payload"]["reasons"] for a in alerts]
     assert sorted(r for a in alerts for r in a["payload"]["reasons"]) == reasons
     assert all(a["payload"]["kind"] == "decision_needed" for a in alerts)
-    # Each reply still produced its own minimal receipt signal; nothing was sent to the seller.
-    assert len(outbox_of(env, "seller.reply.received")) == len(combos)
+    # Every reply is stored, but there is ONE undelivered receipt signal for the inquiry (C1 flood
+    # control coalesces the others); nothing was sent to the seller.
+    assert len(outbox_of(env, "seller.reply.received")) == 1
     assert len(attempts_of(env, inquiry["id"])) == 1
     no_approval_state(env)
 
@@ -459,9 +460,11 @@ async def test_revoked_worker_credential_holds_the_send_despite_a_fresh_heartbea
     assert inquiry["state"] == InquiryState.QUEUED
     # Nothing was published for a mailbox whose credential no longer speaks for it: no attempt,
     # no intent (an unclaimable intent would expire into an uncertain, never-resolvable send).
+    # Since C1, revoking the worker credential also revokes its mailbox binding in the same
+    # transaction, so the sender has no active mailbox at all.
     assert attempts_of(env, inquiry["id"]) == []
     [send] = jobs_of(env, JobType.SELLER_INQUIRY_SEND)
-    assert send["state"] == "queued" and send["last_error_code"] == "MAILBOX_WORKER_CREDENTIAL_NOT_LIVE", send
+    assert send["state"] == "queued" and send["last_error_code"] == "MAILBOX_WORKER_MISSING", send
     no_approval_state(env)
 
 

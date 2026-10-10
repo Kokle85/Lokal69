@@ -41,6 +41,10 @@ Contracts (docs/schema.md section 7):
   claimed job with any other version is moved to ``blocked`` with the typed blocker
   ``incompatible_payload_version`` (never an endless retry timer) and the claim moves on.
 
+`resolve_blocked` closes a blocked ``EMAIL_DELIVERY_UNCERTAIN`` send job whose inquiry has been
+reconciled (``succeeded``/``cancelled``, audited, reason required; refused while the inquiry is
+still uncertain); it never re-queues and can never transmit.
+
 Scopes: recheck jobs need ``rechecks:request``; every other job type is system work (a
 ``system`` principal or ``config:admin``). Reads (`get_job`, `queue_stats`) need ``deals:read``.
 No function performs network I/O; all timestamps that matter for leases come from the database.
@@ -53,7 +57,7 @@ import logging
 import re
 from collections.abc import Collection, Mapping
 from datetime import datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
 from psycopg import sql
@@ -862,6 +866,120 @@ async def unblock(
                 "attempts_before": job.attempts,
                 "attempts_after": int(updated["attempts"]),
                 "acknowledged_uncertain_delivery": uncertain,
+            },
+        )
+    return JobRecord.model_validate(updated)
+
+
+#: ``last_error_code`` of a send job closed by `resolve_blocked` after its inquiry was reconciled.
+RESOLVED_AFTER_RECONCILIATION: Final = "RESOLVED_AFTER_RECONCILIATION"
+ResolveOutcome = Literal["succeeded", "cancelled"]
+
+_SEND_INQUIRY_SQL: Final = """
+select i.state,
+       exists (select 1 from ops.email_delivery_attempts a
+                where a.workspace_id = i.workspace_id and a.inquiry_id = i.id
+                  and (a.outcome = 'running'
+                       or (a.outcome = 'uncertain' and a.reconciled_outcome is null))) as unresolved
+  from app.seller_inquiries i
+ where i.workspace_id = %(workspace_id)s and i.id = %(inquiry)s
+"""
+
+
+async def resolve_blocked(
+    conn: Conn,
+    actor: ActorContext,
+    job_id: UUID,
+    *,
+    outcome: ResolveOutcome,
+    reason: str,
+) -> JobRecord:
+    """Close a ``blocked`` ``EMAIL_DELIVERY_UNCERTAIN`` send job whose inquiry was reconciled.
+
+    The reaper blocks an expired ``seller_inquiry_send`` job (its e-mail may have left); once the
+    inquiry's uncertain attempt is reconciled (accepted, or proven not submitted and handled by
+    the guarded retry) the blocked job only clutters the queue. This explicit, audited operator
+    action (``job.resolve_blocked``, reason required) closes it as ``succeeded`` or
+    ``cancelled`` - it never re-queues anything and can never cause a transmission. It refuses
+    (`EmailDeliveryUncertain`, ``details.reason = inquiry_still_uncertain``) while the inquiry is
+    still ``uncertain`` or any attempt of it is running or unresolved, and (`VersionConflict`)
+    for any other job or blocker.
+    """
+    if actor.principal_kind != "system":
+        actor.require(Scope.CONFIG_ADMIN)
+    if outcome not in ("succeeded", "cancelled"):
+        raise ValidationFailed("outcome must be succeeded or cancelled")
+    text = " ".join(str(reason).split())[:2000]
+    if len(text) < 3:
+        raise ValidationFailed("a reason of at least 3 characters is required")
+    async with mapped_errors():
+        row = await fetch_one(conn, _LOCK_FOR_ACTOR_SQL, {"workspace_id": actor.workspace_id, "id": job_id})
+        if row is None:
+            raise NotFound("Job not found")
+        job = JobRecord.model_validate(row)
+        if (
+            job.state != JobState.BLOCKED
+            or job.job_type != JobType.SELLER_INQUIRY_SEND
+            or job.blocker_code != EMAIL_DELIVERY_UNCERTAIN
+        ):
+            raise VersionConflict(
+                "Only a blocked EMAIL_DELIVERY_UNCERTAIN send job is resolved here",
+                reason="not_an_uncertain_send_job",
+                current_state=job.state.value,
+            )
+        try:
+            inquiry_id = UUID(str(job.payload.get("inquiry_id")))
+        except ValueError:
+            raise ValidationFailed("the send job names no inquiry") from None
+        inquiry = await fetch_one(
+            conn, _SEND_INQUIRY_SQL, {"workspace_id": actor.workspace_id, "inquiry": inquiry_id}
+        )
+        if inquiry is None:
+            raise NotFound("Seller inquiry not found")
+        if inquiry["state"] == "uncertain" or inquiry["unresolved"]:
+            raise EmailDeliveryUncertain(
+                "The inquiry is still uncertain; reconcile it before resolving its send job",
+                details={"reason": "inquiry_still_uncertain"},
+            )
+        updated = await fetch_one(
+            conn,
+            sql.SQL(
+                "update ops.jobs set state = %(state)s, completed_at = clock_timestamp(),"
+                " blocker_code = null, blocker_detail = null, last_error_code = %(code)s,"
+                " last_error_detail = %(detail)s, result_reference = %(result)s"
+                " where workspace_id = %(workspace_id)s and id = %(id)s and state = 'blocked'"
+                " returning {columns}"
+            ).format(columns=job_columns()),
+            {
+                "workspace_id": actor.workspace_id,
+                "id": job_id,
+                "state": outcome,
+                "code": RESOLVED_AFTER_RECONCILIATION,
+                "detail": _detail(text),
+                "result": Jsonb(
+                    {
+                        "outcome": "resolved_after_reconciliation",
+                        "inquiry_id": str(inquiry_id),
+                        "inquiry_state": str(inquiry["state"]),
+                    }
+                ),
+            },
+        )
+        if updated is None:  # pragma: no cover - the row is locked above
+            raise VersionConflict("The job changed state concurrently")
+        await audit.record(
+            conn,
+            actor,
+            "job.resolve_blocked",
+            "job",
+            job_id,
+            reason=text,
+            metadata={
+                "job_type": job.job_type.value,
+                "blocker_code": job.blocker_code,
+                "outcome": outcome,
+                "inquiry_id": str(inquiry_id),
+                "inquiry_state": str(inquiry["state"]),
             },
         )
     return JobRecord.model_validate(updated)

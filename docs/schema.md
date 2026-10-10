@@ -1061,3 +1061,194 @@ letter case, an unparseable key=value string) is refused rather than guessed at.
     `inquiries_marked_replied`, `inquiry_send_jobs_unblocked`.
   - A seller-reply owner alert (`ops.outbox` event `seller_reply.owner_alert`) is decided under the
     inquiry row lock and inserted last (outbox stays the tail of the lock order).
+
+### 11.9 Migration 20261008000200 and the inquiry hardening (work package C1)
+
+- `20261008000200_inquiry_hardening` (forward-only, expand; pure ASCII, no `DROP TRIGGER`; applies
+  on PostgreSQL 16 and 17; not yet applied to the Supabase project - the lead applies it):
+  1. Seller cooldown floor. `seller_inquiry_controls_cooldown_ck` is tightened from 1..365 to
+     **7..365 days** (name kept; `DROP` + `ADD ... NOT VALID` + `VALIDATE`). Backfill first: a row
+     shortened below 7 days through the repository before this migration is raised to exactly
+     7 days (`version + 1` as the controls guard requires, `update_reason` names the migration), so
+     `VALIDATE` cannot fail; rows at 7 days or more are untouched. The domain
+     (`RateCapPolicy.seller_cooldown`, `MAX_SELLER_COOLDOWN`), `inquiries_repo.set_limits`
+     (`ValidationFailed`, `details.reason = seller_cooldown_out_of_range`) and
+     `InquiryControlView.seller_cooldown_seconds` (`ge` 7 days) repeat the rule;
+     `InquiryControls.effective_seller_cooldown` reads a legacy row as at least 7 days.
+  2. `app.seller_replies.signal_status` (`emitted` / `coalesced` / `rate_limited` /
+     `not_applicable`; NULL for older rows), written once at insert (no UPDATE grant). Partial
+     indexes `seller_replies_signal_window_idx` (emitted replies of an inquiry by `ingested_at`) and
+     `outbox_reply_signal_inquiry_idx` (`seller.reply.received` events by `payload ->> 'inquiry_id'`).
+  3. `ops.inquiry_activation_canaries` (resolves the 10.10 follow-up "synthetic canary sends need
+     their own representation"): the owner-controlled activation canary of spec 37.10 is NOT an
+     inquiry - no listing, seller, reservation or quota debit. Columns: bound sender (`id`,
+     CURRENT `version`, `provider`), optional desktop `mailbox_binding_id` (required for
+     `outlook_local`), `target_address_hash` (SHA-256 hex of the canonical lower-case address;
+     never the address), the canary's own `rfc_message_id` (unique per workspace), `purpose`,
+     `state`, `outcome_evidence`/`reply_evidence` (objects, at most 8 KiB), outcome/accept/reply
+     timestamps and the correlated `reply_message_id`. Guard `ops.inquiry_activation_canaries_guard`:
+     insert only `prepared` at version 1, bound to the current version of a verified, unrevoked
+     sender and to that sender's ACTIVE mailbox (`SV003`); identity frozen (`SV004`); steps
+     `prepared -> accepted | uncertain | failed | cancelled`, `uncertain -> accepted | failed |
+     reply_correlated`, `accepted -> reply_correlated` (`SV002`); a finished canary (`failed`,
+     `reply_correlated`, `cancelled`) is frozen (`SV004`); every change advances `version` by one
+     (`SV005`); no delete. RLS + `tenant_isolation` via `ops.apply_security_baseline()`;
+     `suv_backend` gets `SELECT`, `INSERT` and a column `UPDATE` of the lifecycle columns only.
+     `tests/integration/db/test_schema_catalogue.py` lists the table in `EXTRA_TABLES`.
+
+- Repository rules added in C1 (tests on PostgreSQL 16 and 17 in `tests/integration/v11_inquiries`
+  `test_claim_hardening.py`, `test_controls_hardening.py`, `test_canaries.py`;
+  `tests/integration/v11_replies` `test_reply_signal_flood.py`, `test_reply_hardening.py`;
+  `tests/integration/persistence_core/test_outbox_summaryless.py`):
+  - Worker claim (`send_intents_repo.claim`): fixture lineage (`app.listings.is_fixture` of the
+    qualification listing) is a FINAL `intent_invalid` refusal with detail `FIXTURE_LINEAGE`,
+    decided before every other answer (also before the retryable `kill_switch`); audited as a
+    denied `send_intent.claim`. Plan, dispatch and claim each refuse fixture lineage. The shared
+    synthetic test worlds now use REAL lineage (non-fixture source mode at ingest); fixture
+    lineage is exercised explicitly.
+  - A `refused_before_send` report for an intent whose claim was GRANTED (an audited
+    `send_intent.claim` without `proceed: false`; `inquiries_repo.granted_claims`) is no proof of
+    non-submission: `map_outlook_report(..., claim_granted=True)` yields `SendUncertain`
+    (`provider_error = refused_after_granted_claim`), `record_outcome` stores the attempt
+    `uncertain` with `error_code = REFUSED_AFTER_GRANTED_CLAIM`, `reconcile_from_reports`
+    (`claimed_intent_ids`) never proves such an intent unsent, and the guarded `retry` refuses an
+    attempt with a granted claim (`EmailDeliveryUncertain`, `reason =
+    claim_granted_before_refusal`). A refusal at claim time (claim not granted) stays proof.
+  - `inquiries_repo.set_mode(..., mode='automatic', sender_binding_id=None)` refuses with
+    `AutomaticModePrerequisitesMissing` (`INSUFFICIENT_DATA`, `details.missing` lists every code:
+    `sender_binding_missing|revoked|unverified`, `sender_alias_unverified`,
+    `sender_binding_unhealthy`, `standing_authorization_missing|revoked|not_effective`) unless the
+    configured sender binding (default: the newest unrevoked) is usable and the latest standing
+    authorization is effective and unrevoked. `paused` and `disabled_until_sender_ready` are always
+    allowed. `control_view(..., sender_binding_id=None)` adds `authorization_status`,
+    `authorization_version`, `sender_readiness`, `sender_provider`, `sender_binding_version` and
+    `sender_problems`.
+  - Reply signal flood control (`replies_repo.ingest_reply`, under the inquiry row lock): a new
+    matched reply emits its `seller.reply.received` signal only when no signal of the inquiry is
+    still to be posted (`pending`, `retry_wait`, `blocked`, or `sending` before its send attempt
+    began), else `coalesced`; a possibly posted signal (`uncertain`, `sending` after its attempt
+    began) never swallows a newer reply (see 11.10);
+    at most `MAX_SIGNALS_PER_INQUIRY_24H` (PROPOSED 6) emitted per inquiry per rolling 24 hours,
+    else `rate_limited`. The reply itself is always stored and visible (`signal_status` on
+    `ReplySummaryView` and in the `seller_reply.ingest` audit metadata). Per mailbox worker:
+    at most `MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR` (120) NEW stored replies (incl. quarantined
+    conflicts) per rolling hour, else `RateLimited` (429, `details.reason =
+    mail_worker_ingest_volume`, `Retry-After`); duplicates and replays are never limited.
+  - `credentials_repo.revoke_credential` of a `mail_worker` credential still bound to an ACTIVE
+    mailbox goes through `mail_workers_repo.revoke_mail_worker` in the same transaction: lock
+    order published inquiries (id order) -> `ops.mail_worker_bindings` -> `ops.mail_binding_sync`;
+    every published inquiry binding is tombstoned, the mailbox becomes `revoked`, the credential
+    is revoked, audited `mail_worker.revoke` with `tombstoned_bindings`.
+  - `queries.get_reply` applies `reply_content_visible` itself (`ReplyView.for_scopes`): a
+    quarantined reply's subject, body, summary, claims and attachments are withheld for everyone
+    but the owner; `queries.list_replies` withholds the claim-derived `availability` of a
+    quarantined row (`content_withheld = true`) on every page.
+  - `MailboxHealth`: while `heartbeat_status != 'healthy'` the worker-reported dimensions
+    (`mailbox_sync_ok`, `backlog_count`, `unresolved_matching_gaps`, `mailbox_sync_lag`,
+    `backlog_age`) are unknown (`None` / `LagStatus.UNKNOWN` with reason
+    `HEARTBEAT_NOT_HEALTHY`), never shown as if still current.
+  - `TransientConflict` keeps `VERSION_CONFLICT` and `retryable`; `details.reason` is `busy`
+    (default) or `in_progress` (`TransientConflict.in_progress()`, an idempotent request with the
+    same key still running).
+  - `jobs.resolve_blocked(conn, actor, job_id, *, outcome, reason)` (system or `config:admin`):
+    closes a `blocked` `seller_inquiry_send` job with blocker `EMAIL_DELIVERY_UNCERTAIN` as
+    `succeeded`/`cancelled` (`last_error_code = RESOLVED_AFTER_RECONCILIATION`, audited
+    `job.resolve_blocked`); refuses (`EmailDeliveryUncertain`, `inquiry_still_uncertain`) while the
+    inquiry is `uncertain` or has an unresolved attempt, and (`VersionConflict`,
+    `not_an_uncertain_send_job`) for any other job. It never re-queues anything.
+  - `outbox.claim_events`: the fixture-suspicion predicate is NULL-safe
+    (`coalesce(jsonb_typeof(payload -> 'summary') = 'string' and ..., false)`). Before, a payload
+    without a string `summary` made the predicate NULL and the row was neither leased nor refused.
+  - Inquiry summaries carry `waiting_reason` (`UNCERTAIN_DELIVERY`, `NEEDS_FACTS`,
+    `INQUIRIES_PAUSED`, `SENDER_SETUP_INCOMPLETE`, `WORKER_OFFLINE`, `RATE_CAP_REACHED`,
+    `SELLER_COOLDOWN`, `SEND_HELD`): stored state first, then the controls (pre-send states only;
+    see 11.10), then the open send/plan job's wait or blocker code
+    (`queries.inquiries.WAIT_CODES`), then the desktop worker's heartbeat for a running local
+    intent. `attention_only` lists the attention states plus every waiting inquiry.
+  - Activation canaries (`persistence.canaries_repo`): `create_canary` (owner or system; sender
+    verified and unrevoked; the target must not equal any stored seller contact address,
+    `canary_target_is_seller_contact`; Message-ID `<canary-<id>@<sender domain>>`, never
+    parseable as an inquiry Message-ID), `record_canary_outcome` (`accepted` / `uncertain` /
+    `failed`, idempotent replay, allow-listed evidence: lower-case keys, scalar values, no `@`),
+    `record_canary_reply` (only when `In-Reply-To`/`References` name the canary Message-ID; an
+    optional sender address is compared by hash), `cancel_canary`, `get_canary`, `list_canaries`.
+    Nothing is sent here (the sending wiring is the CLI of work package C2). The 15-day evaluation
+    inputs list canaries (and their correlated replies) as `is_canary` records, which
+    `domain.evaluation` excludes from every metric and counts in `excluded_synthetic_records`.
+
+### 11.10 Independent review of work package C1 (no migration)
+
+Corrections made by the C1 review (tests on PostgreSQL 16 and 17:
+`tests/integration/v11_inquiries/test_c1_review.py`, `tests/integration/v11_replies/test_c1_review_signals.py`,
+`tests/integration/repos_sources_listings/test_c1_review_in_progress.py`, `tests/unit/test_c1_review_units.py`):
+
+- Claim/report serialisation (C1 item 4). `send_intents_repo.claim` now takes the inquiry and
+  attempt rows `FOR UPDATE` right after the controls row (`inquiries_repo.lock_attempt`; lock order
+  controls -> inquiry -> attempt, as every inquiry writer) and decides on those fresh rows;
+  `send_intents_repo.report` takes the same rows before it reads the granted claims. Before, the
+  claim held only the controls row and decided on rows read before it: a `refused_before_send`
+  report committing while a claim was being granted was recorded as a proven pre-submission
+  failure (`failed_definite`, eligible for the guarded retry) although the real worker went on to
+  call `.Send` - exactly the stolen-credential double send item 4 closes - and a claim racing a
+  committing refusal could be granted on an already closed attempt.
+- Signal coalescing (C1 item 5). A newer reply is coalesced only into a signal that has not been
+  posted yet: `pending`, `retry_wait` (re-posted later), `blocked` (posted only after an operator
+  unblock), or `sending` while `send_attempted_at` is NULL. An `uncertain` signal (or one whose
+  send attempt began) may already have activated dot, which then read the replies BEFORE the newer
+  one existed; the dispatcher reconciles a found post as `delivered` without re-posting, so the
+  newer reply's activation was lost for good. It now emits its own signal, still bounded by
+  `MAX_SIGNALS_PER_INQUIRY_24H` (`replies_repo.UNDELIVERED_SIGNAL_STATES`,
+  `POSSIBLY_POSTED_SIGNAL_STATES`).
+- Waiting reasons (C1 item 11). The workspace controls decide only for the pre-send states
+  (`qualifying`, `reserved`, `queued`): kill switch or mode `paused` -> `INQUIRIES_PAUSED`; the
+  initial mode `disabled_until_sender_ready` -> `SENDER_SETUP_INCOMPLETE` (it was reported as a
+  pause the owner never made); a rolling cap the owner set to 0 (the plan job finishes "held"
+  without an end) -> `RATE_CAP_REACHED` when no open job names a more specific wait. A
+  `failed_definite` inquiry waits only while a send job holds its guarded retry (its job code
+  decides); a final failure is never reported as waiting for the pause.
+- Tests added for item 9 at the repository level: a lock timeout / serialization failure /
+  deadlock maps to `details.reason = busy`; an idempotent `sources_pause` whose same key is still
+  running raises `TransientConflict` with `details.reason = in_progress`.
+
+### 11.11 Independent security review (r2) of work package C1 (no migration)
+
+Corrections made by the second (safety, privacy, security) C1 review (tests on PostgreSQL 16 and
+17: `tests/integration/v11_inquiries/test_c1_security_review.py`,
+`tests/integration/v11_replies/test_c1_security_signals.py`):
+
+- Granted claims survive the audit redaction (C1 item 4). The audit layer redacts every free-text
+  string of `metadata`; its phone-number rule rewrote about 0.07 % of UUID strings (e.g.
+  `00123456-abcd-...` -> `[REDACTED_PHONE]-abcd-...`). The claim stored `intent_id` as such a
+  string, so a granted claim could be invisible to `inquiries_repo.granted_claims` and to the
+  expired-intent listing: a forged `refused_before_send` report (stolen worker credential) was
+  then recorded as a proven pre-submission failure (`failed_definite`, eligible for the guarded
+  retry, i.e. a second e-mail to the same seller). `send_intents_repo.claim` now stores the intent
+  id as a UUID value (`observability.logging.redact_value` keeps UUID values verbatim), and both
+  readers fail safe on an unreadable intent id: `granted_claims` then counts every
+  `outlook_local` attempt of the inquiry as claimed, and `send_intents_repo._EXPIRED_SQL` never
+  offers an intent of an inquiry with such a granted claim audit (so its refusal is never proof).
+- Claim/report and a concurrent mailbox revocation. `claim` and `report` re-check
+  `mail_workers_repo.require_active_mailbox` AFTER `inquiries_repo.lock_attempt`: a revocation
+  locks the mailbox's published inquiries first (C1 item 6), so a claim that waited for those
+  locks now sees the revoked binding/credential and is refused (`mailbox_binding_revoked`, no
+  claim audit) instead of telling a revoked credential to call `.Send`; a report that waited is
+  not applied. `inquiries_repo.lock_attempt` (send-path `FOR UPDATE` locks) now requires a writer
+  (system or `config:admin`), never a reader.
+- Signal coalescing never into a terminal signal (C1 item 5; supersedes the `blocked` part of
+  11.10). `blocked` outbox events are terminal
+  (nothing moves them back to `pending`; the dispatcher blocks a signal while external
+  notifications are still off, the safe default before activation, or while the Slack route is
+  missing or unverified). Coalescing a newer reply into one muted dot for that inquiry for good.
+  `replies_repo.UNDELIVERED_SIGNAL_STATES` is now `pending`, `retry_wait` (plus `sending` before
+  its attempt began); a newer reply otherwise emits its own signal, still bounded by
+  `MAX_SIGNALS_PER_INQUIRY_24H`. Several blocked signals of one inquiry may therefore exist; none of
+  them is ever delivered.
+- Activation canaries are an e-mail path outside the seller caps (C1 item 12).
+  `canaries_repo.create_canary` locks the controls row first (the inquiry lock order) and refuses
+  while the kill switch is on (`ValidationFailed`, `kill_switch_active`) or once
+  `MAX_CANARIES_PER_24H` (PROPOSED: 5) canaries were prepared in the rolling 24 hours of the
+  workspace (`RateLimited`, `activation_canary_volume`; a cancelled canary counts, it may have
+  been sent before it was cancelled). Purpose and cancel reason never contain `@` (they are stored
+  and shown to `inquiries:read` readers). `CanaryRecord.target_address_hash` (an unsalted SHA-256
+  that can confirm a guessed address) is returned to the owner (`config:admin`) and system
+  principals only; `get_canary` / `list_canaries` give everyone else `None`.

@@ -471,8 +471,9 @@ async def test_a_sold_claim_is_sold_claimed_evidence_with_its_effects(
     assert payload["reply_id"] == str(outcome.reply_id) and payload["inquiry_id"] == str(inquiry)
     assert "sold" in str(payload["status"])
     assert str(payload["dashboard_url"]).startswith("https://dashboard.example.invalid/")
-    # Fixture listings never notify.
-    assert signal["is_fixture"] is True and signal["state"] == "blocked"
+    # The shared synthetic world has REAL lineage, so the signal is deliverable; a fixture
+    # listing's signal is stored blocked (test_reply_signal_flood.py).
+    assert signal["is_fixture"] is False and signal["state"] == "pending"
 
 
 async def test_one_missing_result_is_never_a_sale_and_a_quote_stays_unaccepted(

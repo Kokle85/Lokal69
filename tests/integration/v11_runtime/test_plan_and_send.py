@@ -167,7 +167,7 @@ async def test_fixture_lineage_never_reserves_or_sends(fixture_env: PipelineEnv)
 
     # A fixture-lineage inquiry that WAS queued (arranged through the repository) is never
     # transmitted by the send job: it is cancelled before any intent exists.
-    vehicle = await add_vehicle(env.ctx.db, env.seed, env.workspace_id)
+    vehicle = await add_vehicle(env.ctx.db, env.seed, env.workspace_id, fixture=True)
     assert env.scalar("select is_fixture from app.listings where id = %s", vehicle.listing_id) is True
     world = World(
         workspace_id=env.workspace_id, seed=env.seed, sender_binding_id=sender.binding_id, vehicle=vehicle

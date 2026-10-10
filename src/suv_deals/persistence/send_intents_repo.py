@@ -18,25 +18,32 @@ intent (or the reverse). ``intents_for`` therefore returns every intent that eve
 ``outlook_local`` attempt. Nothing new is stored for an intent; the worker's reports are kept
 (sanitized: no addresses) in the attempt's ``provider_response`` / ``reconciliation_evidence``.
 
-Claim = revalidation immediately before ``.Send``: the attempt is still running and unexpired, the
-kill switch is off and the mode automatic, the bound sender binding version is unchanged and
-usable, the standing authorization is the bound unrevoked version, no suppression applies to the
-seller's SURVIVING (merged) family, no (possibly) transmitted inquiry of that family concerns the
-same or a plausibly same vehicle, the seller cooldown holds, the listing facts are still the
-qualification snapshot, the recipient is still the verified contact and the rolling caps (counted
-at the latest possible hand-over) still hold. A business refusal is ``proceed: false`` with a
-wire ``refusal_reason`` (never an error): the kill switch answers ``kill_switch`` (retryable;
-also when the serving process's own ``SELLER_INQUIRY_MODE``/``SELLER_INQUIRY_KILL_SWITCH`` forbid
-sending, ``claim(process_gate=...)``), a final refusal ``intent_invalid``; rolling caps, the
-seller cooldown and a source pause answer ``not_now`` (the worker waits and claims again). Claims
-change no state.
+Claim = revalidation immediately before ``.Send``: the listing is NOT of fixture lineage
+(``app.listings.is_fixture``, frozen at ingest: a FINAL ``intent_invalid`` checked before every
+other answer, so a fixture intent is closed even while the kill switch is on), the attempt is still
+running and unexpired, the kill switch is off and the mode automatic, the bound sender binding
+version is unchanged and usable, the standing authorization is the bound unrevoked version, no
+suppression applies to the seller's SURVIVING (merged) family, no (possibly) transmitted inquiry of
+that family concerns the same or a plausibly same vehicle, the seller cooldown holds, the listing
+facts are still the qualification snapshot, the recipient is still the verified contact and the
+rolling caps (counted at the latest possible hand-over) still hold. A business refusal is ``proceed:
+false`` with a wire ``refusal_reason`` (never an error): the kill switch answers ``kill_switch``
+(retryable; also when the serving process's own
+``SELLER_INQUIRY_MODE``/``SELLER_INQUIRY_KILL_SWITCH`` forbid sending, ``claim(process_gate=...)``),
+a final refusal ``intent_invalid``; rolling caps, the seller cooldown and a source pause answer
+``not_now`` (the worker waits and claims again). Claims change no state.
 
 Report = ``map_outlook_report`` then ``inquiries_repo.record_outcome`` (a running attempt is
 finalised once: ``sent_items_confirmed`` -> accepted, ``submitted_to_outbox``/``send_call_failed``
--> uncertain, ``refused_before_send`` -> proven pre-submission failure while the lease holds,
-``transport_rejected`` -> definite rejection). A report for an attempt that is already finalised
-never overwrites it: Sent Items evidence reconciles an uncertain attempt to ``accepted``; a
-definitive refusal reconciles it to ``failed_definite`` only through
+-> uncertain, ``refused_before_send`` -> proven pre-submission failure while the lease holds AND no
+claim was ever granted for the intent, ``transport_rejected`` -> definite rejection). A
+``refused_before_send`` report for an intent whose claim was GRANTED (audited ``send_intent.claim``
+with ``proceed``) is NO proof of non-submission: the worker calls ``.Send`` only after a granted
+claim, so such a report (e.g. a stolen worker credential reporting after the real worker sent) is
+recorded ``uncertain`` (``REFUSED_AFTER_GRANTED_CLAIM``) and held for the owner's reconciliation;
+``reconcile_from_reports`` never counts a claimed intent as proven unsent. A report for an attempt
+that is already finalised never overwrites it: Sent Items evidence reconciles an uncertain attempt
+to ``accepted``; a definitive refusal reconciles it to ``failed_definite`` only through
 ``reconcile_from_reports`` (every intent of the inquiry definitively refused by its own worker).
 
 Scopes: the worker routes take the authenticated ``WorkerIdentity`` (mailbox-bound, ``mail:ingest``
@@ -57,6 +64,7 @@ from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import EmailProviderKind, InquiryState, Tristate
 from suv_deals.domain.inquiries import (
+    SELLER_COOLDOWN,
     RateCapPolicy,
     ReconciliationEvidence,
     SendAttemptOutcome,
@@ -317,7 +325,10 @@ _PENDING_SQL: Final = (
 #: Intents whose lease the reaper expired (``LEASE_EXPIRED``, inquiry ``uncertain``) that no
 #: worker ever claimed (no granted ``send_intent.claim`` audit) and that carry no worker report: the
 #: worker only calls ``.Send`` after a granted claim, so its ``intent_expired`` report proves
-#: non-submission. Only recent ones (``EXPIRED_INTENT_WINDOW``) are offered again.
+#: non-submission. Only recent ones (``EXPIRED_INTENT_WINDOW``) are offered again. A granted claim
+#: audit of the inquiry whose intent id is not a readable UUID (rewritten by the audit redaction
+#: before the claim stored it as a UUID value) may name this intent: it is never offered (fail
+#: safe, as `inquiries_repo.granted_claims`).
 _EXPIRED_SQL: Final = (
     "select a.attempt_id from ops.email_delivery_attempts a"
     " join app.seller_inquiries i on i.workspace_id = a.workspace_id and i.id = a.inquiry_id"
@@ -329,7 +340,9 @@ _EXPIRED_SQL: Final = (
     " and not exists (select 1 from ops.audit_events e"
     "   where e.workspace_id = a.workspace_id and e.target_type = 'seller_inquiry'"
     "     and e.target_id = a.inquiry_id and e.action = 'send_intent.claim'"
-    "     and e.metadata ->> 'intent_id' = a.attempt_id::text"
+    "     and (pg_catalog.lower(e.metadata ->> 'intent_id') = a.attempt_id::text"
+    "          or coalesce(pg_catalog.lower(e.metadata ->> 'intent_id'), '')"
+    "             !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')"
     "     and coalesce(e.metadata ->> 'proceed', 'true') <> 'false')"
     " order by a.lease_expires_at, a.id limit %(limit)s"
 )
@@ -433,7 +446,7 @@ with x as (
     join app.seller_entities e on e.workspace_id = i.workspace_id and e.id = i.seller_entity_id
    where i.workspace_id = %(ws)s and i.id = %(inquiry)s
 )
-select l.current_revision_id, l.availability, l.quarantined, l.identity_conflict,
+select l.is_fixture, l.current_revision_id, l.availability, l.quarantined, l.identity_conflict,
        r.asking_minor, r.currency, s.source_key, s.enabled, s.paused,
        (select c.status from app.seller_contacts c
          where c.workspace_id = l.workspace_id and c.id = x.recipient_contact_id) as contact_status,
@@ -459,8 +472,21 @@ select l.current_revision_id, l.availability, l.quarantined, l.identity_conflict
 #: resume) answer ``not_now``: the worker keeps the intent and claims it again later while it is
 #: valid (it reports ``intent_expired`` once its validity ends). The kill switch / mode answers
 #: ``kill_switch`` (the worker reports a RETRYABLE proven pre-submission failure; the next dispatch
-#: preflight decides when). ``intent_invalid`` is final for this message: it never leaves.
+#: preflight decides when). ``intent_invalid`` is final for this message: it never leaves. Fixture
+#: lineage is the first, final answer (``FIXTURE_LINEAGE``): nothing of a fixture listing is ever
+#: sent, whatever the controls say.
 _WAIT: Final = OutlookRefusalReason.NOT_NOW
+FIXTURE_LINEAGE: Final = "FIXTURE_LINEAGE"
+
+
+async def _fixture_lineage(conn: Conn, workspace_id: UUID, listing_id: UUID) -> bool:
+    async with mapped_errors():
+        row = await fetch_one(
+            conn,
+            "select is_fixture from app.listings where workspace_id = %(ws)s and id = %(id)s",
+            {"ws": workspace_id, "id": listing_id},
+        )
+    return row is None or bool(row["is_fixture"])
 
 
 async def _claim_refusal(
@@ -475,9 +501,33 @@ async def _claim_refusal(
             " from app.seller_inquiry_controls where workspace_id = %(ws)s for update",
             {"ws": ws},
         )
+    # Lock order controls -> inquiry -> attempt (every inquiry writer's order). The claim decides
+    # on both rows as they are under their locks: a concurrent report, reconciliation or reaper
+    # either committed first (the claim sees the closed attempt) or waits for this claim's commit
+    # and then sees the granted claim (a refusal report can never become proof meanwhile).
+    record, attempt = await inquiries_repo.lock_attempt(conn, system, attempt.attempt_id)
+    # The mailbox was checked before these locks: a revocation that held them (it tombstones the
+    # mailbox's inquiry bindings first) has committed by now, so a revoked worker credential is
+    # never told to call .Send (C1 security review r2).
+    await require_active_mailbox(conn, worker)
+    async with mapped_errors():
         now_row = await fetch_one(conn, "select clock_timestamp() as now")
-    assert now_row is not None
+        stale = await fetch_one(
+            conn,
+            _CLAIM_FACTS_SQL,
+            {
+                "ws": ws,
+                "inquiry": record.id,
+                "cooldown": SELLER_COOLDOWN
+                if controls is None
+                else max(controls["seller_cooldown"], SELLER_COOLDOWN),
+            },
+        )
+    assert now_row is not None and stale is not None
     now: datetime = ensure_utc(now_row["now"])
+    if stale["is_fixture"]:
+        # Frozen fixture lineage: final, ahead of every retryable answer (spec 18, ADR 0002).
+        return OutlookRefusalReason.INTENT_INVALID, FIXTURE_LINEAGE
     if controls is None or controls["kill_switch"] or controls["mode"] != "automatic":
         return OutlookRefusalReason.KILL_SWITCH, "KILL_SWITCH_ACTIVE"
     if attempt.outcome != SendAttemptOutcome.RUNNING or record.state != InquiryState.SENDING:
@@ -494,13 +544,6 @@ async def _claim_refusal(
         or authorization.authorization.problems_at(now)
     ):
         return OutlookRefusalReason.INTENT_INVALID, "AUTHORIZATION_CHANGED"
-    async with mapped_errors():
-        stale = await fetch_one(
-            conn,
-            _CLAIM_FACTS_SQL,
-            {"ws": ws, "inquiry": record.id, "cooldown": controls["seller_cooldown"]},
-        )
-    assert stale is not None
     if list(stale["hits"] or ()):
         return OutlookRefusalReason.INTENT_INVALID, "SUPPRESSED"
     if stale["duplicate_of"] is not None:
@@ -528,7 +571,7 @@ async def _claim_refusal(
         policy=RateCapPolicy(
             max_per_24h=int(controls["max_per_24h"]),
             max_per_15d=int(controls["max_per_15d"]),
-            seller_cooldown=controls["seller_cooldown"],
+            seller_cooldown=max(controls["seller_cooldown"], SELLER_COOLDOWN),
         ),
         exclude_inquiry_id=record.id,
     )
@@ -550,7 +593,11 @@ async def claim(
     """Fresh server revalidation immediately before ``.Send`` (never replayed from an earlier claim).
 
     Lock order: controls (``FOR UPDATE``, so a concurrent pause is either seen or waits) ->
-    inquiry -> attempt reads. Business refusals are ``proceed: false`` with a refusal reason.
+    inquiry -> attempt (both ``FOR UPDATE``: the decision uses the rows as they are under the
+    locks, so a concurrent worker report can never turn into proof of non-submission while this
+    claim is being granted; the worker's mailbox binding and credential are re-checked under
+    them, so a claim that waited for a revocation is refused). Business refusals are ``proceed:
+    false`` with a refusal reason.
 
     ``process_gate``: the detail code when the serving process's own settings forbid sending
     (``SELLER_INQUIRY_MODE`` not ``automatic`` or ``SELLER_INQUIRY_KILL_SWITCH`` on). The claim
@@ -559,21 +606,26 @@ async def claim(
     """
     await require_active_mailbox(conn, worker)
     record, attempt = await _worker_attempt(conn, worker, intent_id, request_id)
-    refusal = (
-        (OutlookRefusalReason.KILL_SWITCH, process_gate)
-        if process_gate is not None
-        else await _claim_refusal(conn, worker, record, attempt, request_id)
-    )
+    refusal: tuple[OutlookRefusalReason, str] | None
+    if process_gate is None:
+        refusal = await _claim_refusal(conn, worker, record, attempt, request_id)
+    elif await _fixture_lineage(conn, worker.workspace_id, record.qualification_listing_id):
+        refusal = (OutlookRefusalReason.INTENT_INVALID, FIXTURE_LINEAGE)
+    else:
+        refusal = (OutlookRefusalReason.KILL_SWITCH, process_gate)
     actor = worker.actor(request_id)
     await audit.record(
         conn,
         actor,
-        "send_intent.claim",
+        inquiries_repo.CLAIM_AUDIT_ACTION,
         "seller_inquiry",
         record.id,
         reason="claim refused" if refusal else "claim granted",
         metadata={
-            "intent_id": str(intent_id),
+            # A UUID VALUE, never its text: the audit redaction rewrites free-text strings (its
+            # phone-number rule matched ~0.07 % of UUID strings, e.g. ``00123456-...``), which
+            # hid a granted claim from `inquiries_repo.granted_claims` (C1 security review r2).
+            "intent_id": intent_id,
             "proceed": refusal is None,
             "detail": refusal[1] if refusal else None,
             "claim_attempt_id": claim_attempt_id[:64],
@@ -655,13 +707,21 @@ async def report(
     if report.inquiry_id != record.id:
         raise mailbox_mismatch()
     system = worker.system_actor(request_id)
+    # The inquiry and attempt rows are locked BEFORE the granted claims are read: a claim being
+    # granted concurrently holds them until it commits, so its audit is visible here (C1 item 4).
+    record, attempt = await inquiries_repo.lock_attempt(conn, system, attempt.attempt_id)
+    # Re-checked under the locks: a report that waited for a concurrent revocation is refused.
+    await require_active_mailbox(conn, worker)
     intent = await _intent_of(conn, system, record, attempt)
     if intent is None:
         raise ValidationFailed("the intent of this report cannot be rebuilt")
     async with mapped_errors():
         now_row = await fetch_one(conn, "select clock_timestamp() as now")
     assert now_row is not None
-    outcome = map_outlook_report(intent, report, observed_at=ensure_utc(now_row["now"]))
+    claimed = await inquiries_repo.granted_claims(conn, system, record.id)
+    outcome = map_outlook_report(
+        intent, report, observed_at=ensure_utc(now_row["now"]), claim_granted=attempt.attempt_id in claimed
+    )
     used = report.account_smtp_address_used
     matches = None if used is None else used.strip().casefold() == intent.from_address.casefold()
     summary = report_summary(report, account_matches=matches)
@@ -693,6 +753,7 @@ async def report(
         reports,
         worker_online=False,
         intents=intents,
+        claimed_intent_ids=claimed,
     )
     evidence: ReconciliationEvidence | None = None
     if isinstance(decision, ReconcileFoundSent):
@@ -824,8 +885,14 @@ class PersistentOutlookGateway:
             intents = [await _intent_of(conn, self._actor, record, a) for a in attempts]
         return [i for i in intents if i is not None]
 
+    async def claimed_intents(self, inquiry_id: UUID) -> frozenset[UUID]:
+        """The intents of the inquiry a claim was GRANTED for (audited ``send_intent.claim``)."""
+        async with self._db.transaction(self._actor) as conn:
+            return await inquiries_repo.granted_claims(conn, self._actor, inquiry_id)
+
 
 __all__ = [
+    "FIXTURE_LINEAGE",
     "LEASE_OWNER_PREFIX",
     "MAX_INTENTS_PAGE",
     "ClaimResult",

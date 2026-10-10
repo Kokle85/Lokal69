@@ -74,8 +74,10 @@ from suv_deals.domain.enums import (
 from suv_deals.domain.filters import ScreeningResult
 from suv_deals.domain.inquiries import (
     MAX_READINESS_AGE,
+    MAX_SELLER_COOLDOWN,
     POSSIBLY_TRANSMITTED_STATES,
     PRE_RESERVATION_STATES,
+    SELLER_COOLDOWN,
     WINDOW_15D,
     WINDOW_24H,
     ComparableEvidence,
@@ -159,6 +161,9 @@ from suv_deals.integrations.email_providers.base import (
     SendUncertain,
     attempt_outcome,
 )
+from suv_deals.integrations.email_providers.outlook_local import (
+    REFUSED_AFTER_GRANTED_CLAIM as PROVIDER_REFUSED_AFTER_GRANTED_CLAIM,
+)
 from suv_deals.integrations.mime_builder import BuiltMessage, MimeBuildError, build_inquiry_message, mailbox
 from suv_deals.persistence import audit, mail_workers_repo, valuation_repo
 from suv_deals.persistence.database import Conn, Database, fetch_all, fetch_one
@@ -197,6 +202,11 @@ _SOURCE_KEY_RE: Final = re.compile(r"^[a-z0-9_]{3,60}$")
 _PLACEHOLDER_RE: Final = re.compile(r"\{\{([a-z_]+)\}\}")
 REQUALIFIED_AFTER_RESUME: Final = "REQUALIFIED_AFTER_RESUME"
 LEASE_EXPIRED: Final = "LEASE_EXPIRED"
+#: Attempt ``error_code`` of a pre-send refusal reported for an ``outlook_local`` intent whose
+#: claim was GRANTED: no proof of non-submission (held ``uncertain`` for owner reconciliation).
+REFUSED_AFTER_GRANTED_CLAIM: Final = "REFUSED_AFTER_GRANTED_CLAIM"
+#: The audited worker claim (``send_intents_repo.claim``); ``metadata.proceed`` = granted.
+CLAIM_AUDIT_ACTION: Final = "send_intent.claim"
 
 
 # =============================================================================================
@@ -247,9 +257,17 @@ class InquiryControls(BaseModel):
     def paused(self) -> bool:
         return self.kill_switch or self.mode == "paused"
 
+    @property
+    def effective_seller_cooldown(self) -> timedelta:
+        """The stored cooldown, never below the 7-day floor (a row written before migration
+        ``20261008000200`` could hold a shorter one; the stricter value always applies)."""
+        return min(max(self.seller_cooldown, SELLER_COOLDOWN), MAX_SELLER_COOLDOWN)
+
     def policy(self) -> RateCapPolicy:
         return RateCapPolicy(
-            max_per_24h=self.max_per_24h, max_per_15d=self.max_per_15d, seller_cooldown=self.seller_cooldown
+            max_per_24h=self.max_per_24h,
+            max_per_15d=self.max_per_15d,
+            seller_cooldown=self.effective_seller_cooldown,
         )
 
 
@@ -707,6 +725,49 @@ async def get_attempt(conn: Conn, actor: ActorContext, attempt_id: UUID) -> Atte
     return AttemptRecord.model_validate(row)
 
 
+_GRANTED_CLAIMS_SQL: Final = (
+    "select distinct e.metadata ->> 'intent_id' as intent_id from ops.audit_events e"
+    " where e.workspace_id = %(ws)s and e.target_type = 'seller_inquiry' and e.target_id = %(id)s"
+    " and e.action = %(action)s and coalesce(e.metadata ->> 'proceed', 'true') <> 'false'"
+)
+_LOCAL_ATTEMPTS_SQL: Final = (
+    "select attempt_id from ops.email_delivery_attempts where workspace_id = %(ws)s"
+    " and inquiry_id = %(id)s and provider = 'outlook_local'"
+)
+
+
+async def granted_claims(conn: Conn, actor: ActorContext, inquiry_id: UUID) -> frozenset[UUID]:
+    """The ``outlook_local`` intents (== attempt ids) of an inquiry a worker claim was GRANTED for.
+
+    The desktop worker calls ``.Send`` only after a granted claim, so a later ``refused_before_send``
+    report for such an intent proves nothing about non-submission (spec 37.5; C1 item 4). A claim
+    audit without an explicit ``proceed: false`` counts as granted, and a granted claim audit
+    whose intent id cannot be read (missing, or rewritten by the audit redaction before the claim
+    stored it as a UUID value) counts for EVERY ``outlook_local`` intent of the inquiry: fail safe,
+    never "no claim" (C1 security review r2).
+    """
+    require_inquiry_reader(actor)
+    params = {"ws": actor.workspace_id, "id": inquiry_id, "action": CLAIM_AUDIT_ACTION}
+    async with mapped_errors():
+        rows = await fetch_all(conn, _GRANTED_CLAIMS_SQL, params)
+    claimed: set[UUID] = set()
+    unreadable = False
+    for row in rows:
+        try:
+            claimed.add(UUID(str(row["intent_id"])))
+        except ValueError:
+            unreadable = True
+    if unreadable:
+        async with mapped_errors():
+            attempts = await fetch_all(conn, _LOCAL_ATTEMPTS_SQL, params)
+        claimed.update(r["attempt_id"] for r in attempts)
+    return frozenset(claimed)
+
+
+def _claimed_local_attempt(attempt: AttemptRecord, claimed: frozenset[UUID]) -> bool:
+    return attempt.provider == EmailProviderKind.OUTLOOK_LOCAL and attempt.attempt_id in claimed
+
+
 # =============================================================================================
 # Standing authorization
 # =============================================================================================
@@ -929,12 +990,46 @@ async def rate_cap_decision(
     return evaluate_rate_caps(debits, now=now, policy=policy, exclude_inquiry_id=exclude_inquiry_id)
 
 
-async def control_view(conn: Conn, actor: ActorContext) -> InquiryControlView:
-    """``GET /api/inquiry-control`` data (``InquiryControlView``)."""
+_SENDER_READINESS: Final[
+    Mapping[str, Literal["missing", "revoked", "unverified", "alias_unverified", "unhealthy"]]
+] = {
+    "sender_binding_missing": "missing",
+    "sender_binding_revoked": "revoked",
+    "sender_binding_unverified": "unverified",
+    "sender_alias_unverified": "alias_unverified",
+    "sender_binding_unhealthy": "unhealthy",
+}
+_AUTHORIZATION_STATUS: Final[Mapping[str, Literal["missing", "revoked", "not_effective"]]] = {
+    "standing_authorization_missing": "missing",
+    "standing_authorization_revoked": "revoked",
+    "standing_authorization_not_effective": "not_effective",
+}
+
+
+async def control_view(
+    conn: Conn, actor: ActorContext, *, sender_binding_id: UUID | None = None
+) -> InquiryControlView:
+    """``GET /api/inquiry-control`` data (``InquiryControlView``).
+
+    Also the standing-authorization status (``missing`` / ``active`` / ``not_effective`` /
+    ``revoked``) and the configured sender's readiness: ``sender_binding_id`` is the configured
+    sender binding (the caller resolves it from the settings; default: the newest unrevoked
+    binding), ``ready`` when it is verified, alias-verified, healthy and unrevoked.
+    """
     controls = await get_controls(conn, actor)
     if controls is None:
         raise NotFound("Seller inquiry controls not found")
     usage = await quota_usage(conn, actor)
+    async with mapped_errors():
+        now = await _now(conn)
+    authorization = await current_authorization(conn, actor)
+    auth_problems = authorization_problems(authorization, now)
+    binding = (
+        await get_binding(conn, actor, sender_binding_id)
+        if sender_binding_id is not None
+        else await active_binding(conn, actor)
+    )
+    sender_problems = sender_binding_problems(binding)
     return InquiryControlView(
         version=controls.version,
         mode=controls.mode,
@@ -943,10 +1038,16 @@ async def control_view(conn: Conn, actor: ActorContext) -> InquiryControlView:
         kill_switch_set_at=controls.kill_switch_set_at,
         max_per_24h=controls.max_per_24h,
         max_per_15d=controls.max_per_15d,
-        seller_cooldown_seconds=InquiryControlView.cooldown_seconds(controls.seller_cooldown),
+        seller_cooldown_seconds=InquiryControlView.cooldown_seconds(controls.effective_seller_cooldown),
         used_24h=usage.count_24h,
         used_15d=usage.count_15d,
         updated_at=controls.updated_at,
+        authorization_status=_AUTHORIZATION_STATUS[auth_problems[0]] if auth_problems else "active",
+        authorization_version=None if authorization is None else authorization.version,
+        sender_readiness=_SENDER_READINESS[sender_problems[0]] if sender_problems else "ready",
+        sender_provider=None if binding is None else binding.provider,
+        sender_binding_version=None if binding is None else binding.version,
+        sender_problems=tuple(sender_problems),
     )
 
 
@@ -1069,10 +1170,67 @@ async def resume(
     return InquiryResumeResult(version=version, mode=controls.mode, resumed_at=resumed_at)
 
 
+class AutomaticModePrerequisitesMissing(InsufficientData):
+    """``set_mode('automatic')`` without a verified sender binding or an active authorization.
+
+    ``details.missing`` names every missing technical prerequisite (never a message approval):
+    ``sender_binding_missing``, ``sender_binding_revoked``, ``sender_binding_unverified``,
+    ``sender_alias_unverified``, ``sender_binding_unhealthy``, ``standing_authorization_missing``,
+    ``standing_authorization_revoked``, ``standing_authorization_not_effective``.
+    """
+
+    def __init__(self, missing: Sequence[str]) -> None:
+        super().__init__(
+            "Automatic seller inquiries need a verified sender binding and an active standing authorization",
+            details={"reason": "automatic_mode_prerequisites_missing", "missing": list(missing)},
+        )
+
+
+def sender_binding_problems(binding: SenderBindingRecord | None) -> list[str]:
+    """Why ``binding`` is not a usable (verified, alias-verified, healthy, unrevoked) sender."""
+    if binding is None:
+        return ["sender_binding_missing"]
+    if binding.revoked:
+        return ["sender_binding_revoked"]
+    problems: list[str] = []
+    if binding.verified_at is None:
+        problems.append("sender_binding_unverified")
+    if not binding.alias_verified:
+        problems.append("sender_alias_unverified")
+    if binding.health != "healthy":
+        problems.append("sender_binding_unhealthy")
+    return problems
+
+
+def authorization_problems(authorization: AuthorizationRecord | None, now: datetime) -> list[str]:
+    """Why no standing authorization is active at ``now`` (empty = active)."""
+    if authorization is None:
+        return ["standing_authorization_missing"]
+    if authorization.revoked_at is not None or authorization.authorization.revocation.revoked:
+        return ["standing_authorization_revoked"]
+    if authorization.authorization.problems_at(now):
+        return ["standing_authorization_not_effective"]
+    return []
+
+
 async def set_mode(
-    conn: Conn, actor: ActorContext, *, expected_version: int, mode: SenderMode, reason: str
+    conn: Conn,
+    actor: ActorContext,
+    *,
+    expected_version: int,
+    mode: SenderMode,
+    reason: str,
+    sender_binding_id: UUID | None = None,
 ) -> InquiryControls:
-    """Owner/system mode change (``automatic`` only after the sender binding is verified)."""
+    """Owner/system mode change. ``automatic`` only with a verified sender and an authorization.
+
+    Switching to ``automatic`` refuses (`AutomaticModePrerequisitesMissing`, naming every missing
+    prerequisite) unless the configured sender binding (``sender_binding_id``; default: the newest
+    unrevoked binding) is usable (verified, alias-verified, healthy, unrevoked) AND the workspace's
+    latest standing authorization is effective and unrevoked. These are the technical safety
+    prerequisites of spec 37.1, not an approval. ``paused`` / ``disabled_until_sender_ready`` are
+    always allowed (pausing never waits for anything).
+    """
     require_inquiry_writer(actor)
     text = _reason_text(reason)
     controls = await _locked_controls(conn, actor)
@@ -1082,6 +1240,20 @@ async def set_mode(
         )
     if controls.mode == mode:
         return controls
+    if mode == "automatic":
+        binding = (
+            await get_binding(conn, actor, sender_binding_id)
+            if sender_binding_id is not None
+            else await active_binding(conn, actor)
+        )
+        async with mapped_errors():
+            now = await _now(conn)
+        missing = [
+            *sender_binding_problems(binding),
+            *authorization_problems(await current_authorization(conn, actor), now),
+        ]
+        if missing:
+            raise AutomaticModePrerequisitesMissing(missing)
     async with mapped_errors():
         await conn.execute(
             "update app.seller_inquiry_controls set mode = %(mode)s, updated_by = %(by)s,"
@@ -1114,10 +1286,30 @@ async def set_limits(
     seller_cooldown: timedelta,
     reason: str,
 ) -> InquiryControls:
-    """Owner-controlled ceilings (0..2 per 24 h, 0..5 per 15 days; never above the v1.1 ceilings)."""
+    """Owner-controlled ceilings (0..2 per 24 h, 0..5 per 15 days; never above the v1.1 ceilings).
+
+    The seller cooldown is 7..365 days: the owner may widen it, never shorten it below the 7-day
+    floor (``domain.inquiries.SELLER_COOLDOWN``; the database CHECK repeats the rule since
+    migration ``20261008000200``).
+    """
     actor.require(Scope.CONFIG_ADMIN)
     text = _reason_text(reason)
-    policy = RateCapPolicy(max_per_24h=max_per_24h, max_per_15d=max_per_15d, seller_cooldown=seller_cooldown)
+    if not (
+        isinstance(seller_cooldown, timedelta) and SELLER_COOLDOWN <= seller_cooldown <= MAX_SELLER_COOLDOWN
+    ):
+        raise ValidationFailed(
+            "The seller cooldown is 7 to 365 days (never shorter than 7 days)",
+            details={"reason": "seller_cooldown_out_of_range", "fields": ["seller_cooldown"]},
+        )
+    try:
+        policy = RateCapPolicy(
+            max_per_24h=max_per_24h, max_per_15d=max_per_15d, seller_cooldown=seller_cooldown
+        )
+    except ValidationError as exc:
+        raise ValidationFailed(
+            "The caps are 0..2 per 24 hours and 0..5 per 15 days (ceilings, never raised)",
+            details={"reason": "inquiry_caps_out_of_range"},
+        ) from exc
     controls = await _locked_controls(conn, actor)
     if controls.version != expected_version:
         raise VersionConflict(
@@ -1146,7 +1338,11 @@ async def set_limits(
         prior_version=controls.version,
         new_version=controls.version + 1,
         reason=text,
-        metadata={"max_per_24h": policy.max_per_24h, "max_per_15d": policy.max_per_15d},
+        metadata={
+            "max_per_24h": policy.max_per_24h,
+            "max_per_15d": policy.max_per_15d,
+            "seller_cooldown_days": policy.seller_cooldown.days,
+        },
     )
     updated = await get_controls(conn, actor)
     assert updated is not None
@@ -2190,7 +2386,9 @@ async def _hold_errors(
             },
         )
     cooldown = evaluate_seller_cooldown(
-        seller_contact_times(hood.existing, record.seller_key), now=now, cooldown=controls.seller_cooldown
+        seller_contact_times(hood.existing, record.seller_key),
+        now=now,
+        cooldown=controls.effective_seller_cooldown,
     )
     if cooldown.active:
         retry = None if cooldown.until is None else max(1, int((cooldown.until - now).total_seconds()))
@@ -2751,7 +2949,7 @@ async def dispatch(
         related_links=hood.related,
         rate_caps=evaluate_rate_caps(debits, now=now, policy=controls.policy(), exclude_inquiry_id=record.id),
         quota_debit_present=debit is not None,
-        seller_cooldown=controls.seller_cooldown,
+        seller_cooldown=controls.effective_seller_cooldown,
         attempts=tuple(a.evidence() for a in attempts),
         message=message,
         envelope=built.envelope(),
@@ -2868,6 +3066,21 @@ async def _lock_attempt(
     return _inquiry(inquiry_row), AttemptRecord.model_validate(attempt_row)
 
 
+async def lock_attempt(
+    conn: Conn, actor: ActorContext, attempt_id: UUID
+) -> tuple[InquiryRecord, AttemptRecord]:
+    """The attempt's inquiry row, then the attempt row, both ``FOR UPDATE`` (the inquiry lock order).
+
+    The ``outlook_local`` worker claim and report decide on these rows under their locks, so a claim
+    being granted and a concurrent worker report / reconciliation for the same intent are
+    serialised: the later one always sees the earlier one's committed effect (C1 item 4: a refusal
+    report can never be recorded as proof while a claim for the same intent is being granted).
+    Row locks on the send path are a writer's business: a reader can never hold them.
+    """
+    require_inquiry_writer(actor)
+    return await _lock_attempt(conn, actor, attempt_id)
+
+
 async def record_outcome(
     conn: Conn,
     actor: ActorContext,
@@ -2888,7 +3101,9 @@ async def record_outcome(
     failure is recorded as ``uncertain`` (the worker may still have submitted). A report for an
     already finalised attempt never overwrites it: only positive acceptance evidence is added as
     the one-time reconciliation of an ``uncertain`` attempt; anything else is a no-op. A wrong
-    lease token raises ``LeaseLost``. Never triggers a second transmission.
+    lease token raises ``LeaseLost``. Never triggers a second transmission. A pre-submission
+    failure of an ``outlook_local`` attempt whose worker claim was GRANTED (``granted_claims``) is
+    recorded ``uncertain`` (``REFUSED_AFTER_GRANTED_CLAIM``): no proof, owner reconciliation.
     """
     require_inquiry_writer(actor)
     ws = actor.workspace_id
@@ -2937,6 +3152,15 @@ async def record_outcome(
     target_outcome = mapping.outcome
     proof = mapping.pre_submission_proof
     error_code: str | None = None
+    if (
+        isinstance(outcome, SendUncertain) and outcome.provider_error == PROVIDER_REFUSED_AFTER_GRANTED_CLAIM
+    ) or (
+        target_outcome == SendAttemptOutcome.PRE_SUBMISSION_FAILURE
+        and _claimed_local_attempt(attempt, await granted_claims(conn, actor, record.id))
+    ):
+        # A pre-send refusal after a GRANTED claim proves nothing (the worker may have called
+        # .Send): held uncertain for the owner's reconciliation, never retried automatically.
+        target_outcome, proof, error_code = SendAttemptOutcome.UNCERTAIN, None, REFUSED_AFTER_GRANTED_CLAIM
     if target_outcome == SendAttemptOutcome.PRE_SUBMISSION_FAILURE and now >= attempt.lease_expires_at:
         target_outcome, proof, error_code = SendAttemptOutcome.UNCERTAIN, None, "LATE_PRE_SUBMISSION_REPORT"
     if isinstance(outcome, SendDefiniteFailure | SendUncertain) and error_code is None:
@@ -3037,6 +3261,15 @@ async def _apply_reconciliation(
     extra: Mapping[str, Any] | None = None,
 ) -> ReconcileResult:
     decision = reconcile_uncertain(evidence)
+    if (
+        decision.next_state == InquiryState.FAILED_DEFINITE
+        and evidence.proven_not_submitted == "local_validation_failed_before_submit"
+        and _claimed_local_attempt(attempt, await granted_claims(conn, actor, record.id))
+    ):
+        # A worker refusal is no proof once a claim was granted for this intent (C1 item 4).
+        decision = ReconcileDecision(
+            next_state=None, reasons=("STILL_UNCERTAIN", "CLAIM_GRANTED_REFUSAL_IS_NOT_PROOF")
+        )
     if decision.next_state is None:
         await audit.record(
             conn,
@@ -3159,6 +3392,17 @@ async def retry(conn: Conn, actor: ActorContext, inquiry_id: UUID) -> InquiryRec
         raise VersionConflict("The inquiry has no send attempt")
     async with mapped_errors():
         now = await _now(conn)
+    claimed = await granted_claims(conn, actor, inquiry_id)
+    if _claimed_local_attempt(attempts[-1], claimed) and (
+        attempts[-1].outcome == SendAttemptOutcome.PRE_SUBMISSION_FAILURE
+        or attempts[-1].reconciled_outcome == "proven_not_submitted"
+    ):
+        # Defence in depth (rows recorded before C1): a worker refusal after a GRANTED claim is no
+        # proof of non-submission; the owner reconciles, nothing is re-queued automatically.
+        raise EmailDeliveryUncertain(
+            "The last attempt was claimed by the worker; its refusal is no proof of non-submission",
+            details={"reason": "claim_granted_before_refusal"},
+        )
     evidence = [a.evidence() for a in attempts]
     decision = should_retry(
         evidence[-1], now=now, other_attempts=evidence[:-1], retry_sender_binding_id=record.sender_binding_id
@@ -3478,11 +3722,14 @@ def require_message_approval_flag(value: object) -> bool:
 
 
 __all__ = [
+    "CLAIM_AUDIT_ACTION",
     "LEASE_EXPIRED",
+    "REFUSED_AFTER_GRANTED_CLAIM",
     "REQUALIFIED_AFTER_RESUME",
     "AttemptLease",
     "AttemptRecord",
     "AuthorizationRecord",
+    "AutomaticModePrerequisitesMissing",
     "DispatchResult",
     "InquiryControls",
     "InquiryRecord",
@@ -3497,6 +3744,7 @@ __all__ = [
     "WindowDecision",
     "active_suppressions",
     "add_suppression",
+    "authorization_problems",
     "cancel_inquiry",
     "cancel_stale_inquiries",
     "control_view",
@@ -3506,7 +3754,9 @@ __all__ = [
     "get_attempt",
     "get_controls",
     "get_inquiry",
+    "granted_claims",
     "list_attempts",
+    "lock_attempt",
     "mark_replied",
     "next_window_at",
     "open_inquiry",
@@ -3530,6 +3780,7 @@ __all__ = [
     "resume",
     "retry",
     "seller_suppression_key",
+    "sender_binding_problems",
     "set_limits",
     "set_mode",
 ]

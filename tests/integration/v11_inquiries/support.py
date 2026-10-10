@@ -1,7 +1,8 @@
 """Builders for the bounded-inquiry persistence tests (spec 37.1-37.5, 37.8, 37.10; work package B1a).
 
-Everything is SYNTHETIC: reserved example domains (``*.example`` / ``*.invalid``), fixture
-sources, invented listing references, seller ids and Message-IDs. Nothing is ever sent or
+Everything is SYNTHETIC: reserved example domains (``*.example`` / ``*.invalid``), synthetic
+sources (real lineage unless a test asks for fixture lineage), invented listing references, seller
+ids and Message-IDs. Nothing is ever sent or
 fetched: the tests drive the persistence layer through ``Database(set_role="suv_backend")`` (RLS
 and least-privilege grants apply) and arrange rows through the superuser ``Seed`` connection.
 
@@ -265,7 +266,7 @@ LANGUAGE_DE = language_from(DE_TEXT)
 
 @dataclass(frozen=True)
 class Vehicle:
-    """One listing (own fixture source) with its linked seller and current contact evidence."""
+    """One listing (own synthetic source) with its linked seller and current contact evidence."""
 
     source_id: UUID
     source_key: str
@@ -299,10 +300,13 @@ class World:
 
 
 def seed_listing(
-    seed: Seed, workspace_id: UUID, *, price_minor: int = 275000
+    seed: Seed, workspace_id: UUID, *, price_minor: int = 275000, fixture: bool = False
 ) -> tuple[UUID, str, UUID, UUID, str, str]:
-    """A promoted listing on its own enabled fixture source, freshly observed (no network)."""
-    source_id, key = enabled_source(seed, workspace_id)
+    """A promoted listing on its own enabled synthetic source, freshly observed (no network).
+
+    Real lineage by default (``app.listings.is_fixture = false``); ``fixture=True`` for the explicit
+    fixture-lineage refusal tests (plan, dispatch and the worker claim refuse such a listing)."""
+    source_id, key = enabled_source(seed, workspace_id, fixture=fixture)
     reference = unique("SYN").upper().replace("_", "-")
     url = f"https://{SYNTHETIC_HOST}/vehicles/{reference}"
     listing = seed.listing(
@@ -425,10 +429,11 @@ async def add_vehicle(
     language: LanguageDecision | None = LANGUAGE_DE,
     kind: RecipientEvidenceKind = RecipientEvidenceKind.EMAIL_ON_ADVERTISEMENT,
     price_minor: int = 275000,
+    fixture: bool = False,
 ) -> Vehicle:
     """A new listing with a linked seller (own marketplace alias unless given) and its contact."""
     source_id, key, listing_id, revision_id, reference, url = seed_listing(
-        seed, workspace_id, price_minor=price_minor
+        seed, workspace_id, price_minor=price_minor, fixture=fixture
     )
     own = (
         list(aliases) if aliases is not None else [alias("marketplace_seller_id", f"dealer-{reference}", key)]

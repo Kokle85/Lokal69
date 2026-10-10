@@ -82,6 +82,11 @@
                     "null"
                   ]
                 },
+                "content_withheld": {
+                  "default": false,
+                  "description": "True when claim-derived fields of a quarantined reply are withheld (owner only).",
+                  "type": "boolean"
+                },
                 "ingested_at": {
                   "format": "date-time",
                   "type": "string"
@@ -126,6 +131,21 @@
                 "reply_id": {
                   "format": "uuid",
                   "type": "string"
+                },
+                "signal_status": {
+                  "default": null,
+                  "description": "The reply's seller.reply.received signal: emitted, coalesced (one was still pending for the inquiry), rate_limited (per-inquiry 24 h cap) or not_applicable; null before C1.",
+                  "enum": [
+                    "emitted",
+                    "coalesced",
+                    "rate_limited",
+                    "not_applicable",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "vehicle": {
                   "additionalProperties": false,
@@ -194,7 +214,9 @@
                 "quarantined",
                 "processing_state",
                 "received_at",
-                "ingested_at"
+                "ingested_at",
+                "signal_status",
+                "content_withheld"
               ],
               "title": "ReplySummaryView",
               "type": "object"

@@ -140,8 +140,9 @@ async def test_payment_request_alerts_once_and_routine_replies_never(env: Pipeli
     assert job["result_reference"]["decisions"] == []
     assert job["result_reference"]["owner_alert_event_ids"] == []
     assert len(outbox_of(env, SELLER_REPLY_OWNER_ALERT_EVENT_TYPE)) == 1
-    # Three receipt signals (one per reply) but never an outgoing reply or follow-up.
-    assert len(outbox_of(env, "seller.reply.received")) == 3
+    # ONE undelivered receipt signal for the inquiry (C1 flood control: the later replies are
+    # coalesced into it; dot reads every reply) and never an outgoing reply or follow-up.
+    assert len(outbox_of(env, "seller.reply.received")) == 1
     assert len(attempts_of(env, inquiry["id"])) == 1
     assert len(jobs_of(env, JobType.SELLER_INQUIRY_SEND)) == 1
 
@@ -160,7 +161,7 @@ async def test_payment_request_alerts_once_and_routine_replies_never(env: Pipeli
         ("seller.reply.received", OutboxState.DELIVERED),
         (SELLER_REPLY_OWNER_ALERT_EVENT_TYPE, OutboxState.DELIVERED),
     }
-    assert len(api.posts) == 4 and api.other == []
+    assert len(api.posts) == 2 and api.other == []  # one coalesced receipt signal + the alert
     owner_posts = [p for p in api.posts if p["metadata"]["event_type"] == "suv_deals.owner_alert"]
     [post] = owner_posts
     assert post["text"].startswith("Seller reply needs your decision: payment request.")

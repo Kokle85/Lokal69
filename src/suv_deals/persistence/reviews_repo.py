@@ -320,7 +320,7 @@ async def begin_idempotent(
     if isinstance(started, idempotency.ReplayError):
         raise _replay_error(started.error_code)
     if isinstance(started, idempotency.InProgress):
-        raise TransientConflict("The same request is still in progress; retry shortly")
+        raise TransientConflict.in_progress()
     return None
 
 

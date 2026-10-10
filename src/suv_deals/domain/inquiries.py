@@ -113,7 +113,10 @@ DEFAULT_AUTHORIZATION_PATH: Final = (
 #: PROPOSED engineering default: a qualifying observation must be this fresh (else recheck first).
 MAX_OBSERVATION_AGE: Final = timedelta(hours=48)
 #: PROPOSED engineering default: no second inquiry to the same seller (any car) within this window.
+#: It is also the FLOOR (owner decision, C1): the owner may widen the cooldown, never shorten it.
 SELLER_COOLDOWN: Final = timedelta(days=7)
+#: The longest seller cooldown the controls accept (``seller_inquiry_controls_cooldown_ck``).
+MAX_SELLER_COOLDOWN: Final = timedelta(days=365)
 #: PROPOSED engineering default: a reservation binds only a readiness decision this recent (it is
 #: evaluated from current records immediately before reserving).
 MAX_READINESS_AGE: Final = timedelta(minutes=15)
@@ -960,13 +963,25 @@ class SenderStatus(BaseModel):
 
 
 class RateCapPolicy(BaseModel):
-    """Workspace ceilings (spec 37.5). The owner may reduce or pause (0), never raise them here."""
+    """Workspace ceilings (spec 37.5). The owner may reduce or pause (0), never raise them here.
+
+    The seller cooldown is bounded the other way: at least ``SELLER_COOLDOWN`` (7 days, the owner
+    decision's floor) and at most ``MAX_SELLER_COOLDOWN``; a shorter one would allow a burst of
+    e-mails to one dealer.
+    """
 
     model_config = _FROZEN
 
     max_per_24h: int = Field(default=MAX_INQUIRIES_PER_24H, ge=0, le=MAX_INQUIRIES_PER_24H)
     max_per_15d: int = Field(default=MAX_INQUIRIES_PER_15D, ge=0, le=MAX_INQUIRIES_PER_15D)
     seller_cooldown: timedelta = SELLER_COOLDOWN
+
+    @field_validator("seller_cooldown")
+    @classmethod
+    def _cooldown_floor(cls, value: timedelta) -> timedelta:
+        if not SELLER_COOLDOWN <= value <= MAX_SELLER_COOLDOWN:
+            raise ValueError("the seller cooldown is 7 to 365 days (never shorter than 7 days)")
+        return value
 
     @classmethod
     def from_settings(cls, settings: Settings) -> RateCapPolicy:

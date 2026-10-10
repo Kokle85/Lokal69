@@ -274,9 +274,14 @@ async def test_a_credential_revoked_after_authentication_stops_the_request(
     binding sync. Every worker operation now refuses it like a revoked token."""
     inquiry = sent(seed.conn, iw)
     mw = await issue(db, iw)  # the identity is resolved (the request authenticated) here
-    async with unit_of_work(db, owner(iw.workspace_id)) as conn:
-        assert await credentials_repo.revoke_credential(
-            conn, owner(iw.workspace_id), mw.issued.credential.credential_id, reason="synthetic revocation"
+    # TEST ARRANGEMENT ONLY: the credential expired while its binding stays active (since C1 a
+    # revocation through the repository also revokes the binding: see test_reply_hardening.py).
+    with seed.conn.transaction():
+        seed.conn.execute("set local session_replication_role = replica")
+        seed.conn.execute(
+            "update ops.api_credentials set created_at = now() - interval '1 hour',"
+            " expires_at = now() - interval '1 second' where id = %s",
+            (mw.issued.credential.credential_id,),
         )
     beat = MailWorkerHeartbeatRequest.model_validate(
         {

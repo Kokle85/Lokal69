@@ -179,12 +179,12 @@ test.describe('mail workers, lags and evaluation', () => {
     await expect(page.getByText('not monitoring: coverage gap')).toBeVisible()
     await expect(page.getByTestId('mailbox-not-monitoring')).toContainText('the PC may be off, asleep or offline')
     await expect(card).toContainText('6 h ago')
-    // The server keeps the worker's LAST report (in sync, 10 s lag, empty backlog) after the PC went
-    // off: none of it may read as current health.
+    // The worker's LAST report (in sync, 10 s lag, empty backlog) is stored, but without a healthy
+    // heartbeat the server reports these worker-reported dimensions as UNKNOWN (work package C1,
+    // item 8): none of it may read as current health.
     const reported = card.getByTestId('last-report')
     await expect(reported).toHaveCount(5)
-    for (const text of await reported.allTextContents()) expect(text).toMatch(/^unknown now \(last report: /)
-    await expect(reported.first()).toContainText('(last report: yes)')
+    for (const text of await reported.allTextContents()) expect(text).toMatch(/^unknown now \(last report: unknown\)$/)
     await expect(page.locator('section', { has: page.getByRole('heading', { name: data.v11.worker_label }) })).toBeVisible()
     const gap = page.getByTestId('coverage-gap').first()
     await expect(gap).toHaveAttribute('data-open', 'yes')

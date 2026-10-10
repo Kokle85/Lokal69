@@ -98,7 +98,7 @@ from suv_deals.mcp.schemas import SourcesPauseInput
 from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit, gates, idempotency, jobs
 from suv_deals.persistence.database import Conn, fetch_all, fetch_one
-from suv_deals.persistence.errors_map import mapped_errors
+from suv_deals.persistence.errors_map import TransientConflict, mapped_errors
 from suv_deals.views.operations import (
     CrawlRunView,
     ParserHealthView,
@@ -1102,9 +1102,7 @@ async def pause_source(  # noqa: PLR0917 - mirrors the sources_pause tool input
         if isinstance(started, idempotency.ReplayError):
             raise _replay_error(started.error_code)
         if isinstance(started, idempotency.InProgress):
-            raise AppError(
-                ErrorCode.VERSION_CONFLICT, "The same request is still in progress", retryable=True
-            )
+            raise TransientConflict.in_progress()
         source = await _load_source(conn, actor.workspace_id, request.source_id, lock=" for update")
         if source.version != request.expected_version:
             raise VersionConflict("The source changed; reload and retry", current_version=source.version)

@@ -5,7 +5,8 @@ one revocable, narrow identity. This module owns everything that identity touche
 reply ingest itself (``persistence.replies_repo``).
 
 Worker identity (`issue_mail_worker`, `resolve_worker`, `rotate_mail_worker_credential`,
-`revoke_mail_worker`)
+`revoke_mail_worker`; revoking the bound credential through `credentials_repo.revoke_credential`
+revokes the mailbox binding too, with tombstones for every published inquiry binding)
     A worker is one ``ops.mail_worker_bindings`` row (its id is the stable ``mailbox_binding_id``)
     bound to exactly one ``mail_worker`` credential of ``persistence.credentials_repo``
     (``suvmail_`` token, exactly ``mail:ingest``, owner role, machine principal; the token is
@@ -60,7 +61,9 @@ Health (`mailbox_health`, `list_mailbox_health`)
     age, unresolved matching gaps, account check, per-folder checkpoints and every coverage gap
     (reported gaps plus a server-detected ``worker_offline`` gap since the last heartbeat) via
     ``domain.lifecycle.mail_worker_coverage``. ``monitoring_active`` is never claimed without a
-    fresh heartbeat, a connected Outlook and a fresh reconciliation.
+    fresh heartbeat, a connected Outlook and a fresh reconciliation. While the heartbeat is not
+    ``healthy`` the worker-reported dimensions (sync ok, sync lag, backlog, backlog age, matching
+    gaps) are reported UNKNOWN (``None`` / an ``unknown`` lag), never as the last stale values.
 
 Lock order: ``app.seller_inquiries`` (id order when several) -> ``ops.mail_worker_bindings``
 (taken by the sync sequence allocator) -> ``ops.mail_binding_sync``; `publish_mailbox_bindings`
@@ -99,6 +102,7 @@ from suv_deals.domain.enums import EmailProviderKind, InquiryState, Role, Scope
 from suv_deals.domain.lifecycle import (
     CoverageGap,
     LagMeasurement,
+    LagStatus,
     MailCoverageReport,
     MailWorkerHeartbeat,
     mail_worker_coverage,
@@ -495,15 +499,46 @@ async def rotate_mail_worker_credential(
     )
 
 
+_PUBLISHED_INQUIRIES_SQL: Final = """
+select distinct s.inquiry_id from ops.mail_binding_sync s
+ where s.workspace_id = %(ws)s and s.mailbox_binding_id = %(box)s
+ order by s.inquiry_id
+"""
+
+
 async def revoke_mail_worker(
     conn: Conn, actor: ActorContext, mailbox_binding_id: UUID, *, reason: str
 ) -> bool:
-    """Revoke the worker binding (permanent) and its credential; ``False`` if already revoked."""
+    """Revoke the worker binding (permanent) and its credential; ``False`` if already revoked.
+
+    Every inquiry binding published to the mailbox is tombstoned first (final, so a stale local
+    binding can never keep granting access, spec 37.8), in the same transaction. Lock order as
+    everywhere: the published inquiries (id order), then the mailbox row (the sync sequence
+    allocator), then the credential. A revoked mailbox is visibly unusable: health reports it
+    ``revoked`` and the runtime publishes nothing to it (no active mailbox for the sender).
+    `credentials_repo.revoke_credential` of the bound ``mail_worker`` credential comes here too.
+    """
     credentials_repo.require_credential_admin(actor)
     text = _bounded(reason, "reason", minimum=_REASON_MIN, maximum=_REASON_MAX)
+    async with mapped_errors():
+        published = await fetch_all(
+            conn, _PUBLISHED_INQUIRIES_SQL, {"ws": actor.workspace_id, "box": mailbox_binding_id}
+        )
+        inquiry_ids = [r["inquiry_id"] for r in published]
+        if inquiry_ids:
+            await conn.execute(
+                "select id from app.seller_inquiries where workspace_id = %(ws)s"
+                " and id = any(%(ids)s::uuid[]) order by id for update",
+                {"ws": actor.workspace_id, "ids": inquiry_ids},
+            )
     row = await _lock_mailbox(conn, actor, mailbox_binding_id)
     if row["state"] != "active":
         return False
+    tombstoned = 0
+    for inquiry_id in inquiry_ids:
+        result = await publish_inquiry_binding(conn, actor, inquiry_id, tombstone=True)
+        if result is not None and result.created and result.mailbox_binding_id == mailbox_binding_id:
+            tombstoned += 1
     async with mapped_errors():
         await conn.execute(
             "update ops.mail_worker_bindings set state = 'revoked', revoked_at = clock_timestamp(),"
@@ -513,7 +548,13 @@ async def revoke_mail_worker(
     await credentials_repo.revoke_credential(conn, actor, row["credential_id"], reason=text)
     async with mapped_errors():
         await audit.record(
-            conn, actor, "mail_worker.revoke", "mail_worker_binding", mailbox_binding_id, reason=text
+            conn,
+            actor,
+            "mail_worker.revoke",
+            "mail_worker_binding",
+            mailbox_binding_id,
+            reason=text,
+            metadata={"tombstoned_bindings": tombstoned},
         )
     return True
 
@@ -1440,6 +1481,19 @@ def _server_gap(gap: CoverageGap, now: datetime) -> ReportedGap:
     )
 
 
+#: Why worker-reported dimensions are shown as unknown (C1 item 8).
+HEARTBEAT_NOT_HEALTHY: Final = "worker heartbeat not healthy: worker-reported values are unknown"
+
+
+def _unknown_lag(lag: LagMeasurement) -> LagMeasurement:
+    return LagMeasurement(
+        name=lag.name,
+        status=LagStatus.UNKNOWN,
+        reason=HEARTBEAT_NOT_HEALTHY,
+        configured_interval_seconds=lag.configured_interval_seconds,
+    )
+
+
 def _code_value(codes: Sequence[str], prefix: str) -> str | None:
     for code in reversed(codes):
         if code.startswith(prefix):
@@ -1497,6 +1551,11 @@ def _health(
     if open_gaps and not any("coverage gap" in r for r in reasons):
         reasons.append(f"{open_gaps} open coverage gap(s)")
     unresolved = int(matching) if matching is not None and matching.isdigit() else None
+    # Worker-reported dimensions (sync, backlog, matching gaps) are only as current as the last
+    # heartbeat: while it is not healthy they are UNKNOWN, never shown as if still true.
+    reported_known = report.heartbeat_status == "healthy"
+    if not reported_known:
+        unresolved = None
     if unresolved:
         reasons.append(f"{unresolved} unresolved matching gap(s)")
     if account_status in ("mismatch", "not_classic"):
@@ -1515,12 +1574,12 @@ def _health(
         heartbeat_age_seconds=None if last_beat is None else max(0, int((now - last_beat).total_seconds())),
         heartbeat_status=report.heartbeat_status,
         outlook_status=report.outlook_status,
-        mailbox_sync_ok=None if health is None else health["mailbox_sync_ok"],
-        mailbox_sync_lag=report.mailbox_sync_lag,
+        mailbox_sync_ok=None if health is None or not reported_known else health["mailbox_sync_ok"],
+        mailbox_sync_lag=report.mailbox_sync_lag if reported_known else _unknown_lag(report.mailbox_sync_lag),
         last_successful_reconciliation_at=report.last_successful_reconciliation_at,
         reconciliation_status=report.reconciliation_status,
-        backlog_count=report.backlog_count,
-        backlog_age=report.backlog_age,
+        backlog_count=report.backlog_count if reported_known else None,
+        backlog_age=report.backlog_age if reported_known else _unknown_lag(report.backlog_age),
         unresolved_matching_gaps=unresolved,
         account_status=account_status,
         coverage_gaps=gaps,

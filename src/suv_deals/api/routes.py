@@ -351,10 +351,17 @@ async def get_overview(request: Request, auth: Authenticated) -> Response:
 @router.get("/api/candidates")
 async def get_candidates(request: Request, auth: Authenticated) -> Response:
     require_scope(request, auth, CANDIDATES.scope)
-    query = query_model(request, CandidateListQuery).to_tool_input()
+    parsed = query_model(request, CandidateListQuery)
+    query = parsed.to_tool_input()
+    # The dashboard's audit filter (screening-rejected observations); not a spec 21 tool input.
+    rejected = parsed.include_screening_rejected
     secret = api_state(request).cursor_secret()
     result = await _read(
-        request, auth, lambda conn, actor: queries.list_candidates(conn, actor, query, secret=secret)
+        request,
+        auth,
+        lambda conn, actor: queries.list_candidates(
+            conn, actor, query, secret=secret, include_screening_rejected=rejected
+        ),
     )
     return _respond(CANDIDATES, result.envelope(auth.request_id))
 

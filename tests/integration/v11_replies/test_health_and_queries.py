@@ -322,7 +322,8 @@ async def test_inquiry_and_reply_reads(db: Database, seed: Seed, iw: InquiryWorl
     assert as_reviewer.data.recipient.address is None
     assert as_reviewer.data.recipient.address_domain == iw.contact_address.split("@")[1]
     assert as_reviewer.data.recipient.address_redacted
-    assert WarningCode.FIXTURE_DATA in {w.code for w in as_owner.warnings}
+    # The shared synthetic world has REAL lineage (C1: fixture lineage never reserves or sends).
+    assert WarningCode.FIXTURE_DATA not in {w.code for w in as_owner.warnings}
     data = reply.data
     assert data.inquiry_id == inquiry and data.sender.matches_verified_recipient
     assert data.claims is not None and data.claims.price_quotes and not data.claims.price_quotes[0].accepted

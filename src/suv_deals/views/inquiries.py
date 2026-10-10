@@ -23,7 +23,11 @@ Privacy rules (spec 37.1, 37.7, 37.8):
   conflicting upload) may be unrelated personal mail. Its text is shown to the owner only
   (`reply_content_visible`, the same ``config:admin`` rule as addresses, so never over MCP);
   everyone else gets its metadata and quarantine reason (`ReplyView.for_scopes`,
-  ``content_withheld: true``).
+  ``content_withheld: true``). The read queries apply the rule themselves, so every surface
+  inherits it: also the list row's claim-derived ``availability`` (`ReplySummaryView.for_scopes`).
+- An inquiry summary names WHY it waits (`WaitingReason`, derived from the stored state and the
+  open job's wait/blocker code); the control view shows the standing-authorization status and
+  the configured sender's readiness (technical prerequisites, never an approval).
 """
 
 from __future__ import annotations
@@ -93,6 +97,23 @@ ReconciledOutcome = Literal["accepted", "proven_not_submitted"]
 InquiryMode = Literal["disabled_until_sender_ready", "automatic", "paused"]
 CorrelationStatus = Literal["matched", "quarantined", "verified_match"]
 ProcessingState = Literal["stored", "processed", "failed"]
+#: What happened to a reply's ``seller.reply.received`` signal at ingest (C1 flood control).
+SignalStatus = Literal["emitted", "coalesced", "rate_limited", "not_applicable"]
+#: Why an inquiry waits (stored state first, then the open plan/send job's wait or blocker code).
+WaitingReason = Literal[
+    "UNCERTAIN_DELIVERY",
+    "NEEDS_FACTS",
+    "INQUIRIES_PAUSED",
+    "SENDER_SETUP_INCOMPLETE",
+    "WORKER_OFFLINE",
+    "RATE_CAP_REACHED",
+    "SELLER_COOLDOWN",
+    "SEND_HELD",
+]
+AuthorizationStatus = Literal["missing", "active", "not_effective", "revoked"]
+SenderReadiness = Literal["ready", "missing", "unverified", "alias_unverified", "unhealthy", "revoked"]
+#: The 7-day seller-cooldown floor (``domain.inquiries.SELLER_COOLDOWN``) in seconds.
+MIN_SELLER_COOLDOWN_SECONDS: Final = 7 * 86_400
 AttachmentAction = Literal["allow_vehicle_document", "quarantine_sensitive", "reject"]
 QuoteKind = Literal["single", "range", "minimum"]
 ReasonCode = str
@@ -324,6 +345,10 @@ class InquirySummaryView(ViewModel):
     send_attempted_at: UtcDatetime | None
     accepted_at: UtcDatetime | None
     row_version: int = Field(ge=1)
+    waiting_reason: WaitingReason | None = Field(
+        default=None,
+        description="Why the inquiry waits (null: not waiting). Waiting inquiries are attention items.",
+    )
 
 
 class InquiryListView(ViewModel):
@@ -490,6 +515,14 @@ class ReplyView(ViewModel):
             " only the owner reads it on the dashboard (never over MCP)."
         ),
     )
+    signal_status: SignalStatus | None = Field(
+        default=None,
+        description=(
+            "The reply's seller.reply.received signal: emitted, coalesced (one was still pending for"
+            " the inquiry), rate_limited (per-inquiry 24 h cap: stored, no new dot activation) or"
+            " not_applicable; null before C1."
+        ),
+    )
 
     def for_scopes(self, scopes: Iterable[Scope]) -> ReplyView:
         """This reply as a principal with ``scopes`` may see it (`reply_content_visible`)."""
@@ -527,6 +560,23 @@ class ReplySummaryView(ViewModel):
     processing_state: ProcessingState
     received_at: UtcDatetime
     ingested_at: UtcDatetime
+    signal_status: SignalStatus | None = Field(
+        default=None,
+        description=(
+            "The reply's seller.reply.received signal: emitted, coalesced (one was still pending for"
+            " the inquiry), rate_limited (per-inquiry 24 h cap) or not_applicable; null before C1."
+        ),
+    )
+    content_withheld: bool = Field(
+        default=False,
+        description="True when claim-derived fields of a quarantined reply are withheld (owner only).",
+    )
+
+    def for_scopes(self, scopes: Iterable[Scope]) -> ReplySummaryView:
+        """This row as a principal with ``scopes`` may see it (`reply_content_visible`)."""
+        if reply_content_visible(scopes, quarantined=self.quarantined):
+            return self
+        return self.model_copy(update={"availability": None, "content_withheld": True})
 
 
 class ReplyListView(ViewModel):
@@ -548,7 +598,7 @@ class InquiryControlView(ViewModel):
     max_per_15d: int = Field(ge=0, le=MAX_PER_15D_CEILING)
     ceiling_per_24h: Literal[2] = MAX_PER_24H_CEILING
     ceiling_per_15d: Literal[5] = MAX_PER_15D_CEILING
-    seller_cooldown_seconds: int = Field(ge=86_400, le=365 * 86_400)
+    seller_cooldown_seconds: int = Field(ge=MIN_SELLER_COOLDOWN_SECONDS, le=365 * 86_400)
     used_24h: int = Field(ge=0)
     used_15d: int = Field(ge=0)
     updated_at: UtcDatetime
@@ -558,6 +608,17 @@ class InquiryControlView(ViewModel):
         ge=0,
         description="Active kill-switch / authorization-revoked suppressions a resume can remove (audited).",
     )
+    authorization_status: AuthorizationStatus = Field(
+        default="missing", description="The workspace's latest standing authorization (spec 37.1)."
+    )
+    authorization_version: int | None = Field(default=None, ge=1)
+    sender_readiness: SenderReadiness = Field(
+        default="missing",
+        description="The configured sender binding: ready = verified, alias-verified, healthy, unrevoked.",
+    )
+    sender_provider: EmailProviderKind | None = None
+    sender_binding_version: int | None = Field(default=None, ge=1)
+    sender_problems: tuple[ReasonCode, ...] = Field(default=(), max_length=10)
 
     @staticmethod
     def cooldown_seconds(cooldown: timedelta) -> int:
@@ -595,6 +656,8 @@ __all__ = [
     "INQUIRY_PURPOSE",
     "MAX_PER_15D_CEILING",
     "MAX_PER_24H_CEILING",
+    "MIN_SELLER_COOLDOWN_SECONDS",
+    "AuthorizationStatus",
     "DocumentClaimView",
     "InquiryAuthorizationRef",
     "InquiryControlView",
@@ -619,8 +682,11 @@ __all__ = [
     "ReplyView",
     "SendAttemptSummary",
     "SendAttemptsView",
+    "SenderReadiness",
     "SenderRef",
+    "SignalStatus",
     "ValuationStatusView",
+    "WaitingReason",
     "address_domain",
     "recipient_address_visible",
     "reply_content_visible",

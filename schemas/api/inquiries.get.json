@@ -252,6 +252,25 @@
                   ],
                   "title": "InquiryVehicleRef",
                   "type": "object"
+                },
+                "waiting_reason": {
+                  "default": null,
+                  "description": "Why the inquiry waits (null: not waiting). Waiting inquiries are attention items.",
+                  "enum": [
+                    "UNCERTAIN_DELIVERY",
+                    "NEEDS_FACTS",
+                    "INQUIRIES_PAUSED",
+                    "SENDER_SETUP_INCOMPLETE",
+                    "WORKER_OFFLINE",
+                    "RATE_CAP_REACHED",
+                    "SELLER_COOLDOWN",
+                    "SEND_HELD",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -268,7 +287,8 @@
                 "reserved_at",
                 "send_attempted_at",
                 "accepted_at",
-                "row_version"
+                "row_version",
+                "waiting_reason"
               ],
               "title": "InquirySummaryView",
               "type": "object"

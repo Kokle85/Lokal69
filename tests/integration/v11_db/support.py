@@ -1,8 +1,9 @@
 """Synthetic builders for the spec v1.1 section 37 database tests (migration 20261006001000).
 
-Everything here is SYNTHETIC: reserved example domains, fixture sources, invented listing
-references. No real seller, address, vehicle, mailbox or credential appears, and nothing is
-ever sent anywhere: these tests only exercise PostgreSQL constraints, triggers, RLS and grants.
+Everything here is SYNTHETIC: reserved example domains, synthetic sources (real lineage by
+default, see `enabled_source`), invented listing references. No real seller, address, vehicle,
+mailbox or credential appears, and nothing is ever sent anywhere: these tests only exercise
+PostgreSQL constraints, triggers, RLS and grants.
 
 Arrangement uses the superuser test connection (`Seed`, RLS bypassed, triggers active). The
 behaviour under test runs as ``suv_backend`` with the transaction-local workspace GUC, exactly
@@ -158,7 +159,7 @@ def rendered(language: str, reference: str, url: str) -> tuple[RenderedMessage, 
 
 @dataclass(frozen=True)
 class Vehicle:
-    """One listing (on its own enabled fixture source) with a promoted revision."""
+    """One listing (on its own enabled synthetic source) with a promoted revision."""
 
     source_id: UUID
     source_key: str
@@ -186,17 +187,27 @@ class InquiryWorld:
         return self.vehicle.listing_id
 
 
-def enabled_source(seed: Seed, workspace_id: UUID) -> tuple[UUID, str]:
+def enabled_source(seed: Seed, workspace_id: UUID, *, fixture: bool = False) -> tuple[UUID, str]:
+    """An enabled acquisition source of the synthetic world.
+
+    By default it has REAL lineage (``mode = 'public_html'`` with a synthetic, test-arranged terms
+    decision), so its listings carry ``is_fixture = false`` (frozen at ingest) and may reserve and
+    send exactly like production listings: fixture lineage never reserves or sends (plan, dispatch
+    and the worker claim refuse it). ``fixture=True`` gives a ``mode = 'fixture'`` source for the
+    explicit fixture-lineage refusal tests. Nothing is ever fetched from the synthetic host.
+    """
     key = unique("v11src").lower()
     source_id = seed.source(
         workspace_id,
         source_key=key,
+        mode="fixture" if fixture else "public_html",
+        adapter="fixture_adapter" if fixture else "synthetic_public_html",
         enabled=True,
-        adapter_version="fixture@1.0.0",
+        adapter_version="fixture@1.0.0" if fixture else "synthetic@1.0.0",
         terms_status="permitted",
         terms_decision="proceed_permitted",
-        terms_decision_actor="synthetic owner decision",
-        technical_status="fixture_tested",
+        terms_decision_actor="synthetic owner decision (test arrangement)",
+        technical_status="fixture_tested" if fixture else "live_smoke_passed",
         allowed_hosts=[SYNTHETIC_HOST],
         allowed_search_paths=["/search"],
         allowed_detail_paths=["/vehicles/"],
@@ -204,8 +215,8 @@ def enabled_source(seed: Seed, workspace_id: UUID) -> tuple[UUID, str]:
     return source_id, key
 
 
-def vehicle(seed: Seed, workspace_id: UUID, *, profile: str = "primary") -> Vehicle:
-    source_id, key = enabled_source(seed, workspace_id)
+def vehicle(seed: Seed, workspace_id: UUID, *, profile: str = "primary", fixture: bool = False) -> Vehicle:
+    source_id, key = enabled_source(seed, workspace_id, fixture=fixture)
     reference = unique("SYN").upper().replace("_", "-")
     url = f"https://{SYNTHETIC_HOST}/vehicles/{reference}"
     listing = seed.listing(
@@ -350,9 +361,11 @@ def inquiry_world(seed: Seed, name: str = "V11 inquiries") -> InquiryWorld:
     return InquiryWorld(ws, seed, veh, seller, contact_id, address, auth, sender, ctl)
 
 
-def with_vehicle(world: InquiryWorld, *, seller: UUID | None = None, language: str = "de") -> InquiryWorld:
+def with_vehicle(
+    world: InquiryWorld, *, seller: UUID | None = None, language: str = "de", fixture: bool = False
+) -> InquiryWorld:
     """Another listing (new source) of the same workspace with its own verified contact."""
-    veh = vehicle(world.seed, world.workspace_id)
+    veh = vehicle(world.seed, world.workspace_id, fixture=fixture)
     seller_id = seller or world.seller_entity_id
     contact_id, address = contact(world.seed, world.workspace_id, veh, seller_id, language=language)
     return replace(

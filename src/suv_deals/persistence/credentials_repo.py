@@ -423,9 +423,28 @@ async def revoke_credential(conn: Conn, actor: ActorContext, credential_id: UUID
 
     The next request with that token is refused. Unknown or foreign ids are `NotFound`. Audited as
     ``credential.revoke`` with the reason.
+
+    A ``mail_worker`` credential still bound to an ACTIVE mailbox worker binding is revoked
+    through `mail_workers_repo.revoke_mail_worker` (same transaction): the binding becomes
+    ``revoked`` and every inquiry binding published to it is tombstoned, so a stranded mailbox is
+    visible in health and the runtime never publishes to it (C1 item 6).
     """
     require_credential_admin(actor)
     text = _bounded_text(reason, "reason", minimum=3, maximum=500)
+    async with mapped_errors():
+        bound = await fetch_one(
+            conn,
+            "select m.id from ops.api_credentials c"
+            " join ops.mail_worker_bindings m on m.workspace_id = c.workspace_id and m.credential_id = c.id"
+            " where c.workspace_id = %(ws)s and c.id = %(id)s and c.credential_kind = 'mail_worker'"
+            " and c.revoked_at is null and m.state = 'active'",
+            {"ws": actor.workspace_id, "id": credential_id},
+        )
+    if bound is not None:
+        # mail_workers_repo imports this module: resolved at call time.
+        from suv_deals.persistence import mail_workers_repo  # noqa: PLC0415
+
+        return await mail_workers_repo.revoke_mail_worker(conn, actor, bound["id"], reason=text)
     async with mapped_errors():
         existing = await fetch_one(
             conn,

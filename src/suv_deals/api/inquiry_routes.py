@@ -60,21 +60,25 @@ from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import SuppressionReason
 from suv_deals.domain.money import Money
-from suv_deals.errors import AppError, ErrorCode
-from suv_deals.mcp.tools import pause_inquiries, visible_reply
+from suv_deals.errors import AppError, ErrorCode, VersionConflict
+from suv_deals.mcp.tools import pause_inquiries
 from suv_deals.persistence import idempotency, inquiries_repo, queries
 from suv_deals.persistence.database import Conn, db_now
 from suv_deals.persistence.errors_map import TransientConflict
 from suv_deals.persistence.inquiries_repo import SuppressionRow
 from suv_deals.persistence.queries import QueryResult
+from suv_deals.settings import Settings
 from suv_deals.views.common import ResponseEnvelope, envelope
-from suv_deals.views.inquiries import InquiryResumeResult
+from suv_deals.views.inquiries import InquiryControlView, InquiryResumeResult
 from suv_deals.views.lifecycle import CoverageLagsView, ListingLifecycleView
 from suv_deals.views.mail_workers import MailCoverageGapListView, MailWorkerHealthView
+from suv_deals.workers.inquiry_handlers import configured_sender_binding, configured_sender_problems
 
 router = APIRouter()
 
 RESUME_OPERATION: Final = "inquiry_control_resume"
+#: ``details.reason`` of a resume refused because the removable suppressions changed.
+SUPPRESSIONS_CHANGED: Final = "suppressions_changed"
 #: Suppressions a resume may remove (the authorization one only while the authorization is
 #: effective again); every other reason needs its own explicit owner decision.
 RESUMABLE_REASONS: Final = frozenset({SuppressionReason.KILL_SWITCH, SuppressionReason.AUTHORIZATION_REVOKED})
@@ -186,9 +190,10 @@ async def get_reply(request: Request, reply_id: str, auth: Authenticated) -> Res
     require_scope(request, auth, REPLY.scope)
     no_query(request)
     target = path_id(reply_id, "reply_id")
+    # A quarantined reply's text is for the owner only (``views.inquiries.reply_content_visible``);
+    # the read query withholds it for every other caller (the same rule as MCP and the CLI).
     result = await _read(request, auth, lambda conn, actor: queries.get_reply(conn, actor, target))
-    # A quarantined reply's text is for the owner only (``views.inquiries.reply_content_visible``).
-    return _respond(REPLY, visible_reply(result, auth.actor).envelope(auth.request_id))
+    return _respond(REPLY, result.envelope(auth.request_id))
 
 
 # --------------------------------------------------------------------------------------------
@@ -196,16 +201,50 @@ async def get_reply(request: Request, reply_id: str, auth: Authenticated) -> Res
 # --------------------------------------------------------------------------------------------
 
 
+async def configured_control_view(conn: Conn, actor: ActorContext, settings: Settings) -> InquiryControlView:
+    """``inquiries_repo.control_view`` for the CONFIGURED sending identity (``inquiries:read``).
+
+    The sender readiness describes the binding the runtime would actually send from
+    (`workers.inquiry_handlers.configured_sender_binding`: ``SELLER_EMAIL_PROVIDER`` /
+    ``_ACCOUNT_ID`` / ``_FROM`` / ``_REPLY_TO``), never merely the newest binding. Without one, or
+    when the provider's newest binding is not exactly the configured identity, the readiness is
+    ``missing`` and ``sender_problems`` names why (``sender_identity_*`` codes, no values); the
+    runtime never sends from such a binding. Also adds ``removable_suppressions``.
+    """
+    sender = await configured_sender_binding(conn, actor, settings)
+    view = await inquiries_repo.control_view(
+        conn, actor, sender_binding_id=None if sender is None else sender.id
+    )
+    update: dict[str, Any] = {}
+    if sender is None:
+        update = {
+            "sender_readiness": "missing",
+            "sender_provider": None,
+            "sender_binding_version": None,
+            "sender_problems": ("sender_binding_missing",),
+        }
+    else:
+        identity = [
+            f"sender_identity_{code.lower()}"
+            for code in configured_sender_problems(settings, sender)
+            if code != "SENDER_BINDING_MISSING"
+        ]
+        if identity:
+            problems = tuple(dict.fromkeys([*identity, *view.sender_problems]))[:10]
+            update = {"sender_readiness": "missing", "sender_problems": problems}
+    removable = await removable_suppressions(conn, actor, await _now(conn))
+    return view.model_copy(update={**update, "removable_suppressions": len(removable)})
+
+
 @router.get("/api/inquiry-control")
 async def get_inquiry_control(request: Request, auth: Authenticated) -> Response:
     require_scope(request, auth, CONTROL.scope)
     no_query(request)
+    settings = api_state(request).settings
 
     async def work(conn: Conn, actor: ActorContext) -> tuple[Any, datetime]:
-        now = await _now(conn)
-        view = await inquiries_repo.control_view(conn, actor)
-        removable = await removable_suppressions(conn, actor, now)
-        return view.model_copy(update={"removable_suppressions": len(removable)}), now
+        view = await configured_control_view(conn, actor, settings)
+        return view, await _now(conn)
 
     view, as_of = await _read(request, auth, work)
     return _respond(CONTROL, envelope(view, request_id=auth.request_id, as_of=as_of))
@@ -227,6 +266,48 @@ async def post_inquiry_pause(request: Request, auth: Authenticated) -> Response:
     return _respond(PAUSE, envelope(view, request_id=auth.request_id, as_of=as_of))
 
 
+class SuppressionsChanged(VersionConflict):
+    """The removable suppressions differ from the count the owner saw (``409 VERSION_CONFLICT``,
+    ``details.reason = suppressions_changed``); nothing was changed. Reload and decide again."""
+
+    def __init__(self, *, expected: int, current: int) -> None:
+        super().__init__(
+            "The suppressions a resume would remove changed; reload the inquiry controls and retry",
+            reason=SUPPRESSIONS_CHANGED,
+            expected_removable_suppressions=expected,
+            current_removable_suppressions=current,
+        )
+
+
+async def resume_inquiries(
+    conn: Conn,
+    actor: ActorContext,
+    *,
+    expected_version: int,
+    reason: str,
+    remove_suppressions: bool,
+    expected_removable: int | None,
+) -> InquiryResumeResult:
+    """The owner's resume (dashboard route and ``suv-deals inquiries resume``), in ONE transaction.
+
+    ``inquiries_repo.resume`` locks the controls row first and checks ``expected_version``; the
+    removable suppressions are listed after that lock (``add_suppression`` takes the same lock, so
+    the set cannot grow underneath) and, with ``expected_removable``, a different count refuses
+    the WHOLE resume (`SuppressionsChanged`; the caller's transaction rolls back, nothing changes).
+    Only then is each one removed (one audited removal each). Nothing is sent by a resume.
+    """
+    result = await inquiries_repo.resume(conn, actor, expected_version=expected_version, reason=reason)
+    removed = 0
+    if remove_suppressions:
+        rows = await removable_suppressions(conn, actor, await _now(conn))
+        if expected_removable is not None and len(rows) != expected_removable:
+            raise SuppressionsChanged(expected=expected_removable, current=len(rows))
+        for row in rows:
+            await inquiries_repo.remove_suppression(conn, actor, row.id, reason=f"resume: {reason}")
+            removed += 1
+    return result.model_copy(update={"suppressions_removed": removed})
+
+
 async def _resume(conn: Conn, actor: ActorContext, body: InquiryResumeRequest) -> InquiryResumeResult:
     request_hash = idempotency.request_hash_for(RESUME_OPERATION, body)
     started = await idempotency.begin(conn, actor, RESUME_OPERATION, body.idempotency_key, request_hash)
@@ -235,16 +316,15 @@ async def _resume(conn: Conn, actor: ActorContext, body: InquiryResumeRequest) -
     if isinstance(started, idempotency.ReplayError):
         raise _replay_error(started.error_code)
     if isinstance(started, idempotency.InProgress):
-        raise TransientConflict("The same request is still in progress; retry shortly")
-    result = await inquiries_repo.resume(
-        conn, actor, expected_version=body.expected_version, reason=body.reason
+        raise TransientConflict.in_progress()
+    final = await resume_inquiries(
+        conn,
+        actor,
+        expected_version=body.expected_version,
+        reason=body.reason,
+        remove_suppressions=body.remove_suppressions,
+        expected_removable=body.expected_removable_suppressions,
     )
-    removed = 0
-    if body.remove_suppressions:
-        for row in await removable_suppressions(conn, actor, await _now(conn)):
-            await inquiries_repo.remove_suppression(conn, actor, row.id, reason=f"resume: {body.reason}")
-            removed += 1
-    final = result.model_copy(update={"suppressions_removed": removed})
     await idempotency.complete(
         conn, actor, RESUME_OPERATION, body.idempotency_key, final.model_dump(mode="json")
     )
@@ -358,6 +438,10 @@ async def get_evaluation(request: Request, auth: Authenticated) -> Response:
 __all__ = [
     "RESUMABLE_REASONS",
     "RESUME_OPERATION",
+    "SUPPRESSIONS_CHANGED",
+    "SuppressionsChanged",
+    "configured_control_view",
     "removable_suppressions",
+    "resume_inquiries",
     "router",
 ]

@@ -743,7 +743,7 @@ async def request_recheck(conn: Conn, actor: ActorContext, request: RecheckReque
     if isinstance(started, idempotency.ReplayError):
         raise _replay_error(started.error_code)
     if isinstance(started, idempotency.InProgress):
-        raise TransientConflict("The same request is still in progress; retry shortly")
+        raise TransientConflict.in_progress()
     listing = await get_listing(conn, actor, request.listing_id)
     source = await lock_source(conn, actor.workspace_id, listing.source_id, for_network=False)
     if source.technical_status == TechnicalStatus.ACCESS_BLOCKED:

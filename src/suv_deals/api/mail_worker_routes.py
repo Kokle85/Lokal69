@@ -25,7 +25,10 @@ Routes (each runs ONE short transaction of the worker's workspace unless noted):
 - ``POST /replies``: ``Idempotency-Key`` REQUIRED (``400`` without), checked together with the
   stable source identity by ``replies_repo.ingest`` (its own unit of work). An unknown or foreign
   inquiry is ``403`` ``mailbox_binding_mismatch``; the same message again is ``200`` with
-  ``duplicate: true``; a conflicting upload is ``409``.
+  ``duplicate: true``; a conflicting upload is ``409``. A per-credential reply bucket tighter than
+  the mutation bucket (``deps.MAIL_WORKER_REPLY_LIMIT``, PROPOSED 30 in a burst then 10 per
+  minute) and the repository's hourly cap of new replies per mailbox (``details.reason =
+  mail_worker_ingest_volume``) answer ``429`` with ``Retry-After``.
 - ``GET /send-intents``: pending intents of the worker's mailbox plus reaped, never-claimed,
   unreported ones flagged ``expired: true`` (the worker reports them ``intent_expired``).
   ``kill_switch_active`` is also ``true`` while this process's settings forbid sending
@@ -234,9 +237,12 @@ async def get_inquiry_bindings(request: Request, ctx: Worker) -> Response:
 @router.post(MAIL_WORKER_PREFIX + "/replies")
 async def post_reply(request: Request, ctx: Worker) -> Response:
     no_query(request)
+    state = api_state(request)
+    # The reply bucket is tighter than the generic mutation bucket (``deps.MAIL_WORKER_REPLY_LIMIT``);
+    # checked before the body is parsed, so a flood never reaches correlation or the database.
+    state.mail_worker_reply_limiter.check(ctx.worker.credential_id, mutation=True)
     key = required_idempotency_key(request)
     body = await body_model(request, MailWorkerReplyRequest)
-    state = api_state(request)
     ack = await replies_repo.ingest(
         state.db,
         ctx.worker,
@@ -336,7 +342,7 @@ async def post_report(request: Request, intent_id: str, ctx: Worker) -> Response
         if isinstance(started, idempotency.ReplayError):
             raise _replay_error(started.error_code)
         if isinstance(started, idempotency.InProgress):
-            raise TransientConflict("The same report is still being recorded; retry shortly")
+            raise TransientConflict.in_progress("The same report is still being recorded; retry shortly")
         await send_intents_repo.report(conn, ctx.worker, report=body, request_id=ctx.request_id)
         await idempotency.complete(conn, actor, REPORT_OPERATION, key, {"accepted": True})
 

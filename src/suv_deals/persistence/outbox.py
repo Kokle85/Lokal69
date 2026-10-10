@@ -331,13 +331,18 @@ def _resolve_event_id(event_id: UUID | None, payload: Mapping[str, Any]) -> UUID
 # "Looks like a fixture" in SQL, identical to `payload_looks_like_fixture` (plus the row flag
 # and fixture review-case lineage). Shared by the refusal and the claim so a suspicious row can
 # never be leased, even if the refusal statement skipped it because another transaction held it.
+#
+# It is NULL-SAFE (never NULL): ``jsonb_typeof(NULL) = 'string'`` is NULL for a payload without a
+# ``summary``, which used to make the whole OR NULL, so ``not {suspicious}`` excluded every such
+# row from the claim (it was neither leased nor refused: e.g. the category signals, whose payload
+# never carries a summary, had to be leased by a separate NULL-safe claim in the dispatcher).
 _SUSPICIOUS: Final = sql.SQL(
     "(o.is_fixture"
     " or (o.payload -> 'fixture' is not null"
     "     and o.payload -> 'fixture' not in ('false'::jsonb, 'null'::jsonb))"
-    " or (pg_catalog.jsonb_typeof(o.payload -> 'summary') = 'string'"
+    " or coalesce(pg_catalog.jsonb_typeof(o.payload -> 'summary') = 'string'"
     "     and pg_catalog.starts_with(pg_catalog.upper(pg_catalog.regexp_replace("
-    "       o.payload ->> 'summary', '^[[:space:]]+', '')), %(fixture_prefix)s))"
+    "       o.payload ->> 'summary', '^[[:space:]]+', '')), %(fixture_prefix)s), false)"
     " or (o.aggregate_type = 'review_case' and exists ("
     "       select 1 from app.review_cases c"
     "        where c.workspace_id = o.workspace_id and c.id = o.aggregate_id and c.is_fixture)))"

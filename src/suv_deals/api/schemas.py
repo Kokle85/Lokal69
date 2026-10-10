@@ -169,15 +169,21 @@ class ApiQuery(BaseModel):
 
 
 class CandidateListQuery(ApiQuery):
+    """``GET /api/candidates``. ``include_screening_rejected`` (dashboard only, default ``false``)
+    also lists the screening-rejected observations kept for audit (spec 11): it is not part of the
+    spec 21 ``deals_list_candidates`` input (the MCP tool never lists them) and is bound into the
+    cursor's filter hash, so a cursor of one setting is refused for the other."""
+
     cursor: Cursor = None
     limit: _LaxLimit = 25
     profile: ProfileKey | None = None
     country: Annotated[str, Field(pattern=r"^[A-Z]{2}$")] | None = None
     status: Literal["pending", "needs_information", "watch", "shortlisted", "rejected"] | None = None
     changed_since: AwareDatetime | None = None  # RFC 3339 with an offset, exactly as for MCP
+    include_screening_rejected: bool = False
 
     def to_tool_input(self) -> DealsListCandidatesInput:
-        data = self.model_dump(exclude_none=True)
+        data = self.model_dump(exclude_none=True, exclude={"include_screening_rejected"})
         return _to_input(DealsListCandidatesInput, data, "candidate list")
 
 
@@ -340,19 +346,38 @@ class InquiryPauseRequest(ToolInput):
         return _to_input(SellerInquiriesPauseInput, self.model_dump(), "inquiry pause")
 
 
+#: Upper bound of ``InquiryResumeRequest.expected_removable_suppressions`` (the repository lists
+#: at most 5,000 active suppressions).
+MAX_REMOVABLE_SUPPRESSIONS: Final = 5000
+_RemovableCount = Annotated[int, Field(ge=0, le=MAX_REMOVABLE_SUPPRESSIONS, strict=True)]
+
+
 class InquiryResumeRequest(ToolInput):
     """Body of ``POST /api/inquiry-control/resume`` (owner only; never an MCP tool).
 
     ``remove_suppressions``: also remove (audited, one audit event per suppression) the active
     ``kill_switch`` suppressions and, while the current standing authorization is effective and
     unrevoked, the ``authorization_revoked`` ones. Other suppressions (opt-out, bounce, complaint,
-    sender revoked, ...) are never removed here.
+    sender revoked, ...) are never removed here. ``expected_removable_suppressions`` closes the
+    time-of-check/time-of-use gap between the control view the owner read and the resume: the
+    count is compared under the controls lock (suppressions are added only under that lock) and a
+    mismatch refuses the whole resume. It is optional for compatibility with older clients; the
+    dashboard and the CLI (``--expected-suppressions``, required there) send it.
     """
 
     expected_version: Annotated[int, Field(ge=1, strict=True)]
     reason: Reason
     idempotency_key: IdempotencyKey
     remove_suppressions: bool = False
+    expected_removable_suppressions: _RemovableCount | None = Field(
+        default=None,
+        description=(
+            "With remove_suppressions: the removable_suppressions count the owner saw in"
+            " GET /api/inquiry-control. When the current count differs, the resume is refused"
+            " (409 VERSION_CONFLICT, details.reason = suppressions_changed) and nothing changes,"
+            " so only the suppressions the owner saw are ever removed."
+        ),
+    )
 
 
 class MailWorkerHealthQuery(ApiQuery):
@@ -1253,6 +1278,7 @@ __all__ = [
     "MAIL_WORKER_PREFIX",
     "MAIL_WORKER_ROUTES",
     "MAIL_WORKER_SCHEMA_VERSION",
+    "MAX_REMOVABLE_SUPPRESSIONS",
     "MAX_RETURNED_MESSAGE_IDS",
     "REQUEST_ID_HEADER",
     "ROUTES",

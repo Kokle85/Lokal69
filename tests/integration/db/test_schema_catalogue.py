@@ -95,6 +95,8 @@ EXTRA_TABLES = {
     "ops.mail_worker_checkpoints",
     "ops.mail_ingest_dedup",
     "ops.mail_binding_sync",
+    # Owner-controlled activation canaries (migration 20261008000200_inquiry_hardening).
+    "ops.inquiry_activation_canaries",
 }
 ALL_TABLES = SPEC_TABLES | EXTRA_TABLES
 
