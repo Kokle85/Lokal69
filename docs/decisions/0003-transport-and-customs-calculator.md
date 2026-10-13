@@ -44,8 +44,8 @@ every valuation. The research behind the calculator is the evidence pack
    an integer guard, VAT-only incidental costs; config/tax_rules/README.md). Arithmetic is exact
    `Decimal`.
 5. **The North Macedonian rule set ships as an unapproved DRAFT**:
-   `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json`
-   (`mk-passenger-car-import@2026.10-draft.1`, status `draft`, no approver, no sealed hash, 19
+   `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`
+   (`mk-passenger-car-import@2026.10-draft.2`, status `draft`, no approver, no sealed hash, 21
    components, every open point marked `UNCERTAIN - confirm`). It reproduces the fact sheet's
    worked examples to the denar (`tests/unit/test_mk_rule_draft.py`: G01-G19, U1-U10, the ДМВ set
    #1-#19).

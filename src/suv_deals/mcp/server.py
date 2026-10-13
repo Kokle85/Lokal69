@@ -34,8 +34,8 @@ problem names (never values), so the dashboard API keeps working.
 The default registry serves the twelve spec 21 tools, the three spec 37.8 inquiry tools
 (``seller_inquiries_get``, ``seller_replies_get``, ``seller_inquiries_pause``; there is no send
 tool) and the read-only import-cost calculator ``deals_estimate_import_costs`` (North Macedonian
-customs duty, motor-vehicle tax and import VAT for one vehicle; an indicative preview on
-unapproved draft rules is labelled and never stored). ``POST /mcp`` from a client whose failed
+customs duty, motor-vehicle tax and import VAT for one vehicle; an indicative preview on rules
+that are not ACTIVE is labelled and never stored). ``POST /mcp`` from a client whose failed
 authentications exhausted its ``api.middleware.PreAuthLimiter`` budget is ``429`` before any
 token verification.
 
@@ -129,7 +129,8 @@ INSTRUCTIONS: Final = (
     "deals_estimate_import_costs computes the North Macedonian import charges for one vehicle "
     "(customs duty, motor-vehicle tax DMV and import VAT) and its landed cost with the owner's fixed "
     "EUR 700 transport, from a listing's facts and/or the facts you pass. A result in mode "
-    "indicative_preview comes from UNAPPROVED draft rules: relay it with its banner and call every "
+    "indicative_preview comes from rules that are not ACTIVE (draft, under review, or approved but "
+    "not yet activated; rule.status says which): relay it with its banner unchanged and call every "
     "figure indicative, never a customs assessment or a final total; mode unavailable means the "
     "charges are unknown. Missing or unknown inputs (CO2 document, proof of origin, customs rate) "
     "change the result: name the missing_facts and the assumptions, and never present an unknown "

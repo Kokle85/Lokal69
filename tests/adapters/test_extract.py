@@ -130,6 +130,13 @@ def test_json_ld_numbers_never_become_float() -> None:
         (None, None),
         ([1], None),
         ("n/a", None),
+        (Decimal("4.5E+4"), Decimal("45000")),
+        (Decimal("NaN"), None),
+        # Regression: an in-range number with an extreme exponent expands to 100 MB in plain
+        # notation wherever it is shown; it is no value.
+        (Decimal("1E-100000000"), None),
+        (Decimal("0E-999999999"), None),
+        (Decimal("0.000000000001"), Decimal("1E-12")),
     ],
 )
 def test_decimal_from_json(value: object, expected: Decimal | None) -> None:

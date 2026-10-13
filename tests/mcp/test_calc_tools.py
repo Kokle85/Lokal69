@@ -27,7 +27,7 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
 from suv_deals.api.middleware import RateLimit
-from suv_deals.domain.enums import Role, Scope
+from suv_deals.domain.enums import Role, Scope, TaxRuleStatus
 from suv_deals.mcp.schemas import tool_output_schema
 from suv_deals.mcp.server import McpOptions
 from suv_deals.persistence.database import Database
@@ -226,6 +226,20 @@ async def test_unknown_inputs_change_the_result_and_are_never_zero(calc_mcp: Cal
     assert scenarios["standard_duty_if_proof_rejected"]["indicative_total"]["amount"] == G01
 
 
+@pytest.mark.parametrize("first_registration", ["0000", "0000-05", "1800-01-01"])
+async def test_an_implausible_first_registration_is_a_labelled_unknown_not_an_internal_error(
+    calc_mcp: CalcHarness, first_registration: str
+) -> None:
+    """Regression: the shared builder raised, so dot got INTERNAL_ERROR with retryable true (an
+    invitation to retry a call that always fails)."""
+    envelope = await calc_mcp.ok(
+        {"vehicle": D1 | {"first_registration": first_registration}, "customs_eur_mkd_rate": CUSTOMS_RATE}
+    )
+    warnings = envelope["data"]["warnings"]
+    assert any(w.startswith(f"FIRST_REGISTRATION_IMPLAUSIBLE:{first_registration}") for w in warnings)
+    assert legal_base(envelope["data"])["indicative_total"]["amount"] == G01  # the age never changes it
+
+
 # --------------------------------------------------------------------------------------------
 # Active and unavailable
 # --------------------------------------------------------------------------------------------
@@ -242,6 +256,20 @@ async def test_an_active_rule_set_takes_precedence_over_the_preview(calc_mcp: Ca
     legal = legal_base(data)
     assert legal["total"]["amount"] == G01 and legal["indicative_total"] is None
     assert "TAX_RULES_UNAPPROVED" not in codes(envelope)
+
+
+async def test_an_approved_but_inactive_rule_set_is_relayed_as_such(calc_mcp: CalcHarness) -> None:
+    """Regression: dot was told every preview is "UNAPPROVED draft rules"; between Approve and
+    Activate the data says approved, and the instructions now tell dot to relay that banner."""
+    await activate(calc_mcp.db, owner(calc_mcp.workspace_id), mk_draft(), until=TaxRuleStatus.APPROVED)
+    envelope = await calc_mcp.ok({"vehicle": D1, "customs_eur_mkd_rate": CUSTOMS_RATE})
+    data = envelope["data"]
+    assert data["mode"] == "indicative_preview" and data["rule"]["status"] == "approved"
+    assert "approved rules that are not yet active" in data["banner"]["en"]
+    assert "unapproved" not in data["banner"]["en"]
+    tools = {t["name"]: t for t in await calc_mcp.client.tools(calc_mcp.viewer)}
+    assert "UNAPPROVED draft" not in tools[NAME]["description"]
+    assert "approved but not yet activated" in tools[NAME]["description"]
 
 
 async def test_without_any_rule_set_every_charge_is_unknown(

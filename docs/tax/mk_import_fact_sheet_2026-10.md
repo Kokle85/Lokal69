@@ -1,8 +1,8 @@
 # North Macedonia: import charges on a used passenger car (HS 8703), as of 2026-10-13
 
 The evidence pack behind the import-cost calculator and the DRAFT rule set
-`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json`
-(`mk-passenger-car-import@2026.10-draft.1`). The owner, with a qualified customs broker or tax
+`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`
+(`mk-passenger-car-import@2026.10-draft.2`). The owner, with a qualified customs broker or tax
 professional, reviews it **before** approving that rule set (docs/tax_rule_approval.md;
 decision record docs/decisions/0003-transport-and-customs-calculator.md). Per the owner's
 decision of 2026-10-13, transport to MK is fixed at EUR 700 per vehicle.
@@ -18,7 +18,7 @@ How the sections map to the repository:
 
 | Fact sheet | Repository |
 |---|---|
-| Sections 1, 4, 5, 6, 7 (pipeline, duty, ДМВ, VAT) | the draft's 19 components: `customs_value_mkd`, `duty_*`, `vmv_mkd`, `dmv_*`, `vat_base_mkd`, `vat_import` (helpers are `intermediate` and never counted in a total) |
+| Sections 1, 4, 5, 6, 7 (pipeline, duty, ДМВ, VAT) | the draft's 21 components: `customs_value_mkd`, `duty_*`, `vmv_mkd`, `dmv_*`, `vat_base_mkd`, `vat_import` (helpers are `intermediate` and never counted in a total) |
 | Section 2 (inputs) and section 11 (modelling rules) | the builder `src/suv_deals/domain/import_estimate.py` (`VehicleImportFacts` -> `build_tax_inputs`): origin never inferred (no proof = standard duty), CO2 cycle as printed (WLTP when the COC has it, never converted), 400 g/km deemed only when no document exists, the Euro 4 import gate as a warning |
 | Section 3.3 (the EUR 700) | the cost profile `config/cost_profiles/default_unapproved.yaml` (transport line EUR 700) and the builder's single transport line: all 700 in the customs value unless a separately invoiced inland leg is given |
 | Section 3.4 (SchwackeNet) | the optional `catalogue_value_eur`: a separate "customs revaluation risk" scenario, never a max() |

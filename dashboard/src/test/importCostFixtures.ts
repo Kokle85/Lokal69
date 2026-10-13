@@ -14,10 +14,10 @@ import type {
 import { LISTING_ID } from './fixtures'
 
 export const BANNER_MK =
-  'ИНДИКАТИВНА ПРОЦЕНКА – неодобрени нацрт-правила (mk-passenger-car-import@2026.10-draft.1). Не е царинска пресметка; не се користи за вреднувања ни известувања.'
+  'ИНДИКАТИВНА ПРОЦЕНКА – неодобрени нацрт-правила (mk-passenger-car-import@2026.10-draft.2). Не е царинска пресметка; не се користи за вреднувања ни известувања.'
 export const BANNER_EN =
   'INDICATIVE PREVIEW – unapproved draft rules; not a customs assessment; never used for valuations or alerts.'
-export const DRAFT_SHA = '60d41fd7db5d7c64fc6346cb2c9d2e8966e6f02bb7724f76ec4d6282b84b50c9'
+export const DRAFT_SHA = 'a856d5e401eb87e728079be0bfe3a723311480d6cdf1f38123cf6c052603d4b7'
 
 const mkd = (amount: string): AmountView => ({ status: 'known', amount, currency: 'MKD', reason: null })
 const eur = (amount: string): AmountView => ({ status: 'known', amount, currency: 'EUR', reason: null })
@@ -157,7 +157,7 @@ export function importEstimate(overrides: Partial<ImportCostEstimateView> = {}):
     banner: { mk: BANNER_MK, en: BANNER_EN },
     rule: {
       rule_set_id: 'mk-passenger-car-import',
-      version: '2026.10-draft.1',
+      version: '2026.10-draft.2',
       status: 'draft',
       jurisdiction: 'MK',
       currency: 'MKD',
@@ -166,8 +166,8 @@ export function importEstimate(overrides: Partial<ImportCostEstimateView> = {}):
       content_sha256: DRAFT_SHA,
       sha256_recorded: false,
     },
-    selection_reason: 'INDICATIVE PREVIEW: selected mk-passenger-car-import@2026.10-draft.1 (draft)',
-    considered: ['mk-passenger-car-import@2026.10-draft.1: not active for production (draft, fixture=False)'],
+    selection_reason: 'INDICATIVE PREVIEW: selected mk-passenger-car-import@2026.10-draft.2 (draft)',
+    considered: ['mk-passenger-car-import@2026.10-draft.2: not active for production (draft, fixture=False)'],
     jurisdiction: 'MK',
     vehicle_category: 'passenger_car',
     declaration_date: '2026-10-13',

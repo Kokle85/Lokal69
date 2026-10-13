@@ -334,14 +334,27 @@ def _midnight(day: date) -> datetime:
     return datetime.combine(day, time(0), tzinfo=UTC)
 
 
+def _next_month_start(day: date) -> date:
+    return date(day.year + 1, 1, 1) if day.month == 12 else date(day.year, day.month + 1, 1)
+
+
 def _expiry(
     scenarios: ScenarioSet | None,
     comparable: ComparableReference | None,
     tax: TaxCalculation | None,
     fx: Sequence[FxDependency],
     fx_max_age_days: int,
+    *,
+    as_of: datetime,
 ) -> tuple[datetime | None, list[str]]:
-    """Earliest of quote expiries, FX max-age deadlines, comparable freshness and tax rule end."""
+    """Earliest of quote expiries, FX max-age deadlines, comparable freshness, tax rule end and
+    the end of a customs rate's month.
+
+    A customs rate is a monthly list rate, valid in its own month only: a valuation that read it
+    expires when the month ends. A rate whose month had already ended at ``as_of`` sets no
+    deadline (it could not be used, so the valuation is already incomplete for it); recording
+    the new month's rate invalidates such a valuation instead (reconciler FX sweep).
+    """
     deadlines: list[tuple[datetime, str]] = []
     if scenarios is not None and scenarios.earliest_expiry is not None:
         deadlines.append((scenarios.earliest_expiry, "cost quote/estimate expiry"))
@@ -349,6 +362,16 @@ def _expiry(
         if dep.purpose != FxPurpose.CUSTOMS:
             when = _midnight(dep.rate_date + timedelta(days=fx_max_age_days + 1))
             deadlines.append((when, f"FX {dep.base}/{dep.quote} {dep.rate_date.isoformat()} exceeds max age"))
+            continue
+        month_end = _midnight(_next_month_start(dep.rate_date))
+        if month_end > as_of:
+            deadlines.append(
+                (
+                    month_end,
+                    f"customs monthly list rate {dep.base}/{dep.quote} {dep.rate_date.isoformat()} no longer "
+                    "effective",
+                )
+            )
     if comparable is not None and comparable.fresh_until is not None:
         deadlines.append((comparable.fresh_until, "comparable freshness"))
     if tax is not None and tax.rule_valid_to is not None:
@@ -458,7 +481,9 @@ def assemble_valuation(
     expires_at: datetime | None = None
     expiry_reasons: list[str] = []
     if state not in (ValuationState.INVALID, ValuationState.NOT_STARTED):
-        expires_at, expiry_reasons = _expiry(scenarios, comparable, tax, deps.fx, fx_max_age_days)
+        expires_at, expiry_reasons = _expiry(
+            scenarios, comparable, tax, deps.fx, fx_max_age_days, as_of=as_of
+        )
     stale_at: datetime | None = None
     stale_reason: str | None = None
     if expires_at is not None and expires_at <= as_of:

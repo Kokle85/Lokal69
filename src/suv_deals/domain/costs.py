@@ -494,6 +494,13 @@ class CostProfile(_Contract):
     def sha256(self) -> str:
         return sha256_json(self.model_dump(mode="json"))
 
+    def content_sha256(self) -> str:
+        """Hash of the content without the approval record (approval is a separate owner act):
+        a stored and a configured copy of one version match when this matches."""
+        return self.model_copy(
+            update={"approval_status": "unapproved", "approved_by": None, "approved_at": None}
+        ).sha256()
+
     def reference(self) -> CostProfileRef:
         return CostProfileRef(
             profile_key=self.profile_key,

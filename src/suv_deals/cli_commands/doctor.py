@@ -8,6 +8,8 @@ What it checks (and never does):
 - the database: reachability, server version, the migration ledger, the backend role
   (``ops.backend_role_problems()`` when the login role may call it, ``SET ROLE``), required schema
   markers (the same list ``/readyz`` uses) and active workspaces. Read-only;
+- the production tax rules per active workspace: the STORED ACTIVE rule set valuations select
+  today, or that none applies (files under ``config/tax_rules`` never activate anything);
 - the crawler, ONLY with ``--crawler``: ``GET /health`` and the read-only contract inspection
   (`Crawl4AIClient.inspect_contract`: unauthenticated probe, ``/config/dump`` dry runs). It never
   crawls a page and never restarts or reconfigures the crawler;
@@ -250,6 +252,73 @@ async def database_findings(settings: Settings) -> list[Finding]:
                         area, "workspaces", "warn", "no active workspace (run `suv-deals bootstrap owner`)"
                     )
                 )
+    return findings
+
+
+async def tax_rule_readiness(settings: Settings) -> list[Finding]:
+    """The production tax rules per active workspace, from the database (read-only): the rule set
+    valuations select today (``select_rule_set`` over the STORED ACTIVE versions; files never
+    count), or that none applies, so import costs stay unknown."""
+    from suv_deals.cli_commands._common import active_workspaces, open_database, operator_actor
+    from suv_deals.domain.enums import TaxRuleStatus
+    from suv_deals.domain.tax_engine import select_rule_set
+    from suv_deals.errors import AppError, ValidationFailed
+    from suv_deals.persistence import valuation_repo
+    from suv_deals.persistence.database import db_now
+    from suv_deals.persistence.transactions import unit_of_work
+    from suv_deals.workers.runtime import RuntimeOptions
+
+    area = "tax_rules"
+    if settings.database_url is None or not settings.database_url.get_secret_value():
+        return []
+    options = RuntimeOptions()
+    scope = f"{options.tax_jurisdiction}/{options.tax_vehicle_category}"
+    findings: list[Finding] = []
+    try:
+        async with open_database(settings, application_name="suv-deals-doctor") as db:
+            workspace_ids = await active_workspaces(db)
+            for ws in workspace_ids:
+                name = "production" if len(workspace_ids) == 1 else f"{str(ws)[:8]}:production"
+                actor = operator_actor(ws, "doctor")
+                async with unit_of_work(db, actor) as conn:
+                    today = (await db_now(conn)).date()
+                    stored = await valuation_repo.list_rule_sets(
+                        conn, actor, jurisdiction=options.tax_jurisdiction, statuses=[TaxRuleStatus.ACTIVE]
+                    )
+                try:
+                    selection = select_rule_set(
+                        [s.rule_set for s in stored],
+                        options.tax_jurisdiction,
+                        options.tax_vehicle_category,
+                        today,
+                    )
+                except ValidationFailed as exc:
+                    findings.append(Finding(area, name, "error", f"{scope}: {exc.message}"))
+                    continue
+                chosen = selection.rule_set
+                if chosen is not None:
+                    findings.append(
+                        Finding(
+                            area,
+                            name,
+                            "ok",
+                            f"ACTIVE {chosen.label()} (sha256 {(chosen.sha256 or '')[:12]}) for {scope} on "
+                            f"{today.isoformat()}: valuations compute import charges with it",
+                        )
+                    )
+                else:
+                    findings.append(
+                        Finding(
+                            area,
+                            name,
+                            "info",
+                            f"no ACTIVE stored rule set applies for {scope} on {today.isoformat()}: "
+                            "import costs stay unknown and valuations incomplete (the calculator shows an "
+                            "indicative preview); `suv-deals tax-rules list`",
+                        )
+                    )
+    except AppError:
+        return [Finding(area, "production", "warn", "stored tax rule sets could not be read")]
     return findings
 
 
@@ -689,6 +758,10 @@ def doctor(
                     findings.extend(await seller_inquiry_readiness(settings))
                 except Exception as exc:
                     findings.append(Finding("seller_inquiry", "readiness", "warn", unexpected_error(exc)))
+                try:
+                    findings.extend(await tax_rule_readiness(settings))
+                except Exception as exc:
+                    findings.append(Finding("tax_rules", "production", "warn", unexpected_error(exc)))
         if crawler:
             try:
                 findings.extend(await crawler_findings(settings, _make_crawler_http()))

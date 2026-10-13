@@ -364,9 +364,7 @@ async def ensure_cost_profile(
 
 def _content_sha(profile: CostProfile) -> str:
     """Content hash without the approval record (approval is a separate owner act)."""
-    return profile.model_copy(
-        update={"approval_status": "unapproved", "approved_by": None, "approved_at": None}
-    ).sha256()
+    return profile.content_sha256()
 
 
 # --------------------------------------------------------------------------------------------
@@ -575,7 +573,17 @@ async def _value_and_commit(
                 comparable=None if stored_set is None else stored_set.reference(),
                 tax=calc,
                 scenarios=scenarios,
-                fx_rates=[r.rate for r in comparable_rates] if stored_set is not None else [],
+                fx_rates=[
+                    *([r.rate for r in comparable_rates] if stored_set is not None else []),
+                    # The customs rate the tax inputs were built from, even when the engine found it
+                    # not effective (an earlier month): recording the new month's rate must then
+                    # invalidate this valuation (reconciler FX sweep).
+                    *(
+                        [reads.customs_rate.rate]
+                        if calc is not None and reads.customs_rate is not None
+                        else []
+                    ),
+                ],
                 cost_profile=None if stored_set is None else profile.reference(),
                 config_revision_id=str(reads.config_record.id),
                 as_of=reads.as_of,

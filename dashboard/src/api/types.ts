@@ -2314,7 +2314,7 @@ export type ImporterStatus = 'private' | 'non_vat_business' | 'vat_dealer'
 /** Whether an import-cost price is a transaction (invoice/contract) price or an advertised claim. */
 export type ImportPriceBasis = 'invoice' | 'advertised'
 export type FactSource = 'listing' | 'request' | 'default'
-export type CustomsFxSource = 'recorded' | 'caller_supplied' | 'not_needed' | 'none'
+export type CustomsFxSource = 'recorded' | 'recorded_not_effective' | 'caller_supplied' | 'not_needed' | 'none'
 
 export interface ImportBannerView {
   mk: string

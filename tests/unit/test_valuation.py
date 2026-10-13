@@ -54,11 +54,13 @@ from suv_deals.domain.tax_engine import (
 from suv_deals.domain.valuation import (
     CALCULATION_VERSION,
     ComparableReference,
+    FxDependency,
     InvalidationReason,
     ScreeningInput,
     TaxRuleDependency,
     Valuation,
     ValuationDependencies,
+    _expiry,
     assemble_valuation,
     build_dependencies,
     is_stale,
@@ -660,3 +662,32 @@ def test_comparable_quality_vocabularies_map_consistently() -> None:
     assert ComparableReference.quality_from_status("small") == "small"
     assert ComparableReference.quality_from_status("insufficient_comparables") == "insufficient_comparables"
     assert ComparableReference.quality_from_status("insufficient") == "insufficient_comparables"
+
+
+def _customs(on: date) -> FxRate:
+    return FxRate(
+        base="EUR",
+        quote="MKD",
+        rate=Decimal("61.4"),
+        rate_date=on,
+        retrieved_at=datetime.combine(on, datetime.min.time(), tzinfo=UTC),
+        provider="SYNTHETIC customs monthly list",
+        purpose=FxPurpose.CUSTOMS,
+    )
+
+
+def test_a_customs_rate_expires_with_its_month() -> None:
+    """Regression: CUSTOMS dependencies set no deadline, so a valuation computed with October's
+    customs rate stayed current into November although the rate is valid in its month only."""
+    october = FxDependency.from_rate(_customs(date(2026, 10, 1)))
+    when, why = _expiry(None, None, None, [october], 7, as_of=AS_OF)
+    assert when == datetime(2026, 11, 1, tzinfo=UTC)
+    assert why == ["customs monthly list rate EUR/MKD 2026-10-01 no longer effective"]
+    december = FxDependency.from_rate(_customs(date(2026, 12, 1)))
+    assert _expiry(None, None, None, [december], 7, as_of=AS_OF)[0] == datetime(2027, 1, 1, tzinfo=UTC)
+    # A rate whose month had already ended could not be used: no deadline (no stale loop); the
+    # next month's recorded rate invalidates such a valuation instead.
+    september = FxDependency.from_rate(_customs(date(2026, 9, 1)))
+    assert _expiry(None, None, None, [september], 7, as_of=AS_OF) == (None, [])
+    valuation = assemble(tax=None, comparable=None, scenario_set=None, fx_rates=[_customs(date(2026, 10, 1))])
+    assert valuation.expires_at is not None and valuation.expires_at <= datetime(2026, 11, 1, tzinfo=UTC)

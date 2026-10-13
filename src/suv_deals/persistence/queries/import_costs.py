@@ -23,9 +23,13 @@ CLI). Pure computation in ``domain.import_estimate``; this module only gathers i
   before the declaration date. When none is recorded for the declaration month, the caller's
   ``customs_eur_mkd_rate`` is used for this estimate only (assumption
   ``CALLER_SUPPLIED_CUSTOMS_RATE``; never stored); otherwise the customs value stays unknown
-  and the warning names the ``suv-deals fx record --purpose customs`` command.
+  and the warning names the ``suv-deals fx record --purpose customs`` command. A recorded rate
+  of an earlier month is never presented as used (``customs_fx_source``
+  ``recorded_not_effective``, ``customs_fx_rate`` null, ``customs_fx_rate`` in ``missing_facts``)
+  unless last month's rate is accepted for a preview.
 - Transport: the configured cost profile's transport line
-  (``config/cost_profiles/default_unapproved.yaml``, the file the worker runtime loads).
+  (``config/cost_profiles/default_unapproved.yaml``, the file the worker runtime loads). Its
+  approval is the workspace's STORED version of it (the owner approves in Settings), read-only.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from pydantic import ValidationError as ModelValidationError
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
-from suv_deals.domain.costs import CostLine, CostScope, load_cost_profile
+from suv_deals.domain.costs import CostLine, CostProfile, CostScope, load_cost_profile
 from suv_deals.domain.enums import (
     CostCategory,
     CostLineStatus,
@@ -191,6 +195,12 @@ async def _listing_facts(conn: Conn, actor: ActorContext, listing_id: UUID) -> _
     elif screening.payable_amount is None:
         notes.append("LISTING_PAYABLE_UNKNOWN: screening found no payable amount; the price is unknown")
     facts = facts_from_listing(normalized, payable=None if screening is None else screening.payable_amount)
+    if normalized.co2.g_per_km is not None and not facts.co2:
+        notes.append(
+            f"LISTING_CO2_NOT_A_FACT:{str(normalized.co2.g_per_km)[:40]}: the listing's CO2 figure is not "
+            f"plausible for a {normalized.vehicle.fuel.value} car (under 1 g/km or a parse artefact); CO2 "
+            "unknown until a document's figure is given"
+        )
     view = ImportListingView(
         listing_id=listing.id,
         revision_id=revision.id,
@@ -443,7 +453,7 @@ async def _customs_rate(
 # --------------------------------------------------------------------------- transport
 
 
-def _transport(config_dir: Path, scope: CostScope) -> tuple[CostLine, tuple[str, ...]]:
+def _transport(config_dir: Path, scope: CostScope) -> tuple[CostLine, CostProfile | None, tuple[str, ...]]:
     path = config_dir / COST_PROFILE_FILE
     if not path.is_file():
         reason = f"no cost profile at {COST_PROFILE_FILE.as_posix()}; the transport amount is unknown"
@@ -454,15 +464,30 @@ def _transport(config_dir: Path, scope: CostScope) -> tuple[CostLine, tuple[str,
             currency="EUR",
             reason=reason,
         )
-        return line, (f"COST_PROFILE_MISSING: {reason}",)
+        return line, None, (f"COST_PROFILE_MISSING: {reason}",)
     try:
         profile = load_cost_profile(path)
     except ValidationFailed:
         raise AppError(
             ErrorCode.INTERNAL_ERROR, "The configured cost profile could not be read", retryable=False
         ) from None
-    note = (f"COST_PROFILE:{profile.profile_key}@v{profile.version} ({profile.approval_status})",)
-    return single_transport_line(profile.lines(target_scope=scope)), note
+    return single_transport_line(profile.lines(target_scope=scope)), profile, ()
+
+
+async def _profile_note(conn: Conn, actor: ActorContext, profile: CostProfile) -> str:
+    """The configured profile's approval as the workspace records it: the owner approves the
+    STORED version (Settings), the same row valuations use; the file always says unapproved."""
+    tag = f"COST_PROFILE:{profile.profile_key}@v{profile.version}"
+    try:
+        stored = await valuation_repo.find_cost_profile(conn, actor, profile.profile_key, profile.version)
+    except NotFound:
+        return f"{tag} ({profile.approval_status}; not yet stored in this workspace)"
+    if stored.profile.content_sha256() != profile.content_sha256():
+        return (
+            f"{tag} (the configured file differs from the stored version, {stored.profile.approval_status}; "
+            "bump its version)"
+        )
+    return f"{tag} ({stored.profile.approval_status})"
 
 
 # --------------------------------------------------------------------------- service
@@ -503,7 +528,9 @@ async def estimate_import_costs_for(
         origin_country=facts.seller_country,
         listing_id=None if request.listing_id is None else str(request.listing_id),
     )
-    transport, profile_notes = _transport(config_dir, scope)
+    transport, profile, profile_notes = _transport(config_dir, scope)
+    if profile is not None:
+        profile_notes = (*profile_notes, await _profile_note(conn, actor, profile))
     estimate = estimate_import_costs(
         selection,
         facts,
@@ -529,11 +556,15 @@ async def estimate_import_costs_for(
             "notes": tuple(dict.fromkeys([*estimate.notes, *notes])),
         }
     )
+    fx_source: CustomsFxSource = customs.source
+    if customs.rate is not None and estimate.customs_fx_rate is None and customs.source == "recorded":
+        # The newest recorded rate is not valid on the declaration date and was not used.
+        fx_source = "recorded_not_effective"
     return ImportCostResult(
         estimate=estimate,
         facts=facts,
         fact_sources=sources,
-        customs_fx_source=customs.source,
+        customs_fx_source=fx_source,
         listing=None if listing is None else listing.view,
         as_of=now,
     )

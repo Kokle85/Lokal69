@@ -1541,6 +1541,9 @@ class DependencyChange(BaseModel):
     - ``comparable_set_ids`` / ``market_observation_ids``: sets (or sets containing observations);
     - ``fx_rate_ids``; or ``fx_pair`` + ``fx_newer_than``: valuations that used an OLDER rate of
       the same directed pair and purpose than a newly recorded observation;
+    - ``fx_missing_pair``: INCOMPLETE valuations under a tax rule set in that pair's non-EUR
+      currency that depend on no rate of the pair (either direction) and purpose, e.g. computed
+      before the first customs rate was recorded;
     - ``cost_evidence_ids``, ``cost_profile_ids``, ``tax_rule_set_ids`` (rows);
     - ``current_config_revision_id``: valuations computed under any other configuration.
     """
@@ -1555,6 +1558,7 @@ class DependencyChange(BaseModel):
     fx_rate_ids: tuple[UUID, ...] = ()
     fx_pair: tuple[str, str, FxPurpose] | None = None
     fx_newer_than: date | None = None
+    fx_missing_pair: tuple[str, str, FxPurpose] | None = None
     cost_evidence_ids: tuple[UUID, ...] = ()
     cost_profile_ids: tuple[UUID, ...] = ()
     tax_rule_set_ids: tuple[UUID, ...] = ()
@@ -1574,6 +1578,7 @@ class DependencyChange(BaseModel):
                 self.market_observation_ids,
                 self.fx_rate_ids,
                 self.fx_pair,
+                self.fx_missing_pair,
                 self.cost_evidence_ids,
                 self.cost_profile_ids,
                 self.tax_rule_set_ids,
@@ -1638,6 +1643,20 @@ def _dependent_predicate(change: DependencyChange) -> tuple[sql.Composable, dict
         params.update(
             dep_base=base, dep_quote=quote, dep_purpose=purpose.value, dep_date=change.fx_newer_than
         )
+    if change.fx_missing_pair is not None:
+        parts.append(
+            sql.SQL(
+                "(v.state = 'incomplete' and exists (select 1 from app.tax_rule_sets t"
+                " where t.workspace_id = %(ws)s and t.id = v.tax_rule_set_id and t.currency <> 'EUR'"
+                " and t.currency in (%(miss_base)s, %(miss_quote)s))"
+                " and not exists (select 1 from app.fx_rates f where f.workspace_id = %(ws)s"
+                " and f.id = any(v.fx_rate_ids) and f.purpose = %(miss_purpose)s"
+                " and ((f.base = %(miss_base)s and f.quote = %(miss_quote)s)"
+                " or (f.base = %(miss_quote)s and f.quote = %(miss_base)s))))"
+            )
+        )
+        base, quote, purpose = change.fx_missing_pair
+        params.update(miss_base=base, miss_quote=quote, miss_purpose=purpose.value)
     if change.cost_evidence_ids:
         parts.append(sql.SQL("v.cost_evidence_ids && %(dep_ce)s::uuid[]"))
         params["dep_ce"] = list(change.cost_evidence_ids)

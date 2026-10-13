@@ -6,7 +6,7 @@
  * `GET /api/import-costs/estimate` (read-only; the same calculation dot gets through MCP). The URL
  * holds the submitted parameters, so a calculation can be reloaded and navigated back to. Every
  * amount is the server's; until the owner approves and activates a rule set the result is an
- * INDICATIVE PREVIEW on unapproved draft rules, labelled as such and never stored anywhere.
+ * INDICATIVE PREVIEW on rules that are not active, labelled as such and never stored anywhere.
  */
 import { Link, useParams, useSearchParams } from 'react-router'
 import type { ImportCostEstimateQuery } from '../../api/types'

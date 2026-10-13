@@ -20,7 +20,7 @@ North Macedonia that dot can use. Nothing is approved or activated; no migration
   and `select_preview_rule_set` for a labelled indicative preview. Existing rule sets keep their
   hash. Production selection (`select_rule_set`, `allow_unapproved=False`) is unchanged.
 - The North Macedonian DRAFT rule set
-  `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json` (customs duty, motor-vehicle
+  `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json` (customs duty, motor-vehicle
   tax ДМВ, import VAT on an HS 8703 car; status `draft`, every open point `UNCERTAIN - confirm`),
   golden-tested to the denar (`tests/unit/test_mk_rule_draft.py`), and the evidence pack
   docs/tax/mk_import_fact_sheet_2026-10.md. `config validate`, `doctor` and `make smoke-local`
@@ -52,6 +52,32 @@ North Macedonia that dot can use. Nothing is approved or activated; no migration
 - Verification (docs/qa_evidence.md, "Customs calculator wave"): full suite 8,505 passed + 1
   skipped on PostgreSQL 16 and 8,506 passed on 17; desktop 317; dashboard 208 unit tests, build;
   browser E2E 48 on PostgreSQL 16 and 17 (and the harness's 36).
+
+### Customs calculator review fixes (2026-10-13, working tree on top of `787ad7c`)
+
+- Draft rule set re-versioned to `mk-passenger-car-import@2026.10-draft.2` (draft.1 is no longer
+  shipped): a plug-in hybrid without a CO2 document now gets the deemed 400 g/km (ЗДМВ чл. 12(2)),
+  halved by чл. 9(3) (`dmv_co2_deemed_phev_petrol` / `_diesel`, column choice UNCERTAIN - confirm).
+- Builder: a CO2 figure under 1 g/km for a combustion or hybrid car is "not established" (never
+  the Table 2 zero row; a listing's such figure is no fact); an attested HS code that contradicts
+  the fuel leaves the fuel-keyed charges unknown (`HS_CODE_FUEL_MISMATCH`, fuel and hs_code
+  missing); an implausible first registration (year 0000, age over 200) is a labelled unknown,
+  never a 500; a customs rate not valid on the declaration date is named missing
+  (`customs_fx_rate`), never shown as the rate used (`customs_fx_source`
+  `recorded_not_effective`); a CHF price is missing as `price_in_eur_or_mkd`, not as `price`;
+  an alternative group no member covers is named (`RULE_SET_DOES_NOT_COVER_VEHICLE`).
+- Engine validation: an unreferenced alternative-group member must be a fixed 0; a bracket base
+  counts as a use only with a `rate_of_base` row; repeated `base`/`key_terms` are refused;
+  scientific display of extreme decimal exponents (no 100 MB strings); a version closed in any
+  copy is excluded from the preview before the content check. JSON-LD numbers with more than 12
+  fraction digits are no value.
+- Valuations: a customs rate's dependency is recorded even when it was not effective, valuations
+  expire when their customs rate's month ends, and the reconciler re-values valuations that read an
+  older customs rate or none once a newer one is recorded.
+- Labels: the calculator's cost-profile note follows the STORED approval; dot's description and
+  instructions describe a preview by rule status, not as "UNAPPROVED draft rules"; the dashboard no
+  longer promises to keep the listing's CO2 document for an entered CO2 figure; `doctor` reports the
+  stored ACTIVE rule set per workspace and no longer warns on the draft's `TAX_RULE_SET_ID`.
 
 ## Owner decisions (2026-10-10 to 2026-10-13, `20fddf8`, `da4c5e6`)
 

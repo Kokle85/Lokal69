@@ -29,7 +29,7 @@ from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.tax_engine import RuleSet, load_rule_set_file
 
 REPO = Path(__file__).resolve().parents[2]
-DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.1.json"
+DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.2.json"
 PROFILE = REPO / "config" / "cost_profiles" / "default_unapproved.yaml"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 RATE = FxRate(
@@ -84,7 +84,8 @@ def test_transport_is_counted_exactly_once(price: Decimal, inland_cents: int) ->
 
 
 @settings(max_examples=40, deadline=None)
-@given(price=cents, co2=st.integers(min_value=0, max_value=400), fuel=st.sampled_from(["diesel", "petrol"]))
+# A combustion car cannot emit under 1 g/km (such a figure is "not established"), so >= 1.
+@given(price=cents, co2=st.integers(min_value=1, max_value=400), fuel=st.sampled_from(["diesel", "petrol"]))
 def test_indicative_total_is_the_sum_of_the_categories(price: Decimal, co2: int, fuel: str) -> None:
     est = estimate_from_rule_sets(
         [draft()],

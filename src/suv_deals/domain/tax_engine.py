@@ -100,6 +100,8 @@ _APPROVAL_STATUSES: Final = frozenset(
 _FIXTURE_STATUSES: Final = frozenset({TaxRuleStatus.DRAFT, TaxRuleStatus.UNAPPROVED, TaxRuleStatus.REVOKED})
 #: Never selectable, not even for fixtures.
 _CLOSED_STATUSES: Final = frozenset({TaxRuleStatus.SUPERSEDED, TaxRuleStatus.EXPIRED, TaxRuleStatus.REVOKED})
+#: Statuses that close a version for good (never selected, never previewed).
+CLOSED_RULE_STATUSES: Final = _CLOSED_STATUSES
 #: Statuses an indicative preview may run on, best first (``select_preview_rule_set``).
 _PREVIEW_STATUS_ORDER: Final = (TaxRuleStatus.APPROVED, TaxRuleStatus.UNDER_REVIEW, TaxRuleStatus.DRAFT)
 
@@ -707,6 +709,11 @@ def _term_problems(
     what: str = "base term",
 ) -> list[str]:
     problems: list[str] = []
+    terms = list(terms)
+    repeated = sorted({term for term in terms if terms.count(term) > 1})
+    if repeated:
+        # A repeated term would be summed twice (a doubled key selects the wrong band).
+        problems.append(f"{owner}: duplicate {what}(s) {repeated}")
     for term in terms:
         if term in earlier:
             if term not in depends_on:
@@ -944,19 +951,29 @@ def rule_set_problems(rule_set: RuleSet) -> list[str]:
 
 
 def _referenced_terms(comp: Component) -> tuple[str, ...]:
-    """The ``base`` and ``key_terms`` a component sums (the only ways a helper is used)."""
+    """The ``base`` and ``key_terms`` a component sums (the only ways a helper is used).
+
+    A bracket sums its ``base`` only in a ``rate_of_base`` row, so a base without such a row
+    feeds nothing and does not count as a use."""
     if isinstance(comp, PercentageComponent):
         return comp.base
     if isinstance(comp, BracketComponent):
-        return (*comp.base, *(comp.key_terms or ()))
+        uses_base = any(row.rate_of_base is not None for rows in comp.all_tables().values() for row in rows)
+        return (*(comp.base if uses_base else ()), *(comp.key_terms or ()))
     return ()
+
+
+def _zero_fixed(comp: Component) -> bool:
+    return isinstance(comp, FixedComponent) and comp.amount == 0
 
 
 def _intermediate_problems(rule_set: RuleSet) -> list[str]:
     """A helper must feed a later component, and an alternative group is all helpers or none.
 
-    A group member nobody references is accepted when another member of its group is
-    referenced: such members exist only to give the group full coverage.
+    A group member nobody references is accepted only when it is a ``fixed`` amount of 0 and
+    another member of its group is referenced: such members exist only to give the group full
+    coverage. A non-zero unreferenced member would resolve while its referenced siblings do
+    not apply, and its amount would silently vanish from the total.
     """
     components = rule_set.components
     position = {comp.id: index for index, comp in enumerate(components)}
@@ -970,10 +987,17 @@ def _intermediate_problems(rule_set: RuleSet) -> list[str]:
     used_groups = {group for group, comps in members.items() if any(c.id in referenced for c in comps)}
     problems: list[str] = []
     for comp in components:
-        if comp.intermediate and comp.id not in referenced and comp.alternative_group not in used_groups:
+        if not comp.intermediate or comp.id in referenced:
+            continue
+        if comp.alternative_group not in used_groups:
             problems.append(
                 f"component {comp.id!r}: an intermediate component must be a base or key term of a "
                 "later component"
+            )
+        elif not _zero_fixed(comp):
+            problems.append(
+                f"component {comp.id!r}: an unreferenced alternative-group member must be a fixed 0 "
+                "coverage member, or be a base or key term of a later component"
             )
     for group, comps in members.items():
         if len({c.intermediate for c in comps}) > 1:
@@ -1296,7 +1320,8 @@ def select_preview_rule_set(
       sets. A version that is closed in any copy (e.g. revoked in the database while
       the draft file still ships) is excluded entirely.
     - Copies of one version (``rule_set_id@version``, e.g. a draft file and its database
-      row) must have identical content; different content raises ``ValidationFailed``.
+      row) that are still open must have identical content; different content raises
+      ``ValidationFailed`` (a version closed in any copy is excluded before that check).
       Identical copies count once, at their most advanced status.
     - Order: approved, then under_review, then draft; within a status the latest
       ``valid_from`` wins, then the newest ``created_at`` (keyed by ``label()``; known
@@ -1311,15 +1336,21 @@ def select_preview_rule_set(
             copies.setdefault(rs.label(), []).append(rs)
     candidates: list[RuleSet] = []
     for tag, versions in copies.items():
-        if len({compute_rule_set_sha256(rs) for rs in versions}) > 1:
+        differs = len({compute_rule_set_sha256(rs) for rs in versions}) > 1
+        # A closed copy excludes the whole version first, so a revoked copy whose content
+        # differs from the shipped file can never block the previews of other versions.
+        closed = sorted({rs.status.value for rs in versions if rs.status in _CLOSED_STATUSES})
+        if closed:
+            considered.append(
+                f"{tag}: {', '.join(closed)}; never previewed"
+                + ("; copies differ in content" if differs else "")
+            )
+            continue
+        if differs:
             raise ValidationFailed(
                 "the same tax rule set version exists with different content",
                 details={"rule_set": tag},
             )
-        closed = sorted({rs.status.value for rs in versions if rs.status in _CLOSED_STATUSES})
-        if closed:
-            considered.append(f"{tag}: {', '.join(closed)}; never previewed")
-            continue
         open_copies = [rs for rs in versions if rs.status in _PREVIEW_STATUS_ORDER]
         if not open_copies:
             considered.append(f"{tag}: {versions[0].status.value} is never previewed")
@@ -1364,8 +1395,8 @@ def select_preview_rule_set(
     chosen = best[0]
     return RuleSelection(
         rule_set=chosen,
-        reason=f"INDICATIVE PREVIEW: selected {chosen.label()} ({chosen.status.value}); unapproved "
-        "rules, NOT production-ready, never used for valuations or alerts",
+        reason=f"INDICATIVE PREVIEW: selected {chosen.label()} ({chosen.status.value}); rules that are "
+        "not ACTIVE, NOT production-ready, never used for valuations or alerts",
         allow_unapproved=True,
         considered=tuple(considered),
         mode="indicative_preview",
@@ -1776,11 +1807,20 @@ def convert_with_customs_rate(
     return amount, tuple(resolved.warnings)
 
 
+#: Plain notation only within this exponent range: beyond it a decimal such as ``1E-100000000``
+#: (a valid, in-range CO2 figure from crawled JSON) would expand to one character per unit of
+#: exponent, so it is shown in scientific notation instead.
+_PLAIN_EXPONENT_LIMIT: Final = 30
+
+
 def _show(value: Scalar) -> str:
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Decimal):
-        return format(value, "f")  # plain notation: an exact quotient never shows as 1.00E+4
+        exp = value.as_tuple().exponent
+        if isinstance(exp, int) and -_PLAIN_EXPONENT_LIMIT <= exp <= _PLAIN_EXPONENT_LIMIT:
+            return format(value, "f")  # plain notation: an exact quotient never shows as 1.00E+4
+        return str(value)
     return str(value)
 
 

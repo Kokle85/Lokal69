@@ -113,14 +113,26 @@ def parse_locale_number(raw: str, *, kind: NumberKind) -> Decimal | None:
         return None
 
 
+#: Most fraction digits a JSON-LD number may carry. A literal such as ``1e-100000000`` passes
+#: every range check (it is tiny), yet it expands to one character per fraction digit wherever
+#: it is shown in plain notation; no listing quantity needs more. (A huge positive exponent
+#: fails the range checks and is reported as implausible there.)
+MAX_JSON_FRACTION_DIGITS = 12
+
+
 def decimal_from_json(value: Any, *, kind: NumberKind) -> Decimal | None:
-    """Decimal from a JSON-LD scalar (int, Decimal from parse_float, or a locale string)."""
+    """Decimal from a JSON-LD scalar (int, Decimal from parse_float, or a locale string). A
+    non-finite number, or one with more than ``MAX_JSON_FRACTION_DIGITS`` fraction digits, is
+    no value."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, int):
         return Decimal(value)
     if isinstance(value, Decimal):
-        return value if value.is_finite() else None
+        if not value.is_finite():
+            return None
+        exp = value.as_tuple().exponent
+        return value if isinstance(exp, int) and exp >= -MAX_JSON_FRACTION_DIGITS else None
     if isinstance(value, str):
         stripped = value.strip()
         # Machine format first (schema.org recommends '.' as the decimal mark, no grouping).

@@ -57,11 +57,11 @@ pytestmark = pytest.mark.db
 
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "config"
-DRAFT_NAME = "mk_passenger_car_import_2026.10-draft.1.json"
+DRAFT_NAME = "mk_passenger_car_import_2026.10-draft.2.json"
 DRAFT = CONFIG / "tax_rules" / "drafts" / DRAFT_NAME
 PROFILE = CONFIG / "cost_profiles" / "default_unapproved.yaml"
 RULE_SET_ID = "mk-passenger-car-import"
-VERSION = "2026.10-draft.1"
+VERSION = "2026.10-draft.2"
 TAX_RULES = "/api/settings/tax-rules"
 STORE = "/api/settings/tax-rules/store"
 TRANSITION = "/api/settings/tax-rules/transition"
@@ -261,7 +261,7 @@ async def test_listing_shows_the_unstored_draft_with_hash_uncertain_items_and_pr
     assert row["content_sha256"] == draft_hash() and row["sha256_sealed"] is False
     assert row["allowed_actions"] == ["store"] and row["production_selectable"] is False
     assert row["approval"] is None and row["created_at"] is None
-    assert len(row["components"]) == 19 and len(row["sources"]) == 8
+    assert len(row["components"]) == 21 and len(row["sources"]) == 8
     assert any(c["intermediate"] for c in row["components"])
     assert row["uncertain_items"] and all("UNCERTAIN" in item for item in row["uncertain_items"])
     assert listing["calculator"]["mode"] == "indicative_preview"

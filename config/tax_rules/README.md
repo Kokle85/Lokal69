@@ -8,7 +8,7 @@ Spec section 16. Engine: `src/suv_deals/domain/tax_engine.py`. Approval procedur
 - `example_unapproved.json` (top level) has the exact spec section 16 shape with no
   components and status `unapproved`; it can never be selected and calculates nothing.
   The top level holds no rule set with rates (a test enforces it).
-- `drafts/mk_passenger_car_import_2026.10-draft.1.json` is the North Macedonian draft
+- `drafts/mk_passenger_car_import_2026.10-draft.2.json` is the North Macedonian draft
   (customs duty, motor-vehicle tax and import VAT on an HS 8703 passenger car) built from
   the research fact sheet of 2026-10-13. Status `draft`, no approver, no sealed hash;
   every point still to confirm is marked `UNCERTAIN - confirm`. Production selection
@@ -150,9 +150,12 @@ A bracket has exactly one of `input` and `key_terms`. With `key_terms`: no `tabl
 `integer_values_only`, no per-unit outcomes, a supported `key_currency`, and
 `customs_fx_rate` declared when `key_currency` differs from the rule currency;
 `key_currency` without `key_terms` is refused. Every intermediate component must be a
-`base` or `key_terms` term of a later component (`depends_on` alone is not enough),
-except a member of an `alternative_group` in which another member is used (such members
-give the group full coverage); all members of a group are intermediate or none is.
+`base` or `key_terms` term of a later component (`depends_on` alone is not enough, and a
+bracket's `base` counts only when one of its rows has `rate_of_base`), except a `fixed`
+member of amount 0 in an `alternative_group` in which another member is used (such a
+member only gives the group full coverage; a non-zero one would vanish from the total);
+all members of a group are intermediate or none is. A `base` or `key_terms` list never
+repeats a term (it would be summed twice).
 
 Approved/active/superseded/expired versions need sources, approver, approval time,
 review record, valid_from, currency, categories, components (at least one of them not

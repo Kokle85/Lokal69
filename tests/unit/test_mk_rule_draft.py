@@ -46,9 +46,9 @@ from suv_deals.errors import ValidationFailed
 
 REPO = Path(__file__).resolve().parents[2]
 DRAFTS = REPO / "config" / "tax_rules" / "drafts"
-DRAFT = DRAFTS / "mk_passenger_car_import_2026.10-draft.1.json"
+DRAFT = DRAFTS / "mk_passenger_car_import_2026.10-draft.2.json"
 #: Content hash of the shipped draft. A changed draft is a new version, never an edit.
-DRAFT_CONTENT_SHA256 = "60d41fd7db5d7c64fc6346cb2c9d2e8966e6f02bb7724f76ec4d6282b84b50c9"
+DRAFT_CONTENT_SHA256 = "a856d5e401eb87e728079be0bfe3a723311480d6cdf1f38123cf6c052603d4b7"
 CATEGORY = "passenger_car"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 DECL = date(2026, 10, 13)
@@ -173,7 +173,7 @@ def test_drafts_directory_ships_only_unapproved_sourced_drafts() -> None:
 
 def test_draft_identity_and_content_hash_are_pinned() -> None:
     rule_set = draft()
-    assert rule_set.label() == "mk-passenger-car-import@2026.10-draft.1"
+    assert rule_set.label() == "mk-passenger-car-import@2026.10-draft.2"
     assert (rule_set.jurisdiction, rule_set.currency, rule_set.vehicle_categories) == (
         "MK",
         "MKD",
@@ -181,7 +181,7 @@ def test_draft_identity_and_content_hash_are_pinned() -> None:
     )
     assert rule_set.valid_from == date(2025, 7, 1) and rule_set.valid_to is None
     assert compute_rule_set_sha256(rule_set) == DRAFT_CONTENT_SHA256
-    assert len(rule_set.sources) == 8 and len(rule_set.components) == 19
+    assert len(rule_set.sources) == 8 and len(rule_set.components) == 21
 
 
 @pytest.mark.parametrize("on", [date(2025, 7, 1), DECL, date(2030, 1, 1)])
@@ -229,6 +229,8 @@ def test_every_uncertain_marker_is_kept() -> None:
         "dmv_co2_diesel",
         "dmv_co2_phev_petrol",
         "dmv_co2_phev_diesel",
+        "dmv_co2_deemed_phev_petrol",
+        "dmv_co2_deemed_phev_diesel",
         "vat_base_mkd",
     }
     description = rule_set.description or ""
@@ -236,7 +238,7 @@ def test_every_uncertain_marker_is_kept() -> None:
         assert topic in description
     assert description.count("UNCERTAIN") >= 2
     raw = DRAFT.read_text(encoding="utf-8")
-    assert raw.count("UNCERTAIN") == 16
+    assert raw.count("UNCERTAIN") == 18
 
 
 def test_draft_calculation_is_never_production_ready_and_never_rule_supported() -> None:
@@ -899,6 +901,8 @@ def test_u5_fuel_other_leaves_both_dmv_groups_with_a_gap() -> None:
             "dmv_co2_phev_diesel",
             "dmv_co2_deemed_petrol",
             "dmv_co2_deemed_diesel",
+            "dmv_co2_deemed_phev_petrol",
+            "dmv_co2_deemed_phev_diesel",
             "dmv_co2_bev_none",
             "dmv_full",
             "dmv_plugin_hybrid_half",
@@ -963,6 +967,8 @@ def test_u9_co2_document_outside_the_closed_code_set() -> None:
             "dmv_co2_phev_diesel",
             "dmv_co2_deemed_petrol",
             "dmv_co2_deemed_diesel",
+            "dmv_co2_deemed_phev_petrol",
+            "dmv_co2_deemed_phev_diesel",
             "dmv_co2_bev_none",
             "dmv_full",
             "vat_base_mkd",

@@ -5,8 +5,9 @@ Read-only under ``deals:read`` in the expensive rate-limit bucket; the closed in
 calculator service request (``persistence.queries.ImportCostRequest`` and the domain
 ``VehicleImportFacts``) with decimals as bounded strings; the output is the resolved
 ``ResponseEnvelope[ImportCostEstimateView]`` without JSON numbers. The description and the server
-instructions tell dot what it computes, that an ``indicative_preview`` comes from UNAPPROVED draft
-rules, that unknown inputs change the result and that no tool approves tax rules. No rate,
+instructions tell dot what it computes, that an ``indicative_preview`` comes from rules that are not
+ACTIVE (draft, under review or approved but not yet activated, as ``rule.status`` and the banner
+say), that unknown inputs change the result and that no tool approves tax rules. No rate,
 coefficient or threshold appears in the MCP layer. SYNTHETIC values only.
 """
 
@@ -194,8 +195,10 @@ def test_description_and_instructions_tell_dot_how_to_relay_the_result() -> None
         "landed cost",
         "EUR 700",
         "indicative_preview",
-        "UNAPPROVED draft rules",
-        "banner",
+        "rules that are not ACTIVE",
+        "approved but not yet activated",
+        "rule.status",
+        "banner unchanged",
         "CO2 document",
         "proof of origin",
         "never 0",
@@ -210,8 +213,10 @@ def test_description_and_instructions_tell_dot_how_to_relay_the_result() -> None
         "import VAT",
         "EUR 700",
         "indicative_preview",
-        "UNAPPROVED draft rules",
-        "banner",
+        "rules that are not ACTIVE",
+        "approved but not yet activated",
+        "rule.status",
+        "banner unchanged",
         "CO2 document",
         "proof of origin",
         "missing_facts",
@@ -219,6 +224,9 @@ def test_description_and_instructions_tell_dot_how_to_relay_the_result() -> None
         "approves tax rules",
     ):
         assert phrase in INSTRUCTIONS, phrase
+    # Regression: both texts called every preview "UNAPPROVED draft rules", contradicting the
+    # banner of an approved-but-not-active (or under-review) rule set.
+    assert "UNAPPROVED draft" not in description and "UNAPPROVED draft" not in INSTRUCTIONS
     # No rate, coefficient or threshold in the MCP layer: they live only in the rule-set JSON.
     for text in (description, INSTRUCTIONS, json.dumps(tool_input_schema(NAME))):
         assert "%" not in text and "percent" not in text.lower()

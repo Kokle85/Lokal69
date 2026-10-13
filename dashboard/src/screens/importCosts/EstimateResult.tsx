@@ -22,6 +22,8 @@ import { label, shortHash, yesNo } from '../../format'
 
 const FX_SOURCE_TEXT: Record<ImportCostEstimateView['customs_fx_source'], string> = {
   recorded: 'recorded Customs monthly list rate',
+  recorded_not_effective:
+    "the newest recorded Customs rate is of an earlier month and was not used: record this month's rate",
   caller_supplied: 'rate you entered (used for this estimate only, never stored)',
   not_needed: 'not needed (the rules are in EUR)',
   none: 'none: the MKD amounts that depend on it are unknown',
@@ -227,6 +229,8 @@ function ScenarioSection({ scenario, view }: { scenario: ImportScenarioView; vie
 
 const FACT_LABELS: Record<string, string> = {
   price: 'Purchase price',
+  price_in_eur_or_mkd: 'Price in EUR or MKD (a CHF price is not converted)',
+  customs_fx_rate: "Customs rate of the declaration month",
   price_basis: 'Price basis',
   declaration_date: 'Declaration date',
   fuel: 'Fuel / drive',
@@ -323,7 +327,8 @@ export function EstimateResult({ view, warnings }: { view: ImportCostEstimateVie
       {view.missing_facts.length ? (
         <Notice tone="warn">
           <p>
-            Needed to complete the calculation: <strong>{view.missing_facts.map(label).join(', ')}</strong>
+            Needed to complete the calculation:{' '}
+            <strong>{view.missing_facts.map((fact) => FACT_LABELS[fact] ?? label(fact)).join(', ')}</strong>
           </p>
         </Notice>
       ) : null}

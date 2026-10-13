@@ -37,10 +37,13 @@ from tests.integration.import_costs.support import (
 )
 from tests.integration.persistence_core.support import member
 
-from suv_deals.domain.enums import CostCategory, Role, Scope, TaxRuleStatus
+from suv_deals.domain.costs import load_cost_profile
+from suv_deals.domain.enums import Co2Cycle, CostCategory, Role, Scope, TaxRuleStatus
+from suv_deals.domain.listings import Co2Info
 from suv_deals.domain.money import Money
 from suv_deals.domain.tax_engine import RuleSet
 from suv_deals.errors import Forbidden, NotFound
+from suv_deals.persistence import valuation_repo
 from suv_deals.persistence.database import Database
 from suv_deals.persistence.queries import (
     ImportCostRequest,
@@ -116,7 +119,7 @@ async def test_preview_on_the_shipped_draft_from_listing_facts(db: Database, see
     assert view.facts.price.amount == "3000.00" and view.facts.co2_document == "coc"
     assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700.00 EUR") for a in view.assumptions)
     assert any(a.startswith("NO_ORIGIN_PROOF_STANDARD_DUTY") for a in view.assumptions)
-    assert any(n.startswith("COST_PROFILE:default@v3 (unapproved)") for n in view.notes)
+    assert "COST_PROFILE:default@v3 (unapproved; not yet stored in this workspace)" in view.notes
     assert view.unverified_inputs == ("price: advertised price, not an invoice or contract price",)
     async with unit_of_work(db, member(ws, Role.VIEWER)) as conn:
         result = await get_import_cost_estimate(
@@ -283,16 +286,62 @@ async def test_a_previous_month_rate_is_never_silently_used(db: Database, seed: 
     listing = add_listing(seed, ws, source, key)
     await record_customs_rate(db, ws, on=date(2026, 9, 1), value="61.6")
     old = await estimate(db, ws, request(listing_id=str(listing)))
-    assert old.customs_fx_source == "recorded" and not old.scenarios[0].complete
+    assert not old.scenarios[0].complete
+    # Regression: the stale rate was shown as the rate used ("recorded", eur_basis naming it) and
+    # missing_facts was empty, so the envelope said "needed: see the unknown components".
+    assert old.customs_fx_source == "recorded_not_effective" and old.customs_fx_rate is None
+    assert "customs_fx_rate" in old.missing_facts
+    assert old.eur_basis.startswith("no customs rate effective for 2026-10") and "not used" in old.eur_basis
     assert any(w.startswith("CUSTOMS_FX_RATE_NOT_FOR_DECLARATION_MONTH") for w in old.warnings)
+    async with unit_of_work(db, member(ws, Role.VIEWER)) as conn:
+        result = await get_import_cost_estimate(
+            conn, member(ws, Role.VIEWER), request(listing_id=str(listing)), config_dir=CONFIG, as_of=AS_OF
+        )
+    unknown = {w.code.value: w.message for w in result.warnings}["UNKNOWN_COSTS"]
+    assert "customs_fx_rate" in unknown and "see the unknown components" not in unknown
     cv_mkd = next(c for c in old.scenarios[0].components if c.component_id == "customs_value_mkd")
     assert cv_mkd.status == "unknown" and "CUSTOMS_FX_RATE_NOT_EFFECTIVE" in cv_mkd.warnings
     accepted = await estimate(db, ws, request(listing_id=str(listing), accept_previous_month_fx=True))
     assert accepted.scenarios[0].complete
+    assert accepted.customs_fx_source == "recorded" and accepted.customs_fx_rate is not None
+    assert "customs_fx_rate" not in accepted.missing_facts
     assert any(a.startswith("CUSTOMS_FX_PREVIOUS_MONTH_ACCEPTED") for a in accepted.assumptions)
     caller = await estimate(db, ws, request(listing_id=str(listing), customs_eur_mkd_rate=CUSTOMS_RATE))
     assert caller.customs_fx_source == "caller_supplied" and legal_total(caller) == G01
     assert any(w.startswith("CUSTOMS_FX_RATE_NOT_FOR_DECLARATION_MONTH") for w in caller.warnings)
+
+
+async def test_the_cost_profile_note_follows_the_stored_approval(db: Database, seed: Seed) -> None:
+    """Regression: the note always repeated the configured file's "unapproved", although the
+    owner approves the STORED version in Settings and valuations use that approved row."""
+    ws, source, key = workspace(seed, "Import costs profile note")
+    listing = add_listing(seed, ws, source, key)
+    configured = load_cost_profile(CONFIG / "cost_profiles" / "default_unapproved.yaml")
+    tag = f"COST_PROFILE:{configured.profile_key}@v{configured.version}"
+    first = await estimate(db, ws, request(listing_id=str(listing)))
+    assert f"{tag} (unapproved; not yet stored in this workspace)" in first.notes
+    async with unit_of_work(db, owner(ws)) as conn:
+        stored = await valuation_repo.store_cost_profile(conn, owner(ws), configured)
+    unapproved = await estimate(db, ws, request(listing_id=str(listing)))
+    assert f"{tag} (unapproved)" in unapproved.notes
+    async with unit_of_work(db, owner(ws)) as conn:
+        await valuation_repo.approve_cost_profile(conn, owner(ws), stored.id)
+    approved = await estimate(db, ws, request(listing_id=str(listing)))
+    assert f"{tag} (approved)" in approved.notes
+    assert not any("unapproved" in n for n in approved.notes if n.startswith("COST_PROFILE:"))
+
+
+async def test_a_listing_co2_of_zero_for_a_diesel_is_no_fact(db: Database, seed: Seed) -> None:
+    """Regression: a listing's CO2 0 g/km for a diesel gave a complete estimate with ДМВ 0."""
+    ws, source, key = workspace(seed, "Import costs zero CO2")
+    listing = add_listing(seed, ws, source, key, co2=Co2Info(g_per_km=Decimal(0), cycle=Co2Cycle.WLTP))
+    await record_customs_rate(db, ws)
+    view = await estimate(
+        db, ws, request(listing_id=str(listing), vehicle={"declaration_date": "2026-10-13"})
+    )
+    assert not view.scenarios[0].complete and view.facts.co2 == ()
+    assert {"co2", "co2_document"} <= set(view.missing_facts)
+    assert any(w.startswith("LISTING_CO2_NOT_A_FACT:0") for w in view.warnings), view.warnings
 
 
 # --------------------------------------------------------------------------- listings, isolation, scope

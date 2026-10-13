@@ -2,7 +2,10 @@
  * The customs calculator's vehicle-facts form. It only collects text: every value goes to the
  * server as typed (`GET /api/import-costs/estimate`), which validates it; fields a validation
  * error names are marked. On the listing route an empty field keeps the listing's fact (shown as
- * "From the listing: ..."); nothing is inferred here (no origin, no tariff code, no CO2 conversion).
+ * "From the listing: ..."), except a fact the server ties to one you enter: a CO2 figure you enter
+ * never takes the listing's CO2 document, and a price you enter counts as advertised unless you
+ * state its basis (`merge_facts`). Nothing is inferred here (no origin, no tariff code, no CO2
+ * conversion).
  */
 import { useState, type ReactNode } from 'react'
 import { FIELD_LABELS, type FormState, type HintKey, type QueryKey } from './form'
@@ -63,6 +66,32 @@ const IMPORTERS: Option[] = [
 
 const fieldId = (key: QueryKey) => `calc-${key.replace(/_/g, '-')}`
 
+const CO2_FIGURE_KEYS: readonly QueryKey[] = [
+  'co2_wltp_g_km',
+  'co2_nedc_g_km',
+  'co2_nedc_correlated_g_km',
+  'co2_unknown_cycle_g_km',
+]
+
+/**
+ * Facts the server derives from another fact you set, never from the listing (mirrors
+ * `queries.import_costs.merge_facts`): with a CO2 figure (or the "without CO2" box) the CO2
+ * document is only what you state, and a price you enter counts as advertised unless you state
+ * its basis. For these fields "Keep the listing's" would be untrue.
+ */
+const COUPLED: Partial<Record<QueryKey, { given(form: FormState): boolean; empty: string; hint: string }>> = {
+  co2_document: {
+    given: (form) => CO2_FIGURE_KEYS.some((key) => form[key].trim() !== '') || form.co2_clear === 'true',
+    empty: 'Not given (a CO2 figure you enter needs its own document)',
+    hint: "The listing's CO2 document is not applied to a CO2 figure you enter.",
+  },
+  price_basis: {
+    given: (form) => form.price_amount.trim() !== '' || form.price_currency !== '',
+    empty: 'Not given (counts as advertised)',
+    hint: "The listing's price basis is not applied to a price you enter.",
+  },
+}
+
 export interface CalculatorFormProps {
   initial: FormState
   /** The listing route: empty fields keep the listing's facts. */
@@ -79,8 +108,19 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
   const [form, setForm] = useState<FormState>(initial)
   const set = (key: QueryKey, value: string) => setForm((previous) => ({ ...previous, [key]: value }))
 
-  const hint = (key: HintKey): ReactNode =>
-    listingMode && hints[key] ? <span className="field-hint">From the listing: {hints[key]}</span> : null
+  /** The listing's fact no longer applies because the user set the fact it is tied to. */
+  const decoupled = (key: HintKey): boolean =>
+    listingMode && key !== 'co2' && Boolean(COUPLED[key]?.given(form))
+
+  const hint = (key: HintKey): ReactNode => {
+    if (decoupled(key)) return <span className="field-hint">{COUPLED[key as QueryKey]?.hint}</span>
+    return listingMode && hints[key] ? <span className="field-hint">From the listing: {hints[key]}</span> : null
+  }
+
+  const emptyLabel = (key: QueryKey, fallback: string): string => {
+    if (decoupled(key)) return COUPLED[key]?.empty ?? fallback
+    return listingMode && hints[key] ? `Keep the listing's (${hints[key]})` : fallback
+  }
 
   const text = (key: QueryKey, options: { help?: string; inputMode?: 'decimal' | 'numeric' | 'text'; type?: 'text' | 'date' } = {}) => (
     <div className="field" key={key}>
@@ -113,7 +153,7 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
       >
         {choices.map(([value, label]) => (
           <option key={value} value={value}>
-            {listingMode && value === '' && hints[key] ? `Keep the listing's (${hints[key]})` : label}
+            {value === '' ? emptyLabel(key, label) : label}
           </option>
         ))}
       </select>
@@ -150,7 +190,7 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
     >
       <p className="muted small">
         {listingMode
-          ? "Every field you fill in replaces the listing's fact; an empty field keeps the listing's value (or stays unknown, never zero)."
+          ? "Every field you fill in replaces the listing's fact; an empty field keeps the listing's value (or stays unknown, never zero). A CO2 figure you enter does not take the listing's CO2 document."
           : 'Fill in what you know. An empty field stays unknown (never zero), and the result says what is missing.'}{' '}
         Decimals use a dot (e.g. 3000.00). Nothing you enter is stored.
       </p>

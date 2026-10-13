@@ -8,7 +8,7 @@ Engine: `src/suv_deals/domain/tax_engine.py`; file format: `config/tax_rules/REA
 | Capability | State |
 |---|---|
 | Engine, validation, versioning, lifecycle, selection, missing-data handling | `implemented`, `fixture_verified` (synthetic golden/boundary tests) |
-| North Macedonian draft rule set | `draft` - `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json`, golden-tested (`tests/unit/test_mk_rule_draft.py`), **not approved** |
+| North Macedonian draft rule set | `draft` - `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`, golden-tested (`tests/unit/test_mk_rule_draft.py`), **not approved** |
 | Production North Macedonian rule set | `blocked` - no owner-approved, ACTIVE rule set exists |
 | Import-cost calculator (`domain/import_estimate.py`; read service `persistence/queries/import_costs.py`, view `views/import_costs.py`) | indicative preview on the draft only; never production-ready, never used for valuations or alerts |
 
@@ -65,8 +65,9 @@ a new version. Approval never activates automatically.
    Fixture rule sets can never be approved.
 6. **Activate** (`approved -> active`) per jurisdiction and vehicle category. Activation
    re-verifies the rule set and refuses overlap with another ACTIVE version of the same
-   jurisdiction/category and period (ambiguous applicability). Record the configuration
-   change (`TAX_RULE_SET_ID`, `config_revisions`).
+   jurisdiction/category and period (ambiguous applicability). Record the stored rule set
+   id, version and content hash (`suv-deals tax-rules list`); `suv-deals doctor` then reports
+   the ACTIVE set valuations select per workspace (`tax_rules/production`).
 7. **Supersede / expire / revoke** when the law or evidence changes. New valuations then
    select the new version or stay incomplete; existing valuations become stale through
    their dependency fingerprint (tax rule status, approval and validity are part of it).

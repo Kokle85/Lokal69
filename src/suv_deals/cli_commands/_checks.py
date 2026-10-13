@@ -463,6 +463,7 @@ def tax_rule_findings(tax_dir: Path, settings: Settings) -> list[Finding]:
             findings.append(Finding("tax_rules", name, "error", exc.message))
             continue
         is_draft = rule_set.status == TaxRuleStatus.DRAFT and not rule_set.is_fixture
+        labels.append(rule_set.rule_set_id)
         findings.append(
             Finding(
                 "tax_rules",
@@ -477,12 +478,17 @@ def tax_rule_findings(tax_dir: Path, settings: Settings) -> list[Finding]:
             )
         )
     if not production_ready:
+        # Files never activate anything: the owner stores, approves and activates rule sets in the
+        # database (Settings or `tax-rules store`), and valuations read only those. `doctor`
+        # reports the stored production selection per workspace (`tax_rule_readiness`).
         findings.append(
             Finding(
                 "tax_rules",
                 "activation",
                 "info",
-                "no approved/active rule set: import costs stay unknown and valuations incomplete (spec 16)",
+                "no approved/active rule FILE in config/tax_rules (files never activate anything); "
+                "production valuations use the rule sets STORED in the database: `suv-deals doctor` "
+                "reports them per workspace, `suv-deals tax-rules list` lists them (spec 16)",
             )
         )
     if settings.tax_rule_set_id and settings.tax_rule_set_id not in labels:
@@ -491,7 +497,7 @@ def tax_rule_findings(tax_dir: Path, settings: Settings) -> list[Finding]:
                 "tax_rules",
                 "tax_rule_set_id",
                 "warn",
-                "TAX_RULE_SET_ID names no rule file in config/tax_rules",
+                "TAX_RULE_SET_ID names no rule file in config/tax_rules or config/tax_rules/drafts",
             )
         )
     return findings

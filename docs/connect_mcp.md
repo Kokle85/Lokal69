@@ -188,7 +188,7 @@ with the owner's fixed **EUR 700** transport per vehicle (the `transport` line o
 | Scope | `deals:read` (the read credential of section 3 already includes it; no new scope) |
 | Behaviour | read-only, idempotent, not open-world; nothing is stored: no valuation, cost line, alert, rate or audit row |
 | Rate limit | the expensive per-principal bucket (30 calls/minute), like paginated reads |
-| Rules | an ACTIVE, owner-approved rule set (mode `active`, exactly what valuations use); without one, an **indicative preview** on the newest unapproved draft (`config/tax_rules/drafts/`, mode `indicative_preview`); without any, mode `unavailable` |
+| Rules | an ACTIVE, owner-approved rule set (mode `active`, exactly what valuations use); without one, an **indicative preview** on the best rule set that is not ACTIVE (approved but not yet activated, then under review, then draft; stored or `config/tax_rules/drafts/`), mode `indicative_preview`; without any, mode `unavailable` |
 | Contract | `schemas/tools/deals_estimate_import_costs.json`, docs/api_contract.md section 7 |
 
 No MCP tool approves or activates tax rules; that stays an owner act with a review record
@@ -237,14 +237,15 @@ are strings (`"3000.00"`, never `3000`).
 
 | Field (`data.`) | Meaning | What dot says |
 |---|---|---|
-| `mode` | `active`, `indicative_preview` or `unavailable` | in a preview: "indicative, from unapproved draft rules"; unavailable: "import charges unknown" |
+| `mode` | `active`, `indicative_preview` or `unavailable` | in a preview: "indicative", and relay the banner, which names the rule status (draft, under review, or approved but not yet active); never call an approved set unapproved; unavailable: "import charges unknown" |
 | `banner.mk` / `banner.en` | the preview label | relay it with the figures, unchanged |
 | `production_ready` | `false` in every preview | never present a preview as a customs assessment or a final total |
 | `scenarios[0]` (`legal_base`) | `indicative_total` (MKD, a preview) or `total` (active rules), `indicative_total_eur` / `total_eur`, `indicative_landed_cost_eur` / `landed_cost_eur`, `categories` (import duty, motor-vehicle tax, import VAT) and `components` (helpers flagged `intermediate` are never added) | the total, the three charges and the landed cost, with the mode |
 | `scenarios[0].complete: false` | some charge is unknown: the total is `{"status": "unknown", "amount": null}`, `known_subtotal` shows what resolved | "incomplete"; never call the subtotal a total, never treat an unknown charge as 0 |
 | other `scenarios` | `standard_duty_if_proof_rejected`, `customs_revaluation_risk` | the alternative next to the legal base |
-| `missing_facts`, `missing_inputs` | what to supply (e.g. `co2_document`, `origin_proof`, `customs_fx_rate`, `hs_code`) | ask the owner for those documents |
-| `assumptions`, `warnings`, `unverified_inputs`, `uncertain_items` | the labelled assumptions (fixed transport, no proof means standard duty), claims that are not evidence (an advertised price, a listing CO2 figure) and rule statements still marked UNCERTAIN | mention the ones the figures rest on |
+| `missing_facts`, `missing_inputs` | what to supply (e.g. `co2_document`, `co2`, `origin_proof`, `customs_fx_rate`, `hs_code`, `fuel`; `price_in_eur_or_mkd` when a CHF price cannot be converted) | ask the owner for those documents or figures |
+| `customs_fx_rate`, `customs_fx_source` | the customs rate actually used (`recorded`, `caller_supplied`, `not_needed`, `none`, or `recorded_not_effective`: the newest recorded rate is of an earlier month and was NOT used) | with `recorded_not_effective` or `none`, ask the owner to record this month's Customs rate |
+| `assumptions`, `warnings`, `unverified_inputs`, `uncertain_items` | the labelled assumptions (fixed transport, no proof means standard duty), claims that are not evidence (an advertised price, a listing CO2 figure) and rule statements still marked UNCERTAIN; warnings such as `HS_CODE_FUEL_MISMATCH` (the attested tariff code and the fuel disagree), `CO2_ZERO_FOR_COMBUSTION_VEHICLE` (under 1 g/km is not a figure for a combustion car), `FIRST_REGISTRATION_IMPLAUSIBLE` and `RULE_SET_DOES_NOT_COVER_VEHICLE` (no fact completes the charge under these rules) | mention the ones the figures rest on; for a mismatch ask which fact is right |
 | `gates.importable` | the Euro-class import gate (`yes`, `no`, `unknown`); it never changes an amount | warn when `no` or `unknown` |
 | envelope `warnings` | `TAX_RULES_UNAPPROVED` (preview), `UNKNOWN_COSTS`, `SELLER_CLAIMS_UNVERIFIED`, `FIXTURE_DATA` | as above |
 

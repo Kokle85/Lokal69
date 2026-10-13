@@ -8,7 +8,8 @@ tool ``deals_estimate_import_costs`` and the dashboard (``persistence.queries.im
 - Read-only (scope ``deals:read``, the operator's system actor): no valuation, cost line, alert,
   rate or audit row is written, so there is no ``--yes``.
 - Rules: an ACTIVE, owner-approved rule set when one applies (``mode: active``); otherwise an
-  INDICATIVE PREVIEW of the newest unapproved version, shown with the MK/EN banner, totals named
+  INDICATIVE PREVIEW of the best version that is not ACTIVE (approved, under review, then draft),
+  shown with the MK/EN banner naming its status, totals named
   ``indicative_total`` and never production-ready; otherwise ``unavailable``.
 - Unknown is never zero: a missing fact leaves the dependent charges unknown and is listed under
   "missing facts". Nothing is inferred: no proof of origin unless ``--origin-proof`` names one
@@ -478,7 +479,7 @@ def estimate(
     """Estimate customs duty, motor-vehicle tax (ДМВ) and import VAT for one vehicle (read-only).
 
     Give --listing-id, vehicle facts or both. Without an ACTIVE, owner-approved rule set the
-    result is an INDICATIVE PREVIEW of the unapproved draft (never production-ready, never stored,
+    result is an INDICATIVE PREVIEW of a rule set that is not ACTIVE (never production-ready, never stored,
     never used for valuations or alerts). Missing facts stay unknown, never zero.
     """
     request = build_request(options)

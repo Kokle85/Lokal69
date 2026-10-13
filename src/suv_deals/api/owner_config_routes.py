@@ -71,6 +71,7 @@ from suv_deals.domain.enums import CostCategory, TaxRuleStatus
 from suv_deals.domain.import_estimate import DEFAULT_JURISDICTION, DEFAULT_VEHICLE_CATEGORY
 from suv_deals.domain.tax_engine import (
     ALLOWED_TRANSITIONS,
+    CLOSED_RULE_STATUSES,
     RuleSet,
     compute_rule_set_sha256,
     load_rule_set_file,
@@ -358,9 +359,14 @@ async def tax_rule_sets_view(
         if copy is None:
             summaries.append(rule_set_summary(draft.rule_set, stored=None, file_name=draft.name))
         elif compute_rule_set_sha256(copy.rule_set) != compute_rule_set_sha256(draft.rule_set):
+            closed = copy.rule_set.status in CLOSED_RULE_STATUSES
             file_notes.append(
                 f"{draft.name}: the stored {draft.rule_set.label()} ({copy.rule_set.status.value}) has "
-                "DIFFERENT content; give the file a new version (content is never overwritten)"
+                + (
+                    "DIFFERENT content; the version is closed, so neither copy is ever previewed"
+                    if closed
+                    else "DIFFERENT content; give the file a new version (content is never overwritten)"
+                )
             )
     on_date = (await _now(conn)).date()
     return TaxRuleSetsView(
@@ -500,9 +506,7 @@ async def transition_rule_set(
 
 def profile_content_sha256(profile: CostProfile) -> str:
     """The profile's content hash without the approval record (what the owner approves)."""
-    return profile.model_copy(
-        update={"approval_status": "unapproved", "approved_by": None, "approved_at": None}
-    ).sha256()
+    return profile.content_sha256()
 
 
 def configured_profile(config_dir: Path) -> tuple[CostProfile | None, str | None]:

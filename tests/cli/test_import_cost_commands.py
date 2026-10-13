@@ -45,7 +45,7 @@ from suv_deals.domain.tax_engine import (
 from suv_deals.views.import_costs import FactSource, ImportCostEstimateView
 
 REPO = Path(__file__).resolve().parents[2]
-DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.1.json"
+DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.2.json"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 G01 = "168154.45"  # D1: diesel, NEDC 189 (COC), EUR 3,000 + EUR 700 transport, no proof of origin
 G01_FACTS = (
@@ -193,7 +193,7 @@ def test_a_preview_is_labelled_in_both_languages_and_names_its_totals_indicative
     assert "!! ИНДИКАТИВНА ПРОЦЕНКА" in text and "!! INDICATIVE PREVIEW" in text
     assert "Display only" in text
     assert (
-        "mk-passenger-car-import@2026.10-draft.1 (draft)" in text
+        "mk-passenger-car-import@2026.10-draft.2 (draft)" in text
         and "an unsealed draft has no recorded hash" in text
     )
     assert f"indicative_total : {G01} MKD  (2732.72 EUR)" in text
@@ -293,7 +293,7 @@ def test_store_shows_the_target_and_needs_yes(run_cli: Cli) -> None:
         "tax-rules", "store", str(DRAFT), "--owner-user-id", "00000000-0000-4000-8000-000000000001"
     )
     assert result.exit_code == 3
-    assert "mk-passenger-car-import@2026.10-draft.1" in result.output
+    assert "mk-passenger-car-import@2026.10-draft.2" in result.output
     assert "content sha256   : " + compute_rule_set_sha256(load_rule_set_file(DRAFT)) in result.output
     assert "re-run with --yes" in result.output
     missing_owner = run_cli("tax-rules", "store", str(DRAFT), "--yes")

@@ -579,6 +579,19 @@ def test_out_of_range_values_are_dropped_not_fatal(de_adapter: SchemaOrgDealerAd
     } <= set(listing.warnings)
 
 
+@pytest.mark.parametrize("literal", ["1e-100000000", "0e-999999999"])
+def test_co2_with_an_extreme_exponent_is_dropped(de_adapter: SchemaOrgDealerAdapter, literal: str) -> None:
+    """Regression: an in-range JSON number such as 1e-100000000 was stored as the CO2 figure and
+    expanded to 100 MB wherever it was shown in plain notation (import-cost estimate)."""
+    listing = _parse(
+        de_adapter,
+        '{"@type":"Car","name":"X","fuelType":"Benzin","emissionsCO2":' + literal + ","
+        '"offers":{"price":2750,"priceCurrency":"EUR"}}',
+    )
+    assert listing.co2.g_per_km is None
+    assert "CO2_MISSING" in listing.warnings
+
+
 def test_detail_url_serving_a_result_list(de_adapter: SchemaOrgDealerAdapter) -> None:
     html = car_page('{"@type":"ItemList","itemListElement":["https://dealer.example/fahrzeug/TEST-204"]}')
     parsed = de_adapter.parse_detail(raw_document(f"{DE}/TEST-502", html))

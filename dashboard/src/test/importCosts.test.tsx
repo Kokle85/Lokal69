@@ -109,6 +109,26 @@ describe('customs calculator form', () => {
     expect(screen.getByText(/Unknown charges are\s+never counted as zero/)).toBeInTheDocument()
   })
 
+  it('names what to supply in words and never shows a stale customs rate as the rate used', async () => {
+    // Regression: a CHF price was asked for as a missing "price", and a previous month's recorded
+    // rate read as "recorded Customs monthly list rate" while no EUR equivalent was computed.
+    const view = importEstimate({
+      scenarios: [incompleteScenario()],
+      missing_facts: ['price_in_eur_or_mkd', 'customs_fx_rate'],
+      customs_fx_source: 'recorded_not_effective',
+      customs_fx_rate: null,
+    })
+    const api = calculatorApi(() => ok(view))
+    renderApp('/import-costs?fuel=diesel&price_amount=3000.00&price_currency=CHF', { api })
+    await screen.findByTestId('totals-legal_base')
+    const needed = screen.getByText('Needed to complete the calculation:').closest('p')!
+    expect(needed).toHaveTextContent('Price in EUR or MKD (a CHF price is not converted)')
+    expect(needed).toHaveTextContent('Customs rate of the declaration month')
+    expect(needed).not.toHaveTextContent(/Purchase price/)
+    expect(screen.getByText(/the newest recorded Customs rate is of an earlier month and was not used/)).toBeInTheDocument()
+    expect(screen.queryByText(/· recorded Customs monthly list rate/)).not.toBeInTheDocument()
+  })
+
   it('names the fields a validation error points at and never claims a result', async () => {
     const api = calculatorApi(() =>
       apiError(422, 'VALIDATION_ERROR', 'Invalid import-cost estimate request', { details: { fields: ['price_currency'] } }),
@@ -174,6 +194,27 @@ describe('customs calculator from a listing', () => {
     })
     expect(router.state.location.pathname).toBe(`/candidates/${LISTING_ID}/import-costs`)
     expect(router.state.location.search).toBe('?co2_document=coc&origin_proof_kind=eu')
+  })
+
+  it("never promises to keep the listing's CO2 document for a CO2 figure the user enters", async () => {
+    // Regression: the select said "Keep the listing's (listing claim unverified)", yet the server
+    // drops the listing's document whenever the request sets CO2 figures without one.
+    const api = calculatorApi(() => ok(listingEstimate()))
+    renderApp(`/candidates/${LISTING_ID}/import-costs`, { api })
+    const user = userEvent.setup()
+    await screen.findByTestId('estimate-banner')
+    const keep = "Keep the listing's (listing claim unverified)"
+    expect(screen.getByRole('option', { name: keep })).toBeInTheDocument()
+    await user.type(screen.getByLabelText('CO2 WLTP (g/km)'), '210')
+    expect(screen.queryByRole('option', { name: keep })).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('option', { name: 'Not given (a CO2 figure you enter needs its own document)' }),
+    ).toBeInTheDocument()
+    expect(screen.getByText("The listing's CO2 document is not applied to a CO2 figure you enter.")).toBeInTheDocument()
+    await user.clear(screen.getByLabelText('CO2 WLTP (g/km)'))
+    expect(screen.getByRole('option', { name: keep })).toBeInTheDocument()
+    await user.click(screen.getByLabelText('Ignore the listing CO2 figure'))
+    expect(screen.queryByRole('option', { name: keep })).not.toBeInTheDocument()
   })
 
   it('labels ACTIVE rules as such (totals, no preview banner) and an unavailable result as unknown', async () => {

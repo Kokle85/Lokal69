@@ -40,7 +40,7 @@ pytestmark = pytest.mark.db
 
 REPO = Path(__file__).resolve().parents[2]
 G01 = "168154.45"  # D1: diesel, NEDC 189 (COC), EUR 3,000 + EUR 700 transport, no proof of origin
-LABEL = "mk-passenger-car-import@2026.10-draft.1"
+LABEL = "mk-passenger-car-import@2026.10-draft.2"
 FACTS = (
     "--price", "3000", "--fuel", "diesel", "--co2", "nedc:189", "--co2-document", "coc",
     "--declaration-date", "2026-10-13",
@@ -219,7 +219,7 @@ def test_list_then_store_the_shipped_draft_as_the_owner(
     stored = run_cli(*store, "--owner-user-id", str(owner), "--yes", env=db_env)
     assert stored.exit_code == 0, stored.output
     assert f"Stored {LABEL} as draft" in stored.output and "NOT approved" in stored.output
-    assert _stored(seed, workspace) == [("draft", "2026.10-draft.1", owner)]
+    assert _stored(seed, workspace) == [("draft", "2026.10-draft.2", owner)]
     audits = seed.conn.execute(
         "select actor_principal_id, actor_kind, metadata ->> 'rule_set' from ops.audit_events"
         " where workspace_id = %s and action = 'tax_rules.store'",
@@ -273,3 +273,28 @@ def test_store_refuses_different_content_under_a_stored_version(
         run_cli("tax-rules", "list", "--workspace", str(workspace), "--json", env=db_env).output
     )
     assert listed["calculator"]["mode"] == "indicative_preview"  # the stored copy equals the file
+
+
+def _production_line(output: str, workspace: UUID) -> str:
+    """The doctor's ``tax_rules/production`` line of ``workspace`` (prefixed by its id when the
+    database holds several active workspaces)."""
+    lines = [ln for ln in output.splitlines() if "tax_rules/" in ln and "production" in ln]
+    mine = [ln for ln in lines if f"tax_rules/{str(workspace)[:8]}:production" in ln]
+    plain = [ln for ln in lines if "tax_rules/production" in ln]
+    found = mine or plain
+    assert len(found) == 1, output
+    return found[0]
+
+
+def test_doctor_reports_the_stored_active_rule_set(
+    run_cli: Cli, db_env: dict[str, str], db_url: str, workspace: UUID
+) -> None:
+    """Regression: doctor judged production readiness from files only, so after the owner
+    activated the MK set in the database it still said "no approved/active rule set"."""
+    before = run_cli("doctor", "--process", "scheduler", env=db_env)
+    line = _production_line(before.output, workspace)
+    assert "no ACTIVE stored rule set applies for MK/passenger_car" in line
+    _run(db_url, lambda db: activate(db, owner_actor(workspace), mk_draft()))
+    after = run_cli("doctor", "--process", "scheduler", env=db_env)
+    line = _production_line(after.output, workspace)
+    assert line.lstrip().startswith("OK") and f"ACTIVE {LABEL}" in line, after.output

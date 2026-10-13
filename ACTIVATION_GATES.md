@@ -237,8 +237,8 @@ Each step only needs the steps above it; any step can stop without affecting the
   over `valuation_repo.store_rule_set` / `transition_tax_rule_set`); `suv-deals tax-rules store`
   also stores a draft. The valuation pipeline reads rule sets only from the database. Nothing is
   approved or activated automatically: the gate stays `blocked` until the owner does it.
-- **Evidence:** rule set id/version and content SHA-256, review record, approver, activation time,
-  `TAX_RULE_SET_ID` and the configuration revision.
+- **Evidence:** rule set id/version and content SHA-256 (`suv-deals tax-rules list`), review record,
+  approver, activation time, and `suv-deals doctor` reporting `tax_rules/production` ACTIVE.
 
 ## 7. `cost_assumptions`
 

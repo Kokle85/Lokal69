@@ -83,7 +83,7 @@ import logging
 import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any, Final
 from uuid import UUID
 
@@ -599,6 +599,42 @@ async def _close_orphan_runs(conn: Conn, actor: ActorContext, limit: int) -> int
     return len(rows)
 
 
+async def _customs_rate_changes(
+    conn: Conn, actor: ActorContext, currency: str, today: date
+) -> list[valuation_repo.DependencyChange]:
+    """The newest real customs (monthly list) rate of the EUR/<currency> pair, in either stored
+    direction, invalidates valuations that read an OLDER one (it is valid in its own month only)
+    and incomplete valuations under a tax rule set that read none (recorded before the first
+    rate). Without any recorded customs rate there is nothing to invalidate."""
+    found: list[valuation_repo.StoredFxRate] = []
+    for base, quote in (("EUR", currency), (currency, "EUR")):
+        found += await valuation_repo.latest_fx_rates(
+            conn, actor, base=base, quote=quote, purpose=FxPurpose.CUSTOMS, on_or_before=today, limit=1
+        )
+    if not found:
+        return []
+    newest = max(found, key=lambda r: (r.rate.rate_date, r.rate.retrieved_at, str(r.id))).rate
+    detail = f"newer customs EUR/{currency} rate {newest.rate_date.isoformat()}"
+    return [
+        *(
+            valuation_repo.DependencyChange(
+                reason=InvalidationReason.FX,
+                fx_pair=(base, quote, FxPurpose.CUSTOMS),
+                fx_newer_than=newest.rate_date,
+                detail=detail,
+            )
+            for base, quote in (("EUR", currency), (currency, "EUR"))
+        ),
+        valuation_repo.DependencyChange(
+            reason=InvalidationReason.FX,
+            fx_missing_pair=("EUR", currency, FxPurpose.CUSTOMS),
+            detail=(
+                f"customs EUR/{currency} rate recorded ({newest.rate_date.isoformat()}); computed without one"
+            ),
+        ),
+    ]
+
+
 async def _expired_valuations(conn: Conn, actor: ActorContext, limit: int) -> list[UUID]:
     actor.require(Scope.DEALS_READ)
     async with mapped_errors():
@@ -895,6 +931,7 @@ class Reconciler:
                         limit=1,
                     )
                     changes += [valuation_repo.DependencyChange.new_fx_rate(rate) for rate in latest]
+                changes += await _customs_rate_changes(conn, actor, currency, today)
             try:
                 record, _config = await config_repo.current_config(conn, actor)
             except (NotFound, ValidationFailed):

@@ -1139,7 +1139,8 @@ _CALC_SPECS: Final[tuple[ToolSpec, ...]] = (
             "North Macedonia import charges for one passenger car: customs duty, motor-vehicle tax (DMV) "
             "and import VAT, plus the landed cost with the owner's fixed per-vehicle transport (EUR 700, "
             "cost profile). Facts come from listing_id and/or vehicle (vehicle fields win). Mode "
-            "indicative_preview means UNAPPROVED draft rules: relay the banner and call every figure "
+            "indicative_preview means rules that are not ACTIVE (draft, under review, or approved but not "
+            "yet activated; rule.status says which): relay the banner unchanged and call every figure "
             "indicative. A missing CO2 document or proof of origin changes the result; unknown charges are "
             "never 0. Read-only; no tool approves tax rules."
         ),

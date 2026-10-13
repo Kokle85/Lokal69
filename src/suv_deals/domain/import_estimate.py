@@ -80,6 +80,22 @@ DEFAULT_VEHICLE_CATEGORY: Final = "passenger_car"
 USED_VEHICLE_MIN_KM: Final = Decimal(1000)
 #: Sanity bound of a stated mileage (a larger figure is a parse error, never a fact).
 MAX_MILEAGE_KM: Final = Decimal(100_000_000)
+#: Most fraction digits a listing's CO2 figure may carry; more is a parse artefact, never a fact
+#: (and ``1e-100000000`` would expand to 100 MB wherever it is shown in plain notation).
+MAX_CO2_FRACTION_DIGITS: Final = 6
+#: Fuels that burn fuel in an engine: such a car cannot emit under 1 g/km, so a lower figure is
+#: a placeholder or a parse artefact (CO2 not established), never a fact.
+COMBUSTION_FUELS: Final = frozenset(
+    {
+        Fuel.PETROL,
+        Fuel.DIESEL,
+        Fuel.LPG,
+        Fuel.CNG,
+        Fuel.HYBRID_PETROL,
+        Fuel.HYBRID_DIESEL,
+        Fuel.PLUGIN_HYBRID,
+    }
+)
 
 Co2Document = Literal[
     "coc",
@@ -113,6 +129,18 @@ _EURO_CLASS = re.compile(
 )
 _ROMAN: Final[Mapping[str, int]] = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6}
 _COUNTRY: Final = r"^[A-Z]{2}$"
+#: HS 2022 subheadings of heading 8703 -> the drive types they cover (nomenclature, not a rate).
+#: An attested tariff code decides the motor-vehicle-tax treatment (ЗДМВ чл. 6(3)(1), 9(3)), so
+#: a fuel that contradicts it is never silently used. 870310 and 870390 are not constrained.
+_HS_FUELS: Final[Mapping[str, frozenset[Fuel]]] = {
+    **dict.fromkeys(("870321", "870322", "870323", "870324"), frozenset({Fuel.PETROL, Fuel.LPG, Fuel.CNG})),
+    **dict.fromkeys(("870331", "870332", "870333"), frozenset({Fuel.DIESEL})),
+    "870340": frozenset({Fuel.HYBRID_PETROL}),
+    "870350": frozenset({Fuel.HYBRID_DIESEL}),
+    "870360": frozenset({Fuel.PLUGIN_HYBRID}),
+    "870370": frozenset({Fuel.PLUGIN_HYBRID}),
+    "870380": frozenset({Fuel.ELECTRIC}),
+}
 #: Wide context for exact sums; nothing is rounded here except EUR display amounts.
 _CTX: Final = decimal.Context(prec=50)
 
@@ -277,6 +305,17 @@ class VehicleImportFacts(_Contract):
         return self
 
 
+def plausible_listing_co2(g_km: Decimal, fuel: Fuel) -> bool:
+    """Whether a listing's CO2 figure can be a fact: finite, within the reading's bounds, at most
+    ``MAX_CO2_FRACTION_DIGITS`` fraction digits, and not under 1 g/km for a combustion car."""
+    exp = g_km.as_tuple().exponent
+    if not isinstance(exp, int) or exp < -MAX_CO2_FRACTION_DIGITS:
+        return False
+    if not 0 <= g_km <= _input_bound("co2_g_km"):
+        return False
+    return not (fuel in COMBUSTION_FUELS and g_km < 1)
+
+
 def facts_from_listing(
     listing: NormalizedListing, *, payable: Money | None, declaration_date: date | None = None
 ) -> VehicleImportFacts:
@@ -285,7 +324,8 @@ def facts_from_listing(
     Callers override any fact with what they know better (invoice, COC, proof, HS code).
 
     Never raises for a listing value outside a fact's bounds (a parse error is not a fact):
-    such a value is left unknown."""
+    such a value is left unknown. So is a CO2 figure under 1 g/km for a combustion or hybrid
+    car (a placeholder, see ``plausible_listing_co2``)."""
     vehicle = listing.vehicle
     price = None
     if (
@@ -296,7 +336,7 @@ def facts_from_listing(
         price = PriceFact(amount=payable.amount, currency=payable.currency)
     readings: tuple[Co2Reading, ...] = ()
     document: Co2Document | None = None
-    if listing.co2.g_per_km is not None:
+    if listing.co2.g_per_km is not None and plausible_listing_co2(listing.co2.g_per_km, vehicle.fuel):
         readings = (Co2Reading(cycle=listing.co2.cycle, g_km=listing.co2.g_per_km),)
         document = "listing_claim_unverified"
     mileage = vehicle.mileage_km
@@ -375,6 +415,9 @@ class BuiltTaxInputs(_Contract):
     #: caller-attested proof of origin). Amounts computed from them are never presented as
     #: rule-supported (``costs.tax_cost_lines``), even under ACTIVE rules.
     unverified_inputs: tuple[str, ...] = ()
+    #: The customs rate when it is valid on the declaration date (its month, or last month's
+    #: when accepted for a preview); ``None`` when no rate was given or it is not effective.
+    effective_customs_rate: FxRate | None = None
 
     def scenario(self, name: EstimateScenarioName) -> ScenarioInputs | None:
         return next((s for s in self.scenarios if s.name == name), None)
@@ -474,29 +517,37 @@ def vehicle_age_range(first_registration: PartialDate, on: date) -> tuple[int, i
     allows, or ``None`` when unknown. ``2012-05`` is any day of May 2012, never the 1st."""
     if first_registration.value is None:
         return None
-    year = int(first_registration.value[:4])
-    if first_registration.precision == Precision.DAY:
-        try:
+    try:
+        year = int(first_registration.value[:4])
+        if first_registration.precision == Precision.DAY:
             earliest = latest = date.fromisoformat(first_registration.value)
-        except ValueError:
-            return None
-    elif first_registration.precision == Precision.MONTH:
-        month = int(first_registration.value[5:7])
-        earliest, latest = date(year, month, 1), _month_end(date(year, month, 1))
-    else:
-        earliest, latest = date(year, 1, 1), date(year, 12, 31)
+        elif first_registration.precision == Precision.MONTH:
+            month = int(first_registration.value[5:7])
+            earliest, latest = date(year, month, 1), _month_end(date(year, month, 1))
+        else:
+            earliest, latest = date(year, 1, 1), date(year, 12, 31)
+    except ValueError:
+        return None  # e.g. year 0000: not a calendar date, so the age is unknown
     return _completed_years(latest, on), _completed_years(earliest, on)
 
 
 def _age(facts: VehicleImportFacts, on: date, policy: EstimatePolicy) -> tuple[Decimal | None, list[str]]:
-    """Vehicle age only when the registration date's precision leaves a single value."""
+    """Vehicle age only when the registration date's precision leaves a single value. A date that
+    is no calendar date, or an age beyond the engine's own bound, is implausible: unknown, never
+    an error."""
     span = vehicle_age_range(facts.first_registration, on)
+    implausible = (
+        f"FIRST_REGISTRATION_IMPLAUSIBLE:{facts.first_registration.value}: not a plausible first "
+        f"registration for a declaration on {on.isoformat()}; vehicle age unknown"
+    )
     if span is None:
-        return None, []
+        return None, ([] if facts.first_registration.value is None else [implausible])
     fewest, most = span
     warnings: list[str] = []
     if most < 0:
         return None, ["FIRST_REGISTRATION_AFTER_DECLARATION: vehicle age unknown"]
+    if most > _input_bound("vehicle_age_years"):
+        return None, [implausible]
     if most >= policy.oldtimer_min_age_years:
         warnings.append(
             f"POSSIBLE_OLDTIMER_EXEMPTION_NOT_APPLIED: the vehicle may be {most} years old; the "
@@ -523,7 +574,8 @@ def _co2(facts: VehicleImportFacts) -> tuple[Decimal | None, Co2Cycle, list[str]
         )
     elif document == "none_available":
         warnings.append(
-            "CO2_NOT_ESTABLISHED: no ЗДМВ чл. 12(1) document; the rule set's deemed CO2 applies (чл. 12(2))"
+            "CO2_NOT_ESTABLISHED: no ЗДМВ чл. 12(1) document; чл. 12(2) deems 400 g/km, applied only "
+            "where the rule set models it for this vehicle"
         )
         if facts.co2:
             warnings.append("CO2_FIGURE_IGNORED: without a document the stated CO2 figure is not used")
@@ -534,6 +586,13 @@ def _co2(facts: VehicleImportFacts) -> tuple[Decimal | None, Co2Cycle, list[str]
     by_cycle = {reading.cycle: reading.g_km for reading in facts.co2}
     cycle = next(c for c in _CO2_CYCLE_PREFERENCE if c in by_cycle)
     value = by_cycle[cycle]
+    if value < 1 and facts.fuel in COMBUSTION_FUELS and document != "none_available":
+        warnings.append(
+            f"CO2_ZERO_FOR_COMBUSTION_VEHICLE:{value}: a {facts.fuel.value} car cannot emit under 1 g/km; "
+            "the figure is treated as not established. State the document's figure, or "
+            "co2_document=none_available for the deemed 400 g/km (ЗДМВ чл. 12(2))"
+        )
+        return None, Co2Cycle.UNKNOWN, assumptions, warnings
     if len(by_cycle) > 1:
         warnings.append(
             f"CO2_CYCLE_SELECTED:{cycle.value}: the document states several cycles; WLTP is used when "
@@ -600,11 +659,28 @@ def _classification(
         approval_status="approved",
         approved_by=attested_by,
     )
+    warnings: list[str] = []
+    if hs_code_contradicts_fuel(facts.hs_code, facts.fuel):
+        expected = ", ".join(sorted(f.value for f in _HS_FUELS[facts.hs_code]))
+        warnings.append(
+            f"HS_CODE_FUEL_MISMATCH:{facts.hs_code}/{facts.fuel.value}: the attested tariff code covers "
+            f"{expected}, not {facts.fuel.value}; the tariff code decides the motor-vehicle tax (ЗДМВ "
+            "чл. 6(3)(1), 9(3)), so it stays unknown until fuel and hs_code agree"
+        )
     return (
         classification,
         [f"HS_CODE_FROM_CALLER:{facts.hs_code}: attested by the caller, never inferred"],
-        [],
+        warnings,
     )
+
+
+def hs_code_contradicts_fuel(hs_code: str | None, fuel: Fuel) -> bool:
+    """Whether an attested HS-6 code names a drive type other than ``fuel`` (``other`` and
+    ``unknown`` never contradict; codes without a single drive type are not checked)."""
+    if hs_code is None or fuel in (Fuel.OTHER, Fuel.UNKNOWN):
+        return False
+    allowed = _HS_FUELS.get(hs_code)
+    return allowed is not None and fuel not in allowed
 
 
 def _with(inputs: TaxInputs, **changes: Any) -> TaxInputs:
@@ -663,6 +739,23 @@ def build_tax_inputs(
                 f"CUSTOMS_FX_PREVIOUS_MONTH_ACCEPTED:{customs_rate.rate_date.isoformat()}: last month's "
                 "customs rate is used for this preview"
             )
+        if not valid_from <= declaration <= valid_to:
+            # The engine refuses the rate (CUSTOMS_FX_RATE_NOT_EFFECTIVE); name the fact to supply.
+            needed.append("customs_fx_rate")
+            warnings.append(
+                f"CUSTOMS_FX_RATE_NOT_EFFECTIVE_FOR_DECLARATION:{customs_rate.rate_date.isoformat()}: the "
+                f"customs rate is valid {valid_from.isoformat()}..{valid_to.isoformat()}, not on "
+                f"{declaration.isoformat()}; the amounts that depend on it are unknown. Record the Customs "
+                f"monthly list rate for {declaration.strftime('%Y-%m')}"
+            )
+    effective_rate = (
+        customs_rate
+        if customs_rate is not None
+        and valid_from is not None
+        and valid_to is not None
+        and valid_from <= declaration <= valid_to
+        else None
+    )
     fx_inputs = TaxInputs(
         declaration_date=declaration,
         customs_fx_rate=customs_rate,
@@ -727,7 +820,8 @@ def build_tax_inputs(
         needed.append("price")
         warnings.append("PRICE_MISSING: purchase price unknown; customs value unknown")
     elif price.currency == "CHF":
-        needed.append("price")
+        # The price is known; what is missing is a price the customs value can use.
+        needed.append("price_in_eur_or_mkd")
         warnings.append(
             "CUSTOMS_VALUE_CHF_UNSUPPORTED: a CHF price plus EUR transport needs two customs rates; no "
             "reference rate is substituted, so the customs value is unknown"
@@ -774,13 +868,20 @@ def build_tax_inputs(
     if facts.fuel != Fuel.ELECTRIC:
         if facts.co2_document is None:
             needed.append("co2_document")
-        if not facts.co2 and facts.co2_document != "none_available":
+        # From the result, not the input: a figure that is not established is still missing.
+        if co2_value is None and facts.co2_document != "none_available":
             needed.append("co2")
     assumptions.extend(co2_assumptions)
     warnings.extend(co2_warnings)
     classification, class_assumptions, class_warnings = _classification(facts, vehicle_category, attested_by)
     if classification is None and facts.fuel == Fuel.PLUGIN_HYBRID:
         needed.append("hs_code")
+    # An attested tariff code that contradicts the fuel leaves the fuel-keyed charges unknown
+    # (never the treatment of the wrong drive type); the caller makes the two agree.
+    engine_fuel = facts.fuel
+    if hs_code_contradicts_fuel(facts.hs_code, facts.fuel):
+        engine_fuel = Fuel.UNKNOWN
+        needed.extend(("fuel", "hs_code"))
     assumptions.extend(class_assumptions)
     warnings.extend(class_warnings)
     age, age_warnings = _age(facts, declaration, policy)
@@ -795,7 +896,11 @@ def build_tax_inputs(
     unverified: list[str] = []
     if price is not None and facts.price_basis == "advertised":
         unverified.append("price: advertised price, not an invoice or contract price")
-    if facts.co2_document == "listing_claim_unverified" and facts.co2 and facts.fuel != Fuel.ELECTRIC:
+    if (
+        facts.co2_document == "listing_claim_unverified"
+        and co2_value is not None
+        and facts.fuel != Fuel.ELECTRIC
+    ):
         unverified.append("co2: listing claim, not a ЗДМВ чл. 12(1) document")
     if facts.origin_proof.claimed:
         unverified.append("origin_proof: caller attestation, acceptance by Customs assumed")
@@ -828,7 +933,7 @@ def build_tax_inputs(
         co2_cycle=co2_cycle,
         co2_source_document=facts.co2_document,
         emissions_class=facts.emissions_class,
-        fuel=facts.fuel,
+        fuel=engine_fuel,
         engine_displacement_cm3=facts.engine_displacement_cm3,
         power_kw=facts.power_kw,
         customs_fx_rate=customs_rate,
@@ -890,6 +995,7 @@ def build_tax_inputs(
         missing_facts=tuple(dict.fromkeys(needed)),
         notes=tuple(notes),
         unverified_inputs=tuple(unverified),
+        effective_customs_rate=effective_rate,
     )
 
 
@@ -1241,13 +1347,42 @@ def _mode(selection: RuleSelection) -> EstimateMode:
     return "indicative_preview"
 
 
-def _eur_basis(rate: FxRate | None) -> str:
+def _eur_basis(rate: FxRate | None, *, given: FxRate | None = None, declaration: date | None = None) -> str:
+    """How EUR equivalents are computed: from the EFFECTIVE customs rate only. A rate that was
+    given but is not valid on the declaration date is named as not used."""
+    if rate is None and given is not None and declaration is not None:
+        return (
+            f"no customs rate effective for {declaration.strftime('%Y-%m')} (the given {given.base}/"
+            f"{given.quote} {given.rate} of {given.rate_date.isoformat()} is not used): EUR equivalents "
+            "and the landed cost are unknown"
+        )[:500]
     if rate is None:
         return "no customs rate: EUR equivalents and the landed cost are unknown"
     return (
         f"EUR equivalents at the customs rate {rate.base}/{rate.quote} {rate.rate} "
         f"({rate.rate_date.isoformat()}, {rate.provider}); not a payment or reference rate"
     )[:500]
+
+
+_GROUP_GAP: Final = re.compile(r"^ALTERNATIVE_GROUP_(GAP|AMBIGUOUS):(?P<group>[a-z0-9_]+):")
+
+
+def _coverage_gaps(scenario: EstimateScenario) -> list[str]:
+    """A rule-set alternative group with no (or several) applicable members for these facts.
+    No fact the caller can supply completes such a charge, so it is named here instead of
+    leaving an incomplete result with nothing listed as missing."""
+    gaps: dict[str, str] = {}
+    for comp in scenario.components:
+        for text in comp.warnings:
+            match = _GROUP_GAP.match(text)
+            if match is not None:
+                gaps.setdefault(match.group("group"), match.group(1).lower())
+    return [
+        f"RULE_SET_DOES_NOT_COVER_VEHICLE:{group}: {'no' if kind == 'gap' else 'more than one'} "
+        f"alternative of the rule set's {group} group applies to these facts; the dependent charges "
+        "stay unknown (not zero) and no further fact completes them under these rules"
+        for group, kind in gaps.items()
+    ]
 
 
 def estimate_import_costs(
@@ -1307,6 +1442,8 @@ def estimate_import_costs(
         )
         missing = scenarios[0].missing_inputs
     legal_base = scenarios[0] if scenarios else None
+    if legal_base is not None:
+        warnings.extend(_coverage_gaps(legal_base))
     facts_needed = tuple(
         dict.fromkeys(
             [
@@ -1330,8 +1467,10 @@ def estimate_import_costs(
         declaration_date=declaration_date_for(facts, as_of),
         as_of=as_of,
         currency=None if rule_set is None else rule_set.currency,
-        customs_fx_rate=customs_rate,
-        eur_basis=_eur_basis(customs_rate),
+        customs_fx_rate=built.effective_customs_rate,
+        eur_basis=_eur_basis(
+            built.effective_customs_rate, given=customs_rate, declaration=declaration_date_for(facts, as_of)
+        ),
         scenarios=scenarios,
         assumptions=built.assumptions,
         warnings=tuple(dict.fromkeys(warnings)),

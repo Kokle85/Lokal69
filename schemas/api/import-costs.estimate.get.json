@@ -440,6 +440,7 @@
           "customs_fx_source": {
             "enum": [
               "recorded",
+              "recorded_not_effective",
               "caller_supplied",
               "not_needed",
               "none"

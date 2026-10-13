@@ -38,6 +38,7 @@ from suv_deals.domain.tax_engine import (
     RuleSource,
     TaxCalculation,
     TaxInputs,
+    _show,
     calculate,
     compute_rule_set_sha256,
     load_rule_set_file,
@@ -373,9 +374,14 @@ def _helper_only_in_depends_on(d: dict[str, Any]) -> None:
     )
 
 
-def _helper_group(*, referenced: tuple[str, ...], second_intermediate: bool = True) -> Callable[..., None]:
+def _helper_group(
+    *, referenced: tuple[str, ...], second_intermediate: bool = True, second_amount: str = "5"
+) -> Callable[..., None]:
     def mutate(d: dict[str, Any]) -> None:
-        for comp_id, fuel_op, intermediate in (("h_a", "eq", True), ("h_b", "ne", second_intermediate)):
+        for comp_id, fuel_op, intermediate, amount in (
+            ("h_a", "eq", True, "5"),
+            ("h_b", "ne", second_intermediate, second_amount),
+        ):
             d["components"].append(
                 {
                     "id": comp_id,
@@ -386,7 +392,7 @@ def _helper_group(*, referenced: tuple[str, ...], second_intermediate: bool = Tr
                     "intermediate": intermediate,
                     "alternative_group": "helpers",
                     "applies_when": [{"input": "fuel", "op": fuel_op, "value": "diesel"}],
-                    "amount": "5",
+                    "amount": amount,
                 }
             )
         d["optional_inputs"].append("fuel")
@@ -416,6 +422,12 @@ def _helper_group(*, referenced: tuple[str, ...], second_intermediate: bool = Tr
         ),
         (_helper_group(referenced=(), second_intermediate=True), "component 'h_a': an intermediate"),
         (_helper_group(referenced=("h_a",), second_intermediate=False), "mixes intermediate and normal"),
+        # A non-zero member nobody references would resolve while h_a does not apply, and its
+        # amount would vanish from a complete total.
+        (
+            _helper_group(referenced=("h_a",), second_amount="99999"),
+            "component 'h_b': an unreferenced alternative-group member must be a fixed 0 coverage member",
+        ),
     ],
 )
 def test_intermediate_validation(mutate: Callable[[dict[str, Any]], None], needle: str) -> None:
@@ -426,14 +438,91 @@ def test_intermediate_validation(mutate: Callable[[dict[str, Any]], None], needl
 
 
 def test_unreferenced_group_member_is_accepted_for_coverage() -> None:
-    # Only h_a feeds the consumer; h_b exists to give the group full coverage.
-    rule = valid(_helper_group(referenced=("h_a",)))
+    # Only h_a feeds the consumer; h_b (a fixed 0) exists to give the group full coverage.
+    rule = valid(_helper_group(referenced=("h_a",), second_amount="0"))
     diesel = calculate(rule, inputs(fuel=Fuel.DIESEL), T0)
     assert amounts(diesel)["group_user"] == Decimal("5.00")
     petrol = calculate(rule, inputs(fuel=Fuel.PETROL), T0)
     assert result(petrol, "h_b").status == ComponentStatus.RESOLVED and result(petrol, "h_b").intermediate
     assert amounts(petrol)["group_user"] == Decimal("0")  # h_a not applicable contributes nothing
     assert petrol.total_import_cost == calculate(valid(), inputs(), T0).total_import_cost
+
+
+def test_non_zero_unreferenced_group_member_cannot_reach_an_active_total() -> None:
+    """Regression: the coverage exemption let a 99,999 helper pass validation, approval and
+    activation, and its amount vanished from a complete, production-ready total."""
+    mutate = _helper_group(referenced=("h_a",), second_amount="99999")
+    with pytest.raises(ValidationFailed, match="invalid"):
+        preview_set("orphan-member", TaxRuleStatus.ACTIVE, mutate=mutate)
+
+
+def _bracket_base_helper(d: dict[str, Any]) -> None:
+    """A helper listed only as the base of a per-unit CO2 bracket: no row sums the base."""
+    d["components"].insert(
+        3,
+        {
+            "id": "h_c",
+            "kind": "fixed",
+            "label": "SYNTHETIC helper in a bracket base nobody sums",
+            "category": "motor_vehicle_tax",
+            "currency": "MKD",
+            "intermediate": True,
+            "amount": "5000",
+        },
+    )
+    co2 = component(d, "co2_charge")
+    co2["base"] = ["h_c"]
+    co2["depends_on"] = ["h_c"]
+
+
+def _keyed_amount_only_base_helper(d: dict[str, Any]) -> None:
+    """A helper listed only as the base of a money-keyed bracket whose rows are amounts."""
+    d["components"].insert(
+        1,
+        {
+            "id": "h_d",
+            "kind": "fixed",
+            "label": "SYNTHETIC helper in a keyed bracket base nobody sums",
+            "category": "other_import_charges",
+            "currency": "MKD",
+            "intermediate": True,
+            "amount": "5000",
+        },
+    )
+    fee = component(d, "value_band_fee")
+    fee["brackets"] = [
+        {"over": None, "up_to": "1000", "amount": "0"},
+        {"over": "1000", "up_to": None, "amount": "9"},
+    ]
+    fee["base"] = ["h_d"]
+    fee["depends_on"] = ["value_helper", "h_d"]
+
+
+@pytest.mark.parametrize("mutate", [_bracket_base_helper, _keyed_amount_only_base_helper])
+def test_a_bracket_base_without_rate_of_base_rows_does_not_use_a_helper(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    """Regression: a bracket's base counted as a use although only a rate_of_base row sums it."""
+    problems = problems_of(mutate)
+    helper = "h_c" if mutate is _bracket_base_helper else "h_d"
+    assert any(
+        f"component '{helper}': an intermediate component must be a base or key term" in p for p in problems
+    ), problems
+
+
+@pytest.mark.parametrize(("field", "what"), [("key_terms", "key term"), ("base", "base term")])
+def test_duplicate_terms_are_rejected(field: str, what: str) -> None:
+    """Regression: a repeated term was summed twice, so a doubled key picked a higher band."""
+
+    def doubled(d: dict[str, Any]) -> None:
+        component(d, "value_band_fee")[field] = ["value_helper", "value_helper"]
+
+    problems = problems_of(doubled)
+    assert any(f"component 'value_band_fee': duplicate {what}(s) ['value_helper']" in p for p in problems), (
+        problems
+    )
+    with pytest.raises(ValidationFailed):
+        validate_rule_set(build(doubled))
 
 
 def test_approved_rule_set_needs_a_non_intermediate_component() -> None:
@@ -717,6 +806,24 @@ def test_amount_per_unit_multiplies_the_whole_value() -> None:
 # --------------------------------------------------------------------------- E5 integer guard
 
 
+@pytest.mark.parametrize("value", ["1E-100000000", "0E-999999999", "1E+100000000"])
+def test_extreme_exponent_is_shown_in_scientific_notation(value: str) -> None:
+    """Regression: plain-notation display wrote out every zero of a crawled ``1e-100000000``
+    (a valid CO2 figure in range), building strings of hundreds of MB per estimate."""
+    figure = Decimal(value)
+    calc = calculate(valid(), inputs(co2_g_km=figure if figure <= 2000 else Decimal("120")), T0)
+    longest = max(
+        len(text)
+        for comp in calc.components
+        for text in (*comp.warnings, *comp.inputs_used.values(), *comp.inputs_used.keys())
+    )
+    assert longest < 1000
+    assert len(calc.model_dump_json()) < 100_000
+    assert len(_show(figure)) < 40
+    assert _show(Decimal("1.00E+4")) == "10000"  # small exponents keep plain notation
+    assert _show(Decimal("0.0000001")) == "0.0000001"
+
+
 def test_non_integer_value_is_unknown_under_the_integer_guard() -> None:
     calc = calculate(valid(), inputs(co2_g_km=Decimal("120.5")), T0)
     co2 = result(calc, "co2_charge")
@@ -932,6 +1039,24 @@ def test_preview_copies_of_one_version() -> None:
     edited = preview_set("same", mutate=lambda d: d.update(description="SYNTHETIC other content"))
     with pytest.raises(ValidationFailed, match="different content"):
         preview([file_copy, edited])
+
+
+def test_a_closed_copy_with_different_content_excludes_its_version_without_blocking_others() -> None:
+    """Regression: the content check ran first, so revoking a differing stored copy still
+    raised for the whole selection and blocked every other version's preview."""
+    file_copy = preview_set("same")
+    edited_revoked = preview_set(
+        "same", TaxRuleStatus.REVOKED, mutate=lambda d: d.update(description="SYNTHETIC other content")
+    )
+    other = preview_set("other")
+    selection = preview([file_copy, edited_revoked, other])
+    assert selection.rule_set is other
+    assert any(
+        c.startswith(f"{file_copy.label()}: revoked; never previewed") and "copies differ in content" in c
+        for c in selection.considered
+    ), selection.considered
+    alone = preview([file_copy, edited_revoked])
+    assert alone.rule_set is None and "no indicative preview" in alone.reason
 
 
 def test_preview_result_is_never_production_ready() -> None:

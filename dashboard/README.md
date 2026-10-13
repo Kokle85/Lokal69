@@ -18,7 +18,7 @@ static single-page app (Vite 8 + React 19.3 + React Router 8 + TypeScript 6) tha
   starting from that listing's facts; `GET /api/import-costs/estimate`, the same calculation dot
   gets through MCP): North Macedonian customs duty, motor-vehicle tax (ДМВ), import VAT and the
   landed cost, all computed by the server. Until the owner activates an approved rule set the
-  result is an INDICATIVE PREVIEW on the unapproved draft, shown with the server's Macedonian and
+  result is an INDICATIVE PREVIEW on a rule set that is not active (the banner names its status), shown with the server's Macedonian and
   English banner and totals named "indicative"; unknown charges read "unknown" (never 0), helper
   components are secondary rows that are never counted, and the URL keeps the submitted facts;
 - has an owner-only **Tax rules and cost profile** section in Settings (`/api/settings/tax-rules`

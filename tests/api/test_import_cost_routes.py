@@ -374,6 +374,30 @@ async def test_unknown_inputs_stay_unknown_never_zero(calc: CalcHarness) -> None
 
 
 @pytest.mark.db
+@pytest.mark.parametrize(
+    "dates",
+    [
+        {"first_registration": "0000"},
+        {"first_registration": "0000-05"},
+        {"first_registration": "1800-01-01"},
+        {"declaration_date": "9999-12-31", "first_registration": "2020"},
+        {"declaration_date": "2026-12-31", "first_registration": "1800"},
+    ],
+)
+async def test_an_implausible_first_registration_is_never_a_server_error(
+    calc: CalcHarness, dates: dict[str, str]
+) -> None:
+    """Regression: year 0000 raised ValueError and an age over 200 a ValidationError in the shared
+    builder, so the route answered 500 INTERNAL_ERROR (retryable) instead of a labelled unknown."""
+    body = valid(await calc.estimate({**D1, "customs_eur_mkd_rate": CUSTOMS_RATE, **dates}))
+    data = body["data"]
+    assert data["facts"]["first_registration"] == dates["first_registration"]
+    assert any(w.startswith("FIRST_REGISTRATION_IMPLAUSIBLE:") for w in data["warnings"]), data["warnings"]
+    listing = valid(await calc.estimate({"listing_id": str(calc.listing_id), **dates}))
+    assert any(w.startswith("FIRST_REGISTRATION_IMPLAUSIBLE:") for w in listing["data"]["warnings"])
+
+
+@pytest.mark.db
 async def test_an_active_rule_set_takes_precedence(calc: CalcHarness) -> None:
     await record_customs_rate(calc.db, calc.workspace_id)
     await activate(calc.db, owner(calc.workspace_id), mk_draft())  # throwaway SYNTHETIC workspace only

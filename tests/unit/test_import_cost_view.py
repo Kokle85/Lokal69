@@ -217,6 +217,40 @@ def test_typed_warnings_label_preview_claims_and_fixtures() -> None:
     assert "advertised price" in warnings["SELLER_CLAIMS_UNVERIFIED"]
 
 
+def test_chf_price_is_named_as_unconverted_not_as_a_missing_price() -> None:
+    """Regression: a CHF price was reported as a missing 'price' ("needed: price") with the
+    generic customs-value reason, although the price was given."""
+    chf = facts(price={"amount": "3000.00", "currency": "CHF"}, catalogue_value_eur="6000")
+    view = view_of(estimate(chf), chf)
+    assert view.missing_facts == ("price_in_eur_or_mkd",)
+    legal = view.scenarios[0]
+    assert legal.customs_value.status == "unknown"
+    assert (
+        legal.customs_value.reason is not None and "CHF price is not converted" in legal.customs_value.reason
+    )
+    risk = next(s for s in view.scenarios if s.name == "customs_revaluation_risk")
+    assert risk.customs_value.status == "known"  # the catalogue value, not the CHF price
+    warnings = {w.code.value: w.message for w in import_cost_warnings(view)}
+    assert warnings["UNKNOWN_COSTS"].endswith("needed: price_in_eur_or_mkd")
+    eur = view_of(estimate(facts(price=None)), facts(price=None)).scenarios[0]
+    assert eur.customs_value.reason is not None and "the price, the transport or the customs rate" in (
+        eur.customs_value.reason
+    )
+
+
+def test_stale_customs_rate_is_named_in_the_envelope_and_never_shown_as_used() -> None:
+    """Regression: with a previous month's rate, missing_facts was empty ("needed: see the
+    unknown components") and eur_basis named the stale rate as the basis of EUR equivalents."""
+    stale = view_of(
+        estimate(customs_rate=rate("61.6", date(2026, 9, 1))), customs_fx_source="recorded_not_effective"
+    )
+    assert "customs_fx_rate" in stale.missing_facts and stale.customs_fx_rate is None
+    assert stale.customs_fx_source == "recorded_not_effective"
+    assert stale.eur_basis.startswith("no customs rate effective for 2026-10")
+    warnings = {w.code.value: w.message for w in import_cost_warnings(stale)}
+    assert "customs_fx_rate" in warnings["UNKNOWN_COSTS"]
+
+
 # --------------------------------------------------------------------------- the service's pure parts
 
 
@@ -289,7 +323,7 @@ def test_request_needs_something_to_estimate_and_refuses_floats() -> None:
 
 def test_draft_files_are_drafts_only(tmp_path: Path) -> None:
     shipped, notes = load_draft_rule_sets(CONFIG / DRAFT_RULES_DIR)
-    assert [rs.label() for rs in shipped] == ["mk-passenger-car-import@2026.10-draft.1"] and notes == []
+    assert [rs.label() for rs in shipped] == ["mk-passenger-car-import@2026.10-draft.2"] and notes == []
     drafts = tmp_path / "drafts"
     drafts.mkdir()
     shutil.copy(DRAFT, drafts / "a_draft.json")
@@ -331,9 +365,17 @@ def test_conflicting_or_revoked_copies_leave_the_calculator_unavailable() -> Non
     revoked = transition_rule_set(draft(), TaxRuleStatus.REVOKED, at=AS_OF)
     hidden = select_calculator_rule_set([stored(revoked)], [draft()], "MK", "passenger_car", DECL)
     assert hidden.rule_set is None and any("revoked" in c for c in hidden.considered)
-    other = RuleSet.model_validate({**draft().model_dump(), "version": "2026.10-draft.2"})
+    other = RuleSet.model_validate({**draft().model_dump(), "version": "2026.10-draft.3"})
     ambiguous = select_calculator_rule_set([], [draft(), other], "MK", "passenger_car", DECL)
     assert ambiguous.rule_set is None and "AMBIGUOUS_PREVIEW" in ambiguous.reason
+    # Regression: a REVOKED stored copy whose content differs from the shipped file raised for
+    # the whole selection, so revoking it could never unblock the preview of another version.
+    revoked_changed = transition_rule_set(changed, TaxRuleStatus.REVOKED, at=AS_OF)
+    unblocked = select_calculator_rule_set(
+        [stored(revoked_changed), stored(other)], [draft()], "MK", "passenger_car", DECL
+    )
+    assert unblocked.rule_set == other and "CONFLICTING_RULE_SET_COPIES" not in unblocked.reason
+    assert any("revoked; never previewed; copies differ in content" in c for c in unblocked.considered)
 
 
 def test_service_paths_match_the_worker_runtime() -> None:

@@ -74,14 +74,14 @@ from suv_deals.domain.tax_engine import (
 from suv_deals.errors import ValidationFailed
 
 REPO = Path(__file__).resolve().parents[2]
-DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.1.json"
+DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.2.json"
 PROFILE = REPO / "config" / "cost_profiles" / "default_unapproved.yaml"
 MODULE = REPO / "src" / "suv_deals" / "domain" / "import_estimate.py"
-DRAFT_SHA256 = "60d41fd7db5d7c64fc6346cb2c9d2e8966e6f02bb7724f76ec4d6282b84b50c9"
+DRAFT_SHA256 = "a856d5e401eb87e728079be0bfe3a723311480d6cdf1f38123cf6c052603d4b7"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 DECL = date(2026, 10, 13)
 BANNER = (
-    "ИНДИКАТИВНА ПРОЦЕНКА – неодобрени нацрт-правила (mk-passenger-car-import@2026.10-draft.1). Не е "
+    "ИНДИКАТИВНА ПРОЦЕНКА – неодобрени нацрт-правила (mk-passenger-car-import@2026.10-draft.2). Не е "
     "царинска пресметка; не се користи за вреднувања ни известувања. / INDICATIVE PREVIEW – unapproved "
     "draft rules; not a customs assessment; never used for valuations or alerts."
 )
@@ -337,7 +337,10 @@ def test_chf_price_leaves_the_customs_value_unknown() -> None:
     assert base.customs_value is None and not base.complete
     assert base.indicative_total is None and base.indicative_landed_cost_eur is None
     assert base.known_subtotal is None
-    assert est.missing_facts == ("price",)
+    # The price is given; what is missing is a price the customs value can use (regression:
+    # it was reported as a missing "price").
+    assert est.missing_facts == ("price_in_eur_or_mkd",)
+    assert any(w.startswith("CUSTOMS_VALUE_CHF_UNSUPPORTED") for w in est.warnings)
     assert any(w.startswith("CUSTOMS_VALUE_CHF_UNSUPPORTED") for w in est.warnings)
     assert component_amount(est, "dmv_co2_diesel") == money("96390.00")  # nothing else is guessed
 
@@ -405,7 +408,7 @@ def test_preview_is_labelled_on_every_field() -> None:
     assert est.rule is not None
     assert (est.rule.rule_set_id, est.rule.version, est.rule.status) == (
         "mk-passenger-car-import",
-        "2026.10-draft.1",
+        "2026.10-draft.2",
         TaxRuleStatus.DRAFT,
     )
     assert est.rule.content_sha256 == DRAFT_SHA256 and not est.rule.sha256_recorded
@@ -442,6 +445,8 @@ def test_uncertain_items_list_every_marked_component_applicable_first() -> None:
         "dmv_co2_diesel",
         "dmv_co2_phev_petrol",
         "dmv_co2_phev_diesel",
+        "dmv_co2_deemed_phev_petrol",
+        "dmv_co2_deemed_phev_diesel",
         "vat_base_mkd",
     }
     applying = [i.component_id for i in components if i.applies]
@@ -1010,3 +1015,204 @@ def test_convert_with_customs_rate_applies_the_engine_checks() -> None:
     missing, codes = convert_with_customs_rate(Money.of("1", "EUR"), "MKD", reference)
     assert missing is None and codes[0].startswith("CUSTOMS_FX_RATE_WRONG_PURPOSE")
     assert convert_with_customs_rate(Money.of("1", "CHF"), "MKD", inputs)[0] is None
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def _mvt(est: ImportCostEstimate) -> Any:
+    return next(c for c in est.scenarios[0].categories if c.category == CostCategory.MOTOR_VEHICLE_TAX)
+
+
+@pytest.mark.parametrize("fuel", ["diesel", "petrol", "hybrid_petrol", "lpg", "plugin_hybrid"])
+@pytest.mark.parametrize("cycle", ["nedc", "wltp"])
+@pytest.mark.parametrize("document", ["coc", "listing_claim_unverified"])
+@pytest.mark.parametrize("figure", ["0", "0.5"])
+def test_co2_under_one_gram_for_a_combustion_car_is_not_established(
+    fuel: str, cycle: str, document: str, figure: str
+) -> None:
+    """Regression: CO2 0 g/km for a combustion car hit the Table 2 [0,1) row (coefficient 0), so
+    the ДМВ CO2 part came out 0 and the result was complete (54,414.25 instead of 168,154.45)."""
+    hs = {"hs_code": "870360"} if fuel == "plugin_hybrid" else {}
+    est = estimate(facts(fuel=fuel, co2=[{"cycle": cycle, "g_km": figure}], co2_document=document, **hs))
+    base = est.scenarios[0]
+    assert not base.complete and base.indicative_total is None
+    assert "co2" in est.missing_facts
+    assert any(w.startswith(f"CO2_ZERO_FOR_COMBUSTION_VEHICLE:{figure}") for w in est.warnings)
+    assert _mvt(est).status == ComponentStatus.UNKNOWN and _mvt(est).amount is None
+    built = build(facts(fuel=fuel, co2=[{"cycle": cycle, "g_km": figure}], co2_document=document, **hs))
+    assert built.inputs.co2_g_km is None and built.inputs.co2_cycle == Co2Cycle.UNKNOWN
+    assert not any(u.startswith("co2:") for u in built.unverified_inputs)
+
+
+def test_co2_zero_stays_a_fact_for_an_electric_car_and_one_gram_for_any_car() -> None:
+    electric = estimate(facts(fuel="electric", co2=[{"cycle": "wltp", "g_km": "0"}]))
+    assert electric.scenarios[0].complete and _mvt(electric).amount == money("0")
+    assert not any(w.startswith("CO2_ZERO_FOR_COMBUSTION_VEHICLE") for w in electric.warnings)
+    one = estimate(facts(co2=[{"cycle": "wltp", "g_km": "1"}]))
+    assert one.scenarios[0].complete and "co2" not in one.missing_facts
+    deemed = estimate(facts(co2=[{"cycle": "nedc", "g_km": "0"}], co2_document="none_available"))
+    assert deemed.scenarios[0].indicative_total == money("469774.25")  # the deemed 400 g/km applies
+
+
+def test_listing_co2_under_one_gram_for_a_combustion_car_is_no_fact() -> None:
+    """Regression: a dealer page's ``emissionsCO2: 0`` reached valuations and the calculator as
+    a listing claim and gave a complete, understated ДМВ."""
+    zero = _listing().model_copy(update={"co2": Co2Info(g_per_km=Decimal(0), cycle=Co2Cycle.WLTP)})
+    listed = facts_from_listing(zero, payable=Money.of("3000", "EUR"), declaration_date=DECL)
+    assert listed.co2 == () and listed.co2_document is None
+    est = estimate(listed)
+    assert not est.scenarios[0].complete and {"co2", "co2_document"} <= set(est.missing_facts)
+    electric = zero.model_copy(update={"vehicle": zero.vehicle.model_copy(update={"fuel": Fuel.ELECTRIC})})
+    kept = facts_from_listing(electric, payable=Money.of("3000", "EUR"))
+    assert kept.co2 == (Co2Reading(cycle=Co2Cycle.WLTP, g_km=Decimal(0)),)
+
+
+def test_listing_co2_with_an_extreme_exponent_is_no_fact() -> None:
+    """Regression: a crawled ``1e-100000000`` (in range) reached the engine and expanded to a
+    100 MB string per estimate; it is a parse artefact, never a fact."""
+    tiny = Co2Info(g_per_km=Decimal("1E-100000000"), cycle=Co2Cycle.WLTP)
+    electric = _listing().model_copy(update={"co2": tiny})
+    electric = electric.model_copy(
+        update={"vehicle": electric.vehicle.model_copy(update={"fuel": Fuel.ELECTRIC})}
+    )
+    listed = facts_from_listing(electric, payable=Money.of("3000", "EUR"))
+    assert listed.co2 == () and listed.co2_document is None
+    petrol = _listing().model_copy(update={"co2": tiny})
+    est = estimate(facts_from_listing(petrol, payable=Money.of("3000", "EUR"), declaration_date=DECL))
+    assert len(est.model_dump_json()) < 200_000
+
+
+@pytest.mark.parametrize(
+    ("hs", "deemed", "amount", "dmv", "total"),
+    [
+        ("870360", "dmv_co2_deemed_phev_petrol", "278000.00", "139000.00", "218434.25"),
+        ("870370", "dmv_co2_deemed_phev_diesel", "352000.00", "176000.00", "262094.25"),
+    ],
+)
+def test_plugin_hybrid_without_a_co2_document_gets_the_deemed_400_g_km_halved(
+    hs: str, deemed: str, amount: str, dmv: str, total: str
+) -> None:
+    """Regression: no deemed CO2 component covered a plug-in hybrid, so with none_available the
+    ДМВ stayed unknown with nothing listed as missing. ЗДМВ чл. 12(2) deems 400 g/km and чл. 9(3)
+    halves the tax: 0.5 x (value part 0 + 400 x 695 or 880)."""
+    est = estimate(facts(fuel="plugin_hybrid", hs_code=hs, co2=[], co2_document="none_available"))
+    base = est.scenarios[0]
+    assert base.complete, base.unknown_components
+    assert component_amount(est, deemed) == money(amount)
+    assert component_amount(est, "dmv_value_part") == money("0.00")
+    assert component_amount(est, "dmv_plugin_hybrid_half") == money(dmv)
+    # VAT 18 % of customs value 227,674.69 + duty 11,383.73 + ДМВ; total = duty + ДМВ + VAT.
+    assert base.indicative_total == money(total)
+    assert est.missing_facts == ()
+    assert any("applied only where the rule set models it" in w for w in est.warnings)
+    without_hs = estimate(facts(fuel="plugin_hybrid", co2=[], co2_document="none_available"))
+    assert not without_hs.scenarios[0].complete and "hs_code" in without_hs.missing_facts
+
+
+def test_a_rule_set_that_covers_no_alternative_names_the_gap() -> None:
+    """Defence in depth: an alternative group with no applicable member is named, so an
+    incomplete result never carries nothing to act on."""
+    est = estimate(facts(fuel="other"))
+    assert not est.scenarios[0].complete
+    gaps = [w for w in est.warnings if w.startswith("RULE_SET_DOES_NOT_COVER_VEHICLE:")]
+    assert any(w.startswith("RULE_SET_DOES_NOT_COVER_VEHICLE:dmv:") for w in gaps), est.warnings
+    assert not any(w.startswith("RULE_SET_DOES_NOT_COVER_VEHICLE") for w in estimate().warnings)
+
+
+@pytest.mark.parametrize(
+    ("fuel", "hs"),
+    [
+        ("hybrid_petrol", "870360"),  # listing says hybrid, the attested code says plug-in
+        ("electric", "870360"),  # was: ДМВ 0 although a plug-in hybrid pays 50 %
+        ("diesel", "870380"),  # was: full ДМВ although a BEV is not subject
+        ("petrol", "870332"),
+        ("plugin_hybrid", "870380"),
+    ],
+)
+def test_an_attested_hs_code_that_contradicts_the_fuel_leaves_the_tax_unknown(fuel: str, hs: str) -> None:
+    """Regression: the ДМВ treatment followed the fuel alone, so an attested HS code that
+    disagreed gave a complete result with the wrong alternative and no warning."""
+    est = estimate(facts(fuel=fuel, hs_code=hs, co2=[{"cycle": "wltp", "g_km": "40"}]))
+    base = est.scenarios[0]
+    assert not base.complete and base.indicative_total is None
+    assert {"fuel", "hs_code"} <= set(est.missing_facts)
+    assert any(w.startswith(f"HS_CODE_FUEL_MISMATCH:{hs}/{fuel}") for w in est.warnings)
+    assert _mvt(est).status == ComponentStatus.UNKNOWN
+    assert build(facts(fuel=fuel, hs_code=hs)).inputs.fuel == Fuel.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("fuel", "hs"),
+    [
+        ("plugin_hybrid", "870360"),
+        ("plugin_hybrid", "870370"),
+        ("petrol", "870323"),
+        ("lpg", "870322"),
+        ("diesel", "870332"),
+        ("hybrid_petrol", "870340"),
+        ("hybrid_diesel", "870350"),
+        ("electric", "870380"),
+        ("diesel", "870390"),  # "other" subheading: not constrained
+    ],
+)
+def test_a_consistent_hs_code_keeps_the_fuel(fuel: str, hs: str) -> None:
+    est = estimate(facts(fuel=fuel, hs_code=hs, co2=[{"cycle": "wltp", "g_km": "40"}]))
+    assert not any(w.startswith("HS_CODE_FUEL_MISMATCH") for w in est.warnings)
+    assert "fuel" not in est.missing_facts
+    assert build(facts(fuel=fuel, hs_code=hs)).inputs.fuel == Fuel(fuel)
+
+
+@pytest.mark.parametrize(
+    ("value", "precision", "declaration"),
+    [
+        ("0000", "year", DECL),
+        ("0000-05", "month", DECL),
+        ("1800-01-01", "day", DECL),
+        ("1800", "year", DECL),
+        ("2020", "year", date(9999, 12, 31)),
+    ],
+)
+def test_an_implausible_first_registration_leaves_the_age_unknown_never_an_error(
+    value: str, precision: str, declaration: date
+) -> None:
+    """Regression: year 0000 raised ValueError and an age over 200 raised a ValidationError, so
+    the API and MCP answered 500 INTERNAL_ERROR (retryable)."""
+    f = facts(first_registration={"value": value, "precision": precision}, declaration_date=declaration)
+    built = build(f)
+    assert built.inputs.vehicle_age_years is None
+    assert any(w.startswith(f"FIRST_REGISTRATION_IMPLAUSIBLE:{value}") for w in built.warnings), (
+        built.warnings
+    )
+    assert estimate(f).scenarios  # the estimate itself never raises
+    if value.startswith("0000"):
+        assert (
+            vehicle_age_range(PartialDate(value=value, precision=Precision(precision)), declaration) is None
+        )
+
+
+def test_a_previous_month_customs_rate_is_named_missing_and_never_shown_as_used() -> None:
+    """Regression: a stale recorded rate left every charge unknown, yet missing_facts was empty
+    and the estimate presented the stale rate as the rate used for EUR equivalents."""
+    september = rate("61.6", date(2026, 9, 1))
+    stale = estimate(customs_rate=september)
+    assert not stale.scenarios[0].complete
+    assert "customs_fx_rate" in stale.missing_facts
+    assert stale.customs_fx_rate is None
+    assert "61.6" in stale.eur_basis and "not used" in stale.eur_basis
+    assert stale.eur_basis.startswith("no customs rate effective for 2026-10")
+    assert any(
+        w.startswith("CUSTOMS_FX_RATE_NOT_EFFECTIVE_FOR_DECLARATION:2026-09-01") for w in stale.warnings
+    )
+    accepted = estimate(customs_rate=september, accept_previous_month_fx=True)
+    assert accepted.scenarios[0].complete and "customs_fx_rate" not in accepted.missing_facts
+    assert accepted.customs_fx_rate == september and accepted.eur_basis.startswith("EUR equivalents at")
+    active = estimate(
+        rule_sets=[synthetic_active()],
+        jurisdiction="XX",
+        customs_rate=september,
+        accept_previous_month_fx=True,
+    )
+    assert "customs_fx_rate" in active.missing_facts and active.customs_fx_rate is None
+    current = estimate()
+    assert current.customs_fx_rate == rate() and "customs_fx_rate" not in current.missing_facts

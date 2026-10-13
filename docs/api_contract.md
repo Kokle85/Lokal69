@@ -343,7 +343,8 @@ inquiry tools (the same read backs the dashboard and the CLI; docs/connect_mcp.m
 It takes `listing_id` and/or `vehicle` facts (each set field replaces the listing's), an optional
 caller-supplied `customs_eur_mkd_rate` and `accept_previous_month_fx`; decimals are bounded
 strings. It persists nothing. Without an ACTIVE, owner-approved rule set the result is an
-`indicative_preview` on unapproved draft rules (`production_ready: false`, MK/EN `banner`, totals
+`indicative_preview` on rules that are not ACTIVE (draft, under review, or approved but not yet
+activated, as `rule.status` and the banner say; `production_ready: false`, MK/EN `banner`, totals
 named `indicative_total`), or `unavailable` (every import charge unknown). It uses the expensive
 rate-limit bucket.
 

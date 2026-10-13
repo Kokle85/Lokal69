@@ -10,6 +10,9 @@ import pytest
 import yaml
 from tests.cli.conftest import Cli
 
+from suv_deals.cli_commands._checks import tax_rule_findings
+from suv_deals.settings import Settings
+
 REPO = Path(__file__).resolve().parents[2]
 SYNTHETIC_RULES = REPO / "tests" / "fixtures" / "tax" / "synthetic_rule_set.json"
 EXAMPLE_RULES = REPO / "config" / "tax_rules" / "example_unapproved.json"
@@ -89,9 +92,10 @@ def test_config_validate_flags_a_message_approval_gate_and_missing_sender(run_cl
 def test_config_validate_reports_the_tax_rule_draft(run_cli: Cli, config_copy: Path) -> None:
     result = run_cli("config", "validate")
     assert result.exit_code == 0, result.output
-    assert "tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json" in result.output
+    assert "tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json" in result.output
     assert "unapproved draft: indicative preview only, never used for valuations" in result.output
-    assert "no approved/active rule set" in result.output
+    assert "no approved/active rule FILE in config/tax_rules" in result.output
+    assert "rule sets STORED in the database" in result.output
     (config_copy / "tax_rules" / "drafts" / "broken.json").write_text(
         '{"rule_set_id": "x"}', encoding="utf-8"
     )
@@ -146,7 +150,7 @@ def test_tax_rules_validate_drafts_directory(run_cli: Cli) -> None:
     # The North Macedonian draft ships unapproved: valid, unsealed, never selectable.
     result = run_cli("tax-rules", "validate", str(REPO / "config" / "tax_rules" / "drafts"))
     assert result.exit_code == 0, result.output
-    assert "VALID    mk_passenger_car_import_2026.10-draft.1.json" in result.output
+    assert "VALID    mk_passenger_car_import_2026.10-draft.2.json" in result.output
     assert "status             : draft" in result.output
     assert "not recorded (computed" in result.output
     assert "NOT selectable" in result.output
@@ -176,3 +180,17 @@ def test_tax_rules_validate_empty_directory(run_cli: Cli, tmp_path: Path) -> Non
     result = run_cli("tax-rules", "validate", str(tmp_path))
     assert result.exit_code == 1
     assert "no *.json" in result.output
+
+
+def test_tax_rule_set_id_of_the_shipped_draft_is_no_false_warning(config_copy: Path) -> None:
+    """Regression: following docs/tax_rule_approval.md step 6 (TAX_RULE_SET_ID = the MK set)
+    gave "TAX_RULE_SET_ID names no rule file", and the file-only check claimed no rule set was
+    active even after the owner activated one in the database."""
+    findings = tax_rule_findings(
+        config_copy / "tax_rules", Settings.model_construct(tax_rule_set_id="mk-passenger-car-import")
+    )
+    assert not any(f.name == "tax_rule_set_id" for f in findings), findings
+    activation = next(f for f in findings if f.name == "activation")
+    assert "rule sets STORED in the database" in activation.detail
+    unknown = tax_rule_findings(config_copy / "tax_rules", Settings.model_construct(tax_rule_set_id="nope"))
+    assert any(f.name == "tax_rule_set_id" and f.status == "warn" for f in unknown)

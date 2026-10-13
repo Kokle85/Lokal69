@@ -22,8 +22,8 @@ import { renderApp } from './renderApp'
 
 const HASH = 'a'.repeat(64)
 const PROFILE_HASH = 'b'.repeat(64)
-const LABEL = 'mk-passenger-car-import@2026.10-draft.1'
-const FILE = 'mk_passenger_car_import_2026.10-draft.1.json'
+const LABEL = 'mk-passenger-car-import@2026.10-draft.2'
+const FILE = 'mk_passenger_car_import_2026.10-draft.2.json'
 const UNCERTAIN = 'UNCERTAIN - confirm: rounding (0.01 MKD half-up vs whole denars).'
 
 function settings(): SettingsView {
@@ -52,7 +52,7 @@ function ruleSet(overrides: Partial<TaxRuleSetSummaryView> = {}): TaxRuleSetSumm
     origin: 'draft_file',
     file_name: FILE,
     rule_set_id: 'mk-passenger-car-import',
-    version: '2026.10-draft.1',
+    version: '2026.10-draft.2',
     label: LABEL,
     jurisdiction: 'MK',
     vehicle_categories: ['passenger_car'],
@@ -165,7 +165,7 @@ function change(overrides: Partial<TaxRuleChangeResult> = {}): TaxRuleChangeResu
   return {
     action: 'store',
     rule_set_id: 'mk-passenger-car-import',
-    version: '2026.10-draft.1',
+    version: '2026.10-draft.2',
     label: LABEL,
     previous_status: null,
     status: 'draft',
@@ -265,7 +265,7 @@ describe('settings: tax rules and cost profile (owner)', () => {
     const body = api.callsTo('POST /api/settings/tax-rules/transition')[0]!.body as Record<string, unknown>
     expect(body).toMatchObject({
       rule_set_id: 'mk-passenger-car-import',
-      version: '2026.10-draft.1',
+      version: '2026.10-draft.2',
       expected_status: 'under_review',
       target: 'approved',
       content_sha256: HASH,

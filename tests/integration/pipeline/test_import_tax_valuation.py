@@ -12,7 +12,7 @@ throwaway workspace.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -23,12 +23,20 @@ from tests.integration.pipeline.support import PipelineEnv, build_env, by_slid, 
 from suv_deals.clock import SystemClock
 from suv_deals.crawling.scheduler import run_scheduler_tick
 from suv_deals.domain.costs import CostLine
-from suv_deals.domain.enums import CostCategory, CostLineStatus, JobState, TaxRuleStatus
+from suv_deals.domain.enums import (
+    CostCategory,
+    CostLineStatus,
+    FxPurpose,
+    JobState,
+    TaxRuleStatus,
+    ValuationState,
+)
 from suv_deals.domain.money import Money
 from suv_deals.domain.tax_engine import IMPORT_CATEGORIES, ComponentStatus, RuleSet, RuleSource
 from suv_deals.persistence import valuation_repo
 from suv_deals.persistence.database import Conn
 from suv_deals.persistence.queries import ImportCostRequest, ImportCostResult, estimate_import_costs_for
+from suv_deals.workers.reconciliation import ReconcileOptions, Reconciler
 from suv_deals.workers.runner import Worker
 from suv_deals.workers.runtime import RuntimeOptions
 
@@ -131,17 +139,37 @@ def synthetic_xx_rules() -> RuleSet:
     )
 
 
-async def _value_fixture_listings(env: PipelineEnv) -> None:
+def _month_start() -> date:
+    return datetime.now(UTC).date().replace(day=1)
+
+
+def _previous_month_start(day: date) -> date:
+    return (day.replace(day=1) - timedelta(days=1)).replace(day=1)
+
+
+async def _value_fixture_listings(
+    env: PipelineEnv, *, customs_on: date | None = None, customs: bool = True
+) -> None:
     await seed_comparables(env)
     await seed_fx(env)  # reference EUR/MKD for the scenarios
-    month_start = datetime.now(UTC).date().replace(day=1)
-    await record_customs_rate(env.ctx.db, env.workspace_id, on=month_start, value=CUSTOMS)
+    if customs:
+        await record_customs_rate(
+            env.ctx.db, env.workspace_id, on=customs_on or _month_start(), value=CUSTOMS
+        )
     tick = await run_scheduler_tick(
         env.ctx.db, env.ctx.settings, SystemClock(), workspace_ids=[env.workspace_id]
     )
     assert any(w.workspace_id == env.workspace_id and w.enqueued for w in tick.workspaces)
+    await _work(env)
+
+
+async def _work(env: PipelineEnv) -> None:
     reports = await Worker(env.ctx, workspace_ids=[env.workspace_id], worker_id="worker-tax").run_until_idle()
     assert all(r.state == JobState.SUCCEEDED for r in reports), [(r.job_type, r.code) for r in reports]
+
+
+def _xx_env_options() -> RuntimeOptions:
+    return RuntimeOptions(job_lease_seconds=120, heartbeat_seconds=40, tax_jurisdiction="XX")
 
 
 async def _valuation(env: PipelineEnv, slid: str) -> valuation_repo.StoredValuation:
@@ -163,7 +191,7 @@ async def test_valuation_tax_comes_from_the_shared_builder(db_url: str, seed: Se
     env = await build_env(
         db_url,
         seed,
-        options=RuntimeOptions(job_lease_seconds=120, heartbeat_seconds=40, tax_jurisdiction="XX"),
+        options=_xx_env_options(),
         name="Tax builder",
     )
     try:
@@ -185,6 +213,10 @@ async def test_valuation_tax_comes_from_the_shared_builder(db_url: str, seed: Se
         }
         assert tax.total_import_cost == Money.of("69219.45", "MKD")
         assert tax.customs_fx_rate is not None and tax.customs_fx_rate.rate == Decimal(CUSTOMS)
+        # A customs rate is a monthly list rate: the valuation expires when its month ends.
+        next_month = (_month_start() + timedelta(days=32)).replace(day=1)
+        assert valuation.expires_at is not None
+        assert valuation.expires_at <= datetime.combine(next_month, datetime.min.time(), tzinfo=UTC)
         used = next(c for c in tax.components if c.component_id == "duty_standard").inputs_used
         assert "3450" in used["customs_value"]
         # Estimated from claims (the advertised price): never rule- or quote-supported.
@@ -249,5 +281,61 @@ async def test_valuation_and_calculator_agree_once_the_mk_rules_are_active(db_ur
         assert [(c.component_id, c.status, c.amount) for c in legal.components] == [
             (c.component_id, c.status, c.amount) for c in tax.components
         ]
+    finally:
+        await env.close()
+
+
+async def test_a_new_months_customs_rate_revalues_what_last_months_rate_left_incomplete(
+    db_url: str, seed: Seed
+) -> None:
+    """Regression: a valuation built with last month's customs rate (not effective) recorded no FX
+    dependency, and recording this month's rate never invalidated it, so it stayed incomplete."""
+    env = await build_env(db_url, seed, options=_xx_env_options(), name="Tax customs month")
+    try:
+        await activate(env.ctx.db, env.owner, synthetic_xx_rules())
+        last_month = _previous_month_start(_month_start())
+        await _value_fixture_listings(env, customs_on=last_month)
+        before = await _valuation(env, "TEST-204")
+        tax = before.valuation.tax
+        assert tax is not None and not tax.complete and tax.customs_fx_rate is None
+        assert before.valuation.state == ValuationState.INCOMPLETE  # no deadline from a past month
+        customs = [d for d in before.valuation.dependencies.fx if d.purpose == FxPurpose.CUSTOMS]
+        assert [d.rate_date for d in customs] == [last_month]
+        await record_customs_rate(env.ctx.db, env.workspace_id, on=_month_start(), value=CUSTOMS)
+        report = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
+        assert report.valuations_invalidated >= 1 and report.recompute_jobs >= 1
+        await _work(env)
+        after = await _valuation(env, "TEST-204")
+        assert after.valuation.tax is not None and after.valuation.tax.complete
+        used = after.valuation.tax.customs_fx_rate
+        assert used is not None and used.rate_date == _month_start()
+        again = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
+        assert again.valuations_invalidated == 0  # the current rate invalidates nothing more
+    finally:
+        await env.close()
+
+
+async def test_the_first_customs_rate_revalues_valuations_computed_without_one(
+    db_url: str, seed: Seed
+) -> None:
+    """Regression: valuations made under ACTIVE rules before any customs rate was recorded had no
+    FX dependency to invalidate, so recording the first rate never re-valued them."""
+    env = await build_env(db_url, seed, options=_xx_env_options(), name="Tax customs first")
+    try:
+        await activate(env.ctx.db, env.owner, synthetic_xx_rules())
+        await _value_fixture_listings(env, customs=False)
+        before = await _valuation(env, "TEST-204")
+        assert before.valuation.tax is not None and not before.valuation.tax.complete
+        assert not [d for d in before.valuation.dependencies.fx if d.purpose == FxPurpose.CUSTOMS]
+        quiet = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
+        assert quiet.valuations_invalidated == 0  # no customs rate yet: nothing to re-value
+        await record_customs_rate(env.ctx.db, env.workspace_id, on=_month_start(), value=CUSTOMS)
+        report = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
+        assert report.valuations_invalidated >= 1
+        await _work(env)
+        after = await _valuation(env, "TEST-204")
+        assert after.valuation.tax is not None and after.valuation.tax.complete
+        settled = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
+        assert settled.valuations_invalidated == 0
     finally:
         await env.close()

@@ -32,7 +32,7 @@ from suv_deals.persistence.transactions import unit_of_work
 
 REPO = Path(__file__).resolve().parents[3]
 CONFIG = REPO / "config"
-DRAFT_FILE = CONFIG / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.1.json"
+DRAFT_FILE = CONFIG / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.2.json"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 DECL = date(2026, 10, 13)
 CUSTOMS_RATE = "61.5337"
@@ -55,9 +55,12 @@ async def store_rule_set(db: Database, actor: ActorContext, rule_set: RuleSet) -
         await valuation_repo.store_rule_set(conn, actor, rule_set)
 
 
-async def activate(db: Database, actor: ActorContext, rule_set: RuleSet) -> valuation_repo.StoredRuleSet:
+async def activate(
+    db: Database, actor: ActorContext, rule_set: RuleSet, *, until: TaxRuleStatus = TaxRuleStatus.ACTIVE
+) -> valuation_repo.StoredRuleSet:
     """Store ``rule_set`` as a draft and drive it through review, approval and activation (owner
-    acts, SYNTHETIC review record) in this throwaway test workspace only."""
+    acts, SYNTHETIC review record) in this throwaway test workspace only; ``until=APPROVED`` stops
+    after the approval (approved, not yet active)."""
     record = ReviewRecord(
         reviewer="SYNTHETIC reviewer",
         reviewed_at=AS_OF - timedelta(days=1),
@@ -68,7 +71,7 @@ async def activate(db: Database, actor: ActorContext, rule_set: RuleSet) -> valu
         await valuation_repo.store_rule_set(conn, actor, rule_set)
         rs, version = rule_set.rule_set_id, rule_set.version
         await valuation_repo.transition_tax_rule_set(conn, actor, rs, version, TaxRuleStatus.UNDER_REVIEW)
-        await valuation_repo.transition_tax_rule_set(
+        approved = await valuation_repo.transition_tax_rule_set(
             conn,
             actor,
             rs,
@@ -77,6 +80,8 @@ async def activate(db: Database, actor: ActorContext, rule_set: RuleSet) -> valu
             approved_by="SYNTHETIC owner",
             review_record=record,
         )
+        if until == TaxRuleStatus.APPROVED:
+            return approved
         return await valuation_repo.transition_tax_rule_set(conn, actor, rs, version, TaxRuleStatus.ACTIVE)
 
 

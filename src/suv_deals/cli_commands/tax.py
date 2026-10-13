@@ -153,9 +153,10 @@ def stored_rows(stored: Sequence[StoredRuleSet]) -> list[dict[str, Any]]:
 
 def draft_file_rows(directory: Path, stored: Sequence[StoredRuleSet]) -> list[dict[str, Any]]:
     """One row per ``*.json`` under ``config/tax_rules/drafts``, with whether the workspace holds
-    the same version and whether its content is identical (a different copy blocks the preview)."""
+    the same version and whether its content is identical (a different open copy blocks the
+    preview; a closed one only excludes its own version)."""
     from suv_deals.domain.enums import TaxRuleStatus
-    from suv_deals.domain.tax_engine import compute_rule_set_sha256, load_rule_set_file
+    from suv_deals.domain.tax_engine import CLOSED_RULE_STATUSES, compute_rule_set_sha256, load_rule_set_file
     from suv_deals.errors import AppError
 
     by_label = {item.rule_set.label(): item.rule_set for item in stored}
@@ -176,6 +177,11 @@ def draft_file_rows(directory: Path, stored: Sequence[StoredRuleSet]) -> list[di
             note = "not stored in this workspace (`tax-rules store` stores it)"
         elif compute_rule_set_sha256(copy) == compute_rule_set_sha256(rule_set):
             note = f"stored in this workspace ({copy.status.value}), same content"
+        elif copy.status in CLOSED_RULE_STATUSES:
+            note = (
+                f"a stored copy of this version ({copy.status.value}) has DIFFERENT content: the version "
+                "is closed, so neither copy is ever previewed"
+            )
         else:
             note = (
                 "a stored copy of this version has DIFFERENT content: no preview until one of them "
@@ -233,7 +239,8 @@ def list_rule_sets(cli: CliContext, workspace: UUID | None, jurisdiction: str | 
     """Stored rule-set versions and the repository drafts: status, hash, dates (read-only).
 
     Also shows which rule set the import-cost calculator would use today: an ACTIVE, owner-approved
-    version, otherwise an INDICATIVE PREVIEW of the newest unapproved one, otherwise none."""
+    version, otherwise an INDICATIVE PREVIEW of the best non-active one (approved, under review, then
+    draft), otherwise none."""
     settings = load_settings(cli)
 
     async def body() -> int:

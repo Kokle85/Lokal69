@@ -5,7 +5,8 @@ Conventions are those of ``views.valuations.TaxView``: decimals are strings, an 
 is ``{"status": "unknown", "amount": null}`` with a reason (never 0), lists are bounded.
 
 - ``mode``: ``active`` (an ACTIVE, owner-approved rule set; the same rules valuations use),
-  ``indicative_preview`` (no ACTIVE rule set applies: the newest unapproved rule set, labelled
+  ``indicative_preview`` (no ACTIVE rule set applies: the best non-active rule set - approved but not
+  yet activated, then under review, then draft - labelled
   with the MK/EN ``banner``; ``production_ready`` is always false and the totals are named
   ``indicative_total`` / ``indicative_total_eur`` / ``indicative_landed_cost_eur``) or
   ``unavailable`` (no rule set at all; every import charge unknown, no scenarios).
@@ -53,12 +54,18 @@ _DATE: Final = r"^\d{4}-\d{2}-\d{2}$"
 _INDICATIVE: Final = ("indicative_total", "indicative_total_eur", "indicative_landed_cost_eur")
 _FINAL: Final = ("total", "total_eur", "landed_cost_eur")
 _CV_UNKNOWN: Final = "customs value unknown: the price, the transport or the customs rate is missing"
+_CV_CHF: Final = (
+    "customs value unknown: a CHF price is not converted (it would need a CHF customs rate next to the EUR "
+    "one; no other rate is substituted); give the price in EUR or MKD"
+)
 _PREVIEW_STATUSES: Final = frozenset(
     {TaxRuleStatus.APPROVED, TaxRuleStatus.UNDER_REVIEW, TaxRuleStatus.DRAFT}
 )
 
 FactSource = Literal["listing", "request", "default"]
-CustomsFxSource = Literal["recorded", "caller_supplied", "not_needed", "none"]
+#: ``recorded_not_effective``: the newest recorded rate is not valid on the declaration date (an
+#: earlier month), so it was not used and the amounts that depend on it are unknown.
+CustomsFxSource = Literal["recorded", "recorded_not_effective", "caller_supplied", "not_needed", "none"]
 
 
 def _iso(day: date | None) -> str | None:
@@ -182,7 +189,12 @@ class ImportScenarioView(ViewModel):
 
     @classmethod
     def of(
-        cls, scenario: EstimateScenario, *, mode: EstimateMode, currency: str | None
+        cls,
+        scenario: EstimateScenario,
+        *,
+        mode: EstimateMode,
+        currency: str | None,
+        customs_value_reason: str = _CV_UNKNOWN,
     ) -> ImportScenarioView:
         preview = mode == "indicative_preview"
         incomplete = "the calculation is incomplete: " + ", ".join(
@@ -213,7 +225,7 @@ class ImportScenarioView(ViewModel):
             production_ready=scenario.production_ready and not preview,
             customs_value=AmountView.of(
                 scenario.customs_value,
-                unknown_reason=_CV_UNKNOWN,
+                unknown_reason=customs_value_reason,
             ),
             customs_value_basis=scenario.customs_value_basis,
             assumptions=_texts(scenario.assumptions, 20),
@@ -418,6 +430,12 @@ class ImportCostEstimateView(ViewModel):
     ) -> ImportCostEstimateView:
         rule = estimate.rule
         banner = estimate.banner
+        chf_price = facts.price is not None and facts.price.currency == "CHF"
+
+        def cv_reason(scenario: EstimateScenario) -> str:
+            # The risk scenario's customs value is the catalogue value, not the price.
+            return _CV_CHF if chf_price and scenario.name != "customs_revaluation_risk" else _CV_UNKNOWN
+
         return cls(
             estimator_version=estimate.estimator_version,
             mode=estimate.mode,
@@ -454,7 +472,9 @@ class ImportCostEstimateView(ViewModel):
                 ImportFactSourceView(fact=name, source=source) for name, source in fact_sources.items()
             )[:40],
             scenarios=tuple(
-                ImportScenarioView.of(s, mode=estimate.mode, currency=estimate.currency)
+                ImportScenarioView.of(
+                    s, mode=estimate.mode, currency=estimate.currency, customs_value_reason=cv_reason(s)
+                )
                 for s in estimate.scenarios
             ),
             assumptions=_texts(estimate.assumptions, 100),

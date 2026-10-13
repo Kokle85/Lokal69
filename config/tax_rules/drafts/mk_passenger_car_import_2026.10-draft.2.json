@@ -1,7 +1,7 @@
 {
   "rule_set_id": "mk-passenger-car-import",
   "jurisdiction": "MK",
-  "version": "2026.10-draft.1",
+  "version": "2026.10-draft.2",
   "status": "draft",
   "valid_from": "2025-07-01",
   "valid_to": null,
@@ -340,6 +340,30 @@
       "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км); Уредба 277/2019 Табела 2 (220/2023) последна класа"
     },
     {
+      "id": "dmv_co2_deemed_phev_petrol",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, plug-in hybrid HS 8703 60, CO2 not established: deemed 400 g/km x 695 (petrol column top band; halved by dmv_plugin_hybrid_half)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "plugin_hybrid"}, {"input": "classification", "op": "in", "value": ["870360"]}, {"input": "co2_source_document", "op": "eq", "value": "none_available"}],
+      "amount": "278000",
+      "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км), чл. 9(3); Уредба 277/2019 Табела 2 (220/2023) последна класа; column choice UNCERTAIN - confirm"
+    },
+    {
+      "id": "dmv_co2_deemed_phev_diesel",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, plug-in hybrid HS 8703 70, CO2 not established: deemed 400 g/km x 880 (diesel column top band; halved by dmv_plugin_hybrid_half)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "plugin_hybrid"}, {"input": "classification", "op": "in", "value": ["870370"]}, {"input": "co2_source_document", "op": "eq", "value": "none_available"}],
+      "amount": "352000",
+      "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км), чл. 9(3); Уредба 277/2019 Табела 2 (220/2023) последна класа; column choice UNCERTAIN - confirm"
+    },
+    {
       "id": "dmv_co2_bev_none",
       "kind": "fixed",
       "label": "ДМВ CO2 part, battery-electric: not subject",
@@ -374,9 +398,9 @@
       "currency": "MKD",
       "alternative_group": "dmv",
       "applies_when": [{"input": "fuel", "op": "eq", "value": "plugin_hybrid"}],
-      "depends_on": ["dmv_value_part", "dmv_co2_phev_petrol", "dmv_co2_phev_diesel"],
+      "depends_on": ["dmv_value_part", "dmv_co2_phev_petrol", "dmv_co2_phev_diesel", "dmv_co2_deemed_phev_petrol", "dmv_co2_deemed_phev_diesel"],
       "rate": "0.5",
-      "base": ["dmv_value_part", "dmv_co2_phev_petrol", "dmv_co2_phev_diesel"],
+      "base": ["dmv_value_part", "dmv_co2_phev_petrol", "dmv_co2_phev_diesel", "dmv_co2_deemed_phev_petrol", "dmv_co2_deemed_phev_diesel"],
       "legal_reference": "ЗДМВ чл. 9(3)"
     },
     {

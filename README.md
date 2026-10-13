@@ -144,7 +144,7 @@ stores anything:
 
 > **No tax rule set is approved yet.** The rates live only in the rule-set JSON. The North
 > Macedonian rules ship as an unapproved DRAFT
-> (`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json`), so every result is an
+> (`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`), so every result is an
 > **INDICATIVE PREVIEW** (ИНДИКАТИВНА ПРОЦЕНКА): `production_ready: false`, totals named
 > `indicative_total`, never used for valuations or alerts. Valuations keep import charges
 > `unknown` until the owner approves and activates a rule set (dashboard, Settings, "Tax rules
