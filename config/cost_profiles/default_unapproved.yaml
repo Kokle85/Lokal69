@@ -1,8 +1,10 @@
-# Default cost profile (spec section 18). STATUS: UNAPPROVED. NO AMOUNTS.
+# Default cost profile (spec section 18). STATUS: UNAPPROVED. ONE OWNER-SET AMOUNT (transport).
 #
-# Every spec section 18 cost category is listed with status `unknown` and a note. No
-# amount here is invented: an unknown line makes the dependent scenario totals unknown
-# (never zero) until the owner records a quote, an actual or an approved assumption.
+# Every spec section 18 cost category is listed with a note. The only amount is the owner's
+# transport decision of 2026-10-13: a fixed EUR 700 per vehicle to North Macedonia, from any
+# purchase country (`estimated`, low = base = high). Every other line is `unknown`. No amount
+# here is invented: an unknown line makes the dependent scenario totals unknown (never zero)
+# until the owner records a quote, an actual or an approved assumption.
 # Activation gate "Cost assumptions" (spec 32): owner-selected business assumptions/quotes
 # and currency treatment are required before any threshold-driven alert.
 #
@@ -31,10 +33,11 @@
 # note says which one to record not_applicable so that nothing is counted twice.
 # See docs/markets/switzerland.md.
 profile_key: default
-version: 2
+version: 3
 basis: >-
-  Placeholder profile listing every required cost category as unknown. No business
-  assumptions have been selected or approved by the owner.
+  Profile listing every required cost category. Transport is the owner's fixed EUR 700 per
+  vehicle (decision recorded 2026-10-13); every other category is unknown until the owner
+  records a quote, an actual or an assumption.
 currency: EUR
 approval_status: unapproved
 approved_by: null
@@ -64,8 +67,15 @@ assumptions:
     note: Only if a trip or third-party inspection is planned; record not_applicable with a reason otherwise.
   - category: transport
     label: Transport to North Macedonia (incl. loading / non-running surcharges)
-    status: unknown
-    note: Needs a transporter quote scoped to the origin city and vehicle condition (running vs non-running).
+    status: estimated
+    low: "700.00"
+    base: "700.00"
+    high: "700.00"
+    note: >-
+      Owner decision (recorded 2026-10-13): a fixed EUR 700 per vehicle for transport to North
+      Macedonia, from any purchase country (DE, IT, CH) and either vehicle condition. The same
+      amount in every scenario (low = base = high); a transporter quote for a specific vehicle
+      replaces it per valuation.
   - category: export_plates_insurance
     label: Export registration/plates, insurance and documentation
     status: unknown

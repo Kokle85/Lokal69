@@ -136,7 +136,8 @@ Switzerland is **not** in the EU. Buying there differs from buying in DE or IT.
 
 ## 6. Cost lines for a Swiss purchase
 
-`config/cost_profiles/default_unapproved.yaml` (version 2, **unapproved, no amounts**) adds four
+`config/cost_profiles/default_unapproved.yaml` (version 3, **unapproved**; its only amount is the
+owner's fixed EUR 700 transport per vehicle, which also applies to a Swiss purchase) adds four
 lines scoped to `origin_country: CH` (marker `ch_purchase`, labels start with `CH purchase:`):
 
 | Category | Line | Note |
@@ -183,8 +184,8 @@ acknowledgement is not legal permission. See `docs/source_access_register.md`.
 6. **Payment in CHF.** The bank route and charges for paying in CHF (`bank_fx_charges` line).
 7. **Search ceilings.** Accept CHF search ceilings with headroom (section 2), if a Swiss source ever
    uses a CHF price filter.
-8. **Cost assumptions.** Approve or replace the unknown cost lines. Nothing in the profile is
-   approved.
+8. **Cost assumptions.** Approve or replace the unknown cost lines. Transport is the owner's fixed
+   EUR 700 per vehicle (2026-10-13); the profile version itself is not approved yet.
 
 ## 9. Where it lives
 

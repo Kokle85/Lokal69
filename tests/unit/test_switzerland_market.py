@@ -49,7 +49,7 @@ def _scenarios(target: CostScope | None, *, lines_target: CostScope | None) -> S
 
 def test_ch_lines_load_unknown_scoped_and_labelled() -> None:
     profile = load_cost_profile(PROFILE)
-    assert profile.approval_status == "unapproved" and profile.version == 2
+    assert profile.approval_status == "unapproved" and profile.version == 3
     ch = [a for a in profile.assumptions if a.scope is not None and a.scope.origin_country == "CH"]
     assert {(a.category, a.label.startswith(CH_LABEL_PREFIX)) for a in ch} == {
         (CostCategory.CUSTOMS_BROKER, True),

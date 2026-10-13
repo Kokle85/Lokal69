@@ -758,23 +758,30 @@ def test_tax_cost_lines_from_active_rule_are_rule_supported() -> None:
 # --------------------------------------------------------------------------- cost profile
 
 
-def test_default_cost_profile_lists_every_category_unknown() -> None:
+def test_default_cost_profile_has_the_owner_transport_and_every_other_category_unknown() -> None:
     profile = load_cost_profile(REPO / "config" / "cost_profiles" / "default_unapproved.yaml")
     assert profile.approval_status == "unapproved" and profile.approved_by is None
     assert profile.missing_categories() == frozenset()
     assert {a.category for a in profile.assumptions} == REQUIRED_CATEGORIES
-    assert all(
-        a.status == S.UNKNOWN and a.base is None and a.low is None and a.high is None
-        for a in profile.assumptions
-    )
+    # The owner's decision of 2026-10-13: transport is a fixed EUR 700 per vehicle, from every
+    # purchase country (one unscoped line, the same amount in every scenario).
+    [transport] = [a for a in profile.assumptions if a.category == C.TRANSPORT]
+    assert transport.status == S.ESTIMATED and transport.scope is None and transport.currency == "EUR"
+    assert transport.low == transport.base == transport.high == Decimal("700.00")
+    others = [a for a in profile.assumptions if a is not transport]
+    assert all(a.status == S.UNKNOWN and a.base is None and a.low is None and a.high is None for a in others)
     assert all(len(a.note) > 10 for a in profile.assumptions)
     lines = profile.lines()
-    assert all(ln.status == S.UNKNOWN and not ln.assumption_approved for ln in lines)
+    assert all(not ln.assumption_approved for ln in lines)  # the profile itself is not approved yet
+    assert [ln.category for ln in lines if ln.status != S.UNKNOWN] == [C.TRANSPORT]
     result = run(list(lines))
     assert not result.complete and result.scenario(BASE).contribution_before_business_tax is None
-    assert len(result.unknown_lines) == len(profile.assumptions)  # incl. the CH-scoped lines
+    # The line is modelled; the transport TERM also needs the (still unknown) export plates line.
+    assert "transport" not in {u.item for u in result.unknown_lines}
+    assert "export_plates_insurance" in {u.item for u in result.unknown_lines}
+    assert len(result.unknown_lines) == len(profile.assumptions) - 1  # incl. the CH-scoped lines
     ref = profile.reference()
-    assert ref.version == 2 and len(ref.sha256) == 64 and ref.approval_status == "unapproved"
+    assert ref.version == 3 and len(ref.sha256) == 64 and ref.approval_status == "unapproved"
 
 
 def test_cost_profile_rules(tmp_path: Path) -> None:
