@@ -454,6 +454,28 @@ def tax_rule_findings(tax_dir: Path, settings: Settings) -> list[Finding]:
                 + ("" if usable else "; not usable for production valuations"),
             )
         )
+    drafts = tax_dir / "drafts"
+    for path in sorted(drafts.glob("*.json")) if drafts.is_dir() else []:
+        name = f"drafts/{path.name}"
+        try:
+            rule_set = load_rule_set_file(path)
+        except AppError as exc:
+            findings.append(Finding("tax_rules", name, "error", exc.message))
+            continue
+        is_draft = rule_set.status == TaxRuleStatus.DRAFT and not rule_set.is_fixture
+        findings.append(
+            Finding(
+                "tax_rules",
+                name,
+                "ok" if is_draft else "warn",
+                f"valid; status {rule_set.status.value}; "
+                + (
+                    "unapproved draft: indicative preview only, never used for valuations"
+                    if is_draft
+                    else "only drafts belong in drafts/"
+                ),
+            )
+        )
     if not production_ready:
         findings.append(
             Finding(

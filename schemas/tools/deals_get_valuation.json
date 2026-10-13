@@ -1674,6 +1674,7 @@
               "components": {
                 "items": {
                   "additionalProperties": false,
+                  "description": "One rule component. ``intermediate`` marks a helper (e.g. a customs value in the rule\ncurrency or a VAT base): shown for transparency, never counted in a total.",
                   "properties": {
                     "amount": {
                       "additionalProperties": false,
@@ -1768,6 +1769,9 @@
                       "maxItems": 100,
                       "type": "array"
                     },
+                    "intermediate": {
+                      "type": "boolean"
+                    },
                     "kind": {
                       "maxLength": 40,
                       "type": "string"
@@ -1805,6 +1809,7 @@
                     "category",
                     "kind",
                     "status",
+                    "intermediate",
                     "amount",
                     "inputs_used",
                     "missing_inputs",

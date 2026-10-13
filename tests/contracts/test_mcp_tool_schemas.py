@@ -208,12 +208,14 @@ def test_annotations_describe_real_behaviour() -> None:
 
 def test_tool_discovery_hides_unauthorized_tools() -> None:
     inquiry_read = {"seller_inquiries_get", "seller_replies_get"}
+    calculator = {"deals_estimate_import_costs"}  # deals:read, like the read tools
+    read_scopes = (Scope.DEALS_READ, Scope.REVIEWS_READ)
     viewer = {s.name for s in tools_for_scopes(ROLE_SCOPES[Role.VIEWER])}
-    assert viewer == {n for n, s in SPEC_SCOPES.items() if s in (Scope.DEALS_READ, Scope.REVIEWS_READ)}
+    assert viewer == {n for n, s in SPEC_SCOPES.items() if s in read_scopes} | calculator
     reviewer = {s.name for s in tools_for_scopes(ROLE_SCOPES[Role.REVIEWER])}
-    assert reviewer == (set(SPEC_TOOLS) - {"sources_pause"}) | inquiry_read
+    assert reviewer == (set(SPEC_TOOLS) - {"sources_pause"}) | inquiry_read | calculator
     owner = {s.name for s in tools_for_scopes(ROLE_SCOPES[Role.OWNER])}
-    assert owner == set(SPEC_TOOLS) | inquiry_read | {"seller_inquiries_pause"}
+    assert owner == set(SPEC_TOOLS) | inquiry_read | {"seller_inquiries_pause"} | calculator
     assert tools_for_scopes([]) == ()
 
 

@@ -57,6 +57,41 @@ collected). On PostgreSQL 16 one test is skipped by design:
 `tests/integration/db/test_backend_membership.py:30` ("only meaningful with
 TEST_DATABASE_MIGRATOR_ROLE (Supabase-like owner)").
 
+## Customs calculator wave (2026-10-13)
+
+Re-run on the working tree on top of `da4c5e6` with the customs/import-tax calculator, the North
+Macedonian DRAFT rule set and the owner's tax-rule tooling (ADR 0003; not committed when measured,
+so NOT an exact-build release result). Same machine and versions as above (uv 0.11.32, PostgreSQL
+16.15 and 17.11). Offline: no listing site, mailbox, Slack, Supabase project or customs website was
+contacted.
+
+| # | Check | Command | Result |
+|---|---|---|---|
+| C1 | Schema snapshots | `make schemas` then `make schemas-check` | schemas up to date (7 new snapshots: `schemas/tools/deals_estimate_import_costs.json`, `schemas/api/import-costs.estimate.get.json`, five `schemas/api/settings.*.json`) |
+| C2 | Lint, formatting | `make lint` | All checks passed; every file formatted |
+| C3 | Types | `make typecheck` | no issues: 187 backend, 9 E2E-harness and 20 desktop-worker source files |
+| C4 | Full Python suite, PostgreSQL 16 | `TEST_DATABASE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5432/postgres PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider -m "not live and not e2e"` | **8,505 passed, 1 skipped, 0 failed** (13 min 18 s; the skip is the migrator-role-only test) |
+| C5 | Full Python suite, PostgreSQL 17.11 | the same with `...:5433/postgres TEST_DATABASE_MIGRATOR_ROLE=suv_migrator` | **8,506 passed, 0 failed** (13 min 18 s) |
+| C6 | Desktop worker | `PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider desktop/outlook-bridge/tests` | 317 passed |
+| C7 | Dashboard | `cd dashboard && npm run typecheck && npm run lint && npm test` | `tsc -b` exit 0; oxlint clean, "Security check passed (45 source files)"; 14 files, 208 tests passed |
+| C8 | Dashboard build | `cd dashboard && VITE_SUPABASE_URL=https://synthetic-project.supabase.invalid VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_SYNTHETIC_build_key npm run build` | built; "Security check passed (45 source files + build output)" |
+| C9 | Browser E2E, PostgreSQL 16 | `make e2e` | harness 36 passed; Playwright 48 passed (3.1 min), including the two customs-calculator specs |
+| C10 | Browser E2E, PostgreSQL 17 | `cd dashboard && TEST_DATABASE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres TEST_DATABASE_MIGRATOR_ROLE=suv_migrator npx playwright test` | Playwright 48 passed (3.1 min) |
+| C11 | Rule files and configuration | `uv run suv-deals --no-env-file config validate`; `tax-rules validate config/tax_rules/drafts` | 0 errors; the draft is valid, status `draft`, 19 components, computed content hash `60d41fd7...`, not selectable |
+| C12 | Re-run after the last code change (draft loader skips symlinks leaving the drafts directory) | `pytest tests/unit/test_import_cost_view.py tests/integration/import_costs tests/api/test_owner_config_routes.py tests/api/test_import_cost_routes.py tests/mcp/test_calc_tools.py tests/cli` (PostgreSQL 17); the same plus `tests/contracts` (PostgreSQL 16); `make smoke-local` | 470 passed; 1,166 passed; smoke OK, 13 passed |
+
+The golden cases of the North Macedonian draft (fact sheet section 10, `G01`-`G19`, `U1`-`U10`, the
+ДМВ set #1-#19) are in rows C4 and C5 (`tests/unit/test_mk_rule_draft.py`), as are the calculator's
+database tests on both PostgreSQL versions (`tests/integration/import_costs`, `tests/mcp/test_calc_tools.py`,
+`tests/api/test_import_cost_routes.py`, `tests/api/test_owner_config_routes.py`,
+`tests/cli/test_import_cost_db_commands.py`, `tests/integration/pipeline/test_import_tax_valuation.py`).
+
+Known order dependency (present before this wave, reproduced on `da4c5e6`): when
+`tests/integration/v11_db` runs before `tests/cli` in one session, as `make test-integration`
+orders them, three `doctor` tests fail because `doctor` reports "seller-inquiry readiness could not
+be read" for every workspace once one leftover synthetic workspace cannot be read. The default order
+(rows C4 and C5) passes.
+
 ## Earlier runs (kept for honesty)
 
 | Run | Result | Cause |

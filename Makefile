@@ -122,6 +122,7 @@ smoke-local: ## Offline smoke: CLI, configuration, tax rules, fixture E2E pipeli
 	$(CLI) --no-env-file --help >/dev/null
 	$(CLI) --no-env-file config validate
 	$(CLI) --no-env-file tax-rules validate config/tax_rules
+	$(CLI) --no-env-file tax-rules validate config/tax_rules/drafts
 	$(CLI) --no-env-file tax-rules validate tests/fixtures/tax/synthetic_rule_set.json
 	@TEST_DATABASE_ADMIN_URL="$(PG16_ADMIN_URL)" $(PYTEST) -q \
 	  tests/integration/pipeline/test_e2e_fixture_pipeline.py tests/cli/test_crawl_once.py

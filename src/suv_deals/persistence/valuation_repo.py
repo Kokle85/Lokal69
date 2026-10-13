@@ -534,16 +534,33 @@ async def transition_tax_rule_set(
     *,
     approved_by: str | None = None,
     review_record: ReviewRecord | None = None,
+    expected_status: TaxRuleStatus | None = None,
+    expected_sha256: str | None = None,
 ) -> StoredRuleSet:
     """Move a rule set version through the lifecycle (domain rules + database trigger).
 
     Owner only. ``approved_by`` is the approver's NAME (kept in ``approval_reference``); the
     authenticated principal is recorded in ``approved_by``/``approved_at``. Never automatic.
+    ``expected_status`` / ``expected_sha256`` (the status and content hash the owner saw) are
+    compared under the row lock: a different status is ``VersionConflict`` (``details.reason =
+    status_changed``), a different content hash ``ValidationFailed``; nothing changes.
     """
     _require_owner(actor, "Changing a tax rule set status")
     rows = await _rule_rows(conn, actor, rule_set_id, version, lock=True)
     stored = _rule_set_from_rows(rows)
     current = stored.rule_set
+    if expected_status is not None and current.status != expected_status:
+        raise VersionConflict(
+            "The tax rule set status changed; reload and retry",
+            reason="status_changed",
+            expected_status=expected_status.value,
+            current_status=current.status.value,
+        )
+    if expected_sha256 is not None and expected_sha256 != compute_rule_set_sha256(current):
+        raise ValidationFailed(
+            "content_sha256 is not the content hash of this rule set version",
+            details={"fields": ["content_sha256"]},
+        )
     now = ensure_utc(await db_now(conn))
     existing = [
         s.rule_set
@@ -755,6 +772,21 @@ async def find_cost_profile(
     if row is None:
         raise NotFound("Cost profile not found")
     return _profile_from_row(row)
+
+
+async def list_cost_profiles(conn: Conn, actor: ActorContext, *, limit: int = 50) -> list[StoredCostProfile]:
+    """Stored cost-profile versions, newest first per profile key (at most ``limit``)."""
+    require_reader(actor)
+    if not 1 <= limit <= 200:
+        raise ValidationFailed("limit must be between 1 and 200")
+    async with mapped_errors():
+        rows = await fetch_all(
+            conn,
+            f"select {_PROFILE_COLUMNS} from app.cost_profiles"  # noqa: S608 - fixed column list
+            " where workspace_id = %(ws)s order by profile_key, version desc, id limit %(limit)s",
+            {"ws": actor.workspace_id, "limit": limit},
+        )
+    return [_profile_from_row(r) for r in rows]
 
 
 async def approve_cost_profile(conn: Conn, actor: ActorContext, profile_id: UUID) -> StoredCostProfile:
@@ -1774,6 +1806,7 @@ __all__ = [
     "insert_cost_evidence",
     "invalidate_dependents",
     "latest_fx_rates",
+    "list_cost_profiles",
     "list_rule_sets",
     "load_cost_profile",
     "load_rule_set",

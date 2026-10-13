@@ -24,10 +24,12 @@ from mcp.client.streamable_http import streamable_http_client
 from suv_deals.api.middleware import RateLimit
 from suv_deals.domain.enums import Role, Scope
 from suv_deals.mcp.schemas import (
+    ALL_TOOL_NAMES,
+    CALC_TOOL_NAMES,
+    CALC_TOOLS,
     FORBIDDEN_TOOL_NAMES,
     TOOL_NAMES,
     TOOLS,
-    V11_TOOL_NAMES,
     V11_TOOLS,
     DealsHealthInput,
     ToolSpec,
@@ -65,6 +67,9 @@ READ_TOOLS = [
     "deals_get_comparables",
     "deals_get_valuation",
 ]
+#: What a deals:read + reviews:read credential discovers: the read tools, the review queue and the
+#: import-cost calculator (``CALC_TOOLS``, also deals:read).
+VIEWER_TOOLS = [*READ_TOOLS, "reviews_list_pending", *CALC_TOOL_NAMES]
 SECRET_TOKEN = "Zz" * 20  # a well-formed claim token value that must never be echoed
 
 
@@ -98,12 +103,12 @@ async def schema_check(h: DataHarness) -> SchemaCheck:
 async def test_tools_list_is_scope_filtered_deterministic_and_exact(data_mcp: DataHarness) -> None:
     client = data_mcp.client
     owner_tools = await client.tools(data_mcp.owner)
-    served = [*TOOL_NAMES, *V11_TOOL_NAMES]  # spec 21 order, then the spec 37.8 inquiry tools
+    served = list(ALL_TOOL_NAMES)  # spec 21 order, the spec 37.8 inquiry tools, the calculator
     assert [t["name"] for t in owner_tools] == served
     assert [t["name"] for t in await client.tools(data_mcp.owner)] == served  # stable order
     for tool in owner_tools:
         name = tool["name"]
-        spec = TOOLS.get(name) or V11_TOOLS[name]
+        spec = TOOLS.get(name) or V11_TOOLS.get(name) or CALC_TOOLS[name]
         assert tool["inputSchema"] == tool_input_schema(name)
         assert tool["inputSchema"]["additionalProperties"] is False
         assert tool["outputSchema"] == tool_output_schema(name)
@@ -121,9 +126,10 @@ async def test_tools_list_is_scope_filtered_deterministic_and_exact(data_mcp: Da
         *(n for n in TOOL_NAMES if n != "sources_pause"),
         "seller_inquiries_get",
         "seller_replies_get",
+        *CALC_TOOL_NAMES,
     ]  # inquiries:read but never inquiries:pause
     viewer = [t["name"] for t in await client.tools(data_mcp.viewer)]
-    assert viewer == [*READ_TOOLS, "reviews_list_pending"]
+    assert viewer == VIEWER_TOOLS
     listing = await client.result("tools/list", token=data_mcp.viewer)
     assert listing["ttlMs"] == 0 and listing["cacheScope"] == "private"
 
@@ -150,7 +156,7 @@ async def test_official_sdk_client_round_trip_validates_output_schemas(data_mcp:
         Client(streamable_http_client(MCP_URL, http_client=http)) as sdk,
     ):
         listed = await sdk.list_tools()
-        assert [t.name for t in listed.tools] == [*READ_TOOLS, "reviews_list_pending"]
+        assert [t.name for t in listed.tools] == VIEWER_TOOLS
         # The SDK client validates structuredContent against each tool's outputSchema.
         health = await sdk.call_tool("deals_health", {})
         assert health.is_error is False and health.structured_content is not None
@@ -865,7 +871,7 @@ async def test_unexpected_handler_errors_never_leak_details(
     async with mcp_client(make_settings(), db, keys, extra_tools=[(probe, explode)]) as client:
         viewer = tokens.for_role(users.viewer, Role.VIEWER)
         names = [t["name"] for t in await client.tools(viewer)]
-        assert names[-1] == "synthetic_probe" and names[:-1] == [*READ_TOOLS, "reviews_list_pending"]
+        assert names[-1] == "synthetic_probe" and names[:-1] == VIEWER_TOOLS
         result = await client.call("synthetic_probe", {}, token=viewer)
         assert result["isError"] is True
         payload = result["structuredContent"]
@@ -887,7 +893,7 @@ def test_registry_refuses_forbidden_and_duplicate_tools() -> None:
         ToolRegistry.default().with_tools([(forbidden, lambda call: None)])  # type: ignore[arg-type,return-value]
     with pytest.raises(ValueError, match="registered twice"):
         ToolRegistry.default().with_tools([(TOOLS["deals_health"], lambda call: None)])  # type: ignore[arg-type,return-value]
-    assert ToolRegistry.default().names == (*TOOL_NAMES, *V11_TOOL_NAMES)
+    assert ToolRegistry.default().names == ALL_TOOL_NAMES
     with pytest.raises(ValueError, match="registered twice"):
         ToolRegistry.default().with_tools([(V11_TOOLS["seller_inquiries_pause"], lambda call: None)])  # type: ignore[arg-type,return-value]
 

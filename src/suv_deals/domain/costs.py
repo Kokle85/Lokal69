@@ -551,7 +551,12 @@ def tax_calculation_evidence_id(calc: TaxCalculation) -> str:
     return f"{TAX_CALCULATION_EVIDENCE_PREFIX}{calc.content_sha256()}"
 
 
-def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = None) -> tuple[CostLine, ...]:
+def tax_cost_lines(
+    calc: TaxCalculation | None,
+    *,
+    missing_reason: str | None = None,
+    unverified_inputs: Sequence[str] = (),
+) -> tuple[CostLine, ...]:
     """One line per import category from a tax calculation (in the rule currency).
 
     No calculation -> every import category is ``unknown`` (never zero). A category the
@@ -559,9 +564,21 @@ def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = 
     complete (the rule set is then the authority that nothing is levied); from an
     incomplete calculation or a rule set without components it stays ``unknown``.
     Lines from an ACTIVE, approved, non-fixture, complete calculation are
-    ``rule_supported``. Every line carries the rule identity and the
-    ``tax_calculation:<sha256>`` evidence id of the exact calculation.
+    ``rule_supported``, unless the calculation rests on ``unverified_inputs`` (claims such
+    as an advertised price or a listing's CO2 figure, ``BuiltTaxInputs.unverified_inputs``):
+    those amounts are estimates on unapproved assumptions, never rule- or quote-supported.
+    Every line carries the rule identity and the ``tax_calculation:<sha256>`` evidence id of
+    the exact calculation.
+
+    Only an engine ``TaxCalculation`` becomes cost lines. An import-cost estimate
+    (``domain.import_estimate``, e.g. an indicative preview on unapproved rules) is
+    display-only and is refused, so it can never reach a valuation, a scenario or an alert.
     """
+    if calc is not None and not isinstance(calc, TaxCalculation):
+        raise ValidationFailed(
+            "only an engine TaxCalculation becomes cost lines; an import-cost estimate never does"
+        )
+    claims = tuple(dict.fromkeys(unverified_inputs))
     if calc is None:
         reason = missing_reason or "no applicable ACTIVE tax rule set; import costs unknown"
         return tuple(
@@ -579,7 +596,11 @@ def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = 
         f"tax_rule_set:{calc.rule_set_id}@{calc.version}:{calc.rule_sha256 or 'unhashed'}",
         tax_calculation_evidence_id(calc),
     )
-    supported = calc.production_ready
+    supported = calc.production_ready and not claims
+    estimate_reason = None
+    if claims:
+        rule = f"{calc.rule_set_id}@{calc.version}"
+        estimate_reason = f"computed by rule {rule} from unverified inputs: {'; '.join(claims)}"[:500]
     lines: list[CostLine] = []
     for category in sorted(IMPORT_CATEGORIES):
         label = f"{category.value} ({calc.rule_set_id}@{calc.version}, {calc.rule_status.value})"
@@ -646,6 +667,7 @@ def tax_cost_lines(calc: TaxCalculation | None, *, missing_reason: str | None = 
                     currency=calc.currency,
                     base=total.amount,
                     evidence_ids=evidence,
+                    reason=estimate_reason,
                     rule_supported=supported,
                     assumption_approved=supported,
                 )

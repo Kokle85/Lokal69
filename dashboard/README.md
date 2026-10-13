@@ -13,9 +13,25 @@ static single-page app (Vite 8 + React 19.3 + React Router 8 + TypeScript 6) tha
   section, list, detail with the original message and the informational Macedonian preview),
   seller replies (original text, Macedonian summary, unaccepted quotes, escalations), inquiry
   control (pause/resume), mail-worker health and coverage gaps, coverage and lags (per source and
-  per listing) and the 15-day evaluation.
+  per listing) and the 15-day evaluation;
+- has a read-only **Customs calculator** (`/import-costs`, and `/candidates/<id>/import-costs`
+  starting from that listing's facts; `GET /api/import-costs/estimate`, the same calculation dot
+  gets through MCP): North Macedonian customs duty, motor-vehicle tax (ДМВ), import VAT and the
+  landed cost, all computed by the server. Until the owner activates an approved rule set the
+  result is an INDICATIVE PREVIEW on the unapproved draft, shown with the server's Macedonian and
+  English banner and totals named "indicative"; unknown charges read "unknown" (never 0), helper
+  components are secondary rows that are never counted, and the URL keeps the submitted facts;
+- has an owner-only **Tax rules and cost profile** section in Settings (`/api/settings/tax-rules`
+  and `/api/settings/cost-profiles`, `config:admin`): the stored rule-set versions and repository
+  drafts with status chips, content hashes, sources, components and their UNCERTAIN items (the open
+  questions to resolve first), and the configured cost profile with its fixed EUR 700 transport
+  line. Store draft, Submit for review, Approve (named approver + review record bound to the
+  content hash), Activate, Revoke and the cost-profile approval are explicit owner acts: each one
+  states its effect on production valuations and needs a ticked confirmation; nothing is approved
+  or activated automatically. Reviewers and viewers see a read-only note.
 
-**Standing authorization (spec 37.1):** there is no approve, send or reply control anywhere. The
+**Standing authorization (spec 37.1):** there is no approve, send or reply control for seller
+messages anywhere. The
 pipeline sends one initial inquiry per verified vehicle/seller pair from validated records only
 (mode `automatic`, kill switch off, authorization active, sender verified); the dashboard shows
 what happened and lets the owner pause or resume.
@@ -267,8 +283,9 @@ Recommended response headers from the static host (the build already contains a 
   inline scripts or styles). The E2E suite fails on any CSP violation.
 - **Roles.** Mutation controls are shown only for the scopes returned by `/api/me` (viewer:
   read-only, no seller-inquiry area; reviewer: claim/decide/notes/recheck and the inquiry screens
-  read-only; owner: also source pause, inquiry pause/resume and the owner-only administration
-  details in Settings). The backend enforces every scope regardless.
+  read-only; owner: also source pause, inquiry pause/resume, the owner-only administration
+  details and the tax-rule and cost-profile acts in Settings). The backend enforces every scope
+  regardless.
 - **Seller inquiries (spec 37).** No approve, send or reply control exists. The Macedonian preview
   is labelled as an informational audit translation, never an approval draft. Seller addresses
   and the text of a quarantined reply appear only when the API returns them (owner only); seller

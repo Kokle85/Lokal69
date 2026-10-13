@@ -5,7 +5,65 @@ The build waves in order, derived from `git log --oneline` and the wave document
 commits are omitted; they only preserved interrupted work. **No wave activated anything against
 a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC.
 
-## Unreleased (working tree on top of `e5d47f4`, not committed)
+## Unreleased (working tree on top of `da4c5e6`, not committed)
+
+### Customs calculator and dot access (2026-10-13)
+
+Owner decisions of 2026-10-13 (docs/decisions/0003-transport-and-customs-calculator.md): transport
+is a fixed EUR 700 per vehicle (committed in `da4c5e6`) and a customs/import-tax calculator for
+North Macedonia that dot can use. Nothing is approved or activated; no migration.
+
+- Tax engine 1.1 (`tax-engine/1.1.0`, `domain/tax_engine.py`): intermediate (helper) components
+  never counted in totals, brackets keyed on money (`key_terms`, `key_currency`) under the customs
+  rate checks, law-style `over`/`up_to` bounds, `amount_per_unit`, an integer guard
+  (`VALUE_NOT_INTEGER_NO_BAND_RULE`), VAT-only incidental costs (`vat_incidental_costs_total`),
+  and `select_preview_rule_set` for a labelled indicative preview. Existing rule sets keep their
+  hash. Production selection (`select_rule_set`, `allow_unapproved=False`) is unchanged.
+- The North Macedonian DRAFT rule set
+  `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json` (customs duty, motor-vehicle
+  tax ДМВ, import VAT on an HS 8703 car; status `draft`, every open point `UNCERTAIN - confirm`),
+  golden-tested to the denar (`tests/unit/test_mk_rule_draft.py`), and the evidence pack
+  docs/tax/mk_import_fact_sheet_2026-10.md. `config validate`, `doctor` and `make smoke-local`
+  check the drafts directory.
+- `domain/import_estimate.py`: vehicle facts, the builder from facts to engine inputs (origin,
+  tariff code and VAT base never inferred; CO2 cycle as printed, never converted; the Euro 4 import
+  gate as a warning) and the estimate (scenarios: legal base, standard duty if the proof is
+  rejected, customs revaluation risk; `indicative_total` in preview mode; MK/EN banner; uncertain
+  items). `costs.tax_cost_lines` refuses anything but an engine calculation.
+- Read service `persistence/queries/import_costs.py` and view `views/import_costs.py`
+  (`ImportCostEstimateView`), served as the MCP tool `deals_estimate_import_costs` (dot,
+  `deals:read`), `GET /api/import-costs/estimate` with the dashboard "Customs calculator" screen,
+  and `suv-deals import-costs estimate`. Read-only: nothing is persisted.
+- Owner tooling: the dashboard's Settings section "Tax rules and cost profile"
+  (`/api/settings/tax-rules*`, `/api/settings/cost-profiles*`, `config:admin`) stores a repository
+  draft, submits it for review, approves it (approver + review record bound to the content hash),
+  activates or revokes it, and approves the cost profile; `suv-deals tax-rules list` and
+  `tax-rules store`. `valuation_repo.transition_tax_rule_set` gained optional
+  `expected_status`/`expected_sha256` checks under the row lock.
+- Valuations build their tax inputs with the same builder (still ACTIVE rule sets only): builder
+  notes become valuation warnings (`TAX_INPUT_*`, `IMPORT_GATE:`), a customs rate counts only in
+  its own month, tax lines resting on advertised prices or caller claims are never
+  `rule_supported`, and helper components are flagged `intermediate` in the valuation view
+  (snapshots `schemas/valuation.schema.json`, `schemas/tools/deals_get_valuation.json`).
+- Docs: README "Customs calculator", ADR 0003, config/tax_rules/README.md, docs/tax_rule_approval.md,
+  docs/api_contract.md, docs/connect_mcp.md section 7, docs/runbook.md, docs/architecture.md,
+  docs/schema.md 11.15, SECURITY.md, IMPLEMENTATION_STATUS.md, ACTIVATION_GATES.md (`tax_rules` and
+  `cost_assumptions` stay `blocked`).
+- Verification (docs/qa_evidence.md, "Customs calculator wave"): full suite 8,505 passed + 1
+  skipped on PostgreSQL 16 and 8,506 passed on 17; desktop 317; dashboard 208 unit tests, build;
+  browser E2E 48 on PostgreSQL 16 and 17 (and the harness's 36).
+
+## Owner decisions (2026-10-10 to 2026-10-13, `20fddf8`, `da4c5e6`)
+
+- `outlook_local` is the send and reply path; mobile.de and AutoScout24 are included as
+  acquisition sources with `terms_decision: proceed_acknowledged` (sources stay disabled; ADR 0002
+  addendum).
+- Transport is a fixed EUR 700 per vehicle: cost profile `default` version 3, still unapproved.
+
+## Wave D: final review fixes and handoff documentation (2026-10-10, `cee1a15`, `1e157af`)
+
+`1e157af` recorded the exact-build release verification of `cee1a15`
+(docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/).
 
 ### Final verification pass (2026-10-10)
 

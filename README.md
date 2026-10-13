@@ -48,9 +48,9 @@ with row-level security). Details: [docs/architecture.md](docs/architecture.md).
 | `src/suv_deals/workers/` | Job runner, handlers, reconciliation, outbox dispatcher, inquiry and reply handlers |
 | `src/suv_deals/api/`, `mcp/`, `views/` | Dashboard API (FastAPI), mail-worker API, MCP server (official SDK), shared read models |
 | `src/suv_deals/integrations/` | ECB FX, MCP Events webhooks, Slack, MIME builder, e-mail providers, secret box, safe HTTP |
-| `src/suv_deals/cli.py`, `cli_commands/` | The `suv-deals` operator CLI (doctor, db, sources, crawl, inquiries, sender binding, mail worker, canary, market, fx, jobs, ...) |
+| `src/suv_deals/cli.py`, `cli_commands/` | The `suv-deals` operator CLI (doctor, db, sources, crawl, inquiries, sender binding, mail worker, canary, market, fx, jobs, tax rules, import costs, ...) |
 | `supabase/migrations/` | 16 forward-only SQL migrations (applied to the hosted project through `20261008000200`) |
-| `config/` | Business configuration, search profiles, source registry, taxonomy, cost profiles, tax-rule examples, the standing authorization record |
+| `config/` | Business configuration, search profiles, source registry, taxonomy, cost profiles, the tax-rule example and the unapproved North Macedonian draft (`config/tax_rules/drafts/`), the standing authorization record |
 | `schemas/` | Exported JSON schemas of the MCP tools and API responses (checked against the code) |
 | `dashboard/` | Private React dashboard (Vite, Supabase Auth, Vitest, Playwright) |
 | `desktop/outlook-bridge/` | Windows desktop mail worker for classic Outlook (Linux-testable with fakes) |
@@ -129,6 +129,32 @@ FX records, jobs, migrations) needs `--yes`; the process commands (`api serve`, 
 Compose deployments enable a switch only through a dedicated `SUV_DEALS_*` variable
 exported for that deployment (docs/runbook.md section 1). Security model: [SECURITY.md](SECURITY.md).
 
+## Customs calculator
+
+Customs duty, motor-vehicle tax (ДМВ) and import VAT for importing one used passenger car into North
+Macedonia, from a listing's facts, from facts you state, or both, with the landed cost (price +
+the fixed EUR 700 transport + charges). One read-only service backs three surfaces; none of them
+stores anything:
+
+| Who | Where |
+|---|---|
+| Dashboard (scope `deals:read`) | "Customs calculator" (`/import-costs`, or from a candidate's detail page) over `GET /api/import-costs/estimate` |
+| dot (MCP) | tool `deals_estimate_import_costs`, scope `deals:read` ([docs/connect_mcp.md](docs/connect_mcp.md) section 7) |
+| Operator (CLI) | `uv run suv-deals import-costs estimate --listing-id <id>` or vehicle facts, e.g. `--price 3000 --fuel diesel --co2 nedc:189 --co2-document coc --origin-proof none` (`--json` for the shared view) |
+
+> **No tax rule set is approved yet.** The rates live only in the rule-set JSON. The North
+> Macedonian rules ship as an unapproved DRAFT
+> (`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json`), so every result is an
+> **INDICATIVE PREVIEW** (ИНДИКАТИВНА ПРОЦЕНКА): `production_ready: false`, totals named
+> `indicative_total`, never used for valuations or alerts. Valuations keep import charges
+> `unknown` until the owner approves and activates a rule set (dashboard, Settings, "Tax rules
+> and cost profile"; [docs/tax_rule_approval.md](docs/tax_rule_approval.md)). Missing facts (the
+> CO2 document, the month's customs EUR/MKD rate) make the affected charges unknown, never zero;
+> without a stated proof of origin the standard duty applies. Origin, tariff code and the VAT base
+> are never inferred, and WLTP/NEDC figures are never converted. Evidence pack:
+> [docs/tax/mk_import_fact_sheet_2026-10.md](docs/tax/mk_import_fact_sheet_2026-10.md); decisions:
+> [docs/decisions/0003-transport-and-customs-calculator.md](docs/decisions/0003-transport-and-customs-calculator.md).
+
 ## Documentation
 
 | Topic | Document |
@@ -148,7 +174,7 @@ exported for that deployment (docs/runbook.md section 1). Security model: [SECUR
 | Seller e-mail activation and templates | [docs/seller_email_activation.md](docs/seller_email_activation.md), [docs/seller_email_templates.md](docs/seller_email_templates.md) |
 | Source terms, robots and activation checklist | [docs/source_access_register.md](docs/source_access_register.md) |
 | Switzerland as an acquisition market | [docs/markets/switzerland.md](docs/markets/switzerland.md) |
-| Tax rule approval | [docs/tax_rule_approval.md](docs/tax_rule_approval.md) |
+| Tax rule approval; the North Macedonian fact sheet; transport and calculator decisions | [docs/tax_rule_approval.md](docs/tax_rule_approval.md), [docs/tax/mk_import_fact_sheet_2026-10.md](docs/tax/mk_import_fact_sheet_2026-10.md), [ADR 0003](docs/decisions/0003-transport-and-customs-calculator.md) |
 | Tested dependency versions | [docs/dependency_inventory.md](docs/dependency_inventory.md) |
 | Dashboard | [dashboard/README.md](dashboard/README.md) |
 | Desktop mail worker | [desktop/outlook-bridge/README.md](desktop/outlook-bridge/README.md) |

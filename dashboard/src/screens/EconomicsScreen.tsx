@@ -226,6 +226,7 @@ function ValuationBody({ valuation, timeZone }: { valuation: ValuationView; time
             {valuation.tax.components.map((component) => (
               <li key={component.component_id}>
                 {component.label}: <Amount value={component.amount} showReason /> <span className="muted">({label(component.status)})</span>
+                {component.intermediate ? <span className="muted"> · intermediate, not counted in the total</span> : null}
                 {component.missing_inputs.length ? <span className="muted"> · missing {component.missing_inputs.join(', ')}</span> : null}
               </li>
             ))}

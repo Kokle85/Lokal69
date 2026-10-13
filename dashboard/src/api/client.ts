@@ -24,9 +24,14 @@ import {
   type ClaimResult,
   type ComparableSetView,
   type ComparablesQuery,
+  type CostProfileApproveRequest,
+  type CostProfileApproveResult,
+  type CostProfilesView,
   type CoverageLagsView,
   type EvaluationQuery,
   type EvaluationReport,
+  type ImportCostEstimateQuery,
+  type ImportCostEstimateView,
   type InquiryControlView,
   type InquiryListQuery,
   type InquiryListView,
@@ -61,6 +66,10 @@ import {
   type SourceListView,
   type SourcePauseResult,
   type SubmitReviewRequest,
+  type TaxRuleChangeResult,
+  type TaxRuleSetsView,
+  type TaxRuleStoreRequest,
+  type TaxRuleTransitionRequest,
   type ValuationView,
 } from './types'
 
@@ -270,6 +279,30 @@ export class ApiClient {
   }
   async evaluation(query: EvaluationQuery = {}, options: RequestOptions = {}) {
     return this.get<EvaluationReport>('/api/evaluation', { ...query }, options)
+  }
+  /** Read-only import-cost calculator (nothing is stored; an indicative preview is labelled by the server). */
+  async importCostEstimate(query: ImportCostEstimateQuery, options: RequestOptions = {}) {
+    if (query.listing_id !== undefined) pathId(query.listing_id, 'listing_id')
+    return this.get<ImportCostEstimateView>('/api/import-costs/estimate', { ...query }, options)
+  }
+
+  // Owner approval path for tax rule sets and cost profiles (config:admin; unrelated to seller
+  // messages): every act is one explicit owner request with an idempotency key; nothing is approved
+  // or activated automatically.
+  async taxRuleSets(options: RequestOptions = {}) {
+    return this.get<TaxRuleSetsView>('/api/settings/tax-rules', undefined, options)
+  }
+  async storeTaxRuleDraft(body: TaxRuleStoreRequest, options: RequestOptions = {}) {
+    return this.post<TaxRuleChangeResult>('/api/settings/tax-rules/store', body, options)
+  }
+  async transitionTaxRuleSet(body: TaxRuleTransitionRequest, options: RequestOptions = {}) {
+    return this.post<TaxRuleChangeResult>('/api/settings/tax-rules/transition', body, options)
+  }
+  async costProfiles(options: RequestOptions = {}) {
+    return this.get<CostProfilesView>('/api/settings/cost-profiles', undefined, options)
+  }
+  async approveCostProfile(body: CostProfileApproveRequest, options: RequestOptions = {}) {
+    return this.post<CostProfileApproveResult>('/api/settings/cost-profiles/approve', body, options)
   }
 
   // ------------------------------------------------------------------ transport

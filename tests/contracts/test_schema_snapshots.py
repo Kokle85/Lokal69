@@ -43,9 +43,9 @@ from suv_deals.api.schemas import (
 from suv_deals.domain.enums import Scope
 from suv_deals.errors import HTTP_STATUS, ErrorCode, NotFound, RateLimited, ValidationFailed, VersionConflict
 from suv_deals.mcp.schemas import (
-    TOOL_NAMES,
+    ALL_TOOL_NAMES,
+    CALC_TOOLS,
     TOOLS,
-    V11_TOOL_NAMES,
     V11_TOOLS,
     DealsListCandidatesInput,
     ReviewsSubmitInput,
@@ -67,10 +67,10 @@ EXPECTED_FILES = {
     "review.schema.json",
     "valuation.schema.json",
     "event.schema.json",
-    *(f"tools/{name}.json" for name in (*TOOL_NAMES, *V11_TOOL_NAMES)),
+    *(f"tools/{name}.json" for name in ALL_TOOL_NAMES),
     *(f"api/{route_slug(route)}.json" for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)),
 }
-ALL_TOOLS = {**TOOLS, **V11_TOOLS}
+ALL_TOOLS = {**TOOLS, **V11_TOOLS, **CALC_TOOLS}
 
 
 def _all_documents() -> dict[str, dict[str, Any]]:
@@ -133,7 +133,7 @@ def test_document_schemas_are_self_contained(path: str, generated: dict[str, str
         assert not open_maps
 
 
-@pytest.mark.parametrize("name", (*TOOL_NAMES, *V11_TOOL_NAMES))
+@pytest.mark.parametrize("name", ALL_TOOL_NAMES)
 def test_tool_snapshot_content(name: str, generated: dict[str, str]) -> None:
     doc = json.loads(generated[f"tools/{name}.json"])
     assert doc["name"] == name
@@ -400,7 +400,7 @@ def test_contract_doc_lists_every_route_scope_model_and_error() -> None:
         assert f"`{route.response_model.__name__}`" in doc or f"`{route.data_model.__name__}`" in doc
         if route.request_model is not None:
             assert f"`{route.request_model.__name__}`" in doc, route.request_model.__name__
-    for name, spec in V11_TOOLS.items():
+    for name, spec in {**V11_TOOLS, **CALC_TOOLS}.items():
         assert f"| `{name}` | `{spec.scope.value}` |" in doc, name
         assert f"`{spec.output_model.__name__}`" in doc
     assert "served by default" in doc

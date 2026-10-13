@@ -5,6 +5,14 @@ Status of the build against [docs/spec/suv-deal-system-build-spec.md](docs/spec/
 commit `e5d47f4` plus the uncommitted waves D1, D2 and D3 and the final verification pass (exact
 commands, counts and the working-tree note: [docs/qa_evidence.md](docs/qa_evidence.md)).
 
+**Update 2026-10-13 (owner decisions, ADR 0003):** transport is a fixed EUR 700 per vehicle
+(cost profile version 3, still unapproved), and a customs/import-tax calculator for North
+Macedonia (duty, motor-vehicle tax ДМВ, import VAT, landed cost) is `integration_verified` on
+PostgreSQL 16 and 17 for dot (MCP `deals_estimate_import_costs`), the dashboard and the CLI. Its
+rules are an unapproved DRAFT, so every result is a labelled indicative preview and valuations
+still keep import charges unknown (gate `tax_rules` stays `blocked`). Commands and counts of that
+run: [docs/qa_evidence.md](docs/qa_evidence.md), "Customs calculator wave".
+
 States are those of spec 32: `implemented`, `fixture_verified`, `integration_verified`,
 `live_verified`, `active`, `blocked`, `not_requested`. Here `fixture_verified` means proven on
 saved or synthetic fixtures, and `integration_verified` means proven against a real PostgreSQL
@@ -26,8 +34,8 @@ external effect is off by default.
 | M2 Database and reliability foundation | done | 16 forward-only migrations, RLS on every `app`/`ops` table, durable jobs with leases, idempotency, outbox, audit; `tests/integration/db`, `tests/integration/persistence_core` on PostgreSQL 16 and 17.11 | - |
 | M3 Crawl4AI integration and first source | code done, exit **blocked** | Crawl4AI 0.9.4 REST client, URL policy, robots, rate limits, parser health, scheduler; generic dealer adapter `fixture_verified` (`tests/adapters`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`) | a permitted live search/detail smoke on one real source (gates `existing_crawler`, `source_access`) |
 | M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 12 of 14 sources have no adapter; mobile.de and AutoScout24 are included by owner decision (2026-10-10) but their adapters still need real page captures; no MK evidence in any real workspace |
-| M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`) | an approved rule set (gate `tax_rules`), owner cost assumptions (gate `cost_assumptions`) |
-| M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 MCP tools, scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
+| M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine 1.1, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_tax_engine_extensions.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`); the North Macedonian DRAFT rule set golden-tested (`tests/unit/test_mk_rule_draft.py`) and the import-cost calculator (`tests/unit/test_import_estimate.py`, `tests/integration/import_costs`, `tests/mcp/test_calc_tools.py`, `tests/api/test_import_cost_routes.py`, `tests/cli/test_import_cost_db_commands.py`); transport fixed at EUR 700 | the owner's review, approval and activation of a rule set (gate `tax_rules`), approval of the cost profile and the other cost assumptions (gate `cost_assumptions`) |
+| M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 + 1 MCP tools (the +1 is the calculator `deals_estimate_import_costs`), scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
 | M7 Notifications and optional activation bridge | done offline; activation **blocked** | MCP Events provider and subscriptions, Slack fallback and the selected Slack seller-reply route, destination bindings, dedup, uncertainty handling (`tests/integration/pipeline/test_dispatcher.py`, `tests/integration/v11_runtime`, `tests/mcp/test_events.py`) | delivery receipts and dot's processing evidence; an operator command for destination bindings (ACTIVATION_GATES.md section 19) |
 | M7a Bounded automatic seller inquiries | `integration_verified`; activation **blocked** | U1-U12 below; `tests/integration/v11_*`, `tests/integration/mail_worker_e2e`, `desktop/outlook-bridge/tests` | the owner's classic Outlook, the activation canary (rows 4-6) and the Slack -> dot leg; no actual seller e-mail is claimed |
 | M8 Release hardening | partial | independent reviews after every wave (security, spec acceptance, operations), the final review findings fixed in D1/D2, this acceptance matrix with passed/blocked/not-run rows | restore and rollback drills; image digests (the exact-build release report for `cee1a15` is verified: docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/) |
@@ -81,8 +89,9 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 - **Supabase serving.** The hosted project has the schema but no backend process, user, workspace,
   backup or restore drill.
 - **Hosting.** No image was built, no digest recorded, nothing deployed.
-- **Tax rules.** No approved, sourced North Macedonian rule set; every real valuation keeps import
-  charges unknown.
+- **Tax rules.** No approved, ACTIVE North Macedonian rule set; every real valuation keeps import
+  charges unknown. A DRAFT ships under `config/tax_rules/drafts/` (golden-tested, not approved); the
+  import-cost calculator uses it only as a labelled indicative preview.
 - **Owner approval of PROPOSED values:** the EUR 1,500 contribution threshold, 48 h observation
   freshness, the 7-day cooldown default, 3 send attempts, `MAX_SIGNALS_PER_INQUIRY_24H` = 6,
   `MAIL_WORKER_REPLY_LIMIT`, `MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR` = 120,
@@ -91,8 +100,9 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
   docs/qa/cee1a15aaa87583d8e2847bb14253932273855d4/); restore and rollback drills of the hosted
   project were not performed.
 - **Activation tooling not built:** no command records a gate status change; no command creates,
-  approves or verifies a destination binding; no command stores, approves or activates a tax rule
-  set in the database; no command approves a cost profile; no command records the `gmail_api`
+  approves or verifies a destination binding; storing, reviewing, approving and activating a tax
+  rule set and approving the cost profile are owner acts in the dashboard (Settings, "Tax rules and
+  cost profile", `/api/settings/*`, owner only), never automatic; no command records the `gmail_api`
   provider verification.
 
 ## Known limitations
@@ -175,8 +185,9 @@ Found in wave D3 and fixed in the final verification pass:
 
 Still open:
 
-- **Activation tooling missing** for gate status changes, destination bindings, tax rule sets and
-  cost-profile approval (ACTIVATION_GATES.md sections 6, 7, 19).
+- **Activation tooling missing** for gate status changes and destination bindings
+  (ACTIVATION_GATES.md section 19). Tax rule sets and cost-profile approval have the owner's
+  dashboard section (ACTIVATION_GATES.md sections 6, 7); nothing is approved yet.
 
 ## Spec 34 handoff contents
 
@@ -233,10 +244,12 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   arithmetic, FX conversion and scenarios are deterministic and tested on synthetic data. No real
   valuation is evidence-supported: no MK market evidence exists in a real workspace (so every
   valuation is `insufficient_comparables`), no approved tax rule set and no owner-approved cost
-  assumptions.
+  assumptions. The import-cost calculator reproduces the North Macedonian fact sheet's worked
+  examples to the denar, but on unapproved DRAFT rules: its results are labelled indicative
+  previews, not evidence-supported figures.
 - **Can dot read the queue?** Not yet. The MCP server and its tools are complete and tested with
   the official SDK client in process, but no real dot client has connected (gate
-  `mcp_authentication`).
+  `mcp_authentication`). The same holds for the calculator tool `deals_estimate_import_costs`.
 - **Can dot actually be triggered?** No. Neither native MCP Events nor the Slack route is
   configured or verified (gates `native_mcp_events`, `seller_reply_slack_route`,
   `automatic_dot_activation`).

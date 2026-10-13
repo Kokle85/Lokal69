@@ -333,6 +333,20 @@ The three spec 37.8 seller-inquiry tools live in the separate `mcp.schemas.V11_T
 (section 10.4); they are not in `TOOLS` (the spec 21 catalogue stays exactly twelve tools) but the
 default registry serves them after the twelve (`mcp.tools.ToolRegistry.default`).
 
+The import-cost calculator lives in its own table, `mcp.schemas.CALC_TOOLS`, served after the
+inquiry tools (the same read backs the dashboard and the CLI; docs/connect_mcp.md section 7):
+
+| Tool | Scope | Annotations (read-only / destructive / idempotent / open-world) | Result `data` |
+|---|---|---|---|
+| `deals_estimate_import_costs` | `deals:read` | yes / no / yes / no | `ImportCostEstimateView` |
+
+It takes `listing_id` and/or `vehicle` facts (each set field replaces the listing's), an optional
+caller-supplied `customs_eur_mkd_rate` and `accept_previous_month_fx`; decimals are bounded
+strings. It persists nothing. Without an ACTIVE, owner-approved rule set the result is an
+`indicative_preview` on unapproved draft rules (`production_ready: false`, MK/EN `banner`, totals
+named `indicative_total`), or `unavailable` (every import charge unknown). It uses the expensive
+rate-limit bucket.
+
 Input schemas (`tool_input_schema`) are the spec §21 schema map, resolved: no `$ref`,
 `additionalProperties: false` on every object, JSON Schema 2020-12. They add only narrowing
 keywords the domain already enforces (character patterns for idempotency keys, claim tokens and
@@ -365,7 +379,7 @@ text from `ResponseEnvelope.to_text()`.
 `schemas/valuation.schema.json` (`ValuationView`), `schemas/event.schema.json` and
 `schemas/tools/<tool>.json` (MCP `Tool` object with `inputSchema`, `outputSchema`,
 `annotations`, `requiredScope`, `paginated`, `idempotencyOperation` and `errorSchema`; the twelve
-`TOOLS` plus the three served `V11_TOOLS`) and `schemas/api/<route>.json` (one file per spec 37
+`TOOLS`, the three served `V11_TOOLS` and the `CALC_TOOLS` calculator) and `schemas/api/<route>.json` (one file per spec 37
 route of section 10: `method`, `path`, `auth`, `requiredScope`, `requestLocation`, the `request`
 validation schema, the `response` serialization schema, `successStatus`, `errors`, `paginated`,
 `mcpTool`, `summary` and `idempotencyKeyHeader` (`required`, `optional` or `null`); the file
@@ -583,6 +597,12 @@ User-JWT routes like section 6, enveloped, with the same error conventions. Tabl
 | `GET /api/lifecycle/lags` | `deals:read` | - | `CoverageLagsView` (`SourceLagView`, `LagView`) | 200 | - | - |
 | `GET /api/listings/{listing_id}/lifecycle` | `deals:read` | - | `ListingLifecycleView` | 200 | `NOT_FOUND` | - |
 | `GET /api/evaluation` | `inquiries:read` (+ `deals:read`) | query `EvaluationQuery` (`days` = 15) | `EvaluationReport` | 200 | - | - |
+| `GET /api/import-costs/estimate` | `deals:read` | query `ImportCostEstimateQuery` (`listing_id`, flat vehicle facts, `customs_eur_mkd_rate`, `accept_previous_month_fx`) | `ImportCostEstimateView` | 200 | `NOT_FOUND` | `deals_estimate_import_costs` |
+| `GET /api/settings/tax-rules` | `config:admin` | - | `TaxRuleSetsView` of `TaxRuleSetSummaryView` | 200 | - | - |
+| `POST /api/settings/tax-rules/store` | `config:admin` | body `TaxRuleStoreRequest` (`file_name`, `content_sha256`) | `TaxRuleChangeResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
+| `POST /api/settings/tax-rules/transition` | `config:admin` | body `TaxRuleTransitionRequest` (`rule_set_id`, `version`, `expected_status`, `target`, `content_sha256`, `approved_by` + `ReviewRecordInput` for `approved`) | `TaxRuleChangeResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
+| `GET /api/settings/cost-profiles` | `config:admin` | - | `CostProfilesView` of `CostProfileSummaryView` | 200 | - | - |
+| `POST /api/settings/cost-profiles/approve` | `config:admin` | body `CostProfileApproveRequest` (`profile_key`, `version`, `content_sha256`) | `CostProfileApproveResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
 
 Pause and resume take their `idempotency_key` in the body; an optional `Idempotency-Key` header must
 equal it (`idempotency_header="optional"`, as on the other dashboard mutations). Pause uses the
@@ -688,6 +708,52 @@ surface replays the same result); resume uses `inquiry_control_resume`.
 - **Evaluation** is the 15-day quality report from stored evidence (`domain.evaluation`); zero
   suitable deals is reported as zero, and the contribution threshold is used only when
   `CONTRIBUTION_THRESHOLD_APPROVED=true` (otherwise a `THRESHOLD_PROPOSED` warning).
+- **Import-cost calculator** (`GET /api/import-costs/estimate`, handler `api.import_cost_routes`;
+  read-only, persists nothing, so no idempotency key): the `deals_estimate_import_costs` tool
+  input as flat query parameters, converted to that input before use (same rules, same read,
+  `queries.get_import_cost_estimate`). `listing_id` is optional; each vehicle parameter that is
+  given replaces the listing's fact. The nested tool objects are flattened: `price_amount` +
+  `price_currency`, one `co2_wltp_g_km` / `co2_nedc_g_km` / `co2_nedc_correlated_g_km` /
+  `co2_unknown_cycle_g_km` per cycle as printed (never converted; `co2_clear=true` drops the
+  listing's figure), `origin_proof_kind` / `_country` / `_evidence_ref`; validation failures name
+  these parameters. Without an ACTIVE, owner-approved rule set the result is an
+  `indicative_preview` (`production_ready: false`, MK/EN `banner`, totals `indicative_total`,
+  `indicative_total_eur`, `indicative_landed_cost_eur`) or `unavailable`; envelope warnings use
+  the existing codes (`TAX_RULES_UNAPPROVED`, `UNKNOWN_COSTS`, `FIXTURE_DATA`,
+  `SELLER_CLAIMS_UNVERIFIED`). A missing or foreign listing is `404 NOT_FOUND`.
+- **Owner approval path** (`/api/settings/tax-rules*`, `/api/settings/cost-profiles*`, handler
+  `api.owner_config_routes`; `config:admin` only, so reviewers and viewers get `403 FORBIDDEN`; never
+  an MCP tool). `GET /api/settings/tax-rules` lists every stored rule-set version and every
+  `config/tax_rules/drafts/*.json` DRAFT the workspace does not hold yet (`origin` `stored` /
+  `draft_file`): status, dates, currency, `content_sha256` (sealed `sha256`, or computed from an
+  unsealed draft; `sha256_sealed`), sources, a component summary, the recorded approval, every
+  `UNCERTAIN` item, `allowed_actions` and the calculator's selection for today. **Store** takes a draft
+  file NAME only (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,150}\.json$`, no `..`; a name the listing does not show,
+  or a symlink leaving the drafts directory, is `404`; no path, no upload) plus its `content_sha256`,
+  and stores it as `draft` (`valuation_repo.store_rule_set`, audited `tax_rules.store`); a version the
+  workspace already holds is `409 VERSION_CONFLICT` with `details.reason` `already_stored` or
+  `different_content` (content is never overwritten). **Transition** moves a stored version to
+  `under_review` (seals the hash), `approved`, `active` or `revoked`
+  (`valuation_repo.transition_tax_rule_set`: domain lifecycle, database trigger, audit,
+  invalidation on revoke). `expected_status` and `content_sha256` are compared under the row lock: a
+  different status is `409 VERSION_CONFLICT` (`details.reason = status_changed`), a different hash
+  `422` (`details.fields = [content_sha256]`); an illegal transition is `422`. `approved` REQUIRES
+  `approved_by` (the approver's name) and `review_record` (`reviewer`, `reviewed_at` (not in the
+  future), `scope`, optional `professional_reference`, `evidence_refs`, `notes`, and
+  `content_sha256`, which must equal the hash being approved); both are refused for every other
+  target. The review record is bound at APPROVAL (where the engine and the database keep it, in
+  `approval_reference`, at most 500 characters together with the approver's name), not at
+  submission. The authenticated owner is recorded as the approving principal. **Cost profiles**: the
+  configured `cost_profiles/default_unapproved.yaml` (the worker runtime's profile, transport line
+  shown separately) and the stored versions; **approve** names `profile_key`, `version` and the
+  `content_sha256` the owner saw (without the approval record) and calls
+  `valuation_repo.approve_cost_profile` (audited, dependent valuations invalidated); when the
+  configured file's version is not stored yet it is stored unapproved first, in the same
+  transaction. Every mutation takes its `idempotency_key` in the body (operations
+  `owner_tax_rules_store`, `owner_tax_rules_transition`, `owner_cost_profile_approve`; an optional
+  `Idempotency-Key` header must equal it) and runs in the transaction of its idempotency record: the
+  same key replays the original result, a refusal consumes nothing. Nothing is approved, activated or
+  stored automatically.
 - Review decisions (`ReviewDecisionView`, in `GET /api/reviews/{case_id}` and the submit result,
   and the MCP `reviews_submit` result) carry `decided_by_caller`: whether the authenticated caller
   recorded that decision. The review claim lease is `REVIEW_CLAIM_DURATION_SECONDS` (section 10.3).

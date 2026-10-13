@@ -4,6 +4,7 @@ import { Badge, EmptyState, ErrorPanel, KeyValues, LoadingState, Notice, Section
 import { groupDecimal, label, yesNo } from '../format'
 import { useApiQuery } from '../hooks/useApiQuery'
 import { useWorkspace } from '../workspace/WorkspaceProvider'
+import { TaxRulesSection } from './settings/TaxRulesSection'
 
 export function SettingsScreen() {
   const { timezone } = useWorkspace()
@@ -11,7 +12,10 @@ export function SettingsScreen() {
   return (
     <div className="screen">
       <h1>Settings</h1>
-      <p className="muted">Read-only. Configuration changes are owner-only operations outside this dashboard.</p>
+      <p className="muted">
+        Read-only, except the owner&apos;s tax-rule and cost-profile section below. Other configuration changes are owner-only
+        operations outside this dashboard.
+      </p>
       {settings.status === 'loading' ? <LoadingState label="Loading settings" /> : null}
       {settings.error ? <ErrorPanel error={settings.error} onRetry={settings.reload} /> : null}
       {settings.data && settings.envelope ? (
@@ -151,6 +155,8 @@ function SettingsBody({ settings, timeZone }: { settings: SettingsView; timeZone
           </tbody>
         </table>
       </Section>
+
+      <TaxRulesSection />
 
       <Section title="Administration" id="administration">
         <p className="muted">{settings.administration_note}</p>

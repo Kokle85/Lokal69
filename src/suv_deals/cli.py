@@ -13,7 +13,11 @@ Commands (``suv-deals <command> --help`` for details)::
     outbox inspect                 outbox counts and events needing attention
     reviews list                   review cases by state
     evidence verify                recompute revision and snapshot hashes (read-only)
-    tax-rules validate PATH        tax rule-set validation (never approves)
+    tax-rules validate PATH | list | store PATH
+                                   rule-set validation (never approves), stored versions + repo
+                                   drafts, store a draft file as the owner (--owner-user-id; --yes)
+    import-costs estimate          customs duty, motor-vehicle tax and import VAT for one vehicle
+                                   (read-only; an indicative preview until rules are ACTIVE)
     db migrate | target            print the target, then apply migrations (--yes) / only print it
                                    (--local-only: exit 3 unless it stays on this machine)
     api serve                      uvicorn for /api, /healthz, /readyz and /mcp (127.0.0.1 default)
@@ -64,6 +68,7 @@ from suv_deals.cli_commands import (
     db,
     doctor,
     fx,
+    import_costs,
     inquiries,
     jobs,
     market,
@@ -116,6 +121,7 @@ cli.add_command(ops.outbox_group)
 cli.add_command(ops.reviews_group)
 cli.add_command(ops.evidence_group)
 cli.add_command(tax.tax_rules_group)
+cli.add_command(import_costs.import_costs_group)
 cli.add_command(db.db_group)
 cli.add_command(credentials.credentials_group)
 cli.add_command(bootstrap.bootstrap_group)

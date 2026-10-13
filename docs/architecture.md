@@ -76,6 +76,7 @@ seller reply in the owner's mailbox
 | `domain/filters.py` | Deterministic eligibility screening per profile | profiles, money, taxonomy |
 | `domain/comparables.py` | MK comparable selection/exclusion/statistics | listings |
 | `domain/tax_engine.py` | Declarative, versioned, approval-gated import-tax rules | money |
+| `domain/import_estimate.py` | Vehicle facts, the builder from facts to tax-engine inputs (shared by valuations and the import-cost calculator; origin, tariff code and VAT base never inferred) and the import-cost estimate (scenarios, indicative-preview labelling) | tax_engine, costs |
 | `domain/costs.py` | Cost lines, scenarios, cash/landed/ready-to-sell/contribution arithmetic | money, tax_engine |
 | `domain/valuation.py` | Valuation assembly, dependency fingerprint, state | costs, comparables |
 | `domain/ranking.py` | Transparent deterministic ranking with visible contributions | valuation |
@@ -95,7 +96,7 @@ seller reply in the owner's mailbox
 | `integrations/*` | FX (ECB), MCP Events webhook delivery, Slack adapter | domain |
 | `observability/*` | JSON logging with redaction, Prometheus metrics, audit helpers | – |
 | `views/*` | Read models (pydantic) shared by the dashboard API and MCP tools; address/quarantined-text visibility rules (`views.inquiries`) | domain |
-| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`, `jobs` (blocked jobs: list, unblock, resolve), `canary` (owner-controlled activation canaries)) | persistence, workers, api |
+| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`, `jobs` (blocked jobs: list, unblock, resolve), `canary` (owner-controlled activation canaries), `tax-rules` (validate, list, store a draft), `import-costs estimate`) | persistence, workers, api |
 
 Spec v1.1 seller-inquiry and reply modules (section 37, ADR 0002):
 
@@ -123,6 +124,18 @@ Spec v1.1 seller-inquiry and reply modules (section 37, ADR 0002):
 | `mcp/tools.py` (`V11_TOOLS`) | `seller_inquiries_get`, `seller_replies_get`, `seller_inquiries_pause` (no send/resume tool) | persistence, views |
 | `desktop/outlook-bridge/` | Windows desktop worker (classic Outlook Object Model): local correlation, claim-then-send, reports, heartbeats; wire models in `outlook_bridge/wire.py` | the backend only over `/v1/mail-workers` |
 | `dashboard/` | Private React dashboard (BFF routes only, ADR 0001) including the v1.1 inquiry screens | `/api/...` |
+
+Customs calculator modules (ADR 0003):
+
+| Path | Responsibility | Depends on |
+|---|---|---|
+| `config/tax_rules/drafts/` | The unapproved North Macedonian draft rule set (never a production candidate) | - |
+| `persistence/queries/import_costs.py` | Read-only calculator service: ACTIVE stored rule set first, otherwise an indicative preview over stored and draft-file versions; customs rate lookup; listing facts; writes nothing | domain.import_estimate, valuation_repo, listings_repo |
+| `views/import_costs.py` | `ImportCostEstimateView` (closed schema, money as strings) shared by MCP, API and CLI | domain.import_estimate |
+| `mcp/schemas.py` (`CALC_TOOLS`), `mcp/tools.py` (`CALC_HANDLERS`) | `deals_estimate_import_costs` (`deals:read`, read-only) | persistence.queries, views |
+| `api/import_cost_routes.py` | `GET /api/import-costs/estimate` (`deals:read`) | persistence.queries, mcp.tools |
+| `api/owner_config_routes.py`, `views/owner_config.py` | Owner-only `/api/settings/tax-rules*` (store a draft, review, approve, activate, revoke) and `/api/settings/cost-profiles*` (approve) | valuation_repo |
+| `dashboard/src/screens/importCosts/`, `screens/settings/TaxRulesSection.tsx` | The "Customs calculator" screen and the owner's "Tax rules and cost profile" section | `/api/...` |
 
 ## Coding conventions (binding)
 

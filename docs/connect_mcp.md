@@ -12,7 +12,7 @@ listed in step 8.
 |---|---|---|
 | Endpoint | `https://<approved-domain>/mcp` (Streamable HTTP; served by `suv-deals api serve` behind the HTTPS reverse proxy) | tests/mcp (in-process client) |
 | SDK / protocol | official `mcp` 2.3.0, protocol revision 2026-07-28 (older handshake revisions still served, stateless) | docs/research/mcp_python_sdk.md, tests/mcp |
-| Tools (12 + 3) and scopes | `deals_health`, `deals_list_candidates`, `deals_get_candidate`, `deals_get_comparables`, `deals_get_valuation` (`deals:read`); `reviews_list_pending` (`reviews:read`); `reviews_claim`, `reviews_release`, `reviews_submit` (`reviews:write`); `deals_request_recheck` (`rechecks:request`); `deals_add_note` (`notes:write`); `sources_pause` (`sources:pause`); spec 37.8: `seller_inquiries_get`, `seller_replies_get` (`inquiries:read`), `seller_inquiries_pause` (`inquiries:pause`) | `schemas/tools/*.json`, tests/contracts, tests/mcp/test_v11_tools.py |
+| Tools (12 + 3 + 1) and scopes | `deals_health`, `deals_list_candidates`, `deals_get_candidate`, `deals_get_comparables`, `deals_get_valuation` (`deals:read`); `reviews_list_pending` (`reviews:read`); `reviews_claim`, `reviews_release`, `reviews_submit` (`reviews:write`); `deals_request_recheck` (`rechecks:request`); `deals_add_note` (`notes:write`); `sources_pause` (`sources:pause`); spec 37.8: `seller_inquiries_get`, `seller_replies_get` (`inquiries:read`), `seller_inquiries_pause` (`inquiries:pause`); import-cost calculator: `deals_estimate_import_costs` (`deals:read`, read-only; section 7) | `schemas/tools/*.json`, tests/contracts, tests/mcp/test_v11_tools.py, tests/mcp/test_calc_tools.py |
 | Discovery | `tools/list` shows only the tools the credential's scopes allow | tests/mcp |
 | Unauthenticated access | every private call is `401` with a `WWW-Authenticate: Bearer` challenge; a missing identity provider or database is `503`, never an open endpoint | tests/mcp |
 | Events (optional) | `events/list`, `events/subscribe`, `events/unsubscribe` for `review.pending.v1` only when `MCP_EVENTS_ENABLED=true` (and the encryption key is set) | tests/mcp, docs/notification_bridge.md |
@@ -58,7 +58,7 @@ uv run suv-deals credentials create-mcp --workspace <workspace-id> \
 | 2 | Deploy only after the owner authorizes destination and cost; HTTPS and correct auth | docs/runbook.md sections 3 and 8 | **blocked**: no approved host/domain |
 | 3 | Unauthenticated private calls fail; authorized reads succeed | `curl -i https://<domain>/mcp` must be `401`; then a read with the credential | not run (no deployment) |
 | 4 | Add the private custom MCP connection in the product | OpenAI documentation checked 2026-10-06 describes the web flow: open ChatGPT Plugins, select the plus button, choose *Add custom MCP server*, enter the server URL, configure authentication, review the risk warning, create and install the plugin. Availability depends on the account/workspace. No other menu or hidden setting is assumed. | not run |
-| 5 | Read scopes first; verify `deals_health`, `reviews_list_pending` and one specific candidate in the intended dot conversation | ask dot to call those tools | not run |
+| 5 | Read scopes first; verify `deals_health`, `reviews_list_pending`, one specific candidate and `deals_estimate_import_costs` for it in the intended dot conversation | ask dot to call those tools; check that dot relays the preview banner (section 7) | not run |
 | 6 | Review writes only after approval; test claim/submit on a clearly labelled canary case | a SYNTHETIC canary review case in a non-production workspace | not run |
 | 7 | Source and dashboard links open for the owner | open the links returned by `deals_get_candidate` | not run |
 | 8 | Record evidence | client version/surface, negotiated protocol, SDK version (2.3.0), tool-list hash (`sha256` of the `tools/list` result), exact successful test IDs/request ids | not run |
@@ -175,3 +175,99 @@ classic Outlook (owner's PC) -> desktop worker (local correlation only)
 
 Nothing in this page enables sending: seller e-mail is sent only by the pipeline under the standing
 authorization once docs/seller_email_activation.md is complete.
+
+## 7. Import-cost calculator for dot (`deals_estimate_import_costs`)
+
+The owner asked for a customs calculator that dot can use: for one vehicle it computes the North
+Macedonian **customs duty**, **motor-vehicle tax (ДМВ)** and **import VAT**, and the **landed cost**
+with the owner's fixed **EUR 700** transport per vehicle (the `transport` line of
+`config/cost_profiles/default_unapproved.yaml`). The same read backs the dashboard and the CLI.
+
+| Item | Value |
+|---|---|
+| Scope | `deals:read` (the read credential of section 3 already includes it; no new scope) |
+| Behaviour | read-only, idempotent, not open-world; nothing is stored: no valuation, cost line, alert, rate or audit row |
+| Rate limit | the expensive per-principal bucket (30 calls/minute), like paginated reads |
+| Rules | an ACTIVE, owner-approved rule set (mode `active`, exactly what valuations use); without one, an **indicative preview** on the newest unapproved draft (`config/tax_rules/drafts/`, mode `indicative_preview`); without any, mode `unavailable` |
+| Contract | `schemas/tools/deals_estimate_import_costs.json`, docs/api_contract.md section 7 |
+
+No MCP tool approves or activates tax rules; that stays an owner act with a review record
+(docs/tax_rule_approval.md). Today no MK rule set is approved, so every result is an indicative
+preview.
+
+### 7.1 Example call
+
+Give a `listing_id` (from `deals_list_candidates`), `vehicle` facts, or both. Every `vehicle` field
+you set replaces the listing's fact; fields you omit keep the listing's or stay unknown. Decimals
+are strings (`"3000.00"`, never `3000`).
+
+```json
+{
+  "listing_id": "<listing uuid>",
+  "vehicle": {
+    "price": {"amount": "3000.00", "currency": "EUR"},
+    "price_basis": "invoice",
+    "declaration_date": "2026-10-13",
+    "fuel": "diesel",
+    "co2": [{"cycle": "nedc", "g_km": "189"}],
+    "co2_document": "coc",
+    "origin_proof": {"kind": "none"}
+  },
+  "customs_eur_mkd_rate": "61.5337"
+}
+```
+
+- `co2`: the figures exactly as printed, one per cycle; WLTP is used when present, otherwise NEDC.
+  Nothing is converted between cycles.
+- `co2_document`: where the figure is printed (`coc`, `registration_consent`,
+  `manufacturer_certificate`, `technical_assessment_certificate`), `listing_claim_unverified` for an
+  advertised figure, `none_available` only when no document exists (the rules then apply their
+  deemed charge, which is much higher). Omitted: the motor-vehicle tax stays unknown.
+- `origin_proof`: the proof the importer holds (`none`: standard duty; `unknown`: the duty stays
+  unknown; `eu`, `efta`, `tr`, `uk`, `cefta`, `ua`, `us`: a held proof, assumed accepted, with the
+  standard-duty alternative as a second scenario). The seller's country is never taken as origin.
+- `hs_code`: only from a broker, a ruling or the owner (HS 8703); a plug-in hybrid needs it.
+- `transport_after_entry_eur` with `transport_after_entry_separately_invoiced: true` only when the
+  inland leg is invoiced separately; otherwise all EUR 700 is in the customs value.
+- `catalogue_value_eur` adds a `customs_revaluation_risk` scenario; it is never the customs value.
+- `customs_eur_mkd_rate`: the Customs monthly list rate of the declaration month, used only when
+  none is recorded (`suv-deals fx record --purpose customs ...`); labelled and never stored.
+
+### 7.2 Reading the result
+
+| Field (`data.`) | Meaning | What dot says |
+|---|---|---|
+| `mode` | `active`, `indicative_preview` or `unavailable` | in a preview: "indicative, from unapproved draft rules"; unavailable: "import charges unknown" |
+| `banner.mk` / `banner.en` | the preview label | relay it with the figures, unchanged |
+| `production_ready` | `false` in every preview | never present a preview as a customs assessment or a final total |
+| `scenarios[0]` (`legal_base`) | `indicative_total` (MKD, a preview) or `total` (active rules), `indicative_total_eur` / `total_eur`, `indicative_landed_cost_eur` / `landed_cost_eur`, `categories` (import duty, motor-vehicle tax, import VAT) and `components` (helpers flagged `intermediate` are never added) | the total, the three charges and the landed cost, with the mode |
+| `scenarios[0].complete: false` | some charge is unknown: the total is `{"status": "unknown", "amount": null}`, `known_subtotal` shows what resolved | "incomplete"; never call the subtotal a total, never treat an unknown charge as 0 |
+| other `scenarios` | `standard_duty_if_proof_rejected`, `customs_revaluation_risk` | the alternative next to the legal base |
+| `missing_facts`, `missing_inputs` | what to supply (e.g. `co2_document`, `origin_proof`, `customs_fx_rate`, `hs_code`) | ask the owner for those documents |
+| `assumptions`, `warnings`, `unverified_inputs`, `uncertain_items` | the labelled assumptions (fixed transport, no proof means standard duty), claims that are not evidence (an advertised price, a listing CO2 figure) and rule statements still marked UNCERTAIN | mention the ones the figures rest on |
+| `gates.importable` | the Euro-class import gate (`yes`, `no`, `unknown`); it never changes an amount | warn when `no` or `unknown` |
+| envelope `warnings` | `TAX_RULES_UNAPPROVED` (preview), `UNKNOWN_COSTS`, `SELLER_CLAIMS_UNVERIFIED`, `FIXTURE_DATA` | as above |
+
+SYNTHETIC example (the call above without `listing_id`, today's unapproved draft): mode
+`indicative_preview`; `indicative_total` 168,154.45 MKD (import duty 11,383.73 + motor-vehicle tax
+96,390.00 + import VAT 60,380.72), `indicative_total_eur` 2,732.72 EUR at the customs rate and
+`indicative_landed_cost_eur` 6,432.72 EUR (3,000.00 + 700.00 + 2,732.72). The same facts with an EU
+proof of origin give 154,721.64 MKD, with the 168,154.45 MKD standard-duty alternative next to it.
+
+### 7.3 Errors
+
+- `VALIDATION_ERROR` names the failing fields, never their values: `listing_id` and `vehicle` when
+  neither is given, nested paths such as `vehicle.price.amount` or `vehicle.co2.0.g_km`, and both
+  `vehicle.transport_after_entry_eur` and `vehicle.transport_after_entry_separately_invoiced` when
+  only one is set.
+- `NOT_FOUND` for an unknown listing, a listing of another workspace (the same answer) or one
+  without a current, non-quarantined revision; `FORBIDDEN` without `deals:read`; `RATE_LIMITED`
+  with `retry_after_seconds`.
+
+### 7.4 What is verified and what is not
+
+| Item | Status |
+|---|---|
+| Tool schema, scope filtering, validation, isolation, rate bucket, preview labelling, golden totals of the draft, nothing persisted | verified in tests (tests/contracts/test_calc_tool_schemas.py, tests/mcp/test_calc_tools.py, synthetic data) |
+| The MK draft rule set's legal content | **not approved**: every `UNCERTAIN - confirm` marker of the draft must be resolved and the owner must approve and activate it first (docs/tax_rule_approval.md) |
+| dot calling the tool and relaying the banner in the real conversation | **not verified** (no deployment, section 4 step 5) |

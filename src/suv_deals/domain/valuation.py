@@ -376,6 +376,7 @@ def assemble_valuation(
     fx_max_age_days: int = 7,
     fixture_inputs: bool = False,
     tax_unavailable_reason: str | None = None,
+    input_warnings: Sequence[str] = (),
 ) -> Valuation:
     """Assemble a valuation with state, unknowns, expiry and dependency fingerprint. Pure.
 
@@ -385,6 +386,9 @@ def assemble_valuation(
     used, never a whole rate history. When ``tax`` is given, the scenarios' import lines
     must come from exactly that calculation (``costs.tax_cost_lines``); otherwise the
     valuation is incomplete, because its figures would not match its recorded rule.
+    ``input_warnings`` are the caller's own labels on its inputs (e.g. the import-tax input
+    builder's assumptions and the Euro import gate); they are recorded as warnings only and
+    never change the state, the figures or the fingerprint.
     """
     as_of = ensure_utc(as_of)
     deps = build_dependencies(
@@ -408,6 +412,7 @@ def assemble_valuation(
     warnings: list[str] = []
     if fixture:
         warnings.append("FIXTURE_VALUATION: synthetic inputs; never shown as a real opportunity or notified")
+    warnings.extend(input_warnings)
 
     state: ValuationState
     if screening.eligibility == EligibilityState.REJECTED:

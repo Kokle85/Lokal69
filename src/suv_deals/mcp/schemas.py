@@ -2,9 +2,11 @@
 
 The twelve tools of spec 21 (``TOOLS``) plus the three spec 37.8 inquiry tools in the separate
 ``V11_TOOLS`` table (``seller_inquiries_get``, ``seller_replies_get`` under ``inquiries:read``;
-``seller_inquiries_pause`` under ``inquiries:pause``). Both are served by the default registry
-(``mcp.tools.ToolRegistry.default``); ``tool_spec``/``validate_tool_input``/``tools_for_scopes``
-cover both, in that order.
+``seller_inquiries_pause`` under ``inquiries:pause``) and the read-only import-cost calculator in
+``CALC_TOOLS`` (``deals_estimate_import_costs`` under ``deals:read``: North Macedonian customs
+duty, motor-vehicle tax and import VAT for one vehicle). All three tables are served by the
+default registry (``mcp.tools.ToolRegistry.default``); ``tool_spec``/``validate_tool_input``/
+``tools_for_scopes`` cover them in that order (``ALL_TOOL_NAMES``).
 No purchase, seller-contact/send, payment, tax-approval, SQL or arbitrary-crawl tool exists
 (``FORBIDDEN_TOOL_NAMES`` is checked at import time); no tool accepts a recipient, an e-mail
 body or a sender account.
@@ -16,7 +18,9 @@ already enforces (character patterns for idempotency keys, claim tokens and reas
 ``uniqueItems``) plus descriptions. Validation is stricter than JSON coercion: integers and
 booleans must be JSON integers/booleans, ids must be canonical 8-4-4-4-12 UUID strings and
 timestamps must carry a timezone. Optional filters that the spec does not make nullable reject
-an explicit ``null``.
+an explicit ``null``. The calculator's input mirrors the calculator service request field by
+field (``DealsEstimateImportCostsInput``: decimals are bounded strings, never JSON numbers; a
+failure names the nested field, e.g. ``vehicle.price.amount``).
 
 Outputs are ``ResponseEnvelope[<view>]`` (``schema_version``, ``request_id``, ``as_of``,
 ``data``, ``warnings``, ``next_cursor``). Errors are ``ToolError`` payloads with the spec 21
@@ -34,7 +38,8 @@ from collections.abc import Mapping as AbcMapping
 from collections.abc import Sequence as AbcSequence
 from collections.abc import Set as AbcSet
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from functools import cache
 from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, get_args, get_origin
@@ -54,12 +59,20 @@ from pydantic.json_schema import SkipJsonSchema
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
-from suv_deals.domain.enums import ProfileKey, ReviewOutcome, Scope
+from suv_deals.domain.enums import Co2Cycle, Fuel, Precision, ProfileKey, ReviewOutcome, Scope
+from suv_deals.domain.import_estimate import (
+    Co2Document,
+    ImporterStatus,
+    OriginProofKind,
+    PriceBasis,
+    VehicleImportFacts,
+)
 from suv_deals.domain.reviews import SubmitRequest
 from suv_deals.errors import AppError, ValidationFailed
 from suv_deals.views.candidates import CandidateDetail, CandidateListView, ListingRevisionDocument
 from suv_deals.views.common import ErrorPayload, envelope_model_for
 from suv_deals.views.comparables import ComparableSetView
+from suv_deals.views.import_costs import ImportCostEstimateView
 from suv_deals.views.inquiries import InquiryPauseResult, InquiryView, ReplyView
 from suv_deals.views.jsonschema import JSON_SCHEMA_DIALECT, Schema, model_schema, render
 from suv_deals.views.notes import NoteView, RecheckRequestResult
@@ -356,8 +369,8 @@ class ReviewsSubmitInput(ToolInput):
 
 
 class SubmitRuleError(ValueError):
-    """A request broke a cross-field rule (``reviews_submit``, the owner's inquiry resume);
-    ``fields`` names the fields (never their values)."""
+    """A request broke a cross-field rule (``reviews_submit``, the owner's inquiry resume, the
+    import-cost estimate's vehicle facts); ``fields`` names the fields (never their values)."""
 
     def __init__(self, fields: tuple[str, ...]) -> None:
         super().__init__(f"violates review submission rules: {', '.join(fields)}")
@@ -467,6 +480,28 @@ def _strip_union_tags(
     return path
 
 
+def error_field_path(
+    loc: tuple[int | str, ...], model: type[BaseModel] | None = None, *, error_type: str = ""
+) -> str:
+    """One error location as a plain field path (``vehicle.price.amount``, ``co2.0.g_km``) without
+    pydantic's union-member tags; an unknown key (``extra_forbidden``) keeps its own name."""
+    if error_type == "extra_forbidden" and loc:
+        stripped = [*_strip_union_tags(loc[:-1], model), loc[-1]]
+    else:
+        stripped = _strip_union_tags(loc, model, error_type=error_type)
+    return _loc_path(tuple(stripped))
+
+
+def union_none_member(error: Mapping[str, Any]) -> bool:
+    """Whether ``error`` is only the ``None`` member's refusal in an optional (``X | None``) field.
+
+    The other member always reports the real failure; without this an optional nested object
+    would also name its parents (``vehicle``, ``vehicle.price`` next to ``vehicle.price.amount``).
+    """
+    loc = tuple(error.get("loc", ()))
+    return error.get("type") == "none_required" and len(loc) > 1 and loc[-1] == "none"
+
+
 def validation_error_fields(
     exc: ValidationError, *, root: str = "arguments", model: type[BaseModel] | None = None
 ) -> list[str]:
@@ -480,13 +515,9 @@ def validation_error_fields(
     """
     fields: set[str] = set()
     for err in exc.errors():
-        loc = tuple(err["loc"])
-        error_type = str(err.get("type", ""))
-        if error_type == "extra_forbidden" and loc:
-            stripped = [*_strip_union_tags(loc[:-1], model), loc[-1]]
-        else:
-            stripped = _strip_union_tags(loc, model, error_type=error_type)
-        path = _loc_path(tuple(stripped))
+        if union_none_member(err):
+            continue
+        path = error_field_path(tuple(err["loc"]), model, error_type=str(err.get("type", "")))
         cause = (err.get("ctx") or {}).get("error")
         candidates = list(cause.fields) if not path and isinstance(cause, SubmitRuleError) else [path or root]
         for candidate in candidates:
@@ -537,6 +568,280 @@ class SellerInquiriesPauseInput(ToolInput):
     expected_version: ControlVersion
     reason: Reason
     idempotency_key: IdempotencyKey
+
+
+# --------------------------------------------------------------------------- import-cost calculator inputs
+
+#: Decimal strings, never JSON numbers, exponents, signs or digit separators: a money amount in
+#: its currency (at most two decimals), a measured quantity (g/km, km, cm3, kW; at most three
+#: decimals) and the customs EUR/MKD rate (at most ten decimals). The domain facts
+#: (``import_estimate.VehicleImportFacts``) enforce their own sanity bounds.
+MONEY_PATTERN: Final = r"^(0|[1-9][0-9]{0,12})(\.[0-9]{1,2})?$"
+QUANTITY_PATTERN: Final = r"^(0|[1-9][0-9]{0,8})(\.[0-9]{1,3})?$"
+RATE_PATTERN: Final = r"^(0|[1-9][0-9]{0,5})(\.[0-9]{1,10})?$"
+PARTIAL_DATE_PATTERN: Final = r"^[0-9]{4}(-(0[1-9]|1[0-2])(-[0-9]{2})?)?$"
+_ISO_DATE_RE: Final = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_PARTIAL_DATE_PRECISION: Final[Mapping[int, Precision]] = MappingProxyType(
+    {4: Precision.YEAR, 7: Precision.MONTH, 10: Precision.DAY}
+)
+#: A nested argument path (``vehicle.co2.0.g_km``); anything else is ``<unrecognised field>``.
+NESTED_FIELD_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.([A-Za-z_][A-Za-z0-9_]*|[0-9]+)){0,8}$")
+
+
+def _iso_date(value: object) -> object:
+    """``YYYY-MM-DD`` strings only (``format: date``); pydantic alone would also take epoch numbers."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and _ISO_DATE_RE.fullmatch(value):
+        return value
+    raise ValueError("must be a calendar date string YYYY-MM-DD")
+
+
+def _calendar_day(value: str) -> str:
+    if len(value) == 10:
+        date.fromisoformat(value)  # a day that does not exist is a ValueError
+    return value
+
+
+MoneyText = Annotated[str, Field(min_length=1, max_length=16, pattern=MONEY_PATTERN)]
+QuantityText = Annotated[str, Field(min_length=1, max_length=13, pattern=QUANTITY_PATTERN)]
+RateText = Annotated[str, Field(min_length=1, max_length=17, pattern=RATE_PATTERN)]
+IsoDate = Annotated[date, BeforeValidator(_iso_date)]
+PartialDateText = Annotated[
+    str, Field(min_length=4, max_length=10, pattern=PARTIAL_DATE_PATTERN), AfterValidator(_calendar_day)
+]
+StrictBool = Annotated[bool, Field(strict=True)]
+ReferenceText = Annotated[
+    str, Field(min_length=1, max_length=200), AfterValidator(_plain_text), _require_content(1)
+]
+EmissionsClassText = Annotated[
+    str, Field(min_length=1, max_length=40), AfterValidator(_plain_text), _require_content(1)
+]
+HsCodeText = Annotated[str, Field(min_length=6, max_length=16, pattern=r"^[0-9][0-9 .]{4,14}[0-9]$")]
+
+
+class ImportPriceInput(ToolInput):
+    """A purchase price as stated."""
+
+    amount: MoneyText = Field(description='Amount in the currency, e.g. "3000.00".')
+    currency: Literal["EUR", "MKD", "CHF"] = Field(
+        description="EUR or MKD. A CHF price leaves the customs value unknown (two customs rates "
+        "would be needed; a reference rate is never substituted)."
+    )
+
+
+class ImportCo2ReadingInput(ToolInput):
+    """One CO2 figure exactly as printed on the document, with its measurement cycle."""
+
+    cycle: Co2Cycle = Field(
+        description="Cycle printed next to the figure. WLTP is used when present, otherwise NEDC; "
+        "nedc_correlated and unknown leave the CO2 charge unknown (never converted)."
+    )
+    g_km: QuantityText = Field(description='g/km exactly as printed, e.g. "189".')
+
+
+Co2Readings = Annotated[tuple[ImportCo2ReadingInput, ...], Field(max_length=3)]
+
+
+class ImportOriginProofInput(ToolInput):
+    """The proof of preferential origin the importer HOLDS (never inferred from a country)."""
+
+    kind: OriginProofKind = Field(
+        description="none: no proof, so standard duty (the default); unknown: the duty stays unknown; "
+        "eu, efta, tr, uk, cefta, ua, us: a held proof, assumed accepted by Customs, with the "
+        "standard-duty alternative shown next to it."
+    )
+    country: CountryCode | SkipJsonSchema[None] = _optional(
+        "Origin country stated on the proof (ISO 3166-1 alpha-2, or EU); required for efta and cefta."
+    )
+    evidence_ref: ReferenceText | SkipJsonSchema[None] = _optional("Reference of the proof document.")
+
+    _no_null = field_validator("country", "evidence_ref", mode="before")(_reject_null)
+
+
+#: Vehicle fact fields of `ImportVehicleInput` (each optional; explicit null is refused).
+_VEHICLE_FIELDS: Final = (
+    "price",
+    "price_basis",
+    "declaration_date",
+    "fuel",
+    "co2",
+    "co2_document",
+    "co2_round_up_confirmed",
+    "first_registration",
+    "emissions_class",
+    "origin_proof",
+    "hs_code",
+    "hs_evidence_ref",
+    "transport_after_entry_eur",
+    "transport_after_entry_separately_invoiced",
+    "catalogue_value_eur",
+    "importer_status",
+    "mileage_km",
+    "seller_country",
+    "engine_displacement_cm3",
+    "power_kw",
+)
+
+
+class ImportVehicleInput(ToolInput):
+    """Vehicle and import facts the caller knows. Every field that is SET replaces the listing's
+    fact; an omitted field keeps the listing's (or stays unknown). Nothing is inferred: no origin,
+    no tariff code, no VAT base and no WLTP/NEDC conversion."""
+
+    price: ImportPriceInput | SkipJsonSchema[None] = _optional(
+        "Purchase price. Set price_basis invoice for an invoice or contract price; otherwise it counts "
+        "as an advertised price (a claim, flagged)."
+    )
+    price_basis: PriceBasis | SkipJsonSchema[None] = _optional(
+        "invoice (transaction value) or advertised (the default)."
+    )
+    declaration_date: IsoDate | SkipJsonSchema[None] = _optional(
+        "Customs declaration date (YYYY-MM-DD); default today. Selects the rules and the monthly "
+        "customs rate."
+    )
+    fuel: Fuel | SkipJsonSchema[None] = _optional(
+        "Fuel or drive type; unknown leaves the CO2 charge unknown."
+    )
+    co2: Co2Readings | SkipJsonSchema[None] = _optional(
+        "CO2 figures as printed, at most one per cycle; an empty list clears the listing's claim."
+    )
+    co2_document: Co2Document | SkipJsonSchema[None] = _optional(
+        "Where the CO2 figure is printed: coc, registration_consent, manufacturer_certificate or "
+        "technical_assessment_certificate; listing_claim_unverified for an advertised figure; "
+        "none_available ONLY when no document exists (the rules then apply their deemed charge). "
+        "Unknown leaves the motor-vehicle tax unknown."
+    )
+    co2_round_up_confirmed: StrictBool | SkipJsonSchema[None] = _optional(
+        "true: a non-integer CO2 figure may be rounded up (labelled assumption); otherwise it stays unknown."
+    )
+    first_registration: PartialDateText | SkipJsonSchema[None] = _optional(
+        "First registration as YYYY, YYYY-MM or YYYY-MM-DD (never completed with invented parts)."
+    )
+    emissions_class: EmissionsClassText | SkipJsonSchema[None] = _optional(
+        'Euro class as stated, e.g. "Euro 5" (the import gate only; it never changes an amount).'
+    )
+    origin_proof: ImportOriginProofInput | SkipJsonSchema[None] = _optional(
+        "Proof of preferential origin held; omitted means no proof (standard duty)."
+    )
+    hs_code: HsCodeText | SkipJsonSchema[None] = _optional(
+        "Tariff code from a broker, ruling or owner statement (HS 8703 only; never inferred). A "
+        "plug-in hybrid needs it."
+    )
+    hs_evidence_ref: ReferenceText | SkipJsonSchema[None] = _optional("Evidence for hs_code.")
+    transport_after_entry_eur: MoneyText | SkipJsonSchema[None] = _optional(
+        "Inland leg after the MK place of entry, only when it is separately invoiced (then also set "
+        "transport_after_entry_separately_invoiced true): it leaves the customs value and enters the "
+        "import VAT base alone."
+    )
+    transport_after_entry_separately_invoiced: StrictBool | SkipJsonSchema[None] = _optional(
+        "true only with transport_after_entry_eur."
+    )
+    catalogue_value_eur: MoneyText | SkipJsonSchema[None] = _optional(
+        "Catalogue value: adds the customs_revaluation_risk scenario; never used as the customs value."
+    )
+    importer_status: ImporterStatus | SkipJsonSchema[None] = _optional(
+        "private, non_vat_business or vat_dealer (VAT recoverability note only)."
+    )
+    mileage_km: QuantityText | SkipJsonSchema[None] = _optional("Odometer reading in km (used or new).")
+    seller_country: CountryCode | SkipJsonSchema[None] = _optional(
+        "Seller country (recorded; never implies the origin)."
+    )
+    engine_displacement_cm3: QuantityText | SkipJsonSchema[None] = _optional("Engine displacement in cm3.")
+    power_kw: QuantityText | SkipJsonSchema[None] = _optional("Engine power in kW.")
+
+    _no_null = field_validator(*_VEHICLE_FIELDS, mode="before")(_reject_null)
+
+    def to_facts(self) -> VehicleImportFacts:
+        """The domain facts with exactly the SET fields set: ``model_fields_set`` is what overrides
+        the listing's facts (``queries.import_costs.merge_facts``). Raises ``ValidationError``."""
+        data = self.model_dump(exclude_unset=True)
+        if "first_registration" in data:
+            value = data["first_registration"]
+            data["first_registration"] = {"value": value, "precision": _PARTIAL_DATE_PRECISION[len(value)]}
+        return VehicleImportFacts.model_validate(data)
+
+
+def _facts_error_fields(exc: ValidationError) -> tuple[str, ...]:
+    """``vehicle.<path>`` of each domain-fact failure (a rule across facts names ``vehicle``)."""
+    fields: set[str] = set()
+    for err in exc.errors():
+        loc = tuple(err["loc"])
+        if loc and loc[0] == "first_registration":
+            loc = loc[:1]  # the domain's partial date is one string argument here
+        path = _loc_path(("vehicle", *loc))
+        fields.add(path if NESTED_FIELD_PATTERN.fullmatch(path) else "vehicle")
+    return tuple(sorted(fields))
+
+
+class DealsEstimateImportCostsInput(ToolInput):
+    """A listing, vehicle facts or both; every vehicle field that is set replaces the listing's."""
+
+    # Mirrors ``persistence.queries.import_costs.ImportCostRequest`` (built by the handler: this
+    # module cannot import the queries package). The domain facts' cross-field rules are checked
+    # here, so a failure names its fields (``vehicle.<field>``) instead of the whole object.
+
+    listing_id: Id | SkipJsonSchema[None] = _optional(
+        "Listing whose CURRENT revision supplies the facts: advertised price, fuel, CO2 claim, first "
+        "registration, Euro class, seller country, mileage. Omit to estimate from vehicle alone."
+    )
+    vehicle: ImportVehicleInput | SkipJsonSchema[None] = _optional(
+        "Facts you know (better): each field set here replaces the listing's."
+    )
+    customs_eur_mkd_rate: RateText | SkipJsonSchema[None] = _optional(
+        "1 EUR = this many MKD on the Customs monthly list of the declaration month. Used only when no "
+        "customs rate is recorded for that month; labelled and never stored."
+    )
+    accept_previous_month_fx: bool = Field(
+        default=False,
+        strict=True,
+        description="Indicative preview only: accept last month's recorded customs rate (labelled).",
+    )
+
+    _no_null = field_validator("listing_id", "vehicle", "customs_eur_mkd_rate", mode="before")(_reject_null)
+
+    @model_validator(mode="after")
+    def _request_rules(self) -> DealsEstimateImportCostsInput:
+        fields = self._rule_fields()
+        if fields:
+            raise SubmitRuleError(fields)
+        self.vehicle_facts()
+        return self
+
+    def _rule_fields(self) -> tuple[str, ...]:
+        if self.listing_id is None and self.vehicle is None:
+            return ("listing_id", "vehicle")
+        fields: list[str] = []
+        if self.customs_eur_mkd_rate is not None and Decimal(self.customs_eur_mkd_rate) == 0:
+            fields.append("customs_eur_mkd_rate")
+        vehicle = self.vehicle
+        if vehicle is None:
+            return tuple(fields)
+        # The cross-field rules of ``VehicleImportFacts``, named field by field.
+        if vehicle.co2 is not None and len({r.cycle for r in vehicle.co2}) != len(vehicle.co2):
+            fields.append("vehicle.co2")
+        if (vehicle.transport_after_entry_eur is not None) != bool(
+            vehicle.transport_after_entry_separately_invoiced
+        ):
+            fields += [
+                "vehicle.transport_after_entry_eur",
+                "vehicle.transport_after_entry_separately_invoiced",
+            ]
+        if vehicle.hs_evidence_ref is not None and vehicle.hs_code is None:
+            fields.append("vehicle.hs_evidence_ref")
+        return tuple(fields)
+
+    def vehicle_facts(self) -> VehicleImportFacts | None:
+        """The domain facts of ``vehicle`` (``None`` without it); failures name ``vehicle.<field>``."""
+        if self.vehicle is None:
+            return None
+        try:
+            return self.vehicle.to_facts()
+        except ValidationError as exc:
+            raise SubmitRuleError(_facts_error_fields(exc)) from None
+
+    def customs_rate(self) -> Decimal | None:
+        return None if self.customs_eur_mkd_rate is None else Decimal(self.customs_eur_mkd_rate)
 
 
 # --------------------------------------------------------------------------- errors
@@ -823,21 +1128,50 @@ _V11_SPECS: Final[tuple[ToolSpec, ...]] = (
 V11_TOOLS: Final[Mapping[str, ToolSpec]] = MappingProxyType({spec.name: spec for spec in _V11_SPECS})
 V11_TOOL_NAMES: Final[tuple[str, ...]] = tuple(V11_TOOLS)
 
-if FORBIDDEN_TOOL_NAMES & (set(TOOLS) | set(V11_TOOLS)) or set(TOOLS) & set(V11_TOOLS):  # pragma: no cover
+_CALC_SPECS: Final[tuple[ToolSpec, ...]] = (
+    ToolSpec(
+        name="deals_estimate_import_costs",
+        input_model=DealsEstimateImportCostsInput,
+        output_model=ImportCostEstimateView,
+        scope=Scope.DEALS_READ,
+        annotations=_read("Estimate MK import costs"),
+        description=(
+            "North Macedonia import charges for one passenger car: customs duty, motor-vehicle tax (DMV) "
+            "and import VAT, plus the landed cost with the owner's fixed per-vehicle transport (EUR 700, "
+            "cost profile). Facts come from listing_id and/or vehicle (vehicle fields win). Mode "
+            "indicative_preview means UNAPPROVED draft rules: relay the banner and call every figure "
+            "indicative. A missing CO2 document or proof of origin changes the result; unknown charges are "
+            "never 0. Read-only; no tool approves tax rules."
+        ),
+    ),
+)
+#: The import-cost calculator (fit design 6): served after ``V11_TOOLS``, in its own table so the
+#: spec 21 and spec 37.8 catalogues stay exactly as specified. Read-only; persists nothing.
+CALC_TOOLS: Final[Mapping[str, ToolSpec]] = MappingProxyType({spec.name: spec for spec in _CALC_SPECS})
+CALC_TOOL_NAMES: Final[tuple[str, ...]] = tuple(CALC_TOOLS)
+#: Every served tool name, in the served order (spec 21, spec 37.8, calculator).
+ALL_TOOL_NAMES: Final[tuple[str, ...]] = (*TOOL_NAMES, *V11_TOOL_NAMES, *CALC_TOOL_NAMES)
+
+_SERVED: Final = frozenset(ALL_TOOL_NAMES)
+if FORBIDDEN_TOOL_NAMES & _SERVED or len(_SERVED) != len(ALL_TOOL_NAMES):  # pragma: no cover
     raise RuntimeError("a forbidden or duplicated tool is registered")
 
 
+def _served_spec(name: str) -> ToolSpec | None:
+    return TOOLS.get(name) or V11_TOOLS.get(name) or CALC_TOOLS.get(name)
+
+
 def _documented_spec(name: str) -> ToolSpec:
-    """The spec of a ``TOOLS`` or ``V11_TOOLS`` tool, for schema export."""
-    spec = TOOLS.get(name) or V11_TOOLS.get(name)
+    """The spec of a ``TOOLS``, ``V11_TOOLS`` or ``CALC_TOOLS`` tool, for schema export."""
+    spec = _served_spec(name)
     if spec is None:
         raise ValidationFailed("Unknown tool", details={"tool": "unknown"})
     return spec
 
 
 def tool_spec(name: str) -> ToolSpec:
-    """The spec of a served tool (``TOOLS`` or ``V11_TOOLS``)."""
-    spec = TOOLS.get(name) or V11_TOOLS.get(name)
+    """The spec of a served tool (``TOOLS``, ``V11_TOOLS`` or ``CALC_TOOLS``)."""
+    spec = _served_spec(name)
     if spec is None:
         raise ValidationFailed("Unknown tool", details={"tool": "unknown"})
     return spec
@@ -846,7 +1180,7 @@ def tool_spec(name: str) -> ToolSpec:
 def tools_for_scopes(scopes: Iterable[Scope]) -> tuple[ToolSpec, ...]:
     """Tools the caller may discover (unauthorized tools are hidden), spec 21 order first."""
     granted = set(scopes)
-    return tuple(spec for spec in (*_SPECS, *_V11_SPECS) if spec.scope in granted)
+    return tuple(spec for spec in (*_SPECS, *_V11_SPECS, *_CALC_SPECS) if spec.scope in granted)
 
 
 def require_tool_scope(name: str, actor: ActorContext) -> ToolSpec:
@@ -905,7 +1239,7 @@ def tool_error_schema() -> dict[str, Any]:
 
 
 def mcp_tool_definition(name: str) -> dict[str, Any]:
-    """The MCP ``Tool`` object (wire names) for ``tools/list`` (``TOOLS`` or ``V11_TOOLS``)."""
+    """The MCP ``Tool`` object (wire names) for ``tools/list`` (any served tool)."""
     spec = _documented_spec(name)
     return {
         "name": spec.name,
@@ -951,7 +1285,7 @@ def exported_schema_documents() -> dict[str, dict[str, Any]]:
             schema_id=f"{SCHEMA_ID_PREFIX}event.review.pending",
         ),
     }
-    for name in (*TOOL_NAMES, *V11_TOOL_NAMES):
+    for name in ALL_TOOL_NAMES:
         documents[f"tools/{name}.json"] = tool_document(name)
     return documents
 
@@ -962,9 +1296,15 @@ def render_schema_document(document: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    "ALL_TOOL_NAMES",
+    "CALC_TOOLS",
+    "CALC_TOOL_NAMES",
     "DEFAULT_LIMIT",
     "FORBIDDEN_TOOL_NAMES",
     "JSON_SCHEMA_DIALECT",
+    "MONEY_PATTERN",
+    "QUANTITY_PATTERN",
+    "RATE_PATTERN",
     "TOOLS",
     "TOOL_NAMES",
     "V11_TOOLS",
@@ -976,6 +1316,7 @@ __all__ = [
     "CountryCode",
     "Cursor",
     "DealsAddNoteInput",
+    "DealsEstimateImportCostsInput",
     "DealsGetCandidateInput",
     "DealsGetComparablesInput",
     "DealsGetValuationInput",
@@ -985,6 +1326,10 @@ __all__ = [
     "EvidenceIds",
     "Id",
     "IdempotencyKey",
+    "ImportCo2ReadingInput",
+    "ImportOriginProofInput",
+    "ImportPriceInput",
+    "ImportVehicleInput",
     "Limit",
     "ListingRevisionNumber",
     "MissingInformation",
@@ -1009,6 +1354,7 @@ __all__ = [
     "ToolSpec",
     "ValuationIdRef",
     "Version",
+    "error_field_path",
     "exported_schema_documents",
     "mcp_tool_definition",
     "render_schema_document",
@@ -1020,6 +1366,7 @@ __all__ = [
     "tool_output_schema",
     "tool_spec",
     "tools_for_scopes",
+    "union_none_member",
     "validate_tool_input",
     "validation_error_fields",
 ]

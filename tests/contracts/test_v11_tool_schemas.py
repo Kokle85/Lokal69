@@ -21,6 +21,7 @@ from suv_deals.domain.enums import Role, Scope
 from suv_deals.domain.replies import ReplyIngestRequest
 from suv_deals.errors import ValidationFailed
 from suv_deals.mcp.schemas import (
+    CALC_TOOL_NAMES,
     FORBIDDEN_TOOL_NAMES,
     TOOLS,
     V11_TOOL_NAMES,
@@ -87,7 +88,8 @@ def test_the_three_spec_tools_with_their_scopes() -> None:
 
 def test_v11_tools_are_served_after_the_spec_21_tools() -> None:
     registry = ToolRegistry.default()
-    assert registry.names == (*TOOLS, *V11_TOOL_NAMES)
+    # The import-cost calculator (``CALC_TOOLS``) follows the inquiry tools.
+    assert registry.names == (*TOOLS, *V11_TOOL_NAMES, *CALC_TOOL_NAMES)
     for name in V11_TOOL_NAMES:
         tool = registry.get(name)
         assert tool is not None
@@ -95,7 +97,7 @@ def test_v11_tools_are_served_after_the_spec_21_tools() -> None:
         assert tool.definition.output_schema == tool_output_schema(name)
         assert tool_spec(name) is V11_TOOLS[name]
     owner = [spec.name for spec in tools_for_scopes(ROLE_SCOPES[Role.OWNER])]
-    assert owner == [*TOOLS, *V11_TOOL_NAMES]
+    assert owner == [*TOOLS, *V11_TOOL_NAMES, *CALC_TOOL_NAMES]
     with pytest.raises(ValidationFailed):
         validate_tool_input("seller_inquiries_pause", {})
     assert validate_tool_input("seller_inquiries_get", {"inquiry_id": str(uuid4())})

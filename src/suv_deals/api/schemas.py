@@ -30,7 +30,12 @@ which ``api.app.create_app`` includes by default; kept apart from ``ROUTES``, th
   a binding page carries ``has_more``.
 - ``V11_DASHBOARD_ROUTES``: inquiry/reply read models and the inquiry control (pause via the same
   rules as the ``seller_inquiries_pause`` MCP tool; resume is owner-only, dashboard-only), the
-  mail-worker health and coverage-gap views, the lifecycle/lag views and the 15-day evaluation.
+  mail-worker health and coverage-gap views, the lifecycle/lag views, the 15-day evaluation and the
+  read-only import-cost calculator (``GET /api/import-costs/estimate``, served by
+  ``api.import_cost_routes``; the ``deals_estimate_import_costs`` tool input as flat query
+  parameters, ``ImportCostEstimateQuery``) and the owner's approval path for tax rule sets and cost
+  profiles (``/api/settings/tax-rules`` and ``/api/settings/cost-profiles``, ``config:admin`` only,
+  served by ``api.owner_config_routes``; never an MCP tool).
 """
 
 from __future__ import annotations
@@ -56,14 +61,18 @@ from suv_deals.domain.canary import (
     CanaryReport,
 )
 from suv_deals.domain.enums import (
+    Co2Cycle,
     EmailProviderKind,
+    Fuel,
     InquiryState,
     ProfileKey,
     ReplyMessageType,
     ReviewOutcome,
     Scope,
+    TaxRuleStatus,
 )
 from suv_deals.domain.evaluation import EVALUATION_WINDOW_DAYS, EvaluationReport
+from suv_deals.domain.import_estimate import Co2Document, ImporterStatus, OriginProofKind, PriceBasis
 from suv_deals.domain.replies import (
     MAX_REQUEST_BYTES,
     InquiryBinding,
@@ -71,6 +80,7 @@ from suv_deals.domain.replies import (
     ReplyIngestRequest,
     normalize_message_id,
 )
+from suv_deals.domain.tax_engine import ReviewRecord
 from suv_deals.errors import HTTP_STATUS, AppError, ErrorCode, ValidationFailed
 from suv_deals.integrations.email_providers.outlook_local import (
     OutlookAccountReport,
@@ -83,21 +93,31 @@ from suv_deals.mcp.schemas import (
     AwareDatetime,
     CaseVersion,
     ClaimToken,
+    CountryCode,
     Cursor,
     DealsAddNoteInput,
+    DealsEstimateImportCostsInput,
     DealsGetCandidateInput,
     DealsGetComparablesInput,
     DealsListCandidatesInput,
     DealsRequestRecheckInput,
+    EmissionsClassText,
     EvidenceIds,
+    HsCodeText,
     Id,
     IdempotencyKey,
+    IsoDate,
     ListingRevisionNumber,
     MissingInformation,
     ModelRunId,
+    MoneyText,
     NoteText,
+    PartialDateText,
+    QuantityText,
+    RateText,
     Reason,
     ReasonCodes,
+    ReferenceText,
     ReviewsClaimInput,
     ReviewsListPendingInput,
     ReviewsReleaseInput,
@@ -122,6 +142,7 @@ from suv_deals.views.common import (
     is_valid_request_id,
 )
 from suv_deals.views.comparables import ComparableSetView
+from suv_deals.views.import_costs import ImportCostEstimateView
 from suv_deals.views.inquiries import (
     CanaryEvidenceView,
     InquiryControlView,
@@ -145,6 +166,12 @@ from suv_deals.views.operations import (
     SettingsView,
     SourceListView,
     SourcePauseResult,
+)
+from suv_deals.views.owner_config import (
+    CostProfileApproveResult,
+    CostProfilesView,
+    TaxRuleChangeResult,
+    TaxRuleSetsView,
 )
 from suv_deals.views.reviews import (
     ClaimResult,
@@ -424,6 +451,247 @@ class EvaluationQuery(ApiQuery):
     may be given as ``15`` and anything else is refused)."""
 
     days: Annotated[int, Field(ge=EVALUATION_WINDOW_DAYS, le=EVALUATION_WINDOW_DAYS)] = EVALUATION_WINDOW_DAYS
+
+
+# --------------------------------------------------------------------------- import-cost calculator
+
+#: Measurement cycle -> query parameter of its CO2 figure (``ImportCostEstimateQuery``).
+CO2_QUERY_FIELDS: Final[Mapping[Co2Cycle, str]] = MappingProxyType(
+    {
+        Co2Cycle.WLTP: "co2_wltp_g_km",
+        Co2Cycle.NEDC: "co2_nedc_g_km",
+        Co2Cycle.NEDC_CORRELATED: "co2_nedc_correlated_g_km",
+        Co2Cycle.UNKNOWN: "co2_unknown_cycle_g_km",
+    }
+)
+#: Flat query parameters of the nested ``vehicle`` objects of ``DealsEstimateImportCostsInput``.
+_NESTED_QUERY_FIELDS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "price": ("price_amount", "price_currency"),
+        "origin_proof": ("origin_proof_kind", "origin_proof_country", "origin_proof_evidence_ref"),
+    }
+)
+#: Query parameters that are not vehicle facts (passed to the tool input as they are).
+_REQUEST_QUERY_FIELDS: Final = frozenset({"listing_id", "customs_eur_mkd_rate", "accept_previous_month_fx"})
+
+
+class ImportCostEstimateQuery(ApiQuery):
+    """``GET /api/import-costs/estimate``: the flat query-string form of the
+    ``deals_estimate_import_costs`` tool input (``DealsEstimateImportCostsInput``), which it is
+    converted to before use, so both surfaces apply the same rules.
+
+    ``listing_id`` and/or vehicle facts. Every vehicle parameter that is GIVEN replaces the
+    listing's fact; an omitted one keeps the listing's (or stays unknown, never zero). The nested
+    tool objects are flattened: ``price_amount`` + ``price_currency``; one ``co2_<cycle>_g_km`` per
+    measurement cycle, exactly as printed on the document (never converted); ``origin_proof_kind``
+    with ``origin_proof_country`` / ``origin_proof_evidence_ref``. ``co2_clear=true`` estimates
+    without any CO2 figure (the listing's claim is dropped) and takes no ``co2_*_g_km``. Failures
+    name these flat parameters.
+    """
+
+    listing_id: Id | None = None
+    price_amount: MoneyText | None = None
+    price_currency: Literal["EUR", "MKD", "CHF"] | None = None
+    price_basis: PriceBasis | None = None
+    declaration_date: IsoDate | None = None
+    fuel: Fuel | None = None
+    co2_wltp_g_km: QuantityText | None = None
+    co2_nedc_g_km: QuantityText | None = None
+    co2_nedc_correlated_g_km: QuantityText | None = None
+    co2_unknown_cycle_g_km: QuantityText | None = None
+    co2_clear: bool = False
+    co2_document: Co2Document | None = None
+    co2_round_up_confirmed: bool | None = None
+    first_registration: PartialDateText | None = None
+    emissions_class: EmissionsClassText | None = None
+    origin_proof_kind: OriginProofKind | None = None
+    origin_proof_country: CountryCode | None = None
+    origin_proof_evidence_ref: ReferenceText | None = None
+    hs_code: HsCodeText | None = None
+    hs_evidence_ref: ReferenceText | None = None
+    transport_after_entry_eur: MoneyText | None = None
+    transport_after_entry_separately_invoiced: bool | None = None
+    catalogue_value_eur: MoneyText | None = None
+    importer_status: ImporterStatus | None = None
+    mileage_km: QuantityText | None = None
+    seller_country: CountryCode | None = None
+    engine_displacement_cm3: QuantityText | None = None
+    power_kw: QuantityText | None = None
+    customs_eur_mkd_rate: RateText | None = None
+    accept_previous_month_fx: bool = False
+
+    def _readings(self) -> list[tuple[str, dict[str, str]]]:
+        """The given CO2 figures in a fixed order, with the parameter each came from."""
+        readings: list[tuple[str, dict[str, str]]] = []
+        for cycle, name in CO2_QUERY_FIELDS.items():
+            value = getattr(self, name)
+            if value is not None:
+                readings.append((name, {"cycle": cycle.value, "g_km": value}))
+        return readings
+
+    def _vehicle(self, readings: list[tuple[str, dict[str, str]]]) -> dict[str, Any]:
+        vehicle: dict[str, Any] = self.model_dump(
+            exclude_none=True, exclude={*_REQUEST_QUERY_FIELDS, "co2_clear", *CO2_QUERY_FIELDS.values()}
+        )
+        for nested, names in _NESTED_QUERY_FIELDS.items():
+            parts = {name.removeprefix(f"{nested}_"): vehicle.pop(name) for name in names if name in vehicle}
+            if parts:
+                vehicle[nested] = parts
+        if readings or self.co2_clear:
+            vehicle["co2"] = [reading for _, reading in readings]
+        return vehicle
+
+    def _query_fields(self, path: str, readings: list[tuple[str, dict[str, str]]]) -> list[str]:
+        """The flat parameters behind one failing tool-input path (``vehicle.price.amount`` ->
+        ``price_amount``); a rule across a whole nested object (an EFTA proof without its country)
+        names all of that object's parameters."""
+        head, _, rest = path.partition(".")
+        if head != "vehicle":
+            return [head]
+        if not rest:
+            return ["query"]
+        name, _, tail = rest.partition(".")
+        if name == "co2":
+            index = tail.partition(".")[0]
+            if index.isdigit() and int(index) < len(readings):
+                return [readings[int(index)][0]]
+            return [n for n, _ in readings] or ["co2_clear"]
+        if name in _NESTED_QUERY_FIELDS:
+            member = tail.partition(".")[0]
+            return [f"{name}_{member}"] if member else list(_NESTED_QUERY_FIELDS[name])
+        return [name]
+
+    def to_tool_input(self) -> DealsEstimateImportCostsInput:
+        readings = self._readings()
+        if self.co2_clear and readings:
+            raise ValidationFailed(
+                "co2_clear takes no CO2 figure",
+                details={"fields": sorted(["co2_clear", *(name for name, _ in readings)])},
+            )
+        vehicle = self._vehicle(readings)
+        if self.listing_id is None and not vehicle:
+            raise ValidationFailed(
+                "Give a listing_id, vehicle facts or both", details={"fields": ["listing_id"]}
+            )
+        data: dict[str, Any] = self.model_dump(include=set(_REQUEST_QUERY_FIELDS), exclude_none=True)
+        if vehicle:
+            data["vehicle"] = vehicle
+        try:
+            return DealsEstimateImportCostsInput.model_validate(data)
+        except ValidationError as exc:
+            paths = validation_error_fields(exc, root="query", model=DealsEstimateImportCostsInput)
+            fields = sorted({flat for path in paths for flat in self._query_fields(path, readings)})
+            raise ValidationFailed(
+                "Invalid import-cost estimate request", details={"fields": fields[:20]}
+            ) from None
+
+
+# --------------------------------------------------------------------------- owner approval path
+
+#: A draft file NAME under ``config/tax_rules/drafts`` (never a path: no separators, no ``..``).
+DRAFT_FILE_NAME_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,150}\.json$"
+_Sha256Text = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="Lower-case SHA-256 hex.")]
+#: Lifecycle targets the owner can request from the dashboard (``under_review -> draft`` rework,
+#: ``superseded`` and ``expired`` stay outside it).
+TaxRuleTarget = Literal["under_review", "approved", "active", "revoked"]
+
+
+class TaxRuleStoreRequest(ToolInput):
+    """Body of ``POST /api/settings/tax-rules/store`` (owner only): store one repository DRAFT file
+    in the workspace as status ``draft``. Only a file NAME that ``GET /api/settings/tax-rules``
+    lists (no path, no upload); ``content_sha256`` is the content hash the owner saw."""
+
+    file_name: Annotated[str, Field(min_length=6, max_length=160, pattern=DRAFT_FILE_NAME_PATTERN)]
+    content_sha256: _Sha256Text
+    idempotency_key: IdempotencyKey
+
+    @field_validator("file_name")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        if ".." in value:
+            raise ValueError("a draft file name, not a path")
+        return value
+
+
+class ReviewRecordInput(ToolInput):
+    """The review record an approval binds (``domain.tax_engine.ReviewRecord``).
+
+    The whole approval record (approver name plus this record, as canonical JSON) must fit in
+    500 characters (``valuation_repo.MAX_APPROVAL_REFERENCE``); a longer one is refused with
+    ``details.limit``."""
+
+    reviewer: ReferenceText
+    reviewed_at: AwareDatetime = Field(description="When the review was done (not in the future).")
+    scope: Reason = Field(description="What was verified (components, sources, golden cases).")
+    professional_reference: ReferenceText | None = Field(
+        default=None, description="Reference of a professional (customs broker/tax adviser) review."
+    )
+    evidence_refs: tuple[ReferenceText, ...] = Field(default=(), max_length=20)
+    notes: Reason | None = Field(default=None, description="Further notes of the review.")
+    content_sha256: _Sha256Text = Field(description="The rule-set content hash that was reviewed.")
+
+    def to_domain(self) -> ReviewRecord:
+        return ReviewRecord(
+            reviewer=self.reviewer,
+            reviewed_at=self.reviewed_at,
+            content_sha256=self.content_sha256,
+            scope=self.scope,
+            professional_review=self.professional_reference,
+            evidence_refs=self.evidence_refs,
+            notes=self.notes,
+        )
+
+
+class TaxRuleTransitionRequest(ToolInput):
+    """Body of ``POST /api/settings/tax-rules/transition`` (owner only).
+
+    ``expected_status`` and ``content_sha256`` are what the owner saw: a different current status
+    is ``409 VERSION_CONFLICT`` (``details.reason = status_changed``), a different content hash
+    ``422``. ``approved_by`` (the approver's name) and ``review_record`` are REQUIRED for
+    ``approved`` and refused for every other target."""
+
+    model_config = ConfigDict(
+        **ToolInput.model_config,
+        json_schema_extra={
+            "if": {"properties": {"target": {"const": "approved"}}, "required": ["target"]},
+            "then": {"required": ["approved_by", "review_record"]},
+        },
+    )
+
+    rule_set_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:-]{3,200}$")]
+    version: ReferenceText = Field(max_length=80)
+    expected_status: TaxRuleStatus
+    target: TaxRuleTarget
+    content_sha256: _Sha256Text
+    approved_by: ReferenceText | None = Field(
+        default=None, description="Approval only: the approver's name (recorded with the review)."
+    )
+    review_record: ReviewRecordInput | None = None
+    idempotency_key: IdempotencyKey
+
+    @model_validator(mode="after")
+    def _approval_data(self) -> TaxRuleTransitionRequest:
+        if self.target == "approved":
+            missing = tuple(n for n in ("approved_by", "review_record") if getattr(self, n) is None)
+            if missing:
+                raise SubmitRuleError(missing)
+        else:
+            given = tuple(n for n in ("approved_by", "review_record") if getattr(self, n) is not None)
+            if given:
+                raise SubmitRuleError(given)
+        return self
+
+
+class CostProfileApproveRequest(ToolInput):
+    """Body of ``POST /api/settings/cost-profiles/approve`` (owner only): approve one cost-profile
+    version. When the CONFIGURED file's version is not stored yet, it is stored (unapproved, as the
+    worker runtime would) and then approved, in the same transaction. ``content_sha256`` is the
+    content hash the owner saw (without the approval record)."""
+
+    profile_key: Annotated[str, Field(pattern=r"^[a-z0-9_]{1,80}$")]
+    version: Annotated[int, Field(ge=1, strict=True)]
+    content_sha256: _Sha256Text
+    idempotency_key: IdempotencyKey
 
 
 # --------------------------------------------------------------------------- spec 37.8 mail workers
@@ -1332,6 +1600,76 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         request=EvaluationQuery,
         location="query",
     ),
+    _r(
+        "GET",
+        "/api/import-costs/estimate",
+        ImportCostEstimateView,
+        scope=Scope.DEALS_READ,
+        summary=(
+            "Read-only MK import charges (customs duty, motor-vehicle tax, import VAT) and landed cost for"
+            " one vehicle; an indicative preview on unapproved rules is labelled, never stored."
+        ),
+        request=ImportCostEstimateQuery,
+        location="query",
+        errors=_NF,
+        tool="deals_estimate_import_costs",
+    ),
+    _r(
+        "GET",
+        "/api/settings/tax-rules",
+        TaxRuleSetsView,
+        scope=Scope.CONFIG_ADMIN,
+        summary=(
+            "Owner-only: stored tax rule-set versions and repository drafts not stored yet (status, dates,"
+            " content hash, sources, components, approval, UNCERTAIN items) and the calculator's selection."
+        ),
+    ),
+    _r(
+        "POST",
+        "/api/settings/tax-rules/store",
+        TaxRuleChangeResult,
+        scope=Scope.CONFIG_ADMIN,
+        summary="Owner-only: store one repository draft file (by name, content hash bound) as a draft.",
+        request=TaxRuleStoreRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="optional",
+    ),
+    _r(
+        "POST",
+        "/api/settings/tax-rules/transition",
+        TaxRuleChangeResult,
+        scope=Scope.CONFIG_ADMIN,
+        summary=(
+            "Owner-only: submit for review, approve (named approver + review record bound to the content"
+            " hash), activate or revoke a stored rule-set version against the expected status."
+        ),
+        request=TaxRuleTransitionRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="optional",
+    ),
+    _r(
+        "GET",
+        "/api/settings/cost-profiles",
+        CostProfilesView,
+        scope=Scope.CONFIG_ADMIN,
+        summary="Owner-only: the configured cost profile (with its transport line) and the stored versions.",
+    ),
+    _r(
+        "POST",
+        "/api/settings/cost-profiles/approve",
+        CostProfileApproveResult,
+        scope=Scope.CONFIG_ADMIN,
+        summary=(
+            "Owner-only: approve one cost-profile version (content hash bound); the configured file's"
+            " version is stored first when it is not stored yet."
+        ),
+        request=CostProfileApproveRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="optional",
+    ),
 )
 V11_ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType(
     {route.key: route for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)}
@@ -1380,7 +1718,9 @@ def exported_api_schema_documents() -> dict[str, dict[str, Any]]:
 
 
 __all__ = [
+    "CO2_QUERY_FIELDS",
     "COMMON_ERRORS",
+    "DRAFT_FILE_NAME_PATTERN",
     "IDEMPOTENCY_HEADER",
     "MAIL_WORKER_BODY_LIMIT",
     "MAIL_WORKER_PREFIX",
@@ -1401,8 +1741,10 @@ __all__ = [
     "CandidateListQuery",
     "ClaimRequest",
     "ComparablesQuery",
+    "CostProfileApproveRequest",
     "EvaluationQuery",
     "IdempotencyHeader",
+    "ImportCostEstimateQuery",
     "InquiryListQuery",
     "InquiryPauseRequest",
     "InquiryResumeRequest",
@@ -1438,7 +1780,11 @@ __all__ = [
     "ReplyListQuery",
     "ResponseEnvelope",
     "ReviewQueueQuery",
+    "ReviewRecordInput",
     "SubmitReviewRequest",
+    "TaxRuleStoreRequest",
+    "TaxRuleTarget",
+    "TaxRuleTransitionRequest",
     "api_error",
     "exported_api_schema_documents",
     "route_schema_document",

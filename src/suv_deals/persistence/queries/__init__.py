@@ -10,6 +10,8 @@ defence in depth). Missing and foreign-workspace ids raise the same ``NotFound``
 Run the functions inside ``transactions.unit_of_work(db, actor)`` (short transactions, no network
 I/O); `health_view` takes the ``Database`` itself so it can report an outage instead of failing.
 The cursor signing key comes from ``Settings.mcp_cursor_signing_secret`` (`cursor_secret`).
+`get_import_cost_estimate` (the import-cost calculator) also reads ``Settings.config_dir`` (draft
+rule files and the cost profile) and persists nothing.
 """
 
 from __future__ import annotations
@@ -24,6 +26,13 @@ from suv_deals.persistence.queries.economics import (
     COMPARABLES_QUERY,
     get_comparables,
     get_valuation,
+)
+from suv_deals.persistence.queries.import_costs import (
+    IMPORT_COSTS_QUERY,
+    ImportCostRequest,
+    ImportCostResult,
+    estimate_import_costs_for,
+    get_import_cost_estimate,
 )
 from suv_deals.persistence.queries.inquiries import (
     INQUIRIES_QUERY,
@@ -61,6 +70,7 @@ from suv_deals.persistence.queries.reviews import get_review_case, review_queue
 __all__ = [
     "CANDIDATES_QUERY",
     "COMPARABLES_QUERY",
+    "IMPORT_COSTS_QUERY",
     "INQUIRIES_QUERY",
     "OUTBOX_QUERY",
     "REPLIES_QUERY",
@@ -68,6 +78,8 @@ __all__ = [
     "V11_TABLES",
     "CoverageLagsView",
     "EvaluationInputs",
+    "ImportCostRequest",
+    "ImportCostResult",
     "ListingLifecycleView",
     "MailWorkerHealthView",
     "QueryResult",
@@ -75,10 +87,12 @@ __all__ = [
     "SourceLagView",
     "coverage_lags_view",
     "cursor_secret",
+    "estimate_import_costs_for",
     "evaluation_inputs",
     "evaluation_report",
     "get_candidate",
     "get_comparables",
+    "get_import_cost_estimate",
     "get_inquiry",
     "get_reply",
     "get_review_case",

@@ -231,6 +231,8 @@ def test_example_rule_set_has_exact_spec_shape_and_is_inert() -> None:
 
 
 def test_no_rule_set_shipped_in_config_has_rates_or_approval() -> None:
+    # Top level of config/tax_rules: inert examples only. The North Macedonian DRAFT ships in
+    # config/tax_rules/drafts/ (unapproved, never selectable; tests/unit/test_mk_rule_draft.py).
     for path in sorted((REPO / "config" / "tax_rules").glob("*.json")):
         rule_set = load_rule_set_file(path)
         assert rule_set.components == (), path.name

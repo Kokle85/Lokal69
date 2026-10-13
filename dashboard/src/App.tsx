@@ -27,6 +27,7 @@ const SettingsScreen = screen(() => import('./screens/SettingsScreen'), 'Setting
 const LagsScreen = screen(() => import('./screens/LagsScreen'), 'LagsScreen')
 const ListingLifecycleScreen = screen(() => import('./screens/LagsScreen'), 'ListingLifecycleScreen')
 const EvaluationScreen = screen(() => import('./screens/EvaluationScreen'), 'EvaluationScreen')
+const ImportCostsScreen = screen(() => import('./screens/importCosts/ImportCostsScreen'), 'ImportCostsScreen')
 const InquiriesScreen = screen(() => import('./screens/inquiries/InquiriesScreen'), 'InquiriesScreen')
 const InquiryDetailScreen = screen(() => import('./screens/inquiries/InquiryDetailScreen'), 'InquiryDetailScreen')
 const RepliesScreen = screen(() => import('./screens/inquiries/RepliesScreen'), 'RepliesScreen')
@@ -58,6 +59,11 @@ function CandidateDetailRoute() {
   return <CandidateDetailScreen key={listingId} />
 }
 
+function ImportCostsRoute() {
+  const { listingId = '' } = useParams()
+  return <ImportCostsScreen key={listingId} />
+}
+
 function InquiryDetailRoute() {
   const { inquiryId = '' } = useParams()
   return <InquiryDetailScreen key={inquiryId} />
@@ -84,6 +90,9 @@ export const routes: RouteObject[] = [
       { path: 'candidates/:listingId', element: <CandidateDetailRoute /> },
       { path: 'candidates/:listingId/economics', element: <EconomicsScreen /> },
       { path: 'candidates/:listingId/lifecycle', element: <ListingLifecycleScreen /> },
+      // Read-only import-cost calculator (MK customs duty, motor-vehicle tax, import VAT).
+      { path: 'candidates/:listingId/import-costs', element: <ImportCostsRoute /> },
+      { path: 'import-costs', element: <ImportCostsRoute /> },
       { path: 'valuations/:valuationId', element: <EconomicsScreen /> },
       { path: 'reviews', element: <ReviewQueueScreen /> },
       { path: 'reviews/:caseId', element: <ReviewCaseRoute /> },

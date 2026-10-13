@@ -1013,6 +1013,8 @@ export interface TaxComponentView {
   category: CostCategory
   kind: string
   status: 'resolved' | 'unknown' | 'not_applicable'
+  /** A helper (customs value in MKD, VAT base, ...): shown, never counted in a total. */
+  intermediate: boolean
   amount: AmountView
   inputs_used: TaxInputUsed[]
   missing_inputs: string[]
@@ -2286,6 +2288,355 @@ export interface EvaluationReport {
   optimises_for_volume: false
 }
 
+// --------------------------------------------------------------------------- import-cost calculator
+
+/**
+ * `GET /api/import-costs/estimate` (`views.import_costs.ImportCostEstimateView`; MCP
+ * `deals_estimate_import_costs`): North Macedonian customs duty, motor-vehicle tax (ДМВ) and import
+ * VAT for one vehicle. Every figure is computed by the backend; the browser only displays them.
+ * - `active`: an ACTIVE, owner-approved rule set (totals `total`, `total_eur`, `landed_cost_eur`);
+ * - `indicative_preview`: unapproved rules, labelled with the MK/EN `banner`, never production-ready
+ *   (totals `indicative_total`, `indicative_total_eur`, `indicative_landed_cost_eur`);
+ * - `unavailable`: no rule set applies; every import charge is unknown and there are no scenarios.
+ */
+export type EstimateMode = 'active' | 'indicative_preview' | 'unavailable'
+export type EstimateScenarioName = 'legal_base' | 'standard_duty_if_proof_rejected' | 'customs_revaluation_risk'
+export type Co2Cycle = 'nedc' | 'nedc_correlated' | 'wltp' | 'unknown'
+export type Co2Document =
+  | 'coc'
+  | 'registration_consent'
+  | 'manufacturer_certificate'
+  | 'technical_assessment_certificate'
+  | 'listing_claim_unverified'
+  | 'none_available'
+export type OriginProofKind = 'none' | 'unknown' | 'eu' | 'efta' | 'tr' | 'uk' | 'cefta' | 'ua' | 'us'
+export type ImporterStatus = 'private' | 'non_vat_business' | 'vat_dealer'
+/** Whether an import-cost price is a transaction (invoice/contract) price or an advertised claim. */
+export type ImportPriceBasis = 'invoice' | 'advertised'
+export type FactSource = 'listing' | 'request' | 'default'
+export type CustomsFxSource = 'recorded' | 'caller_supplied' | 'not_needed' | 'none'
+
+export interface ImportBannerView {
+  mk: string
+  en: string
+}
+
+export interface ImportRuleView {
+  rule_set_id: string
+  version: string
+  status: TaxRuleStatus
+  jurisdiction: string
+  currency: CurrencyCode | null
+  valid_from: string | null
+  valid_to: string | null
+  /** The recorded hash or, for an unsealed draft, the hash of its content (`sha256_recorded` false). */
+  content_sha256: string
+  sha256_recorded: boolean
+}
+
+export interface ImportCategoryView {
+  category: CostCategory
+  status: 'resolved' | 'unknown' | 'not_applicable'
+  amount: AmountView
+  amount_eur: AmountView
+  component_ids: string[]
+}
+
+export interface ImportScenarioView {
+  name: EstimateScenarioName
+  label: string
+  complete: boolean
+  production_ready: boolean
+  customs_value: AmountView
+  customs_value_basis: string | null
+  assumptions: string[]
+  /** `intermediate` components (customs value in MKD, VAT base, ...) are never counted in a total. */
+  components: TaxComponentView[]
+  categories: ImportCategoryView[]
+  /** Active mode only (null in a preview). */
+  total: AmountView | null
+  total_eur: AmountView | null
+  landed_cost_eur: AmountView | null
+  /** Indicative preview only (null under ACTIVE rules). */
+  indicative_total: AmountView | null
+  indicative_total_eur: AmountView | null
+  indicative_landed_cost_eur: AmountView | null
+  /** Only when incomplete: what resolved, never a total. */
+  known_subtotal: AmountView | null
+  known_subtotal_label: 'known_subtotal'
+  unknown_components: string[]
+  missing_inputs: string[]
+  warnings: string[]
+  effective_date: string
+  customs_fx_rate: FxRateView | null
+  engine_version: string
+  calculation_sha256: string
+}
+
+export interface ImportGatesView {
+  importable: 'yes' | 'no' | 'unknown'
+  reason: string
+  euro_class: number | null
+  min_euro: number
+  legal_basis: string
+}
+
+export interface UncertainItemView {
+  source: 'component' | 'rule_set'
+  component_id: string | null
+  text: string
+  /** Whether it concerns this vehicle's result. */
+  applies: boolean
+}
+
+export interface ImportListingView {
+  listing_id: Uuid
+  revision_id: Uuid
+  revision_number: number
+  source_key: string
+  is_fixture: boolean
+  fixture_label: string | null
+  screened: boolean
+}
+
+export interface Co2ReadingView {
+  cycle: string
+  g_km: DecimalString
+}
+
+export interface ImportFactsView {
+  price: AmountView
+  price_basis: ImportPriceBasis
+  declaration_date: string | null
+  fuel: Fuel
+  co2: Co2ReadingView[]
+  co2_document: Co2Document | null
+  co2_round_up_confirmed: boolean
+  first_registration: string | null
+  emissions_class: string | null
+  origin_proof_kind: OriginProofKind
+  origin_proof_country: CountryCode | null
+  origin_proof_evidence_ref: string | null
+  hs_code: string | null
+  hs_evidence_ref: string | null
+  transport_after_entry_eur: DecimalString | null
+  transport_after_entry_separately_invoiced: boolean
+  catalogue_value_eur: DecimalString | null
+  importer_status: ImporterStatus | null
+  mileage_km: DecimalString | null
+  seller_country: CountryCode | null
+  engine_displacement_cm3: DecimalString | null
+  power_kw: DecimalString | null
+}
+
+export interface ImportFactSourceView {
+  fact: string
+  source: FactSource
+}
+
+export interface ImportCostEstimateView {
+  estimator_version: string
+  mode: EstimateMode
+  production_ready: boolean
+  usage_note: string
+  banner: ImportBannerView | null
+  rule: ImportRuleView | null
+  selection_reason: string
+  considered: string[]
+  jurisdiction: string
+  vehicle_category: string
+  declaration_date: string
+  currency: CurrencyCode | null
+  customs_fx_rate: FxRateView | null
+  customs_fx_source: CustomsFxSource
+  eur_basis: string
+  landed_cost_note: string
+  listing: ImportListingView | null
+  facts: ImportFactsView
+  fact_sources: ImportFactSourceView[]
+  /** `legal_base` first; empty when `unavailable`. */
+  scenarios: ImportScenarioView[]
+  assumptions: string[]
+  warnings: string[]
+  notes: string[]
+  unverified_inputs: string[]
+  uncertain_items: UncertainItemView[]
+  gates: ImportGatesView
+  missing_inputs: string[]
+  missing_facts: string[]
+}
+
+// --------------------------------------------------------------------------- owner approval path
+
+/**
+ * `GET /api/settings/tax-rules` and `/api/settings/cost-profiles` (owner only, `config:admin`;
+ * `views.owner_config`). Every lifecycle act is an explicit owner request; nothing here approves
+ * or activates anything by itself.
+ */
+export type RuleSetOrigin = 'stored' | 'draft_file'
+/** `store` a repository draft file, or a lifecycle target. */
+export type TaxRuleAction = 'store' | 'under_review' | 'approved' | 'active' | 'revoked'
+export type TaxRuleTarget = Exclude<TaxRuleAction, 'store'>
+
+export interface RuleSourceView {
+  url: string
+  title: string
+  retrieved_at: DateTimeString
+  sha256: string
+}
+
+export interface RuleComponentSummary {
+  id: string
+  label: string
+  category: CostCategory
+  kind: string
+  /** A helper value: never counted in a total. */
+  intermediate: boolean
+  legal_reference: string | null
+  /** The label or legal reference is marked UNCERTAIN. */
+  uncertain: boolean
+}
+
+export interface ReviewRecordView {
+  reviewer: string
+  reviewed_at: DateTimeString
+  content_sha256: string
+  scope: string
+  professional_review: string | null
+  evidence_refs: string[]
+  notes: string | null
+}
+
+export interface RuleApprovalView {
+  /** The approver's NAME as recorded with the review. */
+  approved_by: string
+  approved_at: DateTimeString
+  /** The authenticated owner who recorded the approval. */
+  approved_by_principal: Uuid | null
+  review_record: ReviewRecordView | null
+}
+
+export interface TaxRuleSetSummaryView {
+  origin: RuleSetOrigin
+  /** Draft file name under config/tax_rules/drafts (`draft_file` only). */
+  file_name: string | null
+  rule_set_id: string
+  version: string
+  label: string
+  jurisdiction: CountryCode
+  vehicle_categories: string[]
+  status: TaxRuleStatus
+  is_fixture: boolean
+  valid_from: string | null
+  /** Exclusive end; null = open. */
+  valid_to: string | null
+  currency: CurrencyCode | null
+  description: string | null
+  /** The sealed hash, or the one computed from an unsealed draft (`sha256_sealed` says which). */
+  content_sha256: string
+  sha256_sealed: boolean
+  sources: RuleSourceView[]
+  components: RuleComponentSummary[]
+  uncertain_items: string[]
+  approval: RuleApprovalView | null
+  /** What the lifecycle permits now (the server checks again). */
+  allowed_actions: TaxRuleAction[]
+  /** ACTIVE, owner-approved, not a fixture: valuations may select it in its period. */
+  production_selectable: boolean
+  created_at: DateTimeString | null
+  updated_at: DateTimeString | null
+}
+
+export interface CalculatorSelectionView {
+  jurisdiction: CountryCode
+  vehicle_category: string
+  on_date: string
+  mode: 'active' | 'indicative_preview' | 'unavailable'
+  rule_set: string | null
+  status: TaxRuleStatus | null
+  reason: string
+}
+
+export interface TaxRuleSetsView {
+  rule_sets: TaxRuleSetSummaryView[]
+  /** Draft files that are unreadable or ignored. */
+  file_notes: string[]
+  calculator: CalculatorSelectionView
+  production_note: string
+}
+
+export interface TaxRuleChangeResult {
+  action: TaxRuleAction
+  rule_set_id: string
+  version: string
+  label: string
+  /** Null when a draft file was stored. */
+  previous_status: TaxRuleStatus | null
+  status: TaxRuleStatus
+  content_sha256: string
+  sha256_sealed: boolean
+  approved_by: string | null
+  approved_at: DateTimeString | null
+  changed_at: DateTimeString
+  production_effect: string
+}
+
+export interface CostProfileLineView {
+  category: CostCategory
+  label: string
+  status: CostLineStatus
+  currency: CurrencyCode
+  /** Unknown is null, never zero. */
+  low: DecimalString | null
+  base: DecimalString | null
+  high: DecimalString | null
+  note: string
+  /** Only for this case (e.g. `origin_country=CH`). */
+  scope: string | null
+}
+
+export interface CostProfileSummaryView {
+  origin: 'stored' | 'configured_file'
+  id: Uuid | null
+  profile_key: string
+  version: number
+  basis: string
+  currency: CurrencyCode
+  approval_status: 'unapproved' | 'approved' | 'not_stored'
+  approved_at: DateTimeString | null
+  approved_by_principal: Uuid | null
+  is_fixture: boolean
+  /** Content hash without the approval record (what an approval binds). */
+  content_sha256: string
+  /** Configured file only: the stored copy has the same content (null: not stored). */
+  matches_stored: boolean | null
+  /** The general (unscoped) transport line. */
+  transport: CostProfileLineView | null
+  lines: CostProfileLineView[]
+  can_approve: boolean
+  created_at: DateTimeString | null
+}
+
+export interface CostProfilesView {
+  configured_file: string
+  configured: CostProfileSummaryView | null
+  configured_problem: string | null
+  profiles: CostProfileSummaryView[]
+  note: string
+}
+
+export interface CostProfileApproveResult {
+  id: Uuid
+  profile_key: string
+  version: number
+  approval_status: 'approved'
+  approved_at: DateTimeString
+  content_sha256: string
+  /** The configured file's version was stored by this request first. */
+  stored_now: boolean
+  production_effect: string
+}
+
 // --------------------------------------------------------------------------- queries and bodies
 
 export interface CandidateListQuery {
@@ -2390,6 +2741,48 @@ export interface EvaluationQuery {
   days?: 15
 }
 
+/**
+ * `GET /api/import-costs/estimate`: the `deals_estimate_import_costs` tool input as flat query
+ * parameters (`api.schemas.ImportCostEstimateQuery`). Every given vehicle parameter replaces the
+ * listing's fact; an omitted one keeps it (or stays unknown). Decimals are strings; CO2 figures
+ * are given per cycle exactly as printed (never converted).
+ */
+export interface ImportCostEstimateQuery {
+  listing_id?: Uuid
+  price_amount?: DecimalString
+  price_currency?: 'EUR' | 'MKD' | 'CHF'
+  price_basis?: ImportPriceBasis
+  declaration_date?: string
+  fuel?: Fuel
+  co2_wltp_g_km?: DecimalString
+  co2_nedc_g_km?: DecimalString
+  co2_nedc_correlated_g_km?: DecimalString
+  co2_unknown_cycle_g_km?: DecimalString
+  /** Estimate without any CO2 figure (drops the listing's claim); takes no `co2_*_g_km`. */
+  co2_clear?: boolean
+  co2_document?: Co2Document
+  co2_round_up_confirmed?: boolean
+  first_registration?: string
+  emissions_class?: string
+  origin_proof_kind?: OriginProofKind
+  origin_proof_country?: CountryCode
+  origin_proof_evidence_ref?: string
+  hs_code?: string
+  hs_evidence_ref?: string
+  /** Only with `transport_after_entry_separately_invoiced: true`. */
+  transport_after_entry_eur?: DecimalString
+  transport_after_entry_separately_invoiced?: boolean
+  catalogue_value_eur?: DecimalString
+  importer_status?: ImporterStatus
+  mileage_km?: DecimalString
+  seller_country?: CountryCode
+  engine_displacement_cm3?: DecimalString
+  power_kw?: DecimalString
+  /** 1 EUR = this many MKD (the Customs monthly list); used only when none is recorded, never stored. */
+  customs_eur_mkd_rate?: DecimalString
+  accept_previous_month_fx?: boolean
+}
+
 /** `POST /api/inquiry-control/pause` (= MCP `seller_inquiries_pause`). */
 export interface InquiryPauseRequest {
   expected_version: number
@@ -2413,6 +2806,52 @@ export interface InquiryResumeRequest {
   expected_removable_suppressions?: number
 }
 
+/** `POST /api/settings/tax-rules/store` (owner only): a draft file NAME the listing shows, never a path. */
+export interface TaxRuleStoreRequest {
+  file_name: string
+  /** The content hash the owner saw. */
+  content_sha256: string
+  idempotency_key: IdempotencyKey
+}
+
+/** The review record an approval binds (the whole approval record must fit in 500 characters). */
+export interface ReviewRecordInput {
+  reviewer: string
+  /** RFC 3339; not in the future. */
+  reviewed_at: DateTimeString
+  scope: string
+  professional_reference?: string
+  evidence_refs?: string[]
+  notes?: string
+  /** Must equal the content hash being approved. */
+  content_sha256: string
+}
+
+/** `POST /api/settings/tax-rules/transition` (owner only). */
+export interface TaxRuleTransitionRequest {
+  rule_set_id: string
+  version: string
+  /** The status the owner saw; a different one is `409 VERSION_CONFLICT` (`status_changed`). */
+  expected_status: TaxRuleStatus
+  target: TaxRuleTarget
+  /** The content hash the owner saw. */
+  content_sha256: string
+  /** `approved` only (required there). */
+  approved_by?: string
+  /** `approved` only (required there). */
+  review_record?: ReviewRecordInput
+  idempotency_key: IdempotencyKey
+}
+
+/** `POST /api/settings/cost-profiles/approve` (owner only). */
+export interface CostProfileApproveRequest {
+  profile_key: string
+  version: number
+  /** The content hash the owner saw (without the approval record). */
+  content_sha256: string
+  idempotency_key: IdempotencyKey
+}
+
 /** Request-body rules mirrored from the backend for early feedback (the server stays authoritative). */
 export const LIMITS = {
   idempotencyKeyPattern: /^[A-Za-z0-9._:-]{8,128}$/,
@@ -2429,6 +2868,9 @@ export const LIMITS = {
   reasonMax: 2000,
   noteMax: 4000,
   pageLimitMax: 100,
+  /** Approver name + review record as canonical JSON (`valuation_repo.MAX_APPROVAL_REFERENCE`). */
+  approvalReferenceMax: 500,
+  sha256Pattern: /^[0-9a-f]{64}$/,
 } as const
 
 /**

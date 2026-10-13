@@ -1,0 +1,1380 @@
+# ruff: noqa: RUF001, RUF002
+# (RUF001/RUF002: the Macedonian legal references and the preview banner are Cyrillic by design.)
+"""Import-cost estimate for one vehicle: vehicle facts -> ``TaxInputs`` -> tax engine.
+
+Pure: no I/O, no clock, no database. The caller supplies the rule sets, the transport cost
+line, the customs exchange rate and ``as_of``.
+
+- No tax rate, coefficient or threshold lives here. Every amount comes from the selected
+  rule set through ``tax_engine.calculate``; this module only states facts and labels.
+- Unknown is never zero. A missing fact leaves its input missing; the engine then reports
+  the dependent components unknown and the result incomplete, and ``missing_facts`` names
+  what to supply.
+- Nothing is inferred: no origin (default: no proof, so standard duty), no VAT base, no
+  tariff code (a caller-attested HS 8703 code is only passed through) and no WLTP <-> NEDC
+  conversion. A CO2 figure missing from the documents is never replaced by a deemed value
+  here; only an explicit ``none_available`` statement lets the rule set apply its own.
+- Transport is the cost-profile ``transport`` line (owner decision: a fixed amount per
+  vehicle), never a constant in code. By default all of it is transport to the place of
+  entry and so part of the customs value (Царински закон чл. 35(1)(д)); only an inland leg
+  that is separately invoiced leaves the customs value (чл. 36(а)) and enters the import
+  VAT base alone (ЗДДВ чл. 21(2)(2)).
+- Modes. ``active``: an ACTIVE, owner-approved rule set (the same production selection the
+  valuations use). ``indicative_preview``: no ACTIVE set applies, so the newest
+  unapproved set is used, labelled with a banner, never production-ready, and its totals
+  are named ``indicative_total``. ``unavailable``: no rule set at all; import charges stay
+  unknown. An estimate never carries a ``TaxCalculation`` and so can never become cost
+  lines, a valuation or an alert (``costs.tax_cost_lines`` refuses anything else).
+- The valuation pipeline shares the BUILDER only (``facts_from_listing``,
+  ``build_tax_inputs``, ``single_transport_line``) on its own ACTIVE selection, so a
+  valuation computes what the calculator shows; ``BuiltTaxInputs.unverified_inputs`` names
+  the claims (advertised price, listing CO2, caller attestations) that keep such amounts
+  from ever being rule-supported.
+"""
+
+from __future__ import annotations
+
+import calendar
+import decimal
+import math
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Final, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from suv_deals.clock import ensure_utc
+from suv_deals.domain.costs import CostLine
+from suv_deals.domain.enums import Co2Cycle, CostCategory, CostLineStatus, Fuel, Precision, TaxRuleStatus
+from suv_deals.domain.listings import NormalizedListing, PartialDate
+from suv_deals.domain.money import FxRate, Money
+from suv_deals.domain.tax_engine import (
+    ENGINE_VERSION,
+    IMPORT_CATEGORIES,
+    MAX_INPUT_AMOUNT,
+    Classification,
+    ComponentResult,
+    ComponentStatus,
+    IncludedCost,
+    OriginProof,
+    OriginProofStatus,
+    RuleSelection,
+    RuleSet,
+    TaxCalculation,
+    TaxInputs,
+    calculate,
+    compute_rule_set_sha256,
+    convert_with_customs_rate,
+    input_spec,
+    select_preview_rule_set,
+    select_rule_set,
+)
+from suv_deals.errors import ValidationFailed
+
+ESTIMATE_VERSION: Final = "import-estimate/1.0.0"
+DEFAULT_JURISDICTION: Final = "MK"
+DEFAULT_VEHICLE_CATEGORY: Final = "passenger_car"
+#: Same convention as the valuation pipeline: a vehicle with this mileage is used.
+USED_VEHICLE_MIN_KM: Final = Decimal(1000)
+#: Sanity bound of a stated mileage (a larger figure is a parse error, never a fact).
+MAX_MILEAGE_KM: Final = Decimal(100_000_000)
+
+Co2Document = Literal[
+    "coc",
+    "registration_consent",
+    "manufacturer_certificate",
+    "technical_assessment_certificate",
+    "listing_claim_unverified",
+    "none_available",
+]
+OriginProofKind = Literal["none", "unknown", "eu", "efta", "tr", "uk", "cefta", "ua", "us"]
+ImporterStatus = Literal["private", "non_vat_business", "vat_dealer"]
+PriceBasis = Literal["invoice", "advertised"]
+EstimateMode = Literal["active", "indicative_preview", "unavailable"]
+EstimateScenarioName = Literal["legal_base", "standard_duty_if_proof_rejected", "customs_revaluation_risk"]
+Importable = Literal["yes", "no", "unknown"]
+
+#: Partner code of a proof kind when the agreement has a single partner. EFTA and CEFTA
+#: proofs must state the country. The rule set, not this table, decides the duty.
+_PROOF_COUNTRY: Final[Mapping[str, str]] = {"eu": "EU", "tr": "TR", "uk": "GB", "ua": "UA", "us": "US"}
+_CO2_CYCLE_PREFERENCE: Final = (Co2Cycle.WLTP, Co2Cycle.NEDC, Co2Cycle.NEDC_CORRELATED, Co2Cycle.UNKNOWN)
+#: Statuses of a transport cost line that carry an amount.
+_TRANSPORT_STATUSES: Final = frozenset(
+    {CostLineStatus.ESTIMATED, CostLineStatus.QUOTED, CostLineStatus.ACTUAL}
+)
+_CUSTOMS_VALUE_REFERENCE: Final = "Царински закон чл. 35(1)(д)"
+_INLAND_LEG_REFERENCE: Final = "ЗДДВ чл. 21(2)(2)"
+_RISK_BASIS_PREFIX: Final = "RISK SCENARIO - customs revaluation (SchwackeNet), not the legal value:"
+_EURO_CLASS = re.compile(
+    r"^\s*(?:euro|eu)?\s*[-_]?\s*(?:(?P<num>[1-7])(?!\d)|(?P<roman>vi|iv|v|iii|ii|i)(?![a-z]))",
+    re.IGNORECASE,
+)
+_ROMAN: Final[Mapping[str, int]] = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6}
+_COUNTRY: Final = r"^[A-Z]{2}$"
+#: Wide context for exact sums; nothing is rounded here except EUR display amounts.
+_CTX: Final = decimal.Context(prec=50)
+
+#: Rule-set input -> the vehicle fact (or operator datum) that supplies it. The customs value
+#: is not listed: the builder knows whether the price, the transport or the rate is missing.
+_FACT_FOR_INPUT: Final[Mapping[str, str]] = {
+    "customs_fx_rate": "customs_fx_rate",
+    "declaration_date": "declaration_date",
+    "preferential_origin_country": "origin_proof",
+    "origin_evidence": "origin_proof",
+    "fuel": "fuel",
+    "co2_g_km": "co2",
+    "co2_cycle": "co2",
+    "co2_source_document": "co2_document",
+    "classification": "hs_code",
+    "vehicle_category": "hs_code",
+    "vat_incidental_costs_total": "transport_after_entry_eur",
+    "vehicle_age_years": "first_registration",
+    "emissions_class": "emissions_class",
+    "vehicle_condition": "mileage_km",
+    "seller_country": "seller_country",
+    "importer_status": "importer_status",
+}
+
+#: Preview banner wording per rule status (fit design 5).
+_PREVIEW_RULE_WORDS: Final[Mapping[TaxRuleStatus, tuple[str, str]]] = {
+    TaxRuleStatus.DRAFT: ("неодобрени нацрт-правила", "unapproved draft rules"),
+    TaxRuleStatus.UNDER_REVIEW: ("неодобрени правила во преглед", "unapproved rules under review"),
+    TaxRuleStatus.APPROVED: (
+        "одобрени правила што сè уште не се активни",
+        "approved rules that are not yet active",
+    ),
+}
+LANDED_COST_NOTE: Final = (
+    "purchase price + transport + import charges (customs duty, motor-vehicle tax, import VAT), in EUR at "
+    "the customs rate; excludes customs broker/terminal fees, conformity confirmation, registration "
+    "fees and MTPL insurance"
+)
+
+
+def _input_bound(name: str) -> Decimal:
+    """The engine's own upper sanity bound of a numeric ``TaxInputs`` field (one source of truth)."""
+    for item in TaxInputs.model_fields[name].metadata:
+        bound = getattr(item, "le", None)
+        if bound is not None:
+            return Decimal(bound)
+    raise AssertionError(f"TaxInputs.{name} has no upper bound")
+
+
+class _Contract(BaseModel):
+    """Frozen, closed contract base that refuses binary floats."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_floats(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, float):
+                    raise ValueError(f"{key}: binary float is not allowed; use a decimal string")
+        return data
+
+
+# --------------------------------------------------------------------------- vehicle facts
+
+
+class PriceFact(_Contract):
+    """Purchase price as stated. Only EUR and MKD can become a customs value (a CHF price plus
+    EUR transport would need two customs rates; a reference rate is never substituted)."""
+
+    amount: Decimal = Field(ge=0, le=MAX_INPUT_AMOUNT)
+    currency: Literal["EUR", "MKD", "CHF"]
+
+
+class Co2Reading(_Contract):
+    """A CO2 figure exactly as printed on the document, with its measurement cycle."""
+
+    cycle: Co2Cycle
+    g_km: Decimal = Field(ge=0, le=2000)
+
+
+class OriginProofClaim(_Contract):
+    """The proof of origin the importer holds. ``none`` (the default) means no proof, so the
+    standard duty; ``unknown`` leaves the duty unknown. A claimed proof is assumed accepted by
+    Customs and the standard-duty alternative is always shown next to it."""
+
+    kind: OriginProofKind = "none"
+    country: str | None = Field(default=None, pattern=_COUNTRY)
+    evidence_ref: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> OriginProofClaim:
+        if self.kind in ("none", "unknown") and (self.country or self.evidence_ref):
+            raise ValueError(f"an origin proof of kind {self.kind!r} has no country or evidence")
+        if self.kind in ("efta", "cefta") and self.country is None:
+            raise ValueError(f"an {self.kind.upper()} proof must state its origin country")
+        return self
+
+    @property
+    def claimed(self) -> bool:
+        return self.kind not in ("none", "unknown")
+
+
+class VehicleImportFacts(_Contract):
+    """What is known about one vehicle and its import. Every field is optional; a missing fact
+    stays unknown (never zero) and the estimate names it in ``missing_facts``."""
+
+    price: PriceFact | None = None
+    price_basis: PriceBasis = "advertised"
+    declaration_date: date | None = None
+    fuel: Fuel = Fuel.UNKNOWN
+    co2: tuple[Co2Reading, ...] = Field(default=(), max_length=3)
+    co2_document: Co2Document | None = None
+    co2_round_up_confirmed: bool = False
+    first_registration: PartialDate = PartialDate()
+    emissions_class: str | None = Field(default=None, min_length=1, max_length=40)
+    origin_proof: OriginProofClaim = OriginProofClaim()
+    hs_code: str | None = Field(default=None, min_length=4, max_length=16)
+    hs_evidence_ref: str | None = Field(default=None, min_length=1, max_length=200)
+    transport_after_entry_eur: Decimal | None = Field(default=None, ge=0, le=MAX_INPUT_AMOUNT)
+    transport_after_entry_separately_invoiced: bool = False
+    catalogue_value_eur: Decimal | None = Field(default=None, ge=0, le=MAX_INPUT_AMOUNT)
+    importer_status: ImporterStatus | None = None
+    mileage_km: Decimal | None = Field(default=None, ge=0, le=MAX_MILEAGE_KM)
+    seller_country: str | None = Field(default=None, pattern=_COUNTRY)
+    #: Passed through to the engine (within its own sanity bounds); the MK passenger-car rules
+    #: do not use them.
+    engine_displacement_cm3: Decimal | None = Field(
+        default=None, gt=0, le=_input_bound("engine_displacement_cm3")
+    )
+    power_kw: Decimal | None = Field(default=None, gt=0, le=_input_bound("power_kw"))
+
+    @field_validator("hs_code")
+    @classmethod
+    def _hs6(cls, value: str | None) -> str | None:
+        """Separators are stripped and the code is cut to HS-6; it is never inferred."""
+        if value is None:
+            return None
+        digits = re.sub(r"[ .]", "", value)
+        if not re.fullmatch(r"[0-9]{6,10}", digits):
+            raise ValueError("hs_code must have 6-10 digits (spaces and dots allowed)")
+        if not digits.startswith("8703"):
+            raise ValueError(
+                "only HS 8703 passenger cars are modelled; 8704 (e.g. double-cab pick-ups) and 9705 are not"
+            )
+        return digits[:6]
+
+    @model_validator(mode="after")
+    def _consistent(self) -> VehicleImportFacts:
+        cycles = [reading.cycle for reading in self.co2]
+        if len(cycles) != len(set(cycles)):
+            raise ValueError("one CO2 reading per measurement cycle")
+        split = self.transport_after_entry_eur is not None
+        if split != self.transport_after_entry_separately_invoiced:
+            raise ValueError(
+                "transport_after_entry_eur is used only when the inland leg is separately invoiced "
+                "(transport_after_entry_separately_invoiced: true), and then it is required"
+            )
+        if self.hs_evidence_ref is not None and self.hs_code is None:
+            raise ValueError("hs_evidence_ref needs hs_code")
+        return self
+
+
+def facts_from_listing(
+    listing: NormalizedListing, *, payable: Money | None, declaration_date: date | None = None
+) -> VehicleImportFacts:
+    """Facts a listing establishes. The price is the advertised payable amount (never an
+    invoice); a listed CO2 figure is ``listing_claim_unverified``; origin stays "no proof".
+    Callers override any fact with what they know better (invoice, COC, proof, HS code).
+
+    Never raises for a listing value outside a fact's bounds (a parse error is not a fact):
+    such a value is left unknown."""
+    vehicle = listing.vehicle
+    price = None
+    if (
+        payable is not None
+        and payable.currency in ("EUR", "MKD", "CHF")
+        and 0 <= payable.amount <= MAX_INPUT_AMOUNT
+    ):
+        price = PriceFact(amount=payable.amount, currency=payable.currency)
+    readings: tuple[Co2Reading, ...] = ()
+    document: Co2Document | None = None
+    if listing.co2.g_per_km is not None:
+        readings = (Co2Reading(cycle=listing.co2.cycle, g_km=listing.co2.g_per_km),)
+        document = "listing_claim_unverified"
+    mileage = vehicle.mileage_km
+    displacement = vehicle.engine_displacement_cm3
+    return VehicleImportFacts(
+        price=price,
+        price_basis="advertised",
+        declaration_date=declaration_date,
+        fuel=vehicle.fuel,
+        co2=readings,
+        co2_document=document,
+        first_registration=vehicle.first_registration,
+        emissions_class=listing.documentation.emissions_class or None,
+        mileage_km=mileage if mileage is not None and mileage <= MAX_MILEAGE_KM else None,
+        seller_country=listing.location.country,
+        engine_displacement_cm3=None if displacement is None else Decimal(displacement),
+        power_kw=None if vehicle.power_kw is None else Decimal(vehicle.power_kw),
+    )
+
+
+class EstimatePolicy(_Contract):
+    """Presentation gates. They never change an amount (amounts come from the rule set only).
+
+    - ``min_euro``: used cars below this Euro class cannot be imported or registered in
+      practice (fact sheet 9; the legal act is UNCERTAIN - confirm). The calculation still runs.
+    - ``oldtimer_min_age_years``: from this age the motor-vehicle-tax oldtimer exemption may
+      apply (ЗДМВ чл. 17). It is not modelled; the estimate only warns.
+    """
+
+    min_euro: int = Field(default=4, ge=1, le=7)
+    oldtimer_min_age_years: int = Field(default=35, ge=1, le=200)
+
+
+DEFAULT_POLICY: Final = EstimatePolicy()
+
+
+class ImportGates(_Contract):
+    """Whether the vehicle can be imported at all (separate from the charges)."""
+
+    importable: Importable
+    reason: str = Field(min_length=3, max_length=500)
+    euro_class: int | None = None
+    min_euro: int
+    legal_basis: str = "UNCERTAIN - confirm: legal act and gazette number of the Euro minimum (fact sheet 9)"
+
+
+# --------------------------------------------------------------------------- builder
+
+
+class ScenarioInputs(_Contract):
+    """Engine inputs of one labelled scenario."""
+
+    name: EstimateScenarioName
+    label: str = Field(min_length=3, max_length=300)
+    inputs: TaxInputs
+    assumptions: tuple[str, ...] = ()
+
+
+class BuiltTaxInputs(_Contract):
+    """``build_tax_inputs`` result: the legal-base inputs, every scenario (legal base first) and
+    the builder's assumptions, warnings and import gates."""
+
+    inputs: TaxInputs
+    scenarios: tuple[ScenarioInputs, ...]
+    assumptions: tuple[str, ...]
+    warnings: tuple[str, ...]
+    gates: ImportGates
+    #: Price in EUR for the landed cost (``None`` when unknown or not convertible).
+    price_eur: Money | None
+    #: The whole transport line amount (``None`` when the line is unusable).
+    transport: Money | None
+    #: Facts (or operator data) still needed, by the builder's own reasons.
+    missing_facts: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+    #: Inputs that are claims, not evidence (an advertised price, a listing's CO2 figure, a
+    #: caller-attested proof of origin). Amounts computed from them are never presented as
+    #: rule-supported (``costs.tax_cost_lines``), even under ACTIVE rules.
+    unverified_inputs: tuple[str, ...] = ()
+
+    def scenario(self, name: EstimateScenarioName) -> ScenarioInputs | None:
+        return next((s for s in self.scenarios if s.name == name), None)
+
+
+def declaration_date_for(facts: VehicleImportFacts, as_of: datetime) -> date:
+    """The declaration date the estimate uses: the caller's, otherwise ``as_of``'s date."""
+    return facts.declaration_date or ensure_utc(as_of).date()
+
+
+def _money_text(amount: Decimal, currency: str) -> str:
+    return f"{Money(amount=amount, currency=currency).quantized()} {currency}"
+
+
+def _month_end(day: date) -> date:
+    return date(day.year, day.month, calendar.monthrange(day.year, day.month)[1])
+
+
+def _next_month(day: date) -> tuple[int, int]:
+    return (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+
+
+def single_transport_line(lines: Iterable[CostLine]) -> CostLine:
+    """The one cost-profile transport line that applies to a vehicle (``CostProfile.lines`` with
+    its target scope). With none or several, an UNKNOWN line with the reason, so the customs
+    value stays unknown rather than guessed or double counted."""
+    transport = [line for line in lines if line.category == CostCategory.TRANSPORT]
+    if len(transport) == 1:
+        return transport[0]
+    why = "no transport line" if not transport else f"{len(transport)} transport lines"
+    return CostLine(
+        category=CostCategory.TRANSPORT,
+        label="Transport (cost profile)",
+        status=CostLineStatus.UNKNOWN,
+        currency="EUR",
+        reason=f"the cost profile has {why} for this vehicle; the transport amount is unknown",
+    )
+
+
+def _transport_amount(line: CostLine) -> tuple[Decimal | None, list[str], list[str]]:
+    """Amount (EUR), assumptions and warnings of the transport cost line."""
+    if line.category != CostCategory.TRANSPORT:
+        raise ValidationFailed(f"the transport line must have category transport, not {line.category.value}")
+    if line.status not in _TRANSPORT_STATUSES or line.base is None:
+        return None, [], [f"TRANSPORT_LINE_NOT_USABLE:{line.status.value}: transport cost unknown"]
+    if line.base.currency != "EUR":
+        return None, [], [f"TRANSPORT_LINE_CURRENCY_UNSUPPORTED:{line.base.currency}: only EUR is supported"]
+    amount = _money_text(line.base.amount, "EUR")
+    assumptions = [f"TRANSPORT_LINE:{amount} per vehicle ({line.status.value}: {line.label})"[:300]]
+    if any(bound is not None and bound != line.base for bound in (line.low, line.high)):
+        assumptions.append("TRANSPORT_BASE_AMOUNT_USED: the transport line's base amount is used")
+    return line.base.amount, assumptions, []
+
+
+def _euro_class(text: str | None) -> int | None:
+    if text is None:
+        return None
+    match = _EURO_CLASS.match(text)
+    if match is None:
+        return None
+    if match.group("num") is not None:
+        return int(match.group("num"))
+    return _ROMAN[match.group("roman").lower()]
+
+
+def _gates(facts: VehicleImportFacts, policy: EstimatePolicy) -> ImportGates:
+    euro = _euro_class(facts.emissions_class)
+    if euro is None:
+        return ImportGates(
+            importable="unknown",
+            reason=f"EURO_CLASS_UNKNOWN: emissions class not stated or not recognised; the Euro "
+            f"{policy.min_euro} minimum cannot be checked",
+            min_euro=policy.min_euro,
+        )
+    if euro < policy.min_euro:
+        return ImportGates(
+            importable="no",
+            reason=f"EURO_CLASS_BELOW_MINIMUM: Euro {euro} is below the Euro {policy.min_euro} minimum for "
+            "importing/registering a used car",
+            euro_class=euro,
+            min_euro=policy.min_euro,
+        )
+    return ImportGates(
+        importable="yes",
+        reason=f"Euro {euro} meets the Euro {policy.min_euro} minimum",
+        euro_class=euro,
+        min_euro=policy.min_euro,
+    )
+
+
+def _completed_years(born: date, on: date) -> int:
+    return on.year - born.year - ((on.month, on.day) < (born.month, born.day))
+
+
+def vehicle_age_range(first_registration: PartialDate, on: date) -> tuple[int, int] | None:
+    """(fewest, most) completed years since first registration that the date's precision
+    allows, or ``None`` when unknown. ``2012-05`` is any day of May 2012, never the 1st."""
+    if first_registration.value is None:
+        return None
+    year = int(first_registration.value[:4])
+    if first_registration.precision == Precision.DAY:
+        try:
+            earliest = latest = date.fromisoformat(first_registration.value)
+        except ValueError:
+            return None
+    elif first_registration.precision == Precision.MONTH:
+        month = int(first_registration.value[5:7])
+        earliest, latest = date(year, month, 1), _month_end(date(year, month, 1))
+    else:
+        earliest, latest = date(year, 1, 1), date(year, 12, 31)
+    return _completed_years(latest, on), _completed_years(earliest, on)
+
+
+def _age(facts: VehicleImportFacts, on: date, policy: EstimatePolicy) -> tuple[Decimal | None, list[str]]:
+    """Vehicle age only when the registration date's precision leaves a single value."""
+    span = vehicle_age_range(facts.first_registration, on)
+    if span is None:
+        return None, []
+    fewest, most = span
+    warnings: list[str] = []
+    if most < 0:
+        return None, ["FIRST_REGISTRATION_AFTER_DECLARATION: vehicle age unknown"]
+    if most >= policy.oldtimer_min_age_years:
+        warnings.append(
+            f"POSSIBLE_OLDTIMER_EXEMPTION_NOT_APPLIED: the vehicle may be {most} years old; the "
+            "motor-vehicle-tax oldtimer exemption (ЗДМВ чл. 17) is not modelled and needs Customs "
+            "certification"
+        )
+    if fewest != most:
+        warnings.append(f"AGE_AMBIGUOUS:{max(fewest, 0)}-{most}: first registration is not precise enough")
+        return None, warnings
+    return Decimal(most), warnings
+
+
+def _co2(facts: VehicleImportFacts) -> tuple[Decimal | None, Co2Cycle, list[str], list[str]]:
+    """The CO2 figure and cycle the rule set receives, with assumptions and warnings."""
+    assumptions: list[str] = []
+    warnings: list[str] = []
+    document = facts.co2_document
+    if document is None and facts.fuel != Fuel.ELECTRIC:
+        warnings.append("CO2_DOCUMENT_UNKNOWN: state which document gives the CO2 figure (or none_available)")
+    elif document == "listing_claim_unverified":
+        warnings.append(
+            "CO2_NOT_FROM_ART12_DOCUMENT: the CO2 figure is a listing claim, not a COC or other "
+            "ЗДМВ чл. 12(1) document; Customs re-assesses untrue data (чл. 11(4))"
+        )
+    elif document == "none_available":
+        warnings.append(
+            "CO2_NOT_ESTABLISHED: no ЗДМВ чл. 12(1) document; the rule set's deemed CO2 applies (чл. 12(2))"
+        )
+        if facts.co2:
+            warnings.append("CO2_FIGURE_IGNORED: without a document the stated CO2 figure is not used")
+    if not facts.co2:
+        if document not in (None, "none_available") and facts.fuel != Fuel.ELECTRIC:
+            warnings.append("CO2_MISSING: the document's CO2 figure is needed; it is never assumed")
+        return None, Co2Cycle.UNKNOWN, assumptions, warnings
+    by_cycle = {reading.cycle: reading.g_km for reading in facts.co2}
+    cycle = next(c for c in _CO2_CYCLE_PREFERENCE if c in by_cycle)
+    value = by_cycle[cycle]
+    if len(by_cycle) > 1:
+        warnings.append(
+            f"CO2_CYCLE_SELECTED:{cycle.value}: the document states several cycles; WLTP is used when "
+            "present (Уредба 220/2023 чл. 2(2)), never converted"
+        )
+    if value != value.to_integral_value():
+        if facts.co2_round_up_confirmed:
+            rounded = Decimal(math.ceil(value))
+            assumptions.append(f"CO2_ROUNDED_UP_BY_CALLER:{value}->{rounded} g/km")
+            value = rounded
+        else:
+            warnings.append(
+                f"CO2_NOT_INTEGER:{value}: no band rule for a fraction; confirm rounding up "
+                "(co2_round_up_confirmed) or supply the document's whole figure"
+            )
+    return value, cycle, assumptions, warnings
+
+
+def _origin(claim: OriginProofClaim) -> tuple[OriginProof | None, list[str], list[str]]:
+    if claim.kind == "unknown":
+        return None, [], ["ORIGIN_PROOF_UNKNOWN: whether a proof of origin is held is unknown; duty unknown"]
+    if not claim.claimed:
+        return _no_proof(), [_NO_PROOF_ASSUMPTION], []
+    country = claim.country or _PROOF_COUNTRY[claim.kind]
+    proof = OriginProof(
+        proof_type=f"{claim.kind}_proof_of_origin" if claim.kind != "us" else "us_origin_evidence",
+        origin_country=country,
+        preferential=True,
+        acceptance_status=OriginProofStatus.ACCEPTED,
+        evidence_ids=(f"caller_attestation:{claim.evidence_ref or 'origin_proof'}",),
+    )
+    assumption = (
+        f"ORIGIN_PROOF_ASSUMED_ACCEPTED_BY_CUSTOMS:{claim.kind}:{country}: the caller states the proof "
+        "is held; Customs may reject it (standard-duty scenario shown)"
+    )
+    return proof, [assumption], []
+
+
+_NO_PROOF_ASSUMPTION: Final = (
+    "NO_ORIGIN_PROOF_STANDARD_DUTY: no proof of origin, so the standard duty "
+    "(Царински закон чл. 19(4): a preference applies only on request with a proof)"
+)
+
+
+def _no_proof() -> OriginProof:
+    return OriginProof(proof_type="none_claimed", acceptance_status=OriginProofStatus.NOT_AVAILABLE)
+
+
+def _classification(
+    facts: VehicleImportFacts, category: str, attested_by: str
+) -> tuple[Classification | None, list[str], list[str]]:
+    if facts.hs_code is None:
+        if facts.fuel == Fuel.PLUGIN_HYBRID:
+            return (
+                None,
+                [],
+                ["PHEV_HS_CODE_REQUIRED: the plug-in hybrid HS code (870360/870370) decides the tax"],
+            )
+        return None, [], []
+    classification = Classification(
+        tariff_code=facts.hs_code,
+        vehicle_category=category,
+        evidence_ids=(f"caller_attestation:{facts.hs_evidence_ref or 'hs_code'}",),
+        approval_status="approved",
+        approved_by=attested_by,
+    )
+    return (
+        classification,
+        [f"HS_CODE_FROM_CALLER:{facts.hs_code}: attested by the caller, never inferred"],
+        [],
+    )
+
+
+def _with(inputs: TaxInputs, **changes: Any) -> TaxInputs:
+    """A validated copy of ``inputs`` with ``changes`` applied."""
+    return TaxInputs.model_validate({**inputs.model_dump(), **changes})
+
+
+def build_tax_inputs(
+    facts: VehicleImportFacts,
+    *,
+    transport: CostLine,
+    customs_rate: FxRate | None,
+    as_of: datetime,
+    jurisdiction: str = DEFAULT_JURISDICTION,
+    vehicle_category: str = DEFAULT_VEHICLE_CATEGORY,
+    policy: EstimatePolicy = DEFAULT_POLICY,
+    accept_previous_month_fx: bool = False,
+    attested_by: str = "caller",
+) -> BuiltTaxInputs:
+    """Vehicle facts -> engine inputs for every applicable scenario (fit design section 3).
+
+    Raises ``ValidationFailed`` only for contradictory inputs (a transport line of another
+    category, an inland leg larger than the whole transport amount).
+    """
+    as_of = ensure_utc(as_of)
+    assumptions: list[str] = []
+    warnings: list[str] = []
+    notes: list[str] = []
+    needed: list[str] = []
+
+    declaration = declaration_date_for(facts, as_of)
+    if facts.declaration_date is None:
+        warnings.append(f"DECLARATION_DATE_ASSUMED_TODAY:{declaration.isoformat()}")
+
+    valid_from: date | None = None
+    valid_to: date | None = None
+    if customs_rate is None:
+        needed.append("customs_fx_rate")
+        warnings.append(
+            "CUSTOMS_FX_RATE_MISSING: record the Customs monthly EUR/MKD list rate "
+            "(suv-deals fx record --purpose customs); no other rate is substituted"
+        )
+    else:
+        valid_from, valid_to = customs_rate.rate_date, _month_end(customs_rate.rate_date)
+        assumptions.append(
+            f"CUSTOMS_FX_MONTHLY_LIST_VALIDITY:{valid_from.isoformat()}..{valid_to.isoformat()}: the "
+            "customs rate is the monthly list valid in its month"
+        )
+        if (
+            accept_previous_month_fx
+            and declaration > valid_to
+            and (declaration.year, declaration.month) == _next_month(valid_from)
+        ):
+            valid_to = declaration
+            assumptions.append(
+                f"CUSTOMS_FX_PREVIOUS_MONTH_ACCEPTED:{customs_rate.rate_date.isoformat()}: last month's "
+                "customs rate is used for this preview"
+            )
+    fx_inputs = TaxInputs(
+        declaration_date=declaration,
+        customs_fx_rate=customs_rate,
+        customs_fx_valid_from=valid_from,
+        customs_fx_valid_to=valid_to,
+    )
+
+    # Transport: all of it to the place of entry (customs value), unless an inland leg is
+    # separately invoiced; that leg goes to the import VAT base only.
+    total_transport, transport_assumptions, transport_warnings = _transport_amount(transport)
+    assumptions.extend(transport_assumptions)
+    warnings.extend(transport_warnings)
+    if total_transport is None:
+        needed.append("transport")
+    inland = facts.transport_after_entry_eur or Decimal(0)
+    to_entry: Decimal | None = None
+    if total_transport is not None:
+        if inland > total_transport:
+            raise ValidationFailed("transport_after_entry_eur exceeds the transport line amount")
+        to_entry = _CTX.subtract(total_transport, inland)
+        if inland:
+            assumptions.append(
+                f"TRANSPORT_SPLIT:{_money_text(to_entry, 'EUR')} to the MK place of entry in the customs "
+                f"value ({_CUSTOMS_VALUE_REFERENCE}); {_money_text(inland, 'EUR')} separately invoiced "
+                f"inland leg in the import VAT base only (чл. 36(а); {_INLAND_LEG_REFERENCE})"
+            )
+        else:
+            assumptions.append(
+                f"TRANSPORT_IN_CUSTOMS_VALUE:{_money_text(to_entry, 'EUR')}: the whole transport is to the "
+                f"MK place of entry ({_CUSTOMS_VALUE_REFERENCE}); no separately invoiced inland leg "
+                "(чл. 36(а))"
+            )
+    included = (
+        None
+        if to_entry is None
+        else (
+            IncludedCost(
+                label="transport to MK place of entry",
+                amount=Money(amount=to_entry, currency="EUR"),
+                legal_basis=_CUSTOMS_VALUE_REFERENCE,
+                allocation="per vehicle, transport cost line; included in the customs value",
+            ),
+        )
+    )
+    vat_only: tuple[IncludedCost, ...] = ()
+    if inland:
+        vat_only = (
+            IncludedCost(
+                label="inland transport after entry",
+                amount=Money(amount=inland, currency="EUR"),
+                legal_basis=_INLAND_LEG_REFERENCE,
+                allocation="separately invoiced; import VAT base only",
+            ),
+        )
+
+    # Price -> customs value (legal base) and the EUR price for the landed cost.
+    customs_value: Money | None = None
+    basis: str | None = None
+    price_eur: Money | None = None
+    price = facts.price
+    if price is None:
+        needed.append("price")
+        warnings.append("PRICE_MISSING: purchase price unknown; customs value unknown")
+    elif price.currency == "CHF":
+        needed.append("price")
+        warnings.append(
+            "CUSTOMS_VALUE_CHF_UNSUPPORTED: a CHF price plus EUR transport needs two customs rates; no "
+            "reference rate is substituted, so the customs value is unknown"
+        )
+    else:
+        if facts.price_basis == "advertised":
+            assumptions.append(
+                "ADVERTISED_PRICE_AS_TRANSACTION_VALUE: the advertised price stands in for the invoice price "
+                "(Царински закон чл. 28)"
+            )
+        price_money = Money(amount=price.amount, currency=price.currency)
+        if price.currency == "EUR":
+            price_eur = price_money
+        else:
+            price_eur, _ = convert_with_customs_rate(price_money, "EUR", fx_inputs)
+        if to_entry is not None:
+            if price.currency == "EUR":
+                customs_value = Money(amount=_CTX.add(price.amount, to_entry), currency="EUR")
+            else:
+                converted, codes = convert_with_customs_rate(
+                    Money(amount=to_entry, currency="EUR"), "MKD", fx_inputs
+                )
+                if converted is None:
+                    needed.append("customs_fx_rate")
+                    warnings.extend(f"CUSTOMS_VALUE_TRANSPORT_NOT_CONVERTED:{code}" for code in codes)
+                else:
+                    customs_value = Money(amount=_CTX.add(price.amount, converted.amount), currency="MKD")
+            if customs_value is not None:
+                assert total_transport is not None
+                word = "invoice" if facts.price_basis == "invoice" else "advertised price"
+                basis = (
+                    f"Царински закон чл. 28: {word} {_money_text(price.amount, price.currency)} + "
+                    f"чл. 35(1)(д) transport to MK place of entry {_money_text(to_entry, 'EUR')} (transport "
+                    f"line {_money_text(total_transport, 'EUR')}; separately invoiced inland leg "
+                    f"{_money_text(inland, 'EUR')})"
+                )[:300]
+
+    origin_proof, origin_assumptions, origin_warnings = _origin(facts.origin_proof)
+    if facts.origin_proof.kind == "unknown":
+        needed.append("origin_proof")
+    assumptions.extend(origin_assumptions)
+    warnings.extend(origin_warnings)
+    co2_value, co2_cycle, co2_assumptions, co2_warnings = _co2(facts)
+    if facts.fuel != Fuel.ELECTRIC:
+        if facts.co2_document is None:
+            needed.append("co2_document")
+        if not facts.co2 and facts.co2_document != "none_available":
+            needed.append("co2")
+    assumptions.extend(co2_assumptions)
+    warnings.extend(co2_warnings)
+    classification, class_assumptions, class_warnings = _classification(facts, vehicle_category, attested_by)
+    if classification is None and facts.fuel == Fuel.PLUGIN_HYBRID:
+        needed.append("hs_code")
+    assumptions.extend(class_assumptions)
+    warnings.extend(class_warnings)
+    age, age_warnings = _age(facts, declaration, policy)
+    warnings.extend(age_warnings)
+    gates = _gates(facts, policy)
+    if gates.importable == "no":
+        warnings.append(gates.reason)
+    if facts.fuel == Fuel.UNKNOWN:
+        needed.append("fuel")
+        warnings.append("FUEL_UNKNOWN: the fuel decides the motor-vehicle-tax column")
+    used = facts.mileage_km is not None and facts.mileage_km >= USED_VEHICLE_MIN_KM
+    unverified: list[str] = []
+    if price is not None and facts.price_basis == "advertised":
+        unverified.append("price: advertised price, not an invoice or contract price")
+    if facts.co2_document == "listing_claim_unverified" and facts.co2 and facts.fuel != Fuel.ELECTRIC:
+        unverified.append("co2: listing claim, not a ЗДМВ чл. 12(1) document")
+    if facts.origin_proof.claimed:
+        unverified.append("origin_proof: caller attestation, acceptance by Customs assumed")
+    if classification is not None:
+        unverified.append("hs_code: caller attestation, not a binding tariff ruling")
+    if facts.importer_status == "vat_dealer":
+        notes.append(
+            "IMPORT_VAT_DEDUCTIBLE_ONLY_FOR_TRADING: a VAT-registered dealer deducts import VAT on a "
+            "passenger car only if it is used exclusively for trading (ЗДДВ чл. 35 т. 2); otherwise it is "
+            "a final cost"
+        )
+    elif facts.importer_status is not None:
+        notes.append("IMPORT_VAT_IS_A_FINAL_COST: not deductible for this importer (ЗДДВ чл. 35, 51(3))")
+
+    legal = TaxInputs(
+        declaration_date=declaration,
+        jurisdiction=jurisdiction,
+        classification=classification,
+        vehicle_condition="used" if used else None,
+        vehicle_age_years=age,
+        seller_country=facts.seller_country,
+        origin_proof=origin_proof,
+        # The price as stated (advertised or invoice); never a customs value by itself.
+        invoice_price=None if price is None else Money(amount=price.amount, currency=price.currency),
+        customs_value=customs_value,
+        customs_value_basis=basis,
+        included_costs=included,
+        vat_incidental_costs=vat_only,
+        co2_g_km=co2_value,
+        co2_cycle=co2_cycle,
+        co2_source_document=facts.co2_document,
+        emissions_class=facts.emissions_class,
+        fuel=facts.fuel,
+        engine_displacement_cm3=facts.engine_displacement_cm3,
+        power_kw=facts.power_kw,
+        customs_fx_rate=customs_rate,
+        customs_fx_valid_from=valid_from,
+        customs_fx_valid_to=valid_to,
+        exemptions=(),
+        importer_status=facts.importer_status,
+    )
+    scenarios = [
+        ScenarioInputs(
+            name="legal_base",
+            label=f"Legal base: {facts.price_basis} price + transport to the MK place of entry",
+            inputs=legal,
+        )
+    ]
+    if facts.origin_proof.claimed:
+        scenarios.append(
+            ScenarioInputs(
+                name="standard_duty_if_proof_rejected",
+                label="Standard duty: Customs rejects or never receives the proof of origin",
+                inputs=_with(legal, origin_proof=_no_proof()),
+                assumptions=(_NO_PROOF_ASSUMPTION,),
+            )
+        )
+    if facts.catalogue_value_eur is not None:
+        risk_value = None if to_entry is None else _CTX.add(facts.catalogue_value_eur, to_entry)
+        risk_basis = None
+        if risk_value is not None and to_entry is not None:
+            catalogue = _money_text(facts.catalogue_value_eur, "EUR")
+            risk_basis = (
+                f"{_RISK_BASIS_PREFIX} catalogue value {catalogue} + transport to MK place of entry "
+                f"{_money_text(to_entry, 'EUR')}"
+            )[:300]
+        scenarios.append(
+            ScenarioInputs(
+                name="customs_revaluation_risk",
+                label="Risk: Customs revalues the car at its catalogue value (not the legal customs value)",
+                inputs=_with(
+                    legal,
+                    customs_value=None if risk_value is None else Money(amount=risk_value, currency="EUR"),
+                    customs_value_basis=risk_basis,
+                ),
+                assumptions=(
+                    "CUSTOMS_REVALUATION_RISK: catalogue value as customs value (Царински закон чл. 42(3)); "
+                    "never max(invoice, catalogue) (чл. 34(2)(б))",
+                    "CUSTOMS_REVALUATION_TRANSPORT_ADDED: UNCERTAIN - confirm whether Customs adds transport "
+                    "to a catalogue value",
+                ),
+            )
+        )
+    return BuiltTaxInputs(
+        inputs=legal,
+        scenarios=tuple(scenarios),
+        assumptions=tuple(dict.fromkeys(assumptions)),
+        warnings=tuple(dict.fromkeys(warnings)),
+        gates=gates,
+        price_eur=price_eur,
+        transport=None if total_transport is None else Money(amount=total_transport, currency="EUR"),
+        missing_facts=tuple(dict.fromkeys(needed)),
+        notes=tuple(notes),
+        unverified_inputs=tuple(unverified),
+    )
+
+
+# --------------------------------------------------------------------------- selection
+
+
+def select_estimate_rule_set(
+    rule_sets: Iterable[RuleSet],
+    jurisdiction: str,
+    category: str,
+    on_date: date,
+    *,
+    created_at: Mapping[str, datetime] | None = None,
+) -> RuleSelection:
+    """The production selection first (one ACTIVE, approved, non-fixture set); only when none
+    applies, the indicative-preview selection. ``rule_set`` None means import costs unknown."""
+    candidates = tuple(rule_sets)
+    production = select_rule_set(candidates, jurisdiction, category, on_date)
+    if production.rule_set is not None:
+        return production
+    preview = select_preview_rule_set(candidates, jurisdiction, category, on_date, created_at=created_at)
+    considered = tuple(dict.fromkeys((*production.considered, *preview.considered)))
+    if preview.rule_set is not None:
+        return preview.model_copy(update={"considered": considered})
+    return preview.model_copy(
+        update={
+            "reason": f"{production.reason}; {preview.reason}",
+            "considered": considered,
+        }
+    )
+
+
+# --------------------------------------------------------------------------- estimate result
+
+
+class Banner(_Contract):
+    """The label every surface shows (Macedonian and English)."""
+
+    mk: str = Field(min_length=3, max_length=500)
+    en: str = Field(min_length=3, max_length=500)
+
+    def text(self) -> str:
+        return f"{self.mk} / {self.en}"
+
+
+class RuleIdentity(_Contract):
+    rule_set_id: str
+    version: str
+    status: TaxRuleStatus
+    jurisdiction: str
+    currency: str | None
+    valid_from: date | None
+    valid_to: date | None
+    #: The recorded hash, or for an unsealed draft the hash computed from its content, so a
+    #: preview can be reproduced exactly.
+    content_sha256: str
+    sha256_recorded: bool
+
+
+class CategoryEstimate(_Contract):
+    """One import category. Helpers never count; the EUR amount is at the customs rate."""
+
+    category: CostCategory
+    status: ComponentStatus
+    amount: Money | None
+    amount_eur: Money | None
+    component_ids: tuple[str, ...]
+    reason: str | None = None
+
+
+class UncertainItem(_Contract):
+    """A rule-set statement or component marked UNCERTAIN. ``applies`` is false for a component
+    that does not apply to this vehicle (e.g. the plug-in hybrid column for a diesel car)."""
+
+    source: Literal["component", "rule_set"]
+    component_id: str | None = None
+    text: str = Field(min_length=1, max_length=1200)
+    applies: bool = True
+
+
+class EstimateScenario(_Contract):
+    """One labelled scenario. Totals are named by mode: ``total`` (ACTIVE rules) or
+    ``indicative_total`` (preview); the other stays empty."""
+
+    name: EstimateScenarioName
+    label: str
+    customs_value: Money | None
+    customs_value_basis: str | None
+    assumptions: tuple[str, ...]
+    complete: bool
+    production_ready: bool
+    components: tuple[ComponentResult, ...]
+    categories: tuple[CategoryEstimate, ...]
+    total: Money | None = None
+    total_eur: Money | None = None
+    landed_cost_eur: Money | None = None
+    indicative_total: Money | None = None
+    indicative_total_eur: Money | None = None
+    indicative_landed_cost_eur: Money | None = None
+    known_subtotal: Money | None = None
+    unknown_components: tuple[str, ...]
+    missing_inputs: tuple[str, ...]
+    warnings: tuple[str, ...]
+    effective_date: date
+    customs_fx_rate: FxRate | None
+    engine_version: str = ENGINE_VERSION
+    #: ``TaxCalculation.content_sha256()`` of the calculation behind this scenario.
+    calculation_sha256: str
+
+    def final_total(self) -> Money | None:
+        """Whichever total this mode carries (for display; never a production figure in preview)."""
+        return self.total or self.indicative_total
+
+
+class ImportCostEstimate(_Contract):
+    """Result of ``estimate_import_costs``. Display-only: never persisted to valuations, cost
+    lines or alerts, and it carries no ``TaxCalculation`` that could become cost lines."""
+
+    estimator_version: str = ESTIMATE_VERSION
+    mode: EstimateMode
+    production_ready: bool
+    banner: Banner | None
+    rule: RuleIdentity | None
+    selection_reason: str
+    considered: tuple[str, ...]
+    jurisdiction: str
+    vehicle_category: str
+    declaration_date: date
+    as_of: datetime
+    currency: str | None
+    customs_fx_rate: FxRate | None
+    eur_basis: str
+    landed_cost_note: str = LANDED_COST_NOTE
+    scenarios: tuple[EstimateScenario, ...]
+    assumptions: tuple[str, ...]
+    warnings: tuple[str, ...]
+    notes: tuple[str, ...]
+    uncertain_items: tuple[UncertainItem, ...]
+    gates: ImportGates
+    missing_inputs: tuple[str, ...]
+    missing_facts: tuple[str, ...]
+    #: ``BuiltTaxInputs.unverified_inputs``: claims the figures rest on (never rule-supported).
+    unverified_inputs: tuple[str, ...] = ()
+
+    _utc = field_validator("as_of")(ensure_utc)
+
+    @model_validator(mode="after")
+    def _labelled(self) -> ImportCostEstimate:
+        preview_fields = ("indicative_total", "indicative_total_eur", "indicative_landed_cost_eur")
+        active_fields = ("total", "total_eur", "landed_cost_eur")
+        if self.mode == "unavailable" and (self.rule is not None or self.scenarios or self.production_ready):
+            raise ValueError(
+                "an unavailable estimate has no rule set, no scenarios and is not production-ready"
+            )
+        if self.mode == "indicative_preview":
+            if self.production_ready or self.banner is None:
+                raise ValueError(
+                    "an indicative preview is never production-ready and always carries the banner"
+                )
+            if self.rule is None or self.rule.status not in _PREVIEW_RULE_WORDS:
+                raise ValueError("an indicative preview runs on an approved/under_review/draft rule set")
+            if any(getattr(s, f) is not None for s in self.scenarios for f in active_fields):
+                raise ValueError("an indicative preview names its totals indicative_total")
+        if self.mode == "active":
+            if self.rule is None or self.rule.status != TaxRuleStatus.ACTIVE:
+                raise ValueError("an active estimate runs on an ACTIVE rule set")
+            if any(getattr(s, f) is not None for s in self.scenarios for f in preview_fields):
+                raise ValueError("an active estimate never carries indicative totals")
+        if self.production_ready and (
+            self.mode != "active" or not self.scenarios or not self.scenarios[0].production_ready
+        ):
+            raise ValueError("production_ready follows the legal-base scenario of an active estimate")
+        return self
+
+    def scenario(self, name: EstimateScenarioName) -> EstimateScenario | None:
+        return next((s for s in self.scenarios if s.name == name), None)
+
+
+# --------------------------------------------------------------------------- estimate service
+
+
+def _preview_banner(rule_set: RuleSet) -> Banner:
+    words_mk, words_en = _PREVIEW_RULE_WORDS[rule_set.status]
+    return Banner(
+        mk=f"ИНДИКАТИВНА ПРОЦЕНКА – {words_mk} ({rule_set.label()}). Не е царинска пресметка; не се користи "
+        "за вреднувања ни известувања.",
+        en=f"INDICATIVE PREVIEW – {words_en}; not a customs assessment; never used for valuations or alerts.",
+    )
+
+
+_UNAVAILABLE_BANNER: Final = Banner(
+    mk="НЕМА ПРИМЕНЛИВИ ПРАВИЛА – увозните давачки се непознати (не нула).",
+    en="NO APPLICABLE RULES – import charges unknown (not zero).",
+)
+
+
+def _cents(money: Money | None) -> Money | None:
+    return None if money is None else Money(amount=money.quantized(), currency=money.currency)
+
+
+def _in_eur(amount: Money | None, inputs: TaxInputs) -> Money | None:
+    """Unrounded EUR equivalent at the customs rate (``None`` when the rate cannot be used)."""
+    if amount is None:
+        return None
+    if amount.currency == "EUR":
+        return amount
+    converted, _ = convert_with_customs_rate(amount, "EUR", inputs)
+    return converted
+
+
+def _categories(calc: TaxCalculation, inputs: TaxInputs) -> tuple[CategoryEstimate, ...]:
+    """Every import category, with the same unknown/not-applicable rules as the cost lines."""
+    totals = calc.category_totals()
+    rows: list[CategoryEstimate] = []
+    for category in sorted(IMPORT_CATEGORIES):
+        total = totals.get(category)
+        if total is None:
+            applicable_rule = calc.complete and bool(calc.components)
+            rows.append(
+                CategoryEstimate(
+                    category=category,
+                    status=ComponentStatus.NOT_APPLICABLE if applicable_rule else ComponentStatus.UNKNOWN,
+                    amount=None,
+                    amount_eur=None,
+                    component_ids=(),
+                    reason=f"the rule set defines no {category.value} component"
+                    + ("" if applicable_rule else "; the calculation is incomplete (unknown, not zero)"),
+                )
+            )
+            continue
+        rows.append(
+            CategoryEstimate(
+                category=category,
+                status=total.status,
+                amount=total.amount,
+                amount_eur=_cents(_in_eur(total.amount, inputs)),
+                component_ids=total.component_ids,
+            )
+        )
+    return tuple(rows)
+
+
+def _missing(calc: TaxCalculation) -> tuple[str, ...]:
+    """Missing rule inputs (never component ids), required ones first."""
+    names = [*calc.missing_inputs]
+    for comp in calc.components:
+        if comp.status == ComponentStatus.UNKNOWN:
+            names.extend(name for name in comp.missing_inputs if input_spec(name) is not None)
+    return tuple(dict.fromkeys(names))
+
+
+def _scenario(
+    spec: ScenarioInputs,
+    rule_set: RuleSet,
+    *,
+    mode: EstimateMode,
+    built: BuiltTaxInputs,
+    as_of: datetime,
+) -> EstimateScenario:
+    calc = calculate(rule_set, spec.inputs, as_of)
+    preview = mode == "indicative_preview"
+    total = calc.total_import_cost
+    total_eur = _in_eur(total, spec.inputs)
+    landed = None
+    if total_eur is not None and built.price_eur is not None and built.transport is not None:
+        landed = built.price_eur + built.transport + total_eur
+    return EstimateScenario(
+        name=spec.name,
+        label=spec.label,
+        customs_value=spec.inputs.customs_value,
+        customs_value_basis=spec.inputs.customs_value_basis,
+        assumptions=spec.assumptions,
+        complete=calc.complete,
+        production_ready=calc.production_ready and mode == "active",
+        components=calc.components,
+        categories=_categories(calc, spec.inputs),
+        known_subtotal=calc.known_subtotal,
+        unknown_components=calc.unknown_components,
+        missing_inputs=_missing(calc),
+        warnings=calc.warnings,
+        effective_date=calc.effective_date,
+        customs_fx_rate=calc.customs_fx_rate,
+        engine_version=calc.engine_version,
+        calculation_sha256=calc.content_sha256(),
+        total=None if preview else total,
+        total_eur=None if preview else _cents(total_eur),
+        landed_cost_eur=None if preview else _cents(landed),
+        indicative_total=total if preview else None,
+        indicative_total_eur=_cents(total_eur) if preview else None,
+        indicative_landed_cost_eur=_cents(landed) if preview else None,
+    )
+
+
+def _sentences(text: str) -> list[str]:
+    # Split after a full stop followed by a capital (Latin or Cyrillic), so "чл. 17" stays whole.
+    return [s.strip() for s in re.split(r"(?<=\.)\s+(?=[A-ZА-Я])", text) if s.strip()]
+
+
+def _uncertain_items(rule_set: RuleSet, legal_base: EstimateScenario | None) -> tuple[UncertainItem, ...]:
+    """Every rule-set statement and component marked UNCERTAIN; the ones that apply to this
+    vehicle first."""
+    items = [
+        UncertainItem(source="rule_set", text=sentence[:1200])
+        for sentence in _sentences(rule_set.description or "")
+        if "UNCERTAIN" in sentence
+    ]
+    not_applicable = {
+        c.component_id
+        for c in (legal_base.components if legal_base else ())
+        if c.status == ComponentStatus.NOT_APPLICABLE
+    }
+    marked = [
+        UncertainItem(
+            source="component",
+            component_id=comp.id,
+            text=" | ".join(t for t in (comp.label, comp.legal_reference or "") if "UNCERTAIN" in t)[:1200],
+            applies=comp.id not in not_applicable,
+        )
+        for comp in rule_set.components
+        if "UNCERTAIN" in comp.label or "UNCERTAIN" in (comp.legal_reference or "")
+    ]
+    return (*items, *(i for i in marked if i.applies), *(i for i in marked if not i.applies))
+
+
+def _rule_identity(rule_set: RuleSet) -> RuleIdentity:
+    return RuleIdentity(
+        rule_set_id=rule_set.rule_set_id,
+        version=rule_set.version,
+        status=rule_set.status,
+        jurisdiction=rule_set.jurisdiction,
+        currency=rule_set.currency,
+        valid_from=rule_set.valid_from,
+        valid_to=rule_set.valid_to,
+        content_sha256=rule_set.sha256 or compute_rule_set_sha256(rule_set),
+        sha256_recorded=rule_set.sha256 is not None,
+    )
+
+
+def _mode(selection: RuleSelection) -> EstimateMode:
+    chosen = selection.rule_set
+    if selection.mode == "unapproved_allowed":
+        raise ValidationFailed("a fixture (allow_unapproved) selection never feeds an import-cost estimate")
+    if chosen is None:
+        return "unavailable"
+    if selection.mode == "active":
+        if chosen.status != TaxRuleStatus.ACTIVE or chosen.is_fixture:
+            raise ValidationFailed("an active estimate needs an ACTIVE, non-fixture rule set")
+        return "active"
+    return "indicative_preview"
+
+
+def _eur_basis(rate: FxRate | None) -> str:
+    if rate is None:
+        return "no customs rate: EUR equivalents and the landed cost are unknown"
+    return (
+        f"EUR equivalents at the customs rate {rate.base}/{rate.quote} {rate.rate} "
+        f"({rate.rate_date.isoformat()}, {rate.provider}); not a payment or reference rate"
+    )[:500]
+
+
+def estimate_import_costs(
+    selection: RuleSelection,
+    facts: VehicleImportFacts,
+    *,
+    transport: CostLine,
+    customs_rate: FxRate | None,
+    as_of: datetime,
+    jurisdiction: str = DEFAULT_JURISDICTION,
+    vehicle_category: str = DEFAULT_VEHICLE_CATEGORY,
+    policy: EstimatePolicy = DEFAULT_POLICY,
+    accept_previous_month_fx: bool = False,
+    attested_by: str = "caller",
+) -> ImportCostEstimate:
+    """Estimate customs duty, motor-vehicle tax and import VAT for one vehicle. Pure.
+
+    ``accept_previous_month_fx`` applies to an indicative preview only (labelled assumption).
+
+    ``selection`` comes from ``select_estimate_rule_set`` (production first, then the
+    indicative preview) with ``declaration_date_for(facts, as_of)`` as its date. Every
+    scenario is a separate ``calculate`` call on the selected rule set. In preview mode the
+    totals are ``indicative_*`` and the result carries the banner; it is never
+    production-ready. With no rule set the result is ``unavailable`` and every import charge
+    stays unknown.
+    """
+    as_of = ensure_utc(as_of)
+    mode = _mode(selection)
+    rule_set = selection.rule_set
+    if rule_set is not None and rule_set.jurisdiction != jurisdiction:
+        raise ValidationFailed("the selected rule set is for another jurisdiction")
+    # Last month's customs rate is a labelled preview convenience, never for ACTIVE rules.
+    previous_month_fx = accept_previous_month_fx and mode == "indicative_preview"
+    built = build_tax_inputs(
+        facts,
+        transport=transport,
+        customs_rate=customs_rate,
+        as_of=as_of,
+        jurisdiction=jurisdiction,
+        vehicle_category=vehicle_category,
+        policy=policy,
+        accept_previous_month_fx=previous_month_fx,
+        attested_by=attested_by,
+    )
+    warnings = list(built.warnings)
+    if accept_previous_month_fx and not previous_month_fx:
+        warnings.append(
+            "PREVIOUS_MONTH_FX_PREVIEW_ONLY: last month's customs rate is accepted only in a preview"
+        )
+    scenarios: tuple[EstimateScenario, ...] = ()
+    if rule_set is None:
+        warnings.append(f"IMPORT_COSTS_UNKNOWN: {selection.reason}"[:500])
+        missing: tuple[str, ...] = ("tax_rule_set",)
+    else:
+        scenarios = tuple(
+            _scenario(s, rule_set, mode=mode, built=built, as_of=as_of) for s in built.scenarios
+        )
+        missing = scenarios[0].missing_inputs
+    legal_base = scenarios[0] if scenarios else None
+    facts_needed = tuple(
+        dict.fromkeys(
+            [
+                *(("tax_rule_set",) if rule_set is None else ()),
+                *built.missing_facts,
+                *(_FACT_FOR_INPUT[name] for name in missing if name in _FACT_FOR_INPUT),
+            ]
+        )
+    )
+    return ImportCostEstimate(
+        mode=mode,
+        production_ready=bool(legal_base and legal_base.production_ready),
+        banner=_preview_banner(rule_set)
+        if mode == "indicative_preview" and rule_set
+        else (_UNAVAILABLE_BANNER if rule_set is None else None),
+        rule=None if rule_set is None else _rule_identity(rule_set),
+        selection_reason=selection.reason,
+        considered=selection.considered,
+        jurisdiction=jurisdiction,
+        vehicle_category=vehicle_category,
+        declaration_date=declaration_date_for(facts, as_of),
+        as_of=as_of,
+        currency=None if rule_set is None else rule_set.currency,
+        customs_fx_rate=customs_rate,
+        eur_basis=_eur_basis(customs_rate),
+        scenarios=scenarios,
+        assumptions=built.assumptions,
+        warnings=tuple(dict.fromkeys(warnings)),
+        notes=built.notes,
+        uncertain_items=() if rule_set is None else _uncertain_items(rule_set, legal_base),
+        gates=built.gates,
+        missing_inputs=missing,
+        missing_facts=facts_needed,
+        unverified_inputs=built.unverified_inputs,
+    )
+
+
+def estimate_from_rule_sets(
+    rule_sets: Sequence[RuleSet],
+    facts: VehicleImportFacts,
+    *,
+    transport: CostLine,
+    customs_rate: FxRate | None,
+    as_of: datetime,
+    jurisdiction: str = DEFAULT_JURISDICTION,
+    vehicle_category: str = DEFAULT_VEHICLE_CATEGORY,
+    created_at: Mapping[str, datetime] | None = None,
+    policy: EstimatePolicy = DEFAULT_POLICY,
+    accept_previous_month_fx: bool = False,
+    attested_by: str = "caller",
+) -> ImportCostEstimate:
+    """``select_estimate_rule_set`` on the declaration date, then ``estimate_import_costs``."""
+    selection = select_estimate_rule_set(
+        rule_sets,
+        jurisdiction,
+        vehicle_category,
+        declaration_date_for(facts, as_of),
+        created_at=created_at,
+    )
+    return estimate_import_costs(
+        selection,
+        facts,
+        transport=transport,
+        customs_rate=customs_rate,
+        as_of=as_of,
+        jurisdiction=jurisdiction,
+        vehicle_category=vehicle_category,
+        policy=policy,
+        accept_previous_month_fx=accept_previous_month_fx,
+        attested_by=attested_by,
+    )

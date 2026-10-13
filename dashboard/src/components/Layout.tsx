@@ -18,6 +18,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { to: '/', label: 'Overview', end: true },
   { to: '/candidates', label: 'Candidates' },
+  { to: '/import-costs', label: 'Customs calculator', scope: 'deals:read' },
   { to: '/reviews', label: 'Reviews' },
   {
     to: '/inquiries',

@@ -755,6 +755,38 @@ def test_tax_cost_lines_from_active_rule_are_rule_supported() -> None:
     assert abs(import_components.amount - Decimal("35020.95") / Decimal("61.5")) < Decimal("1e-20")
 
 
+def test_tax_lines_from_unverified_inputs_are_never_rule_or_quote_supported() -> None:
+    # The same ACTIVE, complete calculation, but its inputs rest on claims (an advertised price,
+    # a listing's CO2 figure): the lines are estimates on unapproved assumptions.
+    calc = calculate(_active_rule(), _tax_inputs(), datetime(2026, 6, 1, tzinfo=UTC))
+    assert calc.production_ready
+    claims = ("price: advertised price, not an invoice", "co2: listing claim")
+    tax_lines = tax_cost_lines(calc, unverified_inputs=(*claims, claims[0]))
+    resolved = [ln for ln in tax_lines if ln.status == S.ESTIMATED]
+    assert resolved and all(not ln.rule_supported and not ln.assumption_approved for ln in resolved)
+    rule = f"{calc.rule_set_id}@{calc.version}"
+    expected = f"computed by rule {rule} from unverified inputs: {claims[0]}; {claims[1]}"
+    assert all(ln.reason == expected for ln in resolved)
+    # Amounts and evidence are unchanged: only the support label differs.
+    assert [ln.base for ln in tax_lines] == [ln.base for ln in tax_cost_lines(calc)]
+    assert [ln.evidence_ids for ln in tax_lines] == [ln.evidence_ids for ln in tax_cost_lines(calc)]
+    eur_rates = [
+        FxRate(
+            base="EUR",
+            quote="MKD",
+            rate=Decimal("61.5"),
+            rate_date=AS_OF.date(),
+            retrieved_at=AS_OF,
+            provider="SYNTHETIC owner-approved MKD source",
+        )
+    ]
+    others = [ln for ln in _quoted_lines() if ln.category not in IMPORT_CATEGORIES]
+    result = run(others + list(tax_lines), buy=purchase(status=S.QUOTED), rates=eur_rates)
+    assert result.material_support == "estimated"
+    assert any(u.startswith("import_duty:") for u in result.unsupported_material)
+    assert not result.threshold.alert_eligible
+
+
 # --------------------------------------------------------------------------- cost profile
 
 

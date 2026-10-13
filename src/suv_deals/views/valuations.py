@@ -39,7 +39,7 @@ from suv_deals.domain.enums import (
     ValuationState,
 )
 from suv_deals.domain.money import CurrencyCode, Money
-from suv_deals.domain.tax_engine import ComponentStatus, TaxCalculation
+from suv_deals.domain.tax_engine import ComponentResult, ComponentStatus, TaxCalculation
 from suv_deals.domain.valuation import ComparableReference, Valuation, ValuationDependencies
 from suv_deals.views.common import (
     AmountView,
@@ -381,15 +381,43 @@ class TaxInputUsed(ViewModel):
 
 
 class TaxComponentView(ViewModel):
+    """One rule component. ``intermediate`` marks a helper (e.g. a customs value in the rule
+    currency or a VAT base): shown for transparency, never counted in a total."""
+
     component_id: str = Field(max_length=64)
     label: str = Field(max_length=200)
     category: CostCategory
     kind: str = Field(max_length=40)
     status: Literal["resolved", "unknown", "not_applicable"]
+    intermediate: bool
     amount: AmountView
     inputs_used: tuple[TaxInputUsed, ...] = Field(max_length=100)
     missing_inputs: tuple[str, ...] = Field(max_length=100)
     warnings: tuple[str, ...] = Field(max_length=100)
+
+    @classmethod
+    def of(cls, comp: ComponentResult, *, currency: str | None) -> TaxComponentView:
+        """An unknown component shows ``unknown`` (never 0); a not-applicable one its reason."""
+        if comp.status == ComponentStatus.RESOLVED:
+            amount = AmountView.of(comp.amount)
+        elif comp.status == ComponentStatus.NOT_APPLICABLE:
+            amount = AmountView.not_applicable("rule predicate not met", currency=currency)
+        else:
+            amount = AmountView.unknown("missing or unsupported input", currency=currency)
+        return cls(
+            component_id=comp.component_id,
+            label=comp.label,
+            category=comp.category,
+            kind=comp.kind,
+            status=comp.status.value,
+            intermediate=comp.intermediate,
+            amount=amount,
+            inputs_used=tuple(
+                TaxInputUsed(name=k, value=v[:500]) for k, v in sorted(comp.inputs_used.items())
+            ),
+            missing_inputs=comp.missing_inputs,
+            warnings=comp.warnings,
+        )
 
 
 class TaxView(ViewModel):
@@ -434,29 +462,7 @@ class TaxView(ViewModel):
             if not calc.complete:
                 parts.append("calculation incomplete")
             approval = "Not production-supported: " + ", ".join(parts)
-        components = []
-        for comp in calc.components:
-            if comp.status == ComponentStatus.RESOLVED:
-                amount = AmountView.of(comp.amount)
-            elif comp.status == ComponentStatus.NOT_APPLICABLE:
-                amount = AmountView.not_applicable("rule predicate not met", currency=calc.currency)
-            else:
-                amount = AmountView.unknown("missing or unsupported input", currency=calc.currency)
-            components.append(
-                TaxComponentView(
-                    component_id=comp.component_id,
-                    label=comp.label,
-                    category=comp.category,
-                    kind=comp.kind,
-                    status=comp.status.value,
-                    amount=amount,
-                    inputs_used=tuple(
-                        TaxInputUsed(name=k, value=v[:500]) for k, v in sorted(comp.inputs_used.items())
-                    ),
-                    missing_inputs=comp.missing_inputs,
-                    warnings=comp.warnings,
-                )
-            )
+        components = [TaxComponentView.of(comp, currency=calc.currency) for comp in calc.components]
         return cls(
             rule_set_id=calc.rule_set_id,
             version=calc.version,

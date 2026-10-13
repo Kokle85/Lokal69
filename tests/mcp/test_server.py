@@ -224,6 +224,7 @@ async def test_handshake_era_posts_stay_stateless(keys: SigningKeys) -> None:
             "deals_get_candidate",
             "deals_get_comparables",
             "deals_get_valuation",
+            "deals_estimate_import_costs",
         ]
         unauthenticated = {k: v for k, v in headers.items() if k != "Authorization"}
         assert (await client.http.post("/mcp", json=initialize, headers=unauthenticated)).status_code == 401

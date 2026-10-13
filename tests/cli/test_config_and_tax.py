@@ -86,6 +86,20 @@ def test_config_validate_flags_a_message_approval_gate_and_missing_sender(run_cl
     assert "SELLER_EMAIL_PROVIDER: missing (required when SELLER_INQUIRY_MODE=automatic)" in result.output
 
 
+def test_config_validate_reports_the_tax_rule_draft(run_cli: Cli, config_copy: Path) -> None:
+    result = run_cli("config", "validate")
+    assert result.exit_code == 0, result.output
+    assert "tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json" in result.output
+    assert "unapproved draft: indicative preview only, never used for valuations" in result.output
+    assert "no approved/active rule set" in result.output
+    (config_copy / "tax_rules" / "drafts" / "broken.json").write_text(
+        '{"rule_set_id": "x"}', encoding="utf-8"
+    )
+    broken = run_cli("config", "validate", "--config-dir", str(config_copy))
+    assert broken.exit_code == 1
+    assert "ERROR tax_rules/drafts/broken.json" in broken.output
+
+
 def test_config_validate_rejects_an_invalid_source_file(run_cli: Cli, config_copy: Path) -> None:
     (config_copy / "sources" / "broken.yaml").write_text("source_key: Bad Key\n", encoding="utf-8")
     result = run_cli("config", "validate", "--config-dir", str(config_copy))
@@ -126,6 +140,17 @@ def test_tax_rules_validate_directory(run_cli: Cli) -> None:
     result = run_cli("tax-rules", "validate", str(REPO / "config" / "tax_rules"))
     assert result.exit_code == 0
     assert "example_unapproved.json" in result.output
+
+
+def test_tax_rules_validate_drafts_directory(run_cli: Cli) -> None:
+    # The North Macedonian draft ships unapproved: valid, unsealed, never selectable.
+    result = run_cli("tax-rules", "validate", str(REPO / "config" / "tax_rules" / "drafts"))
+    assert result.exit_code == 0, result.output
+    assert "VALID    mk_passenger_car_import_2026.10-draft.1.json" in result.output
+    assert "status             : draft" in result.output
+    assert "not recorded (computed" in result.output
+    assert "NOT selectable" in result.output
+    assert "INVALID" not in result.output
 
 
 def test_tax_rules_validate_rejects_tampered_content(run_cli: Cli, tmp_path: Path) -> None:

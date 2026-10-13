@@ -469,6 +469,7 @@ async def test_oauth_user_maps_to_membership_and_token_scopes_narrow_the_role(
             "deals_get_candidate",
             "deals_get_comparables",
             "deals_get_valuation",
+            "deals_estimate_import_costs",
         ]
         # Unknown, admin and mail-ingest scopes are never effective on MCP.
         owner = tokens.mint(users.owner, scopes=["openid", "config:admin", "mail:ingest", "reviews:read"])
@@ -491,7 +492,7 @@ async def test_rs256_tokens_from_the_jwks_are_accepted(
     async with mcp_client(make_settings(), db, keys) as client:
         token = tokens.mint(users.viewer, alg="RS256", scopes=[Scope.DEALS_READ])
         assert jwt.get_unverified_header(token)["kid"] == RS_KID
-        assert len(await client.tools(token)) == 5
+        assert len(await client.tools(token)) == 6
 
 
 @pytest.mark.db
@@ -565,6 +566,7 @@ async def test_mapped_machine_client_uses_its_explicit_principal(
             "deals_get_candidate",
             "deals_get_comparables",
             "deals_get_valuation",
+            "deals_estimate_import_costs",
         ]
         health = await client.ok("deals_health", token=token)
         assert health["data"]["ready"] in (True, False)
@@ -700,7 +702,7 @@ async def test_static_bearer_rejects_expired_inactive_and_mail_worker_credential
         assert (await client.rpc("tools/list", token=expired_token)).status_code == 401
         assert denials(metrics, "expired_token") == 1
         assert (await client.rpc("tools/list", token=mail_token)).status_code == 401
-        assert len(await client.tools(client_cred.token.get_secret_value())) == 5
+        assert len(await client.tools(client_cred.token.get_secret_value())) == 6
         member_token = member_cred.token.get_secret_value()
         assert "reviews_claim" in await _tool_names(client, member_token)
         # A demoted member's credential is cut to the new role; a removed member loses access.
@@ -822,7 +824,7 @@ async def test_dev_local_mode_accepts_only_dev_credentials_from_loopback(
     local = "http://127.0.0.1:8000"
     async with mcp_client(settings, db, keys, base_url=local) as client:
         assert client.app.auth_mode == "dev_local"
-        assert len(await client.tools(dev)) == 5
+        assert len(await client.tools(dev)) == 6
         assert (await client.rpc("tools/list", token=static)).status_code == 401
     async with mcp_client(settings, db, keys, base_url=local, client=("203.0.113.9", 4000)) as remote:
         response = await remote.rpc("tools/list", token=dev)
@@ -892,7 +894,7 @@ async def test_user_token_through_a_mapped_client_is_never_the_machine_principal
         aliased = tokens.mint(
             "synthetic-aliased@clients", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"}
         )
-        assert len(await client.tools(aliased)) == 5
+        assert len(await client.tools(aliased)) == 6
         wrong_alias = tokens.mint(
             "synthetic-aliased", scopes=[Scope.DEALS_READ], extra={"client_id": "synthetic-aliased"}
         )

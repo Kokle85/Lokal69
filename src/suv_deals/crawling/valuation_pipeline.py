@@ -17,9 +17,17 @@ network I/O.
    - comparables: `select_comparables` (tight first, labelled widening, explicit exclusions; no
      adequate set -> ``insufficient_comparables`` and ``research_needed``; nothing is fabricated);
    - tax: only an ACTIVE, approved rule set is ever selected (`select_rule_set`); without one, every
-     import category stays ``unknown`` (never invented, never zero) and the reason is recorded;
-     inputs the listing does not establish (classification, origin proof, customs value, ...) stay
-     missing, so a calculation is incomplete rather than guessed;
+     import category stays ``unknown`` (never invented, never zero) and the reason is recorded.
+     The engine inputs come from the SAME builder the import-cost calculator uses
+     (`import_estimate.build_tax_inputs` over `facts_from_listing`), so a valuation computes the
+     duty, motor-vehicle tax and import VAT the calculator shows once the owner activates a rule
+     set: the advertised payable amount as the transaction value (labelled assumption), the cost
+     profile's transport line in the customs value, no proof of origin (standard duty), a listing
+     CO2 figure as ``listing_claim_unverified``. Nothing else is inferred (no tariff code, no
+     origin, no VAT base); what the listing does not establish stays missing, so a calculation is
+     incomplete rather than guessed. Amounts computed from such claims are never rule-supported
+     (`tax_cost_lines(unverified_inputs=...)`); the builder's assumptions, warnings and the Euro
+     import gate are recorded as valuation warnings;
    - costs: `CostProfile.lines(target_scope=...)` scoped to the purchase country (a CH purchase gets
      its ``ch_purchase`` lines, others never do); the profile's import categories are replaced by the
      tax engine's lines; `compute_scenarios` with the asking price as an ESTIMATED purchase and the
@@ -45,7 +53,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
 from typing import Final
 from uuid import UUID
 
@@ -62,6 +69,7 @@ from suv_deals.domain.comparables import (
     select_comparables,
 )
 from suv_deals.domain.costs import (
+    CostLine,
     CostProfile,
     CostScope,
     ProceedsEstimate,
@@ -79,6 +87,13 @@ from suv_deals.domain.enums import (
     ValuationState,
 )
 from suv_deals.domain.filters import ScreeningResult
+from suv_deals.domain.import_estimate import (
+    USED_VEHICLE_MIN_KM,  # the builder's new/used mileage convention (re-exported)
+    BuiltTaxInputs,
+    build_tax_inputs,
+    facts_from_listing,
+    single_transport_line,
+)
 from suv_deals.domain.listings import NormalizedListing
 from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.profiles import BusinessConfig
@@ -93,7 +108,6 @@ from suv_deals.domain.tax_engine import (
     IMPORT_CATEGORIES,
     RuleSelection,
     TaxCalculation,
-    TaxInputs,
     select_rule_set,
 )
 from suv_deals.domain.tax_engine import calculate as calculate_tax
@@ -121,8 +135,6 @@ from suv_deals.workers.runtime import Disposition, JobExecution, JobOutcome, Run
 logger = logging.getLogger(__name__)
 
 PURCHASE_EVIDENCE_PREFIX: Final = "listing_revision:"
-#: Mileage at which a vehicle is unambiguously used for the tax engine's new/used input.
-USED_VEHICLE_MIN_KM: Final = Decimal(1000)
 _FIGURE_STATES: Final = frozenset({ValuationState.ESTIMATED, ValuationState.QUOTE_SUPPORTED})
 _COMPARABLE_METRIC: Final = {
     "adequate": "sufficient",
@@ -384,31 +396,35 @@ def _purchase(screening: ScreeningResult, revision_id: UUID) -> PurchaseInput:
 
 
 def _tax_inputs(
-    listing: NormalizedListing,
-    screening: ScreeningResult,
-    as_of: datetime,
+    ctx: RuntimeContext,
+    reads: ValuationReads,
+    *,
     customs: FxRate | None,
-    jurisdiction: str,
-) -> TaxInputs:
-    """Only facts the listing establishes; everything else stays missing (calculation incomplete)."""
-    vehicle = listing.vehicle
-    used = vehicle.mileage_km is not None and vehicle.mileage_km >= USED_VEHICLE_MIN_KM
-    return TaxInputs(
-        declaration_date=as_of.date(),
-        jurisdiction=jurisdiction,
-        vehicle_condition="used" if used else None,
-        seller_country=listing.location.country,
-        invoice_price=screening.payable_amount,
-        co2_g_km=listing.co2.g_per_km,
-        co2_cycle=listing.co2.cycle,
-        emissions_class=listing.documentation.emissions_class,
-        fuel=vehicle.fuel,
-        engine_displacement_cm3=None
-        if vehicle.engine_displacement_cm3 is None
-        else Decimal(vehicle.engine_displacement_cm3),
-        power_kw=None if vehicle.power_kw is None else Decimal(vehicle.power_kw),
-        customs_fx_rate=customs,
+    transport: CostLine,
+) -> BuiltTaxInputs:
+    """The shared import-cost builder over the facts the listing establishes (the advertised
+    price, its CO2 claim, no proof of origin); everything else stays missing."""
+    return build_tax_inputs(
+        facts_from_listing(reads.normalized, payable=reads.screening.payable_amount),
+        transport=transport,
+        customs_rate=customs,
+        as_of=reads.as_of,
+        jurisdiction=ctx.options.tax_jurisdiction,
+        vehicle_category=ctx.options.tax_vehicle_category,
     )
+
+
+def _input_warnings(built: BuiltTaxInputs, *, calculated: bool) -> tuple[str, ...]:
+    """Valuation warnings from the builder: the Euro import gate always, and the assumptions and
+    warnings behind a tax calculation when one was made."""
+    notes: list[str] = []
+    if built.gates.importable != "yes":
+        notes.append(f"IMPORT_GATE:{built.gates.importable}: {built.gates.reason}")
+    if calculated:
+        notes.extend(f"TAX_INPUT_ASSUMPTION:{a}" for a in built.assumptions)
+        notes.extend(f"TAX_INPUT_WARNING:{w}" for w in built.warnings)
+        notes.extend(f"TAX_INPUT_UNVERIFIED:{u}" for u in built.unverified_inputs)
+    return tuple(dict.fromkeys(n[:500] for n in notes))
 
 
 def _selection(ctx: RuntimeContext, reads: ValuationReads) -> tuple[RuleSelection, StoredRuleSet | None]:
@@ -482,19 +498,27 @@ async def _value_and_commit(
         target, reads.candidates, reads.config, reads.as_of, [r.rate for r in stored_rates]
     )
     selection, stored_rule = _selection(ctx, reads)
-    calc: TaxCalculation | None = None
-    if selection.rule_set is not None and not rejected:
-        customs = None if reads.customs_rate is None else reads.customs_rate.rate
-        calc = calculate_tax(
-            selection.rule_set,
-            _tax_inputs(reads.normalized, screening, reads.as_of, customs, ctx.options.tax_jurisdiction),
-            reads.as_of,
-        )
     country = reads.normalized.location.country or reads.source.country
     scope = CostScope(origin_country=country, listing_id=str(reads.listing.id))
     profile = stored_profile.profile
     lines = [line for line in profile.lines(target_scope=scope) if line.category not in IMPORT_CATEGORIES]
-    lines += list(tax_cost_lines(calc, missing_reason=None if calc is not None else selection.reason))
+    calc: TaxCalculation | None = None
+    input_warnings: tuple[str, ...] = ()
+    unverified: tuple[str, ...] = ()
+    if not rejected:
+        customs = None if reads.customs_rate is None else reads.customs_rate.rate
+        built = _tax_inputs(ctx, reads, customs=customs, transport=single_transport_line(lines))
+        if selection.rule_set is not None:
+            calc = calculate_tax(selection.rule_set, built.inputs, reads.as_of)
+            unverified = built.unverified_inputs
+        input_warnings = _input_warnings(built, calculated=calc is not None)
+    lines += list(
+        tax_cost_lines(
+            calc,
+            missing_reason=None if calc is not None else selection.reason,
+            unverified_inputs=unverified,
+        )
+    )
     purchase = _purchase(screening, revision.id)
     comparable_rates = [
         reads.reference_rates[c]
@@ -557,6 +581,7 @@ async def _value_and_commit(
                 as_of=reads.as_of,
                 fixture_inputs=reads.is_fixture,
                 tax_unavailable_reason=None if calc is not None else selection.reason,
+                input_warnings=input_warnings,
             )
             refs = valuation_repo.ValuationRefs(
                 listing_id=reads.listing.id,
@@ -635,4 +660,10 @@ async def _value_and_commit(
     return run
 
 
-__all__ = ["PURCHASE_EVIDENCE_PREFIX", "ValuationPayload", "ensure_cost_profile", "handle_valuation"]
+__all__ = [
+    "PURCHASE_EVIDENCE_PREFIX",
+    "USED_VEHICLE_MIN_KM",
+    "ValuationPayload",
+    "ensure_cost_profile",
+    "handle_valuation",
+]

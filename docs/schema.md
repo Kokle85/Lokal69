@@ -1374,3 +1374,24 @@ route calls yet, so the activation steps that depend on them are blocked on oper
 `app.destination_bindings` (create, approve, enable, verify a delivery route),
 `app.tax_rule_sets` (store and move a rule set through review, approval and activation) and the
 approval of `app.cost_profiles`.
+
+### 11.15 Customs calculator and owner tax-rule tooling (no migration)
+
+No schema change (ADR 0003). Two of the four tables of 11.14 now have callers:
+
+- `app.tax_rule_sets`: the owner-only dashboard routes `/api/settings/tax-rules/store` and
+  `/api/settings/tax-rules/transition` (`api.owner_config_routes`, `config:admin`) and the CLI
+  `suv-deals tax-rules store` (drafts only) call `valuation_repo.store_rule_set` /
+  `transition_tax_rule_set`. The transition takes optional `expected_status` /
+  `expected_sha256`, checked after the row lock, so an act is refused when the row changed after
+  the owner looked at it. The existing `app.tax_rule_sets_guard` trigger still enforces the
+  lifecycle and the frozen content.
+- `app.cost_profiles` approval: `/api/settings/cost-profiles/approve` calls
+  `valuation_repo.approve_cost_profile` (storing the configured version unapproved first when the
+  workspace does not hold it); `valuation_repo.list_cost_profiles` reads them.
+
+The import-cost calculator (`persistence/queries/import_costs.py`) only reads
+`app.tax_rule_sets`, `app.fx_rates`, a listing with its current revision and its source record
+(the transport line comes from the configured cost profile file); it writes no row
+(no valuation, cost line, rate, audit, outbox or job row; `tests/integration/import_costs`).
+`ops.activation_gates` and `app.destination_bindings` still have no operator tooling.

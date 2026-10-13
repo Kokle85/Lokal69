@@ -27,9 +27,15 @@ The tax engine is a rules-and-evidence system, never a guessed formula:
   ``customs_value`` never falls back to the invoice price. Money in a currency other
   than the rule currency is converted only with a customs-purpose rate for exactly
   that currency pair (direction honoured by ``FxRate.convert``).
+- Intermediate components (``intermediate: true``) are helpers such as a customs value
+  in the rule currency or a VAT base. They are evaluated and reported, feed later
+  components, and are never counted in a total, a known subtotal or a category amount.
+  An unknown helper still makes the calculation incomplete.
 - Selection for production uses ``ACTIVE`` rule sets only. ``allow_unapproved`` is
   for visibly labelled synthetic fixtures; results always carry the rule status so a
-  fixture result can never look production-ready.
+  fixture result can never look production-ready. ``select_preview_rule_set`` picks an
+  unapproved rule set for a clearly labelled indicative preview only; production
+  callers never use it.
 
 Lifecycle (spec 16, mirrored by the ``app.tax_rule_sets_guard`` trigger)::
 
@@ -58,10 +64,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.enums import Co2Cycle, CostCategory, Fuel, FxPurpose, TaxRuleStatus
 from suv_deals.domain.listings import sha256_json
-from suv_deals.domain.money import CurrencyCode, FxRate, Money
+from suv_deals.domain.money import CurrencyCode, FxRate, Money, exponent
 from suv_deals.errors import ValidationFailed
 
-ENGINE_VERSION: Final = "tax-engine/1.0.0"
+ENGINE_VERSION: Final = "tax-engine/1.1.0"
 
 #: Cost categories a tax component may produce (spec 18 "duty, motor-vehicle tax,
 #: import VAT and other applicable charges").
@@ -77,6 +83,14 @@ IMPORT_CATEGORIES: Final = frozenset(
 #: Fields excluded from the content hash. Lifecycle/approval metadata changes as a
 #: rule set moves through its lifecycle; the approved *content* must not.
 HASH_EXCLUDED_FIELDS: Final = frozenset({"sha256", "status", "approved_by", "approved_at", "review_record"})
+#: Language fields added in engine 1.1, with their defaults. They are left out of the
+#: content hash while they hold these defaults, so every older rule set hashes as before.
+_COMPONENT_EXTENSION_DEFAULTS: Final[Mapping[str, object]] = MappingProxyType(
+    {"intermediate": False, "key_terms": None, "key_currency": None, "integer_values_only": False}
+)
+_BRACKET_EXTENSION_DEFAULTS: Final[Mapping[str, object]] = MappingProxyType(
+    {"over": None, "up_to": None, "amount_per_unit": None}
+)
 
 #: Statuses that can only be reached through an approval.
 _APPROVAL_STATUSES: Final = frozenset(
@@ -86,6 +100,8 @@ _APPROVAL_STATUSES: Final = frozenset(
 _FIXTURE_STATUSES: Final = frozenset({TaxRuleStatus.DRAFT, TaxRuleStatus.UNAPPROVED, TaxRuleStatus.REVOKED})
 #: Never selectable, not even for fixtures.
 _CLOSED_STATUSES: Final = frozenset({TaxRuleStatus.SUPERSEDED, TaxRuleStatus.EXPIRED, TaxRuleStatus.REVOKED})
+#: Statuses an indicative preview may run on, best first (``select_preview_rule_set``).
+_PREVIEW_STATUS_ORDER: Final = (TaxRuleStatus.APPROVED, TaxRuleStatus.UNDER_REVIEW, TaxRuleStatus.DRAFT)
 
 _MAX_RULE_JSON_BYTES: Final = 1_000_000
 #: Sanity bound for money inputs (any currency). Larger values are input errors, and they
@@ -182,6 +198,11 @@ INPUT_REGISTRY: Final[Mapping[str, InputSpec]] = MappingProxyType(
         "included_costs_total": InputSpec(
             InputKind.MONEY, "money", "sum of costs included in customs value, each with a legal basis"
         ),
+        "vat_incidental_costs_total": InputSpec(
+            InputKind.MONEY,
+            "money",
+            "costs added to the import VAT base only (not in customs value), each with a legal basis",
+        ),
         "co2_g_km": InputSpec(InputKind.NUMBER, "g/km", "CO2 emissions in g/km for the stated cycle"),
         "co2_cycle": InputSpec(InputKind.TEXT, None, "nedc | nedc_correlated | wltp"),
         "co2_source_document": InputSpec(InputKind.TEXT, None, "CoC/manufacturer/accepted document for CO2"),
@@ -259,7 +280,9 @@ class OriginProof(_Contract):
 
 
 class IncludedCost(_Contract):
-    """A cost included in the customs value, with its legal basis and allocation."""
+    """A cost with its legal basis and allocation: included in the customs value
+    (``TaxInputs.included_costs``) or added to the import VAT base only
+    (``TaxInputs.vat_incidental_costs``)."""
 
     label: str = Field(min_length=1, max_length=200)
     amount: Money
@@ -308,6 +331,8 @@ class TaxInputs(_Contract):
     customs_value: Money | None = None
     customs_value_basis: str | None = Field(default=None, min_length=3, max_length=300)
     included_costs: tuple[IncludedCost, ...] | None = None  # None = unknown; () = none included
+    #: Costs in the import VAT base but not in the customs value. None = unknown; () = none.
+    vat_incidental_costs: tuple[IncludedCost, ...] | None = Field(default=None, max_length=20)
     co2_g_km: Decimal | None = Field(default=None, ge=0, le=2000)
     co2_cycle: Co2Cycle = Co2Cycle.UNKNOWN
     co2_source_document: str | None = Field(default=None, min_length=1, max_length=300)
@@ -415,33 +440,70 @@ class Predicate(_Contract):
 
 
 class Bracket(_Contract):
-    """``lower_inclusive <= value < upper_exclusive`` (open-ended when upper is null).
+    """One bracket row, in one of two bound forms (all rows of a table use the same form):
+
+    - ``lower_inclusive <= value < upper_exclusive`` (open-ended when upper is null);
+    - law style "over X up to Y": ``over < value <= up_to``. Only the first row may have
+      ``over`` null (no lower bound) and only the last ``up_to`` null (open-ended).
 
     Exactly one outcome: a fixed ``amount``, ``rate_of_base`` (fraction applied to the
-    component's explicit base terms) or ``amount_per_unit_above_lower``.
+    component's explicit base terms), ``amount_per_unit_above_lower`` (marginal: units
+    above the lower bound) or ``amount_per_unit`` (whole value times the amount).
     """
 
-    lower_inclusive: Decimal = Field(ge=0)
+    lower_inclusive: Decimal | None = Field(default=None, ge=0)
     upper_exclusive: Decimal | None = None
+    over: Decimal | None = Field(default=None, ge=0)
+    up_to: Decimal | None = Field(default=None, ge=0)
     amount: Decimal | None = Field(default=None, ge=0)
     rate_of_base: Decimal | None = Field(default=None, ge=0, le=1)
     amount_per_unit_above_lower: Decimal | None = Field(default=None, ge=0)
+    amount_per_unit: Decimal | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _shape(self) -> Bracket:
-        outcomes = [self.amount, self.rate_of_base, self.amount_per_unit_above_lower]
+        outcomes = [self.amount, self.rate_of_base, self.amount_per_unit_above_lower, self.amount_per_unit]
         if sum(o is not None for o in outcomes) != 1:
             raise ValueError(
                 "a bracket needs exactly one of amount | rate_of_base | amount_per_unit_above_lower"
+                " | amount_per_unit"
             )
-        if self.upper_exclusive is not None and self.upper_exclusive <= self.lower_inclusive:
-            raise ValueError("bracket upper_exclusive must exceed lower_inclusive")
+        if self.lower_inclusive is not None:
+            if self.over is not None or self.up_to is not None:
+                raise ValueError("a bracket uses either lower_inclusive/upper_exclusive or over/up_to")
+            if self.upper_exclusive is not None and self.upper_exclusive <= self.lower_inclusive:
+                raise ValueError("bracket upper_exclusive must exceed lower_inclusive")
+        elif self.upper_exclusive is not None:
+            raise ValueError("bracket upper_exclusive needs lower_inclusive")
+        elif self.over is not None and self.up_to is not None and self.up_to <= self.over:
+            raise ValueError("bracket up_to must exceed over")
         return self
 
+    @property
+    def law_form(self) -> bool:
+        """True for the ``over``/``up_to`` form."""
+        return self.lower_inclusive is None
+
+    def lower_bound(self) -> Decimal:
+        """Lower bound for ``amount_per_unit_above_lower`` (``over``; 0 when unbounded)."""
+        if self.lower_inclusive is not None:
+            return self.lower_inclusive
+        return self.over if self.over is not None else Decimal(0)
+
     def contains(self, value: Decimal) -> bool:
-        return value >= self.lower_inclusive and (
-            self.upper_exclusive is None or value < self.upper_exclusive
-        )
+        if self.lower_inclusive is not None:
+            return value >= self.lower_inclusive and (
+                self.upper_exclusive is None or value < self.upper_exclusive
+            )
+        return (self.over is None or value > self.over) and (self.up_to is None or value <= self.up_to)
+
+    def display(self) -> str:
+        if self.lower_inclusive is not None:
+            upper = "open" if self.upper_exclusive is None else _show(self.upper_exclusive)
+            return f"[{_show(self.lower_inclusive)}, {upper})"
+        lower = "open" if self.over is None else _show(self.over)
+        upper = "open)" if self.up_to is None else f"{_show(self.up_to)}]"
+        return f"({lower}, {upper}"
 
 
 class _ComponentBase(_Contract):
@@ -456,6 +518,10 @@ class _ComponentBase(_Contract):
     alternative_group: str | None = Field(default=None, pattern=_CODE_PATTERN)
     rounding: RoundingSpec | None = None
     legal_reference: str | None = Field(default=None, max_length=500)
+    #: A helper (e.g. a customs value in the rule currency or a VAT base). It is evaluated,
+    #: reported and may feed later components through ``base`` or ``key_terms``, but it is
+    #: never counted in a total, a known subtotal or a category amount.
+    intermediate: bool = False
 
     @field_validator("category")
     @classmethod
@@ -479,10 +545,20 @@ class FixedComponent(_ComponentBase):
 
 
 class BracketComponent(_ComponentBase):
-    """Bracket lookup on a numeric input. CO2 uses per-cycle ``tables``; others use ``brackets``."""
+    """Bracket lookup on a numeric ``input`` or on a money key.
+
+    CO2 uses per-cycle ``tables``; others use ``brackets``. With ``key_terms`` the bracket
+    is keyed on the sum of money inputs and earlier components (in the rule currency),
+    converted to ``key_currency`` with the customs rate when that differs.
+    ``integer_values_only`` makes a non-integer input value unknown instead of silently
+    falling into a band.
+    """
 
     kind: Literal["bracket"]
-    input: str = Field(min_length=1, max_length=120)
+    input: str | None = Field(default=None, min_length=1, max_length=120)
+    key_terms: tuple[str, ...] | None = Field(default=None, min_length=1, max_length=20)
+    key_currency: CurrencyCode | None = None  # None = the rule currency
+    integer_values_only: bool = False
     tables: dict[Co2Cycle, tuple[Bracket, ...]] | None = None
     brackets: tuple[Bracket, ...] | None = None
     base: tuple[str, ...] = Field(default=(), max_length=20)
@@ -490,6 +566,8 @@ class BracketComponent(_ComponentBase):
 
     @model_validator(mode="after")
     def _one_table_form(self) -> BracketComponent:
+        if (self.input is None) == (self.key_terms is None):
+            raise ValueError("a bracket component needs exactly one of input | key_terms")
         if (self.tables is None) == (self.brackets is None):
             raise ValueError("a bracket component needs exactly one of tables | brackets")
         if self.tables is not None and Co2Cycle.UNKNOWN in self.tables:
@@ -578,11 +656,37 @@ class RuleSet(_Contract):
         return f"{self.rule_set_id}@{self.version}"
 
 
+def _without_defaults(item: Mapping[str, Any], defaults: Mapping[str, object]) -> dict[str, Any]:
+    # Identity comparison: the defaults are None/False, and 0 must never pass for False.
+    return {key: value for key, value in item.items() if not (key in defaults and value is defaults[key])}
+
+
+def _hash_payload(rule_set: RuleSet) -> dict[str, Any]:
+    payload = rule_set.model_dump(mode="json", exclude=set(HASH_EXCLUDED_FIELDS))
+    components: list[dict[str, Any]] = []
+    for raw in payload["components"]:
+        comp = _without_defaults(raw, _COMPONENT_EXTENSION_DEFAULTS)
+        if comp.get("brackets") is not None:
+            comp["brackets"] = [
+                _without_defaults(row, _BRACKET_EXTENSION_DEFAULTS) for row in comp["brackets"]
+            ]
+        if comp.get("tables") is not None:
+            comp["tables"] = {
+                cycle: [_without_defaults(row, _BRACKET_EXTENSION_DEFAULTS) for row in rows]
+                for cycle, rows in comp["tables"].items()
+            }
+        components.append(comp)
+    return {**payload, "components": components}
+
+
 def compute_rule_set_sha256(rule_set: RuleSet) -> str:
     """Canonical content hash: sha256 of the canonical JSON of every field except
-    ``HASH_EXCLUDED_FIELDS`` (the hash itself and lifecycle/approval metadata)."""
-    payload = rule_set.model_dump(mode="json", exclude=set(HASH_EXCLUDED_FIELDS))
-    return sha256_json(payload)
+    ``HASH_EXCLUDED_FIELDS`` (the hash itself and lifecycle/approval metadata).
+
+    The engine 1.1 language fields are left out while they hold their defaults, so a rule
+    set that does not use them hashes exactly as it did before they existed.
+    """
+    return sha256_json(_hash_payload(rule_set))
 
 
 def seal_rule_set(rule_set: RuleSet) -> RuleSet:
@@ -599,20 +703,22 @@ def _term_problems(
     earlier: Sequence[str],
     depends_on: Sequence[str],
     declared: frozenset[str],
+    *,
+    what: str = "base term",
 ) -> list[str]:
     problems: list[str] = []
     for term in terms:
         if term in earlier:
             if term not in depends_on:
-                problems.append(f"{owner}: base term {term!r} must also be listed in depends_on")
+                problems.append(f"{owner}: {what} {term!r} must also be listed in depends_on")
             continue
         spec = input_spec(term)
         if spec is None:
-            problems.append(f"{owner}: base term {term!r} is neither an earlier component nor a known input")
+            problems.append(f"{owner}: {what} {term!r} is neither an earlier component nor a known input")
         elif term not in declared:
-            problems.append(f"{owner}: base term {term!r} is not a declared input of this rule set")
+            problems.append(f"{owner}: {what} {term!r} is not a declared input of this rule set")
         elif spec.kind != InputKind.MONEY:
-            problems.append(f"{owner}: base term {term!r} is not a money input")
+            problems.append(f"{owner}: {what} {term!r} is not a money input")
     return problems
 
 
@@ -668,35 +774,95 @@ def _predicate_problems(
     return problems
 
 
-def _bracket_problems(owner: str, comp: BracketComponent, declared: frozenset[str]) -> list[str]:
+def _key_problems(
+    owner: str, comp: BracketComponent, declared: frozenset[str], rule_currency: str | None
+) -> list[str]:
+    """Rules for a bracket keyed on money (``key_terms``)."""
+    if comp.key_terms is None:
+        return [f"{owner}: key_currency is only valid with key_terms"] if comp.key_currency else []
+    problems: list[str] = []
+    if comp.tables is not None:
+        problems.append(f"{owner}: a bracket keyed on money (key_terms) cannot use per-cycle tables")
+    if comp.integer_values_only:
+        problems.append(f"{owner}: integer_values_only is only valid for a bracket on a numeric input")
+    if comp.key_currency is not None:
+        try:
+            exponent(comp.key_currency)
+        except ValidationFailed:
+            problems.append(f"{owner}: key_currency {comp.key_currency} is not a supported currency")
+        if comp.key_currency != rule_currency and "customs_fx_rate" not in declared:
+            problems.append(
+                f"{owner}: key_currency {comp.key_currency} differs from the rule currency, so "
+                "customs_fx_rate must be declared as an input"
+            )
+    return problems
+
+
+def _row_order_problems(where: str, rows: Sequence[Bracket], index: int, contiguous: bool) -> list[str]:
+    """Bounds, order, overlap and contiguity of one row against the previous row."""
+    row = rows[index]
+    last = len(rows) - 1
+    problems: list[str] = []
+    if not row.law_form:
+        if row.upper_exclusive is None and index != last:
+            problems.append(f"{where}: only the last bracket may be open-ended")
+        if index == 0:
+            return problems
+        prev = rows[index - 1]
+        assert row.lower_inclusive is not None and prev.lower_inclusive is not None
+        if row.lower_inclusive <= prev.lower_inclusive:
+            problems.append(f"{where}: brackets must be sorted by lower_inclusive")
+        elif prev.upper_exclusive is not None and row.lower_inclusive < prev.upper_exclusive:
+            problems.append(f"{where}: brackets {index - 1} and {index} overlap")
+        elif contiguous and prev.upper_exclusive != row.lower_inclusive:
+            problems.append(f"{where}: brackets {index - 1} and {index} are not contiguous")
+        return problems
+    if row.over is None and index != 0:
+        problems.append(f"{where}: only the first bracket may have no lower bound (over: null)")
+    if row.up_to is None and index != last:
+        problems.append(f"{where}: only the last bracket may be open-ended (up_to: null)")
+    if index == 0:
+        return problems
+    prev = rows[index - 1]
+    if row.over is None or prev.up_to is None:
+        return problems  # reported above
+    if prev.over is not None and row.over <= prev.over:
+        problems.append(f"{where}: brackets must be sorted by over")
+    elif row.over < prev.up_to:
+        problems.append(f"{where}: brackets {index - 1} and {index} overlap")
+    elif contiguous and row.over != prev.up_to:
+        problems.append(f"{where}: brackets {index - 1} and {index} are not contiguous")
+    return problems
+
+
+def _bracket_problems(
+    owner: str, comp: BracketComponent, declared: frozenset[str], rule_currency: str | None
+) -> list[str]:
     problems: list[str] = []
     is_co2 = comp.input == "co2_g_km"
+    keyed = comp.key_terms is not None
     if is_co2 and comp.tables is None:
         problems.append(f"{owner}: co2_g_km brackets must be keyed by CO2 cycle (tables)")
     if comp.tables is not None and "co2_cycle" not in declared:
         # The table is selected by the measurement cycle, so the cycle is an input of the rule.
         problems.append(f"{owner}: per-cycle CO2 tables need co2_cycle declared as an input")
-    if not is_co2 and comp.tables is not None:
+    if not is_co2 and not keyed and comp.tables is not None:
         problems.append(f"{owner}: per-cycle tables are only valid for co2_g_km")
+    problems.extend(_key_problems(owner, comp, declared, rule_currency))
     for table_key, rows in comp.all_tables().items():
         where = f"{owner}[{table_key}]"
         if not rows:
             problems.append(f"{where}: bracket table is empty")
             continue
+        if len({row.law_form for row in rows}) > 1:
+            problems.append(f"{where}: rows mix lower_inclusive/upper_exclusive and over/up_to bounds")
+            continue
         for index, row in enumerate(rows):
-            if row.upper_exclusive is None and index != len(rows) - 1:
-                problems.append(f"{where}: only the last bracket may be open-ended")
             if row.rate_of_base is not None and not comp.base:
                 problems.append(f"{where}: rate_of_base needs component base terms")
-            if index == 0:
-                continue
-            prev = rows[index - 1]
-            if row.lower_inclusive <= prev.lower_inclusive:
-                problems.append(f"{where}: brackets must be sorted by lower_inclusive")
-            elif prev.upper_exclusive is not None and row.lower_inclusive < prev.upper_exclusive:
-                problems.append(f"{where}: brackets {index - 1} and {index} overlap")
-            elif comp.contiguous and prev.upper_exclusive != row.lower_inclusive:
-                problems.append(f"{where}: brackets {index - 1} and {index} are not contiguous")
+            if keyed and (row.amount_per_unit is not None or row.amount_per_unit_above_lower is not None):
+                problems.append(f"{where}: a bracket keyed on money allows only amount or rate_of_base")
+            problems.extend(_row_order_problems(where, rows, index, comp.contiguous))
     return problems
 
 
@@ -744,9 +910,14 @@ def rule_set_problems(rule_set: RuleSet) -> list[str]:
         if isinstance(comp, PercentageComponent):
             problems.extend(_term_problems(owner, comp.base, seen, comp.depends_on, declared))
         elif isinstance(comp, BracketComponent):
-            problems.extend(_numeric_input_problems(owner, comp.input, declared, units))
+            if comp.input is not None:
+                problems.extend(_numeric_input_problems(owner, comp.input, declared, units))
+            if comp.key_terms is not None:
+                problems.extend(
+                    _term_problems(owner, comp.key_terms, seen, comp.depends_on, declared, what="key term")
+                )
             problems.extend(_term_problems(owner, comp.base, seen, comp.depends_on, declared))
-            problems.extend(_bracket_problems(owner, comp, declared))
+            problems.extend(_bracket_problems(owner, comp, declared, rule_set.currency))
         elif isinstance(comp, PerUnitComponent):
             problems.extend(_numeric_input_problems(owner, comp.input, declared, units))
         seen.append(comp.id)
@@ -758,6 +929,7 @@ def rule_set_problems(rule_set: RuleSet) -> list[str]:
     for group, count in groups.items():
         if count < 2:
             problems.append(f"alternative_group {group!r} needs at least two components")
+    problems.extend(_intermediate_problems(rule_set))
 
     computed = compute_rule_set_sha256(rule_set)
     if rule_set.sha256 is not None and rule_set.sha256 != computed:
@@ -768,6 +940,44 @@ def rule_set_problems(rule_set: RuleSet) -> list[str]:
 
     if rule_set.status in _APPROVAL_STATUSES:
         problems.extend(_approval_problems(rule_set, computed))
+    return problems
+
+
+def _referenced_terms(comp: Component) -> tuple[str, ...]:
+    """The ``base`` and ``key_terms`` a component sums (the only ways a helper is used)."""
+    if isinstance(comp, PercentageComponent):
+        return comp.base
+    if isinstance(comp, BracketComponent):
+        return (*comp.base, *(comp.key_terms or ()))
+    return ()
+
+
+def _intermediate_problems(rule_set: RuleSet) -> list[str]:
+    """A helper must feed a later component, and an alternative group is all helpers or none.
+
+    A group member nobody references is accepted when another member of its group is
+    referenced: such members exist only to give the group full coverage.
+    """
+    components = rule_set.components
+    position = {comp.id: index for index, comp in enumerate(components)}
+    referenced: set[str] = set()
+    for index, comp in enumerate(components):
+        referenced.update(t for t in _referenced_terms(comp) if position.get(t, index) < index)
+    members: dict[str, list[Component]] = {}
+    for comp in components:
+        if comp.alternative_group:
+            members.setdefault(comp.alternative_group, []).append(comp)
+    used_groups = {group for group, comps in members.items() if any(c.id in referenced for c in comps)}
+    problems: list[str] = []
+    for comp in components:
+        if comp.intermediate and comp.id not in referenced and comp.alternative_group not in used_groups:
+            problems.append(
+                f"component {comp.id!r}: an intermediate component must be a base or key term of a "
+                "later component"
+            )
+    for group, comps in members.items():
+        if len({c.intermediate for c in comps}) > 1:
+            problems.append(f"alternative_group {group!r} mixes intermediate and normal components")
     return problems
 
 
@@ -792,6 +1002,8 @@ def _approval_problems(rule_set: RuleSet, computed: str) -> list[str]:
         problems.append(f"status {status} requires vehicle_categories")
     if not rule_set.components:
         problems.append(f"status {status} requires at least one component")
+    elif all(comp.intermediate for comp in rule_set.components):
+        problems.append(f"status {status} requires at least one non-intermediate component")
     default_rounding = rule_set.rounding_rules.component_default if rule_set.rounding_rules else None
     for comp in rule_set.components:
         if comp.rounding is None and default_rounding is None:
@@ -970,12 +1182,35 @@ def transition_rule_set(
 
 
 class RuleSelection(_Contract):
-    """Outcome of ``select_rule_set``. ``rule_set`` None means import costs stay unknown."""
+    """Outcome of ``select_rule_set`` / ``select_preview_rule_set``. ``rule_set`` None means
+    import costs stay unknown.
+
+    ``mode``: ``active`` (production: ACTIVE, approved, non-fixture only),
+    ``unapproved_allowed`` (labelled synthetic fixtures) or ``indicative_preview`` (an
+    unapproved rule set for a labelled preview; never used for valuations, cost lines or
+    alerts).
+    """
 
     rule_set: RuleSet | None
     reason: str
     allow_unapproved: bool
     considered: tuple[str, ...] = ()
+    mode: Literal["active", "unapproved_allowed", "indicative_preview"] = "active"
+
+    @model_validator(mode="after")
+    def _consistent_mode(self) -> RuleSelection:
+        if (self.mode == "active") == self.allow_unapproved:
+            raise ValueError("mode 'active' is exactly the production selection (allow_unapproved=False)")
+        chosen = self.rule_set
+        if (
+            self.mode == "indicative_preview"
+            and chosen is not None
+            and (chosen.status not in _PREVIEW_STATUS_ORDER or chosen.is_fixture)
+        ):
+            raise ValueError(
+                "an indicative preview runs only on a non-fixture approved/under_review/draft set"
+            )
+        return self
 
 
 def select_rule_set(
@@ -1018,6 +1253,7 @@ def select_rule_set(
             "ambiguous tax rule selection: overlapping applicable versions",
             details={"candidates": [rs.label() for rs in candidates]},
         )
+    mode: Literal["active", "unapproved_allowed"] = "unapproved_allowed" if allow_unapproved else "active"
     if not candidates:
         return RuleSelection(
             rule_set=None,
@@ -1025,13 +1261,114 @@ def select_rule_set(
             f"{jurisdiction}/{category} on {on_date.isoformat()}; import costs unknown",
             allow_unapproved=allow_unapproved,
             considered=tuple(considered),
+            mode=mode,
         )
     chosen = candidates[0]
     reason = f"selected {chosen.label()} ({chosen.status.value})"
     if chosen.status != TaxRuleStatus.ACTIVE or chosen.is_fixture:
         reason += "; NOT production-ready (unapproved/fixture selection)"
     return RuleSelection(
-        rule_set=chosen, reason=reason, allow_unapproved=allow_unapproved, considered=tuple(considered)
+        rule_set=chosen,
+        reason=reason,
+        allow_unapproved=allow_unapproved,
+        considered=tuple(considered),
+        mode=mode,
+    )
+
+
+def select_preview_rule_set(
+    rule_sets: Iterable[RuleSet],
+    jurisdiction: str,
+    category: str,
+    on_date: date,
+    *,
+    created_at: Mapping[str, datetime] | None = None,
+) -> RuleSelection:
+    """Pick the rule set for an INDICATIVE PREVIEW when no ACTIVE rule set applies.
+
+    Never for production: the valuation pipeline uses ``select_rule_set`` only, and a
+    preview result must never reach valuations, cost lines or alerts.
+
+    - Candidates: status ``approved`` (not yet active), ``under_review`` or ``draft``;
+      not a fixture; at least one component; valid (``rule_set_problems`` empty); and
+      ``valid_from <= on_date < valid_to`` (a null ``valid_from`` is accepted).
+    - Never considered: unapproved examples, fixtures, superseded, expired and revoked
+      sets. A version that is closed in any copy (e.g. revoked in the database while
+      the draft file still ships) is excluded entirely.
+    - Copies of one version (``rule_set_id@version``, e.g. a draft file and its database
+      row) must have identical content; different content raises ``ValidationFailed``.
+      Identical copies count once, at their most advanced status.
+    - Order: approved, then under_review, then draft; within a status the latest
+      ``valid_from`` wins, then the newest ``created_at`` (keyed by ``label()``; known
+      for database rows only). A tie that cannot be broken raises ``ValidationFailed``,
+      exactly as ``select_rule_set`` does for overlapping ACTIVE versions.
+    """
+    stamps = created_at or {}
+    considered: list[str] = []
+    copies: dict[str, list[RuleSet]] = {}
+    for rs in rule_sets:
+        if rs.jurisdiction == jurisdiction and category in rs.vehicle_categories:
+            copies.setdefault(rs.label(), []).append(rs)
+    candidates: list[RuleSet] = []
+    for tag, versions in copies.items():
+        if len({compute_rule_set_sha256(rs) for rs in versions}) > 1:
+            raise ValidationFailed(
+                "the same tax rule set version exists with different content",
+                details={"rule_set": tag},
+            )
+        closed = sorted({rs.status.value for rs in versions if rs.status in _CLOSED_STATUSES})
+        if closed:
+            considered.append(f"{tag}: {', '.join(closed)}; never previewed")
+            continue
+        open_copies = [rs for rs in versions if rs.status in _PREVIEW_STATUS_ORDER]
+        if not open_copies:
+            considered.append(f"{tag}: {versions[0].status.value} is never previewed")
+            continue
+        rs = min(open_copies, key=lambda r: _PREVIEW_STATUS_ORDER.index(r.status))
+        if rs.is_fixture:
+            considered.append(f"{tag}: fixture rule sets are never previewed")
+        elif not rs.components:
+            considered.append(f"{tag}: no components")
+        elif problems := rule_set_problems(rs):
+            considered.append(f"{tag}: invalid ({problems[0]})")
+        elif not rs.is_effective_on(on_date, open_start=True):
+            considered.append(f"{tag}: not effective on {on_date.isoformat()}")
+        else:
+            candidates.append(rs)
+    if not candidates:
+        return RuleSelection(
+            rule_set=None,
+            reason=f"no approved, under-review or draft rule set for {jurisdiction}/{category} on "
+            f"{on_date.isoformat()}; no indicative preview, import costs unknown",
+            allow_unapproved=True,
+            considered=tuple(considered),
+            mode="indicative_preview",
+        )
+
+    def rank(rs: RuleSet) -> tuple[int, int]:
+        # Lower is better: status order first, then the latest valid_from (null = earliest).
+        return (_PREVIEW_STATUS_ORDER.index(rs.status), -(rs.valid_from or date.min).toordinal())
+
+    candidates.sort(key=rank)
+    best = [rs for rs in candidates if rank(rs) == rank(candidates[0])]
+    if len(best) > 1:
+        stamped = [(stamps.get(rs.label()), rs) for rs in best]
+        newest = max((s for s, _ in stamped if s is not None), default=None)
+        winners = [rs for s, rs in stamped if s is not None and s == newest]
+        if any(s is None for s, _ in stamped) or len(winners) != 1:
+            raise ValidationFailed(
+                "ambiguous indicative preview: several rule sets share status and valid_from",
+                details={"candidates": [rs.label() for rs in best]},
+            )
+        best = winners
+    chosen = best[0]
+    return RuleSelection(
+        rule_set=chosen,
+        reason=f"INDICATIVE PREVIEW: selected {chosen.label()} ({chosen.status.value}); unapproved "
+        "rules, NOT production-ready, never used for valuations or alerts",
+        allow_unapproved=True,
+        considered=tuple(considered),
+        mode="indicative_preview",
     )
 
 
@@ -1058,6 +1395,7 @@ class ComponentResult(_Contract):
     inputs_used: dict[str, str]
     missing_inputs: tuple[str, ...]
     warnings: tuple[str, ...]
+    intermediate: bool = False  # a helper: reported, never counted in a total
 
     @model_validator(mode="after")
     def _unknown_has_no_amount(self) -> ComponentResult:
@@ -1075,7 +1413,8 @@ class CategoryTotal(_Contract):
 
 class TaxCalculation(_Contract):
     """Calculation result. ``total_import_cost`` exists only when complete; otherwise only
-    ``known_subtotal`` (sum of resolved components) plus the unknown component list."""
+    ``known_subtotal`` (sum of resolved components) plus the unknown component list.
+    Intermediate components are reported but never summed into either."""
 
     engine_version: str = ENGINE_VERSION
     rule_set_id: str
@@ -1131,7 +1470,12 @@ class TaxCalculation(_Contract):
 
     def category_totals(self) -> dict[CostCategory, CategoryTotal]:
         """Per-category status/amount. A category is unknown if any of its components is
-        unknown *or* a required input is missing (the rule says it cannot be trusted)."""
+        unknown *or* a required input is missing (the rule says it cannot be trusted).
+
+        Intermediate components count for the status (an unknown helper makes its category
+        unknown, never not-applicable) but never for the amount. ``component_ids`` lists
+        every member, helpers included.
+        """
         result: dict[CostCategory, CategoryTotal] = {}
         for category in sorted({c.category for c in self.components}):
             members = [c for c in self.components if c.category == category]
@@ -1141,7 +1485,7 @@ class TaxCalculation(_Contract):
                     category=category, status=ComponentStatus.UNKNOWN, amount=None, component_ids=ids
                 )
                 continue
-            resolved = [c.amount for c in members if c.amount is not None]
+            resolved = [c.amount for c in members if c.amount is not None and not c.intermediate]
             if not resolved:
                 result[category] = CategoryTotal(
                     category=category, status=ComponentStatus.NOT_APPLICABLE, amount=None, component_ids=ids
@@ -1335,28 +1679,41 @@ class _Resolver:
                 return _MoneyResolved(None, "basis unknown", ["CUSTOMS_VALUE_BASIS_MISSING"])
             return self._convert(i.customs_value, name)
         if name == "included_costs_total":
-            if i.included_costs is None:
-                return _MoneyResolved(None, "unknown")
-            total = Decimal(0)
-            parts: list[str] = []
-            warnings: list[str] = []
-            for cost in i.included_costs:
-                converted = self._convert(cost.amount, f"included_cost:{cost.label}")
-                warnings.extend(converted.warnings)
-                if converted.amount is None:
-                    return _MoneyResolved(None, "unknown", warnings)
-                total = _CTX.add(total, converted.amount)
-                parts.append(converted.display)
-            return _MoneyResolved(
-                total, f"{_show(total)} {self.currency} (" + "; ".join(parts) + ")", warnings
-            )
+            return self._costs_total(i.included_costs, "included_cost")
+        if name == "vat_incidental_costs_total":
+            return self._costs_total(i.vat_incidental_costs, "vat_incidental_cost")
         return _MoneyResolved(None, "unknown", [f"INPUT_NOT_MONEY:{name}"])
 
+    def _costs_total(self, costs: tuple[IncludedCost, ...] | None, prefix: str) -> _MoneyResolved:
+        """Sum of costs in the rule currency. None is unknown; () is a known zero."""
+        if costs is None:
+            return _MoneyResolved(None, "unknown")
+        total = Decimal(0)
+        parts: list[str] = []
+        warnings: list[str] = []
+        for cost in costs:
+            converted = self._convert(cost.amount, f"{prefix}:{cost.label}")
+            warnings.extend(converted.warnings)
+            if converted.amount is None:
+                return _MoneyResolved(None, "unknown", warnings)
+            total = _CTX.add(total, converted.amount)
+            parts.append(converted.display)
+        return _MoneyResolved(total, f"{_show(total)} {self.currency} (" + "; ".join(parts) + ")", warnings)
+
     def _convert(self, money: Money | None, name: str) -> _MoneyResolved:
+        """Money input -> rule currency (customs rate only)."""
         if money is None:
             return _MoneyResolved(None, "unknown")
-        if money.currency == self.currency:
-            return _MoneyResolved(money.amount, f"{_show(money.amount)} {money.currency}")
+        return self.convert_amount(money.amount, money.currency, self.currency, name)
+
+    def convert_amount(self, amount: Decimal, source: str, target: str, name: str) -> _MoneyResolved:
+        """``amount`` in ``source`` -> ``target`` with the customs rate.
+
+        The rate must be customs-purpose, for exactly the {source, target} pair, dated no
+        later than the declaration date and inside the recorded effective period.
+        """
+        if source == target:
+            return _MoneyResolved(amount, f"{_show(amount)} {source}")
         rate = self.inputs.customs_fx_rate
         if rate is None:
             return _MoneyResolved(None, "no customs rate", [f"CUSTOMS_FX_RATE_MISSING:{name}"])
@@ -1369,7 +1726,7 @@ class _Resolver:
                     "reference/payment rates are not customs rates"
                 ],
             )
-        if {rate.base, rate.quote} != {money.currency, self.currency}:
+        if {rate.base, rate.quote} != {source, target}:
             return _MoneyResolved(
                 None, "rate pair mismatch", [f"CUSTOMS_FX_RATE_PAIR_MISMATCH:{rate.base}/{rate.quote}"]
             )
@@ -1393,18 +1750,37 @@ class _Resolver:
                 return _MoneyResolved(None, "rate not effective", ["CUSTOMS_FX_RATE_NOT_EFFECTIVE"])
         else:
             warnings.append("CUSTOMS_FX_EFFECTIVE_PERIOD_NOT_RECORDED")
-        converted = rate.convert(money, self.currency)
+        converted = rate.convert(Money(amount=amount, currency=source), target)
         self.customs_rate_used = rate
         display = (
-            f"{_show(money.amount)} {money.currency} -> {_show(converted.amount)} {self.currency} "
+            f"{_show(amount)} {source} -> {_show(converted.amount)} {target} "
             f"(customs {rate.base}/{rate.quote}={rate.rate} {rate.rate_date.isoformat()} {rate.provider})"
         )
         return _MoneyResolved(converted.amount, display, warnings)
 
 
+def convert_with_customs_rate(
+    money: Money, target: str, inputs: TaxInputs
+) -> tuple[Money | None, tuple[str, ...]]:
+    """``money`` in ``target`` with the customs rate of ``inputs``, under exactly the checks the
+    engine applies to money inputs: customs purpose, the exact currency pair, a rate dated no
+    later than the declaration date and inside the recorded effective period.
+
+    Returns the unrounded amount (or ``None`` when the rate cannot be used) and the warning
+    codes. Never falls back to a reference or payment rate.
+    """
+    resolved = _Resolver(inputs, target).convert_amount(
+        money.amount, money.currency, target, f"{money.currency}->{target}"
+    )
+    amount = None if resolved.amount is None else Money(amount=resolved.amount, currency=target)
+    return amount, tuple(resolved.warnings)
+
+
 def _show(value: Scalar) -> str:
     if isinstance(value, date):
         return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")  # plain notation: an exact quotient never shows as 1.00E+4
     return str(value)
 
 
@@ -1493,12 +1869,41 @@ def _sum_terms(
     return total if known else None
 
 
+def _bracket_key(
+    comp: BracketComponent,
+    resolver: _Resolver,
+    dependents: Mapping[str, Decimal | object | None],
+    ev: _Eval,
+) -> Decimal | None:
+    """Sum of ``key_terms`` in the rule currency, converted to ``key_currency`` (customs rate)."""
+    assert comp.key_terms is not None
+    total = _sum_terms(comp.key_terms, resolver, dependents, ev)
+    if total is None:
+        ev.inputs_used["key"] = "unknown"
+        return None
+    target = comp.key_currency or resolver.currency
+    key = resolver.convert_amount(total, resolver.currency, target, f"{comp.id}:key")
+    ev.inputs_used["key"] = key.display
+    ev.warnings.extend(key.warnings)
+    if key.amount is None:
+        ev.missing.append("customs_fx_rate")
+    return key.amount
+
+
 def _evaluate_bracket(
     comp: BracketComponent,
     resolver: _Resolver,
     dependents: Mapping[str, Decimal | object | None],
     ev: _Eval,
 ) -> Decimal | None:
+    if comp.key_terms is not None:
+        key = _bracket_key(comp, resolver, dependents, ev)
+        if key is None:
+            return None
+        return _bracket_outcome(
+            comp, comp.brackets or (), key, subject="key", resolver=resolver, dependents=dependents, ev=ev
+        )
+    assert comp.input is not None
     resolved = resolver.scalar(comp.input)
     ev.inputs_used[comp.input] = resolved.display
     ev.warnings.extend(resolved.warnings)
@@ -1523,16 +1928,37 @@ def _evaluate_bracket(
             return None
     else:
         rows = comp.brackets or ()
+    if comp.integer_values_only and value != value.to_integral_value():
+        # The rule has bands for whole values only; which band a fraction belongs to is not
+        # established, so the amount stays unknown (never silently the lower band).
+        ev.warnings.append(f"VALUE_NOT_INTEGER_NO_BAND_RULE:{comp.input}={_show(value)}")
+        return None
+    return _bracket_outcome(
+        comp, rows, value, subject=comp.input, resolver=resolver, dependents=dependents, ev=ev
+    )
+
+
+def _bracket_outcome(
+    comp: BracketComponent,
+    rows: Sequence[Bracket],
+    value: Decimal,
+    *,
+    subject: str,
+    resolver: _Resolver,
+    dependents: Mapping[str, Decimal | object | None],
+    ev: _Eval,
+) -> Decimal | None:
     match = next((row for row in rows if row.contains(value)), None)
     if match is None:
-        ev.warnings.append(f"VALUE_OUTSIDE_BRACKETS:{comp.input}={_show(value)}")
+        ev.warnings.append(f"VALUE_OUTSIDE_BRACKETS:{subject}={_show(value)}")
         return None
-    upper = "open" if match.upper_exclusive is None else _show(match.upper_exclusive)
-    ev.inputs_used["bracket"] = f"[{_show(match.lower_inclusive)}, {upper})"
+    ev.inputs_used["bracket"] = match.display()
     if match.amount is not None:
         return match.amount
+    if match.amount_per_unit is not None:
+        return _CTX.multiply(value, match.amount_per_unit)
     if match.amount_per_unit_above_lower is not None:
-        excess = _CTX.subtract(value, match.lower_inclusive)
+        excess = _CTX.subtract(value, match.lower_bound())
         return _CTX.multiply(excess, match.amount_per_unit_above_lower)
     assert match.rate_of_base is not None
     base = _sum_terms(comp.base, resolver, dependents, ev)
@@ -1598,7 +2024,7 @@ def calculate(rule_set: RuleSet, inputs: TaxInputs, as_of: datetime) -> TaxCalcu
     warning). Components are evaluated in order; unknown inputs propagate to
     dependants; a not-applicable dependency contributes nothing. The result is complete
     only when every component is resolved or not applicable and every required input is
-    present.
+    present. Intermediate components are reported but never summed.
     """
     validate_rule_set(rule_set)
     as_of = ensure_utc(as_of)
@@ -1687,11 +2113,13 @@ def calculate(rule_set: RuleSet, inputs: TaxInputs, as_of: datetime) -> TaxCalcu
                 inputs_used=dict(ev.inputs_used),
                 missing_inputs=tuple(dict.fromkeys(ev.missing)),
                 warnings=tuple(dict.fromkeys(ev.warnings)),
+                intermediate=comp.intermediate,
             )
         )
 
+    # An unknown helper keeps the calculation incomplete; a resolved one is never summed.
     unknown = tuple(r.component_id for r in results if r.status == ComponentStatus.UNKNOWN)
-    resolved_amounts = [r.amount.amount for r in results if r.amount is not None]
+    resolved_amounts = [r.amount.amount for r in results if r.amount is not None and not r.intermediate]
     complete = not unknown and not missing_required
     total: Money | None = None
     subtotal: Money | None = None

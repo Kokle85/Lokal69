@@ -1,6 +1,7 @@
-"""MCP tool surface: ``tools/list`` and ``tools/call`` for the twelve spec 21 tools and the three
+"""MCP tool surface: ``tools/list`` and ``tools/call`` for the twelve spec 21 tools, the three
 spec 37.8 inquiry tools (``seller_inquiries_get``, ``seller_replies_get`` under ``inquiries:read``;
-``seller_inquiries_pause`` under ``inquiries:pause``).
+``seller_inquiries_pause`` under ``inquiries:pause``) and the read-only import-cost calculator
+(``deals_estimate_import_costs`` under ``deals:read``).
 
 ``tools/list`` returns only the tools whose scope the caller holds, in the deterministic spec 21
 order, each with its exact resolved ``inputSchema`` (``additionalProperties: false`` everywhere),
@@ -26,6 +27,9 @@ Results are ``cacheScope: private`` with ``ttlMs: 0`` because the list depends o
    bounded job for a registered listing only (``listings_repo.request_recheck``, shared with the
    dashboard API); no tool accepts a URL. ``reviews_submit`` refuses the spec 19 dashboard-action
    reason codes with any outcome but ``needs_information`` (``reviews_repo.submit``).
+   ``deals_estimate_import_costs`` runs the shared calculator read
+   (``queries.get_import_cost_estimate``) and persists nothing: no valuation, cost line, alert,
+   rate or audit row.
 6. Success: ``CallToolResult(structuredContent=<envelope JSON>, content=[TextContent(
    envelope.to_text())])``. Any ``AppError``: ``isError: true`` with the typed ``ToolError``
    payload (same codes as the dashboard API) as structured content and text, with the request's
@@ -47,13 +51,13 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Final
+from typing import Annotated, Any, Final, get_args, get_origin
 from uuid import uuid4
 
 from mcp import types
 from mcp.server import ServerRequestContext
 from mcp.shared.exceptions import MCPError
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from suv_deals.api.middleware import PrincipalRateLimiter, RateLimit
 from suv_deals.clock import Clock, ensure_utc
@@ -62,10 +66,13 @@ from suv_deals.domain.enums import Scope
 from suv_deals.errors import HTTP_STATUS, AppError, ErrorCode, Forbidden, Unauthenticated, ValidationFailed
 from suv_deals.mcp.auth import current_principal
 from suv_deals.mcp.schemas import (
+    CALC_TOOLS,
     FORBIDDEN_TOOL_NAMES,
+    NESTED_FIELD_PATTERN,
     TOOLS,
     V11_TOOLS,
     DealsAddNoteInput,
+    DealsEstimateImportCostsInput,
     DealsGetCandidateInput,
     DealsGetComparablesInput,
     DealsGetValuationInput,
@@ -83,9 +90,11 @@ from suv_deals.mcp.schemas import (
     SubmitRuleError,
     ToolInput,
     ToolSpec,
+    error_field_path,
     tool_error,
     tool_input_schema,
     tool_output_schema,
+    union_none_member,
 )
 from suv_deals.observability.logging import log_context
 from suv_deals.observability.metrics import AppMetrics
@@ -117,7 +126,8 @@ logger = logging.getLogger("suv_deals.mcp.tools")
 
 TRANSACTION_ATTEMPTS: Final = 3
 TOOL_NAME_PATTERN: Final = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-#: Single-object reads; every other tool (paginated reads, health, writes) is "expensive".
+#: Single-object reads; every other tool (paginated reads, health, writes, the import-cost
+#: calculator, which reads files and several tables per call) is "expensive".
 CHEAP_TOOLS: Final = frozenset(
     {"deals_get_candidate", "deals_get_valuation", "seller_inquiries_get", "seller_replies_get"}
 )
@@ -382,11 +392,48 @@ async def seller_inquiries_pause(call: ToolCall[SellerInquiriesPauseInput]) -> R
     return envelope(view, request_id=call.request_id, as_of=as_of)
 
 
+def import_cost_request(arguments: DealsEstimateImportCostsInput) -> queries.ImportCostRequest:
+    """The calculator service request of validated tool arguments: only the ``vehicle`` fields the
+    caller SET override the listing's facts (``VehicleImportFacts.model_fields_set``)."""
+    try:
+        return queries.ImportCostRequest(
+            listing_id=arguments.listing_id,
+            vehicle=arguments.vehicle_facts(),
+            customs_eur_mkd_rate=arguments.customs_rate(),
+            accept_previous_month_fx=arguments.accept_previous_month_fx,
+        )
+    except ValidationError as exc:  # the input model enforces these rules first; never echo values
+        fields = sorted({error_field_path(tuple(e["loc"])) or "arguments" for e in exc.errors()})
+        raise ValidationFailed(
+            "Invalid arguments for deals_estimate_import_costs", details={"fields": fields[:20]}
+        ) from None
+
+
+async def deals_estimate_import_costs(call: ToolCall[DealsEstimateImportCostsInput]) -> ResponseEnvelope[Any]:
+    """North Macedonian import charges for one vehicle: the shared calculator read
+    (``queries.get_import_cost_estimate``, also behind the dashboard and the CLI) with the draft
+    rule files and the cost profile of ``Settings.config_dir``. Read-only: an indicative preview on
+    unapproved rules is labelled (``mode``, ``banner``, ``indicative_total``) and never becomes a
+    valuation, a cost line or an alert."""
+    request = import_cost_request(call.arguments)
+    config_dir = call.services.settings.config_dir
+    result = await call.in_transaction(
+        lambda conn: queries.get_import_cost_estimate(conn, call.actor, request, config_dir=config_dir)
+    )
+    return result.envelope(call.request_id)
+
+
 #: The spec 37.8 inquiry tools (``mcp.schemas.V11_TOOLS``); served by default after the twelve.
 V11_HANDLERS: Final[Mapping[str, ToolHandler]] = {
     "seller_inquiries_get": seller_inquiries_get,
     "seller_replies_get": seller_replies_get,
     "seller_inquiries_pause": seller_inquiries_pause,
+}
+
+
+#: The import-cost calculator (``mcp.schemas.CALC_TOOLS``); served by default after the inquiry tools.
+CALC_HANDLERS: Final[Mapping[str, ToolHandler]] = {
+    "deals_estimate_import_costs": deals_estimate_import_costs,
 }
 
 
@@ -441,17 +488,33 @@ class RegisteredTool:
             return self.spec.input_model.model_validate(dict(arguments or {}))
         except ValidationError as exc:
             raise ValidationFailed(
-                f"Invalid arguments for {self.name}", details={"fields": argument_error_fields(exc)}
+                f"Invalid arguments for {self.name}",
+                details={"fields": argument_error_fields(exc, model=self.spec.input_model)},
             ) from None
 
 
-def argument_error_fields(exc: ValidationError) -> list[str]:
-    """Top-level argument names (plus a list index) of a validation failure, sorted and bounded.
+def _object_argument(model: type[BaseModel], name: str) -> bool:
+    """Whether the argument ``name`` of ``model`` is an object (or a list of objects)."""
+    info = model.model_fields.get(name)
+    pending: list[Any] = [info.annotation] if info is not None else []
+    while pending:
+        annotation = pending.pop()
+        while get_origin(annotation) is Annotated:
+            annotation = get_args(annotation)[0]
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return True
+        pending.extend(get_args(annotation))
+    return False
 
-    Tool inputs are flat, so the first location segment is the argument; pydantic's union-member
-    tags (``changed_since.none``) are dropped. Domain-rule failures name the fields they concern
-    (``schemas.SubmitRuleError``); names that are not plain identifiers become
-    ``<unrecognised field>``. Submitted values never appear.
+
+def argument_error_fields(exc: ValidationError, *, model: type[BaseModel] | None = None) -> list[str]:
+    """Argument names (plus a list index) of a validation failure, sorted and bounded.
+
+    The first location segment is the argument; pydantic's union-member tags
+    (``changed_since.none``) are dropped. Inside an object argument of ``model`` (e.g. the
+    calculator's ``vehicle``) the plain nested path is named (``vehicle.price.amount``).
+    Domain-rule failures name the fields they concern (``schemas.SubmitRuleError``); names that
+    are not plain identifiers become ``<unrecognised field>``. Submitted values never appear.
     """
     fields: set[str] = set()
     for err in exc.errors():
@@ -464,6 +527,12 @@ def argument_error_fields(exc: ValidationError) -> list[str]:
         if not isinstance(head, str) or not _ARGUMENT_RE.fullmatch(head):
             fields.add("<unrecognised field>")
             continue
+        if model is not None and len(loc) > 1 and _object_argument(model, head):
+            if union_none_member(err):
+                continue
+            path = error_field_path(tuple(loc), model, error_type=str(err.get("type", "")))
+            fields.add(path if NESTED_FIELD_PATTERN.fullmatch(path) else "<unrecognised field>")
+            continue
         index = loc[1] if len(loc) > 1 and isinstance(loc[1], int) else None
         fields.add(head if index is None else f"{head}.{index}")
     return sorted(fields)[:20]
@@ -474,9 +543,7 @@ def _register(spec: ToolSpec, handler: ToolHandler) -> RegisteredTool:
         raise ValueError("tool names must be 1-128 characters of [A-Za-z0-9_.-]")
     if spec.name in FORBIDDEN_TOOL_NAMES:
         raise ValueError(f"tool {spec.name!r} must never exist (spec 21)")
-    core = (spec.name in TOOLS and TOOLS[spec.name] is spec) or (
-        spec.name in V11_TOOLS and V11_TOOLS[spec.name] is spec
-    )
+    core = any(spec.name in table and table[spec.name] is spec for table in (TOOLS, V11_TOOLS, CALC_TOOLS))
     if core:
         input_schema = tool_input_schema(spec.name)
         output_schema = tool_output_schema(spec.name)
@@ -509,11 +576,13 @@ class ToolRegistry:
 
     @classmethod
     def default(cls) -> ToolRegistry:
-        """The twelve spec 21 tools, then the three spec 37.8 inquiry tools (no send tool)."""
+        """The twelve spec 21 tools, the three spec 37.8 inquiry tools (no send tool), then the
+        read-only import-cost calculator."""
         return cls(
             [
                 *((TOOLS[name], CORE_HANDLERS[name]) for name in TOOLS),
                 *((V11_TOOLS[name], V11_HANDLERS[name]) for name in V11_TOOLS),
+                *((CALC_TOOLS[name], CALC_HANDLERS[name]) for name in CALC_TOOLS),
             ]
         )
 
@@ -654,8 +723,8 @@ class ToolDispatcher:
 
 
 def handler_for(name: str) -> ToolHandler:
-    """The built-in handler of one spec 21 or spec 37.8 tool (for composing registries)."""
-    return CORE_HANDLERS.get(name) or V11_HANDLERS[name]
+    """The built-in handler of one spec 21, spec 37.8 or calculator tool (for composing registries)."""
+    return CORE_HANDLERS.get(name) or V11_HANDLERS.get(name) or CALC_HANDLERS[name]
 
 
 def tool_names(registry: ToolRegistry | None = None) -> Sequence[str]:
@@ -663,6 +732,7 @@ def tool_names(registry: ToolRegistry | None = None) -> Sequence[str]:
 
 
 __all__ = [
+    "CALC_HANDLERS",
     "CHEAP_TOOLS",
     "CORE_HANDLERS",
     "DEFAULT_CHEAP_LIMIT",
@@ -676,8 +746,11 @@ __all__ = [
     "ToolRateLimiter",
     "ToolRegistry",
     "ToolServices",
+    "argument_error_fields",
+    "deals_estimate_import_costs",
     "error_result",
     "handler_for",
+    "import_cost_request",
     "pause_inquiries",
     "request_id_for",
     "success_result",

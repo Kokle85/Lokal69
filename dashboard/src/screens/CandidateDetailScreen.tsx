@@ -90,6 +90,7 @@ function CandidateBody({ detail, timeZone, onChanged }: { detail: CandidateDetai
         ) : (
           <span className="muted">No valuation yet</span>
         )}
+        <Link to={`/candidates/${summary.listing_id}/import-costs`}>Customs calculator</Link>
         {detail.review_case ? <Link to={`/reviews/${detail.review_case.case_id}`}>Review case</Link> : null}
       </nav>
       <p className="muted small">{detail.source_link.notice}</p>

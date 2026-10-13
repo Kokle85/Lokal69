@@ -3,10 +3,11 @@
 
 Writes ``schemas/listing.schema.json``, ``review.schema.json``, ``valuation.schema.json``,
 ``event.schema.json``, one ``schemas/tools/<tool>.json`` per MCP tool (the twelve served spec
-21 tools and the three prepared spec 37.8 ``V11_TOOLS``) and one ``schemas/api/<route>.json`` per
-spec 37 API route (the mailbox-worker API and the dashboard inquiry routes). Output is
-deterministic (sorted keys, two-space indent, trailing newline), so the files are stable
-snapshots that ``tests/contracts/test_schema_snapshots.py`` compares byte for byte.
+21 tools, the three spec 37.8 ``V11_TOOLS`` and the ``CALC_TOOLS`` import-cost calculator) and
+one ``schemas/api/<route>.json`` per spec 37 API route (the mailbox-worker API and the dashboard
+inquiry routes). Output is deterministic (sorted keys, two-space indent, trailing newline), so the
+files are stable snapshots that ``tests/contracts/test_schema_snapshots.py`` compares byte for
+byte.
 
 Usage::
 

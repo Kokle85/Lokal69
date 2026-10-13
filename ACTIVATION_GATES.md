@@ -216,31 +216,47 @@ Each step only needs the steps above it; any step can stop without affecting the
 ## 6. `tax_rules`
 
 - **State:** `blocked`. The engine, validation, versioning and lifecycle are implemented and
-  tested with synthetic rule sets. No production North Macedonian rule set exists, so every
-  non-fixture valuation keeps import charges `unknown` and stays incomplete. The tax rule is not a
-  gate for the seller inquiry (`TAX_RULE_NOT_APPROVED` is informational there).
+  tested with synthetic rule sets. A North Macedonian DRAFT ships under `config/tax_rules/drafts/`
+  (status `draft`, not approved, golden-tested in `tests/unit/test_mk_rule_draft.py`); it is
+  never selected for valuations, only for the import-cost calculator's labelled indicative
+  preview. No rule set is approved or ACTIVE, so every non-fixture valuation keeps import charges
+  `unknown` and stays incomplete. The tax rule is not a gate for the seller inquiry
+  (`TAX_RULE_NOT_APPROVED` is informational there).
 - **Prerequisites:** a current, sourced rule set (official sources with retrieval time and
-  SHA-256), reviewed against golden cases.
+  SHA-256), reviewed against golden cases. For the shipped draft: every `UNCERTAIN - confirm`
+  marker resolved (the list: docs/decisions/0003-transport-and-customs-calculator.md, "What the
+  owner must confirm"; evidence pack docs/tax/mk_import_fact_sheet_2026-10.md, section 13) and
+  every source re-fetched and re-hashed; the month's customs EUR/MKD rate recorded
+  (`suv-deals fx record ... --purpose customs`).
 - **Who:** owner, with a qualified customs broker or tax professional.
 - **Steps:** docs/tax_rule_approval.md (draft, validate, review, approve, activate). Validation is
   tooled: `uv run suv-deals tax-rules validate <file>`.
-- **Tooling gap:** storing a rule set in the database and moving it through
-  review/approval/activation (`valuation_repo.store_rule_set` / `transition_tax_rule_set`) has no
-  CLI command or API route; the valuation pipeline reads rule sets only from the database. An
-  operator command is needed before this gate can pass (open item).
+- **Tooling:** the owner stores a repository draft and moves it through review, approval (named
+  approver + review record bound to the content hash) and activation in the dashboard, Settings,
+  "Tax rules and cost profile" (`/api/settings/tax-rules*`, owner only; `api.owner_config_routes`
+  over `valuation_repo.store_rule_set` / `transition_tax_rule_set`); `suv-deals tax-rules store`
+  also stores a draft. The valuation pipeline reads rule sets only from the database. Nothing is
+  approved or activated automatically: the gate stays `blocked` until the owner does it.
 - **Evidence:** rule set id/version and content SHA-256, review record, approver, activation time,
   `TAX_RULE_SET_ID` and the configuration revision.
 
 ## 7. `cost_assumptions`
 
 - **State:** `blocked`. Costs are computed from `config/cost_profiles`; unknown costs stay
-  unknown, never zero. The profile is stored unapproved.
-- **Prerequisites:** the owner's choice of logistics, inspection, registration and reserve
-  assumptions, or real quotes, with their currency treatment.
+  unknown, never zero. **Transport is set:** the owner's decision of 2026-10-13 (ADR 0003) is a
+  fixed EUR 700 per vehicle from any purchase country (`default` profile version 3, line
+  `transport`, low = base = high). The profile version is **not yet approved**, and every other
+  line (bank/FX, inspection, broker, registration, repairs, preparation, storage, reserve,
+  selling) is still `unknown`.
+- **Prerequisites:** the owner's choice of the remaining inspection, broker, registration, repair
+  and reserve assumptions, or real quotes, with their currency treatment; then the approval of the
+  profile version.
 - **Steps:** edit the cost profile YAML, `uv run suv-deals config validate`, then
   `suv-deals config apply --reason "<what changed>" --yes`.
-- **Tooling gap:** approving a stored cost profile (`valuation_repo.approve_cost_profile`) has no
-  CLI command or API route (open item).
+- **Tooling:** the owner approves the configured cost-profile version (content hash bound; stored
+  first when the workspace does not hold it yet) in the dashboard, Settings, "Tax rules and cost
+  profile" (`POST /api/settings/cost-profiles/approve`, owner only, over
+  `valuation_repo.approve_cost_profile`).
 - **Evidence:** configuration revision, profile id, the quotes or assumption notes.
 
 ## 8. `contribution_threshold` and other PROPOSED values
@@ -462,7 +478,8 @@ needed before gates 11, 14, 15 or 17 can pass (open item).
 
 | Value | Where | Current |
 |---|---|---|
-| Tax rules | gate 6 | none approved |
+| Tax rules | gate 6 | none approved (MK draft shipped, unapproved) |
+| Transport EUR 700 per vehicle | `config/cost_profiles/default_unapproved.yaml` v3, gate 7 | owner decision 2026-10-13; profile version unapproved |
 | Minimum contribution EUR 1,500 | `config/defaults.yaml`, `CONTRIBUTION_THRESHOLD_APPROVED` | proposal |
 | Observation freshness 48 h for an inquiry | `domain/inquiries.py` `MAX_OBSERVATION_AGE` | proposal |
 | Seller cooldown 7 days (floor; owner may lengthen to 365) | `domain/inquiries.py` `SELLER_COOLDOWN`, DB CHECK | proposal for the default |
