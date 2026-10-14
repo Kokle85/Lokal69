@@ -8,18 +8,38 @@ adapter: automobile_it_public
 adapter_version: unimplemented
 enabled: false
 technical_status: untested
-terms_status: unreviewed
-terms_url: null            # exact terms page not yet identified/verified
-terms_reviewed_at: null
-terms_decision: pending
-terms_decision_actor: null
-terms_decision_note: null
+terms_status: restricted
+terms_url: https://www.automobile.it/policies/condizioni
+terms_reviewed_at: 2026-10-14T00:00:00Z
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-14)"
+terms_decision_note: >-
+  Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
+  terms risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on
+  every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any
+  access block. The terms (in force since 2021-06-29) prohibit any robot, spider, scraper or other
+  automated tool to access the site and collect content without prior written consent, circumventing
+  access-limiting measures and copying listings (art. 4), searching other than through the site's
+  search bar or with 'searchware' (art. 11) and using protected content, a compilation, without
+  written consent (art. 14).
 technical_denial_policy: stop_and_report
 robots_policy: obey
-allowed_hosts: []
+robots_checked_at: 2026-10-14T00:00:00Z
+robots_summary: >-
+  robots.txt of www.automobile.it checked 2026-10-14 (fact, not permission; sha256 0fc830ad...,
+  Last-Modified 2026-09-10): the 'User-agent: *' group disallows */automobile/mbl.it.*, '*?b=*',
+  '*?d=*', /api/*, /rest/*, */catalogo-dealer*, /area-privata*, /mappa-province/*, /fb/*,
+  /post/*/flag/* and /post/*/_share; nothing else is disallowed. No Crawl-delay, no AI-crawler
+  groups.
+allowed_hosts:
+  - 'www.automobile.it'
 allowed_search_paths: []
 allowed_detail_paths: []
 search: {}
 notes: >-
-  Candidate from spec section 5. Exact domains, terms and public routes are unverified;
-  no host, path or selector may be added until they are.
+  Operator (legal notice https://www.automobile.it/policies/chi-siamo, checked 2026-10-14):
+  Marktplaats B.V., Wibautstraat 224, 1097 DN Amsterdam, NL (KvK 28058712; Adevinta group).
+  automobile.it redirects to www.automobile.it; the home page answered HTTP 200 to our user agent.
+  Dealer terms exist separately (/policies/condizioni-concessionari, sellers only). Search and
+  detail routes are not verified (no listing page was fetched); paths stay empty until they are
+  verified from permitted page captures.

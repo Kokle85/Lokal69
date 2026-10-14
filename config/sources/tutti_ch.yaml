@@ -13,23 +13,33 @@ adapter_version: unimplemented   # no route/selector/ID pattern has been verifie
 enabled: false
 technical_status: untested
 terms_status: unreviewed
-terms_url: null            # exact terms page not yet identified/verified
+terms_url: null            # not identified/readable (see notes)
 terms_reviewed_at: null
-terms_decision: pending
-terms_decision_actor: null
-terms_decision_note: null
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-14)"
+terms_decision_note: >-
+  Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
+  terms risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on
+  every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any
+  access block. Nothing could be read from the site, so terms_status stays unreviewed and keeps the
+  source gated.
 technical_denial_policy: stop_and_report
 robots_policy: obey
+robots_checked_at: 2026-10-14T00:00:00Z
+robots_summary: >-
+  robots.txt of www.tutti.ch answered HTTP 403 with an HTML page on 2026-10-14 (not a robots file),
+  as did the home page; no robots rules could be read. The robots module treats a 4xx robots.txt as
+  unavailable (no robots restriction), but a 403 on the pages themselves is an access block that
+  stops the source.
 source_timezone: Europe/Zurich
 allowed_hosts: []
 allowed_search_paths: []
 allowed_detail_paths: []
 search: {}
 notes: >-
-  Swiss general-classifieds candidate with private and dealer car ads. Candidate domain www.tutti.ch is
-  UNVERIFIED: nothing was fetched. Verify before adding any host or path: the exact domain(s) and
-  operator; which terms apply and whether they restrict automated access or derived databases;
-  robots.txt for the intended paths; whether a public vehicle category with result and detail routes
-  exists and may be used; and the language versions (DE/FR/IT). Classifieds carry private sellers:
-  store no seller contact data, record the seller type (a private sale has no reclaimable VAT) and keep
-  untrusted ad text bounded. No route, selector or listing-ID pattern is encoded.
+  Swiss general-classifieds candidate with private and dealer car ads. Every request with our user
+  agent answered HTTP 403 on 2026-10-14. Observed from the build environment (a cloud data-centre
+  network) with our user agent; the owner's network may be answered differently, and any block there
+  stops the source the same way. Domain, operator, terms and imprint are UNVERIFIED. Classifieds
+  carry private sellers: store no seller contact data and record the seller type. No route, selector
+  or listing-ID pattern is encoded.

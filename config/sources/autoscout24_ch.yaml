@@ -35,4 +35,10 @@ notes: >-
   automated queries and the creation/commercial use of a derived database) are recorded for the
   DE/IT sources. Whether they or separate Swiss terms govern AutoScout24 Switzerland has not been
   reviewed, so terms_status stays unreviewed (a stricter gate than restricted) until the
-  CH-specific terms are identified and reviewed.
+  CH-specific terms are identified and reviewed. Terms review attempt of 2026-10-14: the Swiss site's
+  GTC (https://www.autoscout24.ch/de/legal/gtc) and every other HTML page tried answered HTTP 403
+  with a Cloudflare challenge ('Please show us you are not a robot') to our user agent from the build
+  environment (a cloud data-centre network); robots.txt itself was served (unchanged). The operator is
+  therefore unverified (lead from a search listing only: SMG Swiss Marketplace Group AG, Zurich). The
+  owner can read the GTC in a normal browser; until the terms are recorded the source stays gated, and
+  a challenge page met by the crawler stops it (no evasion).

@@ -51,6 +51,8 @@ CONFIGURED_HOSTS = {
     "mobile_de_public": "suchen.mobile.de",
     "autoscout24_de": "www.autoscout24.de",
     "autoscout24_it": "www.autoscout24.it",
+    "subito_it": "www.subito.it",
+    "automobile_it": "www.automobile.it",
 }
 
 

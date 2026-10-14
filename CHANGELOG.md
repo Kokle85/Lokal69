@@ -27,6 +27,25 @@ robots.txt re-check of the same day. Nothing is enabled, fetched or activated.
 - Tests: `test_mobile_de_public_search_is_robots_disallowed`; the CH robots date moved to
   2026-10-14.
 
+Owner decision of 2026-10-14 ("сакам сите да го вклучиш": include every source) and the terms and
+robots.txt review behind it (docs/research/source_terms_review_2026-10-14.md; one research agent per
+source pair plus an independent verifier; only robots.txt, terms, imprint and home pages were
+requested). Nothing is enabled.
+
+- `subito_it`, `automobile_it`, `comparis_ch`, `carforyou_ch`, `tutti_ch`, `pazar3_mk` and
+  `reklama5_mk` now carry `terms_decision: proceed_acknowledged` (owner, 2026-10-14) and a robots
+  record of 2026-10-14.
+- **Subito** (Subito.it S.r.l., Milano) and **automobile.it** (Marktplaats B.V., Amsterdam): terms
+  **restricted**; both expressly prohibit robots, scrapers and automated extraction without consent.
+  Terms URL, review date and canonical host recorded; routes stay unverified.
+- **Comparis**: robots.txt disallows the car-marketplace result and detail endpoints.
+- **AutoScout24.ch, Comparis, CarForYou, Tutti, Pazar3, Reklama5**: the build environment met
+  Cloudflare/DataDome challenges, HTTP 403 or TLS resets on their HTML pages, so their terms stay
+  unreviewed and keep the gate closed; operators are only leads, not recorded facts.
+- Docs: source access register, Swiss market page, status and activation-gate pages.
+- Tests: the owner-decided source set now covers all eleven marketplace and MK sources;
+  `test_italian_marketplace_terms_reviewed`; the Swiss candidate test reads the 2026-10-14 record.
+
 ## Owner decisions D1-D3 and recorded import values (2026-10-14, `e5b0ec9`, `7f7e187`)
 
 Owner decisions of 2026-10-13, given in Macedonian (ADR 0003 decisions 11-14; fact sheet sections

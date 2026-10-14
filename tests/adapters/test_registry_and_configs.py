@@ -51,7 +51,22 @@ CH_MARKETPLACE_CANDIDATES = {
 }
 
 
-OWNER_DECIDED_SOURCES = frozenset({"mobile_de_public", "autoscout24_de", "autoscout24_it", "autoscout24_ch"})
+OWNER_DECIDED_SOURCES = frozenset(
+    {
+        "mobile_de_public",
+        "autoscout24_de",
+        "autoscout24_it",
+        "autoscout24_ch",
+        # Owner decision 2026-10-14: include every remaining marketplace and MK comparable source.
+        "subito_it",
+        "automobile_it",
+        "comparis_ch",
+        "carforyou_ch",
+        "tutti_ch",
+        "pazar3_mk",
+        "reklama5_mk",
+    }
+)
 
 
 @pytest.mark.parametrize("path", CONFIG_FILES, ids=lambda p: p.name)
@@ -139,9 +154,12 @@ def test_swiss_marketplace_candidates_are_gated_placeholders(key: str) -> None:
     assert cfg.enabled is False and cfg.terms_status == TermsStatus.UNREVIEWED
     assert cfg.allowed_hosts == () and cfg.search == {}
     assert cfg.source_timezone == "Europe/Zurich"
-    assert cfg.notes is not None
-    assert domain in cfg.notes and "UNVERIFIED" in cfg.notes  # candidate domain, recorded as unverified
-    assert "robots" in cfg.notes and "terms" in cfg.notes
+    assert cfg.notes is not None and cfg.robots_summary is not None
+    # Review attempt of 2026-10-14: the domain is named, what could not be verified says so, and the
+    # robots record names the host it was (or could not be) read from.
+    assert domain in cfg.notes + cfg.robots_summary
+    assert "unverified" in cfg.notes.lower() and "terms" in cfg.notes
+    assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
     gate = gate_status(cfg)
     assert not gate.adapter_implemented and not gate.active
     assert {"adapter is unimplemented", "terms not reviewed", "no allowed hosts"} <= set(gate.problems)
@@ -170,10 +188,28 @@ def test_swiss_dealer_template() -> None:
 
 
 @pytest.mark.parametrize(
+    ("key", "terms_url", "host"),
+    [
+        ("subito_it", "https://info.subito.it/policies/condizioni-generali.htm", "www.subito.it"),
+        ("automobile_it", "https://www.automobile.it/policies/condizioni", "www.automobile.it"),
+    ],
+)
+def test_italian_marketplace_terms_reviewed(key: str, terms_url: str, host: str) -> None:
+    # Terms review of 2026-10-14: both general terms prohibit robots/scrapers; the owner decided to
+    # include the sources anyway (an audit record, not permission). Routes stay unverified.
+    cfg = load_registry(REPO / "config").config(key)
+    assert cfg.terms_status == TermsStatus.RESTRICTED and cfg.terms_url == terms_url
+    assert cfg.terms_reviewed_at == datetime(2026, 10, 14, tzinfo=UTC)
+    assert cfg.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
+    assert cfg.allowed_hosts == (host,)
+    assert cfg.allowed_search_paths == () and cfg.allowed_detail_paths == ()
+    assert "terms not reviewed" not in activation_problems(cfg)
+    assert {"adapter is unimplemented", "no allowed search paths"} <= set(activation_problems(cfg))
+
+
+@pytest.mark.parametrize(
     "key",
     [
-        "subito_it",
-        "automobile_it",
         "pazar3_mk",
         "reklama5_mk",
         "mobile_de_api",

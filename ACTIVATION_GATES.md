@@ -178,6 +178,16 @@ Each step only needs the steps above it; any step can stop without affecting the
   grants that permission in the Claude Code settings; then the adapters are built and
   fixture-verified (steps 1-7 of docs/source_access_register.md). AutoScout24 Switzerland also needs
   its own terms identified.
+- **All other sources: owner decision recorded 2026-10-14** ("сакам сите да го вклучиш").
+  `subito_it`, `automobile_it`, `comparis_ch`, `carforyou_ch`, `tutti_ch`, `pazar3_mk` and
+  `reklama5_mk` now carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
+  record, not permission); all stay disabled. The terms and robots.txt review of the same day
+  (docs/research/source_terms_review_2026-10-14.md, every finding independently re-verified) found
+  Subito and automobile.it **restricted** (both terms expressly prohibit robots/scrapers), Comparis'
+  robots.txt disallowing its car-search result and detail endpoints, and every Swiss and MK site
+  except automobile.it answering our user agent with a block or bot challenge from the build
+  environment, so their terms stay unreviewed (gate closed) until the owner reads them in a normal
+  browser. Every adapter still needs real page captures.
   The optional official mobile.de Search API is gate 5.
 - **Who:** owner records the terms decision; operator verifies routes, implements/configures the
   adapter, captures fixtures and runs the smoke; owner enables.

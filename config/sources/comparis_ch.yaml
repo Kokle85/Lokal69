@@ -13,23 +13,39 @@ adapter_version: unimplemented   # no route/selector/ID pattern has been verifie
 enabled: false
 technical_status: untested
 terms_status: unreviewed
-terms_url: null            # exact terms page not yet identified/verified
+terms_url: null            # not identified/readable (see notes)
 terms_reviewed_at: null
-terms_decision: pending
-terms_decision_actor: null
-terms_decision_note: null
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-14)"
+terms_decision_note: >-
+  Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
+  terms risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on
+  every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any
+  access block. The terms could not be read (CAPTCHA), so terms_status stays unreviewed and keeps
+  the source gated; the owner can read https://www.comparis.ch/info/copyrights in a normal browser.
 technical_denial_policy: stop_and_report
 robots_policy: obey
+robots_checked_at: 2026-10-14T00:00:00Z
+robots_summary: >-
+  robots.txt of www.comparis.ch checked 2026-10-14 (fact, not permission; sha256 94d20caa..., dated
+  'Sep 09 2026' in its header): the 'User-agent: *' group (227 rules) disallows the car marketplace
+  result and detail endpoints /carfinder/marktplatz/result.aspx,
+  /carfinder/marktplatz/details/show/, /marktplatz/details/show, /carfinder/searchservice/,
+  /carfinder/detailsservice/, /carfinder/api/ and /comparis/searchresult*, plus redirect, tracking
+  and service paths. No Crawl-delay. Consequence: the known car-search result and detail routes are
+  disallowed for our crawler.
 source_timezone: Europe/Zurich
 allowed_hosts: []
 allowed_search_paths: []
 allowed_detail_paths: []
 search: {}
 notes: >-
-  Swiss comparison site with a car-listings section (aggregator candidate). Candidate domain
-  www.comparis.ch is UNVERIFIED: nothing was fetched. An aggregator may republish third-party listings
-  (other marketplaces, dealers): its own terms and robots.txt AND the terms of the original source may
-  apply, so check both, record the original source attribution of every listing, prefer the original
-  source where it is permitted, and deduplicate the same vehicle seen on both. Also verify the exact
-  domain(s) and operator, whether public result and detail routes exist and may be used, and the
-  language versions (DE/FR/IT). No route, selector or listing-ID pattern is encoded.
+  Swiss comparison site with a car-listings section (aggregator). Every HTML page tried (home,
+  /info/copyrights) answered HTTP 403 with a DataDome CAPTCHA to our user agent; robots.txt was
+  served. Observed from the build environment (a cloud data-centre network) with our user agent; the
+  owner's network may be answered differently, and any block there stops the source the same way.
+  Operator unverified (lead from a search listing only: comparis.ch AG, Birmensdorferstrasse 108,
+  8003 Zürich). Candidate terms pages, not read: https://www.comparis.ch/info/copyrights and
+  /info/allgemeine-geschaeftsbedingungen. An aggregator may republish third-party listings: the
+  original source's terms also apply; record the original source attribution of every listing and
+  prefer the original source where permitted.
