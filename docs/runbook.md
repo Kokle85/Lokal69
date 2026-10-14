@@ -202,9 +202,8 @@ uv run suv-deals credentials create-mcp --workspace <id> --label "dot read-only"
    reconcile the ledger (`supabase migration repair --status applied <filename-version>` and
    revert the connector-recorded versions), or keep applying new files through the same
    connector path. `suv-deals doctor` reports such foreign ledger versions as a warning.
-   Pending on that project (2026-10-13): `20261013000100_import_values` (the owner's recorded
-   purchase price and estimated customs value; docs/schema.md 11.16). Until it is applied,
-   recording an estimated customs value there fails; reading and the calculator work.
+   Nothing is pending on that project: `20261013000100_import_values` (the owner's recorded
+   purchase price and estimated customs value; docs/schema.md 11.16) was applied on 2026-10-14.
 5. Verify: `suv-deals doctor --process api` (schema markers, `SET ROLE suv_backend`,
    `ops.backend_role_problems()` when the login may call it) and `GET /readyz`.
 

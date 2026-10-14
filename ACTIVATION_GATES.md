@@ -115,11 +115,9 @@ Each step only needs the steps above it; any step can stop without affecting the
 ## 3. Supabase project
 
 - **State:** `blocked`. Project `Lokal69- Sub` (ref `olkcgrahvkvzgnnsqspr`, eu-west-1,
-  PostgreSQL 17.11) has every migration through `20261008000200` applied (docs/schema.md section
-  9; 16 of the 17 migration files). `20261013000100_import_values` (the owner's recorded purchase
-  price and estimated customs value per listing, docs/schema.md 11.16) is **not yet applied**;
-  until it is, recording an estimated customs value against this project fails (the
-  `customs_value` category is refused). It serves nothing: no backend process has connected to
+  PostgreSQL 17.11) has every migration applied, through `20261013000100_import_values` (docs/schema.md
+  section 9; all 17 migration files; the newest, the owner's recorded purchase price and estimated
+  customs value per listing, docs/schema.md 11.16, applied on 2026-10-14). It serves nothing: no backend process has connected to
   it, no user or workspace was bootstrapped, no backup was restored.
 - **Prerequisites (owner decisions):** approve the project and region for production; choose the
   backup capability actually bought (plan/PITR); decide on the two advisor warnings about the
@@ -138,7 +136,7 @@ Each step only needs the steps above it; any step can stop without affecting the
     `scripts/migrate.sh` or `supabase db push` against this project (docs/runbook.md 4.1).
 - **Steps:**
   1. `DATABASE_URL=<owner connection> uv run suv-deals db migrate --dry-run` (prints the target
-     without the password; expect no pending file once `20261013000100_import_values` is applied).
+     without the password; expect no pending file).
   2. `uv run suv-deals doctor --process api` and `GET /readyz` on the deployed API.
   3. Bootstrap (privileged connection in `MAINTENANCE_DATABASE_URL`, environment only):
      `uv run suv-deals bootstrap owner --user-id <auth user id> --workspace-name "Deals" --yes`,

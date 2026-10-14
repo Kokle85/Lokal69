@@ -8,7 +8,7 @@ Access model: `docs/decisions/0001-bff-only-data-access.md` (ADR 0001).
 
 | Path | Purpose |
 |---|---|
-| `supabase/migrations/20261006000100_*.sql` ... `20261013000100_*.sql` | Forward-only migrations, applied in name order (M2 core 0100-0950, v1.1 inquiries 1000, v1.1 integration 20261007000100/0200/0400, 20261008000100/0200; recorded import values 20261013000100, not yet applied to the hosted project; section 11) |
+| `supabase/migrations/20261006000100_*.sql` ... `20261013000100_*.sql` | Forward-only migrations, applied in name order (M2 core 0100-0950, v1.1 inquiries 1000, v1.1 integration 20261007000100/0200/0400, 20261008000100/0200; recorded import values 20261013000100; all applied to the hosted project, section 9; section 11) |
 | `supabase/tests/supabase_emulation.sql` | **Test-only** Supabase emulation for plain PostgreSQL |
 | `supabase/seed.sql` | **Local development only**: one synthetic workspace |
 | `supabase/config.toml` | Supabase CLI local config (`app`/`ops` not exposed) |
@@ -593,7 +593,7 @@ Advisor notes (2026-10-06):
 | 20261007000400_mail_worker_credential_kind | 20261007220534 | byte-exact (sha256 `44c614a4…437e`) |
 | 20261008000100_inquiry_quota_backstop | 20261008050157 | byte-exact (sha256 `c3c218ff…6fe8`) |
 | 20261008000200_inquiry_hardening | 20261010054751 | byte-exact (sha256 `5729a0a9…59f4`) |
-| 20261013000100_import_values | not yet applied to the hosted project (the orchestrator applies it) | - |
+| 20261013000100_import_values | 20261014001359 | byte-exact (sha256 `17b580b3…243f`) |
 
 Connector constraints found while applying, now enforced by `tests/unit/test_migrations_ascii.py`:
 
@@ -1399,7 +1399,7 @@ The import-cost calculator (`persistence/queries/import_costs.py`) only reads
 
 ### 11.16 Migration 20261013000100: recorded import values (owner decision 2026-10-13)
 
-Not yet applied to the hosted project (section 9; the orchestrator applies it). Forward-only,
+Applied to the hosted project on 2026-10-14, recorded version 20261014001359, byte-exact (section 9). Forward-only,
 expand; pure ASCII, no `DROP TRIGGER`; applies on PostgreSQL 16 and 17
 (`tests/integration/db/test_constraints.py`, `tests/unit/test_migrations_ascii.py`).
 

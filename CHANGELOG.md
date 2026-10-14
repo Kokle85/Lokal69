@@ -57,8 +57,8 @@ DRAFT and every calculator result an indicative preview.
 
 ### D2: recorded import values per listing (migration `20261013000100`)
 
-- Migration `supabase/migrations/20261013000100_import_values.sql` (forward-only, expand; NOT yet
-  applied to the hosted project): `app.cost_evidence` category `customs_value` (the estimated
+- Migration `supabase/migrations/20261013000100_import_values.sql` (forward-only, expand; applied
+  to the hosted project on 2026-10-14 as version 20261014001359): `app.cost_evidence` category `customs_value` (the estimated
   customs value; `cost_evidence_customs_value_ck`: listing-scoped, EUR, kind `estimate`) and two
   partial unique indexes that keep each listing's `purchase` / `customs_value` rows one linear
   supersede chain (docs/schema.md 11.16).
@@ -137,7 +137,7 @@ DRAFT and every calculator result an indicative preview.
 - README "Customs calculator", docs/tax_rule_approval.md, docs/connect_mcp.md section 7,
   docs/api_contract.md, docs/runbook.md (`import-costs values` / `record-values`),
   IMPLEMENTATION_STATUS.md, ACTIVATION_GATES.md (sections 3 and 6), docs/schema.md 11.16 (the
-  migration, **not yet applied to the hosted project**), the fact sheet and ADR 0003.
+  migration, applied to the hosted project on 2026-10-14), the fact sheet and ADR 0003.
 - Verification: docs/qa_evidence.md, "Owner decisions D1-D3".
 
 ## Customs calculator and dot access (2026-10-13, `787ad7c`, `7280bd9`)

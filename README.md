@@ -49,7 +49,7 @@ with row-level security). Details: [docs/architecture.md](docs/architecture.md).
 | `src/suv_deals/api/`, `mcp/`, `views/` | Dashboard API (FastAPI), mail-worker API, MCP server (official SDK), shared read models |
 | `src/suv_deals/integrations/` | ECB FX, MCP Events webhooks, Slack, MIME builder, e-mail providers, secret box, safe HTTP |
 | `src/suv_deals/cli.py`, `cli_commands/` | The `suv-deals` operator CLI (doctor, db, sources, crawl, inquiries, sender binding, mail worker, canary, market, fx, jobs, tax rules, import costs, ...) |
-| `supabase/migrations/` | 17 forward-only SQL migrations (applied to the hosted project through `20261008000200`; `20261013000100_import_values` not yet applied there) |
+| `supabase/migrations/` | 17 forward-only SQL migrations (all applied to the hosted project; docs/schema.md section 9) |
 | `config/` | Business configuration, search profiles, source registry, taxonomy, cost profiles, the tax-rule example and the unapproved North Macedonian draft (`config/tax_rules/drafts/`), the standing authorization record |
 | `schemas/` | Exported JSON schemas of the MCP tools and API responses (checked against the code) |
 | `dashboard/` | Private React dashboard (Vite, Supabase Auth, Vitest, Playwright) |
@@ -171,8 +171,8 @@ records both values per listing: the candidate's "Import values" panel on the da
 `suv-deals import-costs record-values ... --yes` (read: `import-costs values`); no MCP tool
 records them. The calculator's listing mode (dot's included) and the valuations then use them
 (labelled `recorded`), and recording one marks the listing's valuations stale and recomputes them. This
-needs migration `20261013000100_import_values` (docs/schema.md 11.16), **not yet applied to the
-hosted Supabase project**; until it is, recording an estimated customs value there fails.
+needs migration `20261013000100_import_values` (docs/schema.md 11.16), applied to the hosted
+Supabase project on 2026-10-14.
 
 ## Documentation
 
