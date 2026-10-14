@@ -5,7 +5,29 @@ The build waves in order, derived from `git log --oneline` and the wave document
 commits are omitted; they only preserved interrupted work. **No wave activated anything against
 a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC.
 
-## Unreleased (working tree on top of `7280bd9`, not committed)
+## Unreleased (working tree on top of `7f7e187`, not committed)
+
+Owner re-confirmation of 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат") and a
+robots.txt re-check of the same day. Nothing is enabled, fetched or activated.
+
+- **mobile.de robots.txt changed.** `suchen.mobile.de` now disallows `/fahrzeuge/search.html`,
+  `/fahrzeuge/searchresults.html`, `isSearchRequest=true`, `pageNumber=` and
+  `/fahrzeuge/details.html` for every generic crawler; only `details.html?id=<n>&vip=1` stays
+  allowed. `mobile_de_public` therefore has an empty search allow-list and cannot discover listings;
+  the owner's approval does not override robots.txt. Remaining routes: the official Search API
+  (`mobile_de_api`) or listing links the owner supplies.
+- **AutoScout24 DE/IT/CH robots.txt unchanged** since 2026-10-06 (re-check dates and file hashes
+  recorded in `config/sources/autoscout24_*.yaml`).
+- **Owner re-confirmation recorded** in the four `terms_decision_note`s (an audit record, not legal
+  permission).
+- **Adapters still unbuilt.** Fetching one AutoScout24 page to build the parser was denied again by
+  the automated policy classifier of the build environment, after the owner's re-confirmation. The
+  parsers need page captures saved by the owner, or the owner's permission rule in the Claude Code
+  settings.
+- Tests: `test_mobile_de_public_search_is_robots_disallowed`; the CH robots date moved to
+  2026-10-14.
+
+## Owner decisions D1-D3 and recorded import values (2026-10-14, `e5b0ec9`, `7f7e187`)
 
 Owner decisions of 2026-10-13, given in Macedonian (ADR 0003 decisions 11-14; fact sheet sections
 3.4, 6.3, 10.4, 11 and 13). Nothing is approved or activated; the rule set stays an unapproved

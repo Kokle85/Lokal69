@@ -93,6 +93,18 @@ def test_mobile_de_public_terms_record() -> None:
     assert cfg.notes is not None and "section 11" in cfg.notes
 
 
+def test_mobile_de_public_search_is_robots_disallowed() -> None:
+    # robots.txt re-check of 2026-10-14: suchen.mobile.de disallows /fahrzeuge/search.html for
+    # every generic crawler, so no search route may be configured; the owner's approval of the
+    # same day does not override robots.txt.
+    cfg = load_registry(REPO / "config").config("mobile_de_public")
+    assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
+    assert cfg.robots_summary is not None and "disallows /fahrzeuge/search.html" in cfg.robots_summary
+    assert cfg.allowed_search_paths == ()
+    assert cfg.terms_decision_note is not None and "re-confirmed 2026-10-14" in cfg.terms_decision_note
+    assert activation_problems(cfg), "the source stays gated"
+
+
 @pytest.mark.parametrize("key", ["autoscout24_de", "autoscout24_it"])
 def test_autoscout_eu_terms_record(key: str) -> None:
     cfg = load_registry(REPO / "config").config(key)
@@ -108,7 +120,7 @@ def test_autoscout_ch_is_reviewed_separately() -> None:
     assert cfg.notes is not None and "Swiss" in cfg.notes
     assert cfg.source_timezone == "Europe/Zurich"
     # The robots record is a fact, never permission; it does not open any gate.
-    assert cfg.robots_checked_at == datetime(2026, 10, 10, tzinfo=UTC)
+    assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
     assert cfg.robots_summary is not None
     assert "User-agent: *" in cfg.robots_summary and "fact, not permission" in cfg.robots_summary
     assert cfg.allowed_hosts == () and "adapter is unimplemented" in activation_problems(cfg)

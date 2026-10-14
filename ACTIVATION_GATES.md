@@ -165,11 +165,19 @@ Each step only needs the steps above it; any step can stop without affecting the
   `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
   record of the accepted terms risk, not legal permission) and the robots.txt facts checked on
   2026-10-10; AutoScout24 Germany disallows detail pages for generic crawlers, so `autoscout24_de` is
-  `card_only`. They remain disabled because their adapters are not built: building the parsers needs
-  real, redacted page captures, and fetching those pages from the build environment was denied by
-  an automated policy classifier. The capture has to happen on the owner's side (or after the owner
-  grants that permission), then the adapters are built and fixture-verified (steps 1-7 of
-  docs/source_access_register.md). AutoScout24 Switzerland also needs its own terms identified.
+  `card_only`. The owner re-confirmed the approval on 2026-10-14 ("ги одобрувам mobile.de,
+  AutoScout24 да се скенираат"). The robots.txt re-check of 2026-10-14 found AutoScout24 DE/IT/CH
+  unchanged but **mobile.de changed**: `suchen.mobile.de` now disallows its search pages for every
+  generic crawler (detail pages only in the form `details.html?id=<n>&vip=1`), so `mobile_de_public`
+  cannot discover listings and its search allow-list is empty; the owner's approval does not override
+  robots.txt (remaining routes: the official Search API, or listing links the owner supplies). They
+  remain disabled because their adapters are not built: building the parsers needs real, redacted
+  page captures, and fetching those pages from the build environment was denied by an automated
+  policy classifier (2026-10-06, and again on 2026-10-14 after the owner's re-confirmation). The
+  capture has to happen on the owner's side (pages saved from the owner's browser) or after the owner
+  grants that permission in the Claude Code settings; then the adapters are built and
+  fixture-verified (steps 1-7 of docs/source_access_register.md). AutoScout24 Switzerland also needs
+  its own terms identified.
   The optional official mobile.de Search API is gate 5.
 - **Who:** owner records the terms decision; operator verifies routes, implements/configures the
   adapter, captures fixtures and runs the smoke; owner enables.

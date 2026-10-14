@@ -17,12 +17,12 @@ terms_reviewed_at: 2026-10-06T00:00:00Z
 terms_decision: proceed_acknowledged
 terms_decision_actor: "owner (decision recorded 2026-10-10)"
 terms_decision_note: >-
-  Owner decision 2026-10-10: include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
+  Owner decision 2026-10-10, re-confirmed 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат"): include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
 technical_denial_policy: stop_and_report
 robots_policy: obey
-robots_checked_at: 2026-10-10T00:00:00Z
+robots_checked_at: 2026-10-14T00:00:00Z
 robots_summary: >-
-  robots.txt checked 2026-10-10 (fact, not permission): the 'User-agent: *' group disallows detail pages (/angebote/), a query on the bare search path (/lst? and /lst/?), any URL with a 'cat=' parameter, /detailsuche and API paths. Search pages with make/model path segments (/lst/<make>/<model>?...) are not disallowed. Therefore this source is card_only: search-result cards only, no detail fetches.
+  robots.txt re-checked 2026-10-14, unchanged since 2026-10-06 (fact, not permission; sha256 46a815f9...): the 'User-agent: *' group disallows detail pages (/angebote/), a query on the bare search path (/lst? and /lst/?), any URL with a 'cat=' parameter, /detailsuche and API paths. Search pages with make/model path segments (/lst/<make>/<model>?...) are not disallowed. Therefore this source is card_only: search-result cards only, no detail fetches.
 detail_mode: card_only
 allowed_hosts:
   - 'www.autoscout24.de'
