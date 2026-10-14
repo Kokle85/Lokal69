@@ -116,8 +116,11 @@ Each step only needs the steps above it; any step can stop without affecting the
 
 - **State:** `blocked`. Project `Lokal69- Sub` (ref `olkcgrahvkvzgnnsqspr`, eu-west-1,
   PostgreSQL 17.11) has every migration through `20261008000200` applied (docs/schema.md section
-  9; 16 migration files). It serves nothing: no backend process has connected to it, no user or
-  workspace was bootstrapped, no backup was restored.
+  9; 16 of the 17 migration files). `20261013000100_import_values` (the owner's recorded purchase
+  price and estimated customs value per listing, docs/schema.md 11.16) is **not yet applied**;
+  until it is, recording an estimated customs value against this project fails (the
+  `customs_value` category is refused). It serves nothing: no backend process has connected to
+  it, no user or workspace was bootstrapped, no backup was restored.
 - **Prerequisites (owner decisions):** approve the project and region for production; choose the
   backup capability actually bought (plan/PITR); decide on the two advisor warnings about the
   project-provided `public.rls_auto_enable()` (EXECUTE for `anon`/`authenticated`; not created by
@@ -135,7 +138,7 @@ Each step only needs the steps above it; any step can stop without affecting the
     `scripts/migrate.sh` or `supabase db push` against this project (docs/runbook.md 4.1).
 - **Steps:**
   1. `DATABASE_URL=<owner connection> uv run suv-deals db migrate --dry-run` (prints the target
-     without the password; expect no pending file).
+     without the password; expect no pending file once `20261013000100_import_values` is applied).
   2. `uv run suv-deals doctor --process api` and `GET /readyz` on the deployed API.
   3. Bootstrap (privileged connection in `MAINTENANCE_DATABASE_URL`, environment only):
      `uv run suv-deals bootstrap owner --user-id <auth user id> --workspace-name "Deals" --yes`,
@@ -223,9 +226,11 @@ Each step only needs the steps above it; any step can stop without affecting the
   `unknown` and stays incomplete. The tax rule is not a gate for the seller inquiry
   (`TAX_RULE_NOT_APPROVED` is informational there).
 - **Prerequisites:** a current, sourced rule set (official sources with retrieval time and
-  SHA-256), reviewed against golden cases. For the shipped draft: every `UNCERTAIN - confirm`
-  marker resolved (the list: docs/decisions/0003-transport-and-customs-calculator.md, "What the
-  owner must confirm"; evidence pack docs/tax/mk_import_fact_sheet_2026-10.md, section 13) and
+  SHA-256), reviewed against golden cases. For the shipped draft (`2026.10-draft.3`): every
+  remaining `UNCERTAIN - confirm` marker resolved (the list: docs/decisions/0003-transport-and-customs-calculator.md,
+  "What the owner must confirm"; evidence pack docs/tax/mk_import_fact_sheet_2026-10.md, section
+  13; the owner settled two on 2026-10-13: the ДМВ is in the import VAT base, and amounts are
+  whole denars, half-up) and
   every source re-fetched and re-hashed; the month's customs EUR/MKD rate recorded
   (`suv-deals fx record ... --purpose customs`).
 - **Who:** owner, with a qualified customs broker or tax professional.
@@ -239,6 +244,13 @@ Each step only needs the steps above it; any step can stop without affecting the
   approved or activated automatically: the gate stays `blocked` until the owner does it.
 - **Evidence:** rule set id/version and content SHA-256 (`suv-deals tax-rules list`), review record,
   approver, activation time, and `suv-deals doctor` reporting `tax_rules/production` ACTIVE.
+- **Per-vehicle values (owner decision D2, 2026-10-13):** once a rule set is ACTIVE, a valuation
+  computes the import charges on the owner's recorded ESTIMATED customs value of the listing when
+  there is one (else on the price), and its profit on the recorded REAL purchase price (else the
+  advertised price, as an estimate). The owner records both in the candidate's "Import values"
+  panel or with `suv-deals import-costs record-values ... --yes` (needs migration
+  `20261013000100`, section 3). An estimated customs value is a labelled planning figure: tax
+  lines built on it are never `rule_supported`.
 
 ## 7. `cost_assumptions`
 

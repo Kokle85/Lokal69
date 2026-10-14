@@ -96,7 +96,7 @@ seller reply in the owner's mailbox
 | `integrations/*` | FX (ECB), MCP Events webhook delivery, Slack adapter | domain |
 | `observability/*` | JSON logging with redaction, Prometheus metrics, audit helpers | – |
 | `views/*` | Read models (pydantic) shared by the dashboard API and MCP tools; address/quarantined-text visibility rules (`views.inquiries`) | domain |
-| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`, `jobs` (blocked jobs: list, unblock, resolve), `canary` (owner-controlled activation canaries), `tax-rules` (validate, list, store a draft), `import-costs estimate`) | persistence, workers, api |
+| `cli.py`, `cli_commands/*` | `suv-deals` operator CLI (processes, doctor, db, sources, credentials, `inquiries`, `sender-binding`, `mail-worker`, `evaluation`, `jobs` (blocked jobs: list, unblock, resolve), `canary` (owner-controlled activation canaries), `tax-rules` (validate, list, store a draft), `import-costs` (estimate; values; record-values, owner only)) | persistence, workers, api |
 
 Spec v1.1 seller-inquiry and reply modules (section 37, ADR 0002):
 
@@ -136,6 +136,9 @@ Customs calculator modules (ADR 0003):
 | `api/import_cost_routes.py` | `GET /api/import-costs/estimate` (`deals:read`) | persistence.queries, mcp.tools |
 | `api/owner_config_routes.py`, `views/owner_config.py` | Owner-only `/api/settings/tax-rules*` (store a draft, review, approve, activate, revoke) and `/api/settings/cost-profiles*` (approve) | valuation_repo |
 | `dashboard/src/screens/importCosts/`, `screens/settings/TaxRulesSection.tsx` | The "Customs calculator" screen and the owner's "Tax rules and cost profile" section | `/api/...` |
+| `persistence/import_values_repo.py` | The owner's recorded REAL purchase price and ESTIMATED customs value per listing (owner decision D2, ADR 0003 decision 14): `record_import_values` (owner only; supersedes, audits, invalidates the listing's valuations and queues one recomputation), `current_import_values` (`deals:read`), `apply_recorded_values` for the calculator and the valuation pipeline | valuation_repo, domain.import_estimate |
+| `api/import_values_routes.py`, `views/import_values.py` | `GET` / `POST /api/listings/{listing_id}/import-values` (`deals:read` / `config:admin`; never an MCP tool) and their view (whole euros + the exact amount) | persistence.import_values_repo |
+| `dashboard/src/screens/importValues/` | The candidate's "Import values" panel (both values, history, owner-only recording form) | `/api/...` |
 
 ## Coding conventions (binding)
 

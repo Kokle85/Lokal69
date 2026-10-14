@@ -92,7 +92,7 @@ def test_config_validate_flags_a_message_approval_gate_and_missing_sender(run_cl
 def test_config_validate_reports_the_tax_rule_draft(run_cli: Cli, config_copy: Path) -> None:
     result = run_cli("config", "validate")
     assert result.exit_code == 0, result.output
-    assert "tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json" in result.output
+    assert "tax_rules/drafts/mk_passenger_car_import_2026.10-draft.3.json" in result.output
     assert "unapproved draft: indicative preview only, never used for valuations" in result.output
     assert "no approved/active rule FILE in config/tax_rules" in result.output
     assert "rule sets STORED in the database" in result.output
@@ -150,7 +150,7 @@ def test_tax_rules_validate_drafts_directory(run_cli: Cli) -> None:
     # The North Macedonian draft ships unapproved: valid, unsealed, never selectable.
     result = run_cli("tax-rules", "validate", str(REPO / "config" / "tax_rules" / "drafts"))
     assert result.exit_code == 0, result.output
-    assert "VALID    mk_passenger_car_import_2026.10-draft.2.json" in result.output
+    assert "VALID    mk_passenger_car_import_2026.10-draft.3.json" in result.output
     assert "status             : draft" in result.output
     assert "not recorded (computed" in result.output
     assert "NOT selectable" in result.output

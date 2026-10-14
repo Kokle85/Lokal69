@@ -10,6 +10,12 @@ The owner asked, on 2026-10-13: „Транспортот стави го фик
 dot must have access to it so it can compute customs duty and tax from the data it gets about the
 vehicle).
 
+Later the same day the owner settled two of the fact sheet's open questions: „ДМВ влегува во
+основицата за ДДВ" (ДМВ is part of the import VAT base, ЗДДВ Art. 21: customs duty, taxes and other
+import charges except VAT itself; VAT = (customs value + duty + ДМВ + other applicable costs and
+charges) × 18%) and „заокружи го износот без децимали" (round the amounts without decimals).
+They are decisions 11 and 12 below.
+
 Before this decision every cost line except the purchase was `unknown`, and the tax engine
 (spec section 16) had no North Macedonian rule set at all, so import charges were `unknown` in
 every valuation. The research behind the calculator is the evidence pack
@@ -30,8 +36,10 @@ every valuation. The research behind the calculator is the evidence pack
 3. **One calculator, three surfaces, one service.** The read-only service
    `persistence/queries/import_costs.py` (scope `deals:read`) computes customs duty, motor-vehicle
    tax (ДМВ) and import VAT for one vehicle, from a listing's facts, from facts the caller states,
-   or both, plus the landed cost (price + EUR 700 + charges). It persists nothing (no valuation,
-   cost line, rate, audit, outbox or job row). It is served to:
+   or both, plus the landed cost (the REAL purchase price + EUR 700 + charges; decision 13). It
+   persists nothing (no valuation, cost line, rate, audit, outbox or job row); recording a
+   listing's purchase price and estimated customs value is a separate owner act (decision 14). It
+   is served to:
    - **dot** through the MCP tool `deals_estimate_import_costs` (docs/connect_mcp.md section 7);
    - the **dashboard** through `GET /api/import-costs/estimate` and the "Customs calculator"
      screen (`/import-costs`, `/candidates/<id>/import-costs`);
@@ -44,11 +52,12 @@ every valuation. The research behind the calculator is the evidence pack
    an integer guard, VAT-only incidental costs; config/tax_rules/README.md). Arithmetic is exact
    `Decimal`.
 5. **The North Macedonian rule set ships as an unapproved DRAFT**:
-   `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`
-   (`mk-passenger-car-import@2026.10-draft.2`, status `draft`, no approver, no sealed hash, 21
+   `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.3.json`
+   (`mk-passenger-car-import@2026.10-draft.3`, status `draft`, no approver, no sealed hash, 21
    components, every open point marked `UNCERTAIN - confirm`). It reproduces the fact sheet's
-   worked examples to the denar (`tests/unit/test_mk_rule_draft.py`: G01-G19, U1-U10, the ДМВ set
-   #1-#19).
+   worked examples to the denar (`tests/unit/test_mk_rule_draft.py`: G01-G19 with G17b/G17c,
+   U1-U10, the ДМВ set #1-#19). draft.3 replaced draft.2 on 2026-10-13 for decisions 11 and 12
+   (a content change is a new version, never an edit in place).
 6. **Valuations and alerts are unchanged in what they trust.** They use only an ACTIVE,
    owner-approved rule set (`select_rule_set`, `allow_unapproved=False`). Until one exists, import
    charges stay `unknown` and every valuation stays `incomplete`. Valuations now build their tax
@@ -68,8 +77,8 @@ every valuation. The research behind the calculator is the evidence pack
    states is used as an unverified caller attestation, HS 8703 only; a plug-in hybrid needs one,
    since its HS code decides the 50% ДМВ); the CO2 figure is used in the cycle printed on the document and
    WLTP and NEDC are never converted; the VAT base is the rule set's, never a guess. A missing fact
-   makes the affected charges unknown with an explicit reason. A catalogue (SchwackeNet) value only
-   adds a separate "customs revaluation risk" scenario, never a max().
+   makes the affected charges unknown with an explicit reason. An estimated customs value (e.g.
+   SchwackeNet) is a separate value with its source, never a max() of it and the price (decision 13).
 9. **The customs rate is data.** The EUR/MKD rate is the Customs monthly list rate for the
    declaration month, recorded with `suv-deals fx record ... --purpose customs`; a caller may supply
    it for one estimate (labelled `CALLER_SUPPLIED_CUSTOMS_RATE`, never stored). Without one, the
@@ -78,20 +87,80 @@ every valuation. The research behind the calculator is the evidence pack
     rule set and approving the cost profile are owner acts (dashboard Settings, `config:admin`;
     `suv-deals tax-rules store` only stores a draft). Nothing is approved or activated
     automatically.
+11. **ДМВ is part of the import VAT base** (owner decision D1 of 2026-10-13: „ДМВ влегува во
+    основицата за ДДВ"). ЗДДВ Art. 21(2)(1) adds to the base „царината, даноците ... другите
+    увозни давачки, освен данокот на додадена вредност", and ДМВ is an import levy assessed and
+    collected by Customs with the other import charges (ЗДМВ Arts. 8(1)(3), 9(10), 13(6)). So
+    VAT = 18% × (customs value + duty + ДМВ + incidental costs to the first destination not already
+    in the customs value). The draft always encoded this; its `UNCERTAIN - confirm` marker on
+    `vat_base_mkd` is removed and the component cites the owner confirmation and Art. 21(2)(1)
+    (draft.3). The fact sheet keeps the original evidence (section 6.3) and the history of open
+    question 1.
+12. **Amounts are rounded to whole denars** (owner decision D3 of 2026-10-13: „заокружи го износот
+    без децимали"). The rule set rounds every MKD component, the intermediate helpers included,
+    and the total to quantum 1, half-up, before the amount feeds the next charge
+    (`rounding_rules` `component_default` and `total`: `{"quantum": "1", "mode": "half_up",
+    "stage": "before_dependents"}`), as the declaration assesses the customs value, duty, ДМВ and
+    VAT and as the Customs ДМВ guide prints 38,123.8 as 38,124. Effects: totals move by at most a
+    few denars (D1 168,154.45 -> 168,155 MKD; fact sheet section 10.4), and the ДМВ value-part key
+    (customs value + duty, in EUR at the customs rate) is computed from the assessed whole-denar
+    amounts, so at the EUR 10,000 edge a car can fall into the 0% band where 2-decimal rounding put
+    it just above (golden case G17c: CV EUR 9,523.81 gives exactly 615,337 MKD = EUR 10,000).
+    The second half of the decision: the calculator presents EUR amounts (EUR equivalents,
+    purchase price, customs value for duties, landed cost) as whole euros, half-up, rounded from
+    the exact figures (a landed cost is summed exactly and rounded once, so it may differ by EUR 1
+    from the sum of rounded parts); the calculator view shows every amount, MKD included, without
+    a fraction (`"168155"`, `"2733"`), and the `facts` echo the inputs as given. Texts that quote
+    an input amount (the customs-value basis, assumptions, warnings, a recorded value's source)
+    drop a zero fraction ("invoice 3000 EUR + ... 700 EUR") and keep a real one exact
+    ("2800.50"), never a rounded figure the calculation did not use.
+13. **Two values per vehicle** (owner decision D2 of 2026-10-13). Customs officially uses the
+    SchwackeNet catalogue to assess used cars, but Царински закон Art. 28 makes the transaction
+    value (the price actually paid) the primary method; the other methods apply in the legal order
+    and only on founded doubt. So the vehicle facts keep the REAL purchase price (`price`, basis
+    `invoice`, `advertised` or a recorded `recorded_actual` / `recorded_quote` /
+    `recorded_estimate`) apart from an optional ESTIMATED customs value
+    (`estimated_customs_value_eur`, the vehicle without transport, always with
+    `estimated_customs_value_source`). The `primary` scenario's charges are computed on the estimate
+    + the transport to the MK place of entry (whether Customs adds that transport to a catalogue
+    value stays UNCERTAIN), otherwise on the transaction value; with an estimate the
+    `transaction_value` scenario shows the charges if Customs accepts the price paid; the
+    `standard_duty_if_proof_rejected` scenario stays. Every scenario's landed cost, and so the
+    profit, uses the REAL purchase price. The result names both values (`purchase_price`,
+    `customs_value_for_duties`); an estimate is listed in `unverified_inputs`, and one below the
+    price is flagged (`ESTIMATED_CUSTOMS_VALUE_BELOW_PRICE`). Example: bought for EUR 2,800,
+    catalogue EUR 4,200: duties on EUR 4,900 (185,803 MKD), landed cost EUR 6,520; on the invoice
+    (EUR 3,500) 165,213 MKD and EUR 6,185. The old `catalogue_value_eur` input and its
+    `customs_revaluation_risk` scenario are removed; `legal_base` is renamed `primary`.
+14. **The two values are recorded per listing** (owner decision D2, continued). The owner records
+    a listing's real purchase price (EUR, kind `actual` / `quote` / `estimate`, source, optional
+    document reference) and its estimated customs value (EUR without transport, source) in the
+    append-only `app.cost_evidence` (categories `purchase` and the new `customs_value`, migration
+    `20261013000100_import_values`; neither is a cost-profile category). A new value supersedes the
+    current one; recording is owner-only (`POST /api/listings/{listing_id}/import-values`, never an
+    MCP tool) and marks the listing's valuations stale with one queued recomputation. The
+    calculator's listing mode and the valuations use the current values (sources labelled; a
+    request's own value wins in the calculator). Valuations use the recorded purchase price as the
+    purchase (so the profit) and the recorded estimate for the import charges, still under ACTIVE
+    rules only, and cite both rows so superseding either re-values the listing.
 
 ## What the owner must confirm before approval
 
 The `UNCERTAIN - confirm` markers of the draft, from the fact sheet's section 13, ideally with a
 licensed customs broker:
 
-- ДМВ inside the import VAT base (statutory reading; no explicit administrative text).
+- Resolved by the owner on 2026-10-13 (decisions 11 and 12, no longer open): ДМВ inside the
+  import VAT base, and rounding (whole denars, half-up; was 0.01 MKD half-up in draft.2).
 - The СКД rate for the ДМВ value part (customs monthly list or the daily NBRSM rate), and how a CHF
   price is converted.
-- Rounding of duty, ДМВ and VAT (0.01 MKD half-up in the draft, or whole denars).
 - CO2 band edges (printed lower figures read as inclusive), non-integer CO2, the fuel column for
   hybrids and plug-in hybrids, `nedc_correlated` figures.
 - How Customs treats the EUR 700 lump sum (and any broker/terminal fees before the first
   destination) in the customs value and the VAT base.
+- When Customs values a used car on the SchwackeNet catalogue instead of the invoice, and whether
+  it adds the transport to the MK place of entry on top of a catalogue value (decision 13 keeps
+  both values and plans the `primary` charges on the owner's estimate + transport; the
+  transport part is marked UNCERTAIN in every result that uses an estimate).
 - Which non-EU preferential proofs are accepted in practice, and what evidence Customs accepts for
   US origin (final text of Сл. весник 130/25).
 - The legal act behind the Euro 4 import minimum; that no Euro 5 rule or later ДМВ amendment was

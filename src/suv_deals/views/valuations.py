@@ -396,10 +396,11 @@ class TaxComponentView(ViewModel):
     warnings: tuple[str, ...] = Field(max_length=100)
 
     @classmethod
-    def of(cls, comp: ComponentResult, *, currency: str | None) -> TaxComponentView:
-        """An unknown component shows ``unknown`` (never 0); a not-applicable one its reason."""
+    def of(cls, comp: ComponentResult, *, currency: str | None, whole: bool = False) -> TaxComponentView:
+        """An unknown component shows ``unknown`` (never 0); a not-applicable one its reason.
+        ``whole`` shows the amount in whole units (the import-cost calculator)."""
         if comp.status == ComponentStatus.RESOLVED:
-            amount = AmountView.of(comp.amount)
+            amount = AmountView.of(comp.amount, whole=whole)
         elif comp.status == ComponentStatus.NOT_APPLICABLE:
             amount = AmountView.not_applicable("rule predicate not met", currency=currency)
         else:

@@ -244,6 +244,63 @@ def test_cost_evidence_currency_pairing_and_quote_provider(seed: Seed, world_a: 
         seed.cost_evidence(ws, base_minor=-1)
 
 
+# Migration 20261013000100_import_values: the recorded estimated customs value (owner decision
+# 2026-10-13, two separate values per vehicle).
+
+
+def test_customs_value_category_is_accepted_and_unknown_categories_still_refused(
+    seed: Seed, world_a: World
+) -> None:
+    ws = world_a.workspace_id
+    row = seed.cost_evidence(
+        ws, category="customs_value", kind="estimate", base_minor=420000, listing_id=world_a.listing_id
+    )
+    assert seed.scalar("select category from app.cost_evidence where id = %s", (row,)) == "customs_value"
+    purchase = seed.cost_evidence(
+        ws, category="purchase", kind="actual", base_minor=280000, listing_id=world_a.listing_id
+    )
+    assert seed.scalar("select category from app.cost_evidence where id = %s", (purchase,)) == "purchase"
+    for unknown_category in ("customs", "customs_values", "catalogue_value", "CUSTOMS_VALUE", ""):
+        with violates("cost_evidence_category_ck"):
+            seed.cost_evidence(ws, category=unknown_category, listing_id=world_a.listing_id)
+
+
+def test_customs_value_rows_belong_to_a_listing_in_eur_as_estimates(seed: Seed, world_a: World) -> None:
+    ws = world_a.workspace_id
+    with violates("cost_evidence_customs_value_ck"):
+        seed.cost_evidence(ws, category="customs_value", kind="estimate")  # no listing
+    with violates("cost_evidence_customs_value_ck"):
+        seed.cost_evidence(
+            ws, category="customs_value", kind="estimate", currency="MKD", listing_id=world_a.listing_id
+        )
+    for kind in ("actual", "quote"):
+        with violates("cost_evidence_customs_value_ck"):
+            seed.cost_evidence(
+                ws, category="customs_value", kind=kind, provider="Customs", listing_id=world_a.listing_id
+            )
+    # Other categories keep their existing rules (an unscoped transport estimate in MKD is fine).
+    seed.cost_evidence(ws, category="transport", currency="MKD")
+
+
+def test_recorded_import_values_form_one_linear_chain_per_listing_and_category(
+    seed: Seed, world_a: World
+) -> None:
+    ws, listing = world_a.workspace_id, world_a.listing_id
+    first = seed.cost_evidence(ws, category="customs_value", listing_id=listing)
+    with pytest.raises(errors.UniqueViolation) as exc:
+        seed.cost_evidence(ws, category="customs_value", listing_id=listing)  # a second root
+    assert exc.value.diag.constraint_name == "cost_evidence_import_value_root_uk"
+    second = seed.cost_evidence(ws, category="customs_value", listing_id=listing, supersedes_id=first)
+    with pytest.raises(errors.UniqueViolation) as exc:
+        seed.cost_evidence(ws, category="customs_value", listing_id=listing, supersedes_id=first)  # a fork
+    assert exc.value.diag.constraint_name == "cost_evidence_import_value_chain_uk"
+    seed.cost_evidence(ws, category="customs_value", listing_id=listing, supersedes_id=second)
+    # The purchase chain of the same listing is separate; cost categories are not constrained.
+    seed.cost_evidence(ws, category="purchase", kind="actual", listing_id=listing)
+    seed.cost_evidence(ws, category="transport", listing_id=listing)
+    seed.cost_evidence(ws, category="transport", listing_id=listing)
+
+
 def test_valuation_unknown_is_never_zero(seed: Seed, world_a: World) -> None:
     ws = world_a.workspace_id
     with violates("valuations_unknown_not_zero_ck"):

@@ -1,11 +1,14 @@
 # North Macedonia: import charges on a used passenger car (HS 8703), as of 2026-10-13
 
 The evidence pack behind the import-cost calculator and the DRAFT rule set
-`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`
-(`mk-passenger-car-import@2026.10-draft.2`). The owner, with a qualified customs broker or tax
+`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.3.json`
+(`mk-passenger-car-import@2026.10-draft.3`). The owner, with a qualified customs broker or tax
 professional, reviews it **before** approving that rule set (docs/tax_rule_approval.md;
 decision record docs/decisions/0003-transport-and-customs-calculator.md). Per the owner's
-decision of 2026-10-13, transport to MK is fixed at EUR 700 per vehicle.
+decision of 2026-10-13, transport to MK is fixed at EUR 700 per vehicle. Two more owner decisions
+of 2026-10-13 settled open questions 1 and 4 (section 13): ДМВ is part of the import VAT base
+(section 6.3), and every charge is rounded to whole denars (section 3.5); draft.3 encodes both and
+section 10.4 shows the recomputed whole-denar examples.
 
 > **Status: research, not approved, not legal advice.** It was compiled on 2026-10-13 from the
 > primary texts and secondary sources cited in section 14. Nothing here is an approved rate. The
@@ -21,7 +24,7 @@ How the sections map to the repository:
 | Sections 1, 4, 5, 6, 7 (pipeline, duty, ДМВ, VAT) | the draft's 21 components: `customs_value_mkd`, `duty_*`, `vmv_mkd`, `dmv_*`, `vat_base_mkd`, `vat_import` (helpers are `intermediate` and never counted in a total) |
 | Section 2 (inputs) and section 11 (modelling rules) | the builder `src/suv_deals/domain/import_estimate.py` (`VehicleImportFacts` -> `build_tax_inputs`): origin never inferred (no proof = standard duty), CO2 cycle as printed (WLTP when the COC has it, never converted), 400 g/km deemed only when no document exists, the Euro 4 import gate as a warning |
 | Section 3.3 (the EUR 700) | the cost profile `config/cost_profiles/default_unapproved.yaml` (transport line EUR 700) and the builder's single transport line: all 700 in the customs value unless a separately invoiced inland leg is given |
-| Section 3.4 (SchwackeNet) | the optional `catalogue_value_eur`: a separate "customs revaluation risk" scenario, never a max() |
+| Section 3.4 (SchwackeNet) | the optional `estimated_customs_value_eur` with its source (owner decision 2026-10-13): the `primary` charges use it + transport, the `transaction_value` scenario shows the price paid, the landed cost always uses the real purchase price; never a max() |
 | Section 10 (golden examples) | `tests/unit/test_mk_rule_draft.py`: D1-D6 are G01-G06; the section 10.3 ДМВ set #1-#19 is checked one by one; tables 1 and 2 are typed in independently of the JSON |
 | Section 13 (open questions) | the `UNCERTAIN - confirm` markers of the draft and the calculator's `uncertain_items` |
 
@@ -64,9 +67,9 @@ There is no circularity: VAT is not part of the ДМВ base (ЗДМВ Art. 10(2)
 
 | Input | Used for | Notes |
 |---|---|---|
-| Purchase price and currency (EUR/CHF) | CV | Invoice or sales contract is mandatory |
+| REAL purchase price and currency (EUR/CHF) | CV when no estimate is given (transaction value); always the landed cost and the profit | Invoice or sales contract is mandatory |
 | Transport split of the EUR 700: part up to the MK place of entry vs. inland leg | CV vs. VAT base | Default: all 700 in CV (conservative); see section 3.3 |
-| Optional customs/catalogue value (SchwackeNet) | Risk scenario only | Not the legal default; see section 3.4 |
+| Optional ESTIMATED customs value (e.g. SchwackeNet) of the vehicle, without transport, with its source | CV of the `primary` scenario (+ transport to entry); the `transaction_value` scenario keeps the invoice | Owner decision D2 of 2026-10-13: a planning basis, not the legal default (Art. 28); never the profit basis; see section 3.4 |
 | Country of manufacture (VIN WMI) and proof of origin held (EUR.1 / origin declaration / US-origin evidence / none) | Duty rate | Default: no proof, so 5% |
 | HS subheading / drive type: ICE 8703 21-24, 31-33, 90; full hybrid 8703 40/50; plug-in 8703 60/70; BEV 8703 80; double-cab pick-up 8704 | ДМВ scope and reductions | Customs decides classification (ЗДМВ Art. 4(3)) |
 | Fuel (petrol/LPG/CNG vs diesel) | кCO2 column | |
@@ -101,9 +104,10 @@ There is no circularity: VAT is not part of the ДМВ base (ЗДМВ Art. 10(2)
 - **What the law says:**
   - If the invoice is missing for justified reasons, or there are „основани сомневања“ about it, the value is set under Arts. 29-34 (Art. 42(3)) [C]. The importer may ask for a written explanation (Art. 42(4)).
   - Art. 34(2) forbids (б) „систем кој овозможува ... прифаќање на повисоката од две алтернативни вредности“, (ѓ) „минимални царински вредности“ and (е) „произволни или измислени вредности“ [C].
-- **Calculator rule [D]:**
-  - Legal base case: CV = invoice + transport to entry.
-  - Optional risk case: if the user enters a catalogue value, compute a separate scenario with that value as CV. Label it "risk estimate (customs may revalue)". Never present max(invoice, catalogue) as the legal customs value.
+- **Calculator rule [D]** (owner decision D2 of 2026-10-13: two separate values per vehicle):
+  - The REAL purchase price (реална набавна цена) is kept for the profit and the landed cost.
+  - An optional ESTIMATED customs value (проценета царинска вредност, e.g. the SchwackeNet value, with its source) is what the `primary` scenario's import charges are computed on, plus the transport to entry (whether Customs adds that transport to a catalogue value is UNCERTAIN).
+  - Without an estimate, CV = invoice + transport to entry (the transaction value, Art. 28). With one, the `transaction_value` scenario shows the charges if Customs accepts the invoice. Never present max(invoice, catalogue) as the legal customs value.
 - **Effect on ДМВ:** the value component only bites if CV + duty exceeds EUR 10,000.
 
 ### 3.5 Currency conversion and FX
@@ -123,7 +127,10 @@ There is no circularity: VAT is not part of the ДМВ base (ЗДМВ Art. 10(2)
   - Neither refers to the monthly customs list.
   - For this project's cars (ВМВ ≤ EUR 10,000) the value component is 0, so this FX question does not change ДМВ. The CO2 component is fixed directly in MKD.
 - **Calculator rule [D]:** keep FX as a dated table with its source. Default: the customs monthly list for CV, duty and VAT, with an override. Use the same rate for СКД unless a daily NBRSM rate is supplied.
-- **Rounding [U]:** no statutory rounding rule was found for duty, ДМВ or VAT. The official Customs ДМВ guide (29.12.2019) shows 15,500 × 4% × 61.49 = 38,123.8 printed as 38,124 MKD, which suggests whole-denar rounding in practice. The derived examples below keep 2 decimals; rounding each charge to whole denars changes totals by less than 2 MKD.
+- **Rounding [owner decision 2026-10-13; was U]:** no statutory rounding rule was found for duty, ДМВ or VAT. The official Customs ДМВ guide (29.12.2019) shows 15,500 × 4% × 61.49 = 38,123.8 printed as 38,124 MKD, which suggests whole-denar rounding in practice.
+  - **Resolved:** the owner decided on 2026-10-13 „заокружи го износот без децимали" (round the amounts without decimals). The rule set (draft.3) rounds every MKD amount to whole denars, half-up, before it feeds the next charge (customs value, duty, ВМВ, ДМВ parts, ДМВ, VAT base, VAT) and rounds the total the same way. The decision also covers presentation: EUR amounts (EUR equivalents, purchase price, customs value, landed cost) are shown as whole euros, half-up; that is a surface change outside the rule set.
+  - **History:** draft.1 and draft.2 rounded to 0.01 MKD half-up and the section 10.4 examples kept 2 decimals. Whole denars change the D1-D6 totals by less than 1 MKD (section 10.4).
+  - **Edge effect [D]:** the ДМВ value-part key is the assessed customs value + duty in MKD converted at the customs rate, so whole-denar assessment can move a car that sits on the EUR 10,000 edge. At 61.5337 and 5% duty, CV EUR 9,523.81 gives 586,035.27 → 586,035 MKD and duty 29,301.75 → 29,302 MKD, so ВМВ = 615,337 MKD = exactly EUR 10,000 (0%), where 2 decimals gave 615,337.03 MKD (just over, 1%). The first 5%-duty CV over the edge is now EUR 9,523.82 (ВМВ 615,338 MKD).
 
 ---
 
@@ -230,7 +237,7 @@ The percentage applies to the **whole** ВМВ. The bands are printed as „на
 | 40,000-50,000 | 19% |
 | over 50,000 | 20% |
 
-- **Project segment [D]:** the value component is 0 unless CV + duty exceeds EUR 10,000. At 5% duty that means CV above EUR 9,523.81; at 0% duty, CV above EUR 10,000.
+- **Project segment [D]:** the value component is 0 unless CV + duty exceeds EUR 10,000. At 5% duty that means CV above EUR 9,523.81 (with whole-denar assessment at 61.5337, from EUR 9,523.82; section 3.5); at 0% duty, CV above EUR 10,000.
 - An October 2023 proposal to charge 1% on cars up to EUR 10,000 was **not adopted** [C].
 
 ### 5.5 Table 2: CO2 coefficients in force since 27.10.2023 (Сл. весник 220/2023) [C]
@@ -312,7 +319,8 @@ The percentage applies to the **whole** ВМВ. The bands are printed as „на
   1. „Царината, даноците, вклучувајќи ги акцизите, таксите, другите увозни давачки, освен данокот на додадена вредност“
   2. „Зависните трошоци, вклучувајќи ги трошоците за провизии, пакување, превоз и осигурување кои настануваат до првото место на крајната дестинација на доброто во земјата ...“
 
-### 6.3 ДМВ is in the VAT base [C statutory reading; no explicit administrative text]
+### 6.3 ДМВ is in the VAT base [C statutory reading; confirmed by the owner on 2026-10-13]
+- **Owner decision (2026-10-13):** „ДМВ влегува во основицата за ДДВ". Under ЗДДВ Art. 21 the import VAT base includes customs duty, taxes and other import charges, except VAT itself, so VAT = (customs value + duty + ДМВ + other applicable costs and charges) × 18%. The draft (`vat_base_mkd`) cites this confirmation and Art. 21(2)(1); it is no longer `UNCERTAIN`. The evidence below is kept as the basis.
 - **Why it is included:**
   - ЗДДВ Art. 21(2)(1) includes „даноците ... другите увозни давачки“.
   - ЗДМВ makes ДМВ an import levy: it arises at the customs debt (Art. 8(1)(3)), Customs assesses and collects it (Art. 9(10)), and it is paid „исто како и за останатите увозни давачки“ (Art. 13(6)).
@@ -356,6 +364,9 @@ DMV       = 0.5 × DMV if plug-in hybrid; 0 if BEV or oldtimer exemption
 VAT_base  = CV + duty + DMV + other_import_charges + transport_after_entry_EUR × FX
 VAT       = 0.18 × VAT_base
 TOTAL     = duty + DMV + VAT
+Rounding  : every MKD amount above (CV, duty, DMV parts, DMV, VAT_base, VAT) and TOTAL to whole
+            denars, half-up, before it is used further (owner decision 2026-10-13); VMV_EUR for the
+            Table 1 lookup = (CV + duty in MKD, as assessed) / FX
 ```
 
 ---
@@ -450,7 +461,11 @@ Final = (VMV + ДМВ/61.5) × 1.18, rounded to whole EUR.
 
 Correction applied: diesel NEDC 170 g/km uses 375, not 510+. A 170-260 g/km diesel range gives **63,750-228,800 MKD**.
 
-### 10.4 Derived, full pipeline, current rules (FX 61.5337 = customs list from 01.10.2026; 2-decimal rounding; transport EUR 700) [D]
+### 10.4 Derived, full pipeline, current rules (FX 61.5337 = customs list from 01.10.2026; whole-denar rounding; transport EUR 700) [D]
+
+Recomputed on 2026-10-13 for owner decision D3 (whole denars, half-up, every amount before it is
+used further), with an evaluator written from section 7 in exact fractions and independently of
+the engine; the engine (draft.3) agrees on every case of `tests/unit/test_mk_rule_draft.py`.
 
 | | D1 | D2 | D3 | D4 | D5 | D6 (risk) |
 |---|---|---|---|---|---|---|
@@ -459,24 +474,36 @@ Correction applied: diesel NEDC 170 g/km uses 375, not 510+. A 170-260 g/km dies
 | Transport in CV / inland leg (EUR) | 700 / 0 | 700 / 0 | 700 / 0 | 700 / 0 | 550 / 150 (separately invoiced) | 700 / 0 |
 | Origin proof | none, 5% | EU proof accepted, 0% | none, 5% | none, 5% | none, 5% | none, 5% |
 | CV (EUR) | 3,700 | 3,700 | 3,200 | 3,500 | 3,550 | 6,700 |
+| CV (MKD) | 227,675 | 227,675 | 196,908 | 215,368 | 218,445 | 412,276 |
+| Duty | 11,384 | 0 | 9,845 | 10,768 | 10,922 | 20,614 |
+| ВМВ MKD (EUR at 61.5337; value part 0%) | 239,059 (3,885.01) | 227,675 (3,700.01) | 206,753 (3,360.00) | 226,136 (3,674.99) | 229,367 (3,727.50) | 432,890 (7,035.01) |
+| кCO2 × CO2 = ДМВ | 510 × 189 = 96,390 | 96,390 | 590 × 245 = 144,550 | 880 × 400 = 352,000 | 375 × 170 = 63,750 | 96,390 |
+| Inland leg added to VAT base | 0 | 0 | 0 | 0 | 9,230.055 (rounded in the base) | 0 |
+| VAT base | 335,449 | 324,065 | 351,303 | 578,136 | 302,347 | 529,280 |
+| VAT 18% | 60,381 | 58,332 | 63,235 | 104,064 | 54,422 | 95,270 |
+| **Total import charges (MKD)** | **168,155** | **154,722** | **217,630** | **466,832** | **129,094** | **212,274** |
+| Total in EUR at 61.5337 | 2,732.73 | 2,514.43 | 3,536.76 | 7,586.61 | 2,097.94 | 3,449.72 |
+| Price + 700 + charges (EUR) | 6,432.73 | 6,214.43 | 6,736.76 | 11,086.61 | 5,797.94 | 10,149.72 |
+| Whole euros (D3 presentation) | 2,733 / 6,433 | 2,514 / 6,214 | 3,537 / 6,737 | 7,587 / 11,087 | 2,098 / 5,798 | 3,450 / 10,150 |
+
+History (draft.2, 0.01 MKD half-up), kept for comparison:
+
+| | D1 | D2 | D3 | D4 | D5 | D6 (risk) |
+|---|---|---|---|---|---|---|
 | CV (MKD) | 227,674.69 | 227,674.69 | 196,907.84 | 215,367.95 | 218,444.64 | 412,275.79 |
 | Duty | 11,383.73 | 0.00 | 9,845.39 | 10,768.40 | 10,922.23 | 20,613.79 |
-| ВМВ EUR (value part 0%) | 3,885.00 | 3,700.00 | 3,360.00 | 3,675.00 | 3,727.50 | 7,035.00 |
-| кCO2 × CO2 = ДМВ | 510 × 189 = 96,390 | 96,390 | 590 × 245 = 144,550 | 880 × 400 = 352,000 | 375 × 170 = 63,750 | 96,390 |
-| Inland leg added to VAT base | 0 | 0 | 0 | 0 | 9,230.06 | 0 |
 | VAT base | 335,448.42 | 324,064.69 | 351,303.23 | 578,136.35 | 302,346.93 | 529,279.58 |
 | VAT 18% | 60,380.72 | 58,331.64 | 63,234.58 | 104,064.54 | 54,422.45 | 95,270.32 |
-| **Total import charges (MKD)** | **168,154.45** | **154,721.64** | **217,629.97** | **466,832.94** | **129,094.68** | **212,274.11** |
-| Total in EUR at 61.5337 | 2,732.72 | 2,514.42 | 3,536.76 | 7,586.62 | 2,097.95 | 3,449.72 |
-| Price + 700 + charges (EUR) | 6,432.72 | 6,214.42 | 6,736.76 | 11,086.62 | 5,797.95 | 10,149.72 |
+| Total import charges (MKD) | 168,154.45 | 154,721.64 | 217,629.97 | 466,832.94 | 129,094.68 | 212,274.11 |
+| Whole denars minus 2 decimals | +0.55 | +0.36 | +0.03 | −0.94 | −0.68 | −0.11 |
 
 Landed cost excludes broker/terminal, conformity confirmation, registration fees and MTPL.
 
 Notes:
-- D1's CV and duty match the duty researcher's derived test: 227,674.69 / 11,383.73.
+- D1's unrounded CV and duty match the duty researcher's derived test: 227,674.69 / 11,383.73 (227,675 / 11,384 in whole denars).
 - D4 shows that a missing CO2 document is decisive: about +4,850 EUR versus D1.
 - D6 is a risk scenario, not the legal value (Art. 34(2)(б)). It assumes Customs adopts 6,000 EUR + transport as CV.
-- In the calculator, D6 is the `customs_revaluation_risk` scenario of a car bought for 3,000 EUR with a catalogue value of 6,000 EUR: the charges are the same (212,274.11 MKD), but its landed cost uses the price actually paid (3,000 + 700 + 3,449.72 = 7,149.72 EUR), not the 10,149.72 EUR above, which treats 6,000 EUR as the price.
+- In the calculator, D6 is the `primary` scenario of a car bought for 3,000 EUR with `estimated_customs_value_eur` 6,000 EUR (owner decision D2 of 2026-10-13): the charges are the same (212,274 MKD), but its landed cost uses the price actually paid (3,000 + 700 + 3,449.72 = 7,149.72, shown as EUR 7,150), not the 10,149.72 EUR above, which treats 6,000 EUR as the price; the `transaction_value` scenario next to it is D1 (168,155 MKD).
 
 ---
 
@@ -484,7 +511,7 @@ Notes:
 
 1. Default duty is 5%. Use 0% only on a user-confirmed held proof (EU/EFTA/TR/UK/CEFTA/UA) or US-origin evidence, and always display the 5% alternative.
 2. Put all EUR 700 into CV unless the user enters a separately invoiced inland leg. The VAT base always contains all 700.
-3. Compute a legal base case on invoice + transport. If a catalogue value is entered, show a separate "customs revaluation risk" case; never a max() of the two.
+3. Keep two values (owner decision D2 of 2026-10-13): the real purchase price for the landed cost and profit, and an optional estimated customs value (with its source) for the `primary` charges, plus transport. Without an estimate the primary case is invoice + transport; with one, show the `transaction_value` case (invoice + transport) beside it; never a max() of the two.
 4. CO2 column: WLTP if the COC has WLTP (alone or with NEDC); NEDC if NEDC only. If CO2 is missing, compute with 400 g/km and raise a blocking warning.
 5. Band lookup uses inclusive printed lower figures. Flag non-integer CO2.
 6. Block Euro ≤ 3 (configurable, `min_euro = 4`). Flag BEV (ДМВ 0), plug-in hybrid (50%), and 8704 pick-ups (kW table).
@@ -493,7 +520,7 @@ Notes:
    - Table 1;
    - Table 2 effective 2023-10-27;
    - duty branches effective 2025-07-01 (US) and 2011-01-01 (EU).
-8. Rounding is configurable. Default 2 decimals, with a whole-denar option.
+8. Rounding is part of the rule set. Owner decision of 2026-10-13: whole denars, half-up, for every MKD amount before it is used further and for the total (draft.3); EUR amounts are presented as whole euros. (Until draft.2: 2 decimals.)
 9. Registration-stage fees and broker fees are separate, configurable, labelled estimates. They are not import charges.
 
 ---
@@ -517,20 +544,21 @@ Notes:
 | 2010 duty cut act | Attribution to 35/2010 dropped as unsupported |
 | Old Customs FAQ VAT base | Not a conflict: it covers EV and historic vehicles, which pay no ДМВ |
 | Broker claim "kW × 120-360 MKD when CO2 is missing" | Misapplication of the 8704 pick-up Table 3. For M1 the 400 g/km default applies |
-| max(invoice, Schwacke) as customs value | Rejected as a legal rule (Art. 34(2)(б)); kept only as a risk scenario |
+| max(invoice, Schwacke) as customs value | Rejected as a legal rule (Art. 34(2)(б)). Since owner decision D2 (2026-10-13) the owner's ESTIMATED customs value is the planning basis of the `primary` charges, shown next to the `transaction_value` scenario on the invoice; it is never presented as the legal customs value |
 
 ---
 
 ## 13. Open questions (owner / licensed customs broker to confirm before approval)
 
-1. **ДМВ in the VAT base:** the statutory reading is strong, but no Customs or UJP text says so explicitly. Confirm against box 47 of a real ЕЦД for a used M1 car, or the Customs explainer of 03.02.2020 (PojasnuvanjeZakonDMV.pdf).
+1. **ДМВ in the VAT base: RESOLVED by the owner on 2026-10-13** („ДМВ влегува во основицата за ДДВ"; ЗДДВ Art. 21(2)(1); section 6.3; draft.3 `vat_base_mkd`). History: the statutory reading was strong, but no Customs or UJP text says so explicitly; the suggested check was box 47 of a real ЕЦД for a used M1 car, or the Customs explainer of 03.02.2020 (PojasnuvanjeZakonDMV.pdf). A real ЕЦД remains a useful cross-check, not a blocker.
 2. **Customs valuation in 2026:** is the SchwackeNet value applied to every used car or only when the invoice is doubted? On what legal basis, given Art. 34(2)? Is transport then added on top of the catalogue value?
+   - **Owner decision D2 (2026-10-13), not a legal answer:** Customs officially confirms it uses the SchwackeNet catalogue for used vehicles, while Art. 28 keeps the transaction value as the primary method and the other methods apply only in the legal order and on founded doubt. So the system keeps two values per vehicle: the REAL purchase price (profit, landed cost) and an ESTIMATED customs value (import charges; recorded per listing by the owner), and shows the `transaction_value` scenario next to the `primary` one (section 3.4). The questions above, and whether transport is added on top of a catalogue value (UNCERTAIN in the calculator), stay open for the approval.
 3. **FX:**
    - Which NBRSM day feeds the monthly customs list (Правилник 117/2009, unread)?
    - Does Customs use the monthly list or the daily NBRSM rate for СКД (ЗДМВ "day of import" vs Уредба "day of calculation")?
    - How is a CHF price converted?
    - The figure EUR 61.5337 (from 01.10.2026) was seen only in snippets.
-4. **Rounding** of duty, ДМВ and VAT: whole denars or 2 decimals, and which method.
+4. **Rounding: RESOLVED by the owner on 2026-10-13** („заокружи го износот без децимали"): whole denars, half-up, for every MKD amount before it is used further and for the total; EUR amounts shown as whole euros (section 3.5; draft.3 `rounding_rules`). History: the question was whole denars or 2 decimals, and which method; draft.1 and draft.2 used 0.01 MKD half-up.
 5. **CO2 bands:** how Customs treats boundary integers and non-integer CO2; which fuel column applies to hybrids; whether non-COC documents (manufacturer certificate, technical-assessment body) are accepted for used and Swiss cars, and in which column.
 6. **EUR 700 split:** how Customs treats a lump-sum door-to-door transport price; what document separates the inland leg; whether broker, terminal and handling fees before the first destination count as Art. 21(2)(2) incidental costs in the VAT base.
 7. **Origin proofs in practice:** can a buyer get a EUR.1 or a valid origin declaration for a used car from a DE/IT private seller or dealer? Can Swiss exporters issue PEM proofs for EU-built cars?
@@ -582,7 +610,10 @@ Notes:
 
 The section 10 examples were checked twice during research (hand arithmetic and a reference
 evaluator over the draft JSON) and are now checked on every test run through the real engine by
-`tests/unit/test_mk_rule_draft.py`. The primary texts downloaded during research were local
+`tests/unit/test_mk_rule_draft.py`. After the owner's whole-denar decision (2026-10-13) every golden
+case (G01-G19, G17b, G17c, the plug-in hybrid deemed cases, U1-U10 and the section 10.3 set) was
+recomputed with an evaluator written from section 7 in exact fractions, independently of the
+engine, before the tests were changed; the engine on draft.3 agreed on every amount. The primary texts downloaded during research were local
 working copies and are not in the repository: the `sha256` values in the draft's `sources` are of
 those copies. The reviewer must re-fetch every source from its official URL and record its own
 retrieval time and hash before approval (docs/tax_rule_approval.md, step 4).

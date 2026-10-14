@@ -2,13 +2,19 @@
  * The customs calculator's vehicle-facts form. It only collects text: every value goes to the
  * server as typed (`GET /api/import-costs/estimate`), which validates it; fields a validation
  * error names are marked. On the listing route an empty field keeps the listing's fact (shown as
- * "From the listing: ..."), except a fact the server ties to one you enter: a CO2 figure you enter
- * never takes the listing's CO2 document, and a price you enter counts as advertised unless you
- * state its basis (`merge_facts`). Nothing is inferred here (no origin, no tariff code, no CO2
- * conversion).
+ * "From the listing: ...") or the owner's RECORDED import value ("Recorded for this listing:
+ * ..."), except a fact the server ties to one you enter: a CO2 figure you enter never takes the
+ * listing's CO2 document, and a price you enter counts as advertised unless you state its basis
+ * (`merge_facts`). A RECORDED purchase price keeps its recorded kind: the price basis then applies
+ * only to a price you enter (the server refuses a basis alone), so the select is locked until you
+ * enter one. Nothing is inferred here (no origin, no tariff code, no CO2 conversion).
+ *
+ * The two values of a vehicle (owner decision 2026-10-13) have their own group, labelled in English
+ * and Macedonian: the REAL purchase price (the landed cost and the profit use it) and the ESTIMATED
+ * customs value with its source (the import charges of the primary scenario use it).
  */
 import { useState, type ReactNode } from 'react'
-import { FIELD_LABELS, type FormState, type HintKey, type QueryKey } from './form'
+import { FIELD_LABELS, FIELD_LABELS_MK, type FormState, type Hint, type HintKey, type HintOrigin, type QueryKey } from './form'
 
 type Option = readonly [value: string, text: string]
 
@@ -21,7 +27,7 @@ const CURRENCIES: Option[] = [
 const PRICE_BASES: Option[] = [
   ['', 'Not given (counts as advertised)'],
   ['advertised', 'Advertised price (a claim)'],
-  ['invoice', 'Invoice / contract price'],
+  ['invoice', 'Invoice / contract price (actually paid)'],
 ]
 const FUELS: Option[] = [
   ['', 'Not given'],
@@ -73,31 +79,54 @@ const CO2_FIGURE_KEYS: readonly QueryKey[] = [
   'co2_unknown_cycle_g_km',
 ]
 
+/** "The listing's" / "The recorded" (whose value an empty field keeps). */
+const ORIGIN_OWNER: Record<HintOrigin, string> = { listing: "The listing's", recorded: 'The recorded' }
+const ORIGIN_PREFIX: Record<HintOrigin, string> = { listing: 'From the listing', recorded: 'Recorded for this listing' }
+const ORIGIN_KEEP: Record<HintOrigin, string> = { listing: "Keep the listing's", recorded: 'Keep the recorded' }
+
 /**
  * Facts the server derives from another fact you set, never from the listing (mirrors
  * `queries.import_costs.merge_facts`): with a CO2 figure (or the "without CO2" box) the CO2
  * document is only what you state, and a price you enter counts as advertised unless you state
  * its basis. For these fields "Keep the listing's" would be untrue.
  */
-const COUPLED: Partial<Record<QueryKey, { given(form: FormState): boolean; empty: string; hint: string }>> = {
+const COUPLED: Partial<Record<QueryKey, { given(form: FormState): boolean; empty: string; hint: (origin: HintOrigin) => string }>> = {
   co2_document: {
     given: (form) => CO2_FIGURE_KEYS.some((key) => form[key].trim() !== '') || form.co2_clear === 'true',
     empty: 'Not given (a CO2 figure you enter needs its own document)',
-    hint: "The listing's CO2 document is not applied to a CO2 figure you enter.",
+    hint: (origin) => `${ORIGIN_OWNER[origin]} CO2 document is not applied to a CO2 figure you enter.`,
   },
   price_basis: {
     given: (form) => form.price_amount.trim() !== '' || form.price_currency !== '',
     empty: 'Not given (counts as advertised)',
-    hint: "The listing's price basis is not applied to a price you enter.",
+    hint: (origin) => `${ORIGIN_OWNER[origin]} price basis is not applied to a price you enter.`,
   },
+}
+
+/** The English label, with the Macedonian one for the two values (owner decision 2026-10-13). */
+function fieldLabel(key: QueryKey): ReactNode {
+  const mk = FIELD_LABELS_MK[key]
+  return (
+    <>
+      {FIELD_LABELS[key]}
+      {mk ? (
+        <>
+          {' · '}
+          <span lang="mk" className="label-mk">
+            {mk}
+          </span>
+        </>
+      ) : null}
+    </>
+  )
 }
 
 export interface CalculatorFormProps {
   initial: FormState
-  /** The listing route: empty fields keep the listing's facts. */
+  /** The listing route: empty fields keep the listing's facts (or its recorded import values). */
   listingMode: boolean
-  /** What the listing established, per field (listing route only). */
-  hints: Partial<Record<HintKey, string>>
+  /** What the listing established or the owner recorded, per field (listing route only). */
+  hints: Partial<Record<HintKey, Hint>>
   /** Fields the last server-side validation named. */
   invalid: ReadonlySet<string>
   busy: boolean
@@ -108,23 +137,40 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
   const [form, setForm] = useState<FormState>(initial)
   const set = (key: QueryKey, value: string) => setForm((previous) => ({ ...previous, [key]: value }))
 
+  /**
+   * The listing's purchase price is the owner's RECORDED one and no price is entered: it keeps its
+   * recorded kind (actual, quote or estimate), exactly as the valuation uses it, so no other basis
+   * can be stated for it (`merge_facts` refuses a basis without a price). Enter a price to state one.
+   */
+  const basisLocked =
+    listingMode && hints.price_basis?.origin === 'recorded' && !COUPLED.price_basis?.given(form)
+
   /** The listing's fact no longer applies because the user set the fact it is tied to. */
   const decoupled = (key: HintKey): boolean =>
     listingMode && key !== 'co2' && Boolean(COUPLED[key]?.given(form))
 
   const hint = (key: HintKey): ReactNode => {
-    if (decoupled(key)) return <span className="field-hint">{COUPLED[key as QueryKey]?.hint}</span>
-    return listingMode && hints[key] ? <span className="field-hint">From the listing: {hints[key]}</span> : null
+    const shown = listingMode ? hints[key] : undefined
+    if (decoupled(key)) return <span className="field-hint">{COUPLED[key as QueryKey]?.hint(shown?.origin ?? 'listing')}</span>
+    return shown ? (
+      <span className="field-hint" data-hint-origin={shown.origin}>
+        {ORIGIN_PREFIX[shown.origin]}: {shown.text}
+      </span>
+    ) : null
   }
 
   const emptyLabel = (key: QueryKey, fallback: string): string => {
     if (decoupled(key)) return COUPLED[key]?.empty ?? fallback
-    return listingMode && hints[key] ? `Keep the listing's (${hints[key]})` : fallback
+    const shown = listingMode ? hints[key] : undefined
+    return shown ? `${ORIGIN_KEEP[shown.origin]} (${shown.text})` : fallback
   }
 
-  const text = (key: QueryKey, options: { help?: string; inputMode?: 'decimal' | 'numeric' | 'text'; type?: 'text' | 'date' } = {}) => (
+  const text = (
+    key: QueryKey,
+    options: { help?: ReactNode; extra?: ReactNode; inputMode?: 'decimal' | 'numeric' | 'text'; type?: 'text' | 'date' } = {},
+  ) => (
     <div className="field" key={key}>
-      <label htmlFor={fieldId(key)}>{FIELD_LABELS[key]}</label>
+      <label htmlFor={fieldId(key)}>{fieldLabel(key)}</label>
       <input
         id={fieldId(key)}
         name={key}
@@ -132,22 +178,40 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
         inputMode={options.inputMode ?? 'text'}
         autoComplete="off"
         value={form[key]}
-        placeholder={listingMode ? hints[key] : undefined}
+        placeholder={listingMode ? hints[key]?.text : undefined}
         aria-invalid={invalid.has(key) || undefined}
         onChange={(event) => set(key, event.target.value)}
       />
       {hint(key)}
       {options.help ? <span className="field-hint">{options.help}</span> : null}
+      {options.extra}
     </div>
   )
 
-  const select = (key: QueryKey, choices: Option[], help?: string) => (
+  /**
+   * An estimate you enter needs its own source: the server refuses an estimate without one (the
+   * pair is checked before the recorded values are merged, so the recorded source is never reused).
+   * Say so before the request is sent.
+   */
+  const recordedSource = listingMode ? hints.estimated_customs_value_source : undefined
+  const sourceWarning =
+    recordedSource?.origin === 'recorded' &&
+    form.estimated_customs_value_eur.trim() !== '' &&
+    form.estimated_customs_value_source.trim() === '' ? (
+      <span className="field-hint field-hint-warn" role="note">
+        An estimate you enter needs its own source: the recorded source ({recordedSource.text}) is not reused, so the
+        request is refused without one.
+      </span>
+    ) : null
+
+  const select = (key: QueryKey, choices: Option[], help?: string, locked?: ReactNode) => (
     <div className="field" key={key}>
-      <label htmlFor={fieldId(key)}>{FIELD_LABELS[key]}</label>
+      <label htmlFor={fieldId(key)}>{fieldLabel(key)}</label>
       <select
         id={fieldId(key)}
         name={key}
-        value={form[key]}
+        value={locked ? '' : form[key]}
+        disabled={Boolean(locked)}
         aria-invalid={invalid.has(key) || undefined}
         onChange={(event) => set(key, event.target.value)}
       >
@@ -158,6 +222,11 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
         ))}
       </select>
       {hint(key)}
+      {locked ? (
+        <span className="field-hint" role="note">
+          {locked}
+        </span>
+      ) : null}
       {help ? <span className="field-hint">{help}</span> : null}
     </div>
   )
@@ -185,21 +254,46 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
       aria-label="Vehicle facts"
       onSubmit={(event) => {
         event.preventDefault()
-        if (!busy) onSubmit(form)
+        // A basis left over (e.g. from the URL) never relabels the recorded purchase price.
+        if (!busy) onSubmit(basisLocked ? { ...form, price_basis: '' } : form)
       }}
     >
       <p className="muted small">
         {listingMode
-          ? "Every field you fill in replaces the listing's fact; an empty field keeps the listing's value (or stays unknown, never zero). A CO2 figure you enter does not take the listing's CO2 document."
+          ? "Every field you fill in replaces the listing's fact or its recorded value; an empty field keeps it (or stays unknown, never zero). A CO2 figure you enter does not take the listing's CO2 document."
           : 'Fill in what you know. An empty field stays unknown (never zero), and the result says what is missing.'}{' '}
         Decimals use a dot (e.g. 3000.00). Nothing you enter is stored.
       </p>
-      <fieldset>
-        <legend>Price</legend>
+      <fieldset data-testid="calc-two-values">
+        <legend>
+          Two values per vehicle · <span lang="mk">Две вредности по возило</span>
+        </legend>
+        <p className="field-hint">
+          The landed cost and the profit always use the real purchase price. The import charges use the estimated customs
+          value (plus the transport to the MK border) when you give one; otherwise the price paid (transaction value,
+          Customs Law art. 28). With an estimate the result also shows the charges if Customs accepts the price paid.
+        </p>
         <div className="calc-grid">
-          {text('price_amount', { inputMode: 'decimal' })}
+          {text('price_amount', { inputMode: 'decimal', help: 'What is, or will be, actually paid' })}
           {select('price_currency', CURRENCIES)}
-          {select('price_basis', PRICE_BASES)}
+          {select(
+            'price_basis',
+            PRICE_BASES,
+            undefined,
+            basisLocked
+              ? 'The recorded purchase price keeps its recorded kind; enter a price to state another basis.'
+              : undefined,
+          )}
+        </div>
+        <div className="calc-grid">
+          {text('estimated_customs_value_eur', {
+            inputMode: 'decimal',
+            help: 'EUR, the vehicle only, without transport (e.g. the SchwackeNet catalogue value)',
+          })}
+          {text('estimated_customs_value_source', {
+            help: 'Required with an estimate, e.g. "SchwackeNet catalogue"',
+            extra: sourceWarning,
+          })}
         </div>
       </fieldset>
       <fieldset>
@@ -239,14 +333,13 @@ export function CalculatorForm({ initial, listingMode, hints, invalid, busy, onS
         </div>
       </fieldset>
       <fieldset>
-        <legend>Customs value, transport and rate</legend>
+        <legend>Transport, importer and rate</legend>
         <div className="calc-grid">
           {text('declaration_date', { type: 'date', help: 'Default: today' })}
           {text('customs_eur_mkd_rate', {
             inputMode: 'decimal',
             help: 'Customs monthly list rate; used only when none is recorded for the month, never stored',
           })}
-          {text('catalogue_value_eur', { inputMode: 'decimal', help: 'Adds the customs-revaluation risk scenario' })}
           {text('transport_after_entry_eur', { inputMode: 'decimal', help: 'Part of the fixed transport after the MK border' })}
           {select('importer_status', IMPORTERS)}
         </div>

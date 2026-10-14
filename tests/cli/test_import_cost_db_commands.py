@@ -1,9 +1,12 @@
-"""``suv-deals import-costs estimate | tax-rules list | tax-rules store`` on a real database (marker
-``db``).
+"""``suv-deals import-costs estimate | values | record-values | tax-rules list | tax-rules store`` on
+a real database (marker ``db``).
 
 The calculator runs as the operator's system actor (``deals:read``) through the shared read
 service and writes nothing; ``tax-rules store`` stores the shipped DRAFT file as the verified
-ACTIVE owner (audited) and never approves or activates it. Every workspace, listing and rate is
+ACTIVE owner (audited) and never approves or activates it. ``import-costs record-values`` records a
+listing's real purchase price and estimated customs value as the verified ACTIVE owner (audited,
+superseding, valuations invalidated) and ``estimate`` / ``values`` then use and show them (owner
+decision 2026-10-13: bought for EUR 2,800, SchwackeNet EUR 4,200). Every workspace, listing and rate is
 SYNTHETIC; 61.5337 is the fact sheet's golden-case customs rate (test value only) and G01 the
 golden total of the shipped draft. Where a test needs ACTIVE rules, the draft is activated through
 the real owner transitions in a throwaway test workspace only.
@@ -13,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -39,8 +43,9 @@ from suv_deals.persistence.database import Database
 pytestmark = pytest.mark.db
 
 REPO = Path(__file__).resolve().parents[2]
-G01 = "168154.45"  # D1: diesel, NEDC 189 (COC), EUR 3,000 + EUR 700 transport, no proof of origin
-LABEL = "mk-passenger-car-import@2026.10-draft.2"
+#: Whole denars without a fraction (owner decision of 2026-10-13: amounts without decimals).
+G01 = "168155"  # D1: diesel, NEDC 189 (COC), EUR 3,000 + EUR 700 transport, no proof of origin
+LABEL = "mk-passenger-car-import@2026.10-draft.3"
 FACTS = (
     "--price", "3000", "--fuel", "diesel", "--co2", "nedc:189", "--co2-document", "coc",
     "--declaration-date", "2026-10-13",
@@ -110,7 +115,7 @@ def test_estimate_from_facts_is_an_indicative_preview_and_writes_nothing(
     assert data["mode"] == "indicative_preview" and data["production_ready"] is False
     assert data["rule"]["rule_set_id"] == "mk-passenger-car-import" and data["rule"]["status"] == "draft"
     legal = data["scenarios"][0]
-    assert legal["name"] == "legal_base" and legal["total"] is None
+    assert legal["name"] == "primary" and legal["total"] is None
     assert legal["indicative_total"]["amount"] == G01
     assert data["customs_fx_source"] == "caller_supplied"
     assert data["banner"]["mk"].startswith("ИНДИКАТИВНА ПРОЦЕНКА")
@@ -118,7 +123,7 @@ def test_estimate_from_facts_is_an_indicative_preview_and_writes_nothing(
     human = _estimate(run_cli, db_env, workspace, *FACTS, "--customs-eur-mkd-rate", CUSTOMS_RATE)
     assert human.exit_code == 0, human.output
     assert "!! INDICATIVE PREVIEW" in human.output and "mode: indicative_preview" in human.output
-    assert f"{G01} MKD  (2732.72 EUR)" in human.output and "indicative_total" in human.output
+    assert f"{G01} MKD  (2733 EUR)" in human.output and "indicative_total" in human.output
     assert "CALLER_SUPPLIED_CUSTOMS_RATE:1 EUR = 61.5337 MKD" in human.output
     assert counts(seed, workspace) == before
 
@@ -141,7 +146,7 @@ def test_estimate_from_a_listing_with_a_recorded_customs_rate(
     human = _estimate(run_cli, db_env, workspace, *args, "-v")
     assert human.exit_code == 0, human.output
     assert f"listing                     : {listing} revision 1" in human.output
-    assert "price                     : 3000.00 EUR (advertised)  [listing]" in human.output
+    assert "real purchase price       : 3000 EUR (advertised)  [listing]" in human.output
     assert "[helper, not counted]" in human.output
     unknown = _estimate(run_cli, db_env, workspace, "--listing-id", str(uuid4()))
     assert unknown.exit_code == 1 and "NOT_FOUND" in unknown.output
@@ -188,6 +193,185 @@ def test_without_any_rule_set_the_estimate_is_unavailable(
     assert "Missing facts: tax_rule_set" in result.output and "Scenario" not in result.output
 
 
+# --------------------------------------------------------------------------- values / record-values
+
+PAID = ("--purchase-price", "2800", "--purchase-kind", "actual", "--purchase-source", "seller invoice")
+SCHWACKE = (
+    "--estimated-customs-value-eur",
+    "4200",
+    "--estimated-customs-value-source",
+    "SchwackeNet catalogue",
+)
+
+
+def _plain(output: str) -> str:
+    """The output with each label's padding collapsed (``label : value``)."""
+    return re.sub(r"(?<=\S) {2,}: ", " : ", output)
+
+
+def _import_values(seed: Seed, workspace: UUID) -> list[tuple[Any, ...]]:
+    return seed.conn.execute(
+        "select category, kind, base_minor, currency, provider, document_ref, recorded_by, supersedes_id"
+        " from app.cost_evidence where workspace_id = %s and category in ('purchase', 'customs_value')"
+        " order by created_at, category = 'customs_value', id",  # one call's rows share a time
+        (workspace,),
+    ).fetchall()
+
+
+def test_the_owner_records_both_values_and_the_estimate_uses_them(
+    run_cli: Cli, db_env: dict[str, str], workspace: UUID, seed: Seed, source: tuple[UUID, str]
+) -> None:
+    listing = add_listing(seed, workspace, source[0], source[1])  # advertised EUR 3,000
+    _record_customs_rate(run_cli, db_env, workspace)
+    record = ("import-costs", "record-values", "--workspace", str(workspace), "--listing-id", str(listing))
+    refused = run_cli(*record, "--owner-user-id", str(seed.user()), *PAID, env=db_env)
+    assert refused.exit_code == 3 and "re-run with --yes" in refused.output
+    stranger = run_cli(*record, "--owner-user-id", str(seed.user()), *PAID, "--yes", env=db_env)
+    assert stranger.exit_code == 1 and "not an active owner" in stranger.output
+    reviewer = seed.user()
+    seed.membership(workspace, reviewer, "reviewer")
+    not_owner = run_cli(*record, "--owner-user-id", str(reviewer), *PAID, "--yes", env=db_env)
+    assert not_owner.exit_code == 1 and "not an active owner" in not_owner.output
+    assert _import_values(seed, workspace) == []
+
+    owner = _owner(seed, workspace)
+    recorded = run_cli(
+        *record, "--owner-user-id", str(owner), *PAID, *SCHWACKE, "--document-ref", "INV-SYNTHETIC-1",
+        "--yes", env=db_env,
+    )  # fmt: skip
+    assert recorded.exit_code == 0, recorded.output
+    out = _plain(recorded.output)
+    assert f"Recorded for listing {listing} (owner {owner}; audited import_values.record):" in out
+    assert "real purchase price : 2800 EUR  (seller invoice, the first value of its kind)" in out
+    assert "estimated customs value : 4200 EUR  (SchwackeNet catalogue, the first value of its kind)" in out
+    assert "valuations marked stale : 0" in out and "recomputation queued : job " in out
+    rows = _import_values(seed, workspace)
+    assert [r[:7] for r in rows] == [
+        ("purchase", "actual", 280000, "EUR", "seller invoice", "INV-SYNTHETIC-1", owner),
+        ("customs_value", "estimate", 420000, "EUR", "SchwackeNet catalogue", "INV-SYNTHETIC-1", owner),
+    ]
+    audits = seed.conn.execute(
+        "select actor_principal_id, actor_kind from ops.audit_events"
+        " where workspace_id = %s and action = 'import_values.record'",
+        (workspace,),
+    ).fetchall()
+    assert audits == [(owner, "user")]
+    jobs = seed.scalar(
+        "select count(*) from ops.jobs where workspace_id = %s and listing_id = %s"
+        " and job_type = 'valuation'",
+        (workspace, listing),
+    )
+    assert jobs == 1  # the listing's valuation is recomputed with the recorded values
+
+    # The calculator's listing mode uses both recorded values automatically.
+    args = ("--listing-id", str(listing), "--co2-document", "coc", "--declaration-date", "2026-10-13")
+    raw = _estimate(run_cli, db_env, workspace, *args, "--json")
+    assert raw.exit_code == 0, raw.output
+    data = json.loads(raw.output)["data"]
+    totals = {
+        s["name"]: (s["indicative_total"]["amount"], s["indicative_landed_cost_eur"]["amount"])
+        for s in data["scenarios"]
+    }
+    assert totals == {"primary": ("185803", "6520"), "transaction_value": ("165213", "6185")}
+    assert data["purchase_price"]["basis"] == "recorded_actual"
+    assert data["customs_value_for_duties"]["basis"] == "estimated"
+    sources = {s["fact"]: s["source"] for s in data["fact_sources"]}
+    assert sources["price"] == "recorded" and sources["estimated_customs_value_eur"] == "recorded"
+    human = _estimate(run_cli, db_env, workspace, *args)
+    assert human.exit_code == 0, human.output
+    text = _plain(human.output)
+    assert "real purchase price : 2800 EUR (recorded_actual)  [recorded]" in text  # the facts used
+    assert "real purchase price : 2800 EUR  (recorded_actual: recorded actual purchase price" in text
+    assert "customs value for duties : 4900 EUR  (estimated: recorded estimated customs value" in text
+    assert "estimated customs value : 4200 EUR, without transport (SchwackeNet catalogue)  [recorded]" in text
+    assert "RECORDED_PURCHASE_PRICE_USED" in text and "RECORDED_CUSTOMS_VALUE_USED" in text
+    # A value given here replaces the recorded one for this estimate only.
+    override = _estimate(
+        run_cli, db_env, workspace, *args, "--price", "3000", "--price-basis", "invoice", "--json"
+    )
+    odata = json.loads(override.output)["data"]
+    assert odata["purchase_price"]["basis"] == "invoice"
+    assert any(n.startswith("RECORDED_PURCHASE_PRICE_OVERRIDDEN") for n in odata["notes"])
+
+    # values shows the current values; a new value supersedes the old one.
+    shown = run_cli(
+        "import-costs", "values", "--workspace", str(workspace), "--listing-id", str(listing), env=db_env
+    )
+    assert shown.exit_code == 0, shown.output
+    text = _plain(shown.output)
+    assert f"IMPORT VALUES  listing {listing}" in text
+    assert (
+        "real purchase price : 2800 EUR  (actual; source: seller invoice; document INV-SYNTHETIC-1;" in text
+    )
+    assert f"by {owner})" in text
+    assert (
+        "estimated customs value : 4200 EUR  (estimate, without transport; source: SchwackeNet catalogue;"
+        in text
+    )
+    first_purchase = rows[0]
+    again = run_cli(
+        *record, "--owner-user-id", str(owner), "--purchase-price", "2750.50", "--purchase-kind", "quote",
+        "--purchase-source", "seller offer", "--yes", "--json", env=db_env,
+    )  # fmt: skip
+    assert again.exit_code == 0, again.output
+    result = json.loads(again.output)["data"]
+    assert len(result["recorded_ids"]) == 1 and len(result["superseded_ids"]) == 1
+    assert result["values"]["purchase_price"]["amount"]["amount"] == "2751"  # whole euros, half-up
+    assert result["values"]["purchase_price"]["amount_exact"] == "2750.50"
+    assert result["values"]["estimated_customs_value"]["source"] == "SchwackeNet catalogue"
+    assert len(_import_values(seed, workspace)) == 3 and first_purchase[7] is None
+    listed = run_cli(
+        "import-costs",
+        "values",
+        "--workspace",
+        str(workspace),
+        "--listing-id",
+        str(listing),
+        "--json",
+        env=db_env,
+    )
+    view = json.loads(listed.output)["data"]
+    assert view["purchase_price"]["kind"] == "quote"
+    history = [(h["category"], h["kind"], h["current"]) for h in view["history"]]
+    # Newest first; the first call's two rows share one transaction time (either order).
+    assert history[0] == ("purchase", "quote", True)
+    assert sorted(history[1:]) == [("customs_value", "estimate", True), ("purchase", "actual", False)]
+    text = run_cli(
+        "import-costs", "values", "--workspace", str(workspace), "--listing-id", str(listing), env=db_env
+    ).output
+    assert "2751 EUR (exact 2750.50)" in text and "superseded" in text
+
+
+def test_import_values_of_a_missing_or_foreign_listing_are_not_found(
+    run_cli: Cli, db_env: dict[str, str], workspace: UUID, seed: Seed
+) -> None:
+    owner = _owner(seed, workspace)
+    other = seed.workspace("CLI foreign workspace")
+    try:
+        key = unique("synthetic_src").lower()
+        foreign_source = seed.source(other, source_key=key, mode="public_html", adapter="synthetic_adapter")
+        foreign = add_listing(seed, other, foreign_source, key)
+        for listing in (uuid4(), foreign):
+            recorded = run_cli(
+                "import-costs", "record-values", "--workspace", str(workspace), "--listing-id", str(listing),
+                "--owner-user-id", str(owner), *SCHWACKE, "--yes", env=db_env,
+            )  # fmt: skip
+            assert recorded.exit_code == 1 and "NOT_FOUND" in recorded.output, recorded.output
+            shown = run_cli(
+                "import-costs",
+                "values",
+                "--workspace",
+                str(workspace),
+                "--listing-id",
+                str(listing),
+                env=db_env,
+            )
+            assert shown.exit_code == 1 and "NOT_FOUND" in shown.output, shown.output
+        assert _import_values(seed, workspace) == [] and _import_values(seed, other) == []
+    finally:
+        seed.conn.execute("update app.workspaces set active = false where id = %s", (other,))
+
+
 # --------------------------------------------------------------------------- tax-rules list / store
 
 
@@ -219,7 +403,7 @@ def test_list_then_store_the_shipped_draft_as_the_owner(
     stored = run_cli(*store, "--owner-user-id", str(owner), "--yes", env=db_env)
     assert stored.exit_code == 0, stored.output
     assert f"Stored {LABEL} as draft" in stored.output and "NOT approved" in stored.output
-    assert _stored(seed, workspace) == [("draft", "2026.10-draft.2", owner)]
+    assert _stored(seed, workspace) == [("draft", "2026.10-draft.3", owner)]
     audits = seed.conn.execute(
         "select actor_principal_id, actor_kind, metadata ->> 'rule_set' from ops.audit_events"
         " where workspace_id = %s and action = 'tax_rules.store'",

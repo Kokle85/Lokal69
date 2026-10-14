@@ -55,8 +55,9 @@ from suv_deals.views.import_costs import ImportCostEstimateView
 
 pytestmark = pytest.mark.db
 
-G01 = "168154.45"  # D1: diesel, NEDC 189, EUR 3,000 + EUR 700 transport, no proof of origin
-G03 = "217629.97"  # D3: petrol, NEDC 245, EUR 2,500 + EUR 700
+#: Whole denars without a fraction (owner decision of 2026-10-13: amounts without decimals).
+G01 = "168155"  # D1: diesel, NEDC 189, EUR 3,000 + EUR 700 transport, no proof of origin
+G03 = "217630"  # D3: petrol, NEDC 245, EUR 2,500 + EUR 700
 
 
 def request(**kw: Any) -> ImportCostRequest:
@@ -117,7 +118,7 @@ async def test_preview_on_the_shipped_draft_from_listing_facts(db: Database, see
     assert sources["co2"] == "listing" and sources["co2_document"] == "request"
     assert sources["price"] == "listing" and sources["origin_proof"] == "default"
     assert view.facts.price.amount == "3000.00" and view.facts.co2_document == "coc"
-    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700.00 EUR") for a in view.assumptions)
+    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700 EUR") for a in view.assumptions)
     assert any(a.startswith("NO_ORIGIN_PROOF_STANDARD_DUTY") for a in view.assumptions)
     assert "COST_PROFILE:default@v3 (unapproved; not yet stored in this workspace)" in view.notes
     assert view.unverified_inputs == ("price: advertised price, not an invoice or contract price",)
@@ -166,7 +167,7 @@ async def test_request_facts_override_the_listing_and_stand_alone(db: Database, 
     assert readings.facts.co2_document is None and not readings.scenarios[0].complete
     assert "co2_document" in readings.missing_facts
     assert any(w.startswith("CO2_DOCUMENT_UNKNOWN") for w in readings.warnings)
-    # A claimed proof of origin: 0% duty in the legal base, the standard duty shown beside it.
+    # A claimed proof of origin: 0% duty in the primary scenario, the standard duty shown beside it.
     proof = await estimate(
         db,
         ws,
@@ -175,10 +176,10 @@ async def test_request_facts_override_the_listing_and_stand_alone(db: Database, 
             vehicle={"co2_document": "coc", "origin_proof": {"kind": "eu", "country": "DE"}},
         ),
     )
-    assert [s.name for s in proof.scenarios] == ["legal_base", "standard_duty_if_proof_rejected"]
-    assert legal_total(proof) == "154721.64"  # G02
+    assert [s.name for s in proof.scenarios] == ["primary", "standard_duty_if_proof_rejected"]
+    assert legal_total(proof) == "154722"  # G02
     duty = {c.category: c for c in proof.scenarios[1].categories}[CostCategory.IMPORT_DUTY]
-    assert duty.amount.amount == "11383.73"
+    assert duty.amount.amount == "11384"
 
 
 async def test_active_rule_set_wins_and_the_preview_is_only_the_fallback(db: Database, seed: Seed) -> None:
@@ -251,7 +252,7 @@ async def test_missing_customs_rate_names_the_fx_record_command(db: Database, se
     assert view.customs_fx_source == "none" and view.customs_fx_rate is None
     legal = view.scenarios[0]
     # The customs value is known in EUR; without a customs rate it never reaches MKD.
-    assert not legal.complete and legal.customs_value.amount == "3700.00"
+    assert not legal.complete and legal.customs_value.amount == "3700"
     cv_mkd = next(c for c in legal.components if c.component_id == "customs_value_mkd")
     assert cv_mkd.status == "unknown" and "CUSTOMS_FX_RATE_MISSING:customs_value" in cv_mkd.warnings
     assert legal.indicative_total is not None and legal.indicative_total.amount is None

@@ -32,6 +32,9 @@ import {
   type EvaluationReport,
   type ImportCostEstimateQuery,
   type ImportCostEstimateView,
+  type ImportValuesRecordRequest,
+  type ImportValuesRecordResult,
+  type ImportValuesView,
   type InquiryControlView,
   type InquiryListQuery,
   type InquiryListView,
@@ -284,6 +287,17 @@ export class ApiClient {
   async importCostEstimate(query: ImportCostEstimateQuery, options: RequestOptions = {}) {
     if (query.listing_id !== undefined) pathId(query.listing_id, 'listing_id')
     return this.get<ImportCostEstimateView>('/api/import-costs/estimate', { ...query }, options)
+  }
+  /** A listing's recorded real purchase price and estimated customs value (`deals:read`). */
+  async importValues(listingId: string, options: RequestOptions = {}) {
+    return this.get<ImportValuesView>(`/api/listings/${pathId(listingId, 'listing_id')}/import-values`, undefined, options)
+  }
+  /**
+   * Owner only (`config:admin`): record the real purchase price and/or the estimated customs value.
+   * Each supersedes the current value of its kind; the listing's valuations are recomputed.
+   */
+  async recordImportValues(listingId: string, body: ImportValuesRecordRequest, options: RequestOptions = {}) {
+    return this.post<ImportValuesRecordResult>(`/api/listings/${pathId(listingId, 'listing_id')}/import-values`, body, options)
   }
 
   // Owner approval path for tax rule sets and cost profiles (config:admin; unrelated to seller

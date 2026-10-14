@@ -167,6 +167,11 @@ function ValuationBody({ valuation, timeZone }: { valuation: ValuationView; time
             {valuation.purchase.label}: <Amount value={valuation.purchase.amount} showReason /> <StatusLabel status={valuation.purchase.status} />
           </p>
         ) : null}
+        <p className="muted small" data-testid="import-values-hint">
+          The owner records the real purchase price and the estimated customs value under{' '}
+          <Link to={`/candidates/${valuation.listing_id}`}>Import values on the candidate</Link>; recording one marks this
+          valuation stale and recomputes it.
+        </p>
         {valuation.cost_lines.length === 0 ? (
           <EmptyState>No cost lines.</EmptyState>
         ) : (

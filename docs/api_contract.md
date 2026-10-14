@@ -604,6 +604,8 @@ User-JWT routes like section 6, enveloped, with the same error conventions. Tabl
 | `POST /api/settings/tax-rules/transition` | `config:admin` | body `TaxRuleTransitionRequest` (`rule_set_id`, `version`, `expected_status`, `target`, `content_sha256`, `approved_by` + `ReviewRecordInput` for `approved`) | `TaxRuleChangeResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
 | `GET /api/settings/cost-profiles` | `config:admin` | - | `CostProfilesView` of `CostProfileSummaryView` | 200 | - | - |
 | `POST /api/settings/cost-profiles/approve` | `config:admin` | body `CostProfileApproveRequest` (`profile_key`, `version`, `content_sha256`) | `CostProfileApproveResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
+| `GET /api/listings/{listing_id}/import-values` | `deals:read` | - | `ImportValuesView` of `ImportValueRecordView` | 200 | `NOT_FOUND` | - |
+| `POST /api/listings/{listing_id}/import-values` | `config:admin` | body `ImportValuesRecordRequest` (`purchase_price` {`amount`, `currency` EUR, `kind`, `source`, `document_ref`?} and/or `estimated_customs_value` {`amount_eur`, `source`, `document_ref`?}) | `ImportValuesRecordResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - |
 
 Pause and resume take their `idempotency_key` in the body; an optional `Idempotency-Key` header must
 equal it (`idempotency_header="optional"`, as on the other dashboard mutations). Pause uses the
@@ -717,11 +719,59 @@ surface replays the same result); resume uses `inquiry_control_resume`.
   `price_currency`, one `co2_wltp_g_km` / `co2_nedc_g_km` / `co2_nedc_correlated_g_km` /
   `co2_unknown_cycle_g_km` per cycle as printed (never converted; `co2_clear=true` drops the
   listing's figure), `origin_proof_kind` / `_country` / `_evidence_ref`; validation failures name
-  these parameters. Without an ACTIVE, owner-approved rule set the result is an
+  these parameters. Two values (owner decision 2026-10-13): `price_amount` is the REAL purchase
+  price (every landed cost uses it); `estimated_customs_value_eur` + `estimated_customs_value_source`
+  (together; the vehicle without transport, e.g. a SchwackeNet value) carry the `primary`
+  scenario's charges and add the `transaction_value` scenario (Customs accepts the price paid).
+  The result names them as `purchase_price` {`amount`, `basis`, `source`} and
+  `customs_value_for_duties` {`amount` incl. transport to the MK place of entry, `basis`
+  `estimated` | `transaction_value`, `source`}; scenarios are `primary` (first),
+  `standard_duty_if_proof_rejected` and `transaction_value`, each with `customs_value_kind`,
+  `customs_value` (the engine input in its own currency: EUR, or MKD for an MKD price) and
+  `customs_value_eur` (the same value in whole euros at the customs rate, so the scenarios compare
+  in one currency; unknown with a reason when there is no usable rate). Every
+  amount of this view is in whole units without a fraction (`"168155"` MKD, `"2733"` EUR; half-up),
+  the `facts` echo the inputs as given. Without an ACTIVE, owner-approved rule set the result is an
   `indicative_preview` (`production_ready: false`, MK/EN `banner`, totals `indicative_total`,
   `indicative_total_eur`, `indicative_landed_cost_eur`) or `unavailable`; envelope warnings use
   the existing codes (`TAX_RULES_UNAPPROVED`, `UNKNOWN_COSTS`, `FIXTURE_DATA`,
-  `SELLER_CLAIMS_UNVERIFIED`). A missing or foreign listing is `404 NOT_FOUND`.
+  `SELLER_CLAIMS_UNVERIFIED`). A missing or foreign listing is `404 NOT_FOUND`. With a
+  `listing_id`, the listing's CURRENT recorded import values (next item) are used: the recorded
+  real purchase price replaces the advertised price (`facts.price_basis` `recorded_actual` /
+  `recorded_quote` / `recorded_estimate`) and the recorded estimated customs value is the estimate,
+  each with fact source `recorded` (`fact_sources`), unless the request sets that fact (a request
+  price replaces the recorded price with its own basis, a request estimate replaces the recorded
+  one). A `price_basis` without a price cannot relabel the recorded purchase price: it keeps its
+  recorded kind and such a request is `422 VALIDATION_ERROR` naming `price_basis` (without a
+  recorded price a lone basis still restates the listing's advertised price). `purchase_price.source` / `customs_value_for_duties.source` then name the recorded value
+  (kind, EUR amount, source, date), `notes` carry `RECORDED_PURCHASE_PRICE_USED|OVERRIDDEN:<id>` and
+  `RECORDED_CUSTOMS_VALUE_USED|OVERRIDDEN:<id>`, and `listing.recorded_purchase_price_id` /
+  `listing.recorded_customs_value_id` are the current rows' ids.
+- **Recorded import values** (`/api/listings/{listing_id}/import-values`, handler
+  `api.import_values_routes`; never an MCP tool). Owner decision 2026-10-13, two separate values per
+  vehicle: the REAL purchase price (реална набавна цена; profit and landed cost) and the ESTIMATED
+  customs value (проценета царинска вредност; in EUR, WITHOUT transport, e.g. the SchwackeNet
+  catalogue value; the import charges). `GET` (`deals:read`) returns the current
+  `purchase_price` and `estimated_customs_value` (`null` when none) and a `history` of up to 10 rows
+  of both, newest first (`current: false` once superseded); each row has `amount` in whole euros
+  (half-up) and `amount_exact` as recorded, `kind` (`actual` | `quote` | `estimate`; a customs value
+  is always `estimate`), `source`, `document_ref`, `recorded_by_principal`, `recorded_at`.
+  `POST` (`config:admin` and a signed-in user: reviewers and viewers get `403`, system workers and
+  MCP clients are refused by the repository) records `purchase_price` (`amount` > 0 with at most
+  two decimals, `currency` `EUR`, `kind`, `source` 3-120 characters, optional `document_ref`) and/or
+  `estimated_customs_value` (`amount_eur` > 0, `source`, optional `document_ref`); at least one
+  (`422` naming both fields otherwise). Each value supersedes the current row of its kind
+  (`app.cost_evidence`, categories `purchase` / `customs_value`, migration
+  `20261013000100_import_values`), the act is audited (`import_values.record`), the listing's open
+  valuations are marked stale and ONE deduplicated recomputation is queued (`recompute_job_id`,
+  `stale_valuation_ids`). Valuations then use the recorded purchase price as the purchase
+  (`actual` / `quoted` / `estimated` by kind) and the recorded customs value for the import charges
+  (ACTIVE rules only), citing both rows in `cost_evidence_ids`. The `idempotency_key` is in the body
+  (operation `owner_import_values_record`, bound to the listing; an optional `Idempotency-Key`
+  header must equal it). A missing or foreign listing is `404 NOT_FOUND`. The dashboard shows both
+  values in the candidate's "Import values" panel (whole euros, the source and the history; the
+  recording form, with a confirmation that it changes the listing's valuation, for the owner only)
+  and links to the calculator of that listing, whose listing mode uses them.
 - **Owner approval path** (`/api/settings/tax-rules*`, `/api/settings/cost-profiles*`, handler
   `api.owner_config_routes`; `config:admin` only, so reviewers and viewers get `403 FORBIDDEN`; never
   an MCP tool). `GET /api/settings/tax-rules` lists every stored rule-set version and every

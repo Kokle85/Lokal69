@@ -12,15 +12,25 @@ throwaway workspace.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
+from uuid import UUID
 
 import pytest
 from tests.integration.db.helpers import Seed
-from tests.integration.import_costs.support import CONFIG, activate, mk_draft, record_customs_rate
+from tests.integration.import_costs.support import (
+    CONFIG,
+    activate,
+    mk_draft,
+    record_customs_rate,
+    store_rule_set,
+)
 from tests.integration.pipeline.support import PipelineEnv, build_env, by_slid, run, seed_comparables, seed_fx
 
 from suv_deals.clock import SystemClock
+from suv_deals.crawling import valuation_pipeline
 from suv_deals.crawling.scheduler import run_scheduler_tick
 from suv_deals.domain.costs import CostLine
 from suv_deals.domain.enums import (
@@ -33,9 +43,12 @@ from suv_deals.domain.enums import (
 )
 from suv_deals.domain.money import Money
 from suv_deals.domain.tax_engine import IMPORT_CATEGORIES, ComponentStatus, RuleSet, RuleSource
-from suv_deals.persistence import valuation_repo
+from suv_deals.domain.valuation import InvalidationReason
+from suv_deals.persistence import import_values_repo, valuation_repo
 from suv_deals.persistence.database import Conn
+from suv_deals.persistence.import_values_repo import RecordedCustomsValue, RecordedPurchase
 from suv_deals.persistence.queries import ImportCostRequest, ImportCostResult, estimate_import_costs_for
+from suv_deals.persistence.transactions import unit_of_work
 from suv_deals.workers.reconciliation import ReconcileOptions, Reconciler
 from suv_deals.workers.runner import Worker
 from suv_deals.workers.runtime import RuntimeOptions
@@ -337,5 +350,194 @@ async def test_the_first_customs_rate_revalues_valuations_computed_without_one(
         assert after.valuation.tax is not None and after.valuation.tax.complete
         settled = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
         assert settled.valuations_invalidated == 0
+    finally:
+        await env.close()
+
+
+# --------------------------------------------------------------------------- recorded import values
+
+
+async def _record(
+    env: PipelineEnv, listing_id: UUID, **values: Any
+) -> import_values_repo.ImportValuesRecorded:
+    async def go(conn: Conn) -> import_values_repo.ImportValuesRecorded:
+        return await import_values_repo.record_import_values(conn, env.owner, listing_id, **values)
+
+    return await run(env.ctx, env.owner, go)
+
+
+async def _state(env: PipelineEnv, valuation_id: UUID) -> ValuationState:
+    async def go(conn: Conn) -> ValuationState:
+        return (await valuation_repo.load_valuation(conn, env.system, valuation_id)).valuation.state
+
+    return await run(env.ctx, env.system, go)
+
+
+async def test_recorded_values_drive_the_purchase_and_the_duties(db_url: str, seed: Seed) -> None:
+    """Owner decision 2026-10-13: the profit uses the REAL purchase price, the duties the
+    ESTIMATED customs value (+ transport); both rows are cited, so superseding one re-values."""
+    env = await build_env(db_url, seed, options=_xx_env_options(), name="Tax recorded values")
+    try:
+        await activate(env.ctx.db, env.owner, synthetic_xx_rules())
+        await _value_fixture_listings(env)
+        before = await _valuation(env, "TEST-204")
+        listing_id = before.listing_id
+        recorded = await _record(
+            env,
+            listing_id,
+            purchase=RecordedPurchase(amount=Decimal("2000"), kind="actual", source="seller invoice"),
+            customs_value=RecordedCustomsValue(amount_eur=Decimal("4200"), source="SchwackeNet catalogue"),
+        )
+        purchase_id, customs_id = recorded.recorded_ids
+        assert before.id in recorded.stale_valuation_ids
+        assert await _state(env, before.id) == ValuationState.STALE
+        await _work(env)
+        after = await _valuation(env, "TEST-204")
+        assert after.id != before.id
+        # The profit uses the price actually paid (EUR 2,000), not the advertised EUR 2,750.
+        purchase = after.inputs.purchase
+        assert purchase is not None and purchase.status == CostLineStatus.ACTUAL
+        assert purchase.amount == Money.of("2000", "EUR") and purchase.evidence_ids == (str(purchase_id),)
+        scenarios = after.valuation.scenarios
+        assert scenarios is not None
+        assert {s.purchase_cash_outlay_excluding_deposits for s in scenarios.scenarios} == {
+            Money.of("2000", "EUR")
+        }
+        # The duties use the estimated customs value: (EUR 4,200 + 700) x 61.5 = 301,350.00 MKD.
+        tax = after.valuation.tax
+        assert tax is not None and tax.rule_status == TaxRuleStatus.ACTIVE and tax.complete
+        amounts = {c.component_id: c.amount for c in tax.components if c.status == ComponentStatus.RESOLVED}
+        assert amounts == {
+            "duty_standard": Money.of("30135.00", "MKD"),  # 10% of 301,350.00
+            "vehicle_charge": Money.of("1000.00", "MKD"),
+            "processing_fee": Money.of("123.45", "MKD"),
+            "vat": Money.of("66497.00", "MKD"),  # 20% of (301,350.00 + 30,135.00 + 1,000)
+        }
+        used = next(c for c in tax.components if c.component_id == "duty_standard").inputs_used
+        assert "4900" in used["customs_value"]
+        # Both recorded rows are cited and tracked; the estimate is a claim, never rule-supported.
+        assert set(after.refs.cost_evidence_ids) == {purchase_id, customs_id}
+        assert {str(purchase_id), str(customs_id)} <= set(after.valuation.dependencies.cost_evidence_ids)
+        lines = _import_lines(after)
+        assert all(str(customs_id) in ln.evidence_ids for ln in lines.values())
+        assert all(not ln.rule_supported for ln in lines.values())
+        warnings = after.valuation.warnings
+        assert any(
+            w.startswith("TAX_INPUT_ASSUMPTION:ESTIMATED_CUSTOMS_VALUE_USED:SchwackeNet catalogue")
+            for w in warnings
+        )
+        assert any(
+            w.startswith("TAX_INPUT_UNVERIFIED:customs_value: estimated customs value") for w in warnings
+        )
+        assert not any(w.startswith("TAX_INPUT_UNVERIFIED:price:") for w in warnings)  # a paid price
+        # A new estimate supersedes the cited row: the valuation is stale and re-valued on it.
+        lower = await _record(
+            env,
+            listing_id,
+            customs_value=RecordedCustomsValue(amount_eur=Decimal("3000"), source="SchwackeNet catalogue"),
+        )
+        assert lower.superseded_ids == (customs_id,) and after.id in lower.stale_valuation_ids
+        await _work(env)
+        latest = await _valuation(env, "TEST-204")
+        assert latest.valuation.tax is not None
+        duty = next(c for c in latest.valuation.tax.components if c.component_id == "duty_standard")
+        assert duty.amount == Money.of("22755.00", "MKD")  # 10% of (3,000 + 700) x 61.5
+        assert set(latest.refs.cost_evidence_ids) == {purchase_id, lower.recorded_ids[0]}
+        assert latest.inputs.purchase is not None and latest.inputs.purchase.amount == Money.of("2000", "EUR")
+    finally:
+        await env.close()
+
+
+async def test_a_recording_committed_after_the_calculation_read_is_never_lost(
+    db_url: str, seed: Seed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the owner records the FIRST real purchase price while a recomputation job J is
+    queued for another reason. The recording's dedup returns the queued J (no follow-up), a worker
+    claims J before the recording commits and reads no recorded value. The commit only checked the
+    rows the valuation CITED, so J stored a fresh valuation on the advertised price and no job was
+    left to recompute. The commit now re-reads the current import values under the listing lock:
+    J is retried with fresh reads and values the recorded EUR 2,000."""
+    env = await build_env(db_url, seed, options=_xx_env_options(), name="Tax recorded race")
+    try:
+        await activate(env.ctx.db, env.owner, synthetic_xx_rules())
+        await _value_fixture_listings(env)
+        before = await _valuation(env, "TEST-204")
+        listing_id = before.listing_id
+        assert before.inputs.purchase is not None
+        assert before.inputs.purchase.amount != Money.of("2000", "EUR")
+
+        async def queue(conn: Conn) -> valuation_repo.ListingInvalidation:
+            return await valuation_repo.invalidate_listing(
+                conn, env.system, listing_id, InvalidationReason.FX, detail="SYNTHETIC other change"
+            )
+
+        queued = await run(env.ctx, env.system, queue)
+        job_j = queued.recompute_job_id
+        assert job_j is not None and queued.job_created
+
+        # The worker signals once its read phase (inputs, recorded import values) is done.
+        read_done = asyncio.Event()
+        original_read = valuation_pipeline._read
+
+        async def read_then_signal(*args: Any, **kwargs: Any) -> Any:
+            result = await original_read(*args, **kwargs)
+            read_done.set()
+            return result
+
+        monkeypatch.setattr(valuation_pipeline, "_read", read_then_signal)
+        paid = RecordedPurchase(amount=Decimal("2000"), kind="actual", source="seller invoice")
+        worker = Worker(env.ctx, workspace_ids=[env.workspace_id], worker_id="worker-race")
+        async with unit_of_work(env.ctx.db, env.owner) as conn:
+            recorded = await import_values_repo.record_import_values(
+                conn, env.owner, listing_id, purchase=paid
+            )
+            assert recorded.recompute_job_id == job_j  # the queued J itself: no follow-up job
+            # J is claimed and reads BEFORE the recording commits (it sees no recorded value).
+            racing = asyncio.create_task(worker.run_until_idle())
+            await asyncio.wait_for(read_done.wait(), timeout=60)
+        reports = await asyncio.wait_for(racing, timeout=60)
+        (report,) = [r for r in reports if r.job_id == job_j]
+        assert report.state == JobState.RETRY_WAIT and report.code == "VERSION_CONFLICT"
+        # Nothing was stored from the outdated read: the open valuation is still the stale one.
+        current = await _valuation(env, "TEST-204")
+        assert current.id == before.id and await _state(env, before.id) == ValuationState.STALE
+        # J re-runs (its backoff fast-forwarded) on the recorded purchase price.
+        env.seed.conn.execute("update ops.jobs set available_at = now() where id = %s", (job_j,))
+        await _work(env)
+        after = await _valuation(env, "TEST-204")
+        assert after.id != before.id
+        assert after.inputs.purchase is not None
+        assert after.inputs.purchase.amount == Money.of("2000", "EUR")
+        assert after.inputs.purchase.status == CostLineStatus.ACTUAL
+        assert set(after.refs.cost_evidence_ids) == set(recorded.recorded_ids)
+        state = env.scalar("select state from ops.jobs where id = %s", job_j)
+        assert state == "succeeded"
+    finally:
+        await env.close()
+
+
+async def test_recorded_values_never_bring_a_draft_rule_set_into_a_valuation(db_url: str, seed: Seed) -> None:
+    """ACTIVE-only selection is unchanged: with only the MK DRAFT stored, a valuation still has
+    no tax (import costs unknown), while the profit already uses the recorded purchase price."""
+    env = await build_env(db_url, seed, name="Tax recorded draft")
+    try:
+        await store_rule_set(env.ctx.db, env.owner, mk_draft())
+        await _value_fixture_listings(env)
+        listing_id = (await _valuation(env, "TEST-204")).listing_id
+        recorded = await _record(
+            env,
+            listing_id,
+            purchase=RecordedPurchase(amount=Decimal("2500"), kind="quote", source="agreed with the seller"),
+            customs_value=RecordedCustomsValue(amount_eur=Decimal("4200"), source="SchwackeNet catalogue"),
+        )
+        await _work(env)
+        after = await _valuation(env, "TEST-204")
+        assert after.valuation.tax is None and after.refs.tax_rule_set_row_id is None
+        assert {ln.status for ln in _import_lines(after).values()} == {CostLineStatus.UNKNOWN}
+        purchase = after.inputs.purchase
+        assert purchase is not None and purchase.status == CostLineStatus.QUOTED
+        assert purchase.amount == Money.of("2500", "EUR")
+        # Only the purchase row is cited: no calculation rests on the estimate.
+        assert after.refs.cost_evidence_ids == (recorded.recorded_ids[0],)
     finally:
         await env.close()

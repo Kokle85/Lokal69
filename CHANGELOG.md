@@ -5,9 +5,144 @@ The build waves in order, derived from `git log --oneline` and the wave document
 commits are omitted; they only preserved interrupted work. **No wave activated anything against
 a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC.
 
-## Unreleased (working tree on top of `da4c5e6`, not committed)
+## Unreleased (working tree on top of `7280bd9`, not committed)
 
-### Customs calculator and dot access (2026-10-13)
+Owner decisions of 2026-10-13, given in Macedonian (ADR 0003 decisions 11-14; fact sheet sections
+3.4, 6.3, 10.4, 11 and 13). Nothing is approved or activated; the rule set stays an unapproved
+DRAFT and every calculator result an indicative preview.
+
+- **D1 "ДМВ влегува во основицата за ДДВ":** the motor-vehicle tax is part of the import VAT base
+  (ЗДДВ чл. 21: customs, taxes and other import charges except VAT itself): VAT = (customs value
+  + duty + ДМВ + other applicable costs) x 18%. Open question resolved; no longer `UNCERTAIN`.
+- **D2 SchwackeNet vs the invoice:** Customs officially uses the SchwackeNet catalogue for used
+  vehicles, but Царински закон чл. 28 makes the transaction value (the price actually paid) the
+  primary method; the other methods apply in the legal order and only on founded doubt. Each
+  vehicle therefore keeps two separate values: the REAL purchase price (реална набавна цена;
+  profit, landed cost) and the ESTIMATED customs value (проценета царинска вредност; import
+  charges). Example: bought for EUR 2,800, catalogue EUR 4,200: `primary` 185,803 MKD on EUR 4,900
+  and landed cost EUR 6,520; `transaction_value` 165,213 MKD on EUR 3,500 and EUR 6,185.
+- **D3 "заокружи го износот без децимали":** every MKD amount and the total in whole denars
+  (half-up), every amount the calculator shows without decimals (EUR in whole euros, half-up).
+
+### D1 and D3: ДМВ in the VAT base, whole denars (rule set)
+
+- Draft rule set re-versioned to `mk-passenger-car-import@2026.10-draft.3` (draft.2 is no longer
+  shipped; content hash `4fe7f064...`): the ДМВ is part of the import VAT base (owner
+  confirmation, ЗДДВ чл. 21(2)(1); the `UNCERTAIN` marker on `vat_base_mkd` is gone), and every MKD
+  amount and the total are rounded to whole denars, half-up, before they feed the next charge
+  (`rounding_rules` quantum `1`). Totals move by under 1 MKD (D1 168,154.45 -> 168,155 MKD); at the
+  EUR 10,000 value-part edge the key is the assessed whole-denar customs value + duty (new golden
+  case G17c). Every golden case was recomputed with an independent evaluator before the tests
+  changed. Fact sheet open questions 1 and 4 and ADR 0003 (decisions 11 and 12) record it.
+  Showing every amount without decimals (the rest of D3) is the calculator change below.
+
+### D2 and D3: two values per vehicle, whole units (calculator)
+
+- `domain/import_estimate.py`: the vehicle's `price` is the REAL purchase price (landed cost,
+  profit); the new `estimated_customs_value_eur` + `estimated_customs_value_source` (together;
+  positive, two decimals, within the engine bound, source 3-120 characters) carry the `primary`
+  scenario's charges (+ transport to the MK place of entry, UNCERTAIN whether Customs adds it);
+  with an estimate a `transaction_value` scenario shows the charges on the price paid
+  (Царински закон чл. 28). `catalogue_value_eur` and the `customs_revaluation_risk` scenario are
+  removed; `legal_base` is renamed `primary`. The result carries `purchase_price` and
+  `customs_value_for_duties`; purchase-price bases `recorded_actual` / `recorded_quote` /
+  `recorded_estimate` are ready for recorded values. EUR amounts are whole euros (half-up, from the
+  exact figures); the calculator view shows every amount without a fraction.
+- MCP `deals_estimate_import_costs`, `GET /api/import-costs/estimate` and
+  `suv-deals import-costs estimate` take the new inputs (`--estimated-customs-value-eur`,
+  `--estimated-customs-value-source`); snapshots `schemas/tools/deals_estimate_import_costs.json` and
+  `schemas/api/import-costs.estimate.get.json` regenerated; docs/connect_mcp.md, docs/api_contract.md,
+  ADR 0003 (decision 13) and the fact sheet updated. Dashboard test id `totals-legal_base` is now
+  `totals-primary`.
+
+### D2: recorded import values per listing (migration `20261013000100`)
+
+- Migration `supabase/migrations/20261013000100_import_values.sql` (forward-only, expand; NOT yet
+  applied to the hosted project): `app.cost_evidence` category `customs_value` (the estimated
+  customs value; `cost_evidence_customs_value_ck`: listing-scoped, EUR, kind `estimate`) and two
+  partial unique indexes that keep each listing's `purchase` / `customs_value` rows one linear
+  supersede chain (docs/schema.md 11.16).
+- `persistence/import_values_repo.py`: `record_import_values` (signed-in owner with `config:admin`
+  only; listing lock, supersedes the current row of each category, audit `import_values.record`,
+  invalidates the listing's valuations and queues ONE deduplicated recomputation via the new
+  `valuation_repo.invalidate_listing` / `DependencyChange.listing_ids`) and
+  `current_import_values` (`deals:read`, current values + short history).
+  `valuation_repo.get_cost_evidence` never returns these rows; the cost profile is unchanged.
+- API (never an MCP tool): `GET /api/listings/{listing_id}/import-values` (`deals:read`) and
+  `POST /api/listings/{listing_id}/import-values` (`config:admin`, body idempotency key bound to the
+  listing); snapshots `schemas/api/listings.listing_id.import-values.{get,post}.json`.
+- Calculator listing mode: the current recorded purchase price replaces the advertised price
+  (basis `recorded_<kind>`) and the recorded estimate is used, fact source `recorded`, unless the
+  request sets that fact; notes `RECORDED_*_USED|OVERRIDDEN:<id>`, `listing.recorded_*_id`.
+- Valuations: the recorded purchase price is the purchase (`actual` / `quoted` / `estimated`), the
+  recorded estimate feeds the shared builder (ACTIVE rules only); both rows are cited (purchase
+  line; `tax_cost_lines(input_evidence_ids=...)`) and tracked in `cost_evidence_ids`.
+
+### D2: dashboard, CLI and dot
+
+- Dashboard: the calculator form groups "Two values per vehicle · Две вредности по возило" (real
+  purchase price with currency and basis; estimated customs value with its source); listing mode
+  shows the recorded or the listing's values as hints; the result shows `purchase_price` and
+  `customs_value_for_duties` side by side and a "Scenarios side by side" table (`primary`,
+  `transaction_value`). The browser never rounds money; it shows the server's whole-unit strings.
+  New "Import values" panel on the candidate detail page (`screens/importValues/`): both current
+  values in whole euros with kind, source, document and history, a link to the calculator, and an
+  owner-only recording form with a confirmation that it changes the listing's valuation; client
+  `importValues` / `recordImportValues`.
+- CLI: `suv-deals import-costs record-values` (verified ACTIVE owner, audited, `--yes`; usage
+  errors name the options, never the values) and `import-costs values` (read-only); `import-costs
+  estimate` prints whole units (an input typed with cents shows its exact value next to it).
+- dot: the tool and field descriptions and the server instructions explain the two values, the
+  automatic use of a listing's recorded values and that no MCP tool records them (snapshot
+  regenerated; description 598 of 600 characters).
+- Tests: `tests/integration/import_costs/test_import_values.py`, `tests/api/test_import_values_routes.py`,
+  `tests/unit/test_import_values.py`, additions to the calculator, MCP, contract, CLI, constraint and
+  valuation-pipeline suites; vitest `importValues.test.tsx` and two-value cases in
+  `importCosts.test.tsx`; Playwright `importValues.spec.ts` and the owner's example in
+  `importCosts.spec.ts`. `e2e/inquiries.spec.ts` now tolerates "6 h 1 min ago" when a long run
+  crosses a minute boundary.
+
+### Review fixes (owner decisions D1-D3)
+
+- A request `price_basis` without a price no longer relabels the owner's recorded purchase price
+  (an unpaid estimate shown as an invoice, without its unverified flag): `merge_facts` refuses it
+  with `VALIDATION_ERROR` on `price_basis` (a recorded price keeps its recorded kind, as in the
+  valuation); the dashboard locks the Price basis select until a price is entered and never sends
+  a leftover basis for a recorded price.
+- Valuation commit: under the listing lock the pipeline re-reads the listing's current recorded
+  import values and refuses to persist a calculation that read others (`VersionConflict`, the job
+  is retried with fresh reads), so a purchase price recorded while a queued recomputation was being
+  claimed is never lost (`valuation_pipeline._check_import_values`).
+- Each scenario carries `customs_value_eur` (whole euros at the customs rate); the dashboard's
+  "Scenarios side by side" column "Customs value (EUR)" shows it, so an MKD transaction value no
+  longer appears under the EUR header (the scenario section shows the MKD value with the EUR
+  equivalent; the CLI prints both). Snapshots regenerated.
+- draft.3's `customs_value_mkd` label no longer says "invoice + transport": it names the
+  scenario's customs value (transaction value or estimated customs value) incl. transport; content
+  hash `4fe7f064...`.
+- The calculator's warning for an entered estimate without a source now says what happens: the
+  recorded source is not reused and the request is refused without one.
+
+### Integration and documentation
+
+- The calculator's basis, assumption and warning texts and the recorded-value source labels quote
+  amounts without a needless fraction (`import_estimate.plain_amount_text`: "invoice 3000 EUR +
+  ... transport to MK place of entry 700 EUR", "TRANSPORT_LINE:700 EUR per vehicle", "recorded
+  actual purchase price EUR 2800 (...)"); a real fraction stays exact ("2800.50") because the text
+  names the figure the calculation used. The same texts appear in valuation warnings.
+- Stale names removed across code, snapshots, dashboard test ids and docs (`legal_base` ->
+  `primary`; `catalogue_value_eur` / `customs_revaluation_risk` -> the estimated customs value and
+  the `transaction_value` scenario; draft.2 -> draft.3). The remaining mentions are history or
+  tests that assert the old fields are refused.
+- README "Customs calculator", docs/tax_rule_approval.md, docs/connect_mcp.md section 7,
+  docs/api_contract.md, docs/runbook.md (`import-costs values` / `record-values`),
+  IMPLEMENTATION_STATUS.md, ACTIVATION_GATES.md (sections 3 and 6), docs/schema.md 11.16 (the
+  migration, **not yet applied to the hosted project**), the fact sheet and ADR 0003.
+- Verification: docs/qa_evidence.md, "Owner decisions D1-D3".
+
+## Customs calculator and dot access (2026-10-13, `787ad7c`, `7280bd9`)
+
+### Customs calculator and dot access (2026-10-13, `787ad7c`)
 
 Owner decisions of 2026-10-13 (docs/decisions/0003-transport-and-customs-calculator.md): transport
 is a fixed EUR 700 per vehicle (committed in `da4c5e6`) and a customs/import-tax calculator for
@@ -20,7 +155,7 @@ North Macedonia that dot can use. Nothing is approved or activated; no migration
   and `select_preview_rule_set` for a labelled indicative preview. Existing rule sets keep their
   hash. Production selection (`select_rule_set`, `allow_unapproved=False`) is unchanged.
 - The North Macedonian DRAFT rule set
-  `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json` (customs duty, motor-vehicle
+  `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.1.json` (customs duty, motor-vehicle
   tax ДМВ, import VAT on an HS 8703 car; status `draft`, every open point `UNCERTAIN - confirm`),
   golden-tested to the denar (`tests/unit/test_mk_rule_draft.py`), and the evidence pack
   docs/tax/mk_import_fact_sheet_2026-10.md. `config validate`, `doctor` and `make smoke-local`
@@ -28,7 +163,8 @@ North Macedonia that dot can use. Nothing is approved or activated; no migration
 - `domain/import_estimate.py`: vehicle facts, the builder from facts to engine inputs (origin,
   tariff code and VAT base never inferred; CO2 cycle as printed, never converted; the Euro 4 import
   gate as a warning) and the estimate (scenarios: legal base, standard duty if the proof is
-  rejected, customs revaluation risk; `indicative_total` in preview mode; MK/EN banner; uncertain
+  rejected, customs revaluation risk (both replaced in the Unreleased entry above); `indicative_total`
+  in preview mode; MK/EN banner; uncertain
   items). `costs.tax_cost_lines` refuses anything but an engine calculation.
 - Read service `persistence/queries/import_costs.py` and view `views/import_costs.py`
   (`ImportCostEstimateView`), served as the MCP tool `deals_estimate_import_costs` (dot,
@@ -53,7 +189,7 @@ North Macedonia that dot can use. Nothing is approved or activated; no migration
   skipped on PostgreSQL 16 and 8,506 passed on 17; desktop 317; dashboard 208 unit tests, build;
   browser E2E 48 on PostgreSQL 16 and 17 (and the harness's 36).
 
-### Customs calculator review fixes (2026-10-13, working tree on top of `787ad7c`)
+### Customs calculator review fixes (2026-10-13, `7280bd9`)
 
 - Draft rule set re-versioned to `mk-passenger-car-import@2026.10-draft.2` (draft.1 is no longer
   shipped): a plug-in hybrid without a CO2 document now gets the deemed 400 g/km (ЗДМВ чл. 12(2)),

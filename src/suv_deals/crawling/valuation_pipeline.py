@@ -19,24 +19,35 @@ network I/O.
    - tax: only an ACTIVE, approved rule set is ever selected (`select_rule_set`); without one, every
      import category stays ``unknown`` (never invented, never zero) and the reason is recorded.
      The engine inputs come from the SAME builder the import-cost calculator uses
-     (`import_estimate.build_tax_inputs` over `facts_from_listing`), so a valuation computes the
+     (`import_estimate.build_tax_inputs` over `facts_from_listing` plus the listing's recorded
+     import values, `import_values_repo.apply_recorded_values`), so a valuation computes the
      duty, motor-vehicle tax and import VAT the calculator shows once the owner activates a rule
-     set: the advertised payable amount as the transaction value (labelled assumption), the cost
-     profile's transport line in the customs value, no proof of origin (standard duty), a listing
-     CO2 figure as ``listing_claim_unverified``. Nothing else is inferred (no tariff code, no
-     origin, no VAT base); what the listing does not establish stays missing, so a calculation is
-     incomplete rather than guessed. Amounts computed from such claims are never rule-supported
+     set: the owner's recorded real purchase price (otherwise the advertised payable amount) as
+     the transaction value (labelled assumption), the recorded estimated customs value when there
+     is one (owner decision 2026-10-13: the charges follow it, the profit keeps the real purchase
+     price), the cost profile's transport line in the customs value, no proof of origin (standard
+     duty), a listing CO2 figure as ``listing_claim_unverified``. Nothing else is inferred (no
+     tariff code, no origin, no VAT base); what the listing does not establish stays missing, so a
+     calculation is incomplete rather than guessed. Amounts computed from claims (an advertised
+     price, a recorded quote or estimate, an estimated customs value) are never rule-supported
      (`tax_cost_lines(unverified_inputs=...)`); the builder's assumptions, warnings and the Euro
      import gate are recorded as valuation warnings;
    - costs: `CostProfile.lines(target_scope=...)` scoped to the purchase country (a CH purchase gets
      its ``ch_purchase`` lines, others never do); the profile's import categories are replaced by the
-     tax engine's lines; `compute_scenarios` with the asking price as an ESTIMATED purchase and the
-     comparable-based proceeds;
+     tax engine's lines; `compute_scenarios` with the purchase and the comparable-based proceeds.
+     The purchase is the owner's recorded real purchase price when there is one (``actual`` /
+     ``quoted`` / ``estimated`` by its recorded kind), otherwise the asking price as an ESTIMATED
+     purchase. The recorded rows are cited (the purchase line, and the tax lines built from them),
+     tracked in ``cost_evidence_ids``, so superseding one invalidates the valuation; recording one
+     also invalidates the listing directly (`import_values_repo.record_import_values`);
    - `assemble_valuation`: state, unknowns, dependency fingerprint and expiry; fixtures stay fixtures.
 3. **Commit** (one short transaction, the job row locked first, then the listing): when a newer
    revision was promoted while the calculation ran (`valuation_repo.lock_current_revision`), the job
    completes as a successful no-op (``skipped: revision_superseded``; that revision's own valuation
-   job values it) and nothing is stored -- no extra open valuation row. Otherwise the comparable
+   job values it) and nothing is stored -- no extra open valuation row. When the listing's current
+   recorded import values are no longer the ones read (a value recorded or superseded meanwhile;
+   recording takes the same listing lock), nothing is stored and the job is retried with fresh
+   reads (``VersionConflict``). Otherwise the comparable
    set, the valuation (`persist_valuation` with ``require_current_revision`` checks every
    reference against the fingerprint), the transparent ranking, the
    review case of every enabled profile (`reviews_repo.upsert_review_case`: a qualifying revision
@@ -116,6 +127,7 @@ from suv_deals.errors import NotFound, ValidationFailed, VersionConflict
 from suv_deals.observability.logging import log_context
 from suv_deals.persistence import (
     config_repo,
+    import_values_repo,
     listings_repo,
     market_repo,
     reviews_repo,
@@ -124,6 +136,7 @@ from suv_deals.persistence import (
 )
 from suv_deals.persistence.config_repo import ConfigRevisionRecord
 from suv_deals.persistence.database import Conn, db_now
+from suv_deals.persistence.import_values_repo import ImportValues
 from suv_deals.persistence.listings_repo import ListingRecord, RevisionRecord
 from suv_deals.persistence.reviews_repo import CaseUpsertResult
 from suv_deals.persistence.sources_repo import SourceRecord
@@ -170,6 +183,8 @@ class ValuationReads:
     reference_rates: dict[str, StoredFxRate]
     customs_rate: StoredFxRate | None
     rule_sets: list[StoredRuleSet]
+    #: The owner's current recorded real purchase price and estimated customs value.
+    import_values: ImportValues
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +286,9 @@ async def _read(
         rule_sets = await valuation_repo.list_rule_sets(
             conn, actor, jurisdiction=options.tax_jurisdiction, statuses=[TaxRuleStatus.ACTIVE]
         )
+        import_values = await import_values_repo.current_import_values(
+            conn, actor, listing_id, history_limit=0
+        )
         currencies = {c.amount.currency for c in candidates if c.amount is not None}
         if screening.payable_amount is not None:
             currencies.add(screening.payable_amount.currency)
@@ -306,6 +324,7 @@ async def _read(
             reference_rates=reference,
             customs_rate=customs,
             rule_sets=rule_sets,
+            import_values=import_values,
         ),
         None,
     )
@@ -382,7 +401,18 @@ def _superseded_result(superseded: valuation_repo.SupersededRevision) -> dict[st
     }
 
 
-def _purchase(screening: ScreeningResult, revision_id: UUID) -> PurchaseInput:
+def _purchase(screening: ScreeningResult, revision_id: UUID, values: ImportValues) -> PurchaseInput:
+    """The owner's recorded real purchase price (status by its kind, the row cited), otherwise the
+    advertised payable amount as an estimate."""
+    recorded = values.purchase
+    if recorded is not None:
+        return PurchaseInput(
+            label="Vehicle purchase price (recorded)",
+            status=recorded.purchase_status,
+            amount=recorded.amount,
+            basis=recorded.describe()[:200],
+            evidence_ids=(str(recorded.id),),
+        )
     if screening.payable_amount is None:
         return PurchaseInput(status=CostLineStatus.UNKNOWN)
     return PurchaseInput(
@@ -401,9 +431,13 @@ def _tax_inputs(
     transport: CostLine,
 ) -> BuiltTaxInputs:
     """The shared import-cost builder over the facts the listing establishes (the advertised
-    price, its CO2 claim, no proof of origin); everything else stays missing."""
+    price, its CO2 claim, no proof of origin) with the owner's recorded real purchase price and
+    estimated customs value on top; everything else stays missing."""
+    facts, _supplied = import_values_repo.apply_recorded_values(
+        facts_from_listing(reads.normalized, payable=reads.screening.payable_amount), reads.import_values
+    )
     return build_tax_inputs(
-        facts_from_listing(reads.normalized, payable=reads.screening.payable_amount),
+        facts,
         transport=transport,
         customs_rate=customs,
         as_of=reads.as_of,
@@ -469,6 +503,26 @@ def _rank(reads: ValuationReads, result: ComparableSetResult, valuation: Valuati
     )
 
 
+async def _check_import_values(conn: Conn, actor: ActorContext, reads: ValuationReads) -> None:
+    """Under the listing lock: the listing's CURRENT recorded import values are still the ones the
+    calculation read. ``import_values_repo.record_import_values`` takes the same lock and holds it
+    until it commits, so this sees every committed recording. A value recorded or superseded since
+    the read -- a FIRST recording that no valuation cites yet included, which the cited-evidence
+    check of `persist_valuation` cannot see -- refuses the commit (``VersionConflict``: the job is
+    retried with fresh reads), so a valuation computed just before a recording committed never
+    replaces the recomputation that recording queued (it may have returned this very job)."""
+    current = await import_values_repo.current_import_values(conn, actor, reads.listing.id, history_limit=0)
+    if set(current.current_ids) != set(reads.import_values.current_ids):
+        raise VersionConflict("The listing's recorded import values changed since the calculation; recompute")
+
+
+def _cited_import_values(valuation: Valuation, values: ImportValues) -> tuple[UUID, ...]:
+    """The recorded import values the valuation's scenarios cite (tracked in ``cost_evidence_ids``
+    so superseding one invalidates it; `persist_valuation` refuses an untracked or superseded one)."""
+    cited = set(valuation.dependencies.cost_evidence_ids)
+    return tuple(i for i in values.current_ids if str(i) in cited)
+
+
 def _fx_ids(valuation: Valuation, stored: list[StoredFxRate]) -> tuple[UUID, ...]:
     by_key = {FxDependency.from_rate(s.rate).key(): s.id for s in stored}
     ids: list[UUID] = []
@@ -515,9 +569,12 @@ async def _value_and_commit(
             calc,
             missing_reason=None if calc is not None else selection.reason,
             unverified_inputs=unverified,
+            # The tax lines rest on the recorded values the builder used (the transaction value
+            # from the purchase price, the estimated customs value): cite them.
+            input_evidence_ids=tuple(str(i) for i in reads.import_values.current_ids),
         )
     )
-    purchase = _purchase(screening, revision.id)
+    purchase = _purchase(screening, revision.id, reads.import_values)
     comparable_rates = [
         reads.reference_rates[c]
         for c in sorted({s.observation.amount.currency for s in result.selected if s.observation.amount})
@@ -542,6 +599,7 @@ async def _value_and_commit(
             if superseded is not None:
                 await apply_disposition(conn, job, Disposition.complete(_superseded_result(superseded)))
                 return ValuationRun(valuation_id=None, state=None, cases=(), skipped=superseded.reason)
+            await _check_import_values(conn, actor, reads)
             stored_set = (
                 None
                 if rejected
@@ -602,6 +660,7 @@ async def _value_and_commit(
                 ),
                 cost_profile_id=None if stored_set is None else stored_profile.id,
                 fx_rate_ids=_fx_ids(valuation, all_rates),
+                cost_evidence_ids=_cited_import_values(valuation, reads.import_values),
             )
             inputs = (
                 valuation_repo.ValuationInputs()

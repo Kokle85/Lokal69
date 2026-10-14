@@ -1,11 +1,14 @@
 """The North Macedonian import-charge DRAFT (config/tax_rules/drafts) through the real engine.
 
 The draft is NOT APPROVED. It is pinned here to the golden cases of the design (G01-G19,
-G17b, U1-U10) and the motor-vehicle-tax (DMV) regression set of the fact sheet (section
-10.3), every amount in MKD to the cent and computed by ``tax_engine.calculate`` on the
-shipped file. The expected amounts were produced independently (hand arithmetic and a
-reference evaluator of the rule language) and must never be edited to make a test pass:
-a disagreement is a defect in the engine or the draft.
+G17b, G17c, U1-U10) and the motor-vehicle-tax (DMV) regression set of the fact sheet (section
+10.3), every amount in whole MKD and computed by ``tax_engine.calculate`` on the shipped file.
+Owner decisions of 2026-10-13 (draft.3): DMV is part of the import VAT base (ZDDV art.
+21(2)(1)), and every MKD amount, intermediate helpers included, and the total are rounded to
+whole denars half-up before they feed the next charge. The expected amounts were produced
+independently (hand arithmetic and an evaluator written from the fact sheet formulas, with
+exact fractions) and must never be edited to make a test pass: a disagreement is a defect in
+the engine or the draft.
 
 The band and table tests transcribe the fact sheet's tables (sections 5.4 and 5.5) here,
 independently of the JSON, so a transcription error in the draft fails a test.
@@ -32,6 +35,7 @@ from suv_deals.domain.tax_engine import (
     IncludedCost,
     OriginProof,
     OriginProofStatus,
+    PercentageComponent,
     RuleSet,
     TaxCalculation,
     TaxInputs,
@@ -46,15 +50,15 @@ from suv_deals.errors import ValidationFailed
 
 REPO = Path(__file__).resolve().parents[2]
 DRAFTS = REPO / "config" / "tax_rules" / "drafts"
-DRAFT = DRAFTS / "mk_passenger_car_import_2026.10-draft.2.json"
+DRAFT = DRAFTS / "mk_passenger_car_import_2026.10-draft.3.json"
 #: Content hash of the shipped draft. A changed draft is a new version, never an edit.
-DRAFT_CONTENT_SHA256 = "a856d5e401eb87e728079be0bfe3a723311480d6cdf1f38123cf6c052603d4b7"
+DRAFT_CONTENT_SHA256 = "4fe7f064f46ca8b91a90c5d799aa7c3c905973f6ea9a5dadb697490d91c83752"
 CATEGORY = "passenger_car"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 DECL = date(2026, 10, 13)
 #: Customs monthly EUR/MKD list from 01.10.2026 (fact sheet section 3.5).
 FX = "61.5337"
-CENT = Decimal("0.01")
+DENAR = Decimal("1")
 
 DUTY_MEMBERS = ("duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard")
 
@@ -173,7 +177,7 @@ def test_drafts_directory_ships_only_unapproved_sourced_drafts() -> None:
 
 def test_draft_identity_and_content_hash_are_pinned() -> None:
     rule_set = draft()
-    assert rule_set.label() == "mk-passenger-car-import@2026.10-draft.2"
+    assert rule_set.label() == "mk-passenger-car-import@2026.10-draft.3"
     assert (rule_set.jurisdiction, rule_set.currency, rule_set.vehicle_categories) == (
         "MK",
         "MKD",
@@ -231,14 +235,47 @@ def test_every_uncertain_marker_is_kept() -> None:
         "dmv_co2_phev_diesel",
         "dmv_co2_deemed_phev_petrol",
         "dmv_co2_deemed_phev_diesel",
-        "vat_base_mkd",
     }
     description = rule_set.description or ""
-    for topic in ("rounding", "СКД", "ДМВ inside the VAT base", "non-integer CO2", "US-origin evidence"):
-        assert topic in description
-    assert description.count("UNCERTAIN") >= 2
+    open_list = next(s for s in description.split(". ") if s.startswith("UNCERTAIN - confirm:"))
+    still_open = (
+        "СКД",
+        "non-integer CO2",
+        "hybrid/PHEV fuel column",
+        "non-EU preferential list",
+        "US-origin evidence",
+    )
+    for topic in still_open:
+        assert topic in open_list
+    # Resolved by the owner on 2026-10-13: no longer open.
+    for resolved in ("rounding", "whole denars", "VAT base"):
+        assert resolved not in open_list
+    assert description.count("UNCERTAIN") == 2
     raw = DRAFT.read_text(encoding="utf-8")
-    assert raw.count("UNCERTAIN") == 18
+    assert raw.count("UNCERTAIN") == 17
+
+
+def test_owner_decisions_of_2026_10_13_are_encoded() -> None:
+    rule_set = draft()
+    description = rule_set.description or ""
+    assert "Owner decisions of 2026-10-13: ДМВ is part of the import VAT base (ЗДДВ чл. 21(2)(1)" in (
+        description
+    )
+    assert "rounded to whole denars, half-up" in description
+    # D1: the VAT base sums every DMV alternative, with no UNCERTAIN marker, citing the owner.
+    vat_base = next(c for c in rule_set.components if c.id == "vat_base_mkd")
+    assert isinstance(vat_base, PercentageComponent) and vat_base.rate == 1
+    assert {"dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject"} <= set(vat_base.base)
+    assert "UNCERTAIN" not in vat_base.label and "UNCERTAIN" not in (vat_base.legal_reference or "")
+    assert "owner confirmation 2026-10-13" in vat_base.label
+    assert "чл. 21(2)(1)" in (vat_base.legal_reference or "")
+    assert "owner confirmation 2026-10-13" in (vat_base.legal_reference or "")
+    # D3: whole denars, half-up, before dependents, for every component and the total.
+    rules = rule_set.rounding_rules
+    assert rules is not None and rules.component_default is not None and rules.total is not None
+    for spec in (rules.component_default, rules.total):
+        assert (spec.quantum, spec.mode, spec.stage) == (DENAR, "half_up", "before_dependents")
+    assert all(c.rounding is None for c in rule_set.components)  # no component overrides the default
 
 
 def test_draft_calculation_is_never_production_ready_and_never_rule_supported() -> None:
@@ -250,9 +287,9 @@ def test_draft_calculation_is_never_production_ready_and_never_rule_supported() 
     assert not any(line.rule_supported or line.assumption_approved for line in lines)
     by_category = {line.category: line for line in lines}
     assert by_category[CostCategory.OTHER_IMPORT_CHARGES].status == CostLineStatus.NOT_APPLICABLE
-    assert by_category[CostCategory.IMPORT_DUTY].base == Money.of("11383.73", "MKD")
-    assert by_category[CostCategory.MOTOR_VEHICLE_TAX].base == Money.of("96390.00", "MKD")
-    assert by_category[CostCategory.IMPORT_VAT].base == Money.of("60380.72", "MKD")
+    assert by_category[CostCategory.IMPORT_DUTY].base == Money.of("11384", "MKD")
+    assert by_category[CostCategory.MOTOR_VEHICLE_TAX].base == Money.of("96390", "MKD")
+    assert by_category[CostCategory.IMPORT_VAT].base == Money.of("60381", "MKD")
 
 
 # --------------------------------------------------------------------------- golden cases
@@ -294,18 +331,8 @@ GOLDEN: tuple[Golden, ...] = (
     Golden(
         "G01 D1 diesel NEDC 189, 3000 + 700",
         {},
-        _std(
-            "227674.69",
-            "11383.73",
-            "239058.42",
-            "0.00",
-            "dmv_co2_diesel",
-            "96390.00",
-            "96390.00",
-            "335448.42",
-            "60380.72",
-        ),
-        "168154.45",
+        _std("227675", "11384", "239059", "0", "dmv_co2_diesel", "96390", "96390", "335449", "60381"),
+        "168155",
         "(open, 10000]",
     ),
     Golden(
@@ -313,118 +340,50 @@ GOLDEN: tuple[Golden, ...] = (
         {"origin_country": "DE"},
         _with_duty(
             "duty_preferential_eu",
-            _std(
-                "227674.69",
-                "0.00",
-                "227674.69",
-                "0.00",
-                "dmv_co2_diesel",
-                "96390.00",
-                "96390.00",
-                "324064.69",
-                "58331.64",
-            ),
+            _std("227675", "0", "227675", "0", "dmv_co2_diesel", "96390", "96390", "324065", "58332"),
         ),
-        "154721.64",
+        "154722",
     ),
     Golden(
         "G03 D3 petrol NEDC 245, 2500 + 700",
         {"cv": "3200", "fuel": "petrol", "co2": "245"},
-        _std(
-            "196907.84",
-            "9845.39",
-            "206753.23",
-            "0.00",
-            "dmv_co2_petrol",
-            "144550.00",
-            "144550.00",
-            "351303.23",
-            "63234.58",
-        ),
-        "217629.97",
+        _std("196908", "9845", "206753", "0", "dmv_co2_petrol", "144550", "144550", "351303", "63235"),
+        "217630",
     ),
     Golden(
         "G04 D4 diesel, CO2 not established (none_available)",
         {"cv": "3500", "co2": None, "cycle": None, "doc": "none_available"},
         _std(
-            "215367.95",
-            "10768.40",
-            "226136.35",
-            "0.00",
-            "dmv_co2_deemed_diesel",
-            "352000",
-            "352000.00",
-            "578136.35",
-            "104064.54",
+            "215368", "10768", "226136", "0", "dmv_co2_deemed_diesel", "352000", "352000", "578136", "104064"
         ),
-        "466832.94",
+        "466832",
     ),
     Golden(
         "G05 D5 diesel NEDC 170, 550 in CV + 150 inland (VAT base only)",
         {"cv": "3550", "co2": "170", "vat_incidental_eur": ("150",)},
-        _std(
-            "218444.64",
-            "10922.23",
-            "229366.87",
-            "0.00",
-            "dmv_co2_diesel",
-            "63750.00",
-            "63750.00",
-            "302346.93",
-            "54422.45",
-        ),
-        "129094.68",
+        _std("218445", "10922", "229367", "0", "dmv_co2_diesel", "63750", "63750", "302347", "54422"),
+        "129094",
     ),
     Golden(
         "G06 D6 risk: catalogue 6000 + 700",
         {"cv": "6700"},
-        _std(
-            "412275.79",
-            "20613.79",
-            "432889.58",
-            "0.00",
-            "dmv_co2_diesel",
-            "96390.00",
-            "96390.00",
-            "529279.58",
-            "95270.32",
-        ),
-        "212274.11",
+        _std("412276", "20614", "432890", "0", "dmv_co2_diesel", "96390", "96390", "529280", "95270"),
+        "212274",
     ),
     Golden(
         "G07 petrol, COC NEDC 130 + WLTP 155: WLTP is used",
         {"fuel": "petrol", "co2": "155", "cycle": "wltp"},
-        _std(
-            "227674.69",
-            "11383.73",
-            "239058.42",
-            "0.00",
-            "dmv_co2_petrol",
-            "16275.00",
-            "16275.00",
-            "255333.42",
-            "45960.02",
-        ),
-        "73618.75",
+        _std("227675", "11384", "239059", "0", "dmv_co2_petrol", "16275", "16275", "255334", "45960"),
+        "73619",
     ),
     Golden(
         "G08 origin EU, CV exactly 10000: the upper bound is inclusive",
         {"cv": "10000", "co2": "150", "origin_country": "EU"},
         _with_duty(
             "duty_preferential_eu",
-            _std(
-                "615337.00",
-                "0.00",
-                "615337.00",
-                "0.00",
-                "dmv_co2_diesel",
-                "40500.00",
-                "40500.00",
-                "655837.00",
-                "118050.66",
-            ),
+            _std("615337", "0", "615337", "0", "dmv_co2_diesel", "40500", "40500", "655837", "118051"),
         ),
-        "158550.66",
+        "158551",
         "(open, 10000]",
     ),
     Golden(
@@ -432,36 +391,16 @@ GOLDEN: tuple[Golden, ...] = (
         {"cv": "10001", "co2": "150", "origin_country": "IT"},
         _with_duty(
             "duty_preferential_eu",
-            _std(
-                "615398.53",
-                "0.00",
-                "615398.53",
-                "6153.99",
-                "dmv_co2_diesel",
-                "40500.00",
-                "46653.99",
-                "662052.52",
-                "119169.45",
-            ),
+            _std("615399", "0", "615399", "6154", "dmv_co2_diesel", "40500", "46654", "662053", "119170"),
         ),
-        "165823.44",
+        "165824",
         "(10000, 12000]",
     ),
     Golden(
         "G10 standard duty, CV 9600 (VMV 10080)",
         {"cv": "9600", "co2": "150"},
-        _std(
-            "590723.52",
-            "29536.18",
-            "620259.70",
-            "6202.60",
-            "dmv_co2_diesel",
-            "40500.00",
-            "46702.60",
-            "666962.30",
-            "120053.21",
-        ),
-        "196291.99",
+        _std("590724", "29536", "620260", "6203", "dmv_co2_diesel", "40500", "46703", "666963", "120053"),
+        "196292",
         "(10000, 12000]",
     ),
     Golden(
@@ -469,131 +408,80 @@ GOLDEN: tuple[Golden, ...] = (
         {"fx": "61.5", "cv": "12500", "co2": "150", "origin_country": "AT"},
         _with_duty(
             "duty_preferential_eu",
-            _std(
-                "768750.00",
-                "0.00",
-                "768750.00",
-                "15375.00",
-                "dmv_co2_diesel",
-                "40500.00",
-                "55875.00",
-                "824625.00",
-                "148432.50",
-            ),
+            _std("768750", "0", "768750", "15375", "dmv_co2_diesel", "40500", "55875", "824625", "148433"),
         ),
-        "204307.50",
+        "204308",
         "(12000, 14000]",
     ),
     Golden(
         "G12 plug-in hybrid HS 870360, NEDC 50: 50 % of the tax",
         {"fuel": "plugin_hybrid", "hs": "870360", "co2": "50"},
         {
-            "customs_value_mkd": "227674.69",
-            "duty_standard": "11383.73",
-            "vmv_mkd": "239058.42",
-            "dmv_value_part": "0.00",
-            "dmv_co2_phev_petrol": "400.00",
-            "dmv_plugin_hybrid_half": "200.00",
-            "vat_base_mkd": "239258.42",
-            "vat_import": "43066.52",
+            "customs_value_mkd": "227675",
+            "duty_standard": "11384",
+            "vmv_mkd": "239059",
+            "dmv_value_part": "0",
+            "dmv_co2_phev_petrol": "400",
+            "dmv_plugin_hybrid_half": "200",
+            "vat_base_mkd": "239259",
+            "vat_import": "43067",
         },
-        "54650.25",
+        "54651",
     ),
     Golden(
         "G13 battery-electric: no CO2 document needed, not subject",
         {"fuel": "electric", "co2": None, "cycle": None, "doc": None},
         {
-            "customs_value_mkd": "227674.69",
-            "duty_standard": "11383.73",
-            "vmv_mkd": "239058.42",
-            "dmv_value_part": "0.00",
+            "customs_value_mkd": "227675",
+            "duty_standard": "11384",
+            "vmv_mkd": "239059",
+            "dmv_value_part": "0",
             "dmv_co2_bev_none": "0",
             "dmv_bev_not_subject": "0",
-            "vat_base_mkd": "239058.42",
-            "vat_import": "43030.52",
+            "vat_base_mkd": "239059",
+            "vat_import": "43031",
         },
-        "54414.25",
+        "54415",
     ),
     Golden(
         "G14 full hybrid (petrol) NEDC 118",
         {"fuel": "hybrid_petrol", "co2": "118"},
-        _std(
-            "227674.69",
-            "11383.73",
-            "239058.42",
-            "0.00",
-            "dmv_co2_petrol",
-            "8850.00",
-            "8850.00",
-            "247908.42",
-            "44623.52",
-        ),
-        "64857.25",
+        _std("227675", "11384", "239059", "0", "dmv_co2_petrol", "8850", "8850", "247909", "44624"),
+        "64858",
     ),
     Golden(
         "G15 diesel NEDC 191: the printed lower figure is inclusive",
         {"co2": "191"},
-        _std(
-            "227674.69",
-            "11383.73",
-            "239058.42",
-            "0.00",
-            "dmv_co2_diesel",
-            "115555.00",
-            "115555.00",
-            "354613.42",
-            "63830.42",
-        ),
-        "190769.15",
+        _std("227675", "11384", "239059", "0", "dmv_co2_diesel", "115555", "115555", "354614", "63831"),
+        "190770",
     ),
     Golden(
         "G16 diesel, WLTP-only COC 160",
         {"co2": "160", "cycle": "wltp"},
-        _std(
-            "227674.69",
-            "11383.73",
-            "239058.42",
-            "0.00",
-            "dmv_co2_diesel",
-            "31200.00",
-            "31200.00",
-            "270258.42",
-            "48646.52",
-        ),
-        "91230.25",
+        _std("227675", "11384", "239059", "0", "dmv_co2_diesel", "31200", "31200", "270259", "48647"),
+        "91231",
     ),
+    # The value-part edge in whole denars: CV and duty are assessed in whole MKD before the
+    # VMV key is converted, so the smallest VMV over EUR 10,000 at 61.5337 is 615,338 MKD.
     Golden(
-        "G17 value-part edge, standard duty, CV 9523.81 (key just above 10000)",
-        {"cv": "9523.81"},
-        _std(
-            "586035.27",
-            "29301.76",
-            "615337.03",
-            "6153.37",
-            "dmv_co2_diesel",
-            "96390.00",
-            "102543.37",
-            "717880.40",
-            "129218.47",
-        ),
-        "261063.60",
+        "G17 value-part edge, standard duty, CV 9523.82 (VMV 615338 MKD, key just above 10000)",
+        {"cv": "9523.82"},
+        _std("586036", "29302", "615338", "6153", "dmv_co2_diesel", "96390", "102543", "717881", "129219"),
+        "261064",
         "(10000, 12000]",
     ),
     Golden(
-        "G17b same, CV 9523.80 (key just below 10000)",
-        {"cv": "9523.80"},
-        _std(
-            "586034.65",
-            "29301.73",
-            "615336.38",
-            "0.00",
-            "dmv_co2_diesel",
-            "96390.00",
-            "96390.00",
-            "711726.38",
-            "128110.75",
-        ),
-        "253802.48",
+        "G17b same, CV 9523.79 (VMV 615336 MKD, key just below 10000)",
+        {"cv": "9523.79"},
+        _std("586034", "29302", "615336", "0", "dmv_co2_diesel", "96390", "96390", "711726", "128111"),
+        "253803",
+        "(open, 10000]",
+    ),
+    Golden(
+        "G17c same, CV 9523.81: whole denars put the key on exactly 10000 (0 %; 1 % with 0.01 MKD)",
+        {"cv": "9523.81"},
+        _std("586035", "29302", "615337", "0", "dmv_co2_diesel", "96390", "96390", "711727", "128111"),
+        "253803",
         "(open, 10000]",
     ),
     Golden(
@@ -601,35 +489,15 @@ GOLDEN: tuple[Golden, ...] = (
         {"origin_country": "US"},
         _with_duty(
             "duty_us_origin",
-            _std(
-                "227674.69",
-                "0.00",
-                "227674.69",
-                "0.00",
-                "dmv_co2_diesel",
-                "96390.00",
-                "96390.00",
-                "324064.69",
-                "58331.64",
-            ),
+            _std("227675", "0", "227675", "0", "dmv_co2_diesel", "96390", "96390", "324065", "58332"),
         ),
-        "154721.64",
+        "154722",
     ),
     Golden(
         "G19 accepted proof of a non-FTA origin (JP): standard duty",
         {"origin_country": "JP"},
-        _std(
-            "227674.69",
-            "11383.73",
-            "239058.42",
-            "0.00",
-            "dmv_co2_diesel",
-            "96390.00",
-            "96390.00",
-            "335448.42",
-            "60380.72",
-        ),
-        "168154.45",
+        _std("227675", "11384", "239059", "0", "dmv_co2_diesel", "96390", "96390", "335449", "60381"),
+        "168155",
     ),
 )
 
@@ -645,9 +513,11 @@ def test_golden_case(golden: Golden) -> None:
             assert comp.amount is not None
             assert comp.amount.currency == "MKD"
             assert comp.amount.amount == Decimal(golden.expected[comp.component_id]), comp.component_id
+            assert comp.amount.amount == comp.amount.amount.to_integral_value(), comp.component_id  # D3
         else:
             assert comp.status == ComponentStatus.NOT_APPLICABLE, comp.component_id
     assert calc.total_import_cost == Money.of(golden.total, "MKD")
+    assert calc.total_import_cost.amount.as_tuple().exponent == 0  # whole denars, no decimals
     assert calc.known_subtotal is None and calc.unknown_components == () and calc.missing_inputs == ()
 
     # The total is duty + DMV + VAT; helpers (customs value, VMV, value part, CO2 part, VAT base)
@@ -671,19 +541,26 @@ def test_golden_case(golden: Golden) -> None:
 
 def test_value_part_key_is_vmv_converted_to_eur_with_the_customs_rate() -> None:
     at_threshold = component(run(cv="10000", co2="150", origin_country="EU"), "dmv_value_part")
-    assert at_threshold.inputs_used["key"].startswith("615337.00 MKD -> 10000 EUR (customs EUR/MKD=61.5337")
-    above = component(run(cv="9523.81"), "dmv_value_part")
-    assert above.inputs_used["key"].startswith("615337.03 MKD -> 10000.000487")
-    below = component(run(cv="9523.80"), "dmv_value_part")
-    assert below.inputs_used["key"].startswith("615336.38 MKD -> 9999.98992")
+    assert at_threshold.inputs_used["key"].startswith("615337 MKD -> 10000 EUR (customs EUR/MKD=61.5337")
+    above = component(run(cv="9523.82"), "dmv_value_part")
+    assert above.inputs_used["key"].startswith("615338 MKD -> 10000.01625")
+    below = component(run(cv="9523.79"), "dmv_value_part")
+    assert below.inputs_used["key"].startswith("615336 MKD -> 9999.98374")
+    # The key is the ASSESSED (whole-denar) customs value + duty: 586,035.27 -> 586,035 and
+    # 29,301.75 -> 29,302 give exactly 615,337 MKD = EUR 10,000 (0 %), where the unrounded
+    # 615,337.03 MKD was just over (1 %).
+    on_edge = component(run(cv="9523.81"), "dmv_value_part")
+    assert on_edge.inputs_used["key"].startswith("615337 MKD -> 10000 EUR")
+    assert on_edge.inputs_used["bracket"] == "(open, 10000]"
 
 
 def test_inland_leg_enters_the_vat_base_converted_unrounded() -> None:
     calc = run(cv="3550", co2="170", vat_incidental_eur=("150",))
     used = component(calc, "vat_base_mkd").inputs_used["vat_incidental_costs_total"]
     assert used.startswith("9230.055")
+    assert component(calc, "vat_base_mkd").amount == Money.of("302347", "MKD")  # 302,346.055 half-up
     no_inland = run(cv="3550", co2="170")
-    assert component(no_inland, "vat_base_mkd").amount == Money.of("293116.87", "MKD")
+    assert component(no_inland, "vat_base_mkd").amount == Money.of("293117", "MKD")
 
 
 # --------------------------------------------------------------------------- DMV regression set
@@ -811,10 +688,12 @@ def _table_1_cases() -> list[tuple[int, str]]:
 
 @pytest.mark.parametrize(("vmv_eur", "rate"), _table_1_cases())
 def test_table_1_value_part_bands(vmv_eur: int, rate: str) -> None:
-    # Duty 0 (accepted EU proof) and FX 61.5: VMV in MKD is exact and its EUR key is vmv_eur.
+    # Duty 0 (accepted EU proof) and FX 61.5: the customs value is rounded to whole denars
+    # (exact for an even EUR amount, +0.5 MKD for an odd one), so the EUR key is vmv_eur or
+    # vmv_eur + 0.5/61.5 and stays in the band under test.
     calc = run(fx="61.5", cv=str(vmv_eur), co2="150", origin_country="DE")
-    vmv_mkd = Decimal(vmv_eur) * Decimal("61.5")
-    expected = (vmv_mkd * Decimal(rate)).quantize(CENT, rounding=ROUND_HALF_UP)
+    vmv_mkd = (Decimal(vmv_eur) * Decimal("61.5")).quantize(DENAR, rounding=ROUND_HALF_UP)
+    expected = (vmv_mkd * Decimal(rate)).quantize(DENAR, rounding=ROUND_HALF_UP)
     assert component(calc, "vmv_mkd").amount == Money(amount=vmv_mkd, currency="MKD")
     assert component(calc, "dmv_value_part").amount == Money(amount=expected, currency="MKD")
     assert component(calc, "dmv_full").amount == Money(amount=expected + 40500, currency="MKD")
@@ -834,8 +713,8 @@ def _incomplete(calc: TaxCalculation, unknown: list[str]) -> None:
 def test_u1_co2_document_unknown() -> None:
     calc = run(doc=None)
     _incomplete(calc, ["dmv_co2_diesel", "dmv_co2_deemed_diesel", "dmv_full", "vat_base_mkd", "vat_import"])
-    assert component(calc, "duty_standard").amount == Money.of("11383.73", "MKD")
-    assert calc.known_subtotal == Money.of("11383.73", "MKD")  # duty only; helpers never count
+    assert component(calc, "duty_standard").amount == Money.of("11384", "MKD")
+    assert calc.known_subtotal == Money.of("11384", "MKD")  # duty only; helpers never count
     assert "co2_source_document" in component(calc, "dmv_co2_diesel").missing_inputs
     assert calc.category_totals()[CostCategory.MOTOR_VEHICLE_TAX].status == ComponentStatus.UNKNOWN
 
@@ -864,7 +743,7 @@ def test_u3_non_integer_co2_is_unknown_not_the_lower_band() -> None:
     calc = run(co2="190.5")
     _incomplete(calc, ["dmv_co2_diesel", "dmv_full", "vat_base_mkd", "vat_import"])
     assert component(calc, "dmv_co2_diesel").warnings == ("VALUE_NOT_INTEGER_NO_BAND_RULE:co2_g_km=190.5",)
-    assert calc.known_subtotal == Money.of("11383.73", "MKD")
+    assert calc.known_subtotal == Money.of("11384", "MKD")
 
 
 def test_u4_plugin_hybrid_without_a_classification() -> None:
@@ -1006,7 +885,9 @@ def test_u10_customs_rate_outside_its_monthly_window() -> None:
 def test_u10_customs_value_in_mkd_still_needs_the_rate_for_the_value_part_key() -> None:
     calc = run(cv="227674.69", cv_currency="MKD", rate_date=date(2026, 10, 14), fx_valid=None)
     _incomplete(calc, ["dmv_value_part", "dmv_full", "vat_base_mkd", "vat_import"])
-    assert component(calc, "customs_value_mkd").amount == Money.of("227674.69", "MKD")
+    customs_value = component(calc, "customs_value_mkd")
+    assert customs_value.amount == Money.of("227675", "MKD")  # whole denars, half-up
+    assert customs_value.unrounded_amount == Decimal("227674.69")
     part = component(calc, "dmv_value_part")
     assert "customs_fx_rate" in part.missing_inputs
     assert any(w.startswith("CUSTOMS_FX_RATE_AFTER_DECLARATION") for w in part.warnings)

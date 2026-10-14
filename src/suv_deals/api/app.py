@@ -27,8 +27,10 @@
 - **Spec 37 routes**: ``api.mail_worker_routes`` (``/v1/mail-workers``; mailbox-worker credential,
   128 KiB body limit by default, no CORS) and ``api.inquiry_routes`` (dashboard inquiry, reply,
   control, mail-worker health, lifecycle and evaluation routes) are included after the core routes,
-  then ``api.import_cost_routes`` (the read-only import-cost calculator) and
-  ``api.owner_config_routes`` (the owner's tax-rule and cost-profile approval path).
+  then ``api.import_cost_routes`` (the read-only import-cost calculator),
+  ``api.owner_config_routes`` (the owner's tax-rule and cost-profile approval path) and
+  ``api.import_values_routes`` (a listing's recorded real purchase price and estimated customs
+  value; recording is owner-only).
 - **Extension points**: ``extra_routers`` are included after those and before the MCP mount
   (with their own authentication dependency and, through ``ApiOptions.prefix_body_limits``, their
   own body limit).
@@ -63,7 +65,14 @@ from starlette.routing import Route
 from starlette.types import ASGIApp
 
 import suv_deals
-from suv_deals.api import import_cost_routes, inquiry_routes, mail_worker_routes, owner_config_routes, routes
+from suv_deals.api import (
+    import_cost_routes,
+    import_values_routes,
+    inquiry_routes,
+    mail_worker_routes,
+    owner_config_routes,
+    routes,
+)
 from suv_deals.api.auth import SigningKeyResolver, StaticJwks, SupabaseJwtVerifier
 from suv_deals.api.deps import STATE_ATTRIBUTE, ApiOptions, ApiState
 from suv_deals.api.errors import install_exception_handlers
@@ -363,6 +372,7 @@ def create_app(
     app.include_router(inquiry_routes.router)  # spec 37 dashboard inquiry/reply/health routes
     app.include_router(import_cost_routes.router)  # read-only import-cost calculator
     app.include_router(owner_config_routes.router)  # owner: tax rule sets and cost profiles
+    app.include_router(import_values_routes.router)  # recorded purchase price / customs value
     if opts.expose_metrics:
         app.add_api_route("/metrics", _metrics_route(app_metrics), methods=["GET"], include_in_schema=False)
     for extra in extra_routers:

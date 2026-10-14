@@ -219,7 +219,8 @@ test.describe('mail workers, lags and evaluation', () => {
     await expect(card).toHaveAttribute('data-monitoring', 'no')
     await expect(page.getByText('not monitoring: coverage gap')).toBeVisible()
     await expect(page.getByTestId('mailbox-not-monitoring')).toContainText('the PC may be off, asleep or offline')
-    await expect(card).toContainText('6 h ago')
+    // Seeded 6 hours before the run: minutes may have passed since ("6 h 2 min ago" on a long run).
+    await expect(card).toContainText(/\b6 h( \d{1,2} min)? ago/)
     // The worker's LAST report (in sync, 10 s lag, empty backlog) is stored, but without a healthy
     // heartbeat the server reports these worker-reported dimensions as UNKNOWN (work package C1,
     // item 8): none of it may read as current health.

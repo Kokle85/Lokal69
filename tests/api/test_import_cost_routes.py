@@ -63,9 +63,10 @@ from suv_deals.views.jsonschema import model_schema
 
 PATH = "/api/import-costs/estimate"
 KEY = f"GET {PATH}"
-G01 = "168154.45"  # D1: diesel, NEDC 189 on the COC, EUR 3,000 + EUR 700 transport, no proof of origin
-G02 = "154721.64"  # D2: the same car with an accepted EU proof of origin
-G03 = "217629.97"  # D3: petrol, NEDC 245 on the COC, EUR 2,500 + EUR 700
+#: Whole denars without a fraction (owner decision of 2026-10-13: amounts without decimals).
+G01 = "168155"  # D1: diesel, NEDC 189 on the COC, EUR 3,000 + EUR 700 transport, no proof of origin
+G02 = "154722"  # D2: the same car with an accepted EU proof of origin
+G03 = "217630"  # D3: petrol, NEDC 245 on the COC, EUR 2,500 + EUR 700
 SECRET = "Zz" * 20  # a value that must never be echoed
 #: Fact sheet D1 as flat query parameters (stands alone: no listing needed).
 D1: dict[str, str] = {
@@ -100,9 +101,9 @@ def valid(response: httpx.Response) -> dict[str, Any]:
     return body
 
 
-def legal_base(data: dict[str, Any]) -> dict[str, Any]:
+def primary(data: dict[str, Any]) -> dict[str, Any]:
     scenario: dict[str, Any] = data["scenarios"][0]
-    assert scenario["name"] == "legal_base"
+    assert scenario["name"] == "primary"
     return scenario
 
 
@@ -193,7 +194,8 @@ def test_flat_query_parameters_convert_to_the_tool_input() -> None:
             "hs_evidence_ref": "SYNTHETIC broker note",
             "transport_after_entry_eur": "150.00",
             "transport_after_entry_separately_invoiced": "true",
-            "catalogue_value_eur": "6000",
+            "estimated_customs_value_eur": "6000",
+            "estimated_customs_value_source": "SYNTHETIC catalogue",
             "importer_status": "private",
             "first_registration": "2012-05",
             "emissions_class": "Euro 5",
@@ -221,7 +223,8 @@ def test_flat_query_parameters_convert_to_the_tool_input() -> None:
                 "hs_evidence_ref": "SYNTHETIC broker note",
                 "transport_after_entry_eur": "150.00",
                 "transport_after_entry_separately_invoiced": True,
-                "catalogue_value_eur": "6000",
+                "estimated_customs_value_eur": "6000",
+                "estimated_customs_value_source": "SYNTHETIC catalogue",
                 "importer_status": "private",
                 "first_registration": "2012-05",
                 "emissions_class": "Euro 5",
@@ -266,6 +269,18 @@ def test_flat_query_parameters_convert_to_the_tool_input() -> None:
             ["transport_after_entry_eur", "transport_after_entry_separately_invoiced"],
         ),
         ({"hs_evidence_ref": "SYNTHETIC"}, ["hs_evidence_ref"]),
+        (
+            {"estimated_customs_value_eur": "4200"},
+            ["estimated_customs_value_eur", "estimated_customs_value_source"],
+        ),
+        (
+            {"estimated_customs_value_source": "SYNTHETIC catalogue"},
+            ["estimated_customs_value_eur", "estimated_customs_value_source"],
+        ),
+        (
+            {"estimated_customs_value_eur": "0", "estimated_customs_value_source": "SYNTHETIC"},
+            ["estimated_customs_value_eur"],
+        ),
         ({"hs_code": "870421", "fuel": "diesel"}, ["hs_code"]),
         (
             {
@@ -299,13 +314,20 @@ async def test_preview_from_vehicle_facts_alone(calc: CalcHarness) -> None:
     assert data["banner"]["en"].startswith("INDICATIVE PREVIEW")
     assert data["rule"]["rule_set_id"] == "mk-passenger-car-import" and data["rule"]["status"] == "draft"
     assert data["rule"]["sha256_recorded"] is False and data["listing"] is None
-    legal = legal_base(data)
+    legal = primary(data)
     assert legal["indicative_total"] == {"status": "known", "amount": G01, "currency": "MKD", "reason": None}
     assert legal["total"] is None and legal["total_eur"] is None and legal["landed_cost_eur"] is None
-    assert legal["indicative_landed_cost_eur"]["status"] == "known" and legal["production_ready"] is False
+    assert legal["indicative_landed_cost_eur"]["amount"] == "6433" and legal["production_ready"] is False
+    assert legal["indicative_total_eur"]["amount"] == "2733"  # whole euros (EUR 2,732.73)
+    assert data["purchase_price"]["amount"]["amount"] == "3000"
+    assert data["customs_value_for_duties"] == {
+        "amount": {"status": "known", "amount": "3700", "currency": "EUR", "reason": None},
+        "basis": "transaction_value",
+        "source": "invoice or contract price",
+    }
     assert data["customs_fx_source"] == "caller_supplied" and data["customs_fx_rate"]["rate"] == CUSTOMS_RATE
     assert any(a.startswith("CALLER_SUPPLIED_CUSTOMS_RATE") for a in data["assumptions"])
-    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700.00 EUR") for a in data["assumptions"])
+    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700 EUR") for a in data["assumptions"])
     assert any(a.startswith("NO_ORIGIN_PROOF_STANDARD_DUTY") for a in data["assumptions"])
     helpers = {c["component_id"] for c in legal["components"] if c["intermediate"]}
     assert {"customs_value_mkd", "vat_base_mkd"} <= helpers
@@ -321,7 +343,7 @@ async def test_listing_facts_with_query_overrides(calc: CalcHarness) -> None:
     listing = str(calc.listing_id)
     base = {"listing_id": listing, "declaration_date": "2026-10-13", "co2_document": "coc"}
     g01 = valid(await calc.estimate(base))["data"]
-    assert legal_base(g01)["indicative_total"]["amount"] == G01
+    assert primary(g01)["indicative_total"]["amount"] == G01
     assert g01["listing"]["listing_id"] == listing and g01["customs_fx_source"] == "recorded"
     sources = {s["fact"]: s["source"] for s in g01["fact_sources"]}
     assert (
@@ -332,8 +354,8 @@ async def test_listing_facts_with_query_overrides(calc: CalcHarness) -> None:
         await calc.estimate({**base, "origin_proof_kind": "eu", "origin_proof_evidence_ref": "SYNTHETIC"})
     )
     names = [s["name"] for s in eu["data"]["scenarios"]]
-    assert names[:2] == ["legal_base", "standard_duty_if_proof_rejected"]
-    assert legal_base(eu["data"])["indicative_total"]["amount"] == G02
+    assert names[:2] == ["primary", "standard_duty_if_proof_rejected"]
+    assert primary(eu["data"])["indicative_total"]["amount"] == G02
     assert eu["data"]["scenarios"][1]["indicative_total"]["amount"] == G01
     assert "SELLER_CLAIMS_UNVERIFIED" in warning_codes(eu)
     # Every given parameter replaces the listing's fact (D3: petrol, NEDC 245, EUR 2,500 invoice).
@@ -346,8 +368,27 @@ async def test_listing_facts_with_query_overrides(calc: CalcHarness) -> None:
         "price_basis": "invoice",
     }
     g03 = valid(await calc.estimate(petrol))["data"]
-    assert legal_base(g03)["indicative_total"]["amount"] == G03
+    assert primary(g03)["indicative_total"]["amount"] == G03
     assert g03["facts"]["fuel"] == "petrol" and g03["facts"]["price_basis"] == "invoice"
+    # An estimated customs value (owner decision 2026-10-13): the listing's advertised EUR 3,000
+    # stays the purchase price; the primary charges follow the estimate + transport (EUR 6,700).
+    estimated = valid(
+        await calc.estimate(
+            {
+                **base,
+                "estimated_customs_value_eur": "6000",
+                "estimated_customs_value_source": "SchwackeNet catalogue",
+            }
+        )
+    )["data"]
+    assert [s["name"] for s in estimated["scenarios"]] == ["primary", "transaction_value"]
+    assert primary(estimated)["indicative_total"]["amount"] == "212274"
+    assert primary(estimated)["indicative_landed_cost_eur"]["amount"] == "7150"  # 3,000 + 700 + 3,449.72
+    assert estimated["scenarios"][1]["indicative_total"]["amount"] == G01
+    assert estimated["purchase_price"]["basis"] == "advertised"
+    assert estimated["customs_value_for_duties"]["amount"]["amount"] == "6700"
+    sources = {s["fact"]: s["source"] for s in estimated["fact_sources"]}
+    assert sources["estimated_customs_value_eur"] == "request" and sources["price"] == "listing"
 
 
 @pytest.mark.db
@@ -359,7 +400,7 @@ async def test_unknown_inputs_stay_unknown_never_zero(calc: CalcHarness) -> None
         )
     )
     data = body["data"]
-    legal = legal_base(data)
+    legal = primary(data)
     assert legal["complete"] is False
     assert legal["indicative_total"]["status"] == "unknown" and legal["indicative_total"]["amount"] is None
     assert legal["indicative_landed_cost_eur"]["status"] == "unknown"
@@ -404,9 +445,9 @@ async def test_an_active_rule_set_takes_precedence(calc: CalcHarness) -> None:
     body = valid(await calc.estimate(D1))
     data = body["data"]
     assert data["mode"] == "active" and data["banner"] is None and data["rule"]["status"] == "active"
-    legal = legal_base(data)
+    legal = primary(data)
     assert legal["total"]["amount"] == G01 and legal["indicative_total"] is None
-    assert legal["total_eur"]["status"] == "known" and legal["landed_cost_eur"]["status"] == "known"
+    assert legal["total_eur"]["amount"] == "2733" and legal["landed_cost_eur"]["amount"] == "6433"
     assert data["production_ready"] is True and "TAX_RULES_UNAPPROVED" not in warning_codes(body)
 
 

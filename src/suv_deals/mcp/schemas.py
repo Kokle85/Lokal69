@@ -59,6 +59,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
+from suv_deals.domain.costs import SOURCE_LABEL_MAX_LENGTH, SOURCE_LABEL_MIN_LENGTH
 from suv_deals.domain.enums import Co2Cycle, Fuel, Precision, ProfileKey, ReviewOutcome, Scope
 from suv_deals.domain.import_estimate import (
     Co2Document,
@@ -618,10 +619,17 @@ EmissionsClassText = Annotated[
     str, Field(min_length=1, max_length=40), AfterValidator(_plain_text), _require_content(1)
 ]
 HsCodeText = Annotated[str, Field(min_length=6, max_length=16, pattern=r"^[0-9][0-9 .]{4,14}[0-9]$")]
+#: Where a value comes from (``domain.costs.SourceLabel``), e.g. "SchwackeNet catalogue".
+SourceText = Annotated[
+    str,
+    Field(min_length=SOURCE_LABEL_MIN_LENGTH, max_length=SOURCE_LABEL_MAX_LENGTH),
+    AfterValidator(_plain_text),
+    _require_content(SOURCE_LABEL_MIN_LENGTH),
+]
 
 
 class ImportPriceInput(ToolInput):
-    """A purchase price as stated."""
+    """The real purchase price as stated (what is, or will be, actually paid)."""
 
     amount: MoneyText = Field(description='Amount in the currency, e.g. "3000.00".')
     currency: Literal["EUR", "MKD", "CHF"] = Field(
@@ -675,7 +683,8 @@ _VEHICLE_FIELDS: Final = (
     "hs_evidence_ref",
     "transport_after_entry_eur",
     "transport_after_entry_separately_invoiced",
-    "catalogue_value_eur",
+    "estimated_customs_value_eur",
+    "estimated_customs_value_source",
     "importer_status",
     "mileage_km",
     "seller_country",
@@ -690,11 +699,16 @@ class ImportVehicleInput(ToolInput):
     no tariff code, no VAT base and no WLTP/NEDC conversion."""
 
     price: ImportPriceInput | SkipJsonSchema[None] = _optional(
-        "Purchase price. Set price_basis invoice for an invoice or contract price; otherwise it counts "
-        "as an advertised price (a claim, flagged)."
+        "REAL purchase price (what is, or will be, actually paid): the landed cost and the profit always "
+        "use it, never the estimated customs value. Omitted with listing_id: the owner's recorded purchase "
+        "price of the listing when there is one (fact source recorded), otherwise its advertised price. "
+        "Set price_basis invoice for an invoice or contract price; otherwise it counts as an advertised "
+        "price (a claim, flagged)."
     )
     price_basis: PriceBasis | SkipJsonSchema[None] = _optional(
-        "invoice (transaction value) or advertised (the default)."
+        "invoice (transaction value) or advertised (the default for a price passed here). Without a "
+        "price it restates the listing's advertised price; it is refused when the listing has a "
+        "recorded purchase price (that keeps its recorded kind: pass a price to replace it)."
     )
     declaration_date: IsoDate | SkipJsonSchema[None] = _optional(
         "Customs declaration date (YYYY-MM-DD); default today. Selects the rules and the monthly "
@@ -737,8 +751,17 @@ class ImportVehicleInput(ToolInput):
     transport_after_entry_separately_invoiced: StrictBool | SkipJsonSchema[None] = _optional(
         "true only with transport_after_entry_eur."
     )
-    catalogue_value_eur: MoneyText | SkipJsonSchema[None] = _optional(
-        "Catalogue value: adds the customs_revaluation_risk scenario; never used as the customs value."
+    estimated_customs_value_eur: MoneyText | SkipJsonSchema[None] = _optional(
+        "ESTIMATED customs value of the vehicle in EUR, without transport (e.g. the SchwackeNet catalogue "
+        "value Customs uses for used vehicles; more than 0). The primary scenario's charges use it + the "
+        "transport to the MK place of entry; the landed cost and the profit still use price. Adds the "
+        "transaction_value scenario (Customs accepts the price paid, its primary method). Omitted with "
+        "listing_id: the owner's recorded estimate of the listing, if any. Needs "
+        "estimated_customs_value_source."
+    )
+    estimated_customs_value_source: SourceText | SkipJsonSchema[None] = _optional(
+        'Where the estimated customs value comes from, e.g. "SchwackeNet catalogue" or "owner estimate" '
+        "(3-120 characters); only with estimated_customs_value_eur."
     )
     importer_status: ImporterStatus | SkipJsonSchema[None] = _optional(
         "private, non_vat_business or vat_dealer (VAT recoverability note only)."
@@ -783,7 +806,9 @@ class DealsEstimateImportCostsInput(ToolInput):
 
     listing_id: Id | SkipJsonSchema[None] = _optional(
         "Listing whose CURRENT revision supplies the facts: advertised price, fuel, CO2 claim, first "
-        "registration, Euro class, seller country, mileage. Omit to estimate from vehicle alone."
+        "registration, Euro class, seller country, mileage. The owner's RECORDED values of the listing "
+        "are used automatically: the real purchase price instead of the advertised one and the "
+        "estimated customs value (fact source recorded). Omit to estimate from vehicle alone."
     )
     vehicle: ImportVehicleInput | SkipJsonSchema[None] = _optional(
         "Facts you know (better): each field set here replaces the listing's."
@@ -829,6 +854,8 @@ class DealsEstimateImportCostsInput(ToolInput):
             ]
         if vehicle.hs_evidence_ref is not None and vehicle.hs_code is None:
             fields.append("vehicle.hs_evidence_ref")
+        if (vehicle.estimated_customs_value_eur is None) != (vehicle.estimated_customs_value_source is None):
+            fields += ["vehicle.estimated_customs_value_eur", "vehicle.estimated_customs_value_source"]
         return tuple(fields)
 
     def vehicle_facts(self) -> VehicleImportFacts | None:
@@ -1136,13 +1163,13 @@ _CALC_SPECS: Final[tuple[ToolSpec, ...]] = (
         scope=Scope.DEALS_READ,
         annotations=_read("Estimate MK import costs"),
         description=(
-            "North Macedonia import charges for one passenger car: customs duty, motor-vehicle tax (DMV) "
-            "and import VAT, plus the landed cost with the owner's fixed per-vehicle transport (EUR 700, "
-            "cost profile). Facts come from listing_id and/or vehicle (vehicle fields win). Mode "
-            "indicative_preview means rules that are not ACTIVE (draft, under review, or approved but not "
-            "yet activated; rule.status says which): relay the banner unchanged and call every figure "
-            "indicative. A missing CO2 document or proof of origin changes the result; unknown charges are "
-            "never 0. Read-only; no tool approves tax rules."
+            "MK import charges (customs duty, motor-vehicle tax, import VAT) and landed cost per car, fixed "
+            "EUR 700 transport, whole units. price = real purchase price (landed cost, profit); "
+            "estimated_customs_value_eur + source (e.g. SchwackeNet) = primary charges' basis; "
+            "transaction_value = on price paid; recorded listing values apply. indicative_preview = rules "
+            "that are not ACTIVE (draft, under review or approved but not yet activated; see rule.status): "
+            "relay banner unchanged. Missing CO2 document or proof of origin changes the result; unknown "
+            "charges are never 0. Read-only; no tool approves tax rules."
         ),
     ),
 )

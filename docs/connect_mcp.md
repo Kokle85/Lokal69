@@ -229,9 +229,33 @@ are strings (`"3000.00"`, never `3000`).
 - `hs_code`: only from a broker, a ruling or the owner (HS 8703); a plug-in hybrid needs it.
 - `transport_after_entry_eur` with `transport_after_entry_separately_invoiced: true` only when the
   inland leg is invoiced separately; otherwise all EUR 700 is in the customs value.
-- `catalogue_value_eur` adds a `customs_revaluation_risk` scenario; it is never the customs value.
+- `price` is the REAL purchase price (what is actually paid): every landed cost, and so the profit,
+  uses it. `estimated_customs_value_eur` with `estimated_customs_value_source` (both or neither;
+  the vehicle only, without transport, e.g. `"4200"` and `"SchwackeNet catalogue"`) is the value the
+  `primary` scenario's charges are computed on, plus the transport to the MK place of entry (whether
+  Customs adds that transport to a catalogue value is UNCERTAIN). With it, the `transaction_value`
+  scenario shows the charges if Customs accepts the price paid (Царински закон чл. 28, its primary
+  method; another method applies only on founded doubt).
+- With a `listing_id`, the owner's RECORDED values of that listing are used automatically: the
+  recorded real purchase price instead of the advertised price (basis `recorded_actual`,
+  `recorded_quote` or `recorded_estimate`), and the recorded estimated customs value. The owner
+  records them on the dashboard (`POST /api/listings/{listing_id}/import-values`) or with
+  `suv-deals import-costs record-values` (docs/runbook.md); **dot cannot record them** (no tool
+  writes them). `fact_sources` then says `recorded`, `purchase_price.source` /
+  `customs_value_for_duties.source` name the recorded value, `listing.recorded_purchase_price_id` /
+  `listing.recorded_customs_value_id` carry the row ids and `notes` say `RECORDED_*_USED`. A `price`
+  or estimate dot passes replaces the recorded one for that estimate only (notes
+  `RECORDED_*_OVERRIDDEN`); nothing is stored, so the next call uses the recorded values again.
 - `customs_eur_mkd_rate`: the Customs monthly list rate of the declaration month, used only when
   none is recorded (`suv-deals fx record --purpose customs ...`); labelled and never stored.
+
+Two values, never mixed (owner decision 2026-10-13): Customs officially uses the SchwackeNet
+catalogue to assess used vehicles, but the Customs Law makes the price actually paid (transaction
+value, чл. 28) the primary method, with the other methods only in the legal order and on founded
+doubt. So a car bought for EUR 2,800 that the catalogue values at EUR 4,200 keeps EUR 2,800 as its
+real purchase price (profit, landed cost) and EUR 4,200 as its estimated customs value (import
+charges); the result shows both scenarios side by side. Dot should say which value the duties rest
+on and that the price paid stays the basis of the profit.
 
 ### 7.2 Reading the result
 
@@ -240,9 +264,13 @@ are strings (`"3000.00"`, never `3000`).
 | `mode` | `active`, `indicative_preview` or `unavailable` | in a preview: "indicative", and relay the banner, which names the rule status (draft, under review, or approved but not yet active); never call an approved set unapproved; unavailable: "import charges unknown" |
 | `banner.mk` / `banner.en` | the preview label | relay it with the figures, unchanged |
 | `production_ready` | `false` in every preview | never present a preview as a customs assessment or a final total |
-| `scenarios[0]` (`legal_base`) | `indicative_total` (MKD, a preview) or `total` (active rules), `indicative_total_eur` / `total_eur`, `indicative_landed_cost_eur` / `landed_cost_eur`, `categories` (import duty, motor-vehicle tax, import VAT) and `components` (helpers flagged `intermediate` are never added) | the total, the three charges and the landed cost, with the mode |
+| `purchase_price` | the REAL purchase price in whole euros, its `basis` (`invoice`, `advertised`, `recorded_actual`, `recorded_quote`, `recorded_estimate`) and `source` | the price the profit rests on |
+| `customs_value_for_duties` | the customs value the `primary` charges use, in whole euros incl. the transport to the MK place of entry; `basis` `estimated` (with its `source`) or `transaction_value` | "duties computed on ... (estimated from ...)" when estimated |
+| `fact_sources`, `listing.recorded_*_id`, `notes` | where each fact came from (`request`, `recorded`, `listing`, `default`); the owner's recorded value rows used; `RECORDED_*_USED` / `RECORDED_*_OVERRIDDEN` | "using the owner's recorded purchase price / customs value" when `recorded` |
+| `facts` | the facts as entered (e.g. `"3000.00"`); the computed amounts above are whole units | not a result; never quote it as a charge |
+| `scenarios[0]` (`primary`) | `indicative_total` (MKD, a preview) or `total` (active rules), `indicative_total_eur` / `total_eur`, `indicative_landed_cost_eur` / `landed_cost_eur`, `customs_value_kind`, `customs_value` (its own currency) with `customs_value_eur` (whole euros), `categories` (import duty, motor-vehicle tax, import VAT) and `components` (helpers flagged `intermediate` are never added); every amount in whole units | the total, the three charges and the landed cost, with the mode |
 | `scenarios[0].complete: false` | some charge is unknown: the total is `{"status": "unknown", "amount": null}`, `known_subtotal` shows what resolved | "incomplete"; never call the subtotal a total, never treat an unknown charge as 0 |
-| other `scenarios` | `standard_duty_if_proof_rejected`, `customs_revaluation_risk` | the alternative next to the legal base |
+| other `scenarios` | `standard_duty_if_proof_rejected` (with a claimed proof of origin), `transaction_value` (only with an estimated customs value: Customs accepts the price paid) | the alternative next to the primary result; the landed cost of every scenario uses the real purchase price |
 | `missing_facts`, `missing_inputs` | what to supply (e.g. `co2_document`, `co2`, `origin_proof`, `customs_fx_rate`, `hs_code`, `fuel`; `price_in_eur_or_mkd` when a CHF price cannot be converted) | ask the owner for those documents or figures |
 | `customs_fx_rate`, `customs_fx_source` | the customs rate actually used (`recorded`, `caller_supplied`, `not_needed`, `none`, or `recorded_not_effective`: the newest recorded rate is of an earlier month and was NOT used) | with `recorded_not_effective` or `none`, ask the owner to record this month's Customs rate |
 | `assumptions`, `warnings`, `unverified_inputs`, `uncertain_items` | the labelled assumptions (fixed transport, no proof means standard duty), claims that are not evidence (an advertised price, a listing CO2 figure) and rule statements still marked UNCERTAIN; warnings such as `HS_CODE_FUEL_MISMATCH` (the attested tariff code and the fuel disagree), `CO2_ZERO_FOR_COMBUSTION_VEHICLE` (under 1 g/km is not a figure for a combustion car), `FIRST_REGISTRATION_IMPLAUSIBLE` and `RULE_SET_DOES_NOT_COVER_VEHICLE` (no fact completes the charge under these rules) | mention the ones the figures rest on; for a mismatch ask which fact is right |
@@ -250,17 +278,25 @@ are strings (`"3000.00"`, never `3000`).
 | envelope `warnings` | `TAX_RULES_UNAPPROVED` (preview), `UNKNOWN_COSTS`, `SELLER_CLAIMS_UNVERIFIED`, `FIXTURE_DATA` | as above |
 
 SYNTHETIC example (the call above without `listing_id`, today's unapproved draft): mode
-`indicative_preview`; `indicative_total` 168,154.45 MKD (import duty 11,383.73 + motor-vehicle tax
-96,390.00 + import VAT 60,380.72), `indicative_total_eur` 2,732.72 EUR at the customs rate and
-`indicative_landed_cost_eur` 6,432.72 EUR (3,000.00 + 700.00 + 2,732.72). The same facts with an EU
-proof of origin give 154,721.64 MKD, with the 168,154.45 MKD standard-duty alternative next to it.
+`indicative_preview`; `indicative_total` `"168155"` MKD in whole denars (import duty 11,384 +
+motor-vehicle tax 96,390 + import VAT 60,381; the VAT base includes the ДМВ), `indicative_total_eur`
+`"2733"` EUR at the customs rate (2,732.73 rounded half-up) and `indicative_landed_cost_eur` `"6433"`
+EUR (3,000 + 700 + 2,732.73, summed exactly and rounded once). Every amount is in whole units
+without decimals (owner decision 2026-10-13). The same facts with an EU proof of origin give
+154,722 MKD, with the 168,155 MKD standard-duty alternative next to it. Bought for EUR 2,800 with
+`estimated_customs_value_eur` `"4200"`: `primary` 185,803 MKD on EUR 4,900 (landed cost EUR 6,520 =
+2,800 + 700 + 3,019.53) and `transaction_value` 165,213 MKD on EUR 3,500 (landed cost EUR 6,185).
+The same figures come back for `{"listing_id": "<id>", "vehicle": {"co2_document": "coc"}}` once the
+owner has recorded EUR 2,800 (actual) and EUR 4,200 (SchwackeNet catalogue) for that listing, with
+`purchase_price.basis` `recorded_actual` and both facts sourced `recorded`.
 
 ### 7.3 Errors
 
 - `VALIDATION_ERROR` names the failing fields, never their values: `listing_id` and `vehicle` when
   neither is given, nested paths such as `vehicle.price.amount` or `vehicle.co2.0.g_km`, and both
   `vehicle.transport_after_entry_eur` and `vehicle.transport_after_entry_separately_invoiced` when
-  only one is set.
+  only one is set, and both `vehicle.estimated_customs_value_eur` and
+  `vehicle.estimated_customs_value_source` when only one is set.
 - `NOT_FOUND` for an unknown listing, a listing of another workspace (the same answer) or one
   without a current, non-quarantined revision; `FORBIDDEN` without `deals:read`; `RATE_LIMITED`
   with `retry_after_seconds`.
@@ -270,5 +306,6 @@ proof of origin give 154,721.64 MKD, with the 168,154.45 MKD standard-duty alter
 | Item | Status |
 |---|---|
 | Tool schema, scope filtering, validation, isolation, rate bucket, preview labelling, golden totals of the draft, nothing persisted | verified in tests (tests/contracts/test_calc_tool_schemas.py, tests/mcp/test_calc_tools.py, synthetic data) |
+| The two values (real purchase price vs estimated customs value), whole-unit amounts, the owner's recorded listing values used automatically, a dot-supplied value replacing one for a single call, no tool that records them | verified in tests (same files; the owner's EUR 2,800 / EUR 4,200 example, synthetic listing) |
 | The MK draft rule set's legal content | **not approved**: every `UNCERTAIN - confirm` marker of the draft must be resolved and the owner must approve and activate it first (docs/tax_rule_approval.md) |
 | dot calling the tool and relaying the banner in the real conversation | **not verified** (no deployment, section 4 step 5) |

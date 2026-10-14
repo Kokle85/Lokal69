@@ -18,6 +18,10 @@ Commands (``suv-deals <command> --help`` for details)::
                                    drafts, store a draft file as the owner (--owner-user-id; --yes)
     import-costs estimate          customs duty, motor-vehicle tax and import VAT for one vehicle
                                    (read-only; an indicative preview until rules are ACTIVE)
+    import-costs values | record-values
+                                   a listing's real purchase price and estimated customs value:
+                                   show them (read-only) / record them as the owner
+                                   (--owner-user-id; audited; --yes)
     db migrate | target            print the target, then apply migrations (--yes) / only print it
                                    (--local-only: exit 3 unless it stays on this machine)
     api serve                      uvicorn for /api, /healthz, /readyz and /mcp (127.0.0.1 default)

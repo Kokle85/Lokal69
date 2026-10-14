@@ -92,6 +92,38 @@ orders them, three `doctor` tests fail because `doctor` reports "seller-inquiry 
 be read" for every workspace once one leftover synthetic workspace cannot be read. The default order
 (rows C4 and C5) passes.
 
+## Owner decisions D1-D3 (2026-10-13)
+
+Re-run on the working tree on top of `7280bd9` with the owner decisions of 2026-10-13 (ДМВ in the
+import VAT base, whole denars and whole-unit presentation, two values per vehicle with the
+recorded import values and migration `20261013000100_import_values`; ADR 0003 decisions 11-14).
+Not committed when measured, so NOT an exact-build release result. Same machine: uv 0.11.32,
+PostgreSQL 16.15 and 17.11 (`suv_migrator`), Node 22.22.0 / npm 10.9.4. Offline: no listing site,
+mailbox, Slack, Supabase project or customs website was contacted; the migration was NOT applied to
+the hosted project.
+
+| # | Check | Command | Result |
+|---|---|---|---|
+| O1 | Schema snapshots | `make schemas` then `make schemas-check` | schemas up to date (new: `schemas/api/listings.listing_id.import-values.get.json`, `.post.json`; changed: `schemas/tools/deals_estimate_import_costs.json`, `schemas/api/import-costs.estimate.get.json`) |
+| O2 | Lint, formatting | `make lint` | All checks passed; 522 files already formatted |
+| O3 | Types | `make typecheck` | no issues: 190 backend, 9 E2E-harness and 20 desktop-worker source files |
+| O4 | Full Python suite, PostgreSQL 16 | `TEST_DATABASE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5432/postgres PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider` | **8,747 passed, 1 skipped, 0 failed** (12 min 16 s, after the review fixes; the skip is the migrator-role-only test) |
+| O5 | Full Python suite, PostgreSQL 17.11 | the same with `...:5433/postgres TEST_DATABASE_MIGRATOR_ROLE=suv_migrator` | **8,748 passed, 0 failed** (12 min 47 s, after the review fixes) |
+| O6 | Desktop worker | `PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider desktop/outlook-bridge/tests` | 317 passed |
+| O7 | Dashboard | `cd dashboard && npm run typecheck && npm run lint && npm test` | `tsc -b` exit 0; oxlint clean, "Security check passed (46 source files)"; 15 files, 230 tests passed |
+| O8 | Dashboard build | `cd dashboard && VITE_SUPABASE_URL=https://synthetic-project.supabase.invalid VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_SYNTHETIC_build_key npm run build` | built; "Security check passed (46 source files + build output)" |
+| O9 | Browser E2E, PostgreSQL 16 | `make e2e` | harness 36 passed; Playwright 51 passed (3.2 min, after the review fixes), including `importCosts.spec.ts` and `importValues.spec.ts` |
+| O9b | Browser E2E, PostgreSQL 17.11 | `cd dashboard && TEST_DATABASE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres TEST_DATABASE_MIGRATOR_ROLE=suv_migrator npx playwright test` | Playwright 51 passed (3.1 min; before the review fixes, not re-run) |
+| O10 | Rule files and configuration | `uv run suv-deals --no-env-file config validate`; `tax-rules validate config/tax_rules/drafts` | 12 ok, 0 warnings, 0 errors; `mk-passenger-car-import@2026.10-draft.3` valid, status `draft`, 21 components, computed content hash `4fe7f064...`, not selectable |
+| O11 | Migration hygiene and handoff documents | `uv run pytest -q tests/unit/test_migrations_ascii.py tests/cli/test_d2_handoff_docs.py` (re-run after the last document edit) | 42 passed (17 migration files: pure ASCII, no `DROP TRIGGER` statement) |
+
+The owner's example (bought for EUR 2,800, SchwackeNet EUR 4,200, customs rate 61.5337) is asserted
+on every surface in rows O4 and O5 (`tests/unit/test_import_estimate.py`, `tests/mcp/test_calc_tools.py`,
+`tests/api/test_import_cost_routes.py`, `tests/cli/test_import_cost_db_commands.py`,
+`tests/integration/import_costs/`): `primary` 185,803 MKD on EUR 4,900 with landed cost EUR 6,520,
+`transaction_value` 165,213 MKD on EUR 3,500 with EUR 6,185; in the browser in row O9
+(`dashboard/e2e/importCosts.spec.ts`, `importValues.spec.ts`).
+
 ## Earlier runs (kept for honesty)
 
 | Run | Result | Cause |

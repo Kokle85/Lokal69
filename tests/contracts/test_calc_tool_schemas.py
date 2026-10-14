@@ -106,7 +106,8 @@ VEHICLE: dict[str, Any] = {
     "hs_evidence_ref": "SYNTHETIC broker note",
     "transport_after_entry_eur": "150.00",
     "transport_after_entry_separately_invoiced": True,
-    "catalogue_value_eur": "6000",
+    "estimated_customs_value_eur": "6000",
+    "estimated_customs_value_source": "SYNTHETIC catalogue",
     "importer_status": "private",
     "mileage_km": "182000",
     "seller_country": "DE",
@@ -204,6 +205,12 @@ def test_description_and_instructions_tell_dot_how_to_relay_the_result() -> None
         "never 0",
         "Read-only",
         "no tool approves tax rules",
+        "real purchase price",
+        "estimated_customs_value_eur",
+        "SchwackeNet",
+        "transaction_value",
+        "recorded listing values apply",
+        "whole units",
     ):
         assert phrase in description, phrase
     for phrase in (
@@ -222,6 +229,13 @@ def test_description_and_instructions_tell_dot_how_to_relay_the_result() -> None
         "missing_facts",
         "never present an unknown charge as zero",
         "approves tax rules",
+        "real purchase price",
+        "estimated_customs_value_eur",
+        "SchwackeNet",
+        "transaction_value",
+        "recorded values of that listing are used automatically",
+        "you cannot record them",
+        "whole units",
     ):
         assert phrase in INSTRUCTIONS, phrase
     # Regression: both texts called every preview "UNAPPROVED draft rules", contradicting the
@@ -241,6 +255,34 @@ def test_the_transport_named_to_dot_is_the_configured_one() -> None:
     assert transport.low == transport.base == transport.high  # fixed, not a range
     named = f"EUR {transport.base.amount.normalize():f}"
     assert named in CALC_TOOLS[NAME].description and named in INSTRUCTIONS
+
+
+def test_the_input_fields_keep_the_two_values_apart() -> None:
+    """Owner decision 2026-10-13: the REAL purchase price (profit, landed cost) and the ESTIMATED
+    customs value (import charges, e.g. SchwackeNet) are two values; a listing's recorded values
+    are used automatically. Each field description says which one it is."""
+    props = tool_input_schema(NAME)["properties"]
+    vehicle = props["vehicle"]["properties"]
+    price = vehicle["price"]["description"]
+    for phrase in ("REAL purchase price", "landed cost", "profit", "recorded purchase price", "advertised"):
+        assert phrase in price, phrase
+    estimate = vehicle["estimated_customs_value_eur"]["description"]
+    for phrase in (
+        "ESTIMATED customs value",
+        "without transport",
+        "SchwackeNet",
+        "primary scenario",
+        "still use price",
+        "transaction_value",
+        "recorded estimate",
+        "estimated_customs_value_source",
+    ):
+        assert phrase in estimate, phrase
+    source = vehicle["estimated_customs_value_source"]["description"]
+    assert "SchwackeNet catalogue" in source and "only with estimated_customs_value_eur" in source
+    listing = props["listing_id"]["description"]
+    assert "RECORDED values" in listing and "used automatically" in listing
+    assert "real purchase price instead of the advertised one" in listing
 
 
 # =========================================================================== input schema
@@ -287,13 +329,15 @@ def test_vehicle_facts_mirror_the_domain_facts_with_closed_enums() -> None:
         "CHF",
     ]
     assert props["declaration_date"] == {**props["declaration_date"], "type": "string", "format": "date"}
-    for name in ("price", "transport_after_entry_eur", "catalogue_value_eur"):
+    for name in ("price", "transport_after_entry_eur", "estimated_customs_value_eur"):
         node = price["properties"]["amount"] if name == "price" else props[name]
         assert node["type"] == "string" and node["maxLength"] <= 20 and "pattern" in node, name
     for name in ("mileage_km", "engine_displacement_cm3", "power_kw"):
         assert props[name]["type"] == "string" and "pattern" in props[name], name
     for name in ("emissions_class", "hs_evidence_ref"):
         assert props[name]["maxLength"] <= 200, name
+    source = props["estimated_customs_value_source"]
+    assert (source["type"], source["minLength"], source["maxLength"]) == ("string", 3, 120)
 
 
 # =========================================================================== validation
@@ -316,6 +360,8 @@ def test_valid_arguments_become_the_service_request_with_only_the_set_facts() ->
     assert facts.origin_proof.kind == "eu" and facts.origin_proof.country == "DE"
     assert facts.hs_code == "870332"  # separators stripped, HS-6; never inferred
     assert facts.transport_after_entry_eur == Decimal("150.00")
+    assert facts.estimated_customs_value_eur == Decimal(6000)
+    assert facts.estimated_customs_value_source == "SYNTHETIC catalogue"
     assert facts.power_kw == Decimal("110.5") and facts.mileage_km == Decimal(182000)
     # Unset facts stay unset: they keep the listing's (merge_facts) instead of a default.
     partial = import_cost_request(
@@ -374,6 +420,32 @@ def test_valid_arguments_become_the_service_request_with_only_the_set_facts() ->
             ["vehicle.transport_after_entry_eur", "vehicle.transport_after_entry_separately_invoiced"],
         ),
         ({"vehicle": {"emissions_class": "Euro 5" + chr(0x202E)}}, ["vehicle.emissions_class"]),
+        (
+            {"vehicle": {"estimated_customs_value_eur": "4200"}},
+            ["vehicle.estimated_customs_value_eur", "vehicle.estimated_customs_value_source"],
+        ),
+        (
+            {"vehicle": {"estimated_customs_value_source": "SYNTHETIC catalogue"}},
+            ["vehicle.estimated_customs_value_eur", "vehicle.estimated_customs_value_source"],
+        ),
+        (
+            {"vehicle": {"estimated_customs_value_eur": "0", "estimated_customs_value_source": "SYNTHETIC"}},
+            ["vehicle.estimated_customs_value_eur"],
+        ),
+        (
+            {"vehicle": {"estimated_customs_value_eur": "4200", "estimated_customs_value_source": "ab"}},
+            ["vehicle.estimated_customs_value_source"],
+        ),
+        (
+            {
+                "vehicle": {
+                    "estimated_customs_value_eur": "4200",
+                    "estimated_customs_value_source": "Schwacke" + chr(0x202E),
+                }
+            },
+            ["vehicle.estimated_customs_value_source"],
+        ),
+        ({"vehicle": {"catalogue_value_eur": "6000"}}, ["vehicle.catalogue_value_eur"]),
         ({"vehicle": {"mileage_km": "200000000"}}, ["vehicle.mileage_km"]),
         ({"vehicle": {"power_kw": "0"}}, ["vehicle.power_kw"]),
         ({"vehicle": {"recipient": SECRET}}, ["vehicle.recipient"]),
@@ -409,6 +481,8 @@ def test_output_schema_is_a_closed_number_free_envelope_with_the_labels() -> Non
     assert props["mode"]["enum"] == ["active", "indicative_preview", "unavailable"]
     for field in (
         "production_ready",
+        "purchase_price",
+        "customs_value_for_duties",
         "banner",
         "rule",
         "usage_note",
@@ -435,6 +509,20 @@ def test_output_schema_is_a_closed_number_free_envelope_with_the_labels() -> Non
     ):
         assert field in scenario, field
     assert scenario["components"]["items"]["properties"]["intermediate"]["type"] == "boolean"
+    assert scenario["name"]["enum"] == ["primary", "standard_duty_if_proof_rejected", "transaction_value"]
+    assert scenario["customs_value_kind"]["enum"] == ["estimated", "transaction_value"]
+    assert props["customs_value_for_duties"]["properties"]["basis"]["enum"] == [
+        "estimated",
+        "transaction_value",
+    ]
+    assert props["purchase_price"]["properties"]["basis"]["enum"] == [
+        "invoice",
+        "advertised",
+        "recorded_actual",
+        "recorded_quote",
+        "recorded_estimate",
+        None,  # no price known
+    ]
     assert set(props["banner"]["properties"]) == {"mk", "en"}
 
 

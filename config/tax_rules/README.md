@@ -8,7 +8,7 @@ Spec section 16. Engine: `src/suv_deals/domain/tax_engine.py`. Approval procedur
 - `example_unapproved.json` (top level) has the exact spec section 16 shape with no
   components and status `unapproved`; it can never be selected and calculates nothing.
   The top level holds no rule set with rates (a test enforces it).
-- `drafts/mk_passenger_car_import_2026.10-draft.2.json` is the North Macedonian draft
+- `drafts/mk_passenger_car_import_2026.10-draft.3.json` is the North Macedonian draft
   (customs duty, motor-vehicle tax and import VAT on an HS 8703 passenger car) built from
   the research fact sheet of 2026-10-13. Status `draft`, no approver, no sealed hash;
   every point still to confirm is marked `UNCERTAIN - confirm`. Production selection
@@ -16,7 +16,9 @@ Spec section 16. Engine: `src/suv_deals/domain/tax_engine.py`. Approval procedur
   (`domain/import_estimate.py`) uses it only as a clearly labelled **indicative preview**
   (`select_preview_rule_set`): never production-ready, totals named `indicative_total`,
   never persisted to valuations, cost lines or alerts. Golden cases:
-  `tests/unit/test_mk_rule_draft.py`.
+  `tests/unit/test_mk_rule_draft.py`. draft.3 (2026-10-13) encodes two owner decisions: the
+  ДМВ is part of the import VAT base (ЗДДВ чл. 21(2)(1)), and every MKD amount and the total
+  are rounded to whole denars, half-up (`rounding_rules` quantum `1`, `before_dependents`).
 
 No rate, tariff, coefficient or VAT percentage is in `src/`; they exist only in rule-set
 JSON. Until an owner-approved rule set is ACTIVE in the database, every valuation keeps

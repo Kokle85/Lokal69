@@ -3,6 +3,10 @@
  * listing): North Macedonian customs duty, motor-vehicle tax (ДМВ) and import VAT for one vehicle,
  * plus the landed cost with the fixed per-vehicle transport of the cost profile.
  *
+ * Two values per vehicle (owner decision 2026-10-13): the REAL purchase price (landed cost, profit)
+ * and the ESTIMATED customs value (import charges); on the listing route the owner's recorded values
+ * of the listing apply unless the form overrides them.
+ *
  * `GET /api/import-costs/estimate` (read-only; the same calculation dot gets through MCP). The URL
  * holds the submitted parameters, so a calculation can be reloaded and navigated back to. Every
  * amount is the server's; until the owner approves and activates a rule set the result is an
@@ -91,8 +95,9 @@ export function ImportCostsScreen() {
       <h1>Customs calculator</h1>
       <p className="muted">
         North Macedonia import charges for one passenger car: customs duty, motor-vehicle tax (ДМВ) and import VAT, and the
-        landed cost (price + the fixed per-vehicle transport + these charges). Calculated by the server from the vehicle
-        facts; nothing is stored and nothing here is a customs assessment.
+        landed cost (the real purchase price + the fixed per-vehicle transport + these charges). The charges use the
+        estimated customs value when one is given (e.g. SchwackeNet), otherwise the price paid. Calculated by the server
+        from the vehicle facts, amounts in whole units; nothing is stored and nothing here is a customs assessment.
       </p>
       {runnable ? (
         <Estimate

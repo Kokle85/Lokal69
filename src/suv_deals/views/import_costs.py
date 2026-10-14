@@ -14,7 +14,17 @@ is ``{"status": "unknown", "amount": null}`` with a reason (never 0), lists are 
   (``usage_note``). Helper components (customs value in the rule currency, the VAT base) are
   flagged ``intermediate`` and never counted in a total.
 - ``facts`` are the vehicle facts the estimate used and ``fact_sources`` where each came from
-  (the listing, the request, or the builder's default such as "no proof of origin").
+  (the listing, the listing's recorded import value, the request, or the builder's default such
+  as "no proof of origin").
+- Two values (owner decision 2026-10-13): ``purchase_price`` is the REAL purchase price, the
+  basis of every landed cost (and so of the profit); ``customs_value_for_duties`` is what the
+  ``primary`` scenario's charges are computed on (an estimated customs value + transport to the
+  MK place of entry, or the transaction value). With an estimate the ``transaction_value``
+  scenario shows the charges if Customs accepts the price paid.
+- Whole units (owner decision 2026-10-13, "без децимали"): every amount of this view is shown
+  rounded half-up to whole units without a fraction (``"168155"`` MKD, ``"2733"`` EUR). The rule
+  set already assesses MKD in whole denars; EUR amounts are rounded from the exact figures.
+  ``facts`` echo the inputs as given.
 """
 
 from __future__ import annotations
@@ -31,13 +41,16 @@ from suv_deals.domain.enums import CostCategory, Fuel, TaxRuleStatus
 from suv_deals.domain.import_estimate import (
     CategoryEstimate,
     Co2Document,
+    CustomsValueBasis,
+    CustomsValueForDuties,
     EstimateMode,
     EstimateScenario,
     EstimateScenarioName,
     ImportCostEstimate,
     ImporterStatus,
     OriginProofKind,
-    PriceBasis,
+    PurchasePrice,
+    PurchasePriceBasis,
     VehicleImportFacts,
 )
 from suv_deals.domain.money import CurrencyCode, FxRate, Money
@@ -54,6 +67,9 @@ _DATE: Final = r"^\d{4}-\d{2}-\d{2}$"
 _INDICATIVE: Final = ("indicative_total", "indicative_total_eur", "indicative_landed_cost_eur")
 _FINAL: Final = ("total", "total_eur", "landed_cost_eur")
 _CV_UNKNOWN: Final = "customs value unknown: the price, the transport or the customs rate is missing"
+_CV_ESTIMATED: Final = (
+    "customs value unknown: the transport to the MK place of entry is missing or out of bounds"
+)
 _CV_CHF: Final = (
     "customs value unknown: a CHF price is not converted (it would need a CHF customs rate next to the EUR "
     "one; no other rate is substituted); give the price in EUR or MKD"
@@ -62,7 +78,9 @@ _PREVIEW_STATUSES: Final = frozenset(
     {TaxRuleStatus.APPROVED, TaxRuleStatus.UNDER_REVIEW, TaxRuleStatus.DRAFT}
 )
 
-FactSource = Literal["listing", "request", "default"]
+#: Where a fact came from: the listing revision, the listing's recorded import value (the owner's
+#: recorded real purchase price or estimated customs value), the request, or the builder default.
+FactSource = Literal["listing", "recorded", "request", "default"]
 #: ``recorded_not_effective``: the newest recorded rate is not valid on the declaration date (an
 #: earlier month), so it was not used and the amounts that depend on it are unknown.
 CustomsFxSource = Literal["recorded", "recorded_not_effective", "caller_supplied", "not_needed", "none"]
@@ -78,6 +96,11 @@ def _fx(rate: FxRate | None) -> FxRateView | None:
 
 def _texts(values: tuple[str, ...], limit: int, size: int = 500) -> tuple[str, ...]:
     return tuple(v[:size] for v in values[:limit])
+
+
+def _whole(money: Money | None, unknown_reason: str | None = None, currency: str | None = None) -> AmountView:
+    """An amount of this view: whole units, half-up, no fraction (owner decision 2026-10-13)."""
+    return AmountView.of(money, unknown_reason=unknown_reason, currency=currency, whole=True)
 
 
 # --------------------------------------------------------------------------- parts
@@ -118,10 +141,8 @@ class ImportCategoryView(ViewModel):
     def of(cls, row: CategoryEstimate, *, currency: str | None) -> ImportCategoryView:
         reason = row.reason or None
         if row.status == ComponentStatus.RESOLVED:
-            amount = AmountView.of(row.amount, unknown_reason=reason, currency=currency)
-            amount_eur = AmountView.of(
-                row.amount_eur, unknown_reason="no usable customs rate for the EUR equivalent", currency="EUR"
-            )
+            amount = _whole(row.amount, reason, currency)
+            amount_eur = _whole(row.amount_eur, "no usable customs rate for the EUR equivalent", "EUR")
         elif row.status == ComponentStatus.NOT_APPLICABLE:
             why = (reason or "no component of this category applies")[:500]
             amount = AmountView.not_applicable(why, currency=currency)
@@ -140,17 +161,24 @@ class ImportCategoryView(ViewModel):
 
 
 class ImportScenarioView(ViewModel):
-    """One labelled scenario (``legal_base`` first). In ``active`` mode the totals are ``total``,
+    """One labelled scenario (``primary`` first). In ``active`` mode the totals are ``total``,
     ``total_eur`` and ``landed_cost_eur`` (the ``indicative_*`` fields are null); in a preview
     the reverse. A total is known only when the calculation is complete; otherwise it is
-    unknown and ``known_subtotal`` (labelled, never a total) shows what resolved."""
+    unknown and ``known_subtotal`` (labelled, never a total) shows what resolved. The landed cost
+    is the REAL purchase price + transport + this scenario's charges; ``customs_value_kind`` says
+    whether the charges rest on the estimated customs value or the transaction value.
+    ``customs_value`` is the engine input in its own currency (EUR, or MKD for an MKD price);
+    ``customs_value_eur`` is the same value in whole euros at the customs rate, so the scenarios
+    compare in one currency."""
 
     name: EstimateScenarioName
     label: str = Field(max_length=300)
     complete: bool
     production_ready: bool
     customs_value: AmountView
+    customs_value_eur: AmountView
     customs_value_basis: str | None = Field(max_length=300)
+    customs_value_kind: CustomsValueBasis
     assumptions: tuple[str, ...] = Field(max_length=20)
     components: tuple[TaxComponentView, ...] = Field(max_length=100)
     categories: tuple[ImportCategoryView, ...] = Field(max_length=4)
@@ -205,7 +233,7 @@ class ImportScenarioView(ViewModel):
 
         def amount(value: Money | None, unknown_reason: str, unit: str | None) -> AmountView:
             reason = incomplete if not scenario.complete else unknown_reason
-            return AmountView.of(value, unknown_reason=reason[:500], currency=unit)
+            return _whole(value, reason[:500], unit)
 
         def pick(final: Money | None, indicative: Money | None) -> Money | None:
             return indicative if preview else final
@@ -223,13 +251,18 @@ class ImportScenarioView(ViewModel):
             label=scenario.label[:300],
             complete=scenario.complete,
             production_ready=scenario.production_ready and not preview,
-            customs_value=AmountView.of(
-                scenario.customs_value,
-                unknown_reason=customs_value_reason,
+            customs_value=_whole(scenario.customs_value, customs_value_reason),
+            customs_value_eur=_whole(
+                scenario.customs_value_eur,
+                customs_value_reason if scenario.customs_value is None else no_rate,
+                "EUR",
             ),
             customs_value_basis=scenario.customs_value_basis,
+            customs_value_kind=scenario.customs_value_kind,
             assumptions=_texts(scenario.assumptions, 20),
-            components=tuple(TaxComponentView.of(c, currency=currency) for c in scenario.components),
+            components=tuple(
+                TaxComponentView.of(c, currency=currency, whole=True) for c in scenario.components
+            ),
             categories=tuple(ImportCategoryView.of(row, currency=currency) for row in scenario.categories),
             total=named.get("total"),
             total_eur=named.get("total_eur"),
@@ -239,7 +272,7 @@ class ImportScenarioView(ViewModel):
             indicative_landed_cost_eur=named.get("indicative_landed_cost_eur"),
             known_subtotal=None
             if scenario.complete
-            else AmountView.of(scenario.known_subtotal, unknown_reason="nothing resolved", currency=currency),
+            else _whole(scenario.known_subtotal, "nothing resolved", currency),
             unknown_components=scenario.unknown_components[:100],
             missing_inputs=scenario.missing_inputs[:100],
             warnings=_texts(scenario.warnings, 100),
@@ -272,7 +305,9 @@ class UncertainItemView(ViewModel):
 
 
 class ImportListingView(ViewModel):
-    """The listing whose facts were used (its current, promoted, non-quarantined revision)."""
+    """The listing whose facts were used (its current, promoted, non-quarantined revision) and the
+    ids of its CURRENT recorded import values (``fact_sources`` says whether the estimate used them
+    or the request replaced them)."""
 
     listing_id: UUID
     revision_id: UUID
@@ -281,6 +316,8 @@ class ImportListingView(ViewModel):
     is_fixture: bool
     fixture_label: str | None = Field(max_length=200)
     screened: bool
+    recorded_purchase_price_id: UUID | None = None
+    recorded_customs_value_id: UUID | None = None
 
 
 class Co2ReadingView(ViewModel):
@@ -292,7 +329,7 @@ class ImportFactsView(ViewModel):
     """The vehicle facts the estimate used (after request overrides)."""
 
     price: AmountView
-    price_basis: PriceBasis
+    price_basis: PurchasePriceBasis
     declaration_date: str | None = Field(pattern=_DATE)
     fuel: Fuel
     co2: tuple[Co2ReadingView, ...] = Field(max_length=3)
@@ -307,7 +344,8 @@ class ImportFactsView(ViewModel):
     hs_evidence_ref: str | None = Field(max_length=200)
     transport_after_entry_eur: DecimalStr | None
     transport_after_entry_separately_invoiced: bool
-    catalogue_value_eur: DecimalStr | None
+    estimated_customs_value_eur: DecimalStr | None
+    estimated_customs_value_source: str | None = Field(max_length=120)
     importer_status: ImporterStatus | None
     mileage_km: DecimalStr | None
     seller_country: str | None = Field(pattern=r"^[A-Z]{2}$")
@@ -340,7 +378,8 @@ class ImportFactsView(ViewModel):
             hs_evidence_ref=facts.hs_evidence_ref,
             transport_after_entry_eur=dec(facts.transport_after_entry_eur),
             transport_after_entry_separately_invoiced=facts.transport_after_entry_separately_invoiced,
-            catalogue_value_eur=dec(facts.catalogue_value_eur),
+            estimated_customs_value_eur=dec(facts.estimated_customs_value_eur),
+            estimated_customs_value_source=facts.estimated_customs_value_source,
             importer_status=facts.importer_status,
             mileage_km=dec(facts.mileage_km),
             seller_country=facts.seller_country,
@@ -352,6 +391,34 @@ class ImportFactsView(ViewModel):
 class ImportFactSourceView(ViewModel):
     fact: str = Field(max_length=60)
     source: FactSource
+
+
+class ImportPurchasePriceView(ViewModel):
+    """The REAL purchase price (реална набавна цена) in whole euros: the basis of every scenario's
+    landed cost, and so of the profit; never replaced by an estimated customs value. ``basis`` is
+    null when no price is known."""
+
+    amount: AmountView
+    basis: PurchasePriceBasis | None
+    source: str = Field(max_length=200)
+
+    @classmethod
+    def of(cls, price: PurchasePrice) -> ImportPurchasePriceView:
+        return cls(amount=_whole(price.amount, price.reason, "EUR"), basis=price.basis, source=price.source)
+
+
+class ImportCustomsValueView(ViewModel):
+    """The customs value the ``primary`` scenario's charges are computed on, in whole euros,
+    INCLUDING the transport to the MK place of entry: ``estimated`` (проценета царинска вредност +
+    that transport) or ``transaction_value`` (the price paid + that transport, Царински закон чл. 28)."""
+
+    amount: AmountView
+    basis: CustomsValueBasis
+    source: str = Field(max_length=200)
+
+    @classmethod
+    def of(cls, value: CustomsValueForDuties) -> ImportCustomsValueView:
+        return cls(amount=_whole(value.amount, value.reason, "EUR"), basis=value.basis, source=value.source)
 
 
 # --------------------------------------------------------------------------- result
@@ -377,6 +444,8 @@ class ImportCostEstimateView(ViewModel):
     eur_basis: str = Field(max_length=500)
     landed_cost_note: str = Field(max_length=500)
     listing: ImportListingView | None
+    purchase_price: ImportPurchasePriceView
+    customs_value_for_duties: ImportCustomsValueView
     facts: ImportFactsView
     fact_sources: tuple[ImportFactSourceView, ...] = Field(max_length=40)
     scenarios: tuple[ImportScenarioView, ...] = Field(max_length=3)
@@ -413,7 +482,9 @@ class ImportCostEstimateView(ViewModel):
             if any(s.indicative_total is not None for s in self.scenarios):
                 raise ValueError("an active estimate never carries indicative totals")
         if self.production_ready and (self.mode != "active" or not self.scenarios[0].production_ready):
-            raise ValueError("production_ready follows the legal-base scenario of an active estimate")
+            raise ValueError("production_ready follows the primary scenario of an active estimate")
+        if self.scenarios and self.scenarios[0].name != "primary":
+            raise ValueError("the primary scenario comes first")
         if self.listing is not None and self.listing.is_fixture != (self.listing.fixture_label is not None):
             raise ValueError("a fixture-lineage listing is labelled, and only such a listing")
         return self
@@ -433,8 +504,10 @@ class ImportCostEstimateView(ViewModel):
         chf_price = facts.price is not None and facts.price.currency == "CHF"
 
         def cv_reason(scenario: EstimateScenario) -> str:
-            # The risk scenario's customs value is the catalogue value, not the price.
-            return _CV_CHF if chf_price and scenario.name != "customs_revaluation_risk" else _CV_UNKNOWN
+            # An estimated customs value is in EUR; only a transaction value rests on the CHF price.
+            if scenario.customs_value_kind == "estimated":
+                return _CV_ESTIMATED
+            return _CV_CHF if chf_price else _CV_UNKNOWN
 
         return cls(
             estimator_version=estimate.estimator_version,
@@ -467,6 +540,8 @@ class ImportCostEstimateView(ViewModel):
             eur_basis=estimate.eur_basis[:500],
             landed_cost_note=estimate.landed_cost_note[:500],
             listing=listing,
+            purchase_price=ImportPurchasePriceView.of(estimate.purchase_price),
+            customs_value_for_duties=ImportCustomsValueView.of(estimate.customs_value_for_duties),
             facts=ImportFactsView.of(facts),
             fact_sources=tuple(
                 ImportFactSourceView(fact=name, source=source) for name, source in fact_sources.items()
@@ -508,10 +583,12 @@ __all__ = [
     "ImportBannerView",
     "ImportCategoryView",
     "ImportCostEstimateView",
+    "ImportCustomsValueView",
     "ImportFactSourceView",
     "ImportFactsView",
     "ImportGatesView",
     "ImportListingView",
+    "ImportPurchasePriceView",
     "ImportRuleView",
     "ImportScenarioView",
     "UncertainItemView",

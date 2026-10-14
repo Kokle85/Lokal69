@@ -39,7 +39,10 @@ Cost profiles (``app.cost_profiles``)
 Cost evidence (``app.cost_evidence``, append-only)
     quote/estimate/actual with low/base/high minor units, expiry and scope; the evidence
     document's SHA-256 is kept in ``evidence.document_sha256``. A superseding row invalidates
-    valuations that cited the superseded evidence.
+    valuations that cited the superseded evidence. The owner's recorded import values of a listing
+    (categories ``purchase`` and ``customs_value``) live in the same table but are not cost
+    evidence: ``persistence.import_values_repo`` writes and reads them, and `get_cost_evidence`
+    never returns them.
 
 Valuations (``app.valuations``)
     `persist_valuation` stores the domain ``Valuation`` plus the inputs ``ValuationView`` needs
@@ -984,7 +987,13 @@ async def insert_cost_evidence(
     return _evidence_from_row(row)
 
 
+#: Categories of the owner's recorded import values (``import_values_repo``): stored in
+#: ``app.cost_evidence`` but never cost evidence.
+IMPORT_VALUE_CATEGORIES: Final = ("purchase", "customs_value")
+
+
 async def get_cost_evidence(conn: Conn, actor: ActorContext, ids: Sequence[UUID]) -> list[StoredCostEvidence]:
+    """Cost evidence rows by id (a recorded import value is not cost evidence: ``NotFound``)."""
     require_reader(actor)
     wanted = list(dict.fromkeys(ids))
     if not wanted:
@@ -993,8 +1002,9 @@ async def get_cost_evidence(conn: Conn, actor: ActorContext, ids: Sequence[UUID]
         rows = await fetch_all(
             conn,
             f"select {_EVIDENCE_COLUMNS} from app.cost_evidence"  # noqa: S608 - fixed column list
-            " where workspace_id = %(ws)s and id = any(%(ids)s::uuid[])",
-            {"ws": actor.workspace_id, "ids": wanted},
+            " where workspace_id = %(ws)s and id = any(%(ids)s::uuid[])"
+            " and category <> all(%(import_values)s::text[])",
+            {"ws": actor.workspace_id, "ids": wanted, "import_values": list(IMPORT_VALUE_CATEGORIES)},
         )
     by_id = {r["id"]: _evidence_from_row(r) for r in rows}
     if len(by_id) != len(wanted):
@@ -1538,6 +1548,7 @@ class DependencyChange(BaseModel):
     """What changed (spec 18 "Invalidation and material changes"). Set the fields that apply.
 
     - ``listing_id`` + ``current_revision_id``: valuations of an older revision of the listing;
+    - ``listing_ids``: every valuation of these listings (e.g. the owner recorded an import value);
     - ``comparable_set_ids`` / ``market_observation_ids``: sets (or sets containing observations);
     - ``fx_rate_ids``; or ``fx_pair`` + ``fx_newer_than``: valuations that used an OLDER rate of
       the same directed pair and purpose than a newly recorded observation;
@@ -1553,6 +1564,7 @@ class DependencyChange(BaseModel):
     reason: InvalidationReason
     listing_id: UUID | None = None
     current_revision_id: UUID | None = None
+    listing_ids: tuple[UUID, ...] = ()
     comparable_set_ids: tuple[UUID, ...] = ()
     market_observation_ids: tuple[UUID, ...] = ()
     fx_rate_ids: tuple[UUID, ...] = ()
@@ -1574,6 +1586,7 @@ class DependencyChange(BaseModel):
         if not any(
             (
                 self.listing_id,
+                self.listing_ids,
                 self.comparable_set_ids,
                 self.market_observation_ids,
                 self.fx_rate_ids,
@@ -1616,6 +1629,9 @@ def _dependent_predicate(change: DependencyChange) -> tuple[sql.Composable, dict
             sql.SQL("(v.listing_id = %(dep_listing)s and v.listing_revision_id <> %(dep_revision)s)")
         )
         params.update(dep_listing=change.listing_id, dep_revision=change.current_revision_id)
+    if change.listing_ids:
+        parts.append(sql.SQL("v.listing_id = any(%(dep_listings)s::uuid[])"))
+        params["dep_listings"] = list(change.listing_ids)
     if change.comparable_set_ids:
         parts.append(sql.SQL("v.comparable_set_id = any(%(dep_sets)s::uuid[])"))
         params["dep_sets"] = list(change.comparable_set_ids)
@@ -1797,11 +1813,51 @@ async def invalidate_dependents(
     )
 
 
+class ListingInvalidation(BaseModel):
+    """`invalidate_listing` result: the valuations marked stale and the listing's recomputation."""
+
+    model_config = _FROZEN
+
+    listing_id: UUID
+    stale_valuation_ids: tuple[UUID, ...]
+    recompute_job_id: UUID
+    job_created: bool
+
+
+async def invalidate_listing(
+    conn: Conn,
+    actor: ActorContext,
+    listing_id: UUID,
+    reason: InvalidationReason,
+    *,
+    detail: str | None = None,
+) -> ListingInvalidation:
+    """An input of ONE listing changed (e.g. the owner recorded its purchase price): mark every
+    OPEN valuation of the listing stale and queue the listing's deduplicated recomputation, even
+    when no valuation was open (a recomputation that is already RUNNING read the old inputs, so one
+    follow-up job runs after it; a listing that cannot be valued completes that job as a no-op).
+    Runs in the caller's transaction."""
+    change = DependencyChange(reason=reason, listing_ids=(listing_id,), detail=detail)
+    result = await invalidate_dependents(conn, actor, change)
+    job_id = result.recompute_jobs.get(listing_id)
+    created = result.jobs_created > 0  # only this listing's valuations can match
+    if job_id is None:
+        job_id, created = await _enqueue_recompute(conn, actor, listing_id, [], reason)
+    return ListingInvalidation(
+        listing_id=listing_id,
+        stale_valuation_ids=result.stale_valuation_ids,
+        recompute_job_id=job_id,
+        job_created=created,
+    )
+
+
 __all__ = [
+    "IMPORT_VALUE_CATEGORIES",
     "OPEN_VALUATION_STATES",
     "CostEvidenceInput",
     "DependencyChange",
     "InvalidationResult",
+    "ListingInvalidation",
     "StoredCostEvidence",
     "StoredCostProfile",
     "StoredFxRate",
@@ -1824,6 +1880,7 @@ __all__ = [
     "get_valuation_view",
     "insert_cost_evidence",
     "invalidate_dependents",
+    "invalidate_listing",
     "latest_fx_rates",
     "list_cost_profiles",
     "list_rule_sets",

@@ -32,7 +32,7 @@ from suv_deals.persistence.transactions import unit_of_work
 
 REPO = Path(__file__).resolve().parents[3]
 CONFIG = REPO / "config"
-DRAFT_FILE = CONFIG / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.2.json"
+DRAFT_FILE = CONFIG / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.3.json"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 DECL = date(2026, 10, 13)
 CUSTOMS_RATE = "61.5337"

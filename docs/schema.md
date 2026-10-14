@@ -8,7 +8,7 @@ Access model: `docs/decisions/0001-bff-only-data-access.md` (ADR 0001).
 
 | Path | Purpose |
 |---|---|
-| `supabase/migrations/20261006000100_*.sql` ... `20261007000400_*.sql` | Forward-only migrations, applied in name order (M2 core 0100-0950, v1.1 inquiries 1000, v1.1 integration 20261007000100/0200/0400; section 11) |
+| `supabase/migrations/20261006000100_*.sql` ... `20261013000100_*.sql` | Forward-only migrations, applied in name order (M2 core 0100-0950, v1.1 inquiries 1000, v1.1 integration 20261007000100/0200/0400, 20261008000100/0200; recorded import values 20261013000100, not yet applied to the hosted project; section 11) |
 | `supabase/tests/supabase_emulation.sql` | **Test-only** Supabase emulation for plain PostgreSQL |
 | `supabase/seed.sql` | **Local development only**: one synthetic workspace |
 | `supabase/config.toml` | Supabase CLI local config (`app`/`ops` not exposed) |
@@ -393,7 +393,7 @@ Spec §11 lists 37 tables, and all of them exist. This system adds six more:
 | `app.fx_rates` | `1 base = rate quote`: rate date, retrieval time, provider, purpose (reference, customs or payment) | `rate > 0`, `base <> quote`, `unique (workspace_id, base, quote, rate_date, provider, purpose)`; append-only |
 | `app.tax_rule_sets` | Versioned owner-supplied rule sets: jurisdiction, `vehicle_category`, version, status (8 TaxRuleStatus values), `valid_from/valid_to date`, currency, `rules`, `sources`, `sha256`, approval | See the tax rule invariants below |
 | `app.cost_profiles` | Versioned cost assumptions with approval status | approved ⇒ approver and time; fixture never approved |
-| `app.cost_evidence` | quote/estimate/actual, category (CostCategory), provider, `low/base/high_minor` plus currency, obtained/expiry, `scope`, evidence, optional listing, `supersedes_id` | `low <= base <= high` for every present pair; currency iff an amount; quote ⇒ provider; append-only |
+| `app.cost_evidence` | quote/estimate/actual, category (CostCategory, plus `customs_value` since migration 20261013000100), provider, `low/base/high_minor` plus currency, obtained/expiry, `scope`, evidence, optional listing, `supersedes_id` | `low <= base <= high` for every present pair; currency iff an amount; quote ⇒ provider; append-only. The owner's recorded import values of a listing (categories `purchase` and `customs_value`; section 11.16) are listing-scoped, EUR, one linear supersede chain per listing and category |
 | `app.valuations` | One reproducible valuation | See the valuation invariants below |
 
 **Tax rule invariants:**
@@ -593,6 +593,7 @@ Advisor notes (2026-10-06):
 | 20261007000400_mail_worker_credential_kind | 20261007220534 | byte-exact (sha256 `44c614a4…437e`) |
 | 20261008000100_inquiry_quota_backstop | 20261008050157 | byte-exact (sha256 `c3c218ff…6fe8`) |
 | 20261008000200_inquiry_hardening | 20261010054751 | byte-exact (sha256 `5729a0a9…59f4`) |
+| 20261013000100_import_values | not yet applied to the hosted project (the orchestrator applies it) | - |
 
 Connector constraints found while applying, now enforced by `tests/unit/test_migrations_ascii.py`:
 
@@ -1395,3 +1396,51 @@ The import-cost calculator (`persistence/queries/import_costs.py`) only reads
 (the transport line comes from the configured cost profile file); it writes no row
 (no valuation, cost line, rate, audit, outbox or job row; `tests/integration/import_costs`).
 `ops.activation_gates` and `app.destination_bindings` still have no operator tooling.
+
+### 11.16 Migration 20261013000100: recorded import values (owner decision 2026-10-13)
+
+Not yet applied to the hosted project (section 9; the orchestrator applies it). Forward-only,
+expand; pure ASCII, no `DROP TRIGGER`; applies on PostgreSQL 16 and 17
+(`tests/integration/db/test_constraints.py`, `tests/unit/test_migrations_ascii.py`).
+
+Owner decision D2 (ADR 0003 decisions 13 and 14): each vehicle keeps its REAL purchase price
+(profit, landed cost) apart from its ESTIMATED customs value (import charges; e.g. the SchwackeNet
+catalogue value Customs uses for used cars, while Царински закон чл. 28 keeps the price paid as the
+primary method). The owner records both per listing in `app.cost_evidence`:
+
+- `cost_evidence_category_ck` (same name, `DROP` + `ADD`, a widening) accepts `customs_value`.
+  `purchase` was already allowed (`valuation_repo.insert_cost_evidence` still refuses it as cost
+  evidence). Neither is a cost-profile category: `domain.enums.CostCategory`, the cost profiles and
+  their term mapping are unchanged, and `valuation_repo.get_cost_evidence` never returns these rows
+  (`IMPORT_VALUE_CATEGORIES`).
+- `cost_evidence_customs_value_ck`: a `customs_value` row has a `listing_id`, currency `EUR` and kind
+  `estimate`.
+- `cost_evidence_import_value_root_uk` (`workspace_id, listing_id, category` where `supersedes_id is
+  null`) and `cost_evidence_import_value_chain_uk` (`workspace_id, supersedes_id` where not null),
+  both partial on `category in ('purchase', 'customs_value')`: one chain root per listing and
+  category and each row superseded at most once, so exactly one row is current. Other categories are
+  not affected. A duplicate is `23505` -> `VersionConflict`.
+
+Row shape written by `persistence.import_values_repo.record_import_values`: `kind` (`actual` /
+`quote` / `estimate` for a purchase price, always `estimate` for a customs value), `base_minor` +
+`currency` `EUR` (no low/high), `provider` = the source label (redacted, at most 120 characters),
+`obtained_at` = clock time, `scope` = `{"listing_id": ...}`, `evidence` =
+`{"document_sha256": null, "details": {"import_value": <category>}}`, `document_ref` (redacted),
+`listing_id`, `supersedes_id` = the listing's current row of that category, `recorded_by` = the
+owner, `is_fixture` = the listing's frozen lineage.
+
+Recipe (lock order listing -> cost evidence -> audit -> valuations -> jobs): the owner only (a
+signed-in user with `config:admin`; system workers and MCP clients are refused); lock the listing
+(`FOR NO KEY UPDATE`, the same lock the valuation commit takes, so recording and persisting a
+valuation serialise; a foreign or missing listing is `NotFound`), read the current row of each
+category, insert the superseding row(s), audit `import_values.record` (target the listing), then
+`valuation_repo.invalidate_listing`: every OPEN valuation of the listing is marked stale
+(`DependencyChange.listing_ids`, reason `cost_quote`) and ONE deduplicated recomputation is queued
+even when none was open (a running recomputation gets the `:after:<job id>` follow-up). Valuations
+cite the rows they use (the purchase line; the tax lines through
+`costs.tax_cost_lines(input_evidence_ids=...)`) and track them in `cost_evidence_ids`, so a
+superseding row also invalidates them through the existing cost-evidence predicate, and
+`persist_valuation` refuses a valuation that read a row superseded meanwhile. Reading
+(`current_import_values`) needs `deals:read` (or a system worker). API:
+`GET` / `POST /api/listings/{listing_id}/import-values` (docs/api_contract.md 10.2).
+

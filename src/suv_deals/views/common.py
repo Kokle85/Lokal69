@@ -153,12 +153,20 @@ class AmountView(ViewModel):
 
     @classmethod
     def of(
-        cls, money: Money | None, *, unknown_reason: str | None = None, currency: str | None = None
+        cls,
+        money: Money | None,
+        *,
+        unknown_reason: str | None = None,
+        currency: str | None = None,
+        whole: bool = False,
     ) -> AmountView:
-        """Known amount from ``Money`` (rounded for display) or an explicit unknown."""
+        """Known amount from ``Money`` (rounded half-up for display: to the minor unit, or with
+        ``whole`` to whole units without a fraction, ``"2733"``, for a view that presents whole
+        units such as the import-cost calculator) or an explicit unknown."""
         if money is None:
             return cls.unknown(unknown_reason, currency=currency)
-        return cls(status="known", amount=decimal_str(money_display(money)), currency=money.currency)
+        shown = money.amount.quantize(Decimal(1), rounding=ROUND_HALF_UP) if whole else money_display(money)
+        return cls(status="known", amount=decimal_str(shown), currency=money.currency)
 
     @classmethod
     def unknown(cls, reason: str | None = None, *, currency: str | None = None) -> AmountView:

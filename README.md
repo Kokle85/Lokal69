@@ -49,7 +49,7 @@ with row-level security). Details: [docs/architecture.md](docs/architecture.md).
 | `src/suv_deals/api/`, `mcp/`, `views/` | Dashboard API (FastAPI), mail-worker API, MCP server (official SDK), shared read models |
 | `src/suv_deals/integrations/` | ECB FX, MCP Events webhooks, Slack, MIME builder, e-mail providers, secret box, safe HTTP |
 | `src/suv_deals/cli.py`, `cli_commands/` | The `suv-deals` operator CLI (doctor, db, sources, crawl, inquiries, sender binding, mail worker, canary, market, fx, jobs, tax rules, import costs, ...) |
-| `supabase/migrations/` | 16 forward-only SQL migrations (applied to the hosted project through `20261008000200`) |
+| `supabase/migrations/` | 17 forward-only SQL migrations (applied to the hosted project through `20261008000200`; `20261013000100_import_values` not yet applied there) |
 | `config/` | Business configuration, search profiles, source registry, taxonomy, cost profiles, the tax-rule example and the unapproved North Macedonian draft (`config/tax_rules/drafts/`), the standing authorization record |
 | `schemas/` | Exported JSON schemas of the MCP tools and API responses (checked against the code) |
 | `dashboard/` | Private React dashboard (Vite, Supabase Auth, Vitest, Playwright) |
@@ -132,28 +132,47 @@ exported for that deployment (docs/runbook.md section 1). Security model: [SECUR
 ## Customs calculator
 
 Customs duty, motor-vehicle tax (ДМВ) and import VAT for importing one used passenger car into North
-Macedonia, from a listing's facts, from facts you state, or both, with the landed cost (price +
-the fixed EUR 700 transport + charges). One read-only service backs three surfaces; none of them
-stores anything:
+Macedonia, from a listing's facts, from facts you state, or both, with the landed cost (the REAL
+purchase price + the fixed EUR 700 transport + charges). One read-only service backs three
+surfaces; the calculator itself stores nothing:
 
 | Who | Where |
 |---|---|
 | Dashboard (scope `deals:read`) | "Customs calculator" (`/import-costs`, or from a candidate's detail page) over `GET /api/import-costs/estimate` |
 | dot (MCP) | tool `deals_estimate_import_costs`, scope `deals:read` ([docs/connect_mcp.md](docs/connect_mcp.md) section 7) |
-| Operator (CLI) | `uv run suv-deals import-costs estimate --listing-id <id>` or vehicle facts, e.g. `--price 3000 --fuel diesel --co2 nedc:189 --co2-document coc --origin-proof none` (`--json` for the shared view) |
+| Operator (CLI) | `uv run suv-deals import-costs estimate --listing-id <id>` or vehicle facts, e.g. `--price 2800 --estimated-customs-value-eur 4200 --estimated-customs-value-source "SchwackeNet catalogue" --fuel diesel --co2 nedc:189 --co2-document coc --origin-proof none` (`--json` for the shared view) |
 
 > **No tax rule set is approved yet.** The rates live only in the rule-set JSON. The North
 > Macedonian rules ship as an unapproved DRAFT
-> (`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`), so every result is an
+> (`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.3.json`), so every result is an
 > **INDICATIVE PREVIEW** (ИНДИКАТИВНА ПРОЦЕНКА): `production_ready: false`, totals named
 > `indicative_total`, never used for valuations or alerts. Valuations keep import charges
 > `unknown` until the owner approves and activates a rule set (dashboard, Settings, "Tax rules
 > and cost profile"; [docs/tax_rule_approval.md](docs/tax_rule_approval.md)). Missing facts (the
 > CO2 document, the month's customs EUR/MKD rate) make the affected charges unknown, never zero;
 > without a stated proof of origin the standard duty applies. Origin, tariff code and the VAT base
-> are never inferred, and WLTP/NEDC figures are never converted. Evidence pack:
+> are never inferred, and WLTP/NEDC figures are never converted. Per the owner's decisions of
+> 2026-10-13 the VAT base includes the motor-vehicle tax (ДМВ: VAT = (customs value + duty + ДМВ +
+> other applicable costs) x 18%, ЗДДВ чл. 21), every MKD amount is rounded to whole denars and every
+> computed amount is shown without decimals (EUR in whole euros, half-up). Evidence pack:
 > [docs/tax/mk_import_fact_sheet_2026-10.md](docs/tax/mk_import_fact_sheet_2026-10.md); decisions:
 > [docs/decisions/0003-transport-and-customs-calculator.md](docs/decisions/0003-transport-and-customs-calculator.md).
+
+Two values per vehicle (owner decision of 2026-10-13): the REAL purchase price (реална набавна цена:
+profit, landed cost) and the ESTIMATED customs value (проценета царинска вредност: import charges,
+e.g. a SchwackeNet value, without transport). Customs uses the SchwackeNet catalogue for used cars,
+but Царински закон чл. 28 keeps the price actually paid as the primary method, so the result shows
+the `primary` scenario (charges on the estimate + transport to the MK border, or on the price paid
+when there is no estimate) next to the `transaction_value` scenario (charges on the price paid).
+Example: bought for EUR 2,800, catalogue EUR 4,200: `primary` 185,803 MKD on EUR 4,900, landed
+cost EUR 6,520; `transaction_value` 165,213 MKD on EUR 3,500, landed cost EUR 6,185. The owner
+records both values per listing: the candidate's "Import values" panel on the dashboard
+(`POST /api/listings/{listing_id}/import-values`, owner only; read with `GET` on the same path) or
+`suv-deals import-costs record-values ... --yes` (read: `import-costs values`); no MCP tool
+records them. The calculator's listing mode (dot's included) and the valuations then use them
+(labelled `recorded`), and recording one marks the listing's valuations stale and recomputes them. This
+needs migration `20261013000100_import_values` (docs/schema.md 11.16), **not yet applied to the
+hosted Supabase project**; until it is, recording an estimated customs value there fails.
 
 ## Documentation
 

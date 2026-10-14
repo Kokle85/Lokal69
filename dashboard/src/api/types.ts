@@ -2300,7 +2300,9 @@ export interface EvaluationReport {
  * - `unavailable`: no rule set applies; every import charge is unknown and there are no scenarios.
  */
 export type EstimateMode = 'active' | 'indicative_preview' | 'unavailable'
-export type EstimateScenarioName = 'legal_base' | 'standard_duty_if_proof_rejected' | 'customs_revaluation_risk'
+/** `primary` (first): the charges on the customs value used for planning; `transaction_value` (only with an
+ * estimated customs value): Customs accepts the price paid; `standard_duty_if_proof_rejected`. */
+export type EstimateScenarioName = 'primary' | 'standard_duty_if_proof_rejected' | 'transaction_value'
 export type Co2Cycle = 'nedc' | 'nedc_correlated' | 'wltp' | 'unknown'
 export type Co2Document =
   | 'coc'
@@ -2313,7 +2315,11 @@ export type OriginProofKind = 'none' | 'unknown' | 'eu' | 'efta' | 'tr' | 'uk' |
 export type ImporterStatus = 'private' | 'non_vat_business' | 'vat_dealer'
 /** Whether an import-cost price is a transaction (invoice/contract) price or an advertised claim. */
 export type ImportPriceBasis = 'invoice' | 'advertised'
-export type FactSource = 'listing' | 'request' | 'default'
+/** Basis of the REAL purchase price: a stated basis or a value the owner recorded for the listing. */
+export type PurchasePriceBasis = ImportPriceBasis | 'recorded_actual' | 'recorded_quote' | 'recorded_estimate'
+/** What the customs value of the import charges rests on. */
+export type CustomsValueBasis = 'estimated' | 'transaction_value'
+export type FactSource = 'listing' | 'recorded' | 'request' | 'default'
 export type CustomsFxSource = 'recorded' | 'recorded_not_effective' | 'caller_supplied' | 'not_needed' | 'none'
 
 export interface ImportBannerView {
@@ -2347,8 +2353,12 @@ export interface ImportScenarioView {
   label: string
   complete: boolean
   production_ready: boolean
+  /** The engine's customs value in its own currency (EUR, or MKD for an MKD price). */
   customs_value: AmountView
+  /** The same customs value in whole euros at the customs rate (unknown with a reason, never 0). */
+  customs_value_eur: AmountView
   customs_value_basis: string | null
+  customs_value_kind: CustomsValueBasis
   assumptions: string[]
   /** `intermediate` components (customs value in MKD, VAT base, ...) are never counted in a total. */
   components: TaxComponentView[]
@@ -2397,6 +2407,9 @@ export interface ImportListingView {
   is_fixture: boolean
   fixture_label: string | null
   screened: boolean
+  /** The listing's current recorded import values (owner decision 2026-10-13); null when none. */
+  recorded_purchase_price_id?: Uuid | null
+  recorded_customs_value_id?: Uuid | null
 }
 
 export interface Co2ReadingView {
@@ -2406,7 +2419,7 @@ export interface Co2ReadingView {
 
 export interface ImportFactsView {
   price: AmountView
-  price_basis: ImportPriceBasis
+  price_basis: PurchasePriceBasis
   declaration_date: string | null
   fuel: Fuel
   co2: Co2ReadingView[]
@@ -2421,7 +2434,8 @@ export interface ImportFactsView {
   hs_evidence_ref: string | null
   transport_after_entry_eur: DecimalString | null
   transport_after_entry_separately_invoiced: boolean
-  catalogue_value_eur: DecimalString | null
+  estimated_customs_value_eur: DecimalString | null
+  estimated_customs_value_source: string | null
   importer_status: ImporterStatus | null
   mileage_km: DecimalString | null
   seller_country: CountryCode | null
@@ -2432,6 +2446,20 @@ export interface ImportFactsView {
 export interface ImportFactSourceView {
   fact: string
   source: FactSource
+}
+
+/** The REAL purchase price (whole euros): the basis of every landed cost, and so of the profit. */
+export interface ImportPurchasePriceView {
+  amount: AmountView
+  basis: PurchasePriceBasis | null
+  source: string
+}
+
+/** The customs value the `primary` charges are computed on (whole euros, incl. transport to the MK border). */
+export interface ImportCustomsValueView {
+  amount: AmountView
+  basis: CustomsValueBasis
+  source: string
 }
 
 export interface ImportCostEstimateView {
@@ -2452,9 +2480,11 @@ export interface ImportCostEstimateView {
   eur_basis: string
   landed_cost_note: string
   listing: ImportListingView | null
+  purchase_price: ImportPurchasePriceView
+  customs_value_for_duties: ImportCustomsValueView
   facts: ImportFactsView
   fact_sources: ImportFactSourceView[]
-  /** `legal_base` first; empty when `unavailable`. */
+  /** `primary` first; empty when `unavailable`. */
   scenarios: ImportScenarioView[]
   assumptions: string[]
   warnings: string[]
@@ -2464,6 +2494,78 @@ export interface ImportCostEstimateView {
   gates: ImportGatesView
   missing_inputs: string[]
   missing_facts: string[]
+}
+
+// --------------------------------------------------------------------------- recorded import values
+
+/**
+ * A listing's recorded import values (`GET` / `POST /api/listings/{listing_id}/import-values`;
+ * `views.import_values`). Owner decision 2026-10-13: every vehicle keeps two SEPARATE values, the
+ * REAL purchase price (`purchase`: profit and landed cost) and the ESTIMATED customs value
+ * (`customs_value`: in EUR WITHOUT transport; the import charges are computed on it). Recording
+ * is owner-only (`config:admin`); reading needs `deals:read`.
+ */
+export type ImportValueCategory = 'purchase' | 'customs_value'
+/** How firm a recorded purchase price is; an estimated customs value is always `estimate`. */
+export type RecordedValueKind = 'actual' | 'quote' | 'estimate'
+
+export interface ImportValueRecordView {
+  id: Uuid
+  category: ImportValueCategory
+  kind: RecordedValueKind
+  /** Whole euros (half-up, owner decision "без децимали"), as the server presents it. */
+  amount: AmountView
+  /** The amount exactly as recorded (at most two decimals); calculations use it, the UI does not. */
+  amount_exact: DecimalString
+  source: string
+  document_ref: string | null
+  supersedes_id: Uuid | null
+  current: boolean
+  recorded_by_principal: Uuid | null
+  recorded_at: DateTimeString
+  is_fixture: boolean
+}
+
+export interface ImportValuesView {
+  listing_id: Uuid
+  /** The CURRENT recorded value of each kind; `null` when none is recorded (never 0). */
+  purchase_price: ImportValueRecordView | null
+  estimated_customs_value: ImportValueRecordView | null
+  /** Recent rows of both kinds, newest first; superseded ones have `current: false`. */
+  history: ImportValueRecordView[]
+  note: string
+}
+
+export interface ImportValuesRecordResult {
+  values: ImportValuesView
+  recorded_ids: Uuid[]
+  superseded_ids: Uuid[]
+  stale_valuation_ids: Uuid[]
+  recompute_job_id: Uuid
+  production_effect: string
+}
+
+/** The REAL purchase price to record (EUR only; more than zero, at most two decimals). */
+export interface RecordPurchasePriceInput {
+  amount: DecimalString
+  currency: 'EUR'
+  kind: RecordedValueKind
+  source: string
+  document_ref?: string
+}
+
+/** The ESTIMATED customs value of the vehicle to record (EUR, WITHOUT transport). */
+export interface RecordCustomsValueInput {
+  amount_eur: DecimalString
+  source: string
+  document_ref?: string
+}
+
+/** `POST /api/listings/{listing_id}/import-values` body: at least one of the two values. */
+export interface ImportValuesRecordRequest {
+  purchase_price?: RecordPurchasePriceInput
+  estimated_customs_value?: RecordCustomsValueInput
+  idempotency_key: string
 }
 
 // --------------------------------------------------------------------------- owner approval path
@@ -2772,7 +2874,9 @@ export interface ImportCostEstimateQuery {
   /** Only with `transport_after_entry_separately_invoiced: true`. */
   transport_after_entry_eur?: DecimalString
   transport_after_entry_separately_invoiced?: boolean
-  catalogue_value_eur?: DecimalString
+  /** Estimated customs value of the vehicle (EUR, without transport); needs `estimated_customs_value_source`. */
+  estimated_customs_value_eur?: DecimalString
+  estimated_customs_value_source?: string
   importer_status?: ImporterStatus
   mileage_km?: DecimalString
   seller_country?: CountryCode

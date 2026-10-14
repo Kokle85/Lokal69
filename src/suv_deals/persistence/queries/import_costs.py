@@ -11,6 +11,20 @@ CLI). Pure computation in ``domain.import_estimate``; this module only gathers i
   the request's ``vehicle`` sets overrides the listing's; fields it leaves unset keep the
   listing's. Caller CO2 readings without a stated document never inherit the listing's claim
   label, and a caller price without a stated basis counts as advertised.
+- Two values (owner decision 2026-10-13): the vehicle's ``price`` is the REAL purchase price (the
+  landed cost uses it); an ``estimated_customs_value_eur`` with its source, when given, carries
+  the import charges of the ``primary`` scenario, and the ``transaction_value`` scenario shows the
+  charges on the price paid.
+- Recorded values (``import_values_repo``): in listing mode the listing's CURRENT recorded real
+  purchase price replaces the advertised price (``price_basis`` ``recorded_actual`` /
+  ``recorded_quote`` / ``recorded_estimate``) and its current recorded estimated customs value is
+  the estimate, each with fact source ``recorded``, unless the request's ``vehicle`` sets that
+  fact (a request ``price`` replaces the recorded purchase price with its own basis; a request
+  estimate replaces the recorded one). A request ``price_basis`` without a ``price`` cannot relabel
+  a recorded purchase price (refused on ``price_basis``: it keeps its recorded kind).
+  ``purchase_price.source`` / ``customs_value_for_duties.source`` name the recorded value (kind,
+  amount, source, date), the notes say which recorded values were used or overridden, and
+  ``listing`` carries their ids.
 - Rule set: the production selection first (``select_rule_set`` over the STORED rule sets: an
   ACTIVE, owner-approved, non-fixture version, exactly as valuations select it) -> ``active``;
   otherwise the indicative preview (``select_preview_rule_set``) over the stored approved,
@@ -77,8 +91,9 @@ from suv_deals.domain.tax_engine import (
     select_rule_set,
 )
 from suv_deals.errors import AppError, ErrorCode, NotFound, ValidationFailed
-from suv_deals.persistence import listings_repo, sources_repo, valuation_repo
+from suv_deals.persistence import import_values_repo, listings_repo, sources_repo, valuation_repo
 from suv_deals.persistence.database import Conn
+from suv_deals.persistence.import_values_repo import ImportValues, apply_recorded_values
 from suv_deals.persistence.queries._common import QueryResult, db_now, rendering
 from suv_deals.persistence.valuation_repo import StoredFxRate, StoredRuleSet
 from suv_deals.views.common import ResponseWarning, WarningCode, warning
@@ -172,6 +187,9 @@ class _ListingFacts:
     view: ImportListingView
     facts: VehicleImportFacts
     notes: tuple[str, ...]
+    recorded: ImportValues
+    #: Facts the recorded import values supplied (before request overrides).
+    recorded_facts: frozenset[str]
 
 
 async def _listing_facts(conn: Conn, actor: ActorContext, listing_id: UUID) -> _ListingFacts:
@@ -195,6 +213,8 @@ async def _listing_facts(conn: Conn, actor: ActorContext, listing_id: UUID) -> _
     elif screening.payable_amount is None:
         notes.append("LISTING_PAYABLE_UNKNOWN: screening found no payable amount; the price is unknown")
     facts = facts_from_listing(normalized, payable=None if screening is None else screening.payable_amount)
+    recorded = await import_values_repo.current_import_values(conn, actor, listing_id, history_limit=0)
+    facts, recorded_facts = apply_recorded_values(facts, recorded)
     if normalized.co2.g_per_km is not None and not facts.co2:
         notes.append(
             f"LISTING_CO2_NOT_A_FACT:{str(normalized.co2.g_per_km)[:40]}: the listing's CO2 figure is not "
@@ -209,8 +229,12 @@ async def _listing_facts(conn: Conn, actor: ActorContext, listing_id: UUID) -> _
         is_fixture=is_fixture,
         fixture_label=FIXTURE_LABEL if is_fixture else None,
         screened=screening is not None,
+        recorded_purchase_price_id=None if recorded.purchase is None else recorded.purchase.id,
+        recorded_customs_value_id=None if recorded.customs_value is None else recorded.customs_value.id,
     )
-    return _ListingFacts(view=view, facts=facts, notes=tuple(notes))
+    return _ListingFacts(
+        view=view, facts=facts, notes=tuple(notes), recorded=recorded, recorded_facts=recorded_facts
+    )
 
 
 def _known(value: object) -> bool:
@@ -220,15 +244,28 @@ def _known(value: object) -> bool:
 
 
 def merge_facts(
-    listing: VehicleImportFacts | None, override: VehicleImportFacts | None
+    listing: VehicleImportFacts | None,
+    override: VehicleImportFacts | None,
+    *,
+    recorded: frozenset[str] = frozenset(),
 ) -> tuple[VehicleImportFacts, dict[str, FactSource]]:
     """Listing facts with the request's explicitly SET fields on top, and each fact's source.
 
-    Caller CO2 readings without a stated document get no document (never the listing's claim
-    label); a caller price without a stated basis counts as advertised.
+    ``recorded`` names the listing facts a recorded import value supplied (source ``recorded``
+    unless the request sets them). Caller CO2 readings without a stated document get no document
+    (never the listing's claim label); a caller price without a stated basis counts as advertised.
+    A request ``price_basis`` without a ``price`` is refused when the price is a RECORDED one: the
+    owner's recorded purchase price keeps its recorded kind (an actual, a quote or an estimate),
+    exactly as the valuation uses it; only a price the request gives can carry another basis.
     """
     data = (listing or VehicleImportFacts()).model_dump()
     chosen = override.model_fields_set if override is not None else set()
+    if listing is not None and "price" in recorded and "price_basis" in chosen and "price" not in chosen:
+        raise ValidationFailed(
+            "the recorded purchase price keeps its recorded kind; give a price to state another basis "
+            "(or record a new value for the listing)",
+            details={"fields": ["price_basis"]},
+        )
     if override is not None:
         for name in chosen:
             data[name] = getattr(override, name)
@@ -248,6 +285,8 @@ def merge_facts(
     for name in VehicleImportFacts.model_fields:
         if name in chosen:
             sources[name] = "request"
+        elif listing is not None and name in recorded:
+            sources[name] = "recorded"
         elif (
             listing is not None
             and name in _LISTING_FACTS
@@ -507,7 +546,11 @@ async def estimate_import_costs_for(
     actor.require(Scope.DEALS_READ)
     now = ensure_utc(as_of) if as_of is not None else await db_now(conn)
     listing = None if request.listing_id is None else await _listing_facts(conn, actor, request.listing_id)
-    facts, sources = merge_facts(None if listing is None else listing.facts, request.vehicle)
+    facts, sources = merge_facts(
+        None if listing is None else listing.facts,
+        request.vehicle,
+        recorded=frozenset() if listing is None else listing.recorded_facts,
+    )
     declaration = declaration_date_for(facts, now)
 
     stored = await valuation_repo.list_rule_sets(conn, actor, jurisdiction=jurisdiction)
@@ -548,14 +591,18 @@ async def estimate_import_costs_for(
         *file_notes,
         *(n for n in profile_notes if n.startswith("COST_PROFILE_MISSING")),
     ]
-    notes = [n for n in profile_notes if not n.startswith("COST_PROFILE_MISSING")]
-    estimate = estimate.model_copy(
-        update={
-            "assumptions": tuple(dict.fromkeys([*estimate.assumptions, *customs.assumptions])),
-            "warnings": tuple(dict.fromkeys([*estimate.warnings, *(w[:500] for w in warnings)])),
-            "notes": tuple(dict.fromkeys([*estimate.notes, *notes])),
-        }
-    )
+    notes = [
+        *(() if listing is None else _recorded_notes(listing.recorded, sources)),
+        *(n for n in profile_notes if not n.startswith("COST_PROFILE_MISSING")),
+    ]
+    update: dict[str, object] = {
+        "assumptions": tuple(dict.fromkeys([*estimate.assumptions, *customs.assumptions])),
+        "warnings": tuple(dict.fromkeys([*estimate.warnings, *(w[:500] for w in warnings)])),
+        "notes": tuple(dict.fromkeys([*estimate.notes, *(n[:500] for n in notes)])),
+    }
+    if listing is not None:
+        update.update(_recorded_labels(estimate, listing.recorded, sources))
+    estimate = estimate.model_copy(update=update)
     fx_source: CustomsFxSource = customs.source
     if customs.rate is not None and estimate.customs_fx_rate is None and customs.source == "recorded":
         # The newest recorded rate is not valid on the declaration date and was not used.
@@ -570,6 +617,58 @@ async def estimate_import_costs_for(
     )
 
 
+def _purchase_recorded(sources: Mapping[str, FactSource]) -> bool:
+    """The estimate's purchase price is the recorded one: its amount AND its basis (the recorded
+    kind) both come from the recorded value (``merge_facts`` never splits them)."""
+    return sources.get("price") == "recorded" and sources.get("price_basis") == "recorded"
+
+
+def _customs_value_recorded(sources: Mapping[str, FactSource]) -> bool:
+    """The estimated customs value and its source both come from the recorded value."""
+    return (
+        sources.get("estimated_customs_value_eur") == "recorded"
+        and sources.get("estimated_customs_value_source") == "recorded"
+    )
+
+
+def _recorded_notes(recorded: ImportValues, sources: Mapping[str, FactSource]) -> list[str]:
+    """Which of the listing's recorded import values the estimate used, and which the request
+    replaced."""
+    notes: list[str] = []
+    for code, record, used in (
+        ("RECORDED_PURCHASE_PRICE", recorded.purchase, _purchase_recorded(sources)),
+        ("RECORDED_CUSTOMS_VALUE", recorded.customs_value, _customs_value_recorded(sources)),
+    ):
+        if record is None:
+            continue
+        if used:
+            notes.append(f"{code}_USED:{record.id}: {record.describe()}")
+        else:
+            notes.append(
+                f"{code}_OVERRIDDEN:{record.id}: the request's value replaces the {record.describe()}"
+            )
+    return notes
+
+
+def _recorded_labels(
+    estimate: ImportCostEstimate, recorded: ImportValues, sources: Mapping[str, FactSource]
+) -> dict[str, object]:
+    """``purchase_price`` / ``customs_value_for_duties`` sources that name the recorded value used."""
+    update: dict[str, object] = {}
+    purchase = recorded.purchase if _purchase_recorded(sources) else None
+    if purchase is not None:
+        update["purchase_price"] = estimate.purchase_price.model_copy(
+            update={"source": purchase.describe()[:200]}
+        )
+    duties = estimate.customs_value_for_duties
+    customs = recorded.customs_value if _customs_value_recorded(sources) else None
+    if duties.basis == "estimated" and customs is not None:
+        update["customs_value_for_duties"] = duties.model_copy(update={"source": customs.describe()[:200]})
+    elif duties.basis == "transaction_value" and purchase is not None:
+        update["customs_value_for_duties"] = duties.model_copy(update={"source": purchase.describe()[:200]})
+    return update
+
+
 def import_cost_warnings(view: ImportCostEstimateView) -> list[ResponseWarning]:
     """Typed envelope warnings (existing codes only): unapproved/absent rules, unknown charges,
     fixture lineage and unverified claims."""
@@ -578,8 +677,8 @@ def import_cost_warnings(view: ImportCostEstimateView) -> list[ResponseWarning]:
         warnings.append(warning(WarningCode.TAX_RULES_UNAPPROVED, view.banner.en))
     elif view.mode == "unavailable":
         warnings.append(warning(WarningCode.TAX_RULES_UNAPPROVED))
-    legal = view.scenarios[0] if view.scenarios else None
-    if legal is None or not legal.complete:
+    primary = view.scenarios[0] if view.scenarios else None
+    if primary is None or not primary.complete:
         missing = ", ".join(view.missing_facts) or "see the unknown components"
         warnings.append(
             warning(

@@ -1080,3 +1080,16 @@ def test_required_categories_cannot_be_dropped_to_hide_missing_lines() -> None:
         with pytest.raises(ValidationFailed, match="not_applicable line"):
             run([], required_categories=required)
     assert run(required_categories=REQUIRED_CATEGORIES).complete
+
+
+def test_tax_lines_cite_the_recorded_inputs_once_after_the_calculation() -> None:
+    """Owner decision 2026-10-13: a valuation cites the recorded values its tax lines rest on."""
+    rule = load_rule_set_file(REPO / "tests" / "fixtures" / "tax" / "synthetic_rule_set.json")
+    calc = calculate(rule, _tax_inputs(), datetime(2026, 6, 1, tzinfo=UTC))
+    recorded = ("0d8f5a8e-0000-4000-8000-000000000001", "0d8f5a8e-0000-4000-8000-000000000002")
+    lines = tax_cost_lines(calc, input_evidence_ids=(*recorded, recorded[0]))
+    plain = tax_cost_lines(calc)
+    for cited, bare in zip(lines, plain, strict=True):
+        assert cited.evidence_ids == (*bare.evidence_ids, *recorded)  # de-duplicated, tax refs first
+    # No calculation: nothing rests on the recorded values, nothing is cited.
+    assert all(ln.evidence_ids == () for ln in tax_cost_lines(None, input_evidence_ids=recorded))

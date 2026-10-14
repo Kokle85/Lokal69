@@ -103,46 +103,66 @@ def test_preview_view_names_its_totals_indicative_and_flags_helpers() -> None:
     assert view.mode == "indicative_preview" and not view.production_ready
     assert view.banner is not None and f"{view.banner.mk} / {view.banner.en}" == BANNER
     assert view.rule is not None and view.rule.status == TaxRuleStatus.DRAFT and not view.rule.sha256_recorded
-    legal = view.scenarios[0]
-    assert legal.name == "legal_base" and legal.complete
-    assert legal.total is None and legal.total_eur is None and legal.landed_cost_eur is None
-    assert legal.indicative_total is not None and legal.indicative_total.amount == "168154.45"
-    assert legal.indicative_total.currency == "MKD" and legal.known_subtotal is None
-    assert legal.indicative_total_eur is not None and legal.indicative_total_eur.amount == "2732.72"
-    flags = {c.component_id: c.intermediate for c in legal.components}
+    primary = view.scenarios[0]
+    assert primary.name == "primary" and primary.complete
+    assert primary.customs_value_kind == "transaction_value"
+    assert primary.total is None and primary.total_eur is None and primary.landed_cost_eur is None
+    # Whole units without a fraction (owner decision 2026-10-13): MKD as assessed, EUR rounded.
+    assert primary.indicative_total is not None and primary.indicative_total.amount == "168155"
+    assert primary.indicative_total.currency == "MKD" and primary.known_subtotal is None
+    assert primary.indicative_total_eur is not None and primary.indicative_total_eur.amount == "2733"
+    assert primary.indicative_landed_cost_eur is not None
+    assert primary.indicative_landed_cost_eur.amount == "6433"
+    flags = {c.component_id: c.intermediate for c in primary.components}
     assert flags["customs_value_mkd"] and flags["vmv_mkd"] and flags["vat_base_mkd"]
     assert not flags["duty_standard"] and not flags["dmv_full"] and not flags["vat_import"]
-    categories = {c.category: c for c in legal.categories}
-    assert categories[CostCategory.IMPORT_DUTY].amount.amount == "11383.73"
+    shown = {c.component_id: c.amount.amount for c in primary.components}
+    assert shown["customs_value_mkd"] == "227675" and shown["duty_standard"] == "11384"
+    categories = {c.category: c for c in primary.categories}
+    assert categories[CostCategory.IMPORT_DUTY].amount.amount == "11384"
+    assert categories[CostCategory.IMPORT_DUTY].amount_eur.amount == "185"
     assert categories[CostCategory.OTHER_IMPORT_CHARGES].status == "not_applicable"
     assert categories[CostCategory.OTHER_IMPORT_CHARGES].amount.amount is None
+    # The two values: the real purchase price and the customs value the charges use.
+    assert view.purchase_price.amount.amount == "3000" and view.purchase_price.basis == "invoice"
+    assert view.purchase_price.source == "invoice or contract price"
+    duties = view.customs_value_for_duties
+    assert (duties.amount.amount, duties.amount.currency, duties.basis) == (
+        "3700",
+        "EUR",
+        "transaction_value",
+    )
     # Decimals are strings on the wire; the view round-trips through its own JSON.
     data = view.model_dump(mode="json")
     assert ImportCostEstimateView.model_validate(data) == view
     assert data["scenarios"][0]["customs_value"] == {
         "status": "known",
-        "amount": "3700.00",
+        "amount": "3700",
         "currency": "EUR",
         "reason": None,
     }
+    # The facts echo the inputs as given.
+    assert view.facts.price.amount == "3000.00"
 
 
 def test_active_view_carries_final_totals_and_production_readiness() -> None:
     est = estimate(rule_sets=[synthetic_active()], jurisdiction="XX")
     view = view_of(est)
-    legal = view.scenarios[0]
+    primary = view.scenarios[0]
     assert view.mode == "active" and view.production_ready and view.banner is None
-    assert legal.total is not None and legal.total.amount == "168154.45" and legal.indicative_total is None
-    assert legal.production_ready
+    assert primary.total is not None and primary.total.amount == "168155" and primary.indicative_total is None
+    assert primary.total_eur is not None and primary.total_eur.amount == "2733"
+    assert primary.landed_cost_eur is not None and primary.landed_cost_eur.amount == "6433"
+    assert primary.production_ready
 
 
 def test_incomplete_and_unavailable_views_show_unknown_never_zero() -> None:
     unknown_co2 = estimate(facts(co2_document=None))
-    legal = view_of(unknown_co2).scenarios[0]
-    assert not legal.complete and legal.indicative_total is not None
-    assert legal.indicative_total.status == "unknown" and legal.indicative_total.amount is None
-    assert legal.indicative_total.reason is not None and "incomplete" in legal.indicative_total.reason
-    assert legal.known_subtotal is not None and legal.known_subtotal.amount == "11383.73"
+    primary = view_of(unknown_co2).scenarios[0]
+    assert not primary.complete and primary.indicative_total is not None
+    assert primary.indicative_total.status == "unknown" and primary.indicative_total.amount is None
+    assert primary.indicative_total.reason is not None and "incomplete" in primary.indicative_total.reason
+    assert primary.known_subtotal is not None and primary.known_subtotal.amount == "11384"
     none = view_of(estimate(rule_sets=[]))
     assert none.mode == "unavailable" and none.scenarios == () and none.rule is None
     assert none.banner is not None and "unknown" in none.banner.en
@@ -176,6 +196,10 @@ def test_view_invariants_refuse_mislabelled_results() -> None:
         ImportCostEstimateView.model_validate({**data, "scenarios": [broken]})
     with pytest.raises(ValidationError, match="an unavailable estimate has no rule"):
         ImportCostEstimateView.model_validate({**data, "mode": "unavailable"})
+    with pytest.raises(ValidationError, match="primary scenario comes first"):
+        ImportCostEstimateView.model_validate(
+            {**data, "scenarios": [{**scenario, "name": "transaction_value"}]}
+        )
     with pytest.raises(ValidationError, match="ACTIVE rule set"):
         ImportCostEstimateView.model_validate({**data, "mode": "active"})
     with pytest.raises(ValidationError, match="fixture-lineage"):
@@ -220,18 +244,39 @@ def test_typed_warnings_label_preview_claims_and_fixtures() -> None:
 def test_chf_price_is_named_as_unconverted_not_as_a_missing_price() -> None:
     """Regression: a CHF price was reported as a missing 'price' ("needed: price") with the
     generic customs-value reason, although the price was given."""
-    chf = facts(price={"amount": "3000.00", "currency": "CHF"}, catalogue_value_eur="6000")
+    chf = facts(price={"amount": "3000.00", "currency": "CHF"})
     view = view_of(estimate(chf), chf)
     assert view.missing_facts == ("price_in_eur_or_mkd",)
-    legal = view.scenarios[0]
-    assert legal.customs_value.status == "unknown"
+    primary = view.scenarios[0]
+    assert primary.customs_value.status == "unknown"
     assert (
-        legal.customs_value.reason is not None and "CHF price is not converted" in legal.customs_value.reason
+        primary.customs_value.reason is not None
+        and "CHF price is not converted" in primary.customs_value.reason
     )
-    risk = next(s for s in view.scenarios if s.name == "customs_revaluation_risk")
-    assert risk.customs_value.status == "known"  # the catalogue value, not the CHF price
+    assert view.purchase_price.amount.status == "unknown" and view.purchase_price.basis == "invoice"
+    assert view.purchase_price.amount.reason is not None and "CHF price" in view.purchase_price.amount.reason
+    assert view.customs_value_for_duties.amount.status == "unknown"
     warnings = {w.code.value: w.message for w in import_cost_warnings(view)}
     assert warnings["UNKNOWN_COSTS"].endswith("needed: price_in_eur_or_mkd")
+    # With an estimated customs value (EUR) the primary charges are known; only the
+    # transaction-value alternative and the landed cost rest on the CHF price.
+    estimated = facts(
+        price={"amount": "3000.00", "currency": "CHF"},
+        estimated_customs_value_eur="6000",
+        estimated_customs_value_source="SchwackeNet catalogue",
+    )
+    view = view_of(estimate(estimated), estimated)
+    assert view.missing_facts == ("price_in_eur_or_mkd",)
+    primary = view.scenarios[0]
+    assert primary.customs_value_kind == "estimated" and primary.customs_value.amount == "6700"
+    assert primary.complete and primary.indicative_total is not None
+    assert primary.indicative_total.amount == "212274"
+    assert primary.indicative_landed_cost_eur is not None
+    assert primary.indicative_landed_cost_eur.status == "unknown"
+    alternative = next(s for s in view.scenarios if s.name == "transaction_value")
+    assert alternative.customs_value.status == "unknown"
+    assert alternative.customs_value.reason is not None and "CHF price" in alternative.customs_value.reason
+    assert view.customs_value_for_duties.amount.amount == "6700"
     eur = view_of(estimate(facts(price=None)), facts(price=None)).scenarios[0]
     assert eur.customs_value.reason is not None and "the price, the transport or the customs rate" in (
         eur.customs_value.reason
@@ -323,7 +368,7 @@ def test_request_needs_something_to_estimate_and_refuses_floats() -> None:
 
 def test_draft_files_are_drafts_only(tmp_path: Path) -> None:
     shipped, notes = load_draft_rule_sets(CONFIG / DRAFT_RULES_DIR)
-    assert [rs.label() for rs in shipped] == ["mk-passenger-car-import@2026.10-draft.2"] and notes == []
+    assert [rs.label() for rs in shipped] == ["mk-passenger-car-import@2026.10-draft.3"] and notes == []
     drafts = tmp_path / "drafts"
     drafts.mkdir()
     shutil.copy(DRAFT, drafts / "a_draft.json")
@@ -365,7 +410,7 @@ def test_conflicting_or_revoked_copies_leave_the_calculator_unavailable() -> Non
     revoked = transition_rule_set(draft(), TaxRuleStatus.REVOKED, at=AS_OF)
     hidden = select_calculator_rule_set([stored(revoked)], [draft()], "MK", "passenger_car", DECL)
     assert hidden.rule_set is None and any("revoked" in c for c in hidden.considered)
-    other = RuleSet.model_validate({**draft().model_dump(), "version": "2026.10-draft.3"})
+    other = RuleSet.model_validate({**draft().model_dump(), "version": "2026.10-draft.4"})
     ambiguous = select_calculator_rule_set([], [draft(), other], "MK", "passenger_car", DECL)
     assert ambiguous.rule_set is None and "AMBIGUOUS_PREVIEW" in ambiguous.reason
     # Regression: a REVOKED stored copy whose content differs from the shipped file raised for
@@ -396,6 +441,85 @@ def test_result_view_carries_listing_and_fact_sources() -> None:
     assert view.customs_fx_source == "caller_supplied"
     assert [(s.fact, s.source) for s in view.fact_sources] == [("price", "request"), ("co2", "listing")]
     assert view.facts.price.amount == "3000.00" and view.facts.co2[0].g_km == "189"
+    assert (
+        view.facts.estimated_customs_value_eur is None and view.facts.estimated_customs_value_source is None
+    )
+
+
+def test_view_carries_the_estimated_customs_value_apart_from_the_real_price() -> None:
+    """Owner decision 2026-10-13: bought for EUR 2,800, SchwackeNet says EUR 4,200 - the charges
+    of the primary scenario follow the estimate, every landed cost the price paid."""
+    owner = facts(
+        price={"amount": "2800", "currency": "EUR"},
+        estimated_customs_value_eur="4200",
+        estimated_customs_value_source="SchwackeNet catalogue",
+    )
+    view = view_of(estimate(owner), owner)
+    assert [s.name for s in view.scenarios] == ["primary", "transaction_value"]
+    assert [s.customs_value_kind for s in view.scenarios] == ["estimated", "transaction_value"]
+    assert view.purchase_price.amount.amount == "2800"
+    duties = view.customs_value_for_duties
+    assert (duties.amount.amount, duties.basis, duties.source) == (
+        "4900",
+        "estimated",
+        "SchwackeNet catalogue",
+    )
+    primary, alternative = view.scenarios
+    assert primary.indicative_total is not None and primary.indicative_total.amount == "185803"
+    assert primary.indicative_landed_cost_eur is not None
+    assert primary.indicative_landed_cost_eur.amount == "6520"  # 2,800 + 700 + 3,019.53
+    assert alternative.indicative_total is not None and alternative.indicative_total.amount == "165213"
+    assert alternative.indicative_landed_cost_eur is not None
+    assert alternative.indicative_landed_cost_eur.amount == "6185"  # 2,800 + 700 + 2,684.92
+    assert view.facts.estimated_customs_value_eur == "4200"
+    assert view.facts.estimated_customs_value_source == "SchwackeNet catalogue"
+    warnings = {w.code.value: w.message for w in import_cost_warnings(view)}
+    assert "estimated customs value (SchwackeNet catalogue)" in warnings["SELLER_CLAIMS_UNVERIFIED"]
+
+
+def test_every_scenario_states_its_customs_value_in_whole_euros_too() -> None:
+    """Regression: the side-by-side scenarios showed each scenario's customs value in its own
+    currency under one EUR column, so an MKD price put MKD next to EUR. Each scenario now also
+    carries ``customs_value_eur`` (whole euros at the customs rate) to compare them in one unit."""
+    mkd = {"amount": "172294", "currency": "MKD"}  # ~ EUR 2,800 at 61.5337
+    view = view_of(
+        estimate(
+            facts(
+                price=mkd,
+                estimated_customs_value_eur="4200",
+                estimated_customs_value_source="SchwackeNet catalogue",
+            )
+        )
+    )
+    by_name = {s.name: s for s in view.scenarios}
+    primary, alternative = by_name["primary"], by_name["transaction_value"]
+    assert (primary.customs_value.amount, primary.customs_value.currency) == ("4900", "EUR")
+    assert (primary.customs_value_eur.amount, primary.customs_value_eur.currency) == ("4900", "EUR")
+    # The transaction value stays in the price's currency; its EUR equivalent sits next to it.
+    assert (alternative.customs_value.amount, alternative.customs_value.currency) == ("215368", "MKD")
+    assert (alternative.customs_value_eur.amount, alternative.customs_value_eur.currency) == ("3500", "EUR")
+    # Without an estimate the primary scenario is the transaction value: MKD, and EUR next to it.
+    plain = view_of(estimate(facts(price=mkd)))
+    assert plain.scenarios[0].customs_value.currency == "MKD"
+    assert (
+        plain.scenarios[0].customs_value_eur.amount == plain.customs_value_for_duties.amount.amount == "3500"
+    )
+    # Without a customs rate the EUR equivalent is unknown with its reason, never 0.
+    no_rate = view_of(estimate(facts(price=mkd), customs_rate=None)).scenarios[0]
+    assert no_rate.customs_value_eur.status == "unknown" and no_rate.customs_value_eur.amount is None
+    assert no_rate.customs_value_eur.currency == "EUR" and no_rate.customs_value_eur.reason
+
+
+def test_merge_takes_the_estimate_from_the_request_with_its_source() -> None:
+    listed = facts_from_listing(_listing(), payable=Money.of("3000", "EUR"))
+    override = VehicleImportFacts.model_validate(
+        {"estimated_customs_value_eur": "4200", "estimated_customs_value_source": "owner estimate"}
+    )
+    merged, sources = merge_facts(listed, override)
+    assert merged.price == listed.price and merged.estimated_customs_value_eur == Decimal(4200)
+    assert sources["estimated_customs_value_eur"] == sources["estimated_customs_value_source"] == "request"
+    assert sources["price"] == "listing"
+    assert merge_facts(listed, None)[1]["estimated_customs_value_eur"] == "default"
 
 
 # --------------------------------------------------------------------------- builder additions

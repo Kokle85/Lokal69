@@ -8,7 +8,7 @@ Engine: `src/suv_deals/domain/tax_engine.py`; file format: `config/tax_rules/REA
 | Capability | State |
 |---|---|
 | Engine, validation, versioning, lifecycle, selection, missing-data handling | `implemented`, `fixture_verified` (synthetic golden/boundary tests) |
-| North Macedonian draft rule set | `draft` - `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.2.json`, golden-tested (`tests/unit/test_mk_rule_draft.py`), **not approved** |
+| North Macedonian draft rule set | `draft` - `config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.3.json`, golden-tested (`tests/unit/test_mk_rule_draft.py`), **not approved** |
 | Production North Macedonian rule set | `blocked` - no owner-approved, ACTIVE rule set exists |
 | Import-cost calculator (`domain/import_estimate.py`; read service `persistence/queries/import_costs.py`, view `views/import_costs.py`) | indicative preview on the draft only; never production-ready, never used for valuations or alerts |
 
@@ -23,7 +23,10 @@ professional) against the evidence pack
 `UNCERTAIN - confirm` marker (listed in
 [ADR 0003](decisions/0003-transport-and-customs-calculator.md), "What the owner must confirm"),
 re-fetch and re-hash every source, run the golden cases, then approve and activate a rule-set
-version through the procedure below. The Customs Administration's vehicle-tax calculator is indicative only and
+version through the procedure below. Two former markers were settled by the owner on 2026-10-13
+and are no longer open in draft.3: the motor-vehicle tax (ДМВ) is part of the import VAT base
+(VAT = (customs value + duty + ДМВ + other applicable costs) x 18%, ЗДДВ чл. 21(2)(1)), and every
+MKD amount and the total are rounded to whole denars, half-up (`rounding_rules` quantum `1`). The Customs Administration's vehicle-tax calculator is indicative only and
 is a cross-check, not a source of binding rates.
 
 ## Lifecycle
@@ -130,11 +133,15 @@ customs value in MKD stays unknown and the warning names
 
 Valuations and the calculator build the engine inputs with the same builder
 (`import_estimate.build_tax_inputs` over `facts_from_listing`), so once a rule set is ACTIVE a
-valuation computes the duty, motor-vehicle tax and import VAT the calculator shows: the
-advertised payable amount as the transaction value (assumption), the cost profile's transport
-line in the customs value, no proof of origin (standard duty), a listing CO2 figure as
-`listing_claim_unverified`, the customs monthly rate valid in its month. Lines computed from
-such claims (`BuiltTaxInputs.unverified_inputs`) are estimates on unapproved assumptions,
+valuation computes the duty, motor-vehicle tax and import VAT the calculator shows: the owner's
+recorded REAL purchase price of the listing, otherwise the advertised payable amount, as the
+transaction value (assumption); the owner's recorded ESTIMATED customs value, when there is one,
+as the basis of the charges (owner decision D2 of 2026-10-13; the purchase, and so the profit,
+keeps the real purchase price; `import_values_repo`, docs/api_contract.md "Recorded import
+values"); the cost profile's transport line in the customs value, no proof of origin (standard
+duty), a listing CO2 figure as `listing_claim_unverified`, the customs monthly rate valid in its
+month. Lines computed from such claims (an advertised price, a recorded quote or estimate, an
+estimated customs value; `BuiltTaxInputs.unverified_inputs`) are estimates on unapproved assumptions,
 never `rule_supported`, so a valuation built on them is never `quote_supported`. The builder's
 assumptions and warnings and the Euro import gate are recorded as valuation warnings
 (`TAX_INPUT_ASSUMPTION:`, `TAX_INPUT_WARNING:`, `TAX_INPUT_UNVERIFIED:`, `IMPORT_GATE:`).

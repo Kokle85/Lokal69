@@ -7,18 +7,26 @@
  *   unknown; only `active` rules give a "total".
  * - Helper components (customs value in MKD, the VAT base, ...) are shown as secondary rows: they are
  *   never counted in a total.
+ * - Two values per vehicle (owner decision 2026-10-13): the REAL purchase price (every landed cost
+ *   and so the profit use it) and the customs value the duties are computed on are shown side by
+ *   side with their basis, then the scenarios side by side (`primary`, and with an estimated
+ *   customs value the `transaction_value` alternative: Customs accepts the price paid).
+ * - Every amount arrives from the server in whole units (owner decision "без децимали"); input
+ *   echoes (the "Facts used") are shown as entered, an all-zero fraction dropped. No rounding or
+ *   other money arithmetic happens in the browser.
  */
 import type { ReactNode } from 'react'
 import { Link } from 'react-router'
 import type {
   AmountView,
+  CustomsValueBasis,
   ImportCostEstimateView,
-  ImportFactsView,
   ImportScenarioView,
+  PurchasePriceBasis,
   ResponseWarning,
 } from '../../api/types'
 import { Amount, Badge, KeyValues, Notice, Section, Warnings } from '../../components/ui'
-import { label, shortHash, yesNo } from '../../format'
+import { enteredAmountText, enteredDecimalText, label, shortHash, yesNo } from '../../format'
 
 const FX_SOURCE_TEXT: Record<ImportCostEstimateView['customs_fx_source'], string> = {
   recorded: 'recorded Customs monthly list rate',
@@ -30,9 +38,24 @@ const FX_SOURCE_TEXT: Record<ImportCostEstimateView['customs_fx_source'], string
 }
 
 const SCENARIO_TITLES: Record<ImportScenarioView['name'], string> = {
-  legal_base: 'Legal base',
+  primary: 'Primary',
   standard_duty_if_proof_rejected: 'Alternative: proof of origin rejected (standard duty)',
-  customs_revaluation_risk: 'Risk: customs revaluation to the catalogue value',
+  transaction_value: 'Alternative: Customs accepts the price paid (transaction value)',
+}
+
+/** What the real purchase price rests on. */
+export const PURCHASE_BASIS_TEXT: Record<PurchasePriceBasis, string> = {
+  invoice: 'invoice / contract price (actually paid)',
+  advertised: 'advertised price (a claim, not the price paid)',
+  recorded_actual: 'recorded by the owner: actual (paid)',
+  recorded_quote: 'recorded by the owner: quote (not paid yet)',
+  recorded_estimate: 'recorded by the owner: estimate',
+}
+
+/** What the customs value of the duties rests on. */
+export const CUSTOMS_BASIS_TEXT: Record<CustomsValueBasis, string> = {
+  estimated: 'estimated customs value + transport to the MK border',
+  transaction_value: 'transaction value: the price paid + transport to the MK border (Customs Law art. 28)',
 }
 
 function TextList({ items, label: name, className = 'item-list small' }: { items: string[]; label: string; className?: string }) {
@@ -80,6 +103,110 @@ export function EstimateBanner({ view }: { view: ImportCostEstimateView }) {
   )
 }
 
+/**
+ * The two values of the vehicle side by side (owner decision 2026-10-13): the REAL purchase price,
+ * which every landed cost (and so the profit) uses, and the customs value the duties of the primary
+ * scenario are computed on. Both in whole euros as the server sends them; unknown reads "unknown".
+ */
+export function TwoValues({ view }: { view: ImportCostEstimateView }) {
+  const price = view.purchase_price
+  const duties = view.customs_value_for_duties
+  return (
+    <Section title="Purchase price and customs value" id="estimate-two-values">
+      <p className="muted small">
+        Two separate values per vehicle · <span lang="mk">Две одделни вредности по возило</span>
+      </p>
+      <div className="value-pair" data-testid="two-values">
+        <div className="card value-card" data-testid="value-purchase-price">
+          <h3>
+            Purchase price (real, for profit) ·{' '}
+            <span lang="mk" className="label-mk">
+              Реална набавна цена (за профит)
+            </span>
+          </h3>
+          <span className="value-amount">
+            <Amount value={price.amount} showReason />
+          </span>
+          <span className="value-meta">Basis: {price.basis ? PURCHASE_BASIS_TEXT[price.basis] : 'not given'}</span>
+          <span className="value-meta">Source: {price.source}</span>
+          <span className="value-meta">Every landed cost below uses this price, never the customs value.</span>
+        </div>
+        <div className="card value-card" data-testid="value-customs-value">
+          <h3>
+            Customs value for the duties ·{' '}
+            <span lang="mk" className="label-mk">
+              Царинска вредност за давачките
+            </span>
+          </h3>
+          <span className="value-amount">
+            <Amount value={duties.amount} showReason />
+          </span>
+          <span className="value-meta">Basis: {CUSTOMS_BASIS_TEXT[duties.basis]}</span>
+          <span className="value-meta">Source: {duties.source}</span>
+          <span className="value-meta">
+            {duties.basis === 'estimated'
+              ? 'The primary scenario charges the duties on this value; the transaction-value alternative shows them on the price paid (Customs first applies the price paid, Customs Law art. 28).'
+              : 'No estimated customs value given: the duties are charged on the price paid.'}
+          </span>
+        </div>
+      </div>
+      {view.scenarios.length ? <ScenarioGlance view={view} /> : null}
+    </Section>
+  )
+}
+
+/**
+ * The scenarios side by side: customs value, import charges and landed cost (server amounts only).
+ * The customs value column is the server's whole-euro `customs_value_eur` of each scenario, so the
+ * rows compare in one currency even when a transaction value is in MKD (an MKD price).
+ */
+function ScenarioGlance({ view }: { view: ImportCostEstimateView }) {
+  const preview = view.mode === 'indicative_preview'
+  const word = preview ? 'Indicative import charges' : 'Import charges'
+  return (
+    <table className="responsive-table" aria-label="Scenarios side by side">
+      <thead>
+        <tr>
+          <th scope="col">Scenario</th>
+          <th scope="col">Customs value (EUR)</th>
+          <th scope="col">
+            {word} ({view.currency ?? 'rule currency'})
+          </th>
+          <th scope="col">{word} (EUR)</th>
+          <th scope="col">{preview ? 'Indicative landed cost' : 'Landed cost'} (EUR)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {view.scenarios.map((scenario) => (
+          <tr key={scenario.name} data-testid={`glance-${scenario.name}`}>
+            <td data-label="Scenario">
+              {SCENARIO_TITLES[scenario.name]}
+              {scenario.complete ? null : (
+                <>
+                  {' '}
+                  <Badge value="incomplete">incomplete</Badge>
+                </>
+              )}
+            </td>
+            <td data-label="Customs value (EUR)">
+              <Amount value={scenario.customs_value_eur} />
+            </td>
+            <td data-label={`${word} (${view.currency ?? 'rule currency'})`}>
+              <Amount value={preview ? scenario.indicative_total : scenario.total} />
+            </td>
+            <td data-label={`${word} (EUR)`}>
+              <Amount value={preview ? scenario.indicative_total_eur : scenario.total_eur} />
+            </td>
+            <td data-label="Landed cost (EUR)">
+              <Amount value={preview ? scenario.indicative_landed_cost_eur : scenario.landed_cost_eur} />
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 function transportText(assumptions: string[]): string | null {
   const line = assumptions.find((item) => item.startsWith('TRANSPORT_LINE:'))
   return line ? line.slice('TRANSPORT_LINE:'.length) : null
@@ -108,7 +235,21 @@ function Totals({ scenario, preview, view }: { scenario: ImportScenarioView; pre
       </span>,
     ])
   }
-  items.push(['Customs value', <Amount key="cv" value={scenario.customs_value} showReason />])
+  // An MKD transaction value also shows the server's whole-euro equivalent (the rows compare in EUR).
+  const eurEquivalent =
+    scenario.customs_value.currency !== 'EUR' && scenario.customs_value_eur.status === 'known' ? (
+      <span className="muted small">
+        {' '}
+        (<Amount value={scenario.customs_value_eur} />)
+      </span>
+    ) : null
+  items.push([
+    'Customs value',
+    <span key="cv">
+      <Amount value={scenario.customs_value} showReason />
+      {eurEquivalent}
+    </span>,
+  ])
   if (scenario.customs_value_basis) items.push(['Customs value basis', scenario.customs_value_basis])
   return (
     <div className="estimate-totals" data-testid={`totals-${scenario.name}`}>
@@ -228,7 +369,7 @@ function ScenarioSection({ scenario, view }: { scenario: ImportScenarioView; vie
 }
 
 const FACT_LABELS: Record<string, string> = {
-  price: 'Purchase price',
+  price: 'Purchase price (real)',
   price_in_eur_or_mkd: 'Price in EUR or MKD (a CHF price is not converted)',
   customs_fx_rate: "Customs rate of the declaration month",
   price_basis: 'Price basis',
@@ -244,7 +385,8 @@ const FACT_LABELS: Record<string, string> = {
   hs_evidence_ref: 'Tariff code evidence',
   transport_after_entry_eur: 'Inland transport after entry (EUR)',
   transport_after_entry_separately_invoiced: 'Inland leg separately invoiced',
-  catalogue_value_eur: 'Catalogue value (EUR)',
+  estimated_customs_value_eur: 'Estimated customs value (EUR)',
+  estimated_customs_value_source: 'Estimated customs value source',
   importer_status: 'Importer',
   mileage_km: 'Mileage (km)',
   seller_country: 'Seller country',
@@ -256,13 +398,28 @@ function given(value: string | null | undefined): ReactNode {
   return value ? value : <span className="muted">not given</span>
 }
 
-function factValue(fact: string, facts: ImportFactsView): ReactNode {
+/** A money input echo in EUR, as entered (an all-zero fraction dropped; see `enteredDecimalText`). */
+function enteredEur(value: string | null): ReactNode {
+  return value ? <span className="amount">EUR {enteredDecimalText(value)}</span> : given(null)
+}
+
+function factValue(fact: string, view: ImportCostEstimateView): ReactNode {
   const text = given
+  const facts = view.facts
   switch (fact) {
-    case 'price':
-      return <Amount value={facts.price} showReason />
+    case 'price': {
+      const price = facts.price
+      if (price.status !== 'known') return <Amount value={price} showReason />
+      // A EUR price is the server's whole-euro purchase price; another currency is shown as given.
+      if (price.currency === 'EUR' && view.purchase_price.amount.status === 'known') return <Amount value={view.purchase_price.amount} />
+      return <span className="amount">{enteredAmountText(price)}</span>
+    }
     case 'price_basis':
-      return label(facts.price_basis)
+      return PURCHASE_BASIS_TEXT[facts.price_basis] ?? label(facts.price_basis)
+    case 'estimated_customs_value_eur':
+      return enteredEur(facts.estimated_customs_value_eur)
+    case 'transport_after_entry_eur':
+      return enteredEur(facts.transport_after_entry_eur)
     case 'declaration_date':
       return text(facts.declaration_date)
     case 'fuel':
@@ -302,10 +459,10 @@ function FactsTable({ view }: { view: ImportCostEstimateView }) {
         {view.fact_sources.map(({ fact, source }) => (
           <tr key={fact}>
             <td data-label="Fact">{FACT_LABELS[fact] ?? label(fact)}</td>
-            <td data-label="Value used">{factValue(fact, view.facts)}</td>
+            <td data-label="Value used">{factValue(fact, view)}</td>
             <td data-label="Source">
-              <Badge tone={source === 'request' ? 'info' : source === 'listing' ? 'neutral' : 'muted'}>
-                {source === 'request' ? 'you' : source === 'listing' ? 'listing' : 'default'}
+              <Badge tone={source === 'request' ? 'info' : source === 'default' ? 'muted' : source === 'recorded' ? 'ok' : 'neutral'}>
+                {source === 'request' ? 'you' : source === 'recorded' ? 'recorded value' : source}
               </Badge>
             </td>
           </tr>
@@ -338,6 +495,8 @@ export function EstimateResult({ view, warnings }: { view: ImportCostEstimateVie
           <TextList items={view.unverified_inputs} label="Unverified inputs" />
         </Notice>
       ) : null}
+
+      <TwoValues view={view} />
 
       <Section title="Basis" id="estimate-basis">
         <KeyValues
@@ -387,6 +546,13 @@ export function EstimateResult({ view, warnings }: { view: ImportCostEstimateVie
             Facts from listing <Link to={`/candidates/${view.listing.listing_id}`}>{view.listing.source_key}</Link>, revision{' '}
             {view.listing.revision_number}
             {view.listing.screened ? '' : ' (not screened yet: the price is unknown)'}.
+            {view.listing.recorded_purchase_price_id || view.listing.recorded_customs_value_id ? (
+              <span data-testid="recorded-values-note">
+                {' '}
+                The owner&apos;s recorded import values of this listing apply unless you enter your own (
+                <Link to={`/candidates/${view.listing.listing_id}`}>Import values on the candidate</Link>).
+              </span>
+            ) : null}
           </p>
         ) : null}
       </Section>

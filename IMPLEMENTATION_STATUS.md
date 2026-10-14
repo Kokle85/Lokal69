@@ -13,6 +13,19 @@ rules are an unapproved DRAFT, so every result is a labelled indicative preview 
 still keep import charges unknown (gate `tax_rules` stays `blocked`). Commands and counts of that
 run: [docs/qa_evidence.md](docs/qa_evidence.md), "Customs calculator wave".
 
+**Update 2026-10-13, later (owner decisions D1-D3, ADR 0003 decisions 11-14; working tree on top
+of `7280bd9`, not committed):** the draft rule set is `2026.10-draft.3`: the ДМВ is part of the
+import VAT base (ЗДДВ чл. 21(2)(1); no longer UNCERTAIN) and every MKD amount and the total are
+whole denars, half-up; the calculator shows every amount without decimals (EUR in whole euros).
+Each vehicle keeps two values: the REAL purchase price (profit, landed cost) and an ESTIMATED
+customs value (e.g. SchwackeNet; the `primary` import charges), with the `transaction_value`
+scenario (charges on the price paid, Царински закон чл. 28) beside it. The owner records both per
+listing (dashboard "Import values" panel, `POST /api/listings/{listing_id}/import-values`,
+`suv-deals import-costs record-values`; never dot); the calculator's listing mode and valuations
+use them, and recording one re-values the listing. This is `integration_verified` on PostgreSQL 16
+and 17 with migration `20261013000100_import_values`, which is **not yet applied to the hosted
+Supabase project**. Counts: [docs/qa_evidence.md](docs/qa_evidence.md), "Owner decisions D1-D3".
+
 States are those of spec 32: `implemented`, `fixture_verified`, `integration_verified`,
 `live_verified`, `active`, `blocked`, `not_requested`. Here `fixture_verified` means proven on
 saved or synthetic fixtures, and `integration_verified` means proven against a real PostgreSQL
@@ -31,10 +44,10 @@ external effect is off by default.
 |---|---|---|---|
 | M0 Audit and reuse | done | docs/architecture.md, docs/dependency_inventory.md, docs/source_access_register.md, docs/decisions/0001 and 0002, docs/research/ | - |
 | M1 Domain contracts and deterministic tests | done | `src/suv_deals/domain/`; `tests/unit`, `tests/property` (price EUR 2,500-3,000 inclusive, mileage strictly under 200,000 km, unknown is never zero) | - |
-| M2 Database and reliability foundation | done | 16 forward-only migrations, RLS on every `app`/`ops` table, durable jobs with leases, idempotency, outbox, audit; `tests/integration/db`, `tests/integration/persistence_core` on PostgreSQL 16 and 17.11 | - |
+| M2 Database and reliability foundation | done | 17 forward-only migrations (the newest, `20261013000100_import_values`, not yet applied to the hosted project), RLS on every `app`/`ops` table, durable jobs with leases, idempotency, outbox, audit; `tests/integration/db`, `tests/integration/persistence_core` on PostgreSQL 16 and 17.11 | - |
 | M3 Crawl4AI integration and first source | code done, exit **blocked** | Crawl4AI 0.9.4 REST client, URL policy, robots, rate limits, parser health, scheduler; generic dealer adapter `fixture_verified` (`tests/adapters`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`) | a permitted live search/detail smoke on one real source (gates `existing_crawler`, `source_access`) |
 | M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 12 of 14 sources have no adapter; mobile.de and AutoScout24 are included by owner decision (2026-10-10) but their adapters still need real page captures; no MK evidence in any real workspace |
-| M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine 1.1, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_tax_engine_extensions.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`); the North Macedonian DRAFT rule set golden-tested (`tests/unit/test_mk_rule_draft.py`) and the import-cost calculator (`tests/unit/test_import_estimate.py`, `tests/integration/import_costs`, `tests/mcp/test_calc_tools.py`, `tests/api/test_import_cost_routes.py`, `tests/cli/test_import_cost_db_commands.py`); transport fixed at EUR 700 | the owner's review, approval and activation of a rule set (gate `tax_rules`), approval of the cost profile and the other cost assumptions (gate `cost_assumptions`) |
+| M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine 1.1, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_tax_engine_extensions.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`); the North Macedonian DRAFT rule set golden-tested (`tests/unit/test_mk_rule_draft.py`) and the import-cost calculator (`tests/unit/test_import_estimate.py`, `tests/integration/import_costs`, `tests/mcp/test_calc_tools.py`, `tests/api/test_import_cost_routes.py`, `tests/cli/test_import_cost_db_commands.py`); the owner's recorded purchase price and estimated customs value per listing (`tests/integration/import_costs/test_import_values.py`, `tests/api/test_import_values_routes.py`, `tests/integration/pipeline/test_import_tax_valuation.py`); transport fixed at EUR 700 | the owner's review, approval and activation of a rule set (gate `tax_rules`), approval of the cost profile and the other cost assumptions (gate `cost_assumptions`) |
 | M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 + 1 MCP tools (the +1 is the calculator `deals_estimate_import_costs`), scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
 | M7 Notifications and optional activation bridge | done offline; activation **blocked** | MCP Events provider and subscriptions, Slack fallback and the selected Slack seller-reply route, destination bindings, dedup, uncertainty handling (`tests/integration/pipeline/test_dispatcher.py`, `tests/integration/v11_runtime`, `tests/mcp/test_events.py`) | delivery receipts and dot's processing evidence; an operator command for destination bindings (ACTIVATION_GATES.md section 19) |
 | M7a Bounded automatic seller inquiries | `integration_verified`; activation **blocked** | U1-U12 below; `tests/integration/v11_*`, `tests/integration/mail_worker_e2e`, `desktop/outlook-bridge/tests` | the owner's classic Outlook, the activation canary (rows 4-6) and the Slack -> dot leg; no actual seller e-mail is claimed |
@@ -195,7 +208,7 @@ Still open:
 |---|---|
 | Repository location, exact final commit/build ids | `/home/user/Lokal69`; base `e5d47f4` + uncommitted D1-D3; no build id yet (docs/qa_evidence.md) |
 | Local setup commands and tested dependency versions | README.md "Quickstart", docs/dependency_inventory.md, docs/runbook.md 4 |
-| Migrations and reproducible local seed fixtures | `supabase/migrations/` (16 files), `supabase/tests/supabase_emulation.sql`, `tests/e2e/seed.py`, `tests/e2e/seed_v11.py`, `tests/adapters/fixtures/` |
+| Migrations and reproducible local seed fixtures | `supabase/migrations/` (17 files; `20261013000100` not yet applied to the hosted project), `supabase/tests/supabase_emulation.sql`, `tests/e2e/seed.py`, `tests/e2e/seed_v11.py`, `tests/adapters/fixtures/` |
 | Source registry with activation/access/parser coverage | docs/source_access_register.md, `config/sources/`, ACTIVATION_GATES.md section 4 |
 | JSON schemas and MCP tool contract exports | `schemas/tools/`, `schemas/api/` (`scripts/export_schemas.py --check`), docs/api_contract.md |
 | Dashboard and MCP URLs | none: nothing is deployed |
@@ -229,8 +242,9 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   against local PostgreSQL 16 or 17 and fakes, with every source, notification route and seller
   e-mail off.
 - **Where does it run?** Only on the development machine. Compose files and a runbook exist for a
-  VPS (gate `hosting`). The hosted Supabase project has the full schema (migrations through
-  `20261008000200`, docs/schema.md section 9) and serves nothing yet.
+  VPS (gate `hosting`). The hosted Supabase project has the schema through `20261008000200`
+  (docs/schema.md section 9) and serves nothing yet; `20261013000100_import_values` (recorded
+  import values) is not yet applied there.
 - **Which sources are truly working?** None live. The generic dealer adapter is `fixture_verified`
   on synthetic pages; 12 of 14 registered sources have no adapter; mobile.de and AutoScout24 are
   included by owner decision (2026-10-10) but stay disabled until their adapters are built from
@@ -245,8 +259,9 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   valuation is evidence-supported: no MK market evidence exists in a real workspace (so every
   valuation is `insufficient_comparables`), no approved tax rule set and no owner-approved cost
   assumptions. The import-cost calculator reproduces the North Macedonian fact sheet's worked
-  examples to the denar, but on unapproved DRAFT rules: its results are labelled indicative
-  previews, not evidence-supported figures.
+  examples to the denar (whole denars since draft.3), but on unapproved DRAFT rules: its results
+  are labelled indicative previews, not evidence-supported figures. An estimated customs value is
+  a labelled planning figure, never evidence.
 - **Can dot read the queue?** Not yet. The MCP server and its tools are complete and tested with
   the official SDK client in process, but no real dot client has connected (gate
   `mcp_authentication`). The same holds for the calculator tool `deals_estimate_import_costs`.

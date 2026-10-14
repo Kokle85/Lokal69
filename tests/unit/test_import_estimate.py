@@ -47,8 +47,10 @@ from suv_deals.domain.import_estimate import (
     estimate_from_rule_sets,
     estimate_import_costs,
     facts_from_listing,
+    plain_amount_text,
     select_estimate_rule_set,
     vehicle_age_range,
+    whole_units,
 )
 from suv_deals.domain.listings import (
     Co2Info,
@@ -60,6 +62,7 @@ from suv_deals.domain.listings import (
 )
 from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.tax_engine import (
+    MAX_INPUT_AMOUNT,
     ComponentStatus,
     OriginProofStatus,
     ReviewRecord,
@@ -74,14 +77,14 @@ from suv_deals.domain.tax_engine import (
 from suv_deals.errors import ValidationFailed
 
 REPO = Path(__file__).resolve().parents[2]
-DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.2.json"
+DRAFT = REPO / "config" / "tax_rules" / "drafts" / "mk_passenger_car_import_2026.10-draft.3.json"
 PROFILE = REPO / "config" / "cost_profiles" / "default_unapproved.yaml"
 MODULE = REPO / "src" / "suv_deals" / "domain" / "import_estimate.py"
-DRAFT_SHA256 = "a856d5e401eb87e728079be0bfe3a723311480d6cdf1f38123cf6c052603d4b7"
+DRAFT_SHA256 = "4fe7f064f46ca8b91a90c5d799aa7c3c905973f6ea9a5dadb697490d91c83752"
 AS_OF = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 DECL = date(2026, 10, 13)
 BANNER = (
-    "ИНДИКАТИВНА ПРОЦЕНКА – неодобрени нацрт-правила (mk-passenger-car-import@2026.10-draft.2). Не е "
+    "ИНДИКАТИВНА ПРОЦЕНКА – неодобрени нацрт-правила (mk-passenger-car-import@2026.10-draft.3). Не е "
     "царинска пресметка; не се користи за вреднувања ни известувања. / INDICATIVE PREVIEW – unapproved "
     "draft rules; not a customs assessment; never used for valuations or alerts."
 )
@@ -193,9 +196,7 @@ def money(amount: str, currency: str = "MKD") -> Money:
     return Money.of(amount, currency)
 
 
-def component_amount(
-    est: ImportCostEstimate, component_id: str, scenario: str = "legal_base"
-) -> Money | None:
+def component_amount(est: ImportCostEstimate, component_id: str, scenario: str = "primary") -> Money | None:
     chosen = est.scenario(scenario)  # type: ignore[arg-type]
     assert chosen is not None
     return next(c.amount for c in chosen.components if c.component_id == component_id)
@@ -207,7 +208,7 @@ def component_amount(
 @pytest.mark.parametrize(
     ("case", "kw", "total", "total_eur", "landed"),
     [
-        ("D1", {}, "168154.45", "2732.72", "6432.72"),
+        ("D1", {}, "168155", "2733", "6433"),  # EUR 2,732.73 and 6,432.73 in whole euros
         (
             "D3",
             {
@@ -215,16 +216,16 @@ def component_amount(
                 "fuel": "petrol",
                 "co2": [{"cycle": "nedc", "g_km": "245"}],
             },
-            "217629.97",
-            "3536.76",
-            "6736.76",
+            "217630",
+            "3537",
+            "6737",
         ),
         (
             "D4",
             {"price": {"amount": "2800", "currency": "EUR"}, "co2": [], "co2_document": "none_available"},
-            "466832.94",
-            "7586.62",
-            "11086.62",
+            "466832",
+            "7587",
+            "11087",
         ),
         (
             "D5",
@@ -233,9 +234,9 @@ def component_amount(
                 "transport_after_entry_eur": "150",
                 "transport_after_entry_separately_invoiced": True,
             },
-            "129094.68",
-            "2097.95",
-            "5797.95",
+            "129094",
+            "2098",
+            "5798",
         ),
     ],
 )
@@ -244,8 +245,9 @@ def test_fact_sheet_examples_as_indicative_preview(
 ) -> None:
     est = estimate(facts(**kw))
     assert est.mode == "indicative_preview" and not est.production_ready, case
-    base = est.scenario("legal_base")
+    base = est.scenario("primary")
     assert base is not None and base.complete, (case, base and base.unknown_components)
+    assert base.customs_value_kind == "transaction_value"
     assert base.indicative_total == money(total), case
     assert base.indicative_total_eur == money(total_eur, "EUR"), case
     assert base.indicative_landed_cost_eur == money(landed, "EUR"), case
@@ -256,47 +258,72 @@ def test_fact_sheet_examples_as_indicative_preview(
 def test_d2_eu_proof_and_the_standard_duty_alternative() -> None:
     est = estimate(facts(origin_proof={"kind": "eu", "country": "DE", "evidence_ref": "eur1-scan-1"}))
     base, rejected = est.scenarios[0], est.scenario("standard_duty_if_proof_rejected")
-    assert base.name == "legal_base" and rejected is not None
-    assert base.indicative_total == money("154721.64")
-    assert base.indicative_total_eur == money("2514.42", "EUR")
-    assert base.indicative_landed_cost_eur == money("6214.42", "EUR")
-    assert rejected.indicative_total == money("168154.45")  # D1: the 5 % alternative
-    assert component_amount(est, "duty_preferential_eu") == money("0.00")
-    assert component_amount(est, "duty_standard", "standard_duty_if_proof_rejected") == money("11383.73")
+    assert base.name == "primary" and rejected is not None
+    assert base.indicative_total == money("154722")
+    assert base.indicative_total_eur == money("2514", "EUR")  # 2,514.43
+    assert base.indicative_landed_cost_eur == money("6214", "EUR")  # 6,214.43
+    assert rejected.indicative_total == money("168155")  # D1: the 5 % alternative
+    assert component_amount(est, "duty_preferential_eu") == money("0")
+    assert component_amount(est, "duty_standard", "standard_duty_if_proof_rejected") == money("11384")
     assert any(a.startswith("ORIGIN_PROOF_ASSUMED_ACCEPTED_BY_CUSTOMS:eu:DE") for a in est.assumptions)
     assert rejected.assumptions[0].startswith("NO_ORIGIN_PROOF_STANDARD_DUTY")
 
 
-def test_d6_customs_revaluation_risk_scenario() -> None:
-    est = estimate(facts(catalogue_value_eur="6000"))
-    risk = est.scenario("customs_revaluation_risk")
-    assert risk is not None and risk.complete
-    assert risk.customs_value == money("6700.00", "EUR")
-    assert (risk.customs_value_basis or "").startswith(
-        "RISK SCENARIO - customs revaluation (SchwackeNet), not the legal value: catalogue value 6000.00 EUR"
+def test_d6_estimated_customs_value_carries_the_charges_and_the_price_paid_the_landed_cost() -> None:
+    """Fact sheet D6 under the owner decision of 2026-10-13: a car bought for EUR 3,000 whose
+    catalogue (SchwackeNet) value is EUR 6,000. The primary charges follow the estimate; every
+    landed cost uses the price actually paid; the transaction value is the alternative."""
+    est = estimate(
+        facts(estimated_customs_value_eur="6000", estimated_customs_value_source="SchwackeNet catalogue")
     )
-    assert risk.indicative_total == money("212274.11")
-    assert risk.indicative_total_eur == money("3449.72", "EUR")
-    # The buyer still pays the EUR 3,000 price; only the charges follow the catalogue value.
-    assert risk.indicative_landed_cost_eur == money("7149.72", "EUR")
-    assert any("UNCERTAIN - confirm whether Customs adds transport" in a for a in risk.assumptions)
-    assert est.scenarios[0].indicative_total == money("168154.45")  # the legal base is unchanged
+    assert [s.name for s in est.scenarios] == ["primary", "transaction_value"]
+    primary, alternative = est.scenarios
+    assert primary.customs_value_kind == "estimated" and primary.complete
+    assert primary.customs_value == money("6700.00", "EUR")
+    assert (primary.customs_value_basis or "").startswith(
+        "ESTIMATED customs value (SchwackeNet catalogue) 6000 EUR + чл. 35(1)(д) transport to MK place "
+        "of entry 700 EUR (UNCERTAIN whether Customs adds it)"
+    )
+    assert primary.indicative_total == money("212274")
+    assert primary.indicative_total_eur == money("3450", "EUR")  # 3,449.72
+    # The buyer pays EUR 3,000, never the catalogue value: 3,000 + 700 + 3,449.72.
+    assert primary.indicative_landed_cost_eur == money("7150", "EUR")
+    assert primary.assumptions[0].startswith("ESTIMATED_CUSTOMS_VALUE_USED:SchwackeNet catalogue:")
+    assert any("UNCERTAIN - confirm whether Customs adds the transport" in a for a in primary.assumptions)
+    assert alternative.customs_value_kind == "transaction_value"
+    assert alternative.customs_value == money("3700.00", "EUR")
+    assert alternative.indicative_total == money("168155")  # D1: Customs accepts the price paid
+    assert alternative.indicative_landed_cost_eur == money("6433", "EUR")
+    assert alternative.assumptions[0].startswith("TRANSACTION_VALUE_ALTERNATIVE:")
+    assert est.purchase_price.amount == money("3000", "EUR") and est.purchase_price.basis == "invoice"
+    duties = est.customs_value_for_duties
+    assert (duties.amount, duties.basis, duties.source) == (
+        money("6700", "EUR"),
+        "estimated",
+        "SchwackeNet catalogue",
+    )
+    assert any(w.startswith("TRANSACTION_VALUE_ALTERNATIVE:") for w in est.warnings)
+    assert not any(w.startswith("ESTIMATED_CUSTOMS_VALUE_BELOW_PRICE") for w in est.warnings)
     assert est.scenario("standard_duty_if_proof_rejected") is None  # no proof claimed
+    assert (
+        "customs_value: estimated customs value (SchwackeNet catalogue), not a Customs assessment or the "
+        "price paid"
+    ) in est.unverified_inputs
 
 
 def test_cycle_choice_wltp_over_nedc_from_the_coc() -> None:
     est = estimate(
         facts(fuel="petrol", co2=[{"cycle": "nedc", "g_km": "130"}, {"cycle": "wltp", "g_km": "155"}])
     )
-    assert est.scenarios[0].indicative_total == money("73618.75")  # G07
-    assert component_amount(est, "dmv_co2_petrol") == money("16275.00")
+    assert est.scenarios[0].indicative_total == money("73619")  # G07
+    assert component_amount(est, "dmv_co2_petrol") == money("16275")
     assert any(w.startswith("CO2_CYCLE_SELECTED:wltp") for w in est.warnings)
 
 
 def test_plugin_hybrid_with_an_attested_hs_code() -> None:
     est = estimate(facts(fuel="plugin_hybrid", hs_code="8703 60", co2=[{"cycle": "nedc", "g_km": "50"}]))
-    assert est.scenarios[0].indicative_total == money("54650.25")  # G12
-    assert component_amount(est, "dmv_plugin_hybrid_half") == money("200.00")
+    assert est.scenarios[0].indicative_total == money("54651")  # G12
+    assert component_amount(est, "dmv_plugin_hybrid_half") == money("200")
     assert any(a.startswith("HS_CODE_FROM_CALLER:870360") for a in est.assumptions)
 
 
@@ -304,7 +331,7 @@ def test_plugin_hybrid_without_hs_code_is_unknown_not_zero() -> None:
     est = estimate(facts(fuel="plugin_hybrid", co2=[{"cycle": "nedc", "g_km": "50"}]))
     base = est.scenarios[0]
     assert not base.complete and base.indicative_total is None
-    assert base.known_subtotal == money("11383.73")  # the duty only
+    assert base.known_subtotal == money("11384")  # the duty only
     assert "hs_code" in est.missing_facts and "classification" in est.missing_inputs
     assert any(w.startswith("PHEV_HS_CODE_REQUIRED") for w in est.warnings)
     categories = {c.category: c for c in base.categories}
@@ -316,7 +343,7 @@ def test_plugin_hybrid_without_hs_code_is_unknown_not_zero() -> None:
 def test_battery_electric_pays_no_motor_vehicle_tax() -> None:
     est = estimate(facts(fuel="electric", co2=[], co2_document=None))
     base = est.scenarios[0]
-    assert base.indicative_total == money("54414.25")  # G13
+    assert base.indicative_total == money("54415")  # G13
     categories = {c.category: c for c in base.categories}
     assert categories[CostCategory.MOTOR_VEHICLE_TAX].amount == money("0")
     assert categories[CostCategory.MOTOR_VEHICLE_TAX].status == ComponentStatus.RESOLVED
@@ -326,9 +353,13 @@ def test_battery_electric_pays_no_motor_vehicle_tax() -> None:
 def test_price_in_mkd_uses_the_customs_rate_for_the_transport() -> None:
     est = estimate(facts(price={"amount": "184601.10", "currency": "MKD"}))  # EUR 3,000 at 61.5337
     base = est.scenarios[0]
-    assert base.customs_value == money("227674.69")  # 184,601.10 + 700 x 61.5337
-    assert base.indicative_total == money("168154.45")
-    assert base.indicative_landed_cost_eur == money("6432.72", "EUR")
+    assert base.customs_value == money("227674.69")  # 184,601.10 + 700 x 61.5337 (the input)
+    assert component_amount(est, "customs_value_mkd") == money("227675")  # assessed in whole denars
+    assert base.indicative_total == money("168155")
+    assert base.indicative_landed_cost_eur == money("6433", "EUR")
+    assert est.purchase_price.amount == money("3000", "EUR")  # 184,601.10 / 61.5337, whole euros
+    assert est.customs_value_for_duties.amount == money("3700", "EUR")
+    assert est.customs_value_for_duties.basis == "transaction_value"
 
 
 def test_chf_price_leaves_the_customs_value_unknown() -> None:
@@ -342,7 +373,7 @@ def test_chf_price_leaves_the_customs_value_unknown() -> None:
     assert est.missing_facts == ("price_in_eur_or_mkd",)
     assert any(w.startswith("CUSTOMS_VALUE_CHF_UNSUPPORTED") for w in est.warnings)
     assert any(w.startswith("CUSTOMS_VALUE_CHF_UNSUPPORTED") for w in est.warnings)
-    assert component_amount(est, "dmv_co2_diesel") == money("96390.00")  # nothing else is guessed
+    assert component_amount(est, "dmv_co2_diesel") == money("96390")  # nothing else is guessed
 
 
 def test_missing_customs_rate_keeps_every_conversion_unknown() -> None:
@@ -367,7 +398,7 @@ def test_euro_3_is_not_importable_but_the_charges_are_still_estimated() -> None:
     assert est.gates.importable == "no" and est.gates.euro_class == 3 and est.gates.min_euro == 4
     assert "UNCERTAIN - confirm" in est.gates.legal_basis
     assert any(w.startswith("EURO_CLASS_BELOW_MINIMUM") for w in est.warnings)
-    assert est.scenarios[0].indicative_total == money("168154.45")
+    assert est.scenarios[0].indicative_total == money("168155")
 
 
 def test_euro_gate_minimum_is_a_policy_setting() -> None:
@@ -408,7 +439,7 @@ def test_preview_is_labelled_on_every_field() -> None:
     assert est.rule is not None
     assert (est.rule.rule_set_id, est.rule.version, est.rule.status) == (
         "mk-passenger-car-import",
-        "2026.10-draft.2",
+        "2026.10-draft.3",
         TaxRuleStatus.DRAFT,
     )
     assert est.rule.content_sha256 == DRAFT_SHA256 and not est.rule.sha256_recorded
@@ -447,15 +478,16 @@ def test_uncertain_items_list_every_marked_component_applicable_first() -> None:
         "dmv_co2_phev_diesel",
         "dmv_co2_deemed_phev_petrol",
         "dmv_co2_deemed_phev_diesel",
-        "vat_base_mkd",
     }
     applying = [i.component_id for i in components if i.applies]
-    assert applying == ["dmv_value_part", "dmv_co2_diesel", "vat_base_mkd"]
+    assert applying == ["dmv_value_part", "dmv_co2_diesel"]
     assert [i.applies for i in components] == sorted((i.applies for i in components), reverse=True)
     assert all("UNCERTAIN" in i.text for i in est.uncertain_items)
     rule_level = [i.text for i in est.uncertain_items if i.source == "rule_set"]
     assert est.uncertain_items[0].source == "rule_set"
-    assert any(t.startswith("UNCERTAIN - confirm: rounding") for t in rule_level)
+    assert any(t.startswith("UNCERTAIN - confirm: СКД") for t in rule_level)
+    # Resolved by the owner on 2026-10-13 (ДМВ in the VAT base, whole-denar rounding): not listed.
+    assert not any("rounding" in t or "VAT base" in t for t in rule_level)
     assert any("customs processing fees (none found, UNCERTAIN)" in t for t in rule_level)
     proof = estimate(facts(origin_proof={"kind": "us"}))
     assert "duty_us_origin" in {i.component_id for i in proof.uncertain_items if i.applies}
@@ -576,8 +608,8 @@ def test_active_rule_set_is_used_and_preview_is_only_the_fallback() -> None:
     assert est.rule is not None and est.rule.status == TaxRuleStatus.ACTIVE and est.rule.sha256_recorded
     base = est.scenarios[0]
     assert base.production_ready and base.complete
-    assert base.total == money("168154.45") and base.total_eur == money("2732.72", "EUR")
-    assert base.landed_cost_eur == money("6432.72", "EUR")
+    assert base.total == money("168155") and base.total_eur == money("2733", "EUR")
+    assert base.landed_cost_eur == money("6433", "EUR")
     assert base.indicative_total is None and base.indicative_landed_cost_eur is None
     assert "RULE_SET_NOT_ACTIVE" not in " ".join(base.warnings)
     data = est.model_dump()
@@ -633,14 +665,14 @@ def test_select_estimate_rule_set_merges_what_was_considered() -> None:
 # --------------------------------------------------------------------------- builder table
 
 
-def test_builder_legal_base_inputs() -> None:
+def test_builder_primary_inputs() -> None:
     built = build()
     inputs = built.inputs
     assert inputs.jurisdiction == "MK" and inputs.declaration_date == DECL
     assert inputs.customs_value == money("3700.00", "EUR")
     assert inputs.customs_value_basis == (
-        "Царински закон чл. 28: invoice 3000.00 EUR + чл. 35(1)(д) transport to MK place of entry 700.00 EUR "
-        "(transport line 700.00 EUR; separately invoiced inland leg 0.00 EUR)"
+        "Царински закон чл. 28: invoice 3000 EUR + чл. 35(1)(д) transport to MK place of entry 700 EUR "
+        "(transport line 700 EUR; separately invoiced inland leg 0 EUR)"
     )
     assert inputs.included_costs is not None and len(inputs.included_costs) == 1
     entry = inputs.included_costs[0]
@@ -666,10 +698,13 @@ def test_builder_legal_base_inputs() -> None:
     assert inputs.vehicle_condition == "used"
     assert inputs.emissions_class == "Euro 5"
     assert inputs.exemptions == ()
-    assert [s.name for s in built.scenarios] == ["legal_base"]
+    assert [s.name for s in built.scenarios] == ["primary"]
+    assert built.scenarios[0].customs_value_kind == "transaction_value"
+    assert built.purchase_price.amount == money("3000", "EUR") and built.purchase_price.basis == "invoice"
+    assert built.customs_value_for_duties.amount == money("3700.00", "EUR")
     assert built.transport == money("700.00", "EUR") and built.price_eur == money("3000", "EUR")
     assert any(a.startswith("NO_ORIGIN_PROOF_STANDARD_DUTY") for a in built.assumptions)
-    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700.00 EUR") for a in built.assumptions)
+    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700 EUR") for a in built.assumptions)
     assert any(
         a.startswith("CUSTOMS_FX_MONTHLY_LIST_VALIDITY:2026-10-01..2026-10-31") for a in built.assumptions
     )
@@ -731,7 +766,7 @@ def test_separately_invoiced_inland_leg_goes_to_the_vat_base_only() -> None:
     assert built.inputs.vat_incidental_costs is not None and len(built.inputs.vat_incidental_costs) == 1
     leg = built.inputs.vat_incidental_costs[0]
     assert leg.amount == money("150", "EUR") and leg.legal_basis == "ЗДДВ чл. 21(2)(2)"
-    assert any(a.startswith("TRANSPORT_SPLIT:550.00 EUR") for a in built.assumptions)
+    assert any(a.startswith("TRANSPORT_SPLIT:550 EUR") for a in built.assumptions)
     with pytest.raises(ValidationFailed, match="exceeds the transport line"):
         build(facts(transport_after_entry_eur="700.01", transport_after_entry_separately_invoiced=True))
 
@@ -753,7 +788,7 @@ def test_declaration_date_defaults_to_as_of_with_a_warning() -> None:
 def test_advertised_price_is_labelled() -> None:
     built = build(facts(price_basis="advertised"))
     assert any(a.startswith("ADVERTISED_PRICE_AS_TRANSACTION_VALUE") for a in built.assumptions)
-    assert "advertised price 3000.00 EUR" in (built.inputs.customs_value_basis or "")
+    assert "advertised price 3000 EUR" in (built.inputs.customs_value_basis or "")
 
 
 def test_missing_price() -> None:
@@ -806,7 +841,7 @@ def test_claimed_origin_proofs(claim: dict[str, str], country: str, duty_compone
     assert proof is not None and proof.acceptance_status == OriginProofStatus.ACCEPTED
     assert proof.origin_country == country and proof.preferential is True
     assert proof.evidence_ids == ("caller_attestation:origin_proof",)
-    assert [s.name for s in built.scenarios] == ["legal_base", "standard_duty_if_proof_rejected"]
+    assert [s.name for s in built.scenarios] == ["primary", "standard_duty_if_proof_rejected"]
     rejected = built.scenario("standard_duty_if_proof_rejected")
     assert rejected is not None and rejected.inputs.origin_proof is not None
     assert rejected.inputs.origin_proof.acceptance_status == OriginProofStatus.NOT_AVAILABLE
@@ -823,7 +858,7 @@ def test_unknown_origin_proof_leaves_the_duty_unknown() -> None:
     assert est.scenarios[0].indicative_total is None
     assert "origin_proof" in est.missing_facts
     assert any(w.startswith("ORIGIN_PROOF_UNKNOWN") for w in est.warnings)
-    assert [s.name for s in est.scenarios] == ["legal_base"]
+    assert [s.name for s in est.scenarios] == ["primary"]
 
 
 @pytest.mark.parametrize(
@@ -919,7 +954,7 @@ def test_vehicle_age_only_when_unambiguous() -> None:
 def test_possible_oldtimer_is_warned_never_applied() -> None:
     old = estimate(facts(first_registration={"value": "1990", "precision": "year"}))
     assert any(w.startswith("POSSIBLE_OLDTIMER_EXEMPTION_NOT_APPLIED") for w in old.warnings)
-    assert old.scenarios[0].indicative_total == money("168154.45")  # no exemption is applied
+    assert old.scenarios[0].indicative_total == money("168155")  # no exemption is applied
     young = build(facts(first_registration={"value": "1992-01-01", "precision": "day"}))
     assert not any(w.startswith("POSSIBLE_OLDTIMER") for w in young.warnings)
     stricter = build(facts(), policy=EstimatePolicy(oldtimer_min_age_years=14))
@@ -936,7 +971,7 @@ def test_used_condition_follows_the_pipeline_mileage_convention() -> None:
 def test_importer_status_is_presentation_only() -> None:
     dealer = estimate(facts(importer_status="vat_dealer"))
     assert dealer.notes[0].startswith("IMPORT_VAT_DEDUCTIBLE_ONLY_FOR_TRADING")
-    assert dealer.scenarios[0].indicative_total == money("168154.45")
+    assert dealer.scenarios[0].indicative_total == money("168155")
     private = build(facts(importer_status="private"))
     assert private.notes[0].startswith("IMPORT_VAT_IS_A_FINAL_COST")
     assert private.inputs.importer_status == "private"
@@ -987,7 +1022,7 @@ def test_facts_from_listing() -> None:
     assert listed.co2 == (Co2Reading(cycle=Co2Cycle.NEDC, g_km=Decimal(189)),)
     assert listed.origin_proof.kind == "none" and listed.seller_country == "DE"
     est = estimate(listed)
-    assert est.scenarios[0].indicative_total == money("168154.45")
+    assert est.scenarios[0].indicative_total == money("168155")
     assert any(a.startswith("ADVERTISED_PRICE_AS_TRANSACTION_VALUE") for a in est.assumptions)
     assert any(w.startswith("CO2_NOT_FROM_ART12_DOCUMENT") for w in est.warnings)
     no_co2 = _listing().model_copy(update={"co2": Co2Info()})
@@ -1032,7 +1067,7 @@ def test_co2_under_one_gram_for_a_combustion_car_is_not_established(
     fuel: str, cycle: str, document: str, figure: str
 ) -> None:
     """Regression: CO2 0 g/km for a combustion car hit the Table 2 [0,1) row (coefficient 0), so
-    the ДМВ CO2 part came out 0 and the result was complete (54,414.25 instead of 168,154.45)."""
+    the ДМВ CO2 part came out 0 and the result was complete (54,415 instead of 168,155 MKD)."""
     hs = {"hs_code": "870360"} if fuel == "plugin_hybrid" else {}
     est = estimate(facts(fuel=fuel, co2=[{"cycle": cycle, "g_km": figure}], co2_document=document, **hs))
     base = est.scenarios[0]
@@ -1052,7 +1087,7 @@ def test_co2_zero_stays_a_fact_for_an_electric_car_and_one_gram_for_any_car() ->
     one = estimate(facts(co2=[{"cycle": "wltp", "g_km": "1"}]))
     assert one.scenarios[0].complete and "co2" not in one.missing_facts
     deemed = estimate(facts(co2=[{"cycle": "nedc", "g_km": "0"}], co2_document="none_available"))
-    assert deemed.scenarios[0].indicative_total == money("469774.25")  # the deemed 400 g/km applies
+    assert deemed.scenarios[0].indicative_total == money("469775")  # the deemed 400 g/km applies
 
 
 def test_listing_co2_under_one_gram_for_a_combustion_car_is_no_fact() -> None:
@@ -1086,8 +1121,8 @@ def test_listing_co2_with_an_extreme_exponent_is_no_fact() -> None:
 @pytest.mark.parametrize(
     ("hs", "deemed", "amount", "dmv", "total"),
     [
-        ("870360", "dmv_co2_deemed_phev_petrol", "278000.00", "139000.00", "218434.25"),
-        ("870370", "dmv_co2_deemed_phev_diesel", "352000.00", "176000.00", "262094.25"),
+        ("870360", "dmv_co2_deemed_phev_petrol", "278000", "139000", "218435"),
+        ("870370", "dmv_co2_deemed_phev_diesel", "352000", "176000", "262095"),
     ],
 )
 def test_plugin_hybrid_without_a_co2_document_gets_the_deemed_400_g_km_halved(
@@ -1100,9 +1135,9 @@ def test_plugin_hybrid_without_a_co2_document_gets_the_deemed_400_g_km_halved(
     base = est.scenarios[0]
     assert base.complete, base.unknown_components
     assert component_amount(est, deemed) == money(amount)
-    assert component_amount(est, "dmv_value_part") == money("0.00")
+    assert component_amount(est, "dmv_value_part") == money("0")
     assert component_amount(est, "dmv_plugin_hybrid_half") == money(dmv)
-    # VAT 18 % of customs value 227,674.69 + duty 11,383.73 + ДМВ; total = duty + ДМВ + VAT.
+    # VAT 18 % of customs value 227,675 + duty 11,384 + ДМВ (whole denars); total = duty + ДМВ + VAT.
     assert base.indicative_total == money(total)
     assert est.missing_facts == ()
     assert any("applied only where the rule set models it" in w for w in est.warnings)
@@ -1216,3 +1251,277 @@ def test_a_previous_month_customs_rate_is_named_missing_and_never_shown_as_used(
     assert "customs_fx_rate" in active.missing_facts and active.customs_fx_rate is None
     current = estimate()
     assert current.customs_fx_rate == rate() and "customs_fx_rate" not in current.missing_facts
+
+
+# --------------------------------------------------------------------------- two values, whole units
+# Owner decisions of 2026-10-13: the REAL purchase price (profit, landed cost) and the ESTIMATED
+# customs value (the import charges) are separate values; amounts are shown without decimals.
+# Expected MKD totals come from an independent exact-fraction evaluation of the fact sheet's
+# section 7 formulas (customs value -> duty 5 % -> ДМВ value part 0 % under EUR 10,000 + CO2 part
+# 189 x 510 -> VAT 18 % of customs value + duty + ДМВ, every step in whole denars).
+
+SCHWACKE = "SchwackeNet catalogue"
+
+
+def owner_example(**kw: Any) -> VehicleImportFacts:
+    """The owner's example: bought for EUR 2,800 while the catalogue says EUR 4,200 (D1 car)."""
+    data: dict[str, Any] = {
+        "price": {"amount": "2800", "currency": "EUR"},
+        "estimated_customs_value_eur": "4200",
+        "estimated_customs_value_source": SCHWACKE,
+    }
+    data.update(kw)
+    return facts(**data)
+
+
+def test_the_owner_example_charges_follow_the_estimate_and_the_profit_the_price_paid() -> None:
+    est = estimate(owner_example())
+    primary = est.scenario("primary")
+    alternative = est.scenario("transaction_value")
+    assert primary is not None and alternative is not None and est.scenarios[0] is primary
+    # Duties on the estimated customs value 4,200 + 700 = EUR 4,900 = 301,515 MKD.
+    assert primary.customs_value == money("4900.00", "EUR") and primary.customs_value_kind == "estimated"
+    assert component_amount(est, "customs_value_mkd") == money("301515")
+    assert component_amount(est, "duty_standard") == money("15076")
+    assert component_amount(est, "dmv_full") == money("96390")
+    assert component_amount(est, "vat_import") == money("74337")
+    assert primary.indicative_total == money("185803")
+    assert primary.indicative_total_eur == money("3020", "EUR")  # 3,019.53
+    # Landed cost on the price actually paid: 2,800 + 700 + 3,019.53 = 6,519.53.
+    assert primary.indicative_landed_cost_eur == money("6520", "EUR")
+    # Customs accepts the invoice (Царински закон чл. 28): 2,800 + 700 = EUR 3,500 = 215,368 MKD.
+    assert alternative.customs_value == money("3500", "EUR")
+    assert component_amount(est, "duty_standard", "transaction_value") == money("10768")
+    assert alternative.indicative_total == money("165213")
+    assert alternative.indicative_total_eur == money("2685", "EUR")  # 2,684.92
+    assert alternative.indicative_landed_cost_eur == money("6185", "EUR")  # 6,184.92
+    assert est.purchase_price.amount == money("2800", "EUR")
+    assert est.customs_value_for_duties.amount == money("4900", "EUR")
+    assert any(a.startswith(f"ESTIMATED_CUSTOMS_VALUE_USED:{SCHWACKE}:") for a in est.assumptions)
+    assert any(
+        a.startswith("ESTIMATED_CUSTOMS_VALUE_TRANSPORT_ADDED: UNCERTAIN - confirm") for a in est.assumptions
+    )
+
+
+def test_the_customs_value_component_label_names_no_single_basis() -> None:
+    """Regression: the ``customs_value_mkd`` label said "invoice + transport" while the primary
+    scenario's customs value was the ESTIMATED customs value (owner decision 2026-10-13). The label
+    reaches every surface unchanged, so it must fit both bases."""
+    est = estimate(owner_example())
+    for name in ("primary", "transaction_value"):
+        scenario = est.scenario(name)
+        assert scenario is not None
+        label = next(c.label for c in scenario.components if c.component_id == "customs_value_mkd")
+        assert "invoice" not in label.lower()
+        assert "transaction value or estimated customs value" in label
+        assert "transport to the MK place of entry" in label
+    assert est.scenario("primary") is not None and est.scenarios[0].customs_value_kind == "estimated"
+
+
+def test_the_transaction_value_alternative_exists_only_with_an_estimate() -> None:
+    assert [s.name for s in estimate().scenarios] == ["primary"]
+    assert estimate().customs_value_for_duties.basis == "transaction_value"
+    assert not any(w.startswith("TRANSACTION_VALUE_ALTERNATIVE") for w in estimate().warnings)
+    proof = {"kind": "eu", "country": "DE"}
+    with_all = estimate(owner_example(origin_proof=proof))
+    assert [s.name for s in with_all.scenarios] == [
+        "primary",
+        "standard_duty_if_proof_rejected",
+        "transaction_value",
+    ]
+    rejected = with_all.scenario("standard_duty_if_proof_rejected")
+    assert rejected is not None and rejected.customs_value == money("4900.00", "EUR")  # the primary's
+    assert rejected.customs_value_kind == "estimated"
+    assert rejected.assumptions[0].startswith("NO_ORIGIN_PROOF_STANDARD_DUTY")
+    assert any(a.startswith("ESTIMATED_CUSTOMS_VALUE_USED") for a in rejected.assumptions)
+    built = build(owner_example(origin_proof=proof))
+    assert built.inputs == built.scenarios[0].inputs  # the primary inputs (what valuations use)
+    assert built.inputs.customs_value == money("4900", "EUR")
+
+
+@pytest.mark.parametrize(
+    ("estimate_eur", "below"),
+    [("2500", True), ("4200", False), ("3000", False)],
+)
+def test_an_estimate_below_or_above_the_price_both_work(estimate_eur: str, below: bool) -> None:
+    est = estimate(
+        owner_example(price={"amount": "3000", "currency": "EUR"}, estimated_customs_value_eur=estimate_eur)
+    )
+    primary = est.scenario("primary")
+    assert primary is not None and primary.complete
+    assert primary.customs_value == money(str(Decimal(estimate_eur) + 700), "EUR")
+    assert est.purchase_price.amount == money("3000", "EUR")
+    flagged = any(w.startswith("ESTIMATED_CUSTOMS_VALUE_BELOW_PRICE:") for w in est.warnings)
+    assert flagged is below
+    if estimate_eur == "2500":
+        # 2,500 + 700 = EUR 3,200 -> 160,801 MKD; landed 3,000 + 700 + 2,613.22.
+        assert primary.indicative_total == money("160801")
+        assert primary.indicative_landed_cost_eur == money("6313", "EUR")
+    if estimate_eur == "3000":  # the same value as the price: the same charges as the alternative
+        alternative = est.scenario("transaction_value")
+        assert alternative is not None and alternative.indicative_total == primary.indicative_total
+
+
+def test_eur_amounts_round_half_up_to_whole_euros() -> None:
+    assert whole_units(money("2800.50", "EUR")) == money("2801", "EUR")  # never banker's 2800
+    assert whole_units(money("2800.49", "EUR")) == money("2800", "EUR")
+    assert whole_units(money("0.5", "EUR")) == money("1", "EUR")
+    assert whole_units(money("2732.7302", "EUR")) == money("2733", "EUR")
+    assert whole_units(money("227674.5")).amount == Decimal(227675)
+    est = estimate(
+        owner_example(price={"amount": "2800.50", "currency": "EUR"}, estimated_customs_value_eur="4200.50")
+    )
+    assert est.purchase_price.amount == money("2801", "EUR")
+    assert est.customs_value_for_duties.amount == money("4901", "EUR")  # 4,900.50
+    primary = est.scenario("primary")
+    assert primary is not None and primary.customs_value == money("4900.50", "EUR")  # the exact input
+    for scenario in est.scenarios:
+        for value in (scenario.indicative_total_eur, scenario.indicative_landed_cost_eur):
+            assert value is not None and value.amount == value.amount.to_integral_value()
+        for row in scenario.categories:
+            assert (
+                row.amount_eur is None or row.amount_eur.amount == row.amount_eur.amount.to_integral_value()
+            )
+    # The landed cost is summed exactly and rounded once: 2,800.50 + 700 + EUR charges.
+    total_eur = Decimal(185803) / Decimal("61.5337")
+    expected = (Decimal("2800.50") + 700 + total_eur).quantize(Decimal(1))
+    assert primary.indicative_landed_cost_eur == money(str(expected), "EUR")
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"estimated_customs_value_source": None}, "go together"),
+        ({"estimated_customs_value_eur": None}, "go together"),
+        ({"estimated_customs_value_eur": "0"}, "greater than 0"),
+        ({"estimated_customs_value_eur": "-1"}, "greater than 0"),
+        ({"estimated_customs_value_eur": "4200.001"}, "decimal places"),
+        ({"estimated_customs_value_eur": str(MAX_INPUT_AMOUNT + 1)}, "less than or equal"),
+        ({"estimated_customs_value_source": "ab"}, "at least 3"),
+        ({"estimated_customs_value_source": "   ab   "}, "at least 3"),
+        ({"estimated_customs_value_source": "x" * 121}, "at most 120"),
+        ({"estimated_customs_value_source": "Schwacke\nNet"}, "control"),
+        ({"estimated_customs_value_source": "Schwacke\u202eNet"}, "control"),
+        ({"estimated_customs_value_eur": 4200.0}, "binary float"),
+    ],
+)
+def test_an_estimate_needs_its_source_and_stays_within_bounds(changes: dict[str, Any], message: str) -> None:
+    data: dict[str, Any] = {
+        "estimated_customs_value_eur": "4200",
+        "estimated_customs_value_source": SCHWACKE,
+        **changes,
+    }
+    with pytest.raises(ValidationError, match=message):
+        VehicleImportFacts.model_validate({k: v for k, v in data.items() if v is not None})
+
+
+def test_a_source_is_trimmed_and_the_upper_bound_is_accepted() -> None:
+    f = VehicleImportFacts.model_validate(
+        {
+            "estimated_customs_value_eur": str(MAX_INPUT_AMOUNT),
+            "estimated_customs_value_source": "  owner estimate  ",
+        }
+    )
+    assert f.estimated_customs_value_source == "owner estimate"
+    # Estimate + transport over the engine's input bound: unknown (with the reason), never a crash.
+    built = build(
+        facts(estimated_customs_value_eur=str(MAX_INPUT_AMOUNT), estimated_customs_value_source="owner")
+    )
+    assert built.inputs.customs_value is None
+    assert any(w.startswith("CUSTOMS_VALUE_OUT_OF_BOUNDS") for w in built.warnings)
+    assert built.customs_value_for_duties.amount is None
+    assert (
+        built.customs_value_for_duties.reason is not None and "bound" in built.customs_value_for_duties.reason
+    )
+    # The same for a price at the bound (the transaction value).
+    priced = build(facts(price={"amount": str(MAX_INPUT_AMOUNT), "currency": "EUR"}))
+    assert priced.inputs.customs_value is None and priced.price_eur == money(str(MAX_INPUT_AMOUNT), "EUR")
+    assert any(w.startswith("CUSTOMS_VALUE_OUT_OF_BOUNDS") for w in priced.warnings)
+
+
+def test_an_estimate_without_a_price_or_transport_stays_honest() -> None:
+    no_price = estimate(owner_example(price=None))
+    primary = no_price.scenario("primary")
+    assert primary is not None and primary.complete and primary.indicative_total == money("185803")
+    assert primary.indicative_landed_cost_eur is None  # no price: no landed cost, never a guess
+    assert "price" in no_price.missing_facts
+    assert no_price.purchase_price.amount is None and no_price.purchase_price.basis is None
+    assert no_price.purchase_price.reason == "purchase price unknown"
+    assert any(w.startswith("PRICE_MISSING: real purchase price unknown") for w in no_price.warnings)
+    alternative = no_price.scenario("transaction_value")
+    assert alternative is not None and alternative.customs_value is None and not alternative.complete
+    unknown_line = CostLine(
+        category=CostCategory.TRANSPORT, label="t", status=CostLineStatus.UNKNOWN, currency="EUR"
+    )
+    no_transport = estimate(owner_example(), transport=unknown_line)
+    assert no_transport.customs_value_for_duties.amount is None
+    assert no_transport.customs_value_for_duties.reason == "transport to the MK place of entry unknown"
+    assert no_transport.scenarios[0].customs_value is None and "transport" in no_transport.missing_facts
+
+
+def test_an_mkd_price_with_an_estimate_keeps_the_estimate_in_eur() -> None:
+    est = estimate(owner_example(price={"amount": "172294.36", "currency": "MKD"}))  # EUR 2,800
+    primary = est.scenario("primary")
+    assert primary is not None and primary.customs_value == money("4900.00", "EUR")
+    assert primary.indicative_total == money("185803")
+    assert est.purchase_price.amount == money("2800", "EUR")
+    alternative = est.scenario("transaction_value")
+    assert alternative is not None and alternative.customs_value is not None
+    assert alternative.customs_value.currency == "MKD"  # 172,294.36 + 700 x 61.5337
+
+
+@pytest.mark.parametrize(
+    ("basis", "code", "unverified"),
+    [
+        ("recorded_actual", None, None),
+        ("recorded_quote", "RECORDED_QUOTE_AS_TRANSACTION_VALUE", "price: recorded quote"),
+        ("recorded_estimate", "RECORDED_ESTIMATE_AS_TRANSACTION_VALUE", "price: recorded estimate"),
+        ("advertised", "ADVERTISED_PRICE_AS_TRANSACTION_VALUE", "price: advertised price"),
+        ("invoice", None, None),
+    ],
+)
+def test_recorded_purchase_price_bases_are_labelled(
+    basis: str, code: str | None, unverified: str | None
+) -> None:
+    est = estimate(facts(price_basis=basis))
+    assert est.purchase_price.basis == basis and est.purchase_price.amount == money("3000", "EUR")
+    assert any(a.startswith(f"{code}:") for a in est.assumptions) is (code is not None)
+    claims = [u for u in est.unverified_inputs if u.startswith("price:")]
+    assert claims[0].startswith(unverified) if unverified else claims == []
+    assert est.scenarios[0].indicative_total == money("168155")  # the amounts never change
+
+
+def test_the_valuation_builder_keeps_the_transaction_value_without_an_estimate() -> None:
+    listed = facts_from_listing(_listing(), payable=Money.of("3000", "EUR"), declaration_date=DECL)
+    assert listed.estimated_customs_value_eur is None and listed.estimated_customs_value_source is None
+    built = build(listed)
+    assert [s.name for s in built.scenarios] == ["primary"]
+    assert built.inputs.customs_value == money("3700", "EUR")
+    assert built.customs_value_for_duties.basis == "transaction_value"
+    assert built.purchase_price.basis == "advertised"
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "text"),
+    [
+        ("3000.00", "EUR", "3000"),
+        ("700", "EUR", "700"),
+        ("2800.50", "EUR", "2800.50"),
+        ("4200.4", "EUR", "4200.40"),
+        ("0.00", "EUR", "0"),
+        ("227674.69", "MKD", "227674.69"),
+        ("168155", "MKD", "168155"),
+    ],
+)
+def test_texts_quote_amounts_without_a_needless_fraction(amount: str, currency: str, text: str) -> None:
+    """Owner decision 2026-10-13 ("без децимали"): a basis, assumption or warning text never shows
+    ``.00``; a real fraction stays exact because the text names the figure the calculation used."""
+    assert plain_amount_text(Money(amount=Decimal(amount), currency=currency)) == text
+
+
+def test_basis_and_assumption_texts_have_no_zero_fraction() -> None:
+    est = estimate(
+        facts(estimated_customs_value_eur="4200", estimated_customs_value_source="SchwackeNet catalogue")
+    )
+    texts = [s.customs_value_basis or "" for s in est.scenarios] + list(est.assumptions) + list(est.warnings)
+    assert texts and not [t for t in texts if ".00 " in t or t.endswith(".00")], texts

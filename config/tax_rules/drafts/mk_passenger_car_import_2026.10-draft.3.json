@@ -1,13 +1,13 @@
 {
   "rule_set_id": "mk-passenger-car-import",
   "jurisdiction": "MK",
-  "version": "2026.10-draft.2",
+  "version": "2026.10-draft.3",
   "status": "draft",
   "valid_from": "2025-07-01",
   "valid_to": null,
   "currency": "MKD",
   "vehicle_categories": ["passenger_car"],
-  "description": "DRAFT, NOT APPROVED. North Macedonia import charges on a used passenger car (HS 8703, M1) per the fact sheet of 2026-10-13: customs duty (5% default; 0% only on an accepted preferential or US-origin proof), motor-vehicle tax (ДМВ: Table 1 value part on customs value + duty in EUR, Table 2 CO2 part per COC cycle, 400 g/km deemed when CO2 is not established, 50% for plug-in hybrids, BEV not subject) and 18% import VAT on customs value + duty + ДМВ + incidental costs. Not modelled: HS 8704 double-cab pick-ups, HS 9705 collector vehicles, oldtimer exemption (ЗДМВ чл. 17), other exemptions/refunds, customs processing fees (none found, UNCERTAIN), registration-stage fees. UNCERTAIN - confirm: rounding (0.01 MKD half-up vs whole denars), СКД = customs monthly EUR/MKD rate, ДМВ inside the VAT base, CO2 band edges and non-integer CO2, hybrid/PHEV fuel column, non-EU preferential list, US-origin evidence. Sources not yet hashed here: Customs Tariff law amendment 130/25 (final gazette text), Правилник 117/2009 (FX), Customs monthly FX list, Customs vehicle page (expired TLS, snippets only). Source sha256 values are of local research copies and must be re-verified at review.",
+  "description": "DRAFT, NOT APPROVED. North Macedonia import charges on a used passenger car (HS 8703, M1) per the fact sheet of 2026-10-13: customs duty (5% default; 0% only on an accepted preferential or US-origin proof), motor-vehicle tax (ДМВ: Table 1 value part on customs value + duty in EUR, Table 2 CO2 part per COC cycle, 400 g/km deemed when CO2 is not established, 50% for plug-in hybrids, BEV not subject) and 18% import VAT on customs value + duty + ДМВ + incidental costs. Owner decisions of 2026-10-13: ДМВ is part of the import VAT base (ЗДДВ чл. 21(2)(1): customs duty, taxes and other import charges, except VAT itself), and every MKD amount and the total are rounded to whole denars, half-up (as the Customs ДМВ guide of 29.12.2019 prints 38,123.8 as 38,124). Not modelled: HS 8704 double-cab pick-ups, HS 9705 collector vehicles, oldtimer exemption (ЗДМВ чл. 17), other exemptions/refunds, customs processing fees (none found, UNCERTAIN), registration-stage fees. UNCERTAIN - confirm: СКД = customs monthly EUR/MKD rate, CO2 band edges and non-integer CO2, hybrid/PHEV fuel column, non-EU preferential list, US-origin evidence. Sources not yet hashed here: Customs Tariff law amendment 130/25 (final gazette text), Правилник 117/2009 (FX), Customs monthly FX list, Customs vehicle page (expired TLS, snippets only). Source sha256 values are of local research copies and must be re-verified at review.",
   "sources": [
     {"url": "https://portal.mdt.gov.mk/post-body-files/propisi-od-oblasta-na-danocite-taksite-i-drugite-javni-prixodi-file-7DcP.pdf", "title": "Закон за данок на моторни возила, Сл. весник РСМ 261/2019 (MoF copy)", "retrieved_at": "2026-10-13T12:20:14Z", "sha256": "7ac463cce1798d9addcb961fc60e68d0f089b6f236fcc603db10792461564615"},
     {"url": "https://portal.mdt.gov.mk/post-body-files/propisi-od-oblasta-na-danocite-taksite-i-drugite-javni-prixodi-file-UXof.pdf", "title": "Уредба за начинот на пресметка на ДМВ, Сл. весник РСМ 277/2019 (MoF copy)", "retrieved_at": "2026-10-13T12:20:12Z", "sha256": "32d4c144c12c1da7bddebf16d001128588c59eb0dba62da94da57f3d28ff379c"},
@@ -24,7 +24,7 @@
   "optional_inputs": ["co2_g_km", "co2_cycle", "co2_source_document", "classification"],
   "input_units": {"co2_g_km": "g/km"},
   "components": [
-    {"id": "customs_value_mkd", "kind": "percentage", "label": "Customs value in MKD (intermediate; invoice + transport to MK place of entry, customs FX)", "category": "import_duty", "currency": "MKD", "intermediate": true, "rate": "1", "base": ["customs_value"], "legal_reference": "Царински закон чл. 28, 35(1)(д), 36(а), 43; Сл. весник РМ 39/2005 со измени"},
+    {"id": "customs_value_mkd", "kind": "percentage", "label": "Customs value in MKD (intermediate; the scenario's customs value: transaction value or estimated customs value, incl. transport to the MK place of entry; customs FX)", "category": "import_duty", "currency": "MKD", "intermediate": true, "rate": "1", "base": ["customs_value"], "legal_reference": "Царински закон чл. 28, 35(1)(д), 36(а), 43; Сл. весник РМ 39/2005 со измени"},
     {
       "id": "duty_preferential_eu",
       "kind": "percentage",
@@ -414,12 +414,12 @@
       "amount": "0",
       "legal_reference": "ЗДМВ чл. 6(3)(1)"
     },
-    {"id": "vat_base_mkd", "kind": "percentage", "label": "Import VAT base: customs value + duty + ДМВ + incidental costs to first destination not in customs value (intermediate; ДМВ in base - UNCERTAIN - confirm on a real ЕЦД)", "category": "import_vat", "currency": "MKD", "intermediate": true, "depends_on": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard", "dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject"], "rate": "1", "base": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard", "dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject", "vat_incidental_costs_total"], "legal_reference": "ЗДДВ чл. 21(1)-(2) (пречистен текст УЈП до 267/25)"},
+    {"id": "vat_base_mkd", "kind": "percentage", "label": "Import VAT base: customs value + duty + ДМВ + incidental costs to first destination not in customs value (intermediate; ДМВ in the base per owner confirmation 2026-10-13)", "category": "import_vat", "currency": "MKD", "intermediate": true, "depends_on": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard", "dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject"], "rate": "1", "base": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard", "dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject", "vat_incidental_costs_total"], "legal_reference": "ЗДДВ чл. 21(1)-(2), ДМВ under чл. 21(2)(1) (царината, даноците и другите увозни давачки, освен ДДВ) - owner confirmation 2026-10-13 (пречистен текст УЈП до 267/25)"},
     {"id": "vat_import", "kind": "percentage", "label": "Import VAT 18%", "category": "import_vat", "currency": "MKD", "depends_on": ["vat_base_mkd"], "rate": "0.18", "base": ["vat_base_mkd"], "legal_reference": "ЗДДВ чл. 28-29 (општа стапка 18%); чл. 31(6)(1), 43(5)-(7)"}
   ],
   "rounding_rules": {
-    "component_default": {"quantum": "0.01", "mode": "half_up", "stage": "before_dependents"},
-    "total": {"quantum": "0.01", "mode": "half_up", "stage": "before_dependents"}
+    "component_default": {"quantum": "1", "mode": "half_up", "stage": "before_dependents"},
+    "total": {"quantum": "1", "mode": "half_up", "stage": "before_dependents"}
   },
   "missing_input_behavior": "return_incomplete",
   "sha256": null,

@@ -5,10 +5,16 @@
  *
  * Nothing here interprets an amount: values are passed through as the strings the user typed and
  * the server validates them (failures name the parameters, which the form marks). An empty field
- * is "not given": on the listing route the listing's fact then applies, otherwise it stays unknown.
+ * is "not given": on the listing route the listing's fact (or the owner's RECORDED import value)
+ * then applies, otherwise it stays unknown.
+ *
+ * Two values per vehicle (owner decision 2026-10-13): `price_amount` is the REAL purchase price
+ * (реална набавна цена: the landed cost and the profit use it) and `estimated_customs_value_eur`
+ * (with its source) the ESTIMATED customs value (проценета царинска вредност: the import charges
+ * of the primary scenario are computed on it plus the transport to the MK border).
  */
-import type { AmountView, ImportCostEstimateQuery, ImportCostEstimateView } from '../../api/types'
-import { amountText, label } from '../../format'
+import type { AmountView, ImportCostEstimateQuery, ImportCostEstimateView, PurchasePriceBasis } from '../../api/types'
+import { amountText, enteredAmountText, enteredDecimalText, label } from '../../format'
 
 /** Every vehicle/request parameter the form can send (`listing_id` comes from the route). */
 export const QUERY_KEYS = [
@@ -33,7 +39,8 @@ export const QUERY_KEYS = [
   'hs_evidence_ref',
   'transport_after_entry_eur',
   'transport_after_entry_separately_invoiced',
-  'catalogue_value_eur',
+  'estimated_customs_value_eur',
+  'estimated_customs_value_source',
   'importer_status',
   'mileage_km',
   'seller_country',
@@ -59,7 +66,7 @@ export type FormState = Record<QueryKey, string>
 /** Human labels of the parameters (also used to name the fields a validation error points at). */
 export const FIELD_LABELS: Record<QueryKey | 'listing_id', string> = {
   listing_id: 'Listing',
-  price_amount: 'Purchase price',
+  price_amount: 'Purchase price (real, for profit)',
   price_currency: 'Price currency',
   price_basis: 'Price basis',
   declaration_date: 'Customs declaration date',
@@ -80,7 +87,8 @@ export const FIELD_LABELS: Record<QueryKey | 'listing_id', string> = {
   hs_evidence_ref: 'Tariff code evidence',
   transport_after_entry_eur: 'Inland transport after entry (EUR)',
   transport_after_entry_separately_invoiced: 'Inland leg separately invoiced',
-  catalogue_value_eur: 'Catalogue value (EUR)',
+  estimated_customs_value_eur: 'Estimated customs value (for duties)',
+  estimated_customs_value_source: 'Source of the estimated customs value',
   importer_status: 'Importer',
   mileage_km: 'Mileage (km)',
   seller_country: 'Seller country',
@@ -88,6 +96,13 @@ export const FIELD_LABELS: Record<QueryKey | 'listing_id', string> = {
   power_kw: 'Power (kW)',
   customs_eur_mkd_rate: 'Customs rate EUR/MKD',
   accept_previous_month_fx: "Accept last month's customs rate (preview only)",
+}
+
+/** The Macedonian labels shown next to the English ones of the two values (owner decision 2026-10-13). */
+export const FIELD_LABELS_MK: Partial<Record<QueryKey, string>> = {
+  price_amount: 'Реална набавна цена (за профит)',
+  estimated_customs_value_eur: 'Проценета царинска вредност (за давачки)',
+  estimated_customs_value_source: 'Извор на проценетата вредност',
 }
 
 export function emptyForm(): FormState {
@@ -136,27 +151,64 @@ export function invalidKeys(fields: string[]): Set<QueryKey | 'listing_id'> {
   return new Set(fields.filter((field) => known.has(field)) as Array<QueryKey | 'listing_id'>)
 }
 
-function amount(value: AmountView): string | null {
-  return value.status === 'known' ? amountText(value) : null
+/** Where a hint's value comes from: the listing itself or the owner's recorded import value. */
+export type HintOrigin = 'listing' | 'recorded'
+
+/** What an empty field keeps on the listing route, and where that value comes from. */
+export interface Hint {
+  text: string
+  origin: HintOrigin
 }
 
 /** A form parameter, or `co2` for the CO2 figures as a group. */
 export type HintKey = QueryKey | 'co2'
 
+/** How a price basis reads in a hint ("recorded: actual (paid)"). */
+export const PRICE_BASIS_TEXT: Record<PurchasePriceBasis, string> = {
+  invoice: 'invoice / contract price',
+  advertised: 'advertised price (a claim)',
+  recorded_actual: 'recorded: actual (paid)',
+  recorded_quote: 'recorded: quote (not paid yet)',
+  recorded_estimate: 'recorded: estimate',
+}
+
+function isKnown(value: AmountView): boolean {
+  return value.status === 'known' && value.amount !== null
+}
+
 /**
- * What the LISTING established, per form parameter (shown next to the empty fields of the listing
- * route: leaving a field empty keeps exactly this value). Only facts whose source is the listing.
+ * The purchase price an empty price field keeps: the server's whole-euro purchase price when the
+ * price is in EUR (no rounding in the browser), otherwise the price as given (an MKD price).
  */
-export function listingHints(view: ImportCostEstimateView | null): Partial<Record<HintKey, string>> {
+function priceText(view: ImportCostEstimateView): string | null {
+  const price = view.facts.price
+  if (!isKnown(price)) return null
+  if (price.currency === 'EUR' && isKnown(view.purchase_price.amount)) return amountText(view.purchase_price.amount)
+  return enteredAmountText(price)
+}
+
+/**
+ * What the LISTING established, or the owner RECORDED for it, per form parameter (shown next to
+ * the empty fields of the listing route: leaving a field empty keeps exactly this value). Only facts
+ * whose source is the listing or a recorded import value.
+ */
+export function listingHints(view: ImportCostEstimateView | null): Partial<Record<HintKey, Hint>> {
   if (!view) return {}
-  const fromListing = new Set(view.fact_sources.filter((s) => s.source === 'listing').map((s) => s.fact))
-  const facts = view.facts
-  const hints: Partial<Record<HintKey, string>> = {}
-  const set = (fact: string, key: HintKey, value: string | null | undefined) => {
-    if (fromListing.has(fact) && value) hints[key] = value
+  const origins = new Map<string, HintOrigin>()
+  for (const { fact, source } of view.fact_sources) {
+    if (source === 'listing' || source === 'recorded') origins.set(fact, source)
   }
-  set('price', 'price_amount', amount(facts.price))
-  set('price_basis', 'price_basis', label(facts.price_basis))
+  const facts = view.facts
+  const hints: Partial<Record<HintKey, Hint>> = {}
+  const set = (fact: string, key: HintKey, value: string | null | undefined) => {
+    const origin = origins.get(fact)
+    if (origin && value) hints[key] = { text: value, origin }
+  }
+  set('price', 'price_amount', priceText(view))
+  set('price_basis', 'price_basis', PRICE_BASIS_TEXT[facts.price_basis] ?? label(facts.price_basis))
+  const estimate = facts.estimated_customs_value_eur
+  set('estimated_customs_value_eur', 'estimated_customs_value_eur', estimate ? `EUR ${enteredDecimalText(estimate)}` : null)
+  set('estimated_customs_value_source', 'estimated_customs_value_source', facts.estimated_customs_value_source)
   set('fuel', 'fuel', label(facts.fuel))
   const readings = facts.co2.map((reading) => `${reading.g_km} g/km (${label(reading.cycle)})`).join(', ')
   set('co2', 'co2', readings)

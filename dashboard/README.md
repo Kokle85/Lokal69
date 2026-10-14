@@ -20,7 +20,16 @@ static single-page app (Vite 8 + React 19.3 + React Router 8 + TypeScript 6) tha
   landed cost, all computed by the server. Until the owner activates an approved rule set the
   result is an INDICATIVE PREVIEW on a rule set that is not active (the banner names its status), shown with the server's Macedonian and
   English banner and totals named "indicative"; unknown charges read "unknown" (never 0), helper
-  components are secondary rows that are never counted, and the URL keeps the submitted facts;
+  components are secondary rows that are never counted, and the URL keeps the submitted facts.
+  Two values per vehicle (owner decision 2026-10-13): the REAL purchase price (profit, landed cost)
+  and the ESTIMATED customs value (e.g. SchwackeNet, without transport; the `primary` charges),
+  shown side by side with the `transaction_value` scenario (charges on the price paid). Every
+  amount comes from the server in whole units; the browser never rounds money;
+- has an **Import values** panel on the candidate detail page
+  (`GET`/`POST /api/listings/{listing_id}/import-values`): the listing's current recorded real
+  purchase price and estimated customs value in whole euros with source and history, a link to
+  the calculator for that listing (whose listing mode uses them), and for the owner only a
+  recording form that needs a ticked confirmation because recording re-values the listing;
 - has an owner-only **Tax rules and cost profile** section in Settings (`/api/settings/tax-rules`
   and `/api/settings/cost-profiles`, `config:admin`): the stored rule-set versions and repository
   drafts with status chips, content hashes, sources, components and their UNCERTAIN items (the open

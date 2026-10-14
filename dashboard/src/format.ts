@@ -26,6 +26,27 @@ export function amountText(value: AmountView | null | undefined): string {
   return 'unknown'
 }
 
+const ZERO_FRACTION = /^(-?(?:0|[1-9][0-9]*))\.0+$/
+
+/**
+ * A decimal string AS ENTERED (an input echo, e.g. the calculator's `facts`), grouped and with an
+ * all-zero fraction dropped ("3000.00" -> "3,000"). A non-zero fraction ("2800.50") is kept as
+ * entered: rounding it would be money arithmetic, which the browser never does. Every amount the
+ * server computes already arrives in whole units (owner decision 2026-10-13, "без децимали").
+ */
+export function enteredDecimalText(value: string): string {
+  const match = ZERO_FRACTION.exec(value)
+  return groupDecimal(match ? (match[1] ?? value) : value)
+}
+
+/** `amountText` for an input echo (see `enteredDecimalText`); unknown stays "unknown", never 0. */
+export function enteredAmountText(value: AmountView | null | undefined): string {
+  if (value?.status === 'known' && value.amount !== null) {
+    return `${value.currency ?? ''} ${enteredDecimalText(value.amount)}`.trim()
+  }
+  return amountText(value)
+}
+
 /** A bare decimal string with its currency (cost-line bounds); `null` is shown as "unknown". */
 export function decimalText(value: string | null | undefined, currency?: string | null): string {
   if (value === null || value === undefined || value === '') return 'unknown'

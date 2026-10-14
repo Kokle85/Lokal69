@@ -11,6 +11,8 @@ import {
   countText,
   decimalText,
   durationText,
+  enteredAmountText,
+  enteredDecimalText,
   groupDecimal,
   kmText,
   localInputToRfc3339,
@@ -39,6 +41,18 @@ describe('money formatting', () => {
     expect(groupDecimal('12345678901234567890.123456789')).toBe('12,345,678,901,234,567,890.123456789')
     expect(groupDecimal('not a number')).toBe('not a number')
     expect(amountText({ status: 'known', amount: '2750.00', currency: 'EUR', reason: null })).toBe('EUR 2,750.00')
+  })
+
+  it('shows an input echo as entered: an all-zero fraction dropped, never rounded', () => {
+    expect(enteredDecimalText('3000.00')).toBe('3,000')
+    expect(enteredDecimalText('4200')).toBe('4,200')
+    expect(enteredDecimalText('0.00')).toBe('0')
+    // A non-zero fraction stays as entered: rounding would be money arithmetic in the browser.
+    expect(enteredDecimalText('2800.50')).toBe('2,800.50')
+    expect(enteredDecimalText('1e3')).toBe('1e3')
+    expect(enteredAmountText({ status: 'known', amount: '184601.10', currency: 'MKD', reason: null })).toBe('MKD 184,601.10')
+    expect(enteredAmountText({ status: 'known', amount: '2750.00', currency: 'EUR', reason: null })).toBe('EUR 2,750')
+    expect(enteredAmountText({ status: 'unknown', amount: null, currency: 'EUR', reason: 'no price' })).toBe('unknown')
   })
 
   it('renders an unknown amount with its reason and an explicit status', () => {

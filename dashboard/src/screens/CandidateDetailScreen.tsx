@@ -22,6 +22,7 @@ import { MutationStatus } from '../review/MutationStatus'
 import { useIdempotentMutation } from '../review/useIdempotentMutation'
 import { useWorkspace } from '../workspace/WorkspaceProvider'
 import { modelText } from './CandidatesScreen'
+import { ImportValuesPanel } from './importValues/ImportValuesPanel'
 
 export function CandidateDetailScreen() {
   const { listingId = '' } = useParams()
@@ -175,6 +176,8 @@ function CandidateBody({ detail, timeZone, onChanged }: { detail: CandidateDetai
           unknown.
         </p>
       </Section>
+
+      <ImportValuesPanel listingId={summary.listing_id} onRecorded={onChanged} />
 
       <Section title="Lifecycle and freshness" id="lifecycle">
         <KeyValues

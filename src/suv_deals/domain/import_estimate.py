@@ -19,6 +19,21 @@ line, the customs exchange rate and ``as_of``.
   entry and so part of the customs value (Царински закон чл. 35(1)(д)); only an inland leg
   that is separately invoiced leaves the customs value (чл. 36(а)) and enters the import
   VAT base alone (ЗДДВ чл. 21(2)(2)).
+- Two values per vehicle (owner decision 2026-10-13). ``price`` is the REAL purchase price
+  (реална набавна цена): the landed cost, and so the profit, always use it. The optional
+  ``estimated_customs_value_eur`` (проценета царинска вредност, e.g. a SchwackeNet catalogue
+  value; the vehicle only, without transport) with its ``estimated_customs_value_source`` is
+  what the import charges of the ``primary`` scenario are computed on: the estimate plus the
+  transport to the MK place of entry (whether Customs adds that transport to a catalogue value
+  is UNCERTAIN). Without an estimate the customs value is the transaction value, the price
+  actually paid plus that transport (Царински закон чл. 28, 35(1)(д)). With an estimate the
+  ``transaction_value`` scenario shows the alternative where Customs accepts the price paid,
+  its primary method; another method applies only on founded doubt, in the legal order. A
+  car bought well under the usual market price is the case this separates.
+- Whole units (owner decision 2026-10-13, "без децимали"): the rule set rounds every MKD
+  component and the total to whole denars; the EUR amounts of the result (EUR equivalents,
+  purchase price, customs value for duties, landed cost) are rounded half-up to whole euros
+  from the exact figures, so a rounded part may differ from the rounded sum by EUR 1.
 - Modes. ``active``: an ACTIVE, owner-approved rule set (the same production selection the
   valuations use). ``indicative_preview``: no ACTIVE set applies, so the newest
   unapproved set is used, labelled with a banner, never production-ready, and its totals
@@ -39,14 +54,15 @@ import decimal
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from suv_deals.clock import ensure_utc
-from suv_deals.domain.costs import CostLine
+from suv_deals.domain.costs import CostLine, SourceLabel
 from suv_deals.domain.enums import Co2Cycle, CostCategory, CostLineStatus, Fuel, Precision, TaxRuleStatus
 from suv_deals.domain.listings import NormalizedListing, PartialDate
 from suv_deals.domain.money import FxRate, Money
@@ -107,9 +123,18 @@ Co2Document = Literal[
 ]
 OriginProofKind = Literal["none", "unknown", "eu", "efta", "tr", "uk", "cefta", "ua", "us"]
 ImporterStatus = Literal["private", "non_vat_business", "vat_dealer"]
+#: How a caller states a price: an invoice/contract price or an advertised one.
 PriceBasis = Literal["invoice", "advertised"]
+#: Basis of the REAL purchase price: a stated basis (``PriceBasis``) or a value the owner recorded
+#: for the listing (an actual purchase, a quote or an estimate of the purchase price).
+PurchasePriceBasis = Literal[
+    "invoice", "advertised", "recorded_actual", "recorded_quote", "recorded_estimate"
+]
+#: What the customs value for the import charges rests on: an estimated customs value (plus the
+#: transport to the place of entry) or the transaction value (the price paid plus that transport).
+CustomsValueBasis = Literal["estimated", "transaction_value"]
 EstimateMode = Literal["active", "indicative_preview", "unavailable"]
-EstimateScenarioName = Literal["legal_base", "standard_duty_if_proof_rejected", "customs_revaluation_risk"]
+EstimateScenarioName = Literal["primary", "standard_duty_if_proof_rejected", "transaction_value"]
 Importable = Literal["yes", "no", "unknown"]
 
 #: Partner code of a proof kind when the agreement has a single partner. EFTA and CEFTA
@@ -121,8 +146,36 @@ _TRANSPORT_STATUSES: Final = frozenset(
     {CostLineStatus.ESTIMATED, CostLineStatus.QUOTED, CostLineStatus.ACTUAL}
 )
 _CUSTOMS_VALUE_REFERENCE: Final = "Царински закон чл. 35(1)(д)"
+_TRANSACTION_VALUE_REFERENCE: Final = "Царински закон чл. 28"
 _INLAND_LEG_REFERENCE: Final = "ЗДДВ чл. 21(2)(2)"
-_RISK_BASIS_PREFIX: Final = "RISK SCENARIO - customs revaluation (SchwackeNet), not the legal value:"
+#: How each purchase-price basis is named in labels and bases.
+_PRICE_WORDS: Final[Mapping[str, str]] = {
+    "invoice": "invoice",
+    "advertised": "advertised price",
+    "recorded_actual": "recorded actual purchase price",
+    "recorded_quote": "recorded purchase quote",
+    "recorded_estimate": "recorded purchase-price estimate",
+}
+#: Default source label of the purchase price per basis (a caller or the service may name one).
+_PRICE_SOURCES: Final[Mapping[str, str]] = {
+    "invoice": "invoice or contract price",
+    "advertised": "advertised price (a claim, not an invoice)",
+    "recorded_actual": "recorded actual purchase price",
+    "recorded_quote": "recorded purchase quote (not yet paid)",
+    "recorded_estimate": "recorded purchase-price estimate",
+}
+#: Bases whose price is a claim, not evidence of the price paid: the amounts computed from them
+#: are never rule-supported (``unverified_inputs``), and they stand in for the transaction value.
+_CLAIMED_PRICE: Final[Mapping[str, str]] = {
+    "advertised": "price: advertised price, not an invoice or contract price",
+    "recorded_quote": "price: recorded quote, not a paid invoice or contract price",
+    "recorded_estimate": "price: recorded estimate, not an invoice or contract price",
+}
+_ESTIMATE_TRANSPORT_UNCERTAIN: Final = (
+    "ESTIMATED_CUSTOMS_VALUE_TRANSPORT_ADDED: UNCERTAIN - confirm whether Customs adds the transport "
+    "to the MK place of entry to an estimated (catalogue) customs value; it is added here "
+    "(Царински закон чл. 35(1)(д))"
+)
 _EURO_CLASS = re.compile(
     r"^\s*(?:euro|eu)?\s*[-_]?\s*(?:(?P<num>[1-7])(?!\d)|(?P<roman>vi|iv|v|iii|ii|i)(?![a-z]))",
     re.IGNORECASE,
@@ -175,9 +228,10 @@ _PREVIEW_RULE_WORDS: Final[Mapping[TaxRuleStatus, tuple[str, str]]] = {
     ),
 }
 LANDED_COST_NOTE: Final = (
-    "purchase price + transport + import charges (customs duty, motor-vehicle tax, import VAT), in EUR at "
-    "the customs rate; excludes customs broker/terminal fees, conformity confirmation, registration "
-    "fees and MTPL insurance"
+    "real purchase price + transport + import charges (customs duty, motor-vehicle tax, import VAT), in "
+    "EUR at the customs rate, rounded to whole euros; the charges follow the scenario's customs value, the "
+    "purchase price is always the one actually paid; excludes customs broker/terminal fees, conformity "
+    "confirmation, registration fees and MTPL insurance"
 )
 
 
@@ -247,10 +301,14 @@ class OriginProofClaim(_Contract):
 
 class VehicleImportFacts(_Contract):
     """What is known about one vehicle and its import. Every field is optional; a missing fact
-    stays unknown (never zero) and the estimate names it in ``missing_facts``."""
+    stays unknown (never zero) and the estimate names it in ``missing_facts``.
+
+    ``price`` is the REAL purchase price (the landed cost and the profit use it);
+    ``estimated_customs_value_eur`` is the separate value of the vehicle for customs (without
+    transport), used for the import charges when given, always with its source."""
 
     price: PriceFact | None = None
-    price_basis: PriceBasis = "advertised"
+    price_basis: PurchasePriceBasis = "advertised"
     declaration_date: date | None = None
     fuel: Fuel = Fuel.UNKNOWN
     co2: tuple[Co2Reading, ...] = Field(default=(), max_length=3)
@@ -263,7 +321,14 @@ class VehicleImportFacts(_Contract):
     hs_evidence_ref: str | None = Field(default=None, min_length=1, max_length=200)
     transport_after_entry_eur: Decimal | None = Field(default=None, ge=0, le=MAX_INPUT_AMOUNT)
     transport_after_entry_separately_invoiced: bool = False
-    catalogue_value_eur: Decimal | None = Field(default=None, ge=0, le=MAX_INPUT_AMOUNT)
+    #: Estimated customs value of the VEHICLE in EUR, without transport (e.g. a SchwackeNet
+    #: catalogue value): positive, at most two decimals, within the engine's input bound.
+    estimated_customs_value_eur: Decimal | None = Field(
+        default=None, gt=0, le=MAX_INPUT_AMOUNT, decimal_places=2
+    )
+    #: Where the estimate comes from (e.g. "SchwackeNet catalogue", "owner estimate"); required
+    #: exactly when an estimate is given.
+    estimated_customs_value_source: SourceLabel | None = None
     importer_status: ImporterStatus | None = None
     mileage_km: Decimal | None = Field(default=None, ge=0, le=MAX_MILEAGE_KM)
     seller_country: str | None = Field(default=None, pattern=_COUNTRY)
@@ -302,6 +367,11 @@ class VehicleImportFacts(_Contract):
             )
         if self.hs_evidence_ref is not None and self.hs_code is None:
             raise ValueError("hs_evidence_ref needs hs_code")
+        if (self.estimated_customs_value_eur is None) != (self.estimated_customs_value_source is None):
+            raise ValueError(
+                "estimated_customs_value_eur and estimated_customs_value_source go together: an estimated "
+                "customs value always names its source"
+            )
         return self
 
 
@@ -392,20 +462,68 @@ class ScenarioInputs(_Contract):
     name: EstimateScenarioName
     label: str = Field(min_length=3, max_length=300)
     inputs: TaxInputs
+    #: What this scenario's customs value rests on (the estimate or the transaction value).
+    customs_value_kind: CustomsValueBasis
     assumptions: tuple[str, ...] = ()
 
 
+class PurchasePrice(_Contract):
+    """The REAL purchase price (реална набавна цена) in EUR: the basis of the landed cost and the
+    profit in every scenario, never replaced by an estimated customs value. Exact in
+    ``BuiltTaxInputs``; whole euros (half-up) in ``ImportCostEstimate``. Unknown (with
+    ``reason``) when no price is given or it cannot be converted; never zero."""
+
+    amount: Money | None
+    #: ``None`` when no price is given.
+    basis: PurchasePriceBasis | None
+    source: str = Field(min_length=3, max_length=200)
+    reason: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def _explained(self) -> PurchasePrice:
+        if self.amount is not None and self.amount.currency != "EUR":
+            raise ValueError("the purchase price is stated in EUR")
+        if (self.amount is None) == (self.reason is None):
+            raise ValueError("an unknown purchase price carries a reason, a known one none")
+        return self
+
+
+class CustomsValueForDuties(_Contract):
+    """The customs value the import charges of the ``primary`` scenario are computed on, in EUR,
+    INCLUDING the transport to the MK place of entry: the estimated customs value plus that
+    transport (``estimated``) or the transaction value (``transaction_value``). Exact in
+    ``BuiltTaxInputs``; whole euros (half-up) in ``ImportCostEstimate``."""
+
+    amount: Money | None
+    basis: CustomsValueBasis
+    source: str = Field(min_length=3, max_length=200)
+    reason: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def _explained(self) -> CustomsValueForDuties:
+        if self.amount is not None and self.amount.currency != "EUR":
+            raise ValueError("the customs value for duties is stated in EUR")
+        if (self.amount is None) == (self.reason is None):
+            raise ValueError("an unknown customs value carries a reason, a known one none")
+        return self
+
+
 class BuiltTaxInputs(_Contract):
-    """``build_tax_inputs`` result: the legal-base inputs, every scenario (legal base first) and
-    the builder's assumptions, warnings and import gates."""
+    """``build_tax_inputs`` result: the primary scenario's inputs, every scenario (primary first)
+    and the builder's assumptions, warnings and import gates."""
 
     inputs: TaxInputs
     scenarios: tuple[ScenarioInputs, ...]
     assumptions: tuple[str, ...]
     warnings: tuple[str, ...]
     gates: ImportGates
-    #: Price in EUR for the landed cost (``None`` when unknown or not convertible).
+    #: The REAL purchase price in EUR for the landed cost (``None`` when unknown or not
+    #: convertible); never the estimated customs value.
     price_eur: Money | None
+    #: The real purchase price with its basis and source (exact).
+    purchase_price: PurchasePrice
+    #: The primary scenario's customs value in EUR with its basis and source (exact).
+    customs_value_for_duties: CustomsValueForDuties
     #: The whole transport line amount (``None`` when the line is unusable).
     transport: Money | None
     #: Facts (or operator data) still needed, by the builder's own reasons.
@@ -428,8 +546,36 @@ def declaration_date_for(facts: VehicleImportFacts, as_of: datetime) -> date:
     return facts.declaration_date or ensure_utc(as_of).date()
 
 
+def whole_units(money: Money) -> Money:
+    """``money`` rounded half-up to whole units of its currency (owner decision 2026-10-13: amounts
+    without decimals). For presentation only; every sum is formed from the exact figures first."""
+    return Money(amount=money.amount.quantize(Decimal(1), rounding=ROUND_HALF_UP), currency=money.currency)
+
+
+def plain_amount_text(money: Money) -> str:
+    """An amount quoted in a text, without a needless fraction (owner decision 2026-10-13: amounts
+    without decimals): ``3000.00`` reads ``3000``, while a real fraction stays exact (``2800.50``),
+    because such a text quotes the figure a calculation actually used, never a rounded one."""
+    quantized = money.quantized()
+    if quantized.is_zero():
+        return "0"
+    whole = quantized.to_integral_value()
+    return str(whole) if quantized == whole else str(quantized)
+
+
 def _money_text(amount: Decimal, currency: str) -> str:
-    return f"{Money(amount=amount, currency=currency).quantized()} {currency}"
+    return f"{plain_amount_text(Money(amount=amount, currency=currency))} {currency}"
+
+
+def _within_bound(amount: Decimal) -> bool:
+    """Whether a customs value stays inside the engine's input sanity bound."""
+    return amount <= MAX_INPUT_AMOUNT
+
+
+_OUT_OF_BOUND: Final = (
+    "CUSTOMS_VALUE_OUT_OF_BOUNDS: {what} plus the transport exceeds the engine's input bound; the customs "
+    "value is unknown"
+)
 
 
 def _month_end(day: date) -> date:
@@ -688,6 +834,227 @@ def _with(inputs: TaxInputs, **changes: Any) -> TaxInputs:
     return TaxInputs.model_validate({**inputs.model_dump(), **changes})
 
 
+_TRANSACTION_VALUE_ASSUMPTION: Final = (
+    "TRANSACTION_VALUE_ALTERNATIVE: Customs accepts the price actually paid as the transaction value "
+    "(Царински закон чл. 28, its primary method); the charges follow that price + the transport to the "
+    "MK place of entry instead of the estimated customs value"
+)
+_CHF_REASON: Final = (
+    "a CHF price is not converted (it would need a CHF customs rate next to the EUR one; no other rate is "
+    "substituted)"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _TransactionValue:
+    """The transaction value (price paid + transport to the place of entry) and the EUR price."""
+
+    customs_value: Money | None
+    basis: str | None
+    price_eur: Money | None
+    #: Why ``customs_value`` is unknown (``None`` when it is known).
+    reason: str | None
+    assumptions: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    needed: tuple[str, ...] = ()
+
+
+def _transaction_value(
+    facts: VehicleImportFacts,
+    *,
+    to_entry: Decimal | None,
+    total_transport: Decimal | None,
+    inland: Decimal,
+    fx_inputs: TaxInputs,
+) -> _TransactionValue:
+    estimated = facts.estimated_customs_value_eur is not None
+    price = facts.price
+    if price is None:
+        warning = (
+            "PRICE_MISSING: real purchase price unknown; the landed cost and the transaction-value "
+            "alternative are unknown"
+            if estimated
+            else "PRICE_MISSING: purchase price unknown; customs value unknown"
+        )
+        return _TransactionValue(None, None, None, "purchase price unknown", (), (warning,), ("price",))
+    if price.currency == "CHF":
+        # The price is known; what is missing is a price the customs value can use.
+        what = (
+            "the transaction value and the EUR purchase price of the landed cost are unknown"
+            if estimated
+            else "the customs value is unknown"
+        )
+        warning = (
+            "CUSTOMS_VALUE_CHF_UNSUPPORTED: a CHF price plus EUR transport needs two customs rates; no "
+            f"reference rate is substituted, so {what}"
+        )
+        return _TransactionValue(None, None, None, _CHF_REASON, (), (warning,), ("price_in_eur_or_mkd",))
+    assumptions: list[str] = []
+    warnings: list[str] = []
+    needed: list[str] = []
+    word = _PRICE_WORDS[facts.price_basis]
+    if facts.price_basis in _CLAIMED_PRICE:
+        code = "ADVERTISED_PRICE" if facts.price_basis == "advertised" else facts.price_basis.upper()
+        assumptions.append(
+            f"{code}_AS_TRANSACTION_VALUE: the {word} stands in for the invoice price "
+            f"({_TRANSACTION_VALUE_REFERENCE})"
+        )
+    price_money = Money(amount=price.amount, currency=price.currency)
+    price_eur = (
+        price_money
+        if price.currency == "EUR"
+        else convert_with_customs_rate(price_money, "EUR", fx_inputs)[0]
+    )
+    if to_entry is None or total_transport is None:
+        return _TransactionValue(
+            None, None, price_eur, "transport to the MK place of entry unknown", tuple(assumptions)
+        )
+    total: Decimal | None
+    if price.currency == "EUR":
+        total = _CTX.add(price.amount, to_entry)
+    else:
+        converted, codes = convert_with_customs_rate(Money(amount=to_entry, currency="EUR"), "MKD", fx_inputs)
+        if converted is None:
+            needed.append("customs_fx_rate")
+            warnings.extend(f"CUSTOMS_VALUE_TRANSPORT_NOT_CONVERTED:{code}" for code in codes)
+            total = None
+        else:
+            total = _CTX.add(price.amount, converted.amount)
+    reason = "no usable customs rate to convert the transport into MKD" if total is None else None
+    if total is not None and not _within_bound(total):
+        warnings.append(_OUT_OF_BOUND.format(what="the price"))
+        total, reason = None, "the price plus the transport exceeds the engine's input bound"
+    customs_value = None if total is None else Money(amount=total, currency=price.currency)
+    basis = None
+    if customs_value is not None:
+        basis = (
+            f"{_TRANSACTION_VALUE_REFERENCE}: {word} {_money_text(price.amount, price.currency)} + "
+            f"чл. 35(1)(д) transport to MK place of entry {_money_text(to_entry, 'EUR')} (transport "
+            f"line {_money_text(total_transport, 'EUR')}; separately invoiced inland leg "
+            f"{_money_text(inland, 'EUR')})"
+        )[:300]
+    return _TransactionValue(
+        customs_value, basis, price_eur, reason, tuple(assumptions), tuple(warnings), tuple(needed)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _EstimatedValue:
+    """The estimated customs value plus the transport to the place of entry (``given`` false when
+    the facts carry no estimate)."""
+
+    given: bool
+    customs_value: Money | None = None
+    basis: str | None = None
+    reason: str | None = None
+    #: The estimate's assumptions: listed with the estimate and on every scenario that uses it.
+    assumptions: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def _estimated_value(
+    facts: VehicleImportFacts, *, to_entry: Decimal | None, price_eur: Money | None
+) -> _EstimatedValue:
+    estimate, source = facts.estimated_customs_value_eur, facts.estimated_customs_value_source
+    if estimate is None or source is None:
+        return _EstimatedValue(given=False)
+    used = (
+        f"ESTIMATED_CUSTOMS_VALUE_USED:{source}: the import charges of the primary scenario are computed on "
+        f"the estimated customs value {_money_text(estimate, 'EUR')} + the transport to the MK place of "
+        "entry; the landed cost and the profit use the real purchase price (owner decision 2026-10-13)"
+    )
+    assumptions = (used, _ESTIMATE_TRANSPORT_UNCERTAIN)
+    warnings = [
+        "TRANSACTION_VALUE_ALTERNATIVE: Customs first applies the transaction value, the price actually "
+        f"paid ({_TRANSACTION_VALUE_REFERENCE}), and another method only on founded doubt, in the legal "
+        "order; the transaction_value scenario shows the charges if Customs accepts the price paid"
+    ]
+    if price_eur is not None and estimate < price_eur.amount:
+        warnings.append(
+            f"ESTIMATED_CUSTOMS_VALUE_BELOW_PRICE:{_money_text(estimate, 'EUR')} < "
+            f"{_money_text(price_eur.amount, 'EUR')}: the estimate is below the real purchase price; Customs "
+            f"starts from the price actually paid ({_TRANSACTION_VALUE_REFERENCE}), so the transaction_value "
+            "scenario is the likelier assessment"
+        )
+    if to_entry is None:
+        return _EstimatedValue(
+            True,
+            reason="transport to the MK place of entry unknown",
+            assumptions=assumptions,
+            warnings=tuple(warnings),
+        )
+    total = _CTX.add(estimate, to_entry)
+    if not _within_bound(total):
+        warnings.append(_OUT_OF_BOUND.format(what="the estimated customs value"))
+        return _EstimatedValue(
+            True,
+            reason="the estimate plus the transport exceeds the engine's input bound",
+            assumptions=assumptions,
+            warnings=tuple(warnings),
+        )
+    basis = (
+        f"ESTIMATED customs value ({source}) {_money_text(estimate, 'EUR')} + чл. 35(1)(д) transport to MK "
+        f"place of entry {_money_text(to_entry, 'EUR')} (UNCERTAIN whether Customs adds it); the transaction "
+        f"value ({_TRANSACTION_VALUE_REFERENCE}) is the alternative scenario"
+    )[:300]
+    return _EstimatedValue(
+        True,
+        customs_value=Money(amount=total, currency="EUR"),
+        basis=basis,
+        assumptions=assumptions,
+        warnings=tuple(warnings),
+    )
+
+
+def _purchase_price(facts: VehicleImportFacts, price_eur: Money | None) -> PurchasePrice:
+    """The real purchase price in EUR (exact) with its basis and source."""
+    price = facts.price
+    if price is None:
+        return PurchasePrice(
+            amount=None, basis=None, source="no purchase price given", reason="purchase price unknown"
+        )
+    source = _PRICE_SOURCES[facts.price_basis]
+    if price_eur is not None:
+        return PurchasePrice(amount=price_eur, basis=facts.price_basis, source=source)
+    reason = (
+        _CHF_REASON
+        if price.currency == "CHF"
+        else "no usable customs rate for the EUR equivalent of the price"
+    )
+    return PurchasePrice(amount=None, basis=facts.price_basis, source=source, reason=reason)
+
+
+def _customs_value_for_duties(
+    facts: VehicleImportFacts,
+    *,
+    transaction: _TransactionValue,
+    estimated: _EstimatedValue,
+    fx_inputs: TaxInputs,
+) -> CustomsValueForDuties:
+    """The primary scenario's customs value in EUR (exact), with its basis and source."""
+    if estimated.given:
+        assert facts.estimated_customs_value_source is not None
+        return CustomsValueForDuties(
+            amount=estimated.customs_value,
+            basis="estimated",
+            source=facts.estimated_customs_value_source,
+            reason=estimated.reason,
+        )
+    source = "no purchase price given" if facts.price is None else _PRICE_SOURCES[facts.price_basis]
+    value = transaction.customs_value
+    if value is None:
+        return CustomsValueForDuties(
+            amount=None, basis="transaction_value", source=source, reason=transaction.reason or "unknown"
+        )
+    in_eur = value if value.currency == "EUR" else convert_with_customs_rate(value, "EUR", fx_inputs)[0]
+    return CustomsValueForDuties(
+        amount=in_eur,
+        basis="transaction_value",
+        source=source,
+        reason=None if in_eur is not None else "no usable customs rate for the EUR equivalent",
+    )
+
+
 def build_tax_inputs(
     facts: VehicleImportFacts,
     *,
@@ -811,53 +1178,23 @@ def build_tax_inputs(
             ),
         )
 
-    # Price -> customs value (legal base) and the EUR price for the landed cost.
-    customs_value: Money | None = None
-    basis: str | None = None
-    price_eur: Money | None = None
+    # The real purchase price -> the transaction value (Царински закон чл. 28) and the EUR price
+    # for the landed cost; an estimated customs value, when given, carries the primary charges.
     price = facts.price
-    if price is None:
-        needed.append("price")
-        warnings.append("PRICE_MISSING: purchase price unknown; customs value unknown")
-    elif price.currency == "CHF":
-        # The price is known; what is missing is a price the customs value can use.
-        needed.append("price_in_eur_or_mkd")
-        warnings.append(
-            "CUSTOMS_VALUE_CHF_UNSUPPORTED: a CHF price plus EUR transport needs two customs rates; no "
-            "reference rate is substituted, so the customs value is unknown"
-        )
-    else:
-        if facts.price_basis == "advertised":
-            assumptions.append(
-                "ADVERTISED_PRICE_AS_TRANSACTION_VALUE: the advertised price stands in for the invoice price "
-                "(Царински закон чл. 28)"
-            )
-        price_money = Money(amount=price.amount, currency=price.currency)
-        if price.currency == "EUR":
-            price_eur = price_money
-        else:
-            price_eur, _ = convert_with_customs_rate(price_money, "EUR", fx_inputs)
-        if to_entry is not None:
-            if price.currency == "EUR":
-                customs_value = Money(amount=_CTX.add(price.amount, to_entry), currency="EUR")
-            else:
-                converted, codes = convert_with_customs_rate(
-                    Money(amount=to_entry, currency="EUR"), "MKD", fx_inputs
-                )
-                if converted is None:
-                    needed.append("customs_fx_rate")
-                    warnings.extend(f"CUSTOMS_VALUE_TRANSPORT_NOT_CONVERTED:{code}" for code in codes)
-                else:
-                    customs_value = Money(amount=_CTX.add(price.amount, converted.amount), currency="MKD")
-            if customs_value is not None:
-                assert total_transport is not None
-                word = "invoice" if facts.price_basis == "invoice" else "advertised price"
-                basis = (
-                    f"Царински закон чл. 28: {word} {_money_text(price.amount, price.currency)} + "
-                    f"чл. 35(1)(д) transport to MK place of entry {_money_text(to_entry, 'EUR')} (transport "
-                    f"line {_money_text(total_transport, 'EUR')}; separately invoiced inland leg "
-                    f"{_money_text(inland, 'EUR')})"
-                )[:300]
+    transaction = _transaction_value(
+        facts,
+        to_entry=to_entry,
+        total_transport=total_transport,
+        inland=inland,
+        fx_inputs=fx_inputs,
+    )
+    assumptions.extend(transaction.assumptions)
+    warnings.extend(transaction.warnings)
+    needed.extend(transaction.needed)
+    price_eur = transaction.price_eur
+    estimated = _estimated_value(facts, to_entry=to_entry, price_eur=price_eur)
+    assumptions.extend(estimated.assumptions)
+    warnings.extend(estimated.warnings)
 
     origin_proof, origin_assumptions, origin_warnings = _origin(facts.origin_proof)
     if facts.origin_proof.kind == "unknown":
@@ -894,8 +1231,13 @@ def build_tax_inputs(
         warnings.append("FUEL_UNKNOWN: the fuel decides the motor-vehicle-tax column")
     used = facts.mileage_km is not None and facts.mileage_km >= USED_VEHICLE_MIN_KM
     unverified: list[str] = []
-    if price is not None and facts.price_basis == "advertised":
-        unverified.append("price: advertised price, not an invoice or contract price")
+    if price is not None and facts.price_basis in _CLAIMED_PRICE:
+        unverified.append(_CLAIMED_PRICE[facts.price_basis])
+    if facts.estimated_customs_value_source is not None:
+        unverified.append(
+            f"customs_value: estimated customs value ({facts.estimated_customs_value_source}), not a "
+            "Customs assessment or the price paid"
+        )
     if (
         facts.co2_document == "listing_claim_unverified"
         and co2_value is not None
@@ -915,7 +1257,7 @@ def build_tax_inputs(
     elif facts.importer_status is not None:
         notes.append("IMPORT_VAT_IS_A_FINAL_COST: not deductible for this importer (ЗДДВ чл. 35, 51(3))")
 
-    legal = TaxInputs(
+    transaction_inputs = TaxInputs(
         declaration_date=declaration,
         jurisdiction=jurisdiction,
         classification=classification,
@@ -923,10 +1265,10 @@ def build_tax_inputs(
         vehicle_age_years=age,
         seller_country=facts.seller_country,
         origin_proof=origin_proof,
-        # The price as stated (advertised or invoice); never a customs value by itself.
+        # The real purchase price as stated; never a customs value by itself.
         invoice_price=None if price is None else Money(amount=price.amount, currency=price.currency),
-        customs_value=customs_value,
-        customs_value_basis=basis,
+        customs_value=transaction.customs_value,
+        customs_value_basis=transaction.basis,
         included_costs=included,
         vat_incidental_costs=vat_only,
         co2_g_km=co2_value,
@@ -942,55 +1284,68 @@ def build_tax_inputs(
         exemptions=(),
         importer_status=facts.importer_status,
     )
-    scenarios = [
-        ScenarioInputs(
-            name="legal_base",
-            label=f"Legal base: {facts.price_basis} price + transport to the MK place of entry",
-            inputs=legal,
+    word = _PRICE_WORDS[facts.price_basis]
+    if estimated.given:
+        primary = ScenarioInputs(
+            name="primary",
+            label=(
+                f"Primary: estimated customs value ({facts.estimated_customs_value_source}) + transport to "
+                "the MK place of entry"
+            )[:300],
+            inputs=_with(
+                transaction_inputs, customs_value=estimated.customs_value, customs_value_basis=estimated.basis
+            ),
+            customs_value_kind="estimated",
+            assumptions=estimated.assumptions,
         )
-    ]
+    else:
+        primary = ScenarioInputs(
+            name="primary",
+            label=(
+                f"Primary: transaction value, {word} + transport to the MK place of entry "
+                f"({_TRANSACTION_VALUE_REFERENCE})"
+            ),
+            inputs=transaction_inputs,
+            customs_value_kind="transaction_value",
+        )
+    scenarios = [primary]
     if facts.origin_proof.claimed:
         scenarios.append(
             ScenarioInputs(
                 name="standard_duty_if_proof_rejected",
-                label="Standard duty: Customs rejects or never receives the proof of origin",
-                inputs=_with(legal, origin_proof=_no_proof()),
-                assumptions=(_NO_PROOF_ASSUMPTION,),
+                label=(
+                    "Standard duty: Customs rejects or never receives the proof of origin (primary customs "
+                    "value)"
+                ),
+                inputs=_with(primary.inputs, origin_proof=_no_proof()),
+                customs_value_kind=primary.customs_value_kind,
+                assumptions=(_NO_PROOF_ASSUMPTION, *primary.assumptions),
             )
         )
-    if facts.catalogue_value_eur is not None:
-        risk_value = None if to_entry is None else _CTX.add(facts.catalogue_value_eur, to_entry)
-        risk_basis = None
-        if risk_value is not None and to_entry is not None:
-            catalogue = _money_text(facts.catalogue_value_eur, "EUR")
-            risk_basis = (
-                f"{_RISK_BASIS_PREFIX} catalogue value {catalogue} + transport to MK place of entry "
-                f"{_money_text(to_entry, 'EUR')}"
-            )[:300]
+    if estimated.given:
         scenarios.append(
             ScenarioInputs(
-                name="customs_revaluation_risk",
-                label="Risk: Customs revalues the car at its catalogue value (not the legal customs value)",
-                inputs=_with(
-                    legal,
-                    customs_value=None if risk_value is None else Money(amount=risk_value, currency="EUR"),
-                    customs_value_basis=risk_basis,
+                name="transaction_value",
+                label=(
+                    f"Alternative: Customs accepts the {word} as the transaction value "
+                    f"({_TRANSACTION_VALUE_REFERENCE})"
                 ),
-                assumptions=(
-                    "CUSTOMS_REVALUATION_RISK: catalogue value as customs value (Царински закон чл. 42(3)); "
-                    "never max(invoice, catalogue) (чл. 34(2)(б))",
-                    "CUSTOMS_REVALUATION_TRANSPORT_ADDED: UNCERTAIN - confirm whether Customs adds transport "
-                    "to a catalogue value",
-                ),
+                inputs=transaction_inputs,
+                customs_value_kind="transaction_value",
+                assumptions=(_TRANSACTION_VALUE_ASSUMPTION,),
             )
         )
     return BuiltTaxInputs(
-        inputs=legal,
+        inputs=primary.inputs,
         scenarios=tuple(scenarios),
         assumptions=tuple(dict.fromkeys(assumptions)),
         warnings=tuple(dict.fromkeys(warnings)),
         gates=gates,
         price_eur=price_eur,
+        purchase_price=_purchase_price(facts, price_eur),
+        customs_value_for_duties=_customs_value_for_duties(
+            facts, transaction=transaction, estimated=estimated, fx_inputs=fx_inputs
+        ),
         transport=None if total_transport is None else Money(amount=total_transport, currency="EUR"),
         missing_facts=tuple(dict.fromkeys(needed)),
         notes=tuple(notes),
@@ -1082,10 +1437,15 @@ class EstimateScenario(_Contract):
 
     name: EstimateScenarioName
     label: str
+    #: The engine's customs value input (exact; EUR, or MKD for an MKD price) and its basis.
     customs_value: Money | None
     customs_value_basis: str | None
+    customs_value_kind: CustomsValueBasis
     assumptions: tuple[str, ...]
     complete: bool
+    #: ``customs_value`` in EUR at the customs rate (whole euros, half-up), so scenarios compare in
+    #: one currency; ``None`` when the customs value is unknown or the rate cannot be used.
+    customs_value_eur: Money | None = None
     production_ready: bool
     components: tuple[ComponentResult, ...]
     categories: tuple[CategoryEstimate, ...]
@@ -1129,6 +1489,10 @@ class ImportCostEstimate(_Contract):
     customs_fx_rate: FxRate | None
     eur_basis: str
     landed_cost_note: str = LANDED_COST_NOTE
+    #: The REAL purchase price (whole euros): the landed cost and the profit use it.
+    purchase_price: PurchasePrice
+    #: The customs value the ``primary`` charges are computed on (whole euros, incl. transport).
+    customs_value_for_duties: CustomsValueForDuties
     scenarios: tuple[EstimateScenario, ...]
     assumptions: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -1167,7 +1531,9 @@ class ImportCostEstimate(_Contract):
         if self.production_ready and (
             self.mode != "active" or not self.scenarios or not self.scenarios[0].production_ready
         ):
-            raise ValueError("production_ready follows the legal-base scenario of an active estimate")
+            raise ValueError("production_ready follows the primary scenario of an active estimate")
+        if self.scenarios and self.scenarios[0].name != "primary":
+            raise ValueError("the primary scenario comes first")
         return self
 
     def scenario(self, name: EstimateScenarioName) -> EstimateScenario | None:
@@ -1192,8 +1558,13 @@ _UNAVAILABLE_BANNER: Final = Banner(
 )
 
 
-def _cents(money: Money | None) -> Money | None:
-    return None if money is None else Money(amount=money.quantized(), currency=money.currency)
+def _whole(money: Money | None) -> Money | None:
+    return None if money is None else whole_units(money)
+
+
+def _whole_statement[S: (PurchasePrice, CustomsValueForDuties)](statement: S) -> S:
+    """The statement with its EUR amount in whole euros (half-up)."""
+    return statement.model_copy(update={"amount": _whole(statement.amount)})
 
 
 def _in_eur(amount: Money | None, inputs: TaxInputs) -> Money | None:
@@ -1231,7 +1602,7 @@ def _categories(calc: TaxCalculation, inputs: TaxInputs) -> tuple[CategoryEstima
                 category=category,
                 status=total.status,
                 amount=total.amount,
-                amount_eur=_cents(_in_eur(total.amount, inputs)),
+                amount_eur=_whole(_in_eur(total.amount, inputs)),
                 component_ids=total.component_ids,
             )
         )
@@ -1259,6 +1630,8 @@ def _scenario(
     preview = mode == "indicative_preview"
     total = calc.total_import_cost
     total_eur = _in_eur(total, spec.inputs)
+    # Landed cost on the REAL purchase price (never the estimated customs value), summed exactly
+    # and rounded to whole euros once.
     landed = None
     if total_eur is not None and built.price_eur is not None and built.transport is not None:
         landed = built.price_eur + built.transport + total_eur
@@ -1266,7 +1639,9 @@ def _scenario(
         name=spec.name,
         label=spec.label,
         customs_value=spec.inputs.customs_value,
+        customs_value_eur=_whole(_in_eur(spec.inputs.customs_value, spec.inputs)),
         customs_value_basis=spec.inputs.customs_value_basis,
+        customs_value_kind=spec.customs_value_kind,
         assumptions=spec.assumptions,
         complete=calc.complete,
         production_ready=calc.production_ready and mode == "active",
@@ -1281,11 +1656,11 @@ def _scenario(
         engine_version=calc.engine_version,
         calculation_sha256=calc.content_sha256(),
         total=None if preview else total,
-        total_eur=None if preview else _cents(total_eur),
-        landed_cost_eur=None if preview else _cents(landed),
+        total_eur=None if preview else _whole(total_eur),
+        landed_cost_eur=None if preview else _whole(landed),
         indicative_total=total if preview else None,
-        indicative_total_eur=_cents(total_eur) if preview else None,
-        indicative_landed_cost_eur=_cents(landed) if preview else None,
+        indicative_total_eur=_whole(total_eur) if preview else None,
+        indicative_landed_cost_eur=_whole(landed) if preview else None,
     )
 
 
@@ -1294,7 +1669,7 @@ def _sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=\.)\s+(?=[A-ZА-Я])", text) if s.strip()]
 
 
-def _uncertain_items(rule_set: RuleSet, legal_base: EstimateScenario | None) -> tuple[UncertainItem, ...]:
+def _uncertain_items(rule_set: RuleSet, primary: EstimateScenario | None) -> tuple[UncertainItem, ...]:
     """Every rule-set statement and component marked UNCERTAIN; the ones that apply to this
     vehicle first."""
     items = [
@@ -1304,7 +1679,7 @@ def _uncertain_items(rule_set: RuleSet, legal_base: EstimateScenario | None) -> 
     ]
     not_applicable = {
         c.component_id
-        for c in (legal_base.components if legal_base else ())
+        for c in (primary.components if primary else ())
         if c.status == ComponentStatus.NOT_APPLICABLE
     }
     marked = [
@@ -1441,9 +1816,9 @@ def estimate_import_costs(
             _scenario(s, rule_set, mode=mode, built=built, as_of=as_of) for s in built.scenarios
         )
         missing = scenarios[0].missing_inputs
-    legal_base = scenarios[0] if scenarios else None
-    if legal_base is not None:
-        warnings.extend(_coverage_gaps(legal_base))
+    primary = scenarios[0] if scenarios else None
+    if primary is not None:
+        warnings.extend(_coverage_gaps(primary))
     facts_needed = tuple(
         dict.fromkeys(
             [
@@ -1455,7 +1830,7 @@ def estimate_import_costs(
     )
     return ImportCostEstimate(
         mode=mode,
-        production_ready=bool(legal_base and legal_base.production_ready),
+        production_ready=bool(primary and primary.production_ready),
         banner=_preview_banner(rule_set)
         if mode == "indicative_preview" and rule_set
         else (_UNAVAILABLE_BANNER if rule_set is None else None),
@@ -1471,11 +1846,13 @@ def estimate_import_costs(
         eur_basis=_eur_basis(
             built.effective_customs_rate, given=customs_rate, declaration=declaration_date_for(facts, as_of)
         ),
+        purchase_price=_whole_statement(built.purchase_price),
+        customs_value_for_duties=_whole_statement(built.customs_value_for_duties),
         scenarios=scenarios,
         assumptions=built.assumptions,
         warnings=tuple(dict.fromkeys(warnings)),
         notes=built.notes,
-        uncertain_items=() if rule_set is None else _uncertain_items(rule_set, legal_base),
+        uncertain_items=() if rule_set is None else _uncertain_items(rule_set, primary),
         gates=built.gates,
         missing_inputs=missing,
         missing_facts=facts_needed,

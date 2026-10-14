@@ -57,11 +57,11 @@ pytestmark = pytest.mark.db
 
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "config"
-DRAFT_NAME = "mk_passenger_car_import_2026.10-draft.2.json"
+DRAFT_NAME = "mk_passenger_car_import_2026.10-draft.3.json"
 DRAFT = CONFIG / "tax_rules" / "drafts" / DRAFT_NAME
 PROFILE = CONFIG / "cost_profiles" / "default_unapproved.yaml"
 RULE_SET_ID = "mk-passenger-car-import"
-VERSION = "2026.10-draft.2"
+VERSION = "2026.10-draft.3"
 TAX_RULES = "/api/settings/tax-rules"
 STORE = "/api/settings/tax-rules/store"
 TRANSITION = "/api/settings/tax-rules/transition"

@@ -35,7 +35,10 @@ which ``api.app.create_app`` includes by default; kept apart from ``ROUTES``, th
   ``api.import_cost_routes``; the ``deals_estimate_import_costs`` tool input as flat query
   parameters, ``ImportCostEstimateQuery``) and the owner's approval path for tax rule sets and cost
   profiles (``/api/settings/tax-rules`` and ``/api/settings/cost-profiles``, ``config:admin`` only,
-  served by ``api.owner_config_routes``; never an MCP tool).
+  served by ``api.owner_config_routes``; never an MCP tool), and a listing's recorded import values
+  (``/api/listings/{listing_id}/import-values``: the real purchase price and the estimated customs
+  value, owner decision 2026-10-13; recording is ``config:admin`` only, reading ``deals:read``;
+  served by ``api.import_values_routes``; never an MCP tool).
 """
 
 from __future__ import annotations
@@ -124,6 +127,7 @@ from suv_deals.mcp.schemas import (
     ReviewsSubmitInput,
     SellerInquiriesPauseInput,
     SourcesPauseInput,
+    SourceText,
     SourceVersion,
     SubmitRuleError,
     SummaryText,
@@ -143,6 +147,7 @@ from suv_deals.views.common import (
 )
 from suv_deals.views.comparables import ComparableSetView
 from suv_deals.views.import_costs import ImportCostEstimateView
+from suv_deals.views.import_values import ImportValuesRecordResult, ImportValuesView
 from suv_deals.views.inquiries import (
     CanaryEvidenceView,
     InquiryControlView,
@@ -486,7 +491,11 @@ class ImportCostEstimateQuery(ApiQuery):
     measurement cycle, exactly as printed on the document (never converted); ``origin_proof_kind``
     with ``origin_proof_country`` / ``origin_proof_evidence_ref``. ``co2_clear=true`` estimates
     without any CO2 figure (the listing's claim is dropped) and takes no ``co2_*_g_km``. Failures
-    name these flat parameters.
+    name these flat parameters. ``price_amount`` is the REAL purchase price (the landed cost uses
+    it); ``estimated_customs_value_eur`` + ``estimated_customs_value_source`` (together) carry the
+    primary scenario's charges and add the ``transaction_value`` scenario. ``price_basis`` without
+    ``price_amount`` is refused when the listing has a recorded purchase price (it keeps its
+    recorded kind).
     """
 
     listing_id: Id | None = None
@@ -511,7 +520,8 @@ class ImportCostEstimateQuery(ApiQuery):
     hs_evidence_ref: ReferenceText | None = None
     transport_after_entry_eur: MoneyText | None = None
     transport_after_entry_separately_invoiced: bool | None = None
-    catalogue_value_eur: MoneyText | None = None
+    estimated_customs_value_eur: MoneyText | None = None
+    estimated_customs_value_source: SourceText | None = None
     importer_status: ImporterStatus | None = None
     mileage_km: QuantityText | None = None
     seller_country: CountryCode | None = None
@@ -692,6 +702,49 @@ class CostProfileApproveRequest(ToolInput):
     version: Annotated[int, Field(ge=1, strict=True)]
     content_sha256: _Sha256Text
     idempotency_key: IdempotencyKey
+
+
+# --------------------------------------------------------------------------- recorded import values
+
+
+class RecordPurchasePriceInput(ToolInput):
+    """The REAL purchase price (реална набавна цена) to record: what is, or will be, actually paid,
+    in EUR. The profit and the landed cost use it; it never replaces the customs value."""
+
+    amount: MoneyText = Field(description='Amount in EUR, more than zero, e.g. "2800.00".')
+    currency: Literal["EUR"] = Field(description="EUR only (convert at the rate actually paid).")
+    kind: Literal["actual", "quote", "estimate"] = Field(
+        description="actual: paid (invoice/contract); quote: offered or agreed, not yet paid; estimate."
+    )
+    source: SourceText = Field(description='Where the price comes from, e.g. "seller invoice".')
+    document_ref: ReferenceText | None = Field(default=None, description="Reference of the document.")
+
+
+class RecordCustomsValueInput(ToolInput):
+    """The ESTIMATED customs value (проценета царинска вредност) of the vehicle to record: in EUR,
+    WITHOUT transport, e.g. the SchwackeNet catalogue value. The import charges are computed on it."""
+
+    amount_eur: MoneyText = Field(
+        description='Amount in EUR, more than zero, without transport, e.g. "4200".'
+    )
+    source: SourceText = Field(description='Where the estimate comes from, e.g. "SchwackeNet catalogue".')
+    document_ref: ReferenceText | None = Field(default=None, description="Reference of the document.")
+
+
+class ImportValuesRecordRequest(ToolInput):
+    """Body of ``POST /api/listings/{listing_id}/import-values`` (owner only): record the listing's
+    real purchase price and/or estimated customs value (at least one). Each supersedes the current
+    recorded value of its kind; the listing's valuations are recomputed with them."""
+
+    purchase_price: RecordPurchasePriceInput | None = None
+    estimated_customs_value: RecordCustomsValueInput | None = None
+    idempotency_key: IdempotencyKey
+
+    @model_validator(mode="after")
+    def _something_to_record(self) -> ImportValuesRecordRequest:
+        if self.purchase_price is None and self.estimated_customs_value is None:
+            raise SubmitRuleError(("purchase_price", "estimated_customs_value"))
+        return self
 
 
 # --------------------------------------------------------------------------- spec 37.8 mail workers
@@ -1670,6 +1723,31 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
         idempotency_header="optional",
     ),
+    _r(
+        "GET",
+        "/api/listings/{listing_id}/import-values",
+        ImportValuesView,
+        scope=Scope.DEALS_READ,
+        summary=(
+            "A listing's current recorded real purchase price and estimated customs value with a short"
+            " history (owner decision 2026-10-13: two separate values)."
+        ),
+        errors=_NF,
+    ),
+    _r(
+        "POST",
+        "/api/listings/{listing_id}/import-values",
+        ImportValuesRecordResult,
+        scope=Scope.CONFIG_ADMIN,
+        summary=(
+            "Owner-only: record the real purchase price (profit, landed cost) and/or the estimated customs"
+            " value (import charges); supersedes the current value and recomputes the listing's valuations."
+        ),
+        request=ImportValuesRecordRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="optional",
+    ),
 )
 V11_ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType(
     {route.key: route for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)}
@@ -1745,6 +1823,7 @@ __all__ = [
     "EvaluationQuery",
     "IdempotencyHeader",
     "ImportCostEstimateQuery",
+    "ImportValuesRecordRequest",
     "InquiryListQuery",
     "InquiryPauseRequest",
     "InquiryResumeRequest",
@@ -1776,6 +1855,8 @@ __all__ = [
     "PathId",
     "PauseSourceRequest",
     "RecheckRequest",
+    "RecordCustomsValueInput",
+    "RecordPurchasePriceInput",
     "ReleaseRequest",
     "ReplyListQuery",
     "ResponseEnvelope",

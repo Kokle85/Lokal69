@@ -51,6 +51,7 @@ Business rules implemented here:
 from __future__ import annotations
 
 import decimal
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -59,10 +60,19 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.enums import (
@@ -140,6 +150,31 @@ MATERIAL_CATEGORIES: Final = frozenset(
 
 _AMOUNT_STATUSES: Final = frozenset({CostLineStatus.QUOTED, CostLineStatus.ESTIMATED, CostLineStatus.ACTUAL})
 _EVIDENCED_STATUSES: Final = frozenset({CostLineStatus.QUOTED, CostLineStatus.ACTUAL})
+
+#: Bounds of a source label (``SourceLabel``), counted after trimming.
+SOURCE_LABEL_MIN_LENGTH: Final = 3
+SOURCE_LABEL_MAX_LENGTH: Final = 120
+#: Control, format (bidirectional overrides, zero-width), surrogate and unassigned characters.
+_HIDDEN_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
+
+def _plain_label(value: str) -> str:
+    if any(unicodedata.category(ch) in _HIDDEN_CATEGORIES for ch in value):
+        raise ValueError("a source label has no control, format or unassigned characters")
+    return value
+
+
+#: Where a recorded or estimated amount comes from, as a short label shown next to it (e.g.
+#: "SchwackeNet catalogue", "owner estimate", "dealer invoice 2026-10-01"): 3-120 characters after
+#: trimming, one plain line. Shared by the import-cost facts (``import_estimate.VehicleImportFacts``)
+#: and the recorded import values.
+SourceLabel = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, min_length=SOURCE_LABEL_MIN_LENGTH, max_length=SOURCE_LABEL_MAX_LENGTH
+    ),
+    AfterValidator(_plain_label),
+]
 
 
 # --------------------------------------------------------------------------- models
@@ -563,6 +598,7 @@ def tax_cost_lines(
     *,
     missing_reason: str | None = None,
     unverified_inputs: Sequence[str] = (),
+    input_evidence_ids: Sequence[str] = (),
 ) -> tuple[CostLine, ...]:
     """One line per import category from a tax calculation (in the rule currency).
 
@@ -575,7 +611,8 @@ def tax_cost_lines(
     as an advertised price or a listing's CO2 figure, ``BuiltTaxInputs.unverified_inputs``):
     those amounts are estimates on unapproved assumptions, never rule- or quote-supported.
     Every line carries the rule identity and the ``tax_calculation:<sha256>`` evidence id of
-    the exact calculation.
+    the exact calculation, plus ``input_evidence_ids``: the recorded inputs the calculation was
+    built from (e.g. the owner's recorded estimated customs value), so a valuation cites them.
 
     Only an engine ``TaxCalculation`` becomes cost lines. An import-cost estimate
     (``domain.import_estimate``, e.g. an indicative preview on unapproved rules) is
@@ -599,9 +636,14 @@ def tax_cost_lines(
             for c in sorted(IMPORT_CATEGORIES)
         )
     totals = calc.category_totals()
-    evidence = (
-        f"tax_rule_set:{calc.rule_set_id}@{calc.version}:{calc.rule_sha256 or 'unhashed'}",
-        tax_calculation_evidence_id(calc),
+    evidence = tuple(
+        dict.fromkeys(
+            (
+                f"tax_rule_set:{calc.rule_set_id}@{calc.version}:{calc.rule_sha256 or 'unhashed'}",
+                tax_calculation_evidence_id(calc),
+                *input_evidence_ids,
+            )
+        )
     )
     supported = calc.production_ready and not claims
     estimate_reason = None

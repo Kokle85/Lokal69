@@ -3,8 +3,11 @@
 North Macedonian customs duty, motor-vehicle tax and import VAT for one vehicle through the shared
 calculator read (``queries.get_import_cost_estimate``). Covered: the indicative preview on the
 shipped DRAFT rule set from vehicle facts alone, from a listing and with request overrides (the
-fact sheet's golden totals G01/G02/G03), unknown inputs that change the result (never zero), the
-ACTIVE rule set taking precedence, ``unavailable`` without any rule set, scope, validation, the
+fact sheet's golden totals G01/G02/G03, in whole units), the estimated customs value apart from the
+real purchase price (owner decision 2026-10-13), the owner's RECORDED values of a listing used
+automatically in listing mode (and a dot-supplied value replacing one for that call only; dot can
+never record them), unknown inputs that change the result (never zero), the ACTIVE rule set taking
+precedence, ``unavailable`` without any rule set, scope, validation, the
 same ``NOT_FOUND`` for missing and foreign listings, the expensive rate-limit bucket, the official
 SDK client's output-schema validation, and that a call persists nothing. Every workspace, listing
 and rate is SYNTHETIC; the customs rate 61.5337 is the golden-case test input.
@@ -16,6 +19,7 @@ import shutil
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -28,9 +32,16 @@ from mcp.client.streamable_http import streamable_http_client
 
 from suv_deals.api.middleware import RateLimit
 from suv_deals.domain.enums import Role, Scope, TaxRuleStatus
-from suv_deals.mcp.schemas import tool_output_schema
+from suv_deals.mcp.schemas import ALL_TOOL_NAMES, tool_output_schema
 from suv_deals.mcp.server import McpOptions
+from suv_deals.persistence import import_values_repo
 from suv_deals.persistence.database import Database
+from suv_deals.persistence.import_values_repo import (
+    ImportValuesRecorded,
+    RecordedCustomsValue,
+    RecordedPurchase,
+)
+from suv_deals.persistence.transactions import unit_of_work
 from tests.integration.db.helpers import Seed
 from tests.integration.import_costs.support import (
     CONFIG,
@@ -58,9 +69,10 @@ from tests.mcp.conftest import (
 pytestmark = pytest.mark.db
 
 NAME = "deals_estimate_import_costs"
-G01 = "168154.45"  # D1: diesel, NEDC 189 on the COC, EUR 3,000 + EUR 700 transport, no proof of origin
-G02 = "154721.64"  # D2: the same car with an accepted EU proof of origin
-G03 = "217629.97"  # D3: petrol, NEDC 245 on the COC, EUR 2,500 + EUR 700
+#: Whole denars without a fraction (owner decision of 2026-10-13: amounts without decimals).
+G01 = "168155"  # D1: diesel, NEDC 189 on the COC, EUR 3,000 + EUR 700 transport, no proof of origin
+G02 = "154722"  # D2: the same car with an accepted EU proof of origin
+G03 = "217630"  # D3: petrol, NEDC 245 on the COC, EUR 2,500 + EUR 700
 SECRET = "Zz" * 20  # a value that must never be echoed
 D1: dict[str, Any] = {
     "price": {"amount": "3000.00", "currency": "EUR"},
@@ -70,6 +82,10 @@ D1: dict[str, Any] = {
     "co2": [{"cycle": "nedc", "g_km": "189"}],
     "co2_document": "coc",
 }
+#: The owner's example (2026-10-13): bought for EUR 2,800, the SchwackeNet catalogue says EUR 4,200.
+PAID = RecordedPurchase(amount=Decimal("2800.00"), kind="actual", source="seller invoice")
+SCHWACKE = RecordedCustomsValue(amount_eur=Decimal("4200"), source="SchwackeNet catalogue")
+LISTING_FACTS: dict[str, Any] = {"co2_document": "coc", "declaration_date": "2026-10-13"}
 
 
 @dataclass
@@ -113,9 +129,31 @@ async def calc_mcp(
         )
 
 
-def legal_base(data: dict[str, Any]) -> dict[str, Any]:
+async def record_values(
+    harness: CalcHarness,
+    *,
+    purchase: RecordedPurchase | None = None,
+    customs_value: RecordedCustomsValue | None = None,
+) -> ImportValuesRecorded:
+    """The OWNER records the listing's values (the dashboard's path; dot has no tool for it)."""
+    who = owner(harness.workspace_id)
+    async with unit_of_work(harness.db, who) as conn:
+        return await import_values_repo.record_import_values(
+            conn, who, harness.listing_id, purchase=purchase, customs_value=customs_value
+        )
+
+
+def totals(data: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """``{scenario: (indicative_total MKD, indicative_landed_cost_eur)}``."""
+    return {
+        s["name"]: (s["indicative_total"]["amount"], s["indicative_landed_cost_eur"]["amount"])
+        for s in data["scenarios"]
+    }
+
+
+def primary(data: dict[str, Any]) -> dict[str, Any]:
     scenario: dict[str, Any] = data["scenarios"][0]
-    assert scenario["name"] == "legal_base"
+    assert scenario["name"] == "primary"
     return scenario
 
 
@@ -140,15 +178,25 @@ async def test_preview_from_vehicle_facts_alone_is_labelled_and_persists_nothing
     assert "unapproved draft rules" in data["banner"]["en"]
     assert data["rule"]["rule_set_id"] == "mk-passenger-car-import" and data["rule"]["status"] == "draft"
     assert data["rule"]["sha256_recorded"] is False  # an unsealed draft shows its content hash
-    legal = legal_base(data)
+    legal = primary(data)
     assert legal["complete"] is True and legal["production_ready"] is False
     assert legal["indicative_total"]["amount"] == G01 and legal["indicative_total"]["currency"] == "MKD"
     assert legal["total"] is None and legal["landed_cost_eur"] is None
-    assert legal["indicative_landed_cost_eur"]["status"] == "known"
+    # Whole euros (owner decision 2026-10-13): EUR 2,732.73 and 6,432.73.
+    assert legal["indicative_total_eur"]["amount"] == "2733"
+    assert legal["indicative_landed_cost_eur"] == {
+        "status": "known",
+        "amount": "6433",
+        "currency": "EUR",
+        "reason": None,
+    }
+    assert data["purchase_price"]["amount"]["amount"] == "3000"
+    assert data["customs_value_for_duties"]["amount"]["amount"] == "3700"
+    assert data["customs_value_for_duties"]["basis"] == "transaction_value"
     assert data["customs_fx_source"] == "caller_supplied" and data["listing"] is None
     assert data["customs_fx_rate"]["rate"] == CUSTOMS_RATE
     assert any(a.startswith("CALLER_SUPPLIED_CUSTOMS_RATE") for a in data["assumptions"])
-    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700.00 EUR") for a in data["assumptions"])
+    assert any(a.startswith("TRANSPORT_IN_CUSTOMS_VALUE:700 EUR") for a in data["assumptions"])
     assert {s["fact"]: s["source"] for s in data["fact_sources"]}["price"] == "request"
     assert "TAX_RULES_UNAPPROVED" in codes(envelope)
     assert "display only" in data["usage_note"].lower()
@@ -168,7 +216,7 @@ async def test_preview_from_a_listing_uses_its_facts_and_the_recorded_customs_ra
     )
     data = envelope["data"]
     assert data["mode"] == "indicative_preview"
-    assert legal_base(data)["indicative_total"]["amount"] == G01
+    assert primary(data)["indicative_total"]["amount"] == G01
     assert (
         data["listing"]["listing_id"] == str(calc_mcp.listing_id) and data["listing"]["is_fixture"] is False
     )
@@ -197,7 +245,7 @@ async def test_vehicle_facts_override_the_listing(calc_mcp: CalcHarness) -> None
         }
     )
     data = envelope["data"]
-    assert legal_base(data)["indicative_total"]["amount"] == G03
+    assert primary(data)["indicative_total"]["amount"] == G03
     sources = {s["fact"]: s["source"] for s in data["fact_sources"]}
     assert {sources[f] for f in ("price", "fuel", "co2", "co2_document")} == {"request"}
     assert sources["seller_country"] == "listing" and sources["first_registration"] == "listing"
@@ -208,7 +256,7 @@ async def test_unknown_inputs_change_the_result_and_are_never_zero(calc_mcp: Cal
     unknown = {k: v for k, v in D1.items() if k != "co2_document"} | {"origin_proof": {"kind": "unknown"}}
     envelope = await calc_mcp.ok({"vehicle": unknown, "customs_eur_mkd_rate": CUSTOMS_RATE})
     data = envelope["data"]
-    legal = legal_base(data)
+    legal = primary(data)
     assert legal["complete"] is False
     assert legal["indicative_total"] == {**legal["indicative_total"], "status": "unknown", "amount": None}
     assert legal["known_subtotal"] is not None and legal["unknown_components"]
@@ -222,7 +270,7 @@ async def test_unknown_inputs_change_the_result_and_are_never_zero(calc_mcp: Cal
         }
     )
     scenarios = {s["name"]: s for s in proof["data"]["scenarios"]}
-    assert scenarios["legal_base"]["indicative_total"]["amount"] == G02
+    assert scenarios["primary"]["indicative_total"]["amount"] == G02
     assert scenarios["standard_duty_if_proof_rejected"]["indicative_total"]["amount"] == G01
 
 
@@ -237,7 +285,160 @@ async def test_an_implausible_first_registration_is_a_labelled_unknown_not_an_in
     )
     warnings = envelope["data"]["warnings"]
     assert any(w.startswith(f"FIRST_REGISTRATION_IMPLAUSIBLE:{first_registration}") for w in warnings)
-    assert legal_base(envelope["data"])["indicative_total"]["amount"] == G01  # the age never changes it
+    assert primary(envelope["data"])["indicative_total"]["amount"] == G01  # the age never changes it
+
+
+async def test_an_estimated_customs_value_carries_the_charges_and_the_price_paid_the_landed_cost(
+    calc_mcp: CalcHarness,
+) -> None:
+    """Owner decision 2026-10-13: bought for EUR 2,800, the catalogue says EUR 4,200."""
+    vehicle = D1 | {
+        "price": {"amount": "2800.00", "currency": "EUR"},
+        "estimated_customs_value_eur": "4200",
+        "estimated_customs_value_source": "SchwackeNet catalogue",
+    }
+    envelope = await calc_mcp.ok({"vehicle": vehicle, "customs_eur_mkd_rate": CUSTOMS_RATE})
+    data = envelope["data"]
+    scenarios = {s["name"]: s for s in data["scenarios"]}
+    assert [s["name"] for s in data["scenarios"]] == ["primary", "transaction_value"]
+    assert scenarios["primary"]["customs_value_kind"] == "estimated"
+    assert scenarios["primary"]["customs_value"]["amount"] == "4900"
+    assert scenarios["primary"]["indicative_total"]["amount"] == "185803"
+    assert scenarios["primary"]["indicative_landed_cost_eur"]["amount"] == "6520"
+    assert scenarios["transaction_value"]["indicative_total"]["amount"] == "165213"
+    assert scenarios["transaction_value"]["indicative_landed_cost_eur"]["amount"] == "6185"
+    assert data["purchase_price"] == {
+        "amount": {"status": "known", "amount": "2800", "currency": "EUR", "reason": None},
+        "basis": "invoice",
+        "source": "invoice or contract price",
+    }
+    assert data["customs_value_for_duties"]["basis"] == "estimated"
+    assert data["customs_value_for_duties"]["source"] == "SchwackeNet catalogue"
+    assert {s["fact"]: s["source"] for s in data["fact_sources"]}["estimated_customs_value_eur"] == "request"
+    assert any(w.startswith("TRANSACTION_VALUE_ALTERNATIVE") for w in data["warnings"])
+    assert "SELLER_CLAIMS_UNVERIFIED" in codes(envelope)
+
+
+async def test_listing_mode_uses_the_owners_recorded_values_automatically(calc_mcp: CalcHarness) -> None:
+    """The owner recorded the real purchase price (EUR 2,800, paid) and the SchwackeNet estimate
+    (EUR 4,200) on the dashboard; dot passes only the listing and gets both, labelled recorded."""
+    await record_customs_rate(calc_mcp.db, calc_mcp.workspace_id)
+    recorded = await record_values(calc_mcp, purchase=PAID, customs_value=SCHWACKE)
+    purchase_id, customs_id = (str(i) for i in recorded.recorded_ids)
+    before = counts(calc_mcp.seed, calc_mcp.workspace_id)
+    evidence = "select count(*) from app.cost_evidence where workspace_id = %s"
+    rows_before = calc_mcp.seed.scalar(evidence, (calc_mcp.workspace_id,))
+    envelope = await calc_mcp.ok({"listing_id": str(calc_mcp.listing_id), "vehicle": LISTING_FACTS})
+    # A read: no valuation, audit, job or cost-evidence row is written by the tool.
+    assert counts(calc_mcp.seed, calc_mcp.workspace_id) == before
+    assert calc_mcp.seed.scalar(evidence, (calc_mcp.workspace_id,)) == rows_before
+    data = envelope["data"]
+    # Duties on the estimate + EUR 700 transport; every landed cost on the EUR 2,800 actually paid
+    # (not the advertised EUR 3,000). Whole units only.
+    assert totals(data) == {"primary": ("185803", "6520"), "transaction_value": ("165213", "6185")}
+    scenarios = {s["name"]: s for s in data["scenarios"]}
+    assert scenarios["primary"]["customs_value_kind"] == "estimated"
+    assert scenarios["primary"]["customs_value"]["amount"] == "4900"
+    assert scenarios["transaction_value"]["customs_value"]["amount"] == "3500"
+    price = data["purchase_price"]
+    assert price["amount"]["amount"] == "2800" and price["basis"] == "recorded_actual"
+    assert (
+        price["source"].startswith("recorded actual purchase price") and "seller invoice" in price["source"]
+    )
+    duties = data["customs_value_for_duties"]
+    assert duties["amount"]["amount"] == "4900" and duties["basis"] == "estimated"
+    assert duties["source"].startswith("recorded estimated customs value")
+    assert "SchwackeNet catalogue" in duties["source"]
+    sources = {s["fact"]: s["source"] for s in data["fact_sources"]}
+    recorded_facts = ("price", "price_basis", "estimated_customs_value_eur", "estimated_customs_value_source")
+    assert {sources[f] for f in recorded_facts} == {"recorded"}
+    assert sources["co2"] == "listing" and sources["co2_document"] == "request"
+    assert data["listing"]["recorded_purchase_price_id"] == purchase_id
+    assert data["listing"]["recorded_customs_value_id"] == customs_id
+    assert any(n.startswith(f"RECORDED_PURCHASE_PRICE_USED:{purchase_id}:") for n in data["notes"])
+    assert any(n.startswith(f"RECORDED_CUSTOMS_VALUE_USED:{customs_id}:") for n in data["notes"])
+    # The catalogue estimate is not evidence of what Customs will assess; the paid price is.
+    assert any(u.startswith("customs_value:") for u in data["unverified_inputs"])
+    assert not any(u.startswith("price:") for u in data["unverified_inputs"])
+    # Dot reads recorded values but can never record them: no served tool writes import values.
+    owner_token = calc_mcp.tokens.for_role(calc_mcp.users.owner, Role.OWNER)
+    served = [t["name"] for t in await calc_mcp.client.tools(owner_token)]
+    assert set(served) <= set(ALL_TOOL_NAMES)
+    assert not [n for n in ALL_TOOL_NAMES if "record" in n or "import_value" in n or "customs" in n]
+
+
+async def test_a_dot_supplied_value_replaces_the_recorded_one_for_that_call_only(
+    calc_mcp: CalcHarness,
+) -> None:
+    await record_customs_rate(calc_mcp.db, calc_mcp.workspace_id)
+    recorded = await record_values(calc_mcp, purchase=PAID, customs_value=SCHWACKE)
+    purchase_id, customs_id = (str(i) for i in recorded.recorded_ids)
+    listing = str(calc_mcp.listing_id)
+    # Dot's own estimate replaces the recorded SchwackeNet value; the recorded price stays.
+    estimate = {"estimated_customs_value_eur": "3500", "estimated_customs_value_source": "owner estimate"}
+    envelope = await calc_mcp.ok({"listing_id": listing, "vehicle": LISTING_FACTS | estimate})
+    data = envelope["data"]
+    sources = {s["fact"]: s["source"] for s in data["fact_sources"]}
+    assert sources["estimated_customs_value_eur"] == "request" and sources["price"] == "recorded"
+    assert data["customs_value_for_duties"] == {
+        "amount": {"status": "known", "amount": "4200", "currency": "EUR", "reason": None},
+        "basis": "estimated",
+        "source": "owner estimate",
+    }
+    assert data["purchase_price"]["amount"]["amount"] == "2800"
+    assert any(n.startswith(f"RECORDED_CUSTOMS_VALUE_OVERRIDDEN:{customs_id}:") for n in data["notes"])
+    assert any(n.startswith(f"RECORDED_PURCHASE_PRICE_USED:{purchase_id}:") for n in data["notes"])
+    # The same facts given to dot without a listing give the same charges and landed costs.
+    alone = await calc_mcp.ok(
+        {
+            "vehicle": D1 | {"price": {"amount": "2800.00", "currency": "EUR"}} | estimate,
+            "customs_eur_mkd_rate": CUSTOMS_RATE,
+        }
+    )
+    assert totals(data) == totals(alone["data"])
+    scenarios = {s["name"]: s for s in data["scenarios"]}
+    assert scenarios["primary"]["customs_value"]["amount"] == "4200"  # 3,500 + 700 transport
+    assert scenarios["transaction_value"]["customs_value"]["amount"] == "3500"  # 2,800 + 700
+    assert totals(data)["transaction_value"] == ("165213", "6185")
+    # Dot's own real purchase price replaces the recorded one; the recorded estimate stays.
+    priced = await calc_mcp.ok(
+        {
+            "listing_id": listing,
+            "vehicle": LISTING_FACTS
+            | {"price": {"amount": "3000.00", "currency": "EUR"}, "price_basis": "invoice"},
+        }
+    )
+    pdata = priced["data"]
+    assert (
+        pdata["purchase_price"]["basis"] == "invoice"
+        and pdata["purchase_price"]["amount"]["amount"] == "3000"
+    )
+    assert pdata["customs_value_for_duties"]["amount"]["amount"] == "4900"
+    assert totals(pdata)["transaction_value"][0] == G01  # D1 on the EUR 3,000 invoice
+    assert any(n.startswith(f"RECORDED_PURCHASE_PRICE_OVERRIDDEN:{purchase_id}:") for n in pdata["notes"])
+    # Nothing was stored by either call: the next call uses the recorded values again.
+    again = await calc_mcp.ok({"listing_id": listing, "vehicle": LISTING_FACTS})
+    assert totals(again["data"]) == {"primary": ("185803", "6520"), "transaction_value": ("165213", "6185")}
+
+
+async def test_a_recorded_purchase_price_alone_is_the_transaction_value(calc_mcp: CalcHarness) -> None:
+    await record_customs_rate(calc_mcp.db, calc_mcp.workspace_id)
+    await record_values(
+        calc_mcp, purchase=RecordedPurchase(amount=Decimal("2800.50"), kind="quote", source="seller offer")
+    )
+    envelope = await calc_mcp.ok({"listing_id": str(calc_mcp.listing_id), "vehicle": LISTING_FACTS})
+    data = envelope["data"]
+    assert [s["name"] for s in data["scenarios"]] == ["primary"]  # no estimate: no alternative
+    assert primary(data)["customs_value_kind"] == "transaction_value"
+    # Whole euros, half-up: EUR 2,800.50 shows as 2801; the charges use the exact amount.
+    assert data["purchase_price"]["amount"]["amount"] == "2801"
+    assert data["purchase_price"]["basis"] == "recorded_quote"
+    assert data["customs_value_for_duties"]["amount"]["amount"] == "3501"
+    assert data["customs_value_for_duties"]["basis"] == "transaction_value"
+    for scenario in data["scenarios"]:
+        for amount in (scenario["indicative_total"], scenario["indicative_landed_cost_eur"]):
+            assert amount["amount"].isdigit(), amount  # never a fraction
+    assert "price: recorded quote, not a paid invoice or contract price" in data["unverified_inputs"]
 
 
 # --------------------------------------------------------------------------------------------
@@ -253,8 +454,9 @@ async def test_an_active_rule_set_takes_precedence_over_the_preview(calc_mcp: Ca
     data = envelope["data"]
     assert data["mode"] == "active" and data["banner"] is None
     assert data["rule"]["status"] == "active" and data["rule"]["sha256_recorded"] is True
-    legal = legal_base(data)
+    legal = primary(data)
     assert legal["total"]["amount"] == G01 and legal["indicative_total"] is None
+    assert legal["total_eur"]["amount"] == "2733" and legal["landed_cost_eur"]["amount"] == "6433"
     assert "TAX_RULES_UNAPPROVED" not in codes(envelope)
 
 
@@ -326,6 +528,11 @@ async def test_invalid_arguments_are_validation_errors_naming_fields_only(calc_m
             ["vehicle.transport_after_entry_eur", "vehicle.transport_after_entry_separately_invoiced"],
         ),
         ({"vehicle": {"recipient": SECRET}}, ["vehicle.recipient"]),
+        (
+            {"vehicle": {"estimated_customs_value_eur": "4200"}},
+            ["vehicle.estimated_customs_value_eur", "vehicle.estimated_customs_value_source"],
+        ),
+        ({"vehicle": {"catalogue_value_eur": "6000"}}, ["vehicle.catalogue_value_eur"]),
     ]
     for arguments, fields in bad:
         payload = await calc_mcp.client.fails(NAME, arguments, token=calc_mcp.viewer, code="VALIDATION_ERROR")

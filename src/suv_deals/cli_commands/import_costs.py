@@ -1,12 +1,17 @@
-"""``suv-deals import-costs estimate`` (fit design 6; docs/tax_rule_approval.md).
+"""``suv-deals import-costs estimate | values | record-values`` (fit design 6; docs/tax_rule_approval.md).
 
-The import-cost calculator for one vehicle: customs duty, motor-vehicle tax and import VAT on
-import into North Macedonia, from a listing's facts (``--listing-id``), the facts given here, or
-both (a fact given here overrides the listing's). The read service is the one behind the MCP
-tool ``deals_estimate_import_costs`` and the dashboard (``persistence.queries.import_costs``).
+``estimate`` is the import-cost calculator for one vehicle: customs duty, motor-vehicle tax and
+import VAT on import into North Macedonia, from a listing's facts (``--listing-id``), the facts
+given here, or both (a fact given here overrides the listing's). The read service is the one behind
+the MCP tool ``deals_estimate_import_costs`` and the dashboard (``persistence.queries.import_costs``).
+``values`` / ``record-values`` show and record a listing's two values (owner decision 2026-10-13,
+below) through ``persistence.import_values_repo``, the store behind
+``GET/POST /api/listings/{listing_id}/import-values``.
 
-- Read-only (scope ``deals:read``, the operator's system actor): no valuation, cost line, alert,
-  rate or audit row is written, so there is no ``--yes``.
+- ``estimate`` is read-only (scope ``deals:read``, the operator's system actor): no valuation, cost
+  line, alert, rate or audit row is written, so there is no ``--yes``. In listing mode the
+  listing's CURRENT recorded values are used automatically (fact source ``recorded``) unless a
+  value is given here.
 - Rules: an ACTIVE, owner-approved rule set when one applies (``mode: active``); otherwise an
   INDICATIVE PREVIEW of the best version that is not ACTIVE (approved, under review, then draft),
   shown with the MK/EN banner naming its status, totals named
@@ -16,6 +21,21 @@ tool ``deals_estimate_import_costs`` and the dashboard (``persistence.queries.im
   (standard duty), no tariff code unless ``--hs-code`` is given, no WLTP <-> NEDC conversion.
 - Amounts are exact decimals (``3000`` or ``3000.50``, never ``3000,50``). No rate, coefficient or
   threshold lives here; this module only collects facts and prints the shared view.
+- Two values (owner decision 2026-10-13): ``--price`` is the REAL purchase price (реална набавна
+  цена; the profit and every landed cost use it); ``--estimated-customs-value-eur`` with
+  ``--estimated-customs-value-source`` is the ESTIMATED customs value of the vehicle without
+  transport (проценета царинска вредност, e.g. the SchwackeNet catalogue value), the value the
+  primary charges are computed on (plus the transport to the MK place of entry); the
+  ``transaction_value`` scenario shows the charges on the price paid (Customs Law art. 28, the
+  primary method). Results are printed in whole units (MKD and EUR, half-up); a fact typed with a
+  fraction is shown whole with its exact value next to it (calculations use the exact value).
+- ``values`` is read-only (``deals:read``, the operator's system actor): the current real purchase
+  price and estimated customs value of a listing and a short history.
+- ``record-values`` is an OWNER action: ``--owner-user-id`` must be an ACTIVE owner of the
+  workspace (verified; the rows and the audit event ``import_values.record`` name that owner) and
+  ``--yes`` confirms the write. Each value supersedes the listing's current value of the same kind
+  (append-only history); the listing's valuations are marked stale and one recomputation is
+  queued. Amounts are EUR with at most two decimals and more than zero; nothing is converted here.
 """
 
 # ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
@@ -25,7 +45,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
 
@@ -39,6 +59,7 @@ from suv_deals.cli_commands._common import (
     fail,
     load_settings,
     pass_cli,
+    require_yes,
     run_async,
     safe,
     workspace_option,
@@ -46,9 +67,15 @@ from suv_deals.cli_commands._common import (
 from suv_deals.domain.enums import Co2Cycle, Fuel
 
 if TYPE_CHECKING:
+    from suv_deals.persistence.import_values_repo import RecordedCustomsValue, RecordedPurchase
     from suv_deals.persistence.queries.import_costs import ImportCostRequest
     from suv_deals.views.common import AmountView, ResponseWarning
     from suv_deals.views.import_costs import ImportCostEstimateView, ImportScenarioView
+    from suv_deals.views.import_values import (
+        ImportValueRecordView,
+        ImportValuesRecordResult,
+        ImportValuesView,
+    )
 
 #: The closed vocabularies of ``domain.import_estimate`` (kept equal by tests/cli; repeated here
 #: so ``--help`` does not import the domain).
@@ -64,6 +91,11 @@ CO2_DOCUMENTS: Final = (
 )
 ORIGIN_PROOF_KINDS: Final = ("none", "unknown", "eu", "efta", "tr", "uk", "cefta", "ua", "us")
 IMPORTER_STATUSES: Final = ("private", "non_vat_business", "vat_dealer")
+#: How firm a recorded real purchase price is (``import_values_repo.RecordedKind``).
+PURCHASE_KINDS: Final = ("actual", "quote", "estimate")
+#: History rows ``values`` shows by default / at most (``import_values_repo``).
+DEFAULT_HISTORY: Final = 10
+MAX_HISTORY: Final = 50
 
 _DECIMAL_RE: Final = re.compile(r"^[0-9]{1,15}(\.[0-9]{1,10})?$")
 _PARTIAL_DATE_RE: Final = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
@@ -77,7 +109,8 @@ _PLAIN_FACTS: Final = (
     "hs_code",
     "hs_evidence_ref",
     "transport_after_entry_eur",
-    "catalogue_value_eur",
+    "estimated_customs_value_eur",
+    "estimated_customs_value_source",
     "importer_status",
     "mileage_km",
     "engine_displacement_cm3",
@@ -219,6 +252,23 @@ def _amount(view: AmountView) -> str:
     return "unknown" + (f" ({view.reason})" if view.reason else "")
 
 
+def whole(text: str, unit: str = "") -> str:
+    """A decimal in whole units, half-up (owner decision 2026-10-13: "без децимали"):
+    ``whole("3000.00", "EUR")`` is ``3000 EUR``; an amount with a fraction keeps its exact value
+    next to it, ``2801 EUR (exact 2800.50)``, since calculations always use the exact value."""
+    exact = Decimal(text)
+    rounded = exact.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    shown = f"{rounded} {unit}" if unit else f"{rounded}"
+    return shown if rounded == exact else f"{shown} (exact {text})"
+
+
+def _fact_amount(view: AmountView) -> str:
+    """A fact echoed as typed (``"3000.00"``), shown in whole units."""
+    if view.status == "known" and view.amount is not None:
+        return whole(view.amount, view.currency or "")
+    return _amount(view)
+
+
 def _pair(local: AmountView, eur: AmountView | None) -> str:
     """``<amount> MKD  (<amount> EUR)``; an unknown amount is shown once, with its reason."""
     if local.status != "known" or eur is None or local.currency == "EUR":
@@ -250,7 +300,7 @@ def _facts_lines(view: ImportCostEstimateView) -> list[str]:
         proof += f", evidence {facts.origin_proof_evidence_ref}"
     lines = [
         "  facts used [source]:",
-        tagged("price", f"{_amount(facts.price)} ({facts.price_basis})", "price"),
+        tagged("real purchase price", f"{_fact_amount(facts.price)} ({facts.price_basis})", "price"),
         tagged("fuel", facts.fuel.value, "fuel"),
         tagged("CO2", co2, "co2"),
         tagged("CO2 document", facts.co2_document or "not stated", "co2_document"),
@@ -259,9 +309,18 @@ def _facts_lines(view: ImportCostEstimateView) -> list[str]:
         tagged("first registration", facts.first_registration or "unknown", "first_registration"),
         tagged("emissions class", facts.emissions_class or "unknown", "emissions_class"),
     ]
+
+    def eur(value: str | None) -> str | None:
+        return None if value is None else whole(value, "EUR")
+
     optional = (
-        ("inland leg (separate)", facts.transport_after_entry_eur, " EUR", "transport_after_entry_eur"),
-        ("catalogue value", facts.catalogue_value_eur, " EUR", "catalogue_value_eur"),
+        ("inland leg (separate)", eur(facts.transport_after_entry_eur), "", "transport_after_entry_eur"),
+        (
+            "estimated customs value",
+            eur(facts.estimated_customs_value_eur),
+            f", without transport ({facts.estimated_customs_value_source})",
+            "estimated_customs_value_eur",
+        ),
         ("importer status", facts.importer_status, "", "importer_status"),
         ("mileage", facts.mileage_km, " km", "mileage_km"),
         ("seller country", facts.seller_country, "", "seller_country"),
@@ -275,7 +334,10 @@ def _facts_lines(view: ImportCostEstimateView) -> list[str]:
 def _scenario_lines(scenario: ImportScenarioView, *, active: bool, verbose: bool) -> list[str]:
     lines = [f"Scenario {scenario.name}: {safe(scenario.label)}"]
     basis = f"  ({scenario.customs_value_basis})" if scenario.customs_value_basis else ""
-    lines.append(_line("customs value", _amount(scenario.customs_value) + basis))
+    kind = f" [{scenario.customs_value_kind}]"
+    lines.append(
+        _line("customs value", _pair(scenario.customs_value, scenario.customs_value_eur) + kind + basis)
+    )
     categories = {c.category.value: c for c in scenario.categories}
     for key, label in _CATEGORY_LABELS.items():
         row = categories.get(key)
@@ -338,6 +400,14 @@ def render_estimate(
         )
     gates = view.gates
     lines.append(_line("import gate", f"importable {gates.importable}: {gates.reason}"))
+    price = view.purchase_price
+    lines.append(
+        _line("real purchase price", f"{_amount(price.amount)}  ({price.basis or 'none'}: {price.source})")
+    )
+    duties = view.customs_value_for_duties
+    lines.append(
+        _line("customs value for duties", f"{_amount(duties.amount)}  ({duties.basis}: {duties.source})")
+    )
     lines += _facts_lines(view)
     for scenario in view.scenarios:
         lines += ["", *_scenario_lines(scenario, active=active, verbose=verbose)]
@@ -368,7 +438,8 @@ def render_estimate(
 
 @click.group("import-costs")
 def import_costs_group() -> None:
-    """Import-cost calculator: customs duty, motor-vehicle tax and import VAT (read-only)."""
+    """Import-cost calculator (read-only) and a listing's recorded real purchase price and
+    estimated customs value (recording is an owner action)."""
 
 
 @import_costs_group.command("estimate")
@@ -376,7 +447,12 @@ def import_costs_group() -> None:
 @click.option(
     "--listing-id", type=click.UUID, default=None, help="Use this listing's facts (current revision)."
 )
-@click.option("--price", type=DECIMAL, default=None, help="Purchase price (exact decimal).")
+@click.option(
+    "--price",
+    type=DECIMAL,
+    default=None,
+    help="Real purchase price (exact decimal); the landed cost uses it.",
+)
 @click.option(
     "--price-currency",
     type=click.Choice(PRICE_CURRENCIES),
@@ -446,10 +522,16 @@ def import_costs_group() -> None:
     help="Confirms the inland leg is invoiced separately (it then leaves the customs value).",
 )
 @click.option(
-    "--catalogue-value-eur",
+    "--estimated-customs-value-eur",
     type=DECIMAL,
     default=None,
-    help="Catalogue value; adds the customs revaluation RISK scenario.",
+    help="Estimated customs value of the vehicle in EUR, without transport (e.g. SchwackeNet); the "
+    "primary charges use it, the landed cost keeps --price. Needs --estimated-customs-value-source.",
+)
+@click.option(
+    "--estimated-customs-value-source",
+    default=None,
+    help="Where the estimated customs value comes from, e.g. 'SchwackeNet catalogue' (3-120 characters).",
 )
 @click.option("--importer-status", type=click.Choice(IMPORTER_STATUSES), default=None, help="Who imports.")
 @click.option("--mileage-km", type=DECIMAL, default=None, help="Odometer reading in km.")
@@ -511,15 +593,391 @@ def estimate(
     run_async(body)
 
 
+# --------------------------------------------------------------------------- recorded values
+
+#: Option names of each repository input field (usage errors name options, never values).
+_PURCHASE_OPTIONS: Final = {
+    "amount": "--purchase-price",
+    "kind": "--purchase-kind",
+    "source": "--purchase-source",
+    "document_ref": "--document-ref",
+}
+_CUSTOMS_OPTIONS: Final = {
+    "amount_eur": "--estimated-customs-value-eur",
+    "source": "--estimated-customs-value-source",
+    "document_ref": "--document-ref",
+}
+
+
+def _invalid(what: str, exc: Exception, options: Mapping[str, str]) -> str:
+    from pydantic import ValidationError
+
+    assert isinstance(exc, ValidationError)
+    lines = []
+    for err in exc.errors(include_input=False, include_url=False):
+        loc = err["loc"]
+        option = options.get(str(loc[0]), what) if loc else what
+        lines.append(f"{option}: {err['msg']}")
+    return f"invalid {what}:\n  " + "\n  ".join(lines[:10])
+
+
+def recorded_inputs(
+    *,
+    purchase_price: Decimal | None,
+    purchase_kind: str | None,
+    purchase_source: str | None,
+    estimated_customs_value_eur: Decimal | None,
+    estimated_customs_value_source: str | None,
+    document_ref: str | None,
+) -> tuple[RecordedPurchase | None, RecordedCustomsValue | None]:
+    """The repository inputs of ``record-values`` (validated before any database work; a usage
+    error names the options). A purchase price needs its kind and source; an estimated customs
+    value needs its source; ``--document-ref`` goes with every value of the call."""
+    from pydantic import ValidationError
+
+    from suv_deals.persistence.import_values_repo import RecordedCustomsValue, RecordedPurchase
+
+    price_parts = {
+        "--purchase-price": purchase_price,
+        "--purchase-kind": purchase_kind,
+        "--purchase-source": purchase_source,
+    }
+    customs_parts = {
+        "--estimated-customs-value-eur": estimated_customs_value_eur,
+        "--estimated-customs-value-source": estimated_customs_value_source,
+    }
+    for parts, what in (
+        (price_parts, "a real purchase price"),
+        (customs_parts, "an estimated customs value"),
+    ):
+        given = [name for name, value in parts.items() if value is not None]
+        if given and len(given) != len(parts):
+            missing = ", ".join(name for name in parts if name not in given)
+            fail(f"{what} needs {', '.join(parts)} together (missing: {missing})", EXIT_USAGE)
+    if purchase_price is None and estimated_customs_value_eur is None:
+        fail(
+            "record --purchase-price (with --purchase-kind and --purchase-source), "
+            "--estimated-customs-value-eur (with --estimated-customs-value-source) or both",
+            EXIT_USAGE,
+        )
+    purchase: RecordedPurchase | None = None
+    customs: RecordedCustomsValue | None = None
+    if purchase_price is not None:
+        try:
+            purchase = RecordedPurchase.model_validate(
+                {
+                    "amount": purchase_price,
+                    "currency": "EUR",
+                    "kind": purchase_kind,
+                    "source": purchase_source,
+                    "document_ref": document_ref,
+                }
+            )
+        except ValidationError as exc:
+            fail(_invalid("real purchase price", exc, _PURCHASE_OPTIONS), EXIT_USAGE)
+    if estimated_customs_value_eur is not None:
+        try:
+            customs = RecordedCustomsValue.model_validate(
+                {
+                    "amount_eur": estimated_customs_value_eur,
+                    "source": estimated_customs_value_source,
+                    "document_ref": document_ref,
+                }
+            )
+        except ValidationError as exc:
+            fail(_invalid("estimated customs value", exc, _CUSTOMS_OPTIONS), EXIT_USAGE)
+    return purchase, customs
+
+
+def _recorded_amount(record: ImportValueRecordView) -> str:
+    """Whole euros (half-up), with the exact recorded amount when it has a fraction."""
+    amount = record.amount
+    if amount.status != "known" or amount.amount is None:  # pragma: no cover - recorded values are known
+        return _amount(amount)
+    shown = f"{amount.amount} {amount.currency}"
+    return (
+        shown
+        if Decimal(record.amount_exact) == Decimal(amount.amount)
+        else f"{shown} (exact {record.amount_exact})"
+    )
+
+
+def _describe_record(record: ImportValueRecordView) -> str:
+    what = record.kind if record.category == "purchase" else "estimate, without transport"
+    parts = [f"{_recorded_amount(record)}  ({what}; source: {record.source}"]
+    if record.document_ref:
+        parts.append(f"; document {record.document_ref}")
+    parts.append(f"; recorded {record.recorded_at.strftime('%Y-%m-%d %H:%M')} UTC")
+    if record.recorded_by_principal is not None:
+        parts.append(f" by {record.recorded_by_principal}")
+    parts.append(f")  [{record.id}]")
+    return "".join(parts)
+
+
+_RECORD_LABELS: Final = {
+    "purchase": "real purchase price",
+    "customs_value": "estimated customs value",
+}
+
+
+def render_values(view: ImportValuesView) -> list[str]:
+    """The human-readable current values and history (``import-costs values``)."""
+    lines = [f"IMPORT VALUES  listing {view.listing_id}"]
+    price, customs = view.purchase_price, view.estimated_customs_value
+    lines.append(
+        _line(
+            "real purchase price",
+            _describe_record(price)
+            if price is not None
+            else "not recorded (the calculator and valuations use the advertised price)",
+        )
+    )
+    lines.append(
+        _line(
+            "estimated customs value",
+            _describe_record(customs)
+            if customs is not None
+            else "not recorded (the charges use the transaction value: price + transport)",
+        )
+    )
+    if view.history:
+        lines.append("History (newest first):")
+        for record in view.history:
+            state = "current" if record.current else "superseded"
+            lines.append(
+                f"  {record.recorded_at.strftime('%Y-%m-%d %H:%M')}  {_RECORD_LABELS[record.category]:<24}"
+                f" {record.kind:<9} {_recorded_amount(record):<12} {state:<10} {safe(record.source)}"
+                f"  [{record.id}]"
+            )
+    lines.append(f"Note: {safe(view.note)}")
+    return lines
+
+
+def render_recorded(result: ImportValuesRecordResult, owner_user_id: UUID) -> list[str]:
+    """The human-readable outcome of ``import-costs record-values``."""
+    values = result.values
+    superseded = set(result.superseded_ids)
+    lines = [
+        f"Recorded for listing {values.listing_id} (owner {owner_user_id}; audited import_values.record):"
+    ]
+    current = {r.id: r for r in (values.purchase_price, values.estimated_customs_value) if r is not None}
+    for record_id in result.recorded_ids:
+        record = current.get(record_id)
+        if record is None:  # pragma: no cover - a recorded value is the current one in its transaction
+            continue
+        previous = record.supersedes_id
+        chain = f", supersedes {previous}" if previous in superseded else ", the first value of its kind"
+        lines.append(
+            _line(_RECORD_LABELS[record.category], f"{_recorded_amount(record)}  ({record.source}{chain})")
+        )
+    lines.append(_line("valuations marked stale", str(len(result.stale_valuation_ids))))
+    lines.append(_line("recomputation queued", f"job {result.recompute_job_id}"))
+    lines.append(f"  {safe(result.production_effect)}")
+    lines += ["", *render_values(values)]
+    return lines
+
+
+@import_costs_group.command("values")
+@workspace_option
+@click.option(
+    "--listing-id", type=click.UUID, required=True, help="The listing whose recorded values to show."
+)
+@click.option(
+    "--history",
+    type=click.IntRange(0, MAX_HISTORY),
+    default=DEFAULT_HISTORY,
+    show_default=True,
+    help="History rows of both values (newest first).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output (the API view).")
+@pass_cli
+def values(
+    cli: CliContext, /, *, workspace: UUID | None, listing_id: UUID, history: int, as_json: bool
+) -> None:
+    """Show a listing's recorded REAL purchase price and ESTIMATED customs value (read-only).
+
+    The real purchase price (реална набавна цена) is what is, or will be, actually paid: the profit
+    and the landed cost use it. The estimated customs value (проценета царинска вредност, e.g. the
+    SchwackeNet catalogue value) is the vehicle's value for customs without transport: the import
+    charges use it. `import-costs estimate --listing-id` and the valuations use the current values.
+    """
+    settings = load_settings(cli)
+
+    async def body() -> int:
+        from suv_deals.api.import_values_routes import values_view
+        from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
+        from suv_deals.persistence import import_values_repo
+        from suv_deals.persistence.database import db_now
+        from suv_deals.persistence.transactions import unit_of_work
+
+        async with open_database(settings, application_name="suv-deals-cli") as db:
+            workspace_id = await resolve_workspace(db, workspace)
+            actor = operator_actor(workspace_id, "import-costs-values")
+            async with unit_of_work(db, actor) as conn:
+                recorded = await import_values_repo.current_import_values(
+                    conn, actor, listing_id, history_limit=history
+                )
+                as_of = await db_now(conn)
+        view = values_view(recorded)
+        if as_json:
+            emit_json({"as_of": as_of.isoformat(), "data": view.model_dump(mode="json")})
+        else:
+            for line in render_values(view):
+                echo(line)
+        return 0
+
+    run_async(body)
+
+
+@import_costs_group.command("record-values")
+@workspace_option
+@click.option("--listing-id", type=click.UUID, required=True, help="The listing the values belong to.")
+@click.option(
+    "--owner-user-id",
+    type=click.UUID,
+    required=True,
+    help="The owner's user id: an ACTIVE owner of the workspace records the values (audited as that owner).",
+)
+@click.option(
+    "--purchase-price",
+    type=DECIMAL,
+    default=None,
+    help="REAL purchase price in EUR (at most two decimals): what is, or will be, actually paid; the "
+    "profit and the landed cost use it. Needs --purchase-kind and --purchase-source.",
+)
+@click.option(
+    "--purchase-kind",
+    type=click.Choice(PURCHASE_KINDS),
+    default=None,
+    help="actual (paid), quote (offered or agreed, not paid) or estimate (the owner's estimate).",
+)
+@click.option(
+    "--purchase-source",
+    default=None,
+    help="Where the price comes from, e.g. 'seller invoice' (3-120 characters).",
+)
+@click.option(
+    "--estimated-customs-value-eur",
+    type=DECIMAL,
+    default=None,
+    help="ESTIMATED customs value of the vehicle in EUR WITHOUT transport (e.g. the SchwackeNet catalogue "
+    "value); the import charges use it. Needs --estimated-customs-value-source.",
+)
+@click.option(
+    "--estimated-customs-value-source",
+    default=None,
+    help="Where the estimate comes from, e.g. 'SchwackeNet catalogue' (3-120 characters).",
+)
+@click.option(
+    "--document-ref",
+    default=None,
+    help="Reference of the supporting document (e.g. an invoice number), stored with each value recorded "
+    "by this call (redacted; one plain line).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output (the API view).")
+@click.option("--yes", is_flag=True, help="Confirm the database write.")
+@pass_cli
+def record_values(
+    cli: CliContext,
+    /,
+    *,
+    workspace: UUID | None,
+    listing_id: UUID,
+    owner_user_id: UUID,
+    purchase_price: Decimal | None,
+    purchase_kind: str | None,
+    purchase_source: str | None,
+    estimated_customs_value_eur: Decimal | None,
+    estimated_customs_value_source: str | None,
+    document_ref: str | None,
+    as_json: bool,
+    yes: bool,
+) -> None:
+    """Record a listing's REAL purchase price and/or ESTIMATED customs value (owner; audited; --yes).
+
+    Two separate values per vehicle (owner decision 2026-10-13): the real purchase price
+    (реална набавна цена) for the profit and the landed cost, the estimated customs value
+    (проценета царинска вредност, without transport) for the import charges. Each supersedes the
+    listing's current value of its kind (the history keeps both); the listing's valuations are
+    marked stale and recomputed with the new values, and `import-costs estimate --listing-id` uses
+    them. Nothing approves tax rules or contacts anyone.
+    """
+    purchase, customs = recorded_inputs(
+        purchase_price=purchase_price,
+        purchase_kind=purchase_kind,
+        purchase_source=purchase_source,
+        estimated_customs_value_eur=estimated_customs_value_eur,
+        estimated_customs_value_source=estimated_customs_value_source,
+        document_ref=document_ref,
+    )
+    if not as_json:
+        echo(f"Listing                  : {listing_id}")
+        if purchase is not None:
+            echo(
+                f"  real purchase price    : {whole(str(purchase.amount), 'EUR')} "
+                f"({purchase.kind}; {safe(purchase.source)})"
+            )
+        if customs is not None:
+            echo(
+                f"  estimated customs value: {whole(str(customs.amount_eur), 'EUR')}, without transport "
+                f"({safe(customs.source)})"
+            )
+        stored_ref = next((v.document_ref for v in (purchase, customs) if v is not None), None)
+        if stored_ref is not None:
+            echo(f"  document reference     : {safe(stored_ref)}")
+        echo("  effect                 : supersedes the current value of each kind; the listing's")
+        echo("                           valuations are marked stale and recomputed")
+    require_yes(yes, "import-costs record-values")
+    settings = load_settings(cli)
+
+    async def body() -> int:
+        from suv_deals.api.import_values_routes import record_result
+        from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
+        from suv_deals.cli_commands.inquiries import owner_actor_for
+        from suv_deals.persistence import import_values_repo
+        from suv_deals.persistence.database import db_now
+        from suv_deals.persistence.transactions import unit_of_work
+
+        purpose = "import-costs-record-values"
+        async with open_database(settings, application_name="suv-deals-cli") as db:
+            workspace_id = await resolve_workspace(db, workspace)
+            operator = operator_actor(workspace_id, purpose, admin=True)
+            async with unit_of_work(db, operator) as conn:
+                owner = await owner_actor_for(conn, workspace_id, owner_user_id, purpose)
+            async with unit_of_work(db, owner) as conn:
+                recorded = await import_values_repo.record_import_values(
+                    conn, owner, listing_id, purchase=purchase, customs_value=customs
+                )
+                as_of = await db_now(conn)
+        result = record_result(recorded)
+        if as_json:
+            emit_json({"as_of": as_of.isoformat(), "data": result.model_dump(mode="json")})
+        else:
+            for line in render_recorded(result, owner_user_id):
+                echo(line)
+        return 0
+
+    run_async(body)
+
+
 __all__ = [
     "CO2_DOCUMENTS",
+    "DEFAULT_HISTORY",
     "IMPORTER_STATUSES",
+    "MAX_HISTORY",
     "ORIGIN_PROOF_KINDS",
     "PRICE_BASES",
     "PRICE_CURRENCIES",
+    "PURCHASE_KINDS",
     "build_request",
     "estimate",
     "import_costs_group",
+    "record_values",
+    "recorded_inputs",
     "render_estimate",
+    "render_recorded",
+    "render_values",
+    "values",
     "vehicle_facts",
+    "whole",
 ]

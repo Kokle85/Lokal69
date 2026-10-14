@@ -6,7 +6,7 @@
     "readOnlyHint": true,
     "title": "Estimate MK import costs"
   },
-  "description": "North Macedonia import charges for one passenger car: customs duty, motor-vehicle tax (DMV) and import VAT, plus the landed cost with the owner's fixed per-vehicle transport (EUR 700, cost profile). Facts come from listing_id and/or vehicle (vehicle fields win). Mode indicative_preview means rules that are not ACTIVE (draft, under review, or approved but not yet activated; rule.status says which): relay the banner unchanged and call every figure indicative. A missing CO2 document or proof of origin changes the result; unknown charges are never 0. Read-only; no tool approves tax rules.",
+  "description": "MK import charges (customs duty, motor-vehicle tax, import VAT) and landed cost per car, fixed EUR 700 transport, whole units. price = real purchase price (landed cost, profit); estimated_customs_value_eur + source (e.g. SchwackeNet) = primary charges' basis; transaction_value = on price paid; recorded listing values apply. indicative_preview = rules that are not ACTIVE (draft, under review or approved but not yet activated; see rule.status): relay banner unchanged. Missing CO2 document or proof of origin changes the result; unknown charges are never 0. Read-only; no tool approves tax rules.",
   "errorSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
@@ -117,7 +117,7 @@
         "type": "string"
       },
       "listing_id": {
-        "description": "Listing whose CURRENT revision supplies the facts: advertised price, fuel, CO2 claim, first registration, Euro class, seller country, mileage. Omit to estimate from vehicle alone.",
+        "description": "Listing whose CURRENT revision supplies the facts: advertised price, fuel, CO2 claim, first registration, Euro class, seller country, mileage. The owner's RECORDED values of the listing are used automatically: the real purchase price instead of the advertised one and the estimated customs value (fact source recorded). Omit to estimate from vehicle alone.",
         "format": "uuid",
         "type": "string"
       },
@@ -125,13 +125,6 @@
         "additionalProperties": false,
         "description": "Facts you know (better): each field set here replaces the listing's.",
         "properties": {
-          "catalogue_value_eur": {
-            "description": "Catalogue value: adds the customs_revaluation_risk scenario; never used as the customs value.",
-            "maxLength": 16,
-            "minLength": 1,
-            "pattern": "^(0|[1-9][0-9]{0,12})(\\.[0-9]{1,2})?$",
-            "type": "string"
-          },
           "co2": {
             "description": "CO2 figures as printed, at most one per cycle; an empty list clears the listing's claim.",
             "items": {
@@ -197,6 +190,19 @@
             "maxLength": 13,
             "minLength": 1,
             "pattern": "^(0|[1-9][0-9]{0,8})(\\.[0-9]{1,3})?$",
+            "type": "string"
+          },
+          "estimated_customs_value_eur": {
+            "description": "ESTIMATED customs value of the vehicle in EUR, without transport (e.g. the SchwackeNet catalogue value Customs uses for used vehicles; more than 0). The primary scenario's charges use it + the transport to the MK place of entry; the landed cost and the profit still use price. Adds the transaction_value scenario (Customs accepts the price paid, its primary method). Omitted with listing_id: the owner's recorded estimate of the listing, if any. Needs estimated_customs_value_source.",
+            "maxLength": 16,
+            "minLength": 1,
+            "pattern": "^(0|[1-9][0-9]{0,12})(\\.[0-9]{1,2})?$",
+            "type": "string"
+          },
+          "estimated_customs_value_source": {
+            "description": "Where the estimated customs value comes from, e.g. \"SchwackeNet catalogue\" or \"owner estimate\" (3-120 characters); only with estimated_customs_value_eur.",
+            "maxLength": 120,
+            "minLength": 3,
             "type": "string"
           },
           "first_registration": {
@@ -296,7 +302,7 @@
           },
           "price": {
             "additionalProperties": false,
-            "description": "Purchase price. Set price_basis invoice for an invoice or contract price; otherwise it counts as an advertised price (a claim, flagged).",
+            "description": "REAL purchase price (what is, or will be, actually paid): the landed cost and the profit always use it, never the estimated customs value. Omitted with listing_id: the owner's recorded purchase price of the listing when there is one (fact source recorded), otherwise its advertised price. Set price_basis invoice for an invoice or contract price; otherwise it counts as an advertised price (a claim, flagged).",
             "properties": {
               "amount": {
                 "description": "Amount in the currency, e.g. \"3000.00\".",
@@ -322,7 +328,7 @@
             "type": "object"
           },
           "price_basis": {
-            "description": "invoice (transaction value) or advertised (the default).",
+            "description": "invoice (transaction value) or advertised (the default for a price passed here). Without a price it restates the listing's advertised price; it is refused when the listing has a recorded purchase price (that keeps its recorded kind: pass a price to replace it).",
             "enum": [
               "invoice",
               "advertised"
@@ -471,6 +477,74 @@
             ],
             "type": "string"
           },
+          "customs_value_for_duties": {
+            "additionalProperties": false,
+            "description": "The customs value the ``primary`` scenario's charges are computed on, in whole euros,\nINCLUDING the transport to the MK place of entry: ``estimated`` (проценета царинска вредност +\nthat transport) or ``transaction_value`` (the price paid + that transport, Царински закон чл. 28).",
+            "properties": {
+              "amount": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "basis": {
+                "enum": [
+                  "estimated",
+                  "transaction_value"
+                ],
+                "type": "string"
+              },
+              "source": {
+                "maxLength": 200,
+                "type": "string"
+              }
+            },
+            "required": [
+              "amount",
+              "basis",
+              "source"
+            ],
+            "title": "ImportCustomsValueView",
+            "type": "object"
+          },
           "declaration_date": {
             "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
             "type": "string"
@@ -494,6 +568,7 @@
                 "source": {
                   "enum": [
                     "listing",
+                    "recorded",
                     "request",
                     "default"
                   ],
@@ -514,13 +589,6 @@
             "additionalProperties": false,
             "description": "The vehicle facts the estimate used (after request overrides).",
             "properties": {
-              "catalogue_value_eur": {
-                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
               "co2": {
                 "items": {
                   "additionalProperties": false,
@@ -578,6 +646,20 @@
               },
               "engine_displacement_cm3": {
                 "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "estimated_customs_value_eur": {
+                "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "estimated_customs_value_source": {
+                "maxLength": 120,
                 "type": [
                   "string",
                   "null"
@@ -720,7 +802,10 @@
               "price_basis": {
                 "enum": [
                   "invoice",
-                  "advertised"
+                  "advertised",
+                  "recorded_actual",
+                  "recorded_quote",
+                  "recorded_estimate"
                 ],
                 "type": "string"
               },
@@ -759,7 +844,8 @@
               "hs_evidence_ref",
               "transport_after_entry_eur",
               "transport_after_entry_separately_invoiced",
-              "catalogue_value_eur",
+              "estimated_customs_value_eur",
+              "estimated_customs_value_source",
               "importer_status",
               "mileage_km",
               "seller_country",
@@ -823,7 +909,7 @@
           },
           "listing": {
             "additionalProperties": false,
-            "description": "The listing whose facts were used (its current, promoted, non-quarantined revision).",
+            "description": "The listing whose facts were used (its current, promoted, non-quarantined revision) and the\nids of its CURRENT recorded import values (``fact_sources`` says whether the estimate used them\nor the request replaced them).",
             "properties": {
               "fixture_label": {
                 "maxLength": 200,
@@ -838,6 +924,22 @@
               "listing_id": {
                 "format": "uuid",
                 "type": "string"
+              },
+              "recorded_customs_value_id": {
+                "default": null,
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "recorded_purchase_price_id": {
+                "default": null,
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "revision_id": {
                 "format": "uuid",
@@ -862,7 +964,9 @@
               "source_key",
               "is_fixture",
               "fixture_label",
-              "screened"
+              "screened",
+              "recorded_purchase_price_id",
+              "recorded_customs_value_id"
             ],
             "title": "ImportListingView",
             "type": [
@@ -901,6 +1005,81 @@
           },
           "production_ready": {
             "type": "boolean"
+          },
+          "purchase_price": {
+            "additionalProperties": false,
+            "description": "The REAL purchase price (реална набавна цена) in whole euros: the basis of every scenario's\nlanded cost, and so of the profit; never replaced by an estimated customs value. ``basis`` is\nnull when no price is known.",
+            "properties": {
+              "amount": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "basis": {
+                "enum": [
+                  "invoice",
+                  "advertised",
+                  "recorded_actual",
+                  "recorded_quote",
+                  "recorded_estimate",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source": {
+                "maxLength": 200,
+                "type": "string"
+              }
+            },
+            "required": [
+              "amount",
+              "basis",
+              "source"
+            ],
+            "title": "ImportPurchasePriceView",
+            "type": "object"
           },
           "rule": {
             "additionalProperties": false,
@@ -980,7 +1159,7 @@
           "scenarios": {
             "items": {
               "additionalProperties": false,
-              "description": "One labelled scenario (``legal_base`` first). In ``active`` mode the totals are ``total``,\n``total_eur`` and ``landed_cost_eur`` (the ``indicative_*`` fields are null); in a preview\nthe reverse. A total is known only when the calculation is complete; otherwise it is\nunknown and ``known_subtotal`` (labelled, never a total) shows what resolved.",
+              "description": "One labelled scenario (``primary`` first). In ``active`` mode the totals are ``total``,\n``total_eur`` and ``landed_cost_eur`` (the ``indicative_*`` fields are null); in a preview\nthe reverse. A total is known only when the calculation is complete; otherwise it is\nunknown and ``known_subtotal`` (labelled, never a total) shows what resolved. The landed cost\nis the REAL purchase price + transport + this scenario's charges; ``customs_value_kind`` says\nwhether the charges rest on the estimated customs value or the transaction value.\n``customs_value`` is the engine input in its own currency (EUR, or MKD for an MKD price);\n``customs_value_eur`` is the same value in whole euros at the customs rate, so the scenarios\ncompare in one currency.",
               "properties": {
                 "assumptions": {
                   "items": {
@@ -1393,6 +1572,57 @@
                     "null"
                   ]
                 },
+                "customs_value_eur": {
+                  "additionalProperties": false,
+                  "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                  "properties": {
+                    "amount": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "default": null,
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "known",
+                        "unknown",
+                        "not_applicable"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "amount",
+                    "currency",
+                    "reason"
+                  ],
+                  "title": "AmountView",
+                  "type": "object"
+                },
+                "customs_value_kind": {
+                  "enum": [
+                    "estimated",
+                    "transaction_value"
+                  ],
+                  "type": "string"
+                },
                 "effective_date": {
                   "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                   "type": "string"
@@ -1654,9 +1884,9 @@
                 },
                 "name": {
                   "enum": [
-                    "legal_base",
+                    "primary",
                     "standard_duty_if_proof_rejected",
-                    "customs_revaluation_risk"
+                    "transaction_value"
                   ],
                   "type": "string"
                 },
@@ -1778,7 +2008,9 @@
                 "complete",
                 "production_ready",
                 "customs_value",
+                "customs_value_eur",
                 "customs_value_basis",
+                "customs_value_kind",
                 "assumptions",
                 "components",
                 "categories",
@@ -1888,6 +2120,8 @@
           "eur_basis",
           "landed_cost_note",
           "listing",
+          "purchase_price",
+          "customs_value_for_duties",
           "facts",
           "fact_sources",
           "scenarios",
