@@ -163,8 +163,18 @@ def _print_outcome(result: CaptureOutcome) -> None:
         if step.error is not None:
             parts.append(f"error: {step.error}")
         echo(f"  {step.label:<10}: {', '.join(parts)}")
-    if result.detail_links_matching:
-        echo(f"  links      : {result.detail_links_matching} detail link(s) match the reviewed pattern")
+    if result.links_total is not None:
+        echo(
+            f"  links      : {result.links_total} on the search page, "
+            f"{result.detail_links_matching} match the reviewed detail pattern"
+        )
+        for shape, count in list(result.search_link_shapes.items())[:5]:
+            echo(f"  link forms : {count} x {shape}")
+        for script in sorted(result.search_scripts, key=lambda item: -int(item["chars"]))[:5]:
+            kind = script["type"] or "no type"
+            ident = f", id={script['id']}" if script["id"] else ""
+            origin = " (external)" if script["external"] else ""
+            echo(f"  script     : {script['chars']} chars, {kind}{ident}{origin}")
     for note in result.skipped:
         echo(f"  skipped    : {note}")
     echo(f"  requests   : {result.requests}")

@@ -374,3 +374,9 @@ def test_outline_keeps_names_and_resolves_links_without_text() -> None:
     assert f"{HOST}" in links[0]
     assert links[0] == DETAIL_1
     assert "Sample results" not in json.dumps(outline)
+    assert outline["link_shapes"]["same-host /annunci/ 2 segment(s)"] == 2
+    assert outline["link_shapes"]["other-host /annunci/ 2 segment(s)"] == 1
+    assert outline["link_shapes"]["same-host /angebote/ 2 segment(s)"] == 1
+    assert outline["scripts"][0]["type"] == "application/ld+json"
+    assert outline["scripts"][0]["chars"] > 0
+    assert "seller@example.org" not in json.dumps(outline)

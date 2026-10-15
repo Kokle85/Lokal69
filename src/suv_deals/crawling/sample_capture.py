@@ -21,8 +21,9 @@ Saved output, under ``<out_root>/<source_key>/<UTC timestamp>/``:
 
 - ``search.html`` and ``detail-N.html``: the 2xx pages with e-mail addresses, international phone
   numbers and ``tel:`` links masked. Parsers are developed from these files on this machine only.
-- ``structure.json``: per page, tag, class and attribute NAMES with counts, the ``h1`` count, and
-  JSON-LD ``@type`` and key NAMES. No text and no attribute values.
+- ``structure.json``: per page, tag, class and attribute NAMES with counts, the ``h1`` count, JSON-LD
+  ``@type`` and key NAMES, link shapes (host kind, first path segment, depth) and script tags (type,
+  id, size). No text, no slugs and no attribute values.
 - ``manifest.json``: statuses, sizes, SHA-256 of the saved bytes, the robots verdict and the stop
   reason. A run that stops early still writes its manifest: that is the evidence of the block.
 
@@ -76,6 +77,8 @@ _MAX_CLASSES: Final = 300
 _MAX_ATTRIBUTES: Final = 200
 _MAX_JSONLD: Final = 20
 _MAX_LINKS: Final = 5000
+_MAX_SCRIPTS: Final = 40
+_MAX_LINK_SHAPES: Final = 40
 _BLOCK_STATUSES: Final = frozenset({401, 403, 429})
 _TITLE: Final = re.compile(rb"<title[^>]*>(.*?)</title>", re.DOTALL)
 # Title phrases of block and challenge pages (matched on the lower-cased title).
@@ -146,6 +149,9 @@ class CaptureOutcome:
     robots_sha256: str | None = None
     steps: list[SampleStep] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    links_total: int | None = None  # None until the search page was captured
+    search_link_shapes: dict[str, int] = field(default_factory=dict)
+    search_scripts: list[dict[str, Any]] = field(default_factory=list)
     detail_links_matching: int = 0
     requests: int = 0
     stop_kind: str | None = None
@@ -179,7 +185,12 @@ class _OutlineParser(HTMLParser):
         self.h1 = 0
         self.jsonld: list[dict[str, Any]] = []
         self.links: list[str] = []
+        self.link_shapes: Counter[str] = Counter()
+        self.scripts: list[dict[str, Any]] = []
+        self._base_host = urlsplit(base_url).hostname or ""
         self._script_type: str | None = None
+        self._script_attrs: dict[str, Any] = {}
+        self._script_chars = 0
         self._script_text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -191,21 +202,34 @@ class _OutlineParser(HTMLParser):
             self.attribute_counts[name] += 1
             if name == "class" and value:
                 self.class_counts.update(value.split())
-        if tag == "a" and values.get("href") and len(self.links) < _MAX_LINKS:
+        if tag == "a" and values.get("href"):
             absolute = _absolute(self._base, values["href"] or "")
             if absolute is not None:
-                self.links.append(absolute)
+                self.link_shapes[_link_shape(absolute, self._base_host)] += 1
+                if len(self.links) < _MAX_LINKS:
+                    self.links.append(absolute)
         if tag == "script":
             self._script_type = (values.get("type") or "").strip().lower()
+            self._script_attrs = {
+                "type": self._script_type or None,
+                "id": values.get("id"),
+                "external": values.get("src") is not None,
+            }
+            self._script_chars = 0
             self._script_text = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script" and self._script_type is not None:
             if self._script_type == "application/ld+json":
                 self._add_jsonld("".join(self._script_text))
+            if len(self.scripts) < _MAX_SCRIPTS:
+                self.scripts.append({**self._script_attrs, "chars": self._script_chars})
             self._script_type = None
 
     def handle_data(self, data: str) -> None:
+        if self._script_type is None:
+            return
+        self._script_chars += len(data)
         if self._script_type == "application/ld+json":
             self._script_text.append(data)
 
@@ -231,6 +255,16 @@ def _type_name(value: object) -> str:
     return ""
 
 
+def _link_shape(link: str, base_host: str) -> str:
+    """Where a link points, as a shape only: host kind, first path segment and depth (no slug, no query)."""
+    parts = urlsplit(link)
+    where = "same-host" if parts.hostname == base_host else "other-host"
+    segments = [segment for segment in parts.path.split("/") if segment]
+    head = f"/{segments[0]}/" if segments else "/"
+    query = " +query" if parts.query else ""
+    return f"{where} {head} {len(segments)} segment(s){query}"
+
+
 def _absolute(base: str, href: str) -> str | None:
     try:
         parts = urlsplit(urljoin(base, href.strip()))
@@ -253,6 +287,8 @@ def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[st
         "h1": parser.h1,
         "jsonld": parser.jsonld,
         "links_total": len(parser.links),
+        "link_shapes": dict(parser.link_shapes.most_common(_MAX_LINK_SHAPES)),
+        "scripts": parser.scripts,
     }
     return outline, parser.links
 
@@ -467,6 +503,9 @@ class _Run:
         if body is None:
             return
         outline, links = outline_html(body, base_url=search_url)
+        self.outcome.links_total = len(links)
+        self.outcome.search_link_shapes = dict(outline["link_shapes"])
+        self.outcome.search_scripts = list(outline["scripts"])
         candidates = _detail_candidates(links, self.policy)
         outline["detail_links_matching"] = len(candidates)
         self.outlines["search"] = outline
