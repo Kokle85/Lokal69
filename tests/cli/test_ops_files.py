@@ -322,7 +322,16 @@ def test_dockerfile_and_dockerignore() -> None:
 
 
 @pytest.mark.parametrize(
-    "script", ["doctor.sh", "backup.sh", "restore_check.sh", "verify_release.sh", "migrate.sh", "rollback.sh"]
+    "script",
+    [
+        "doctor.sh",
+        "backup.sh",
+        "restore_check.sh",
+        "verify_release.sh",
+        "migrate.sh",
+        "rollback.sh",
+        "crawler_firewall.sh",
+    ],
 )
 def test_shell_scripts_parse(script: str) -> None:
     path = SCRIPTS / script
@@ -330,7 +339,9 @@ def test_shell_scripts_parse(script: str) -> None:
     assert subprocess.run(["bash", "-n", str(path)], capture_output=True, check=False).returncode == 0
 
 
-@pytest.mark.parametrize("script", ["backup.sh", "restore_check.sh", "verify_release.sh"])
+@pytest.mark.parametrize(
+    "script", ["backup.sh", "restore_check.sh", "verify_release.sh", "crawler_firewall.sh"]
+)
 def test_scripts_have_help(script: str) -> None:
     result = subprocess.run(
         ["bash", str(SCRIPTS / script), "--help"], capture_output=True, text=True, check=False

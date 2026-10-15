@@ -126,6 +126,13 @@ sudo iptables -I INPUT -i br-suv-crawl -m conntrack --ctstate NEW -j DROP
 sudo iptables -I INPUT -i br-suv-crawlint -m conntrack --ctstate NEW -j DROP
 ```
 
+On a single host, WSL included, `sudo scripts/crawler_firewall.sh` adds exactly these rules (only
+the missing ones) and then runs the verification below from inside the crawler container;
+`--check` verifies without adding. The rules are not persistent: run it again after every Docker
+or WSL restart, before the worker crawls. On Windows use Docker Engine inside the WSL
+distribution, not Docker Desktop: Docker Desktop keeps its bridges in its own VM, where these
+`iptables` rules cannot be applied from the WSL shell.
+
 Container DNS keeps working: Docker's embedded resolver (127.0.0.11) answers inside the container
 namespace and forwards from the daemon's namespace. The worker <-> crawler traffic stays on the
 internal bridge and never targets a host address. Persist the rules with the host's firewall
