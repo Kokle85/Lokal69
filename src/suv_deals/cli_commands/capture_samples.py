@@ -170,6 +170,13 @@ def _print_outcome(result: CaptureOutcome) -> None:
         )
         for shape, count in list(result.search_link_shapes.items())[:5]:
             echo(f"  link forms : {count} x {shape}")
+        for shape, count in list(result.search_path_shapes.items())[:6]:
+            echo(f"  path forms : {count} x {shape} (anywhere in the page)")
+        if result.search_json_types:
+            types = ", ".join(
+                f"{name} x{count}" for name, count in list(result.search_json_types.items())[:6]
+            )
+            echo(f"  json types : {types}")
         for script in sorted(result.search_scripts, key=lambda item: -int(item["chars"]))[:5]:
             kind = script["type"] or "no type"
             ident = f", id={script['id']}" if script["id"] else ""

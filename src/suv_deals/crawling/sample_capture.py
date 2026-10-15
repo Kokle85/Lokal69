@@ -33,6 +33,7 @@ This module never reads or writes the database and never changes a source flag o
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from collections import Counter
@@ -104,6 +105,10 @@ _CHALLENGE_MARKERS: Final = (
 _EMAIL: Final = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,5}")
 _PHONE: Final = re.compile(rb"(?<![\w+])\+\d{1,3}[\s().\-/]{0,3}(?:\d[\s().\-/]{0,3}){6,13}\d")
 _TEL: Final = re.compile(rb"tel:[^\"'\s<>]{1,40}", re.IGNORECASE)
+_ABSOLUTE_URL: Final = re.compile(r"https?://([a-z0-9.-]{3,253})(/[^\s\"'<>]*)?", re.IGNORECASE)
+_RELATIVE_PATH: Final = re.compile(r"(?<=[\s\"'(=>,])(/[^\s\"'<>]*)")
+_JSON_TYPE: Final = re.compile(r'"@type"\s*:\s*"([A-Za-z]{2,40})"')
+_ID_TAIL: Final = re.compile(r"(?:^|-)\d{5,}$")
 
 
 class CaptureRefused(Exception):
@@ -152,6 +157,8 @@ class CaptureOutcome:
     links_total: int | None = None  # None until the search page was captured
     search_link_shapes: dict[str, int] = field(default_factory=dict)
     search_scripts: list[dict[str, Any]] = field(default_factory=list)
+    search_path_shapes: dict[str, int] = field(default_factory=dict)
+    search_json_types: dict[str, int] = field(default_factory=dict)
     detail_links_matching: int = 0
     requests: int = 0
     stop_kind: str | None = None
@@ -275,11 +282,36 @@ def _absolute(base: str, href: str) -> str | None:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
 
 
+def _path_shape(path: str, kind: str) -> str:
+    """A path as a shape: where it points, first segment, depth and whether the last segment ends in a
+    numeric id. No slug and no query string."""
+    segments = [segment for segment in path.split("?", 1)[0].split("#", 1)[0].split("/") if segment]
+    head = f"/{segments[0]}/" if segments else "/"
+    tail = " +id" if segments and _ID_TAIL.search(segments[-1]) else ""
+    return f"{kind} {head} {len(segments)} segment(s){tail}"
+
+
+def path_forms(text: str, *, base_host: str) -> tuple[Counter[str], Counter[str]]:
+    """Path shapes of every URL-like path in the page (scripts, JSON and attributes included) and the
+    JSON ``@type`` values found in it. Entities and escaped slashes are normalised first."""
+    normalized = html.unescape(text).replace("\\/", "/")
+    shapes: Counter[str] = Counter()
+    for match in _ABSOLUTE_URL.finditer(normalized):
+        host = match.group(1).lower()
+        kind = "same-host" if host == base_host else "other-host"
+        shapes[_path_shape(match.group(2) or "/", kind)] += 1
+    for match in _RELATIVE_PATH.finditer(normalized):
+        shapes[_path_shape(match.group(1), "relative")] += 1
+    return shapes, Counter(_JSON_TYPE.findall(normalized))
+
+
 def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[str]]:
     """Structure of one page (names and counts) and its absolute links, in document order."""
+    text = body.decode("utf-8", errors="replace")
     parser = _OutlineParser(base_url)
-    parser.feed(body.decode("utf-8", errors="replace"))
+    parser.feed(text)
     parser.close()
+    shapes, json_types = path_forms(text, base_host=urlsplit(base_url).hostname or "")
     outline: dict[str, Any] = {
         "tags": dict(parser.tag_counts.most_common()),
         "classes": dict(parser.class_counts.most_common(_MAX_CLASSES)),
@@ -288,6 +320,8 @@ def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[st
         "jsonld": parser.jsonld,
         "links_total": len(parser.links),
         "link_shapes": dict(parser.link_shapes.most_common(_MAX_LINK_SHAPES)),
+        "path_shapes": dict(shapes.most_common(_MAX_LINK_SHAPES)),
+        "json_types": dict(json_types.most_common(_MAX_LINK_SHAPES)),
         "scripts": parser.scripts,
     }
     return outline, parser.links
@@ -506,6 +540,8 @@ class _Run:
         self.outcome.links_total = len(links)
         self.outcome.search_link_shapes = dict(outline["link_shapes"])
         self.outcome.search_scripts = list(outline["scripts"])
+        self.outcome.search_path_shapes = dict(outline["path_shapes"])
+        self.outcome.search_json_types = dict(outline["json_types"])
         candidates = _detail_candidates(links, self.policy)
         outline["detail_links_matching"] = len(candidates)
         self.outlines["search"] = outline

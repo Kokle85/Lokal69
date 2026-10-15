@@ -366,6 +366,16 @@ def test_challenge_reason_is_specific() -> None:
     assert challenge_reason(b"<title>Lista annunci</title><p>ok</p>") is None
 
 
+def test_path_forms_read_escaped_urls_inside_scripts() -> None:
+    body = (
+        b'<script type="application/json">{"url":"https:\\/\\/www.sample-market.it\\/annunci\\/'
+        b'sample-car-3-12345678","@type":"ItemList"}</script>'
+    )
+    outline, _ = outline_html(body, base_url=SEARCH)
+    assert outline["path_shapes"]["same-host /annunci/ 2 segment(s) +id"] == 1
+    assert outline["json_types"] == {"ItemList": 1}
+
+
 def test_outline_keeps_names_and_resolves_links_without_text() -> None:
     outline, links = outline_html(SEARCH_HTML, base_url=SEARCH)
     assert outline["tags"]["a"] == 5
@@ -378,5 +388,7 @@ def test_outline_keeps_names_and_resolves_links_without_text() -> None:
     assert outline["link_shapes"]["other-host /annunci/ 2 segment(s)"] == 1
     assert outline["link_shapes"]["same-host /angebote/ 2 segment(s)"] == 1
     assert outline["scripts"][0]["type"] == "application/ld+json"
+    assert outline["path_shapes"]["relative /annunci/ 2 segment(s)"] == 2
+    assert outline["json_types"]["Car"] == 1
     assert outline["scripts"][0]["chars"] > 0
     assert "seller@example.org" not in json.dumps(outline)
