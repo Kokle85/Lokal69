@@ -42,6 +42,9 @@ Commands (``suv-deals <command> --help`` for details)::
                                    blocked queue jobs; an uncertain-delivery send job is unblocked
                                    only with the owner's acknowledgement (--owner-user-id), resolved
                                    only after its inquiry was reconciled (audited; --yes)
+    capture-samples --source KEY --search-path PATH --yes
+                                   owner-run sample pages of one reviewed source for parser work
+                                   (needs SOURCE_NETWORK_ENABLED=true for that command; no database)
     canary prepare | status | cancel | send
                                    the owner-controlled activation canary (target address from
                                    SUV_CANARY_TARGET_ADDRESS or a hidden prompt, stored as a hash);
@@ -66,6 +69,7 @@ import suv_deals
 from suv_deals.cli_commands import (
     bootstrap,
     canary,
+    capture_samples,
     config_cmd,
     crawl,
     credentials,
@@ -137,6 +141,7 @@ cli.add_command(jobs.jobs_group)
 cli.add_command(canary.canary_group)
 cli.add_command(fx.fx_group)
 cli.add_command(market.market_group)
+cli.add_command(capture_samples.capture_samples_command)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

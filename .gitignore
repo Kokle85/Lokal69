@@ -30,3 +30,6 @@ dashboard/.vite/
 .DS_Store
 .idea/
 .vscode/
+
+# owner-run sample captures (suv-deals capture-samples): local only, never committed
+/captures/

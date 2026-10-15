@@ -10,6 +10,13 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 Owner re-confirmation of 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат") and a
 robots.txt re-check of the same day. Nothing is enabled, fetched or activated.
 
+- **`suv-deals capture-samples` (owner-run).** Saves a few reviewed pages of one source (one search
+  path, at most `--detail-limit` detail pages) to the git-ignored `captures/` folder, so parsers are
+  written from real structure. Guard rails: `--yes`, `SOURCE_NETWORK_ENABLED=true` for that command
+  only, reviewed path and detail patterns, robots.txt on every URL, no redirects, 20 s spacing, and
+  the first block, challenge page or error stops the run. It prints counts and statuses only; no
+  database, no source flag or gate changes. Tests use fake fetchers (no network).
+
 - **mobile.de robots.txt changed.** `suchen.mobile.de` now disallows `/fahrzeuge/search.html`,
   `/fahrzeuge/searchresults.html`, `isSearchRequest=true`, `pageNumber=` and
   `/fahrzeuge/details.html` for every generic crawler; only `details.html?id=<n>&vip=1` stays
