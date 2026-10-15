@@ -66,6 +66,12 @@ _EXIT_FOR_STOP: Final[Mapping[str | None, int]] = {
     help="One reviewed search path without a query string, for example /lst/toyota/rav-4.",
 )
 @click.option(
+    "--query",
+    default=None,
+    metavar="K=V&...",
+    help="Optional query for the search page, for example priceto=3000; checked against robots.txt.",
+)
+@click.option(
     "--detail-limit",
     type=click.IntRange(0, 10),
     default=2,
@@ -85,6 +91,7 @@ def capture_samples_command(
     *,
     source_key: str,
     search_path: str,
+    query: str | None,
     detail_limit: int,
     out_dir: Path | None,
     yes: bool,
@@ -126,6 +133,7 @@ def capture_samples_command(
                 outcome = await capture_samples(
                     cfg,
                     search_path=search_path,
+                    query=query,
                     detail_limit=detail_limit,
                     out_root=root,
                     fetcher=fetcher,
@@ -138,6 +146,10 @@ def capture_samples_command(
         return _EXIT_FOR_STOP.get(outcome.stop_kind, EXIT_PROBLEMS)
 
     run_async(body)
+
+
+def _whole(value: object) -> str:
+    return "-" if value is None else f"{float(str(value)):,.0f}"
 
 
 def _status(status: int | None) -> str:
@@ -166,8 +178,27 @@ def _print_outcome(result: CaptureOutcome) -> None:
     if result.links_total is not None:
         echo(
             f"  links      : {result.links_total} on the search page, "
+            f"{result.jsonld_links_total} in JSON-LD, "
             f"{result.detail_links_matching} match the reviewed detail pattern"
         )
+        stats = result.search_offer_stats
+        if stats.get("offers_with_price"):
+            currency = stats["currency"] or ""
+            echo(
+                f"  offers     : {stats['offers_with_price']} with a price, "
+                f"{_whole(stats['price_min'])}-{_whole(stats['price_max'])} {currency}".rstrip()
+            )
+        if stats.get("mileages_km"):
+            echo(
+                f"  mileage    : {stats['mileages_km']} with km, "
+                f"{_whole(stats['mileage_km_min'])}-{_whole(stats['mileage_km_max'])} km"
+            )
+        if result.search_query_keys:
+            keys = ", ".join(
+                f"{name} x{count}" for name, count in list(result.search_query_keys.items())[:12]
+            )
+            echo(f"  query keys : {keys}")
+        echo(f"  next link  : {result.search_rel_next} rel=next link(s)")
         for shape, count in list(result.search_link_shapes.items())[:5]:
             echo(f"  link forms : {count} x {shape}")
         for shape, count in list(result.search_path_shapes.items())[:6]:
@@ -189,6 +220,9 @@ def _print_outcome(result: CaptureOutcome) -> None:
             ident = f", id={script['id']}" if script["id"] else ""
             origin = " (external)" if script["external"] else ""
             echo(f"  script     : {script['chars']} chars, {kind}{ident}{origin}")
+    for label, detail_types in result.detail_json_types.items():
+        listed = ", ".join(f"{name} x{count}" for name, count in list(detail_types.items())[:6]) or "none"
+        echo(f"  {label} json types: {listed}")
     for note in result.skipped:
         echo(f"  skipped    : {note}")
     echo(f"  requests   : {result.requests}")

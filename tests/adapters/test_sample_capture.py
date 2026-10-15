@@ -20,6 +20,7 @@ from suv_deals.crawling.sample_capture import (
     CaptureRefused,
     capture_samples,
     challenge_reason,
+    offer_stats,
     outline_html,
     redact_html,
 )
@@ -105,6 +106,7 @@ async def _run(
     cfg: SourceConfig | None = None,
     search_path: str = "/lst/toyota/rav-4",
     detail_limit: int = 2,
+    query: str | None = None,
 ) -> tuple[CaptureOutcome, list[float]]:
     waits: list[float] = []
 
@@ -120,6 +122,7 @@ async def _run(
         clock=FrozenClock(),
         sleep=sleep,
         resolver=_resolver,
+        query=query,
     )
     return outcome, waits
 
@@ -406,3 +409,77 @@ def test_outline_keeps_names_and_resolves_links_without_text() -> None:
     assert outline["json_types"]["Car"] == 1
     assert outline["scripts"][0]["chars"] > 0
     assert "seller@example.org" not in json.dumps(outline)
+
+
+JSONLD_ONLY_SEARCH = (
+    b"<html><head><title>Results</title>"
+    b'<link rel="next" href="/lst/toyota/rav-4?page=2">'
+    b'<script type="application/ld+json">{"@type":"SearchResultsPage","mainEntity":{"@type":"ItemList",'
+    b'"itemListElement":['
+    b'{"@type":"ListItem","url":"/annunci/sample-car-1","item":{"@type":["Car","Product"],'
+    b'"mileageFromOdometer":{"@type":"QuantitativeValue","value":187000,"unitCode":"KMT"},'
+    b'"offers":{"@type":"Offer","price":2900,"priceCurrency":"EUR","url":"/annunci/sample-car-1"}}},'
+    b'{"@type":"ListItem","url":"/annunci/sample-car-2","item":{"@type":["Car","Product"],'
+    b'"mileageFromOdometer":{"@type":"QuantitativeValue","value":150000,"unitCode":"KMT"},'
+    b'"offers":{"@type":"Offer","price":2650,"priceCurrency":"EUR","url":"/annunci/sample-car-2"}}}'
+    b"]}}</script></head><body><h1>Results</h1>"
+    b'<a href="/lst/toyota/rav-4?page=2&amp;sort=price">2</a></body></html>'
+)
+
+
+async def test_query_is_sent_and_recorded_and_checked_against_robots(tmp_path: Path) -> None:
+    with_query = f"{SEARCH}?priceto=3000&kmto=200000"
+    site = _healthy_site(**{with_query: RobotsFetchResponse(200, SEARCH_HTML, None)})
+    outcome, _ = await _run(site, tmp_path / "ok", query="priceto=3000&kmto=200000", detail_limit=0)
+    assert site.requests == [ROBOTS, with_query]
+    assert outcome.stop_kind is None
+    assert _manifest(outcome)["search_query"] == "priceto=3000&kmto=200000"
+
+    blocked = _healthy_site(
+        **{ROBOTS: RobotsFetchResponse(200, b"User-agent: *\nDisallow: /lst/toyota/rav-4?\n", None)}
+    )
+    refused, _ = await _run(blocked, tmp_path / "robots", query="priceto=3000")
+    assert blocked.requests == [ROBOTS], "robots.txt is evaluated on the path WITH its query"
+    assert refused.stop_kind == "robots_disallowed"
+
+
+@pytest.mark.parametrize("query", ["a b=1", "x=<script>", "=1", "k=v&", "k=" + "9" * 81])
+async def test_malformed_query_is_refused_before_any_request(tmp_path: Path, query: str) -> None:
+    site = _healthy_site()
+    with pytest.raises(CaptureRefused, match="key=value"):
+        await _run(site, tmp_path, query=query)
+    assert site.requests == []
+
+
+async def test_detail_links_are_taken_from_json_ld_when_the_page_has_no_anchors(tmp_path: Path) -> None:
+    site = _healthy_site(**{SEARCH: RobotsFetchResponse(200, JSONLD_ONLY_SEARCH, None)})
+    outcome, _ = await _run(site, tmp_path)
+
+    assert site.requests == [ROBOTS, SEARCH, DETAIL_1, DETAIL_2]
+    assert outcome.links_total == 1, "only the pagination anchor is an <a> link"
+    assert outcome.jsonld_links_total == 4, "ListItem.url and Offer.url for both cards"
+    assert outcome.detail_links_matching == 2
+    assert outcome.search_rel_next == 1
+    assert outcome.search_query_keys == {"page": 2, "sort": 1}
+    assert outcome.search_offer_stats == {
+        "offers_with_price": 2,
+        "price_min": 2650.0,
+        "price_max": 2900.0,
+        "currency": "EUR",
+        "mileages_km": 2,
+        "mileage_km_min": 150000.0,
+        "mileage_km_max": 187000.0,
+    }
+    assert set(outcome.detail_json_types) == {"detail-1", "detail-2"}
+
+
+def test_offer_stats_ignore_non_numeric_prices_and_other_units() -> None:
+    documents = [
+        {"@type": "Offer", "price": "2900", "priceCurrency": "EUR"},
+        {"@type": "Offer", "price": True, "priceCurrency": "EUR"},
+        {"@type": "Car", "mileageFromOdometer": {"value": 90000, "unitCode": "SMI"}},
+    ]
+    stats = offer_stats(documents)
+    assert stats["offers_with_price"] == 0
+    assert stats["mileages_km"] == 0
+    assert stats["price_min"] is None

@@ -44,7 +44,7 @@ from decimal import Decimal
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Final
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -80,6 +80,11 @@ _MAX_JSONLD: Final = 20
 _MAX_LINKS: Final = 5000
 _MAX_SCRIPTS: Final = 40
 _MAX_JSONLD_SHAPE: Final = 300
+_MAX_QUERY_KEYS: Final = 40
+_QUERY_STRING: Final = re.compile(
+    r"^[A-Za-z0-9_.~-]{1,40}=[A-Za-z0-9_.~,%+-]{0,80}(?:&[A-Za-z0-9_.~-]{1,40}=[A-Za-z0-9_.~,%+-]{0,80}){0,11}$"
+)
+_QUERY_KEY: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,39}$")
 _MAX_LINK_SHAPES: Final = 40
 _BLOCK_STATUSES: Final = frozenset({401, 403, 429})
 _TITLE: Final = re.compile(rb"<title[^>]*>(.*?)</title>", re.DOTALL)
@@ -161,6 +166,12 @@ class CaptureOutcome:
     search_path_shapes: dict[str, int] = field(default_factory=dict)
     search_json_types: dict[str, int] = field(default_factory=dict)
     search_jsonld_shape: dict[str, int] = field(default_factory=dict)
+    search_query: str | None = None
+    jsonld_links_total: int = 0
+    search_offer_stats: dict[str, Any] = field(default_factory=dict)
+    search_query_keys: dict[str, int] = field(default_factory=dict)
+    search_rel_next: int = 0
+    detail_json_types: dict[str, dict[str, int]] = field(default_factory=dict)
     detail_links_matching: int = 0
     requests: int = 0
     stop_kind: str | None = None
@@ -197,6 +208,7 @@ class _OutlineParser(HTMLParser):
         self.link_shapes: Counter[str] = Counter()
         self.scripts: list[dict[str, Any]] = []
         self.jsonld_documents: list[Any] = []
+        self.rel_next = 0
         self._base_host = urlsplit(base_url).hostname or ""
         self._script_type: str | None = None
         self._script_attrs: dict[str, Any] = {}
@@ -212,6 +224,8 @@ class _OutlineParser(HTMLParser):
             self.attribute_counts[name] += 1
             if name == "class" and value:
                 self.class_counts.update(value.split())
+        if tag in ("a", "link") and "next" in (values.get("rel") or "").lower().split():
+            self.rel_next += 1
         if tag == "a" and values.get("href"):
             absolute = _absolute(self._base, values["href"] or "")
             if absolute is not None:
@@ -346,27 +360,111 @@ def jsonld_shape(documents: list[Any], *, base_host: str) -> Counter[str]:
     return shapes
 
 
-def path_forms(text: str, *, base_host: str) -> tuple[Counter[str], Counter[str]]:
-    """Path shapes of every URL-like path in the page (scripts, JSON and attributes included) and the
-    JSON ``@type`` values found in it. Entities and escaped slashes are normalised first."""
+def _query_keys(path: str) -> list[str]:
+    query = path.split("#", 1)[0].partition("?")[2]
+    return [key for key, _ in parse_qsl(query, keep_blank_values=True) if _QUERY_KEY.fullmatch(key)]
+
+
+def path_forms(text: str, *, base_host: str) -> tuple[Counter[str], Counter[str], Counter[str]]:
+    """Path shapes of every URL-like path in the page (scripts, JSON and attributes included), the
+    JSON ``@type`` values and the query parameter NAMES used in those URLs. Entities and escaped
+    slashes are normalised first. Parameter values are never kept."""
     normalized = html.unescape(text).replace("\\/", "/")
     shapes: Counter[str] = Counter()
+    query_keys: Counter[str] = Counter()
     for match in _ABSOLUTE_URL.finditer(normalized):
         host = match.group(1).lower()
         kind = "same-host" if host == base_host else "other-host"
         shapes[_path_shape(match.group(2) or "/", kind)] += 1
+        if kind == "same-host":
+            query_keys.update(_query_keys(match.group(2) or ""))
     for match in _RELATIVE_PATH.finditer(normalized):
         shapes[_path_shape(match.group(1), "relative")] += 1
-    return shapes, Counter(_JSON_TYPE.findall(normalized))
+        query_keys.update(_query_keys(match.group(1)))
+    return shapes, Counter(_JSON_TYPE.findall(normalized)), query_keys
+
+
+def jsonld_urls(documents: list[Any], *, base_url: str) -> list[str]:
+    """Absolute http(s) URLs found as string values in JSON-LD documents, in document order."""
+    found: list[str] = []
+
+    def walk(value: Any, depth: int) -> None:
+        if depth > 10 or len(found) >= _MAX_LINKS:
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key != "@context":
+                    walk(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+        elif isinstance(value, str) and value.startswith(("/", "http://", "https://")):
+            absolute = _absolute(base_url, value)
+            if absolute is not None:
+                found.append(absolute)
+
+    for document in documents:
+        walk(document, 0)
+    return found
+
+
+def offer_stats(documents: list[Any]) -> dict[str, Any]:
+    """Aggregates over the JSON-LD offers of a page: counts, minimum and maximum only.
+
+    Used to check that a search filter took effect (all prices inside the asked band) without
+    keeping any single listing's values.
+    """
+    prices: list[float] = []
+    currencies: Counter[str] = Counter()
+    mileages: list[float] = []
+
+    def number(value: Any) -> float | None:
+        return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+    def walk(value: Any, depth: int) -> None:
+        if depth > 10:
+            return
+        if isinstance(value, dict):
+            if "Offer" in _type_name(value.get("@type")).split(","):
+                price = number(value.get("price"))
+                if price is not None:
+                    prices.append(price)
+                    currency = value.get("priceCurrency")
+                    if isinstance(currency, str) and currency:
+                        currencies[currency.upper()[:3]] += 1
+            odometer = value.get("mileageFromOdometer")
+            if isinstance(odometer, dict) and str(odometer.get("unitCode", "")).upper() in {"KMT", "KM"}:
+                km = number(odometer.get("value"))
+                if km is not None:
+                    mileages.append(km)
+            for item in value.values():
+                walk(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+
+    for document in documents:
+        walk(document, 0)
+    return {
+        "offers_with_price": len(prices),
+        "price_min": min(prices) if prices else None,
+        "price_max": max(prices) if prices else None,
+        "currency": currencies.most_common(1)[0][0] if currencies else None,
+        "mileages_km": len(mileages),
+        "mileage_km_min": min(mileages) if mileages else None,
+        "mileage_km_max": max(mileages) if mileages else None,
+    }
 
 
 def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[str]]:
-    """Structure of one page (names and counts) and its absolute links, in document order."""
+    """Structure of one page (names and counts) and its absolute links: anchors in document order,
+    then the URLs found in JSON-LD (``links_total`` counts anchors only)."""
     text = body.decode("utf-8", errors="replace")
     parser = _OutlineParser(base_url)
     parser.feed(text)
     parser.close()
-    shapes, json_types = path_forms(text, base_host=urlsplit(base_url).hostname or "")
+    shapes, json_types, query_keys = path_forms(text, base_host=urlsplit(base_url).hostname or "")
+    jsonld_links = jsonld_urls(parser.jsonld_documents, base_url=base_url)
     outline: dict[str, Any] = {
         "tags": dict(parser.tag_counts.most_common()),
         "classes": dict(parser.class_counts.most_common(_MAX_CLASSES)),
@@ -383,8 +481,12 @@ def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[st
             )
         ),
         "scripts": parser.scripts,
+        "jsonld_links_total": len(jsonld_links),
+        "offer_stats": offer_stats(parser.jsonld_documents),
+        "query_keys": dict(query_keys.most_common(_MAX_QUERY_KEYS)),
+        "rel_next": parser.rel_next,
     }
-    return outline, parser.links
+    return outline, parser.links + jsonld_links
 
 
 def redact_html(body: bytes) -> bytes:
@@ -574,7 +676,7 @@ class _Run:
             return body
         return None
 
-    async def run(self, search_path: str, detail_limit: int) -> None:
+    async def run(self, search_path: str, detail_limit: int, query: str | None = None) -> None:
         revision = await fetch_robots(
             self.policy, self.host, self._robots_fetch, resolver=self.resolver, clock=self.clock
         )
@@ -585,9 +687,10 @@ class _Run:
         if revision.availability == RobotsAvailability.UNREACHABLE:
             self._stop("robots_unreachable", "robots.txt could not be read, so nothing else was requested")
             return
-        search_url = f"https://{self.host}{search_path}"
+        target = f"{search_path}?{query}" if query else search_path
+        search_url = f"https://{self.host}{target}"
         if not evaluate(revision, search_url, self.user_agent, now=self.clock.now()).allowed:
-            self._stop("robots_disallowed", f"robots.txt disallows {search_path}; nothing else was requested")
+            self._stop("robots_disallowed", f"robots.txt disallows {target}; nothing else was requested")
             return
         self.pacer.delay = effective_delay_seconds(
             self.cfg.rate_budget, crawl_delay(revision, self.user_agent)
@@ -597,7 +700,11 @@ class _Run:
         if body is None:
             return
         outline, links = outline_html(body, base_url=search_url)
-        self.outcome.links_total = len(links)
+        self.outcome.links_total = int(outline["links_total"])
+        self.outcome.jsonld_links_total = int(outline["jsonld_links_total"])
+        self.outcome.search_offer_stats = dict(outline["offer_stats"])
+        self.outcome.search_query_keys = dict(outline["query_keys"])
+        self.outcome.search_rel_next = int(outline["rel_next"])
         self.outcome.search_link_shapes = dict(outline["link_shapes"])
         self.outcome.search_scripts = list(outline["scripts"])
         self.outcome.search_path_shapes = dict(outline["path_shapes"])
@@ -630,7 +737,9 @@ class _Run:
             detail_body = await self._get(label, url, "detail")
             if detail_body is None:
                 return
-            self.outlines[label] = outline_html(detail_body, base_url=url)[0]
+            detail_outline = outline_html(detail_body, base_url=url)[0]
+            self.outlines[label] = detail_outline
+            self.outcome.detail_json_types[label] = dict(detail_outline["json_types"])
 
 
 def _describe_stop(step: SampleStep, kind: str) -> str:
@@ -643,7 +752,9 @@ def _describe_stop(step: SampleStep, kind: str) -> str:
     return f"{step.label} answered {detail} ({kind}); the run stopped"
 
 
-def _write(run: _Run, *, out_root: Path, search_path: str, detail_limit: int) -> None:
+def _write(
+    run: _Run, *, out_root: Path, search_path: str, detail_limit: int, query: str | None = None
+) -> None:
     outcome = run.outcome
     stamp = ensure_utc(run.clock.now())
     directory = out_root / run.cfg.source_key / stamp.strftime("%Y%m%dT%H%M%SZ")
@@ -665,6 +776,7 @@ def _write(run: _Run, *, out_root: Path, search_path: str, detail_limit: int) ->
         "captured_at": stamp.isoformat(),
         "user_agent": run.user_agent,
         "search_path": search_path,
+        "search_query": query,
         "detail_limit": detail_limit,
         "robots": {
             "file": "robots.txt" if run.revision is not None and run.revision.body is not None else None,
@@ -699,6 +811,7 @@ async def capture_samples(
     sleep: Sleep,
     resolver: Resolver = system_resolver,
     user_agent: str = CAPTURE_USER_AGENT,
+    query: str | None = None,
 ) -> CaptureOutcome:
     """Capture the reviewed pages of one source (every guard is described in the module docstring).
 
@@ -711,6 +824,10 @@ async def capture_samples(
         raise CaptureRefused(f"--detail-limit must be between 0 and {MAX_DETAIL_PAGES}")
     if not search_path.startswith("/") or "?" in search_path or "#" in search_path:
         raise CaptureRefused("the search path must start with / and carry no query string or fragment")
+    if query is not None and (len(query) > 400 or not _QUERY_STRING.fullmatch(query)):
+        raise CaptureRefused(
+            "the query must be key=value pairs joined by & (letters, digits and . _ ~ - , % + only)"
+        )
     policy = SourceUrlPolicy.from_source(cfg)
     try:
         policy.check(f"https://{host}{search_path}", "search")
@@ -725,9 +842,10 @@ async def capture_samples(
         clock=clock,
         user_agent=user_agent,
     )
-    await run.run(search_path, detail_limit)
+    run.outcome.search_query = query
+    await run.run(search_path, detail_limit, query)
     run.outcome.requests = run.pacer.requests
-    _write(run, out_root=out_root, search_path=search_path, detail_limit=detail_limit)
+    _write(run, out_root=out_root, search_path=search_path, detail_limit=detail_limit, query=query)
     return run.outcome
 
 
