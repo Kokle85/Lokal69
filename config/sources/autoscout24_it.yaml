@@ -28,7 +28,7 @@ allowed_hosts:
 allowed_search_paths:
   - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
 allowed_detail_paths:
-  - '^/annunci/[a-z0-9-]+$'
+  - '^/annunci/[A-Za-z0-9][A-Za-z0-9._~%-]{0,300}/?$'
 search: {}
 notes: >-
   AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or Italy-specific (autoscout24.it) and business-use terms apply must be verified before a decision. Owner-run capture 2026-10-15 (suv-deals capture-samples, structure only): /lst/<make>/<model> answers HTTP 200 (a hyphenated model slug such as rav-4 is redirected with 308 to rav4) and publishes its results as schema.org JSON-LD: a SearchResultsPage whose mainEntity is an ItemList of 20 ListItem entries, each with a relative url /annunci/<slug> and an item typed Car/Product carrying name, brand, model, fuelType, vehicleTransmission, vehicleConfiguration, mileageFromOdometer (QuantitativeValue), image, additionalProperty and offers (Offer: price, priceCurrency, url, availability, itemCondition, seller AutoDealer). Listing links appear only in that JSON-LD; the page's <a> links are facets and dealer pages. robots.txt unchanged (sha256 7c78475c...). Search filter parameters, pagination and detail pages are not verified yet.

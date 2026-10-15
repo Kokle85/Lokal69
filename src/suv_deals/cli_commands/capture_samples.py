@@ -193,6 +193,13 @@ def _print_outcome(result: CaptureOutcome) -> None:
                 f"  mileage    : {stats['mileages_km']} with km, "
                 f"{_whole(stats['mileage_km_min'])}-{_whole(stats['mileage_km_max'])} km"
             )
+        for label, key in (("models", "models"), ("brands", "brands")):
+            names = stats.get(key) or {}
+            if names:
+                listed = ", ".join(f"{name} x{count}" for name, count in list(names.items())[:10])
+                echo(f"  {label:<11}: {listed}")
+        for shape, count in result.detail_misses.items():
+            echo(f"  detail miss: {count} x {shape}")
         if result.search_query_keys:
             keys = ", ".join(
                 f"{name} x{count}" for name, count in list(result.search_query_keys.items())[:12]

@@ -469,6 +469,8 @@ async def test_detail_links_are_taken_from_json_ld_when_the_page_has_no_anchors(
         "mileages_km": 2,
         "mileage_km_min": 150000.0,
         "mileage_km_max": 187000.0,
+        "models": {},
+        "brands": {},
     }
     assert set(outcome.detail_json_types) == {"detail-1", "detail-2"}
 
@@ -483,3 +485,30 @@ def test_offer_stats_ignore_non_numeric_prices_and_other_units() -> None:
     assert stats["offers_with_price"] == 0
     assert stats["mileages_km"] == 0
     assert stats["price_min"] is None
+
+
+def test_offer_stats_count_model_and_brand_names() -> None:
+    documents = [
+        {"@type": ["Car", "Product"], "model": "RAV 4", "brand": {"@type": "Brand", "name": "Toyota"}},
+        {"@type": ["Car", "Product"], "model": "RAV 4", "brand": {"@type": "Brand", "name": "Toyota"}},
+        {"@type": ["Car", "Product"], "model": "C-HR", "brand": "Toyota"},
+    ]
+    stats = offer_stats(documents)
+    assert stats["models"] == {"RAV 4": 2, "C-HR": 1}
+    assert stats["brands"] == {"Toyota": 3}
+
+
+async def test_refused_detail_links_are_described_without_their_slug(tmp_path: Path) -> None:
+    page = (
+        b'<html><head><title>Results</title><script type="application/ld+json">{"@type":"ItemList",'
+        b'"itemListElement":[{"@type":"ListItem","url":"/annunci/Sample.Car-1/"},'
+        b'{"@type":"ListItem","url":"/annunci/sample-car-2"}]}</script></head><body></body></html>'
+    )
+    site = _healthy_site(**{SEARCH: RobotsFetchResponse(200, page, None)})
+    outcome, _ = await _run(site, tmp_path, detail_limit=0)
+
+    assert outcome.detail_links_matching == 1
+    assert outcome.detail_misses == {
+        "/annunci/ 2 segment(s) path_not_allowed [digit,dot,hyphen,lower,upper] trailing-slash": 1
+    }
+    assert "Sample.Car" not in json.dumps(outcome.detail_misses)

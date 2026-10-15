@@ -85,6 +85,8 @@ _QUERY_STRING: Final = re.compile(
     r"^[A-Za-z0-9_.~-]{1,40}=[A-Za-z0-9_.~,%+-]{0,80}(?:&[A-Za-z0-9_.~-]{1,40}=[A-Za-z0-9_.~,%+-]{0,80}){0,11}$"
 )
 _QUERY_KEY: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,39}$")
+_DETAIL_PREFIX: Final = re.compile(r"^\^/([A-Za-z0-9_-]+)/")
+_VEHICLE_TYPES: Final = frozenset({"Car", "Vehicle", "Product"})
 _MAX_LINK_SHAPES: Final = 40
 _BLOCK_STATUSES: Final = frozenset({401, 403, 429})
 _TITLE: Final = re.compile(rb"<title[^>]*>(.*?)</title>", re.DOTALL)
@@ -172,6 +174,7 @@ class CaptureOutcome:
     search_query_keys: dict[str, int] = field(default_factory=dict)
     search_rel_next: int = 0
     detail_json_types: dict[str, dict[str, int]] = field(default_factory=dict)
+    detail_misses: dict[str, int] = field(default_factory=dict)
     detail_links_matching: int = 0
     requests: int = 0
     stop_kind: str | None = None
@@ -409,14 +412,17 @@ def jsonld_urls(documents: list[Any], *, base_url: str) -> list[str]:
 
 
 def offer_stats(documents: list[Any]) -> dict[str, Any]:
-    """Aggregates over the JSON-LD offers of a page: counts, minimum and maximum only.
+    """Aggregates over the JSON-LD offers of a page: counts, minimum and maximum, and how often each
+    model and brand name occurs.
 
-    Used to check that a search filter took effect (all prices inside the asked band) without
-    keeping any single listing's values.
+    Used to check that a search filter took effect (all prices inside the asked band, only SUV
+    models after a body filter) without keeping any single listing's values.
     """
     prices: list[float] = []
     currencies: Counter[str] = Counter()
     mileages: list[float] = []
+    models: Counter[str] = Counter()
+    brands: Counter[str] = Counter()
 
     def number(value: Any) -> float | None:
         return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
@@ -432,6 +438,14 @@ def offer_stats(documents: list[Any]) -> dict[str, Any]:
                     currency = value.get("priceCurrency")
                     if isinstance(currency, str) and currency:
                         currencies[currency.upper()[:3]] += 1
+            if set(_type_name(value.get("@type")).split(",")) & _VEHICLE_TYPES:
+                model = value.get("model")
+                if isinstance(model, str) and model.strip():
+                    models[model.strip()[:40]] += 1
+                brand = value.get("brand")
+                brand_name = brand.get("name") if isinstance(brand, dict) else brand
+                if isinstance(brand_name, str) and brand_name.strip():
+                    brands[brand_name.strip()[:40]] += 1
             odometer = value.get("mileageFromOdometer")
             if isinstance(odometer, dict) and str(odometer.get("unitCode", "")).upper() in {"KMT", "KM"}:
                 km = number(odometer.get("value"))
@@ -453,6 +467,8 @@ def offer_stats(documents: list[Any]) -> dict[str, Any]:
         "mileages_km": len(mileages),
         "mileage_km_min": min(mileages) if mileages else None,
         "mileage_km_max": max(mileages) if mileages else None,
+        "models": dict(models.most_common(15)),
+        "brands": dict(brands.most_common(10)),
     }
 
 
@@ -533,19 +549,53 @@ def _path_refusal(cfg: SourceConfig, search_path: str, reason: str) -> str:
     )
 
 
-def _detail_candidates(links: Iterable[str], policy: SourceUrlPolicy) -> list[str]:
+def _char_classes(segment: str) -> str:
+    classes: set[str] = set()
+    for char in segment:
+        if "a" <= char <= "z":
+            classes.add("lower")
+        elif "A" <= char <= "Z":
+            classes.add("upper")
+        elif "0" <= char <= "9":
+            classes.add("digit")
+        else:
+            classes.add({"-": "hyphen", ".": "dot", "_": "underscore", "%": "percent"}.get(char, "other"))
+    return ",".join(sorted(classes))
+
+
+def detail_prefixes(cfg: SourceConfig) -> frozenset[str]:
+    """The literal first path segment of each reviewed detail pattern (``^/annunci/...`` -> annunci)."""
+    return frozenset(
+        match.group(1) for pattern in cfg.allowed_detail_paths if (match := _DETAIL_PREFIX.match(pattern))
+    )
+
+
+def _detail_candidates(
+    links: Iterable[str], policy: SourceUrlPolicy, prefixes: frozenset[str] = frozenset()
+) -> tuple[list[str], Counter[str]]:
+    """Links the reviewed detail pattern accepts, and the shapes of same-host links under a detail
+    prefix that it refuses (reason and character classes of the last segment; never the slug)."""
     seen: set[str] = set()
     accepted: list[str] = []
+    misses: Counter[str] = Counter()
     for link in links:
         if link in seen:
             continue
         seen.add(link)
         try:
             policy.check(link, "detail")
-        except PolicyDenied:
+        except PolicyDenied as exc:
+            parts = urlsplit(link)
+            segments = [segment for segment in parts.path.split("/") if segment]
+            if segments and segments[0] in prefixes and policy.host_allowed(parts.hostname or ""):
+                trailing = " trailing-slash" if parts.path.endswith("/") else ""
+                misses[
+                    f"/{segments[0]}/ {len(segments)} segment(s) {exc.reason.value} "
+                    f"[{_char_classes(segments[-1])}]{trailing}"
+                ] += 1
             continue
         accepted.append(link)
-    return accepted
+    return accepted, misses
 
 
 async def _fetch(
@@ -710,8 +760,10 @@ class _Run:
         self.outcome.search_path_shapes = dict(outline["path_shapes"])
         self.outcome.search_json_types = dict(outline["json_types"])
         self.outcome.search_jsonld_shape = dict(outline["jsonld_shape"])
-        candidates = _detail_candidates(links, self.policy)
+        candidates, misses = _detail_candidates(links, self.policy, detail_prefixes(self.cfg))
         outline["detail_links_matching"] = len(candidates)
+        outline["detail_misses"] = dict(misses.most_common(10))
+        self.outcome.detail_misses = dict(misses.most_common(10))
         self.outlines["search"] = outline
         self.outcome.detail_links_matching = len(candidates)
 
