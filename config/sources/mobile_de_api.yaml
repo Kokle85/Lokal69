@@ -28,3 +28,6 @@ notes: >-
   Entitlement unverified. Activation requires an owner-approved account/agreement, a recorded
   entitlement reference, server-side credentials, an implementation written from the official
   documentation, recorded fixtures and a successful low-volume test.
+  Owner decision 2026-10-15: mobile.de answered the permission request with a price of EUR 990 per
+  month for Search API access; the owner deferred the API ("оставаме за понатака"). Nothing is
+  ordered or implemented; revisit only on a new owner decision.
