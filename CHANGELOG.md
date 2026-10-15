@@ -13,7 +13,8 @@ robots.txt re-check of the same day. Nothing is enabled, fetched or activated.
 - **`suv-deals capture-samples` (owner-run).** Saves a few reviewed pages of one source (one search
   path, at most `--detail-limit` detail pages) to the git-ignored `captures/` folder, so parsers are
   written from real structure. Guard rails: `--yes`, `SOURCE_NETWORK_ENABLED=true` for that command
-  only, reviewed path and detail patterns, robots.txt on every URL, no redirects, 20 s spacing, and
+  only, reviewed path and detail patterns, robots.txt on every URL, same-host redirects only through the same checks (two hops at most),
+  20 s spacing, and
   the first block, challenge page or error stops the run. It prints counts and statuses only; no
   database, no source flag or gate changes. Tests use fake fetchers (no network).
 

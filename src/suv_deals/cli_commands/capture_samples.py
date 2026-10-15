@@ -154,6 +154,8 @@ def _print_outcome(result: CaptureOutcome) -> None:
         parts = [_status(step.status)]
         if step.status is not None:
             parts.append(f"{step.size} bytes")
+        if step.location is not None:
+            parts.append(f"redirect to {step.location}")
         if step.truncated:
             parts.append("truncated at the size cap")
         if step.challenge is not None:

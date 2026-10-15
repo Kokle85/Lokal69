@@ -217,8 +217,83 @@ async def test_challenge_page_with_200_is_detected_and_stops(tmp_path: Path) -> 
     assert outcome.steps[-1].challenge == "title:just a moment"
 
 
-async def test_redirects_are_not_followed_and_stop_the_run(tmp_path: Path) -> None:
-    site = _healthy_site(**{SEARCH: RobotsFetchResponse(301, b"", None, "https://elsewhere.example/")})
+async def test_same_host_redirect_to_a_reviewed_path_is_followed(tmp_path: Path) -> None:
+    redirected = f"{SEARCH}?sort=price"
+    site = _healthy_site(
+        **{
+            SEARCH: RobotsFetchResponse(308, b"", None, redirected),
+            redirected: RobotsFetchResponse(200, SEARCH_HTML, None),
+        }
+    )
+    outcome, _ = await _run(site, tmp_path)
+
+    assert site.requests == [ROBOTS, SEARCH, redirected, DETAIL_1, DETAIL_2]
+    assert outcome.stop_kind is None
+    assert outcome.directory is not None
+    assert (outcome.directory / "search.html").exists(), "the page behind the redirect is the one saved"
+    manifest = _manifest(outcome)
+    assert [step["label"] for step in manifest["steps"]] == [
+        "search",
+        "search-redirect-1",
+        "detail-1",
+        "detail-2",
+    ]
+    assert manifest["steps"][0]["location"] == SEARCH, "the target is recorded without its query string"
+    assert manifest["steps"][0]["file"] is None
+    assert manifest["steps"][1]["file"] == "search.html"
+
+
+async def test_redirect_to_another_host_stops_the_run(tmp_path: Path) -> None:
+    site = _healthy_site(
+        **{SEARCH: RobotsFetchResponse(301, b"", None, "https://elsewhere.example.net/lst/toyota/rav-4")}
+    )
+    outcome, _ = await _run(site, tmp_path)
+
+    assert site.requests == [ROBOTS, SEARCH]
+    assert outcome.stop_kind == "redirect_refused"
+    assert "URL policy" in (outcome.stop_reason or "")
+
+
+async def test_redirect_to_an_unreviewed_path_stops_the_run(tmp_path: Path) -> None:
+    site = _healthy_site(**{SEARCH: RobotsFetchResponse(302, b"", None, f"https://{HOST}/ricerca/avanzata")})
+    outcome, _ = await _run(site, tmp_path)
+
+    assert site.requests == [ROBOTS, SEARCH]
+    assert outcome.stop_kind == "redirect_refused"
+
+
+async def test_redirect_loop_stops_after_the_second_hop(tmp_path: Path) -> None:
+    site = _healthy_site(
+        **{
+            SEARCH: RobotsFetchResponse(308, b"", None, f"{SEARCH}?a=1"),
+            f"{SEARCH}?a=1": RobotsFetchResponse(308, b"", None, f"{SEARCH}?a=2"),
+            f"{SEARCH}?a=2": RobotsFetchResponse(308, b"", None, f"{SEARCH}?a=3"),
+        }
+    )
+    outcome, _ = await _run(site, tmp_path)
+
+    assert site.requests == [ROBOTS, SEARCH, f"{SEARCH}?a=1", f"{SEARCH}?a=2"]
+    assert outcome.stop_kind == "redirect_refused"
+    assert "more than 2 times" in (outcome.stop_reason or "")
+
+
+async def test_redirect_target_disallowed_by_robots_is_not_requested(tmp_path: Path) -> None:
+    redirected = f"{SEARCH}?sort=price"
+    site = _healthy_site(
+        **{
+            ROBOTS: RobotsFetchResponse(200, b"User-agent: *\nDisallow: /lst/toyota/rav-4?\n", None),
+            SEARCH: RobotsFetchResponse(308, b"", None, redirected),
+        }
+    )
+    outcome, _ = await _run(site, tmp_path)
+
+    assert site.requests == [ROBOTS, SEARCH]
+    assert outcome.stop_kind == "redirect_refused"
+    assert "robots.txt" in (outcome.stop_reason or "")
+
+
+async def test_redirect_without_a_location_is_not_followed(tmp_path: Path) -> None:
+    site = _healthy_site(**{SEARCH: RobotsFetchResponse(301, b"", None, None)})
     outcome, _ = await _run(site, tmp_path)
 
     assert site.requests == [ROBOTS, SEARCH]

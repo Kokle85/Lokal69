@@ -9,7 +9,9 @@ be read locally. It is deliberately not a crawler:
   ``detail_mode: card_only`` sources;
 - robots.txt is fetched first and every URL is checked against it for our product token; a URL that
   robots.txt disallows is never requested, and nothing is requested when robots.txt is unreachable;
-- every request passes ``SourceUrlPolicy`` (host, path, public DNS); redirects are not followed;
+- every request passes ``SourceUrlPolicy`` (host, path, public DNS). A redirect is followed only when
+  its target is on the same host, passes the same policy and robots.txt, and within two hops; any
+  other redirect stops the run;
 - one request at a time, spaced by the source's ``min_delay_seconds`` or a robots crawl-delay;
 - the first block (401/403/429), challenge page, network error or other non-2xx answer stops the
   run. There are no retries and no workaround of any kind: no CAPTCHA solving, proxies, stealth
@@ -51,6 +53,7 @@ from suv_deals.crawling.rate_limits import effective_delay_seconds
 from suv_deals.crawling.robots import (
     RobotsAvailability,
     RobotsFetchResponse,
+    RobotsRevision,
     crawl_delay,
     evaluate,
     fetch_robots,
@@ -63,6 +66,7 @@ CAPTURE_USER_AGENT: Final = DEFAULT_USER_AGENT
 DEFAULT_TIMEOUT_S: Final = 45.0
 DEFAULT_MAX_BYTES: Final = 8_000_000
 MAX_DETAIL_PAGES: Final = 10
+MAX_REDIRECT_HOPS: Final = 2  # same-host hops only; each hop is checked like a request of its own
 PageFetcher = Callable[[str], Awaitable[RobotsFetchResponse]]
 Sleep = Callable[[float], Awaitable[None]]
 TRUNCATED: Final = "truncated"
@@ -112,6 +116,7 @@ class SampleStep:
     status: int | None
     size: int = 0
     truncated: bool = False
+    location: str | None = None  # redirect target without query string (3xx only)
     challenge: str | None = None
     error: str | None = None
     sha256: str | None = None
@@ -320,13 +325,21 @@ async def _fetch(
     pacer: _Pacer,
     fetcher: PageFetcher,
     resolver: Resolver,
-) -> tuple[SampleStep, bytes | None]:
-    """One policy-checked request. The body is returned only for a 2xx page that is not a challenge."""
+) -> tuple[SampleStep, bytes | None, str | None]:
+    """One policy-checked request.
+
+    Returns the step, the body (only for a 2xx page that is not a challenge) and, for a 3xx answer
+    with a Location, the absolute redirect target. The caller decides whether to follow it.
+    """
     public = _public_url(url)
     try:
         await policy.resolve_check(url, purpose, resolver)
     except PolicyDenied as exc:
-        return SampleStep(label=label, url=public, status=None, error=f"policy:{exc.reason.value}"), None
+        return (
+            SampleStep(label=label, url=public, status=None, error=f"policy:{exc.reason.value}"),
+            None,
+            None,
+        )
     await pacer.before_request()
     response = await fetcher(url)
     body = response.body if response.body is not None else b""
@@ -339,11 +352,15 @@ async def _fetch(
     )
     if response.status is None or response.error_kind not in (None, TRUNCATED):
         step.error = response.error_kind or "no_response"
-        return step, None
+        return step, None, None
+    if 300 <= response.status <= 399:
+        target = _absolute(url, response.location) if response.location else None
+        step.location = _public_url(target) if target is not None else None
+        return step, None, target
     if not 200 <= response.status <= 299:
-        return step, None
+        return step, None, None
     step.challenge = challenge_reason(body)
-    return step, (None if step.challenge is not None else body)
+    return step, (None if step.challenge is not None else body), None
 
 
 class _Run:
@@ -369,8 +386,9 @@ class _Run:
         self.user_agent = user_agent
         self.pacer = _Pacer(sleep, Decimal(cfg.rate_budget.min_delay_seconds))
         self.outcome = CaptureOutcome(source_key=cfg.source_key, host=self.host)
-        self.pages: list[tuple[str, bytes]] = []
+        self.pages: list[tuple[str, bytes, SampleStep]] = []
         self.outlines: dict[str, dict[str, Any]] = {}
+        self.revision: RobotsRevision | None = None
 
     def _stop(self, kind: str, reason: str) -> None:
         self.outcome.stop_kind = kind
@@ -380,24 +398,51 @@ class _Run:
         await self.pacer.before_request()
         return await self.fetcher(url)
 
+    def _redirect_refusal(self, current: str, target: str, purpose: FetchPurpose) -> str | None:
+        """Why a redirect target may not be followed, or None when it may (same host, reviewed, allowed)."""
+        try:
+            self.policy.validate_redirect(current, target, purpose)
+        except PolicyDenied as exc:
+            return f"the URL policy refuses it ({exc.reason.value})"
+        if (
+            self.revision is not None
+            and not evaluate(self.revision, target, self.user_agent, now=self.clock.now()).allowed
+        ):
+            return "robots.txt disallows it"
+        return None
+
     async def _get(self, label: str, url: str, purpose: FetchPurpose) -> bytes | None:
-        step, body = await _fetch(
-            label,
-            url,
-            purpose,
-            policy=self.policy,
-            pacer=self.pacer,
-            fetcher=self.fetcher,
-            resolver=self.resolver,
-        )
-        self.outcome.steps.append(step)
-        kind = step.stop_kind()
-        if kind is not None:
-            self._stop(kind, _describe_stop(step, kind))
-            return None
-        if body is not None:
-            self.pages.append((label, body))
-        return body
+        current = url
+        for hop in range(MAX_REDIRECT_HOPS + 1):
+            hop_label = label if hop == 0 else f"{label}-redirect-{hop}"
+            step, body, target = await _fetch(
+                hop_label,
+                current,
+                purpose,
+                policy=self.policy,
+                pacer=self.pacer,
+                fetcher=self.fetcher,
+                resolver=self.resolver,
+            )
+            self.outcome.steps.append(step)
+            if target is not None:
+                if hop == MAX_REDIRECT_HOPS:
+                    self._stop("redirect_refused", f"{label} redirected more than {MAX_REDIRECT_HOPS} times")
+                    return None
+                refusal = self._redirect_refusal(current, target, purpose)
+                if refusal is not None:
+                    self._stop("redirect_refused", f"{label} redirect not followed: {refusal}")
+                    return None
+                current = target
+                continue
+            kind = step.stop_kind()
+            if kind is not None:
+                self._stop(kind, _describe_stop(step, kind))
+                return None
+            if body is not None:
+                self.pages.append((label, body, step))
+            return body
+        return None
 
     async def run(self, search_path: str, detail_limit: int) -> None:
         revision = await fetch_robots(
@@ -406,6 +451,7 @@ class _Run:
         self.outcome.robots_status = revision.http_status
         self.outcome.robots_availability = revision.availability.value
         self.outcome.robots_sha256 = revision.content_hash
+        self.revision = revision
         if revision.availability == RobotsAvailability.UNREACHABLE:
             self._stop("robots_unreachable", "robots.txt could not be read, so nothing else was requested")
             return
@@ -466,11 +512,9 @@ def _write(run: _Run, *, out_root: Path, search_path: str, detail_limit: int) ->
     stamp = ensure_utc(run.clock.now())
     directory = out_root / run.cfg.source_key / stamp.strftime("%Y%m%dT%H%M%SZ")
     directory.mkdir(parents=True, exist_ok=False)
-    steps = {step.label: step for step in outcome.steps}
-    for label, body in run.pages:
+    for label, body, step in run.pages:
         saved = redact_html(body)
         (directory / f"{label}.html").write_bytes(saved)
-        step = steps[label]
         step.file = f"{label}.html"
         step.size = len(saved)
         step.sha256 = hashlib.sha256(saved).hexdigest()
