@@ -172,6 +172,13 @@ def _print_outcome(result: CaptureOutcome) -> None:
             echo(f"  link forms : {count} x {shape}")
         for shape, count in list(result.search_path_shapes.items())[:6]:
             echo(f"  path forms : {count} x {shape} (anywhere in the page)")
+        url_keys = [(key, count) for key, count in result.search_jsonld_shape.items() if ": url: " in key]
+        for key, count in url_keys[:6]:
+            echo(f"  json urls  : {count} x {key}")
+        if result.search_jsonld_shape:
+            echo(
+                f"  json keys  : {len(result.search_jsonld_shape)} distinct key/kind pairs in structure.json"
+            )
         if result.search_json_types:
             types = ", ".join(
                 f"{name} x{count}" for name, count in list(result.search_json_types.items())[:6]

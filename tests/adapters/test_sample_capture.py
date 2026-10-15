@@ -376,6 +376,20 @@ def test_path_forms_read_escaped_urls_inside_scripts() -> None:
     assert outline["json_types"] == {"ItemList": 1}
 
 
+def test_jsonld_shape_names_keys_and_url_shapes_but_no_values() -> None:
+    body = (
+        b'<script type="application/ld+json">{"@graph":[{"@type":"ItemList","url":"https://www.sample-market.it/'
+        b'offers/sample-car-4-98765432","itemListElement":[{"@type":"Offer","price":2990,"seller":{"name":"Dealer"}}]}]}'
+        b"</script>"
+    )
+    outline, _ = outline_html(body, base_url=SEARCH)
+    shape = outline["jsonld_shape"]
+    assert shape["ItemList.url: url: same-host /offers/ 2 segment(s) +id"] == 1
+    assert shape["Offer.price: number"] == 1
+    assert shape["Offer.seller: object"] == 1
+    assert "Dealer" not in json.dumps(outline), "no values are stored"
+
+
 def test_outline_keeps_names_and_resolves_links_without_text() -> None:
     outline, links = outline_html(SEARCH_HTML, base_url=SEARCH)
     assert outline["tags"]["a"] == 5

@@ -79,6 +79,7 @@ _MAX_ATTRIBUTES: Final = 200
 _MAX_JSONLD: Final = 20
 _MAX_LINKS: Final = 5000
 _MAX_SCRIPTS: Final = 40
+_MAX_JSONLD_SHAPE: Final = 300
 _MAX_LINK_SHAPES: Final = 40
 _BLOCK_STATUSES: Final = frozenset({401, 403, 429})
 _TITLE: Final = re.compile(rb"<title[^>]*>(.*?)</title>", re.DOTALL)
@@ -159,6 +160,7 @@ class CaptureOutcome:
     search_scripts: list[dict[str, Any]] = field(default_factory=list)
     search_path_shapes: dict[str, int] = field(default_factory=dict)
     search_json_types: dict[str, int] = field(default_factory=dict)
+    search_jsonld_shape: dict[str, int] = field(default_factory=dict)
     detail_links_matching: int = 0
     requests: int = 0
     stop_kind: str | None = None
@@ -194,6 +196,7 @@ class _OutlineParser(HTMLParser):
         self.links: list[str] = []
         self.link_shapes: Counter[str] = Counter()
         self.scripts: list[dict[str, Any]] = []
+        self.jsonld_documents: list[Any] = []
         self._base_host = urlsplit(base_url).hostname or ""
         self._script_type: str | None = None
         self._script_attrs: dict[str, Any] = {}
@@ -245,6 +248,7 @@ class _OutlineParser(HTMLParser):
             data: Any = json.loads(text)
         except (ValueError, RecursionError):
             return
+        self.jsonld_documents.append(data)
         graph = data.get("@graph") if isinstance(data, dict) else None
         items: list[Any] = graph if isinstance(graph, list) else data if isinstance(data, list) else [data]
         for item in items:
@@ -291,6 +295,57 @@ def _path_shape(path: str, kind: str) -> str:
     return f"{kind} {head} {len(segments)} segment(s){tail}"
 
 
+def _value_kind(value: Any, base_host: str) -> str:
+    """The kind of a JSON value, never the value itself; URL-like strings are reduced to their shape."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")):
+            parts = urlsplit(value)
+            kind = "same-host" if (parts.hostname or "") == base_host else "other-host"
+            return f"url: {_path_shape(parts.path or '/', kind)}"
+        if value.startswith("/"):
+            return f"url: {_path_shape(value, 'relative')}"
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    return "list"
+
+
+def jsonld_shape(documents: list[Any], *, base_host: str) -> Counter[str]:
+    """Key names of every JSON-LD object with the kind of each value, as ``<type>.<key>: <kind>``.
+
+    The type is the object's own ``@type`` (or the enclosing one when it has none). Keys that start
+    with ``@`` are not counted, except that ``@graph`` items are walked. Values are never stored.
+    """
+    shapes: Counter[str] = Counter()
+
+    def walk(value: Any, owner: str, depth: int) -> None:
+        if depth > 8:
+            return
+        if isinstance(value, dict):
+            name = _type_name(value.get("@type")) or owner
+            for key, item in value.items():
+                if key == "@graph":
+                    walk(item, name, depth + 1)
+                    continue
+                if key.startswith("@"):
+                    continue
+                shapes[f"{name}.{key}: {_value_kind(item, base_host)}"] += 1
+                walk(item, name, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, owner, depth + 1)
+
+    for document in documents:
+        walk(document, "root", 0)
+    return shapes
+
+
 def path_forms(text: str, *, base_host: str) -> tuple[Counter[str], Counter[str]]:
     """Path shapes of every URL-like path in the page (scripts, JSON and attributes included) and the
     JSON ``@type`` values found in it. Entities and escaped slashes are normalised first."""
@@ -322,6 +377,11 @@ def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[st
         "link_shapes": dict(parser.link_shapes.most_common(_MAX_LINK_SHAPES)),
         "path_shapes": dict(shapes.most_common(_MAX_LINK_SHAPES)),
         "json_types": dict(json_types.most_common(_MAX_LINK_SHAPES)),
+        "jsonld_shape": dict(
+            jsonld_shape(parser.jsonld_documents, base_host=urlsplit(base_url).hostname or "").most_common(
+                _MAX_JSONLD_SHAPE
+            )
+        ),
         "scripts": parser.scripts,
     }
     return outline, parser.links
@@ -542,6 +602,7 @@ class _Run:
         self.outcome.search_scripts = list(outline["scripts"])
         self.outcome.search_path_shapes = dict(outline["path_shapes"])
         self.outcome.search_json_types = dict(outline["json_types"])
+        self.outcome.search_jsonld_shape = dict(outline["jsonld_shape"])
         candidates = _detail_candidates(links, self.policy)
         outline["detail_links_matching"] = len(candidates)
         self.outlines["search"] = outline
@@ -593,6 +654,8 @@ def _write(run: _Run, *, out_root: Path, search_path: str, detail_limit: int) ->
         step.file = f"{label}.html"
         step.size = len(saved)
         step.sha256 = hashlib.sha256(saved).hexdigest()
+    if run.revision is not None and run.revision.body is not None:
+        (directory / "robots.txt").write_text(run.revision.body, encoding="utf-8")
     (directory / "structure.json").write_text(
         json.dumps(run.outlines, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -604,6 +667,7 @@ def _write(run: _Run, *, out_root: Path, search_path: str, detail_limit: int) ->
         "search_path": search_path,
         "detail_limit": detail_limit,
         "robots": {
+            "file": "robots.txt" if run.revision is not None and run.revision.body is not None else None,
             "http_status": outcome.robots_status,
             "availability": outcome.robots_availability,
             "content_sha256": outcome.robots_sha256,
