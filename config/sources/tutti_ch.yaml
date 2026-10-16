@@ -46,4 +46,7 @@ notes: >-
   network) with our user agent; the owner's network may be answered differently, and any block there
   stops the source the same way. Domain, operator, terms and imprint are UNVERIFIED. Classifieds
   carry private sellers: store no seller contact data and record the seller type. No route, selector
-  or listing-ID pattern is encoded.
+  or listing-ID pattern is encoded. Owner-network probe of 2026-10-16 (scripts/readiness_check.sh):
+  robots.txt and the home page answered HTTP 403 directly, and the home page answered a redirect
+  that was not followed via Crawl4AI, so the run stopped. The source is blocked from the owner's
+  network too and stays off; a block is never worked around.

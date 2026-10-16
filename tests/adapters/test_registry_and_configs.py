@@ -218,8 +218,6 @@ def test_italian_marketplace_terms_reviewed(key: str, terms_url: str, host: str)
 @pytest.mark.parametrize(
     "key",
     [
-        "pazar3_mk",
-        "reklama5_mk",
         "mobile_de_api",
         "carforyou_ch",
         "tutti_ch",
@@ -229,6 +227,33 @@ def test_italian_marketplace_terms_reviewed(key: str, terms_url: str, host: str)
 def test_unreviewed_sources(key: str) -> None:
     cfg = load_registry(REPO / "config").config(key)
     assert cfg.terms_status == TermsStatus.UNREVIEWED and cfg.terms_url is None
+
+
+@pytest.mark.parametrize(
+    ("key", "status", "terms_url"),
+    [
+        ("reklama5_mk", TermsStatus.RESTRICTED, "https://reklama5.mk/Help/TermsOfService"),
+        (
+            "pazar3_mk",
+            TermsStatus.NO_RESTRICTION_FOUND,
+            "https://www.pazar3.mk/korisnicka-poddrska/politika-na-privatnost",
+        ),
+    ],
+)
+def test_mk_comparable_terms_reviewed_facts_only(key: str, status: TermsStatus, terms_url: str) -> None:
+    # Terms read by the owner on 2026-10-16 (the pages answer 403 to the build environment). Reklama5
+    # forbids copying content of other people's ads; Pazar3 publishes only a privacy policy. Owner
+    # decision of the same day for both: store facts only. The sources stay disabled and gated.
+    cfg = load_registry(REPO / "config").config(key)
+    assert cfg.terms_status == status and cfg.terms_url == terms_url
+    assert cfg.terms_reviewed_at == datetime(2026, 10, 16, tzinfo=UTC)
+    assert cfg.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
+    assert cfg.terms_decision_note is not None and "Само факти" in cfg.terms_decision_note
+    assert "no retained page snapshots" in " ".join(cfg.terms_decision_note.split())
+    assert cfg.robots_checked_at == datetime(2026, 10, 16, tzinfo=UTC)
+    assert cfg.allowed_search_paths == ("^/$",) and cfg.allowed_detail_paths == ()
+    problems = activation_problems(cfg)
+    assert "terms not reviewed" not in problems and "adapter is unimplemented" in problems
 
 
 def test_roles_and_modes() -> None:

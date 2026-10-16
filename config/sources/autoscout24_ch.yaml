@@ -45,4 +45,8 @@ notes: >-
   environment (a cloud data-centre network); robots.txt itself was served (unchanged). The operator is
   therefore unverified (lead from a search listing only: SMG Swiss Marketplace Group AG, Zurich). The
   owner can read the GTC in a normal browser; until the terms are recorded the source stays gated, and
-  a challenge page met by the crawler stops it (no evasion).
+  a challenge page met by the crawler stops it (no evasion). Owner-network probe of 2026-10-16
+  (scripts/readiness_check.sh): robots.txt answered HTTP 200 (sha256 ac07ed5145ad..., unchanged), but
+  the home page answered HTTP 403 directly and a redirect that was not followed via Crawl4AI, so
+  the run stopped. The source is blocked from the owner's network too and stays off; a block is
+  never worked around.

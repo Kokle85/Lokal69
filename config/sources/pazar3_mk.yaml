@@ -10,25 +10,28 @@ adapter: pazar3_mk
 adapter_version: unimplemented
 enabled: false
 technical_status: untested
-terms_status: unreviewed
-terms_url: null            # not identified/readable (see notes)
-terms_reviewed_at: null
+terms_status: no_restriction_found
+terms_url: https://www.pazar3.mk/korisnicka-poddrska/politika-na-privatnost
+terms_reviewed_at: 2026-10-16T00:00:00Z
 terms_decision: proceed_acknowledged
-terms_decision_actor: "owner (decision recorded 2026-10-14)"
+terms_decision_actor: "owner (decisions recorded 2026-10-14 and 2026-10-16)"
 terms_decision_note: >-
   Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
-  terms risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on
-  every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any
-  access block. Nothing could be read from the site, so terms_status stays unreviewed and keeps the
-  source gated.
+  terms risk (audit record, not legal permission). Owner decision 2026-10-16 ("Само факти", the same
+  rule as Reklama5): store facts only, namely make, model, year, mileage, fuel, gearbox, asking price
+  and the ad URL. No ad text, photos, seller names or contact data, and no retained page snapshots.
+  Collection stays low-volume (one pass a day per reference model), obeys robots.txt on every fetch,
+  never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
 technical_denial_policy: stop_and_report
 robots_policy: obey
-robots_checked_at: 2026-10-14T00:00:00Z
+robots_checked_at: 2026-10-16T00:00:00Z
 robots_summary: >-
-  robots.txt, the home page and the candidate terms page
-  (/customer-service/advertising-terms-and-conditions) of www.pazar3.mk all answered HTTP 403 with a
-  Cloudflare 'Sorry, you have been blocked' page on 2026-10-14; no robots rules could be read.
-  pazar3.mk redirects to www.pazar3.mk.
+  robots.txt of www.pazar3.mk answered HTTP 200 on 2026-10-16 from the owner's network (fact, not
+  permission; sha256 8633e9afc044...), and the home page was allowed for our user agent (the probe
+  obeys robots.txt before every page). The rules themselves are not recorded here yet; they are
+  read again before every fetch and are to be recorded with the first search-page capture. On
+  2026-10-14 robots.txt, the home page and a candidate terms page answered HTTP 403 with a
+  Cloudflare block to the build environment. pazar3.mk redirects to www.pazar3.mk.
 source_timezone: Europe/Skopje
 # Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
 # --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
@@ -39,9 +42,18 @@ allowed_search_paths:
 allowed_detail_paths: []
 search: {}
 notes: >-
-  Comparable-source candidate (spec sections 5 and 15): asking prices only, never acquisition. Every
-  request with our user agent was blocked by Cloudflare on 2026-10-14. Observed from the build
-  environment (a cloud data-centre network) with our user agent; the owner's network may be answered
-  differently, and any block there stops the source the same way. Operator unverified (lead from a
-  search listing only: PAZAR3.KOM DOOEL, Resen). Collect only vehicle-relevant data; avoid seller
-  personal contact details.
+  Comparable-source candidate (spec sections 5 and 15): asking prices only, never acquisition. No
+  separate terms page was found: the footer link to the advertising rules
+  (/korisnicka-poddrska/pravila-i-uslovi-za-oglasuvanje) opens the same privacy policy (owner,
+  2026-10-16). The privacy policy ("Последна промена на: 28.05.2025"; operator ПАЗАР3.КОМ ДООЕЛ,
+  Ресен), read by the owner on 2026-10-16, refers to "Условите за користење на веб страната" but
+  contains no clause on automated access, robots, scraping or reuse of ad content. It says that
+  visitors' personal data are not collected and that the seller decides whether a phone number is
+  shown. Recorded as no_restriction_found, which is not a licence; the referenced terms of use are
+  to be read if they are ever published separately. Reachability 2026-10-16 from the owner's
+  network (scripts/readiness_check.sh): the home page answered HTTP 200 both directly and via
+  Crawl4AI. Only the Crawl4AI (rendered) page carried ads in JSON-LD: an ItemList of Product items
+  with an Offer (price and priceCurrency EUR or MKD; 123456789 is a placeholder price, not a price)
+  and ad URLs of the form /oglas/vozila/avtomobili/<make>/<model>/.../<id>. The car category is
+  /oglasi/vozila/avtomobili. The per-model search route and the ad page structure are not verified
+  yet, so only the home page is allowed. Any block met by the crawler stops the source.

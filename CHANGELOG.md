@@ -5,7 +5,7 @@ The build waves in order, derived from `git log --oneline` and the wave document
 commits are omitted; they only preserved interrupted work. **No wave activated anything against
 a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC.
 
-## Unreleased (working tree on top of `7f7e187`, not committed)
+## Unreleased (on top of `7f7e187`)
 
 Owner decisions of 2026-10-16 („не треба да бидат строги правилата ... само за да имаме
 орјентација", „Цените се извадени од Reklama5"; ADR 0005).
@@ -55,6 +55,20 @@ owner's own estimates; ADR 0004).
   honest User-Agent, no stealth). Report: `captures/readiness/<UTC>/report.txt`.
 - **Home-page probe paths.** Reklama5, Pazar3, AutoScout24 CH, CarForYou and Tutti now list their
   host and `^/$` only, for that probe; they stay disabled with no detail path.
+
+Owner decisions of 2026-10-16 on the MK sources ("Само факти"; the owner read both sites'
+pages, which answer 403 to the build environment). Nothing is enabled.
+
+- **Reklama5 terms recorded as `restricted`.** The terms of use (updated 03.07.2026) have no
+  automated-access clause but forbid collecting users' personal information and copying content of
+  other people's ads.
+- **Pazar3 recorded as `no_restriction_found`.** Only a privacy policy (28.05.2025) is published;
+  the advertising-rules link opens it. Not a licence.
+- **Facts only for both.** Make, model, year, km, fuel, gearbox, asking price and the ad URL; no ad
+  text, photos, seller names or contact data, and no retained page snapshots.
+- **Swiss sources blocked from the owner's network too** (2026-10-16 probe: AutoScout24 CH and
+  Tutti 403, CarForYou robots.txt unreachable). They stay off; `docs/source_access_register.md`
+  updated.
 
 Owner re-confirmation of 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат") and a
 robots.txt re-check of the same day. Nothing is enabled, fetched or activated.
