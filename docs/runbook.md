@@ -232,6 +232,7 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `config validate [--config-dir] [--json]` | offline; a primary maximum other than EUR 3,000 fails |
 | `config apply --reason ... [--dry-run] --yes` | records the YAML business configuration as a revision |
 | `sources list / inspect KEY [--from-db]` | gates with separate terms and technical status |
+| `sources smoke-evidence KEY [--run-id ID]` | read-only JSON: the persisted spec-31 evidence of the source's latest (or the given) crawl run: run and job ids, redacted fetch outcomes, observed listings with revision and field-evidence ids, the configuration revision (section 9.1) |
 | `sources sync [--fixture-sources] [--dry-run] --yes` | YAML -> `app.sources`; never enables a gated source |
 | `sources set-technical-status KEY STATUS --reason ... --yes`, `sources resume KEY --reason ... --yes` | audited owner recovery actions; neither one enables a source |
 | `crawl once --source KEY [--profile primary] [--max-pages 1]` | one bounded discovery through every gate; if this command does not get its own job (another due discovery job first, or a running worker claimed it), the job is cancelled while it still waits, so the page cap can never be skipped silently |
@@ -418,14 +419,16 @@ git diff config/sources/autoscout24_it.yaml
 uv run suv-deals sources sync --dry-run
 uv run suv-deals sources sync --yes
 
-# 2. One bounded discovery (one model page: renault/captur), then the detail pages it queued.
+# 2. One bounded discovery (one model page: renault/captur), then at most 5 of the detail pages
+#    it queued (--max-jobs is the bound; see below).
 SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
   uv run suv-deals crawl once --source autoscout24_it --max-pages 1
 SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
-  uv run suv-deals worker --drain --queues detail
+  uv run suv-deals worker --drain --queues detail --max-jobs 5
 
-# 3. Look at the result.
+# 3. Look at the result (read-only) and collect the spec-31 evidence ids.
 uv run suv-deals sources inspect autoscout24_it --from-db
+uv run suv-deals sources smoke-evidence autoscout24_it
 uv run suv-deals doctor --verbose
 git rev-parse HEAD
 
@@ -444,27 +447,50 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   price band, `kmto` and `sort=age&desc=1&ustate=U`; `--max-pages 1` means ONE search request,
   through the URL policy, robots.txt and the persistent budget gate (20 s spacing, 200 requests a
   day). Expected: `Job state: succeeded`, `pages: 1`, `completeness: budget_limited` (12 models,
-  capped at one page). The worker then fetches the `/annunci/` detail pages that one search page
-  queued: at most `max_detail_jobs_per_run` (10), 20 s apart; add `--max-jobs 1` to stop after the
-  first one.
+  capped at one page).
+- The search page queues one detail job per new or changed organic card: on a first run every
+  card, up to about 20. `max_detail_jobs_per_run` (10) does NOT bound that: each detail job is
+  its own run, so a drain without `--max-jobs` fetches every queued `/annunci/` page, 20 s apart.
+  `--max-jobs 5` is the bound here: at most 5 detail jobs, one `/annunci/` page each (use
+  `--max-jobs 1` for one); the jobs left waiting are never fetched (see the report-back item).
+- This one-page smoke requests ONLY `/lst/renault/captur`, the slug already verified on the
+  captures: it checks the live page structure, not the model slugs marked UNVERIFIED in the
+  configuration notes. Those are first requested by a full 12-model walk, either a separate
+  `crawl once --source <key> --max-pages 12` (12 search requests, 20 s apart; on .it it queues
+  detail jobs for the new cards of every model) or the first scheduled runs after enabling. A
+  wrong slug answers HTTP 404 and is skipped (the walk goes on and ends `partial`): in
+  `sources smoke-evidence` it is a `search` fetch with `http_status: 404` (search fetches are in
+  the configured model order).
 - A 403, a challenge page or a login wall stops the run and records the source as
   `access_blocked` (disabled, one operational review item; `technical_denial_policy:
   stop_and_report`); a 429 stops it too (back-off, `Retry-After` honoured). Do not retry and change
   nothing else; run step 4 and report what was printed. Never use another network, a proxy or
   other browser settings to get past a block.
 - Report back, for the evidence record (spec 31): the printed `crawl once` lines (job id, state,
-  pages, completeness), the `worker` table, the `sources inspect --from-db` JSON and the
-  `git rev-parse HEAD` output. From these the operator records step 6 (`technical_status:
-  live_smoke_passed`, committed with the evidence) or fixes the parser first. Enabling for real
-  (step 7) is a separate, committed configuration revision; until then step 4 keeps the source
-  off, and a detail job still queued is blocked as `source_paused` when a worker reaches it
-  (nothing is fetched).
+  pages, completeness), the `worker` table, the `sources inspect --from-db` JSON, the
+  `sources smoke-evidence` JSON and the `git rev-parse HEAD` output. `sources smoke-evidence`
+  (read-only) prints the source's latest crawl run (run and job ids, outcome, access state,
+  adapter/parser versions, timing), the detail jobs it queued, the redacted fetch outcomes of
+  both (purpose, host, HTTP status, access state, time; no URL or body is stored), every listing
+  the run observed (canonical URL, card price and mileage) with the persisted revision and
+  field-evidence ids, and the workspace's current configuration revision. From these the operator
+  records step 6 (`technical_status: live_smoke_passed`, committed with the evidence) or fixes
+  the parser first. Enabling for real (step 7) is a separate, committed configuration revision;
+  until then step 4 keeps the source off, and a detail job still queued is blocked as
+  `source_paused` when a worker reaches it (nothing is fetched).
 - `doctor` reads the YAML: between steps 1 and 4 it reports `autoscout24_it` as `active
   (public_html)`, after step 4 again `not active: 1 gate problem(s)`.
 - `autoscout24_de` follows later the same way (replace the key in every command). It is
   `card_only`: `worker --drain --queues detail` then only ingests the search cards' own facts and
-  makes no request (robots.txt disallows `/angebote/`); the smoke also shows whether the site
-  applies `pricefrom`/`priceto`/`kmto` on .de (the page's server-normalised `pageQuery`).
+  makes no request (robots.txt disallows `/angebote/`), so there `--max-jobs 5` may be left out
+  (with it, only 5 of the cards are ingested).
+- The smoke does NOT show whether .de applies `pricefrom`/`priceto`/`kmto`: the adapter does not
+  record the page's server-normalised `pageQuery` and raw pages are not kept
+  (`SNAPSHOT_STORAGE=disabled`). The only indirect check is the cards' stored price and mileage in
+  `sources smoke-evidence` (`card_price_minor`, `card_mileage_km`): a card outside the primary
+  profile's price band or above its mileage ceiling means that filter was ignored; every card
+  inside is consistent with the filters, never proof of them. The filters stay unverified on .de
+  until such evidence is recorded.
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

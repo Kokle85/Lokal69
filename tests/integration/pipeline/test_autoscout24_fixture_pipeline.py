@@ -9,16 +9,25 @@ unchanged. One discovery job capped at one page (what ``suv-deals crawl once --m
 enqueues) is processed by the worker, then the detail jobs it queued: Italy fetches the four saved
 detail pages, Germany (card_only) ingests the cards' own facts and never requests a detail page.
 The YAML files stay disabled; this proves wiring, never access to the live sites.
+
+``suv-deals sources smoke-evidence`` (runbook 9.1, step 6) then reads back exactly what the run
+persisted: the spec-31 evidence ids (run, job, fetch outcomes, listings, revisions, field evidence)
+and the configuration revision.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import uuid
 from collections import Counter
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
+from click.testing import CliRunner
 from tests.adapters.autoscout24_fixture_set import (
     FIXTURES,
     IT_DAMAGED,
@@ -32,6 +41,7 @@ from tests.integration.db.helpers import Seed
 from tests.integration.pipeline.support import PipelineEnv, build_env, by_slid, jobs_of, run
 
 from suv_deals.adapters.registry import load_registry
+from suv_deals.cli import cli
 from suv_deals.crawling.discovery import DEFAULT_PARTITION
 from suv_deals.domain.enums import JobState, JobType
 from suv_deals.domain.sources import SourceConfig
@@ -111,10 +121,73 @@ def _revision_counts(env: PipelineEnv) -> dict[str, int]:
     return {r["source_listing_id"]: int(r["revisions"]) for r in rows}
 
 
+def _cli_smoke_evidence(db_url: str, env: PipelineEnv, key: str) -> dict[str, Any]:
+    """``suv-deals sources smoke-evidence KEY`` exactly as the owner runs it (read-only)."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    try:
+        result = CliRunner().invoke(
+            cli,
+            ["--no-env-file", "sources", "smoke-evidence", key, "--workspace", str(env.workspace_id)],
+            env={
+                "APP_ENV": "test",
+                "DATABASE_URL": db_url,
+                "DATABASE_SET_ROLE": "suv_backend",
+                "DATABASE_POOL_MAX": "3",
+                "BUILD_ID": "cli-test",
+            },
+            catch_exceptions=False,
+        )
+    finally:
+        for handler in list(root.handlers):
+            if handler not in handlers:
+                root.removeHandler(handler)
+        root.setLevel(level)
+    assert result.exit_code == 0, result.output
+    evidence: dict[str, Any] = json.loads(result.stdout)
+    return evidence
+
+
+def _check_smoke_evidence(
+    env: PipelineEnv, evidence: dict[str, Any], discovery_job: UUID, fetches: dict[str, int]
+) -> None:
+    """The command names every spec-31 evidence id the smoke persisted (and nothing else)."""
+    [run_row] = env.rows("select id from ops.crawl_runs where workspace_id = %s", env.workspace_id)
+    run = evidence["crawl_run"]
+    assert (run["id"], run["job_id"]) == (str(run_row["id"]), str(discovery_job))
+    assert (run["outcome"], run["access_state"], run["pages_fetched"]) == ("budget_limited", "ok", 1)
+    assert run["adapter_version"] == evidence["source"]["adapter_version"] == "autoscout24@1.0.0"
+    config = env.rows(
+        "select id, revision from app.config_revisions where workspace_id = %s"
+        " order by revision desc limit 1",
+        env.workspace_id,
+    )[0]
+    assert (evidence["config_revision"]["id"], evidence["config_revision"]["revision"]) == (
+        str(config["id"]),
+        config["revision"],
+    )
+    # Redacted fetch outcomes: no URL is stored, so none is printed.
+    assert Counter(f["purpose"] for f in evidence["fetches"]) == fetches
+    assert all(f["access_state"] == "ok" and "url" not in f for f in evidence["fetches"])
+    detail_jobs = {str(j["id"]) for j in jobs_of(env, JobType.DETAIL)}
+    assert {j["id"] for j in evidence["detail_jobs"]} == detail_jobs
+    listings = by_slid(env)
+    assert {item["listing_id"] for item in evidence["listings"]} == {str(r["id"]) for r in listings.values()}
+    printed_evidence: set[str] = set()
+    for item in evidence["listings"]:
+        revisions = item["revisions"]
+        assert revisions and all(r["job_id"] in detail_jobs and r["evidence_ids"] for r in revisions)
+        assert item["current_revision_id"] in {r["revision_id"] for r in revisions}
+        assert item["card_price_minor"] is not None and item["is_fixture"] is True
+        printed_evidence.update(e for r in revisions for e in r["evidence_ids"])
+    stored = env.rows("select id from app.field_evidence where workspace_id = %s", env.workspace_id)
+    assert printed_evidence == {str(r["id"]) for r in stored}
+
+
 async def test_italian_discovery_and_details_over_the_saved_fixtures(db_url: str, seed: Seed) -> None:
     env = await _env(db_url, seed, "autoscout24_it")
     try:
-        await _enqueue_one_page_discovery(env)
+        discovery_job = await _enqueue_one_page_discovery(env)
         by_type = await _drain(env, "worker-as24-it")
         assert by_type[JobType.DISCOVERY] == 1 and by_type[JobType.DETAIL] == len(IT_SEARCH_CARDS)
         assert env.ctx.fixture_client is not None
@@ -145,6 +218,8 @@ async def test_italian_discovery_and_details_over_the_saved_fixtures(db_url: str
             "select count(*) from app.field_evidence where workspace_id = %s", env.workspace_id
         )
         assert evidence > 0
+        smoke = await asyncio.to_thread(_cli_smoke_evidence, db_url, env, "autoscout24_it")
+        _check_smoke_evidence(env, smoke, discovery_job, {"search": 1, "detail": len(IT_SEARCH_CARDS)})
     finally:
         await env.close()
 
@@ -152,7 +227,7 @@ async def test_italian_discovery_and_details_over_the_saved_fixtures(db_url: str
 async def test_german_card_only_discovery_never_requests_a_detail_page(db_url: str, seed: Seed) -> None:
     env = await _env(db_url, seed, "autoscout24_de")
     try:
-        await _enqueue_one_page_discovery(env)
+        discovery_job = await _enqueue_one_page_discovery(env)
         by_type = await _drain(env, "worker-as24-de")
         assert by_type[JobType.DISCOVERY] == 1 and by_type[JobType.DETAIL] == 3  # card ingestion jobs
         assert env.ctx.fixture_client is not None
@@ -173,5 +248,7 @@ async def test_german_card_only_discovery_never_requests_a_detail_page(db_url: s
             env.workspace_id,
         )
         assert fetches == [{"purpose": "search", "host": "www.autoscout24.de", "access_state": "ok"}]
+        smoke = await asyncio.to_thread(_cli_smoke_evidence, db_url, env, "autoscout24_de")
+        _check_smoke_evidence(env, smoke, discovery_job, {"search": 1})
     finally:
         await env.close()

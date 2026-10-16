@@ -1043,6 +1043,105 @@ async def get_source(conn: Conn, actor: ActorContext, source_id: UUID) -> Source
         return await _status_view(conn, record)
 
 
+_SMOKE_RUN_SQL: Final = (
+    "select id, job_id, profile_id, outcome, access_state, error_code, adapter_version, parser_version,"
+    " crawler_version, build_id, started_at, finished_at, pages_fetched, cards_seen, new_listings,"
+    " changed_listings, detail_jobs_enqueued, gap_reasons from ops.crawl_runs"
+    " where workspace_id = %(ws)s and source_id = %(source_id)s"
+    " and (%(run_id)s::uuid is null or id = %(run_id)s::uuid)"
+    " order by started_at desc, id desc limit 1"
+)
+_SMOKE_DETAIL_JOBS_SQL: Final = (
+    "select id, state, attempts, listing_id, generation, last_error_code, blocker_code from ops.jobs"
+    " where workspace_id = %(ws)s and source_id = %(source_id)s and job_type = 'detail'"
+    " and payload ->> 'run_id' = %(run_text)s order by created_at, id"
+)
+_SMOKE_FETCHES_SQL: Final = (
+    "select id, job_id, crawl_run_id, purpose, host, http_status, access_state, error_code,"
+    " retry_after_seconds, snapshot_id, fetched_at from ops.fetch_attempts"
+    " where workspace_id = %(ws)s and source_id = %(source_id)s and (crawl_run_id = %(run_id)s"
+    " or job_id = %(run_job_id)s::uuid or job_id = any(%(job_ids)s::uuid[])) order by fetched_at, id"
+)
+_SMOKE_LISTINGS_SQL: Final = (
+    "select l.id as listing_id, l.source_listing_id, l.canonical_url, l.first_seen_at, l.last_seen_at,"
+    " l.availability, l.eligibility_state, l.current_revision_id, l.is_fixture, o.id as observation_id,"
+    " o.observed_at, o.card_price_minor, o.card_currency, o.card_mileage_km"
+    " from app.listing_observations o"
+    " join app.listings l on l.workspace_id = o.workspace_id and l.id = o.listing_id"
+    " where o.workspace_id = %(ws)s and o.source_id = %(source_id)s and o.crawl_run_id = %(run_id)s"
+    " order by o.page_number, o.position, o.id"
+)
+_SMOKE_REVISIONS_SQL: Final = (
+    "select r.id as revision_id, r.listing_id, r.revision_number, r.observed_at, r.parser_version,"
+    " r.asking_minor, r.currency, r.price_basis, r.price_type, r.mileage_km, r.quarantined, j.id as job_id,"
+    " array(select e.id from app.field_evidence e where e.workspace_id = r.workspace_id"
+    "   and e.listing_id = r.listing_id and e.revision_id = r.id order by e.field_path, e.id) as evidence_ids"
+    " from ops.jobs j join app.listing_revisions r on r.workspace_id = j.workspace_id"
+    " and r.listing_id = j.listing_id and r.detail_generation = j.generation"
+    " where j.workspace_id = %(ws)s and j.id = any(%(job_ids)s::uuid[])"
+    " order by r.listing_id, r.revision_number"
+)
+_SMOKE_CONFIG_SQL: Final = (
+    "select id, revision, config_hash, effective_at from app.config_revisions"
+    " where workspace_id = %(ws)s order by revision desc limit 1"
+)
+
+
+async def smoke_evidence(
+    conn: Conn, actor: ActorContext, source_key: str, run_id: UUID | None = None
+) -> dict[str, Any]:
+    """The persisted evidence of one crawl run of a source (activation step 6, spec 31; read-only).
+
+    ``run_id`` defaults to the source's latest run. Returns the workspace's current configuration
+    revision, the source's adapter version, the run (job, outcome, access state, versions, timing),
+    the detail jobs the run queued, the redacted fetch outcomes of the run and of those jobs (no URL
+    and no body is stored), and every listing the run observed (canonical URL, card price and
+    mileage) with the revisions those detail jobs wrote and their field-evidence ids.
+    """
+    actor.require(Scope.DEALS_READ)
+    source = await get_source_by_key(conn, actor, source_key)
+    async with mapped_errors():
+        base = {"ws": actor.workspace_id, "source_id": source.id}
+        run = await fetch_one(conn, _SMOKE_RUN_SQL, {**base, "run_id": run_id})
+        if run is None:
+            raise NotFound("No crawl run of this source")
+        detail_jobs = await fetch_all(conn, _SMOKE_DETAIL_JOBS_SQL, {**base, "run_text": str(run["id"])})
+        job_ids = [job["id"] for job in detail_jobs]
+        fetches = await fetch_all(
+            conn,
+            _SMOKE_FETCHES_SQL,
+            {**base, "run_id": run["id"], "run_job_id": run["job_id"], "job_ids": job_ids},
+        )
+        observed = await fetch_all(conn, _SMOKE_LISTINGS_SQL, {**base, "run_id": run["id"]})
+        revisions = await fetch_all(
+            conn, _SMOKE_REVISIONS_SQL, {"ws": actor.workspace_id, "job_ids": job_ids}
+        )
+        config = await fetch_one(conn, _SMOKE_CONFIG_SQL, {"ws": actor.workspace_id})
+    by_listing: dict[UUID, list[dict[str, Any]]] = {}
+    for revision in revisions:
+        by_listing.setdefault(revision["listing_id"], []).append(
+            {**revision, "evidence_ids": list(revision["evidence_ids"] or [])}
+        )
+    return {
+        "workspace_id": actor.workspace_id,
+        "source": {
+            "source_id": source.id,
+            "source_key": source.source_key,
+            "adapter": source.adapter,
+            "adapter_version": source.adapter_version,
+            "technical_status": source.technical_status.value,
+            "enabled": source.enabled,
+            "detail_mode": source.detail_mode,
+            "version": source.version,
+        },
+        "config_revision": None if config is None else dict(config),
+        "crawl_run": dict(run),
+        "detail_jobs": [dict(job) for job in detail_jobs],
+        "fetches": [dict(fetch) for fetch in fetches],
+        "listings": [{**row, "revisions": by_listing.get(row["listing_id"], [])} for row in observed],
+    }
+
+
 async def list_sources(conn: Conn, actor: ActorContext) -> SourceListView:
     actor.require(Scope.DEALS_READ)
     async with mapped_errors():

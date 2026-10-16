@@ -113,6 +113,8 @@ def test_source_register_live_smoke_is_the_gated_crawl_once_procedure() -> None:
     register = _text("docs/source_access_register.md")
     step = register[register.index("6. **Live low-volume smoke.**") : register.index("7. **Enable.**")]
     assert "suv-deals crawl once --source" in step and "--max-pages 1" in step
+    assert "--max-jobs N" in step and "at most `max_detail_jobs_per_run`" not in step
+    assert "suv-deals sources smoke-evidence <key>" in step
     assert "pytest marker" not in step
     assert "insufficient_comparables" in register  # F2: no MK evidence -> no valuation
 
@@ -130,6 +132,10 @@ def test_autoscout24_rows_record_step_5_and_name_the_live_smoke_next() -> None:
     ]
     rows.append(next(line for line in gates if line.startswith("| `autoscout24_de`, `autoscout24_it` |")))
     for row in rows:
+        # The one-page smoke never confirms the unverified slugs or the .de filters (it requests
+        # only renault/captur and nothing records pageQuery).
+        assert "to confirm the unverified model slugs" not in row
+        assert "to confirm the search filters" not in row
         assert "fixture_tested" in row and "step 5" in row and "2026-10-16" in row
         assert "SYNTHETIC" in row.upper() and "live smoke" in row
         assert row.index("fixture_tested") < row.index("live smoke")
@@ -172,7 +178,14 @@ def test_runbook_autoscout24_smoke_commands_match_the_real_cli() -> None:
         smoke
     )
     assert "crawl once --source autoscout24_it --max-pages 1" in block
-    assert "worker --drain --queues detail" in block
+    # The detail drain is bounded by --max-jobs: max_detail_jobs_per_run never bounds a drain
+    # (each detail job is its own run), so the runbook must not claim it does.
+    assert "worker --drain --queues detail --max-jobs 5" in block
+    assert "at most `max_detail_jobs_per_run`" not in section
+    # The spec-31 evidence ids come from a documented read-only command.
+    assert "sources smoke-evidence autoscout24_it" in block and "`sources smoke-evidence` JSON" in section
+    # The one-page smoke requests only the verified slug, and pageQuery is never recorded.
+    assert "ONLY `/lst/renault/captur`" in section and "does NOT show whether .de applies" in section
     assert "sources sync --yes" in block and "sources inspect autoscout24_it --from-db" in block
     assert "git checkout -- config/sources/autoscout24_it.yaml" in block
     assert block.index("enabled: true") < block.index("crawl once") < block.index("git checkout --")

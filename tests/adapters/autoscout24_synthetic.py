@@ -166,10 +166,12 @@ def search_page(
     include_next_data: bool = True,
     title: str = "Synthetic results",
     page_query: dict[str, str] | None = None,
+    omit: tuple[str, ...] = (),
 ) -> str:
     """A search page with ``__NEXT_DATA__``; ``next_data`` replaces the script body verbatim.
 
-    ``page_query`` replaces the server-normalised query (default: the Italian keys).
+    ``page_query`` replaces the server-normalised query (default: the Italian keys); ``omit`` drops
+    those ``pageProps`` keys (e.g. ``numberOfPages`` or ``numberOfResults``: drift cases).
     """
     query = page_query
     if query is None:
@@ -184,6 +186,8 @@ def search_page(
     }
     if listings is None:
         props.pop("listings")
+    for key in omit:
+        props.pop(key)
     body = (
         next_data
         if next_data is not None
@@ -217,7 +221,7 @@ def detail_page(
     drive: str = "Anteriore",
     fuel_code: str = "D",
     plugin: bool = False,
-    price: int = 7400,
+    price: int | None = 7400,
     description: str = "<p>Synthetic description.</p>",
     version: str = "Captur 1.5 dci 110CV Synthetic",
     status: str = "Active",
@@ -232,7 +236,7 @@ def detail_page(
     include_price_raw: bool = True,
     ld_currency: str = "EUR",
     on_request: bool = False,
-    ld_price: bool = True,
+    ld_offer_price: int | None = None,
     next_data_override: str | None = None,
     json_ld_override: str | None = None,
 ) -> str:
@@ -243,7 +247,9 @@ def detail_page(
     with ``__NEXT_DATA__``. ``euro`` is the stated emission class (both places the real page has
     it; ``euro_directive=False`` keeps only ``rawData.environment``), ``damaged`` sets
     ``rawData.condition.damage.isCurrentlyDamaged``. ``on_request`` publishes no amount anywhere and
-    sets ``prices.public.onRequestOnly``; ``ld_price=False`` drops the JSON-LD ``Offer.price``.
+    sets ``prices.public.onRequestOnly``; ``price=None`` publishes no amount anywhere (no
+    ``priceRaw``, no ``Offer.price`` and no formatted price text); ``ld_offer_price`` lets the
+    JSON-LD ``Offer.price`` disagree with ``priceRaw``.
     ``next_data_override`` / ``json_ld_override`` replace the script bodies verbatim (drift cases).
     """
     lid = listing_id or uuid_for(n)
@@ -275,13 +281,14 @@ def detail_page(
         ],
         "emissionsCO2": 105,
     }
-    price_text = "Prezzo su richiesta" if on_request else f"€ {price}"
-    offer_price: dict[str, Any] = {} if on_request or not ld_price else {"price": price}
+    price_text = "Prezzo su richiesta" if on_request else (None if price is None else f"€ {price}")
+    ld_amount = price if ld_offer_price is None else ld_offer_price
+    offer_price: dict[str, Any] = {} if on_request or ld_amount is None else {"price": ld_amount}
     product = {
         "@context": "https://schema.org",
         "@type": "Product",
         "brand": {"@type": "Brand", "name": "Renault"},
-        "name": f"Renault per {price_text}",
+        "name": "Renault Captur" if price_text is None else f"Renault per {price_text}",
         "description": description,
         "offers": {
             "@type": "Offer",

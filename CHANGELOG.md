@@ -33,6 +33,31 @@ Owner decisions of 2026-10-16 („не треба да бидат строги �
   review queue and the MCP typed warnings read the stored flag, and the 15-day evaluation's best
   supported economics counts only well-matched candidates.
 
+AutoScout24 step-5 review fixes (2026-10-16). Both sources stay `enabled: false` and
+`fixture_tested`; nothing was fetched.
+
+- **Fixtures** (now IT 37 pages, DE 23 pages, regenerated). `detail_price_missing.html` shows no
+  amount anywhere (no `priceRaw`, no `Offer.price` and no formatted price; `detail_page(price=None)`
+  replaces the `ld_price` option). The German '+' slug is invented
+  (`renault-captur-synthetic+edition-tce-140-benzin-grau`). New: last-model pages reporting 45
+  results next to 3 cards with `numberOfPages` 1 or missing (the walk ends PARTIAL, never
+  COMPLETE), an empty listings array without `numberOfResults` (drift), instruction wording
+  without markup and markup without wording (card and detail; each flags
+  `SELLER_TEXT_SUSPICIOUS` on its own), and an Italian detail page whose JSON-LD `Offer.price`
+  disagrees with `priceRaw` (`detail_page(ld_offer_price=...)`). The German card test pins that
+  the displayed `priceRaw`, not `tracking.price`, is the card's asking price.
+- **Phone check.** The marketplace-page check also finds national numbers with a two-digit area
+  code followed by a separator (`06 12345678`, `02 1234 5678`).
+- **`suv-deals sources smoke-evidence KEY [--run-id ID]`** (read-only): the spec-31 evidence of a
+  crawl run (run and job ids, the detail jobs it queued, redacted fetch outcomes, observed
+  listings with card price/mileage, revision and field-evidence ids, the configuration revision).
+- **Docs.** Runbook 9.1, the register and ACTIVATION_GATES: `max_detail_jobs_per_run` does not
+  bound a detail drain (each detail job is its own run), so the smoke uses
+  `worker --drain --queues detail --max-jobs 5`; the one-page smoke checks only `renault/captur`
+  (unverified slugs need a full 12-model walk); it cannot show whether .de applies
+  `pricefrom`/`priceto`/`kmto` (`pageQuery` is not recorded; card prices are only an indirect
+  check); the report-back includes the `sources smoke-evidence` JSON. Config notes corrected.
+
 AutoScout24 activation step 5 (2026-10-16): saved SYNTHETIC fixtures, `fixture_tested`. Not a
 live verification; both sources stay `enabled: false`, and the next step is the owner's live smoke.
 

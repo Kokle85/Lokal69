@@ -28,8 +28,9 @@ files:
   search_damaged.html: 'Damaged vehicle on the card: vehicle.isCurrentlyDamaged true (no full asking price)
     next to false.'
   search_empty.html: 'Empty result: numberOfResults 0 and an empty listings array (an explicit empty result).'
-  search_injection.html: 'Prompt injection and XSS in seller-written card text: a <script> block, an <img
-    onerror> payload and ''Ignore all previous instructions'' in the version text, next to one clean card.'
+  search_injection.html: 'Prompt injection and XSS in seller-written card text, next to one clean card:
+    a <script> block, an <img onerror> payload and ''Ignore all previous instructions'' in one version
+    text; the instruction wording alone (no markup); the <img onerror> markup alone (no wording).'
   search_listings_missing.html: 'Changed markup: pageProps without a listings array while numberOfResults
     12 is reported.'
   search_malformed.html: 'Known malformed markup: truncated __NEXT_DATA__ JSON next to the site''s contact
@@ -43,9 +44,17 @@ files:
   search_mileage_conflict.html: 'Contradictory card values: tracking.mileage 143200 versus the displayed
     ''43.200 km'', and tracking.price 3100 versus priceRaw 2900.'
   search_model2.html: 'Second model page of the walk (nissan/qashqai, cursor model:1): 2 organic cards.'
+  search_more_results_no_page_count.html: 'Paginated result of the last model (suzuki/sx4-s-cross), changed
+    markup: the numberOfPages key is missing while numberOfResults 45 is reported next to 3 organic cards.
+    The reported count alone makes the model page PARTIAL, so the walk never ends COMPLETE on it.'
+  search_more_results_than_cards.html: 'Paginated result of the last model (suzuki/sx4-s-cross) without
+    a page count to rely on: numberOfPages 1 while numberOfResults 45 is reported next to 3 organic cards.
+    The reported count alone makes the model page PARTIAL, so the walk never ends COMPLETE on it.'
   search_net_gross.html: 'VAT label wording on cards: ''inkl. MwSt.'' (gross, VAT shown), ''zzgl. MwSt.''
     (net: never read as gross), no label at all, and an unlabelled card whose version text says ''Nettopreis''
     (seller text never becomes a price basis).'
+  search_no_result_count.html: 'Changed markup: an empty listings array while the numberOfResults key
+    is missing (a renamed count): drift, never an explicit empty result.'
   search_normal.html: 'Normal search page (renault/captur): 3 organic Main cards (manual petrol EUR 2,900
     with a ''+'' slug, automatic diesel EUR 2,750 from a private seller, semi-automatic LPG EUR 2,850
     with offerType N) and one Sponsored/Top card (dropped).'
@@ -110,12 +119,21 @@ routes:
   https://www.autoscout24.de/lst/renault/captur?fixture=many-pages:
     file: search_many_pages.html
     description: paginated result, page 1 of 3
+  https://www.autoscout24.de/lst/suzuki/sx4-s-cross?fixture=more-results-than-cards:
+    file: search_more_results_than_cards.html
+    description: 45 results reported, 3 cards, numberOfPages 1
+  https://www.autoscout24.de/lst/suzuki/sx4-s-cross?fixture=no-page-count:
+    file: search_more_results_no_page_count.html
+    description: 45 results reported, 3 cards, numberOfPages missing
   https://www.autoscout24.de/lst/renault/captur?fixture=result-type-renamed:
     file: search_result_type_renamed.html
     description: result type renamed
   https://www.autoscout24.de/lst/renault/captur?fixture=listings-missing:
     file: search_listings_missing.html
     description: listings array missing
+  https://www.autoscout24.de/lst/renault/captur?fixture=no-result-count:
+    file: search_no_result_count.html
+    description: empty listings, no result count
   https://www.autoscout24.de/lst/renault/captur?fixture=malformed:
     file: search_malformed.html
     description: truncated __NEXT_DATA__

@@ -33,7 +33,9 @@ _EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-
 _PHONE_SEP = r"[ \t\u00a0./()\-]{0,3}"
 _PHONES = (
     re.compile(r"(?<![\w.:/=-])(?:\+|00)[1-9]\d{0,3}(?:" + _PHONE_SEP + r"\d){6,13}(?!\w)"),
-    re.compile(r"(?<![\w.:/+=-])0[1-9]\d(?:" + _PHONE_SEP + r"\d){6,9}(?!\w)"),
+    # National numbers: a separator may follow the area code's second digit (Rome "06 12345678",
+    # Milan "02 1234 5678"), so the area code is never assumed to be three digits long.
+    re.compile(r"(?<![\w.:/+=-])0[1-9](?:" + _PHONE_SEP + r"\d){6,10}(?!\w)"),
     re.compile(r"(?<![\w.:/+=-])3\d{2}(?:" + _PHONE_SEP + r"\d){7}(?!\w)"),
     re.compile(r"\btel:", re.IGNORECASE),
 )
@@ -106,6 +108,40 @@ def _check_marketplace_page(source_key: str, text: str) -> None:
         assert match.group(1).lower().endswith(".example"), match.group(0)
     for pattern in _PHONES:
         assert not pattern.search(text), pattern.pattern
+
+
+@pytest.mark.parametrize(
+    "phone",
+    [
+        "06 12345678",  # Rome: two-digit area code, then a space
+        "02 1234 5678",  # Milan
+        "06/1234567",
+        "02.12345678",
+        "02-12345678",
+        "Tel. 06 4881 2345",
+        "011 1234567",
+        "030 1234567",
+        "089 12345678",
+        "0612345678",
+        "+39 06 12345678",
+        "+49 30 1234567",
+        "333 1234567",  # Italian mobile
+        "tel:+390612345678",
+    ],
+)
+def test_the_marketplace_page_check_finds_phone_numbers(phone: str) -> None:
+    page = (FIXTURES / "autoscout24_it" / "detail_normal.html").read_text(encoding="utf-8")
+    _check_marketplace_page("autoscout24_it", page)  # the saved page itself carries none
+    with pytest.raises(AssertionError):
+        _check_marketplace_page("autoscout24_it", page.replace("</main>", f"<p>{phone}</p></main>"))
+
+
+@pytest.mark.parametrize(
+    "value", ["2026-01-01T00:00:00Z", "09/2018", "03-2017", "00000000-0000-4000-8000-000000000101"]
+)
+def test_dates_and_synthetic_ids_are_no_phone_numbers(value: str) -> None:
+    page = (FIXTURES / "autoscout24_it" / "detail_normal.html").read_text(encoding="utf-8")
+    _check_marketplace_page("autoscout24_it", page.replace("</main>", f"<p>{value}</p></main>"))
 
 
 @pytest.mark.parametrize("source_key", MARKETPLACE_FIXTURE_SOURCES)

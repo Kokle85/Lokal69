@@ -211,8 +211,10 @@ Each step only needs the steps above it; any step can stop without affecting the
   6. Live smoke by hand: with `SOURCE_NETWORK_ENABLED=true` (Compose:
      `SUV_DEALS_ENABLE_SOURCE_NETWORK=true` exported for that run only),
      `uv run suv-deals crawl once --source <key> --max-pages 1`, then
-     `uv run suv-deals worker --drain --queues detail`; check `suv-deals sources inspect <key>
-     --from-db` and `doctor`. Then `technical_status: live_smoke_passed`. For AutoScout24 the
+     `uv run suv-deals worker --drain --queues detail --max-jobs N` (`--max-jobs` bounds the
+     detail requests; `max_detail_jobs_per_run` does not bound a drain); check `suv-deals sources
+     inspect <key> --from-db` and `doctor`, and collect the evidence ids with `suv-deals sources
+     smoke-evidence <key>`. Then `technical_status: live_smoke_passed`. For AutoScout24 the
      exact owner commands (local uncommitted `enabled: true`, sync, smoke, switch-off) are in
      docs/runbook.md section 9.1.
   7. Enable through an auditable configuration revision (`sources sync --yes`).
@@ -539,4 +541,4 @@ Append one row per completed activation step (newest last). Ids, versions, hashe
 
 | Date (UTC) | Gate / step | Commit | Evidence (ids, codes) | Recorded by |
 |---|---|---|---|---|
-| 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 31 pages, DE 20 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |
+| 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 37 pages, DE 23 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |

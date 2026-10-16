@@ -206,6 +206,40 @@ def inspect(
             echo(f"  - {problem}")
 
 
+@sources_group.command("smoke-evidence")
+@click.argument("source_key")
+@click.option(
+    "--run-id", type=click.UUID, default=None, help="A crawl run of the source (default: its latest)."
+)
+@workspace_option
+@pass_cli
+def smoke_evidence(cli: CliContext, source_key: str, run_id: UUID | None, workspace: UUID | None) -> None:
+    """Read-only: the persisted evidence of one crawl run (the live smoke, activation step 6).
+
+    JSON with the workspace's current configuration revision, the source's adapter version, the
+    run (job id, outcome, access state, versions, timing), the detail jobs it queued, the redacted
+    fetch outcomes of the run and of those jobs (no URL or body is stored), and every listing the
+    run observed (canonical URL, card price and mileage) with the revisions its detail jobs wrote
+    and their field-evidence ids (spec 31 evidence fields).
+    """
+    settings = load_settings(cli)
+
+    async def body() -> int:
+        from suv_deals.cli_commands._common import open_database, operator_actor, resolve_workspace
+        from suv_deals.persistence import sources_repo
+        from suv_deals.persistence.transactions import unit_of_work
+
+        async with open_database(settings, application_name="suv-deals-cli") as db:
+            workspace_id = await resolve_workspace(db, workspace)
+            actor = operator_actor(workspace_id, "sources-smoke-evidence")
+            async with unit_of_work(db, actor) as conn:
+                evidence = await sources_repo.smoke_evidence(conn, actor, source_key, run_id)
+        emit_json(evidence)
+        return 0
+
+    run_async(body)
+
+
 def _fixture_source_configs() -> list[SourceConfig]:
     """SYNTHETIC fixture sources (``tests/adapters/fixtures/*/source.yaml``), exactly as stored."""
     import yaml

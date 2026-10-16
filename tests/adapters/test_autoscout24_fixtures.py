@@ -19,11 +19,14 @@ from urllib.parse import urlsplit
 import pytest
 from tests.adapters.autoscout24_fixture_set import (
     DE_NOT_APPLICABLE,
+    DE_PLUS_SLUG,
     FIXTURES,
     IT_CONDITIONAL,
     IT_DAMAGED,
     IT_DETAIL_SLUG,
     IT_INJECTION,
+    IT_INJECTION_MARKUP,
+    IT_INJECTION_WORDING,
     IT_JSON_LD_ONLY,
     IT_MALFORMED,
     IT_MARKUP_CHANGED,
@@ -32,6 +35,7 @@ from tests.adapters.autoscout24_fixture_set import (
     IT_NORMAL,
     IT_ON_REQUEST,
     IT_OTHER_LISTING,
+    IT_PRICE_CONFLICT,
     IT_PRICE_MISSING,
     IT_SEARCH_CARDS,
     IT_STATUS_INACTIVE,
@@ -95,12 +99,17 @@ REQUIRED_IT_COVERAGE = {
     "normal search page": "search_normal.html",
     "paginated search (second model page of the walk)": "search_model2.html",
     "paginated search (more result pages reported)": "search_many_pages.html",
+    "paginated search (more results than cards, numberOfPages 1)": "search_more_results_than_cards.html",
+    "paginated search (more results than cards, no numberOfPages)": (
+        "search_more_results_no_page_count.html"
+    ),
     "empty result": "search_empty.html",
     "non-organic results only": "search_sponsored_only.html",
     "normal detail": "detail_normal.html",
     "missing-price detail (on request)": "detail_price_on_request.html",
-    "missing-price detail (no amount)": "detail_price_missing.html",
+    "missing-price detail (no amount anywhere)": "detail_price_missing.html",
     "contradictory mileage": "detail_mileage_conflict.html",
+    "contradictory price (listingDetails versus JSON-LD)": "detail_price_conflict.html",
     "net/gross wording (net)": "detail_net_price.html",
     "net/gross wording (gross)": "detail_vat_shown.html",
     "conditional price": "detail_conditional_price.html",
@@ -113,7 +122,10 @@ REQUIRED_IT_COVERAGE = {
     "changed markup (detail)": "detail_markup_changed.html",
     "changed markup (search)": "search_markup_changed.html",
     "changed markup (result type renamed)": "search_result_type_renamed.html",
+    "changed markup (no result count)": "search_no_result_count.html",
     "prompt injection and XSS (detail)": "detail_injection.html",
+    "prompt injection wording only (detail)": "detail_injection_wording.html",
+    "active markup only (detail)": "detail_injection_markup.html",
     "prompt injection and XSS (search)": "search_injection.html",
 }
 #: Germany is card_only (robots.txt disallows /angebote/): the detail categories do not apply and the
@@ -122,6 +134,10 @@ REQUIRED_DE_COVERAGE = {
     "normal search page": "search_normal.html",
     "paginated search (second model page of the walk)": "search_model2.html",
     "paginated search (more result pages reported)": "search_many_pages.html",
+    "paginated search (more results than cards, numberOfPages 1)": "search_more_results_than_cards.html",
+    "paginated search (more results than cards, no numberOfPages)": (
+        "search_more_results_no_page_count.html"
+    ),
     "empty result": "search_empty.html",
     "missing-price card (detail category N/A)": "search_price_missing.html",
     "contradictory mileage on the card (detail category N/A)": "search_mileage_conflict.html",
@@ -134,6 +150,7 @@ REQUIRED_DE_COVERAGE = {
     "known malformed markup": "search_malformed.html",
     "changed markup": "search_markup_changed.html",
     "changed markup (result type renamed)": "search_result_type_renamed.html",
+    "changed markup (no result count)": "search_no_result_count.html",
     "prompt injection and XSS": "search_injection.html",
 }
 
@@ -284,6 +301,25 @@ async def test_more_reported_result_pages_make_the_model_page_partial(
 
 
 @pytest.mark.parametrize("key", SOURCE_KEYS)
+@pytest.mark.parametrize("case", ["more-results-than-cards", "no-page-count"])
+async def test_more_reported_results_than_cards_make_the_model_page_partial(
+    key: str, case: str, client: FixtureCrawlClient
+) -> None:
+    """Without a page count above 1 (numberOfPages 1, or the key missing), the reported result count
+    alone marks the page incomplete: on the LAST model the walk must then end PARTIAL, never
+    COMPLETE, or discovery would mark every listing beyond the first page absent."""
+    adapter = _adapter(key)
+    last = len(adapter.models) - 1
+    assert adapter.models[last].label == "suzuki/sx4-s-cross"
+    parsed = await _search(key, client, _variant(key, case, "/lst/suzuki/sx4-s-cross"), f"model:{last}")
+    page = parsed.page
+    assert page.access_state == AccessState.OK and len(page.observations) == 3 and not parsed.dropped
+    assert page.completeness == Completeness.PARTIAL and not page.has_more and page.next_cursor is None
+    assert page.result_count_reported == 45
+    assert page.access_evidence == "45 results reported, 3 cards on the page"
+
+
+@pytest.mark.parametrize("key", SOURCE_KEYS)
 async def test_the_last_model_with_an_explicit_empty_result_is_complete(
     key: str, client: FixtureCrawlClient
 ) -> None:
@@ -306,6 +342,7 @@ async def test_non_organic_results_only_are_no_results(client: FixtureCrawlClien
     [
         ("result-type-renamed", "drift: no Organic/Main card among 3 listings"),
         ("listings-missing", "drift: pageProps.listings is missing"),
+        ("no-result-count", "drift: no listings while the page reports no result count"),
         ("malformed", "drift: NEXT_DATA_UNPARSABLE"),
         ("markup-changed", "drift: NEXT_DATA_MISSING"),
         ("empty-shell", "characters of visible text and no structured content"),
@@ -370,16 +407,20 @@ async def test_injection_and_markup_in_card_text_are_flagged_and_stripped(
     key: str, client: FixtureCrawlClient
 ) -> None:
     parsed = await _search(key, client, _variant(key, "injection"))
-    clean, hostile = (c.listing for c in parsed.cards)
+    clean, hostile, wording_only, markup_only = (c.listing for c in parsed.cards)
     assert "SELLER_TEXT_SUSPICIOUS" not in clean.warnings
-    assert "SELLER_TEXT_SUSPICIOUS" in hostile.warnings
+    # Each signal flags on its own: instruction wording without markup, markup without wording.
+    for flagged in (hostile, wording_only, markup_only):
+        assert "SELLER_TEXT_SUSPICIOUS" in flagged.warnings, flagged.vehicle.trim
     dumped = json.dumps(
-        [hostile.model_dump(mode="json"), parsed.page.observations[1].model_dump(mode="json")]
+        [c.listing.model_dump(mode="json") for c in parsed.cards[1:]]
+        + [o.model_dump(mode="json") for o in parsed.page.observations[1:]]
     ).lower()
     for markup in ("<script", "<img", "onerror", "alert("):
         assert markup not in dumped
     # The text is data: the card's facts are read exactly as on the clean card.
-    assert hostile.price == clean.price and hostile.vehicle.mileage_km == clean.vehicle.mileage_km
+    for flagged in (hostile, wording_only, markup_only):
+        assert flagged.price == clean.price and flagged.vehicle.mileage_km == clean.vehicle.mileage_km
 
 
 # --------------------------------------------------------------------------- Italian detail pages
@@ -414,6 +455,28 @@ async def test_net_and_gross_wording(client: FixtureCrawlClient) -> None:
     assert (gross.price.basis, gross.price.vat_treatment) == (PriceBasis.UNKNOWN, VatTreatment.VAT_SHOWN)
     assert "SELLER_TEXT_NET_PRICE_WORDING" not in gross.warnings
     assert _screen(gross).state == EligibilityState.ELIGIBLE_PRIMARY
+
+
+async def test_contradictory_detail_prices_keep_the_displayed_price(client: FixtureCrawlClient) -> None:
+    """listingDetails priceRaw 2900 versus JSON-LD Offer.price 3100: priceRaw wins, the conflict is kept."""
+    listing = await _listing(client, IT_PRICE_CONFLICT)
+    assert (listing.price.amount_minor, listing.price.type) == (290000, PriceType.FULL_VEHICLE_ASKING)
+    [conflict] = [c for c in listing.conflicts if c.field == "price.amount_minor"]
+    assert conflict.values == ["2900", "3100"]
+
+
+def test_the_missing_price_detail_shows_no_amount_anywhere() -> None:
+    """The saved missing-price page really has nothing to read (no formatted price either)."""
+    html = (FIXTURES / "autoscout24_it" / "detail_price_missing.html").read_text(encoding="utf-8")
+    assert "€" not in html and "Prezzo" not in html
+    state = json.loads(
+        html.split('<script id="__NEXT_DATA__" type="application/json">')[1].split("</script>")[0]
+    )
+    details = state["props"]["pageProps"]["listingDetails"]
+    assert details["price"]["priceFormatted"] is None
+    assert details["prices"]["public"]["price"] is None and details["prices"]["public"]["priceRaw"] is None
+    product = json.loads(html.split("<script type='application/ld+json'>")[1].split("</script>")[0])
+    assert "price" not in product["offers"] and product["name"] == "Renault Captur"
 
 
 async def test_contradictory_mileage_is_a_recorded_conflict(client: FixtureCrawlClient) -> None:
@@ -458,6 +521,17 @@ async def test_injection_in_a_detail_page_is_flagged_stripped_and_never_obeyed(
     # "approve this car" changes nothing: EUR 7,400 is screened on its merits (above the band).
     assert listing.price.amount_minor == 740000
     assert _screen(listing).state == EligibilityState.REJECTED
+
+
+@pytest.mark.parametrize("n", [IT_INJECTION_WORDING, IT_INJECTION_MARKUP])
+async def test_each_injection_signal_alone_flags_a_detail_page(n: int, client: FixtureCrawlClient) -> None:
+    """Instruction wording without markup, and active markup without wording, each flag on their own."""
+    listing = await _listing(client, n)
+    assert "SELLER_TEXT_SUSPICIOUS" in listing.warnings
+    dumped = listing.model_dump_json().lower()
+    for markup in ("<img", "onerror", "alert("):
+        assert markup not in dumped
+    assert listing.price.amount_minor == 290000  # the facts are read as on a clean page
 
 
 async def test_a_non_active_status_never_marks_the_listing_available(client: FixtureCrawlClient) -> None:
@@ -524,7 +598,7 @@ async def test_german_normal_search_page_cards(client: FixtureCrawlClient) -> No
     assert parsed.dropped == {"not_organic": 1}
     assert [o.source_listing_id for o in page.observations] == [uuid_for(n) for n in (501, 502, 503)]
     assert all(o.canonical_url.startswith(f"https://{DE_HOST}/angebote/") for o in page.observations)
-    assert "led+kamera" in page.observations[0].canonical_url
+    assert DE_PLUS_SLUG in page.observations[0].canonical_url and "+" in DE_PLUS_SLUG
     # card_only: the card's facts travel with the observation (the only facts this source has).
     assert [o.card_listing for o in page.observations] == [c.listing for c in parsed.cards]
     first, private, lpg = (c.listing for c in parsed.cards)
@@ -557,6 +631,10 @@ async def test_german_contradictory_card_values(client: FixtureCrawlClient) -> N
     assert (conflict.field, conflict.values) == ("vehicle.mileage_km", ["143200", "43200"])
     assert mileage.vehicle.mileage_km == Decimal(143200)  # tracking digits; the conflict is recorded
     assert {c.field for c in price.conflicts} == {"price.amount_minor"}
+    # For price the DISPLAYED priceRaw (2900) wins over the analytics tracking.price (3100): for the
+    # card_only source the card is the only asking price that is screened.
+    assert price.price.amount_minor == 290000
+    assert parsed.page.observations[1].card_price_minor == 290000
 
 
 async def test_german_vat_labels_never_turn_net_into_gross(client: FixtureCrawlClient) -> None:

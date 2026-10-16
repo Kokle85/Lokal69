@@ -349,7 +349,7 @@ def test_german_search_page_cards_are_identity_only() -> None:
             displacement="1.332 cm³",
             vat_label="inkl. MwSt.",
             price=13950,
-            slug="renault-captur-synthetic-edition-tce-140-led+kamera-benzin-grau-cat_ma60mo99999",
+            slug="renault-captur-synthetic+edition-tce-140-benzin-grau-cat_ma60mo99999",
         ),
         card(
             2,
@@ -372,7 +372,7 @@ def test_german_search_page_cards_are_identity_only() -> None:
     assert parsed.page.access_state == AccessState.OK
     urls = [o.canonical_url for o in parsed.page.observations]
     assert all(u.startswith(f"https://{DE_HOST}/angebote/") for u in urls)
-    assert "led+kamera" in urls[0]  # '+' slugs keep their identity
+    assert "synthetic+edition" in urls[0]  # '+' slugs keep their identity
     gearboxes = [c.listing.vehicle.gearbox for c in parsed.cards]
     assert gearboxes == [Gearbox.MANUAL, Gearbox.AUTOMATIC, Gearbox.SEMI_AUTOMATIC]
     assert [c.listing.vehicle.fuel for c in parsed.cards] == [Fuel.PETROL, Fuel.DIESEL, Fuel.LPG]
