@@ -69,6 +69,7 @@ from suv_deals.crawling.rate_limits import (
     OutcomeResult,
     RoutePauseRecommendation,
     RunUsage,
+    SearchReserve,
     abandon_request,
     clear_access_block,
     decide,
@@ -78,7 +79,7 @@ from suv_deals.crawling.rate_limits import (
 )
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import Scope
-from suv_deals.domain.sources import RateBudget
+from suv_deals.domain.sources import DiscoverySchedule, RateBudget
 from suv_deals.errors import NotFound, ValidationFailed
 from suv_deals.observability.logging import redact
 from suv_deals.persistence import audit
@@ -275,7 +276,10 @@ class DbBudgetGate:
     """`BudgetGate` backed by ``ops.host_budgets`` for one workspace (shared by all workers).
 
     Per-run caps (search pages / detail fetches per crawl run) are counted per gate instance,
-    which a worker creates per run (`reset_run` starts a new run).
+    which a worker creates per run (`reset_run` starts a new run). For a source in ``schedules``
+    (its discovery window), a detail request may not use what today's remaining discovery runs
+    still need for their search pages (`rate_limits.SearchReserve`: runs left x search pages
+    per run x enabled search profiles of the workspace, one schedule each).
     """
 
     def __init__(
@@ -288,6 +292,7 @@ class DbBudgetGate:
         rng: random.Random | None = None,
         crawl_delays: Mapping[str, Decimal] | None = None,
         source_hosts: Mapping[str, Collection[str]] | None = None,
+        schedules: Mapping[str, DiscoverySchedule] | None = None,
     ) -> None:
         self._db = db
         self._workspace_id = workspace_id
@@ -300,6 +305,7 @@ class DbBudgetGate:
             if source_hosts is None
             else {key: frozenset(_host(h) for h in hosts) for key, hosts in source_hosts.items()}
         )
+        self._schedules = dict(schedules or {})
         self._usage: dict[str, RunUsage] = {}
         self._leases: dict[int, tuple[BudgetRequest, UUID]] = {}
         self._results: dict[tuple[str, str], OutcomeResult] = {}
@@ -353,6 +359,7 @@ class DbBudgetGate:
             )
             row = next(r for r in rows if r["host"] == host)
             state = state_from_row(row, request.source_key, self._policy)
+            reserve = await self._search_reserve(conn, request, budget, now)
             decision = decide(
                 state,
                 now,
@@ -361,6 +368,7 @@ class DbBudgetGate:
                 run_usage=usage,
                 source_usage=source_usage,
                 crawl_delay=delay,
+                search_reserve=reserve,
             )
             if not isinstance(decision, Allow):
                 return decision
@@ -373,6 +381,7 @@ class DbBudgetGate:
                 source_usage=source_usage,
                 crawl_delay=delay,
                 policy=self._policy,
+                search_reserve=reserve,
             )
             token = uuid4()
             params = _row_params(
@@ -507,6 +516,24 @@ class DbBudgetGate:
         )
         async with mapped_errors(), scope as conn, mapped_errors():
             yield conn
+
+    async def _search_reserve(
+        self, conn: Conn, request: BudgetRequest, budget: RateBudget, now: datetime
+    ) -> SearchReserve | None:
+        schedule = self._schedules.get(request.source_key)
+        if request.purpose != "detail" or schedule is None:
+            return None
+        runs, until = schedule.runs_left_today(now)
+        if not runs or until is None:
+            return None
+        row = await fetch_one(
+            conn,
+            "select count(*) as profiles from app.search_profiles where workspace_id = %(workspace_id)s"
+            " and enabled",
+            {"workspace_id": self._workspace_id},
+        )
+        profiles = 0 if row is None else int(row["profiles"])
+        return SearchReserve(requests=runs * budget.max_search_pages_per_run * profiles, until=until)
 
     async def _hosts_of(self, conn: Conn, source_key: str) -> frozenset[str]:
         if self._source_hosts is not None:

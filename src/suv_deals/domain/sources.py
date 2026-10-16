@@ -102,6 +102,30 @@ def _max_runs_per_utc_day(interval: int, start: int, end: int, zone_key: str) ->
     return max(count for day, count in counts.items() if first <= day <= last)
 
 
+# The scheduler wakes on this UTC grid (`crawling.scheduler`: every SCHEDULER_INTERVAL_SECONDS
+# counted from this origin, `jobs.current_slot` uses the same one).
+TICK_GRID_ORIGIN: Final = datetime(2000, 1, 1, tzinfo=UTC)
+
+
+@lru_cache(maxsize=64)
+def _unreached_slots(
+    interval: int, start: int, end: int, zone_key: str, tick_seconds: int
+) -> tuple[int, datetime | None]:
+    """Slots of the reference year whose run window holds no scheduler tick: (count, first one)."""
+    tick = timedelta(seconds=tick_seconds)
+    first, last = date(BUDGET_REFERENCE_YEAR, 1, 1), date(BUDGET_REFERENCE_YEAR, 12, 31)
+    missed, example = 0, None
+    for offset in range((last - first).days + 1):
+        for slot, run_end in _compute_day_slots(
+            interval, start, end, zone_key, first + timedelta(days=offset)
+        ):
+            first_tick = TICK_GRID_ORIGIN - ((TICK_GRID_ORIGIN - slot) // tick) * tick  # ceil to the grid
+            if first_tick >= run_end:
+                missed += 1
+                example = example or slot
+    return missed, example
+
+
 class DiscoverySchedule(BaseModel):
     """An explicit discovery cadence for one source (an owner decision), e.g.::
 
@@ -227,6 +251,35 @@ class DiscoverySchedule(BaseModel):
         instant = _aware(instant)
         return min(start for start, _ in self._around(instant, 1, 2) if start > instant)
 
+    def run_window_end(self, slot: datetime) -> datetime | None:
+        """When the run of ``slot`` may no longer start (the next slot or the window end); None
+        when ``slot`` is not a slot of this schedule (e.g. the window changed since)."""
+        slot = _aware(slot)
+        return next((end for start, end in self._around(slot, 1, 1) if start == slot), None)
+
+    def runs_left_today(self, now: datetime) -> tuple[int, datetime | None]:
+        """Slots of the UTC day of ``now`` (the budget day) whose run window has not ended yet,
+        and when the last of those run windows ends (None: no run left today)."""
+        now = _aware(now)
+        ends = [end for start, end in self._around(now, 1, 1) if start.date() == now.date() and end > now]
+        return len(ends), (max(ends) if ends else None)
+
+    def tick_problem(self, tick_seconds: int) -> str | None:
+        """Why a scheduler waking every ``tick_seconds`` on its UTC grid would never start some
+        slots (a slot runs only if a tick falls inside its run window), or None."""
+        missed, example = _unreached_slots(
+            self.interval_minutes, self.start_minute, self.end_minute, self.timezone, tick_seconds
+        )
+        if not missed or example is None:
+            return None
+        local = example.astimezone(ZoneInfo(self.timezone)).strftime("%H:%M")
+        return (
+            f"the discovery schedule ({self.describe()}) has slots that no scheduler tick reaches"
+            f" (SCHEDULER_INTERVAL_SECONDS={tick_seconds}: {missed} slots in {BUDGET_REFERENCE_YEAR},"
+            f" e.g. {local}); use an interval_minutes that is a multiple of the scheduler interval with"
+            " window_start on its grid, or lower SCHEDULER_INTERVAL_SECONDS"
+        )
+
 
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -334,10 +387,22 @@ SECONDS_PER_DAY: Final = 86_400
 
 
 def search_request_share(budget: RateBudget, detail_mode: str) -> int:
-    """Requests a day the search pages of a source may use: the whole budget when it is
-    ``card_only`` (it makes no other requests), half of it otherwise (the other half is left for
-    the detail pages its runs queue)."""
+    """Requests a day the search pages of a source WITHOUT a discovery window may use
+    (`discovery_interval_seconds`): the whole budget when it is ``card_only`` (it makes no other
+    requests), half of it otherwise (the other half is left for the detail pages its runs queue;
+    a rule of thumb for the stretched cadence, not a reservation)."""
     return budget.daily_request_budget if detail_mode == "card_only" else budget.daily_request_budget // 2
+
+
+def window_search_share(budget: RateBudget, detail_mode: str) -> int:
+    """Requests a day the search pages of a source WITH a discovery window may use: the whole
+    budget when it is ``card_only``, otherwise all but one run's detail allowance
+    (``max_detail_jobs_per_run``). The rest is for detail pages; the budget gate keeps detail
+    requests from using what the day's remaining runs still need for their search pages
+    (`DiscoverySchedule.runs_left_today`, `crawling.rate_limits.SearchReserve`)."""
+    if detail_mode == "card_only":
+        return budget.daily_request_budget
+    return max(budget.daily_request_budget - budget.max_detail_jobs_per_run, 0)
 
 
 def schedule_budget_problem(
@@ -346,20 +411,20 @@ def schedule_budget_problem(
     """Why an explicit discovery schedule does not fit the daily request budget, or None.
 
     A day of full runs (the most slots of any UTC day x ``max_search_pages_per_run`` x one
-    schedule per enabled profile) must fit `search_request_share`. An explicit owner schedule is
+    schedule per enabled profile) must fit `window_search_share`. An explicit owner schedule is
     never stretched to fit (unlike `discovery_interval_seconds`): it is refused instead.
     """
     runs = schedule.max_runs_per_budget_day()
     pages = budget.max_search_pages_per_run
     schedules = max(profiles, 1)
     needed = runs * pages * schedules
-    share = search_request_share(budget, detail_mode)
+    share = window_search_share(budget, detail_mode)
     if needed <= share:
         return None
     rule = (
         "the whole budget, card_only"
         if detail_mode == "card_only"
-        else "half of it; the other half is kept for detail pages"
+        else f"all but max_detail_jobs_per_run {budget.max_detail_jobs_per_run}, kept for detail pages"
     )
     return (
         f"the discovery schedule ({schedule.describe()}) needs {runs} runs x {pages} search pages x"

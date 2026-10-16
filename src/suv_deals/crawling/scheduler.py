@@ -20,7 +20,11 @@ slots and due times):
      (`domain.sources.schedule_budget_problem`), its schedules are refused here (reported in
      ``WorkspaceTick.schedules_over_budget``, nothing is created or changed) and every run of an
      existing row is skipped (``schedule_over_budget``) until the budget, window or profiles
-     change.
+     change. Likewise a window with slots that no tick of this scheduler reaches
+     (`DiscoverySchedule.tick_problem`: e.g. a 10-minute interval, or a 30-minute one with
+     ``SCHEDULER_INTERVAL_SECONDS=3600``) is refused (``WorkspaceTick.schedules_off_tick``) and
+     its due schedules are not advanced (skipped ``schedule_off_tick``, they stay due and
+     visibly unscanned) until the window or the scheduler interval changes.
 
    An existing row follows a changed interval or window (`sources_repo.ensure_schedule` updates
    its interval and due time, audited ``schedule.reconfigure``).
@@ -35,9 +39,9 @@ slots and due times):
    the window end): the scheduler never replays missed slots as a burst (never silently increases
    traffic to catch up). Racing schedulers get ``already_scheduled`` for the same slot.
 
-The process wakes on the ``SCHEDULER_INTERVAL_SECONDS`` UTC grid (15 minutes by default), so a
-window slot is picked up by the first tick at or after it: Europe/Skopje's :00/:30 slots fall on
-that grid exactly.
+The process wakes on the ``SCHEDULER_INTERVAL_SECONDS`` UTC grid (15 minutes by default) and
+never in between, so a window slot runs only if a tick falls inside its run window (refused
+otherwise, see step 2): Europe/Skopje's :00/:30 slots fall on the 15-minute grid exactly.
 
 Real sources are not scheduled at all while ``SOURCE_NETWORK_ENABLED=false`` (their schedules stay
 due and visibly unscanned); fixture sources run offline, and never in production, whose processes
@@ -80,6 +84,7 @@ DEFAULT_PARTITION: Final = "default"
 NETWORK_DISABLED: Final = "source_network_disabled"
 FIXTURE_IN_PRODUCTION: Final = "fixture_source_in_production"
 ADVANCE_FAILED: Final = "advance_failed"
+OFF_TICK: Final = "schedule_off_tick"
 
 
 class WorkspaceTick(BaseModel):
@@ -90,6 +95,9 @@ class WorkspaceTick(BaseModel):
     # Sources whose explicit discovery schedule does not fit their daily request budget with the
     # workspace's enabled profiles: none of their schedules was created or changed.
     schedules_over_budget: tuple[str, ...] = ()
+    # Sources whose discovery window has slots no tick of this scheduler reaches: none of their
+    # schedules was created, changed or advanced.
+    schedules_off_tick: tuple[str, ...] = ()
     enqueued: tuple[UUID, ...] = ()
     already_scheduled: int = 0
     not_due: int = 0
@@ -127,6 +135,7 @@ class EnsuredSchedules(BaseModel):
 
     ensured: int = 0
     over_budget: tuple[str, ...] = ()
+    off_tick: tuple[str, ...] = ()
 
 
 def _slot_of(now: datetime, interval: timedelta) -> datetime:
@@ -168,8 +177,9 @@ async def ensure_schedules(
     Idempotent (``ensure_schedule`` inserts with ``ON CONFLICT DO NOTHING`` and only touches an
     existing row whose cadence changed). A new row schedules nothing by itself. A source with an
     explicit discovery schedule that does not fit its daily request budget with the enabled
-    profiles is refused (logged, reported, no row created or changed). ``now`` replaces database
-    time (tests with a frozen clock).
+    profiles, or whose slots a scheduler waking every ``interval_seconds`` cannot all reach, is
+    refused (logged, reported, no row created or changed). ``now`` replaces database time (tests
+    with a frozen clock).
     """
     # MK comparable sources are crawled too (their detail pages become market evidence, never
     # acquisition revisions: `crawling.mk_evidence`; F2, wave D2).
@@ -180,6 +190,7 @@ async def ensure_schedules(
         return EnsuredSchedules()
     ensured = 0
     over_budget: list[str] = []
+    off_tick: list[str] = []
     async with unit_of_work(db, actor) as conn:
         profiles = [p for p in await config_repo.list_profiles(conn, actor) if p.enabled]
         for source in eligible:
@@ -189,6 +200,15 @@ async def ensure_schedules(
             config = source.source_config()
             window = config.schedule
             if window is not None:
+                unreachable = window.tick_problem(interval_seconds)
+                if unreachable is not None:
+                    # A slot no tick reaches would be lost silently, run after run: refuse it.
+                    logger.warning(
+                        "discovery schedule refused: the scheduler interval cannot reach its slots",
+                        extra={"source_key": source.source_key, "problem": unreachable},
+                    )
+                    off_tick.append(source.source_key)
+                    continue
                 problem = schedule_budget_problem(
                     window, config.rate_budget, config.detail_mode, profiles=len(profiles)
                 )
@@ -214,7 +234,7 @@ async def ensure_schedules(
                     now=now,
                 )
                 ensured += 1
-    return EnsuredSchedules(ensured=ensured, over_budget=tuple(over_budget))
+    return EnsuredSchedules(ensured=ensured, over_budget=tuple(over_budget), off_tick=tuple(off_tick))
 
 
 async def tick_workspace(
@@ -241,6 +261,10 @@ async def tick_workspace(
         if source.mode == SourceMode.FIXTURE and not fixture_runs_allowed(settings):
             # Production processes have no fixture data: a job could only block, one per slot.
             skipped[FIXTURE_IN_PRODUCTION] += 1
+            continue
+        if source.source_key in ensured.off_tick:
+            # Refused window (see `ensure_schedules`): stays due, visibly unscanned.
+            skipped[OFF_TICK] += 1
             continue
 
         async def advance(schedule_id: UUID = schedule.id) -> ScheduleAdvance:
@@ -278,6 +302,7 @@ async def tick_workspace(
         workspace_id=workspace_id,
         schedules_ensured=ensured.ensured,
         schedules_over_budget=ensured.over_budget,
+        schedules_off_tick=ensured.off_tick,
         enqueued=tuple(enqueued),
         already_scheduled=already,
         not_due=not_due,

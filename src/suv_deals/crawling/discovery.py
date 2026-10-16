@@ -37,6 +37,15 @@ a failed traversal (retrying would not help; the schedule backs off and parser h
 later-page failures keep the committed pages and finish the run ``partial``. After a COMPLETE
 traversal, `mark_complete_scan_absences` runs in its own short transaction (absence never means
 removed or sold).
+
+Discovery windows (a source's ``schedule``, `domain.sources.DiscoverySchedule`): a slot's run may
+start only while that slot is live (from the slot until the next slot or the window end), checked
+when the job STARTS against database time, not only when the scheduler enqueued it. A job claimed
+later (released by the budget gate, retried after a 429 or a transient failure, reclaimed after a
+lost lease, or simply queued too long) fetches nothing: it finishes with a ``cancelled`` run whose
+gap reason is ``slot_expired: <slot> ...`` and the next slot is left to the scheduler. A first-page
+refusal or failure that would defer the job to or past the end of its slot's run window ends the
+job the same way instead of deferring it (the job completes; the gap is recorded).
 """
 
 from __future__ import annotations
@@ -52,16 +61,19 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from suv_deals.adapters.base import DiscoveryPage, ParseOutcome, ParserHealth, SearchRequest
+from suv_deals.adapters.registry import build_adapter
+from suv_deals.clock import ensure_utc
 from suv_deals.crawling.detail import apply_budget_refusal
 from suv_deals.crawling.policy_client import BudgetRefused
 from suv_deals.crawling.rate_limits import Deny, DenyReason
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import AccessState, Completeness, CoverageMode, JobState, TechnicalStatus
 from suv_deals.domain.profiles import SearchProfile
+from suv_deals.domain.sources import DiscoverySchedule
 from suv_deals.errors import AppError, NotFound, SourcePaused, ValidationFailed
 from suv_deals.observability.logging import log_context
 from suv_deals.persistence import config_repo, listings_repo, sources_repo
-from suv_deals.persistence.database import Conn, fetch_all
+from suv_deals.persistence.database import Conn, fetch_all, fetch_one
 from suv_deals.persistence.errors_map import mapped_errors
 from suv_deals.persistence.listings_repo import IngestReport
 from suv_deals.persistence.sources_repo import CrawlRunRecord, RunOutcome, SourceRecord, SourceRoute
@@ -75,6 +87,7 @@ from suv_deals.workers.runtime import (
     apply_disposition,
     backoff_delay,
     call_with_budget,
+    refusal_disposition,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +97,8 @@ WATERMARK_OVERLAP: Final = timedelta(hours=48)
 DEFAULT_PARTITION: Final = "default"
 #: Upper bound of a payload page cap (the source's per-run budget always applies as well).
 MAX_PAGE_CAP: Final = 1000
+#: Job code / gap prefix of a windowed slot whose run may no longer start (see module docstring).
+SLOT_EXPIRED: Final = "slot_expired"
 
 
 class DiscoveryPayload(BaseModel):
@@ -136,7 +151,21 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
     if source_id is None or profile_id is None:
         raise ValidationFailed("a discovery job needs its source and profile")
     partition = job.partition_key or payload.partition_key
-    source, profile = await _preflight(ctx, actor, source_id, profile_id)
+    source, profile, now = await _preflight(ctx, actor, source_id, profile_id)
+    window = source.discovery_schedule()
+    slot = payload.slot or job.scheduled_slot
+    expired = _slot_expired(window, slot, now)
+    if expired is not None:
+        return await _skip_expired_slot(
+            ctx,
+            execution,
+            source=source,
+            profile_id=profile_id,
+            partition=partition,
+            coverage=payload.coverage_mode,
+            reason=expired,
+        )
+    deadline = None if window is None or slot is None else window.run_window_end(slot)
     session = await ctx.open_crawl_session(job.workspace_id, source)
     adapter = session.adapter
     coverage = payload.coverage_mode or adapter.capabilities().coverage_mode
@@ -185,6 +214,7 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
             coverage=coverage,
             traversal=traversal,
             health=health,
+            deadline=deadline,
         )
         if traversal.completeness == Completeness.COMPLETE and outcome.state == JobState.SUCCEEDED:
             if health is None:
@@ -199,14 +229,22 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
     return outcome
 
 
+async def _db_now(conn: Conn) -> datetime:
+    row = await fetch_one(conn, "select clock_timestamp() as now")
+    assert row is not None
+    return ensure_utc(row["now"])
+
+
 async def _preflight(
     ctx: RuntimeContext, actor: ActorContext, source_id: UUID, profile_id: UUID
-) -> tuple[SourceRecord, SearchProfile]:
+) -> tuple[SourceRecord, SearchProfile, datetime]:
+    """The gated source, the enabled profile and database time (the scheduler's clock)."""
     async with unit_of_work(ctx.db, actor) as conn:
         await lock_source(conn, actor.workspace_id, source_id, for_network=True)
         source = await sources_repo.get_source_record(conn, actor, source_id)
         _record, config = await config_repo.current_config(conn, actor)
         profiles = await config_repo.list_profiles(conn, actor)
+        now = await _db_now(conn)
     problems = source.activation_problems()
     if problems:
         raise SourcePaused(f"source {source.source_key} is gated: {'; '.join(problems)[:300]}")
@@ -216,7 +254,80 @@ async def _preflight(
     profile = config.profiles.get(stored.profile_key)
     if profile is None or not stored.enabled or not profile.enabled:
         raise SourcePaused(f"profile {stored.profile_key.value} is not enabled")
-    return source, profile
+    return source, profile, now
+
+
+def _slot_expired(window: DiscoverySchedule | None, slot: datetime | None, now: datetime) -> str | None:
+    """The gap reason when a windowed slot's run may no longer start at ``now`` (None: it may,
+    or the job has no window or no slot, e.g. ``suv-deals crawl once``)."""
+    if window is None or slot is None:
+        return None
+    slot = ensure_utc(slot)
+    if window.live_slot(now) == slot:
+        return None
+    end = window.run_window_end(slot)
+    until = f"run window ended {end.isoformat()}" if end is not None else "no longer a slot of the window"
+    return f"{SLOT_EXPIRED}: {slot.isoformat()} not started ({until}; now {now.isoformat()})"
+
+
+async def _skip_expired_slot(
+    ctx: RuntimeContext,
+    execution: JobExecution,
+    *,
+    source: SourceRecord,
+    profile_id: UUID,
+    partition: str,
+    coverage: CoverageMode | None,
+    reason: str,
+) -> JobOutcome:
+    """Finish a windowed job whose slot may no longer start: no network I/O, a ``cancelled`` run
+    carrying the gap (recorded on the schedule like any incomplete run), the job completed."""
+    job = execution.job
+    actor = execution.actor
+    mode = coverage or build_adapter(source.source_config()).capabilities().coverage_mode
+
+    async def commit() -> tuple[UUID, JobState]:
+        execution.check_lease()
+        async with job_unit_of_work(ctx.db, job) as (conn, _locked):
+            await close_interrupted_runs(conn, actor, job.id, attempt=job.attempts)
+            run = await sources_repo.start_crawl_run(
+                conn,
+                actor,
+                source_id=source.id,
+                profile_id=profile_id,
+                partition_key=partition,
+                coverage_mode=mode,
+                adapter_version=source.adapter_version,
+                job_id=job.id,
+                parser_version=source.adapter_version,
+                build_id=ctx.settings.build_id,
+            )
+            await sources_repo.finish_crawl_run(
+                conn, actor, run.id, RunOutcome(completeness="cancelled", gap_reasons=(reason[:300],))
+            )
+            state = await apply_disposition(
+                conn,
+                job,
+                Disposition.complete(
+                    {"run_id": str(run.id), "completeness": "cancelled", "skipped": SLOT_EXPIRED}
+                ),
+            )
+        return run.id, state
+
+    run_id, state = await retry_transient(commit)
+    logger.info("discovery slot expired before its run started; nothing fetched", extra={"gap": reason})
+    return JobOutcome(
+        state=state,
+        code=SLOT_EXPIRED,
+        details={"run_id": str(run_id), "completeness": "cancelled", "pages": 0},
+    )
+
+
+def _retry_instant(retry_at: datetime | timedelta | None, now: datetime) -> datetime:
+    """When a deferred job would become available again (`jobs.fail_retry` / `jobs.release`)."""
+    if isinstance(retry_at, timedelta):
+        return now + retry_at
+    return now if retry_at is None else max(ensure_utc(retry_at), now)
 
 
 # --------------------------------------------------------------------------------------------
@@ -429,7 +540,10 @@ async def _commit(
     coverage: CoverageMode,
     traversal: Traversal,
     health: ParserHealth | None,
+    deadline: datetime | None = None,
 ) -> JobOutcome:
+    """Commit the traversal (see module docstring). ``deadline`` (a windowed slot's run-window
+    end): a deferral of the job to or past it ends the job instead (gap ``slot_expired``)."""
     job = execution.job
     actor = execution.actor
     watermark_to: datetime | None = None
@@ -451,6 +565,22 @@ async def _commit(
     async def commit() -> tuple[list[IngestReport], str | None, JobState]:
         execution.check_lease()
         async with job_unit_of_work(ctx.db, job) as (conn, _locked):
+            outcome_to_record, expired = run_outcome, None
+            if deadline is not None:
+                planned = (
+                    refusal_disposition(traversal.refusal, job.attempts)
+                    if traversal.refusal is not None
+                    else _disposition(session, source, traversal, job.attempts, {})
+                )
+                now = await _db_now(conn)
+                if planned.kind == "retry" and _retry_instant(planned.retry_at, now) >= deadline:
+                    expired = (
+                        f"{SLOT_EXPIRED}: the retry ({planned.code}) would start after the run window"
+                        f" ended {deadline.isoformat()}; not deferred"
+                    )
+                    outcome_to_record = run_outcome.model_copy(
+                        update={"gap_reasons": (*run_outcome.gap_reasons[:19], expired[:300])}
+                    )
             failure = traversal.failure
             if failure is not None and failure.access_state == AccessState.ACCESS_BLOCKED:
                 await sources_repo.record_access_block(
@@ -473,7 +603,7 @@ async def _commit(
                 await listings_repo.ingest_search_page(conn, actor, run, page, job_id=job.id)
                 for page in traversal.ok_pages
             ]
-            await sources_repo.finish_crawl_run(conn, actor, run.id, run_outcome)
+            await sources_repo.finish_crawl_run(conn, actor, run.id, outcome_to_record)
             result = {
                 "run_id": str(run.id),
                 "completeness": str(final),
@@ -482,6 +612,12 @@ async def _commit(
                 "new_listings": sum(r.new_listings for r in reports),
                 "detail_jobs": sum(len(r.detail_jobs) for r in reports),
             }
+            if expired is not None:
+                # The slot's run may no longer start when the deferral ends: never run it late.
+                state = await apply_disposition(
+                    conn, job, Disposition.complete({**result, "skipped": SLOT_EXPIRED})
+                )
+                return reports, SLOT_EXPIRED, state
             if traversal.refusal is not None:
                 # Nothing was fetched: released without consuming an attempt when the refusal
                 # lifts on its own (otherwise retried with the attempt counted, or blocked).
@@ -584,6 +720,7 @@ async def _mark_absences(ctx: RuntimeContext, actor: ActorContext, run_id: UUID)
 
 __all__ = [
     "MAX_PAGE_CAP",
+    "SLOT_EXPIRED",
     "WATERMARK_OVERLAP",
     "DiscoveryPayload",
     "Traversal",

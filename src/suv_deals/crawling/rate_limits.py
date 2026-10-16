@@ -16,7 +16,8 @@ Rules implemented:
   crawl-delay is untrusted input and capped at `MAX_CRAWL_DELAY_SECONDS` (one day).
 - Daily request and byte budgets per source (UTC day) and per-run caps on search
   pages and detail fetches. A refusal is a `Deny`; nothing ever "catches up" by
-  raising traffic later.
+  raising traffic later. For a source with a discovery window, detail requests may not
+  use what the day's remaining discovery runs still need (`SearchReserve`).
 - 429: `Retry-After` (seconds or HTTP-date) is honoured and never shortened. A value
   above `retry_after_max_seconds` is not retried automatically: the route gets a
   pause recommendation instead.
@@ -187,6 +188,23 @@ class DailyUsage(BaseModel):
     bytes: int = Field(default=0, ge=0)
 
 
+class SearchReserve(BaseModel):
+    """What the remaining discovery runs of today's budget day still need for their search pages
+    (a source with a discovery window: `DiscoverySchedule.runs_left_today` x search pages per run
+    x enabled profiles). Detail requests may not use it; it ends at ``until`` (the end of the last
+    run window of the day)."""
+
+    model_config = _FROZEN
+
+    requests: int = Field(ge=0)
+    until: datetime
+
+    @field_validator("until")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return ensure_utc(value)
+
+
 class Allow(BaseModel):
     model_config = _FROZEN
 
@@ -305,8 +323,15 @@ def decide(
     run_usage: RunUsage | None = None,
     source_usage: DailyUsage | None = None,
     crawl_delay: Decimal | None = None,
+    search_reserve: SearchReserve | None = None,
 ) -> BudgetDecision:
-    """May one request start now? Pure; does not consume anything."""
+    """May one request start now? Pure; does not consume anything.
+
+    ``search_reserve`` keeps a detail request from using what today's remaining discovery runs
+    still need: it is refused (``BUDGET_EXHAUSTED`` until the reserve ends) once the day's
+    requests plus the reserve reach the daily budget, so the runs of a discovery window are not
+    starved by the detail pages earlier runs queued.
+    """
     now = ensure_utc(now)
     if state.access_blocked_at is not None:
         return Deny(reason=DenyReason.ACCESS_BLOCKED)
@@ -325,6 +350,15 @@ def decide(
         requests_today, bytes_today = rolled.requests_today, rolled.bytes_today
     if requests_today >= budget.daily_request_budget or bytes_today >= budget.daily_byte_budget:
         return Deny(reason=DenyReason.BUDGET_EXHAUSTED, until=next_utc_midnight(now))
+    if (
+        purpose == "detail"
+        and search_reserve is not None
+        and search_reserve.requests > 0
+        and requests_today + search_reserve.requests >= budget.daily_request_budget
+    ):
+        return Deny(
+            reason=DenyReason.BUDGET_EXHAUSTED, until=min(search_reserve.until, next_utc_midnight(now))
+        )
 
     if run_usage is not None:
         if purpose == "search" and run_usage.search_pages >= budget.max_search_pages_per_run:
@@ -357,6 +391,7 @@ def start_request(
     source_usage: DailyUsage | None = None,
     crawl_delay: Decimal | None = None,
     policy: BackoffPolicy = DEFAULT_BACKOFF,
+    search_reserve: SearchReserve | None = None,
 ) -> HostBudgetState:
     """Consume a token, take the per-host navigation lease and count the request.
 
@@ -371,6 +406,7 @@ def start_request(
         run_usage=run_usage,
         source_usage=source_usage,
         crawl_delay=crawl_delay,
+        search_reserve=search_reserve,
     )
     if not isinstance(decision, Allow):
         raise ValueError(f"start_request without an Allow decision ({decision.kind})")

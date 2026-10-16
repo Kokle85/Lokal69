@@ -190,6 +190,9 @@ def inspect(
             f"discovery         : {window.describe()}; {window.runs_per_day} runs a day x "
             f"{budget.max_search_pages_per_run} search page(s) per enabled profile"
         )
+        unreachable = window.tick_problem(settings.scheduler_interval_seconds)
+        if unreachable is not None:
+            echo(f"discovery problem : {unreachable} (the scheduler refuses this source)")
     else:
         echo("discovery         : global scheduler interval, stretched to fit the daily budget")
     echo(f"active            : {str(gate.active).lower()}")

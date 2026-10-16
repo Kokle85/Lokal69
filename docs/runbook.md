@@ -107,10 +107,30 @@ source's YAML (`config/sources/<key>.yaml`):
   `scheduler_missed_slots`, never a burst). The scheduler ticks on the 15-minute UTC grid, so a
   :00/:30 Skopje slot starts within a second of its time.
 
+  The window is checked again when the worker STARTS a slot's job (database time): a job claimed
+  after its slot's run window (released by the budget gate to 00:00 UTC, retried after a 429 or
+  an outage, reclaimed after a crash, or simply queued too long) fetches nothing; it completes
+  with a `cancelled` crawl run whose gap is `slot_expired: <slot> ...`. A first-page refusal or
+  failure whose retry would start at or after the run-window end ends the job the same way
+  instead of deferring it. So nothing is fetched for a slot after 22:00 or before 08:00.
+
+  The scheduler only wakes on its `SCHEDULER_INTERVAL_SECONDS` grid, so every slot's run window
+  must contain a tick: `interval_minutes` a multiple of the scheduler interval with
+  `window_start` on its grid (30-minute slots from 08:00 with the default 900 s work; 10-minute
+  slots, or `SCHEDULER_INTERVAL_SECONDS=3600` with 30-minute slots, do not). Otherwise the
+  scheduler refuses the source (log line "discovery schedule refused: the scheduler interval
+  cannot reach its slots", `schedules_off_tick` in the tick report, its schedules not advanced)
+  and `sources inspect` prints a "discovery problem" line.
+
   An explicit window is never stretched to fit the budget. Loading the YAML checks that one day
   of runs (the most slots in any UTC day, the budget day) x `max_search_pages_per_run` fits the
-  `daily_request_budget` (all of it for `card_only`, half of it otherwise: the rest is for detail
-  pages); a window that does not fit is a configuration error naming the numbers. The YAML does
+  `daily_request_budget` (all of it for `card_only`; otherwise all but one run's detail allowance,
+  `max_detail_jobs_per_run`: the rest is for detail pages); a window that does not fit is a
+  configuration error naming the numbers. Detail pages are not capped per run (one job per new or
+  changed card, plus stale refreshes), so the budget gate reserves the search pages of the day's
+  remaining runs: a detail request that would leave less than they need is refused until the
+  last run window of the day ends (or the next UTC day), and the runs up to 21:30 keep their
+  pages even on a busy day (e.g. the first day after enabling). The YAML does
   not know how many search profiles are enabled, so that check counts one; the scheduler
   re-checks with the workspace's enabled profiles. If they would overspend (e.g. a second profile
   doubles 336 search requests a day), `ensure_schedules` refuses the source (log line
@@ -121,7 +141,8 @@ source's YAML (`config/sources/<key>.yaml`):
 **Changing a window** (or removing it, or changing a budget):
 
 1. Edit the `schedule` block / `rate_budget` in `config/sources/<key>.yaml`, keeping the comment
-   with the owner's decision and the arithmetic (runs x pages <= budget share).
+   with the owner's decision and the arithmetic (runs x pages <= budget share). The same
+   interval with moved hours is followed too (step 4).
 2. `uv run suv-deals sources inspect <key>` shows the cadence ("discovery: every 30 min from
    08:00 to 22:00 Europe/Skopje; 28 runs a day ..."); a window that does not fit fails here with
    the reason.

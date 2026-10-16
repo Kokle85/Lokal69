@@ -4,8 +4,9 @@ A SYNTHETIC source with the owner's window (every 30 minutes, slots 08:00 ... 21
 Europe/Skopje) is advanced through `sources_repo.advance_schedule` with an explicit ``now`` (the
 frozen clock; production uses database time): jobs only for live slots inside the window, one job
 for the current slot after downtime (never a burst), the DST changes of 2026-10-25 and
-2027-03-28, existing rows following a changed window (audited), and the budget re-check with the
-workspace's enabled profiles.
+2027-03-28, existing rows following a changed window (audited), the budget re-check with the
+workspace's enabled profiles, and the budget gate keeping the search pages of the day's remaining
+runs from detail requests.
 """
 
 from __future__ import annotations
@@ -17,11 +18,15 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from tests.integration.db.helpers import Seed, unique
-from tests.integration.repos_sources_listings.support import Env, source_config
+from tests.integration.repos_sources_listings.support import HOST, Env, source_config
 
+from suv_deals.adapters.base import FetchPurpose
+from suv_deals.crawling.policy_client import BudgetRequest
+from suv_deals.crawling.rate_limits import Allow, Deny, DenyReason
 from suv_deals.domain.enums import CoverageMode
-from suv_deals.domain.sources import DiscoverySchedule
+from suv_deals.domain.sources import DiscoverySchedule, RateBudget
 from suv_deals.persistence import sources_repo
+from suv_deals.persistence.budgets import DbBudgetGate
 from suv_deals.persistence.database import Database
 from suv_deals.persistence.sources_repo import ScheduleAdvance, ScheduleRecord
 from suv_deals.persistence.transactions import unit_of_work
@@ -38,18 +43,23 @@ def local(year: int, month: int, day: int, hour: int, minute: int = 0, second: i
     return datetime(year, month, day, hour, minute, second, tzinfo=SKOPJE).astimezone(UTC)
 
 
-async def _sync(db: Database, env: Env, *extra: tuple[str, DiscoverySchedule | None]) -> dict[str, uuid.UUID]:
+async def _sync(
+    db: Database, env: Env, *extra: tuple[str, DiscoverySchedule | None], budget: RateBudget | None = None
+) -> dict[str, uuid.UUID]:
     """Sync the env's source plus ``extra`` (key, window) sources; returns their ids."""
     configs = [source_config(env.source_key)]
-    configs += [source_config(key, schedule=window) for key, window in extra]
+    more: dict[str, Any] = {} if budget is None else {"rate_budget": budget}
+    configs += [source_config(key, schedule=window, **more) for key, window in extra]
     async with unit_of_work(db, env.system) as conn:
         await sources_repo.sync_sources_from_yaml(conn, env.system, configs)
         return {key: (await sources_repo.get_source_by_key(conn, env.system, key)).id for key, _ in extra}
 
 
-async def _windowed(db: Database, env: Env, window: DiscoverySchedule = WINDOW) -> uuid.UUID:
+async def _windowed(
+    db: Database, env: Env, window: DiscoverySchedule = WINDOW, budget: RateBudget | None = None
+) -> uuid.UUID:
     key = unique("win").lower()
-    return (await _sync(db, env, (key, window)))[key]
+    return (await _sync(db, env, (key, window), budget=budget))[key]
 
 
 async def _ensure(
@@ -273,9 +283,10 @@ async def test_an_existing_row_follows_a_changed_window_audited(db: Database, en
 
 
 async def test_a_window_over_budget_is_skipped_with_more_profiles(db: Database, env: Env, seed: Seed) -> None:
-    """28 runs x 2 pages = 56 of the synthetic 100 search requests (half of 200) with one
-    profile; a second enabled profile needs 112: every run is refused, never stretched."""
-    source_id = await _windowed(db, env)
+    """28 runs x 2 pages = 56 of the 90 search requests a synthetic 100-request budget allows
+    (all but one run's 10 detail pages) with one profile; a second enabled profile needs 112:
+    every run is refused, never stretched."""
+    source_id = await _windowed(db, env, budget=RateBudget(daily_request_budget=100))
     schedule = await _ensure(db, env, source_id, local(2026, 10, 20, 8))
     seed.conn.execute(
         "update app.search_profiles set enabled = true where id = %s", (env.profiles["manual_4000"],)
@@ -290,3 +301,77 @@ async def test_a_window_over_budget_is_skipped_with_more_profiles(db: Database, 
     allowed = await _advance(db, env, schedule.id, local(2026, 10, 20, 8, 30, 2))
     assert allowed.outcome == "enqueued"
     assert _jobs(seed, schedule.id) == [local(2026, 10, 20, 8, 30)]
+
+
+async def test_a_moved_window_with_the_same_interval_is_followed_audited(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """The owner moves the hours and keeps 30 minutes (07:00-22:00): a row that already ran its
+    21:30 slot and waits for tomorrow's 08:00 moves to 07:00, with one ``schedule.reconfigure``
+    (a fast path comparing the interval alone would lose the 07:00 and 07:30 slots)."""
+    source_id = await _windowed(db, env)
+    schedule = await _ensure(db, env, source_id, local(2026, 10, 20, 21, 29))
+    last = await _advance(db, env, schedule.id, local(2026, 10, 20, 21, 30, 1))
+    assert last.outcome == "enqueued" and last.next_due_at == local(2026, 10, 21, 8)
+    _finish_jobs(seed, schedule.id)
+    before = _row(seed, schedule.id)
+
+    earlier = WINDOW.model_copy(update={"window_start": "07:00"})
+    await _sync(db, env, (await _source_key(db, env, source_id), earlier))
+    row = await _ensure(db, env, source_id, local(2026, 10, 20, 22, 30), window=earlier)
+    assert row.interval_seconds == 1800 == before["interval_seconds"]
+    assert row.next_due_at == local(2026, 10, 21, 7) and row.row_version == before["row_version"] + 1
+    [change] = _audits(seed, schedule.id)
+    assert change[0] == "schedule.reconfigure"
+    assert change[3]["interval_seconds_before"] == change[3]["interval_seconds_after"] == 1800
+    assert change[3]["next_due_at_before"] == local(2026, 10, 21, 8).isoformat()
+    assert change[3]["next_due_at_after"] == local(2026, 10, 21, 7).isoformat()
+    assert change[3]["cadence"] == "every 30 min from 07:00 to 22:00 Europe/Skopje"
+    first = await _advance(db, env, schedule.id, local(2026, 10, 21, 7, 0, 2))
+    assert first.outcome == "enqueued" and first.slot == local(2026, 10, 21, 7)
+
+
+async def _source_key(db: Database, env: Env, source_id: uuid.UUID) -> str:
+    async with unit_of_work(db, env.system) as conn:
+        return (await sources_repo.get_source_record(conn, env.system, source_id)).source_key
+
+
+async def test_the_gate_keeps_the_remaining_runs_search_pages_from_detail_requests(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """A source with a discovery window (here every hour, all day, UTC: at least the current
+    hour's run is left at any time): 11 requests used, one run of 20 search pages left at least,
+    budget 30. A detail request would leave less than the run needs and is refused until the
+    reserve ends; a search request and a detail request of a source without a window go ahead."""
+    hourly = DiscoverySchedule(interval_minutes=60, timezone="UTC")
+    budget = RateBudget(min_delay_seconds=5, max_search_pages_per_run=20, daily_request_budget=30)
+
+    def gate(schedules: dict[str, DiscoverySchedule] | None) -> DbBudgetGate:
+        return DbBudgetGate(
+            db,
+            env.workspace_id,
+            {env.source_key: budget},
+            source_hosts={env.source_key: [HOST]},
+            schedules=schedules,
+        )
+
+    def request(purpose: FetchPurpose) -> BudgetRequest:
+        return BudgetRequest(source_key=env.source_key, host=HOST, purpose=purpose, url=f"https://{HOST}/x")
+
+    first = request("search")
+    assert isinstance(await gate(None).acquire(first), Allow)  # creates the host row
+    seed.conn.execute(
+        "update ops.host_budgets set requests_today = 11, tokens = capacity, in_flight_until = null,"
+        " in_flight_token = null, next_request_not_before = null where workspace_id = %s and host = %s",
+        (env.workspace_id, HOST),
+    )
+    denied = await gate({env.source_key: hourly}).acquire(request("detail"))
+    assert isinstance(denied, Deny) and denied.reason == DenyReason.BUDGET_EXHAUSTED
+    assert denied.until is not None and denied.until.time() == datetime.min.time()  # 24:00 UTC
+    assert isinstance(await gate({env.source_key: hourly}).acquire(request("search")), Allow)
+    seed.conn.execute(
+        "update ops.host_budgets set tokens = capacity, in_flight_until = null, in_flight_token = null,"
+        " next_request_not_before = null where workspace_id = %s and host = %s",
+        (env.workspace_id, HOST),
+    )
+    assert isinstance(await gate(None).acquire(request("detail")), Allow)

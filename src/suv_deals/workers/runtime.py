@@ -242,6 +242,8 @@ class RuntimeContext:
             {source.source_key: source.rate_budget()},
             policy=self.backoff,
             source_hosts={source.source_key: source.budget_hosts()},
+            # A discovery window's remaining runs keep their search requests (detail pages wait).
+            schedules=None if config.schedule is None else {source.source_key: config.schedule},
         )
         client = PolicyEnforcingCrawlClient(
             inner, {source.source_key: policy}, gate, resolver=resolver, clock=self.clock

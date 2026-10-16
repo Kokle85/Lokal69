@@ -38,9 +38,12 @@ allowed_detail_paths:
 # наместиш само од 08:00 до 22:00" (every 30 minutes, only from 08:00 to 22:00, owner's local time).
 # Slots 08:00, 08:30, ..., 21:30 Europe/Skopje (22:00 is the exclusive end; CET/CEST handled):
 # 28 runs a day x 12 search pages = 336 search requests a day, all inside one UTC budget day.
-# This source fetches detail pages, so its search pages may use half of the daily budget
-# (domain.sources.schedule_budget_problem): 2 x 336 = 672, the other half for the detail pages
-# the runs queue (at most 10 per run, 280 a day).
+# Budget 600 (owner, 2026-10-16): 336 search + 264 for detail pages. Nothing caps the detail pages
+# per run (one per new or changed card, plus stale refreshes); the budget gate keeps them from
+# using what the day's remaining runs still need (crawling.rate_limits.SearchReserve), so on a
+# busy day the extra detail pages wait (end of the 21:30 run window or next UTC day) and the runs
+# up to 21:30 keep their 336. Load check (domain.sources.schedule_budget_problem): 336 + 10
+# (one run's max_detail_jobs_per_run) <= 600.
 schedule:
   interval_minutes: 30
   window_start: "08:00"
@@ -50,7 +53,7 @@ rate_budget:
   min_delay_seconds: 20            # per-host spacing (shared rate limiter)
   max_search_pages_per_run: 12     # one search page for each of the 12 configured models
   max_detail_jobs_per_run: 10
-  daily_request_budget: 672        # 336 search + 336 for detail pages (see schedule above)
+  daily_request_budget: 600        # 336 search + 264 for detail pages (see schedule above)
 search:
   # One search page per model per run (newest first), in this order. Slug verification
   # (2026-10-16, from the owner-captured pages' links and taxonomy): see notes.

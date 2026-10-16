@@ -27,7 +27,7 @@ from suv_deals.domain.sources import (
     SourceConfig,
     discovery_interval_seconds,
     load_source_configs,
-    search_request_share,
+    window_search_share,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -49,7 +49,7 @@ def test_a_day_of_scheduled_runs_fits_every_shipped_budget(key: str) -> None:
         # An explicit window: its own slots, never stretched; its search pages fit the share.
         assert interval == cfg.schedule.interval_seconds
         search = budget.max_search_pages_per_run * cfg.schedule.max_runs_per_budget_day()
-        assert search <= search_request_share(budget, cfg.detail_mode)
+        assert search <= window_search_share(budget, cfg.detail_mode)
         return
     assert interval % BASE == 0 and BASE <= interval <= SECONDS_PER_DAY
     search = budget.max_search_pages_per_run * _runs_per_day(interval)

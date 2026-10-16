@@ -25,8 +25,20 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from suv_deals.adapters.base import FetchPurpose
 from suv_deals.adapters.registry import load_registry
-from suv_deals.crawling import scheduler
+from suv_deals.crawling import discovery, scheduler
+from suv_deals.crawling.rate_limits import (
+    Allow,
+    Deny,
+    DenyReason,
+    HostBudgetState,
+    RunUsage,
+    SearchReserve,
+    decide,
+    next_utc_midnight,
+    start_request,
+)
 from suv_deals.domain.enums import CoverageMode
 from suv_deals.domain.sources import (
     DiscoverySchedule,
@@ -35,6 +47,7 @@ from suv_deals.domain.sources import (
     discovery_interval_seconds,
     load_source_configs,
     schedule_budget_problem,
+    window_search_share,
 )
 from suv_deals.errors import ValidationFailed
 from suv_deals.persistence import sources_repo
@@ -80,10 +93,10 @@ def test_autoscout24_budgets_fit_336_search_requests_a_day() -> None:
     de, it = CONFIGS["autoscout24_de"], CONFIGS["autoscout24_it"]
     # Germany is card_only (search pages only): 336 of 350.
     assert de.detail_mode == "card_only" and de.rate_budget.daily_request_budget == 350
-    # Italy fetches detail pages: search pages may use half the budget (336 of 672), the other
-    # half is left for the detail pages (at most 10 per run, 280 a day).
-    assert it.detail_mode == "fetch" and it.rate_budget.daily_request_budget == 672
-    assert it.rate_budget.max_detail_jobs_per_run * 28 <= 672 - 336
+    # Italy fetches detail pages: the owner's 600 = 336 search + 264 for detail pages; the load
+    # check leaves at least one run's detail allowance, the gate keeps the 336 at runtime.
+    assert it.detail_mode == "fetch" and it.rate_budget.daily_request_budget == 600
+    assert window_search_share(it.rate_budget, it.detail_mode) == 590 >= 336
     for cfg in (de, it):
         assert cfg.schedule is not None
         assert schedule_budget_problem(cfg.schedule, cfg.rate_budget, cfg.detail_mode) is None
@@ -236,6 +249,44 @@ def test_naive_times_are_refused() -> None:
         OWNER.live_slot(datetime(2026, 10, 20, 8))  # a naive datetime is the point of the test
 
 
+def test_run_window_end_and_runs_left_today() -> None:
+    assert OWNER.run_window_end(local(2026, 10, 20, 8)) == local(2026, 10, 20, 8, 30)
+    assert OWNER.run_window_end(local(2026, 10, 20, 21, 30)) == local(2026, 10, 20, 22)
+    assert OWNER.run_window_end(local(2026, 10, 20, 8, 10)) is None  # not a slot of the window
+    # The UTC budget day of 2026-10-20 holds all 28 slots (06:00-19:30Z).
+    assert OWNER.runs_left_today(datetime(2026, 10, 20, 0, 0, tzinfo=UTC)) == (28, local(2026, 10, 20, 22))
+    assert OWNER.runs_left_today(local(2026, 10, 20, 13, 47)) == (17, local(2026, 10, 20, 22))  # 13:30..21:30
+    assert OWNER.runs_left_today(local(2026, 10, 20, 21, 45)) == (1, local(2026, 10, 20, 22))
+    assert OWNER.runs_left_today(local(2026, 10, 20, 22)) == (0, None)
+
+
+@pytest.mark.parametrize(
+    ("interval", "tick", "reached"),
+    [
+        (30, 900, True),  # the shipped configuration: every :00/:30 slot is on the 15-minute grid
+        (30, 1800, True),
+        (20, 900, True),  # 08:20 -> the 08:30 tick, 08:40 -> 08:45
+        (60, 3600, True),
+        (30, 3600, False),  # every :30 slot expires before a tick reaches it
+        (30, 2700, False),
+        (10, 900, False),
+        (5, 900, False),
+    ],
+)
+def test_slots_a_scheduler_tick_cannot_reach_are_a_problem(interval: int, tick: int, reached: bool) -> None:
+    window = OWNER.model_copy(update={"interval_minutes": interval})
+    problem = window.tick_problem(tick)
+    assert (problem is None) == reached
+    if problem is not None:
+        assert f"SCHEDULER_INTERVAL_SECONDS={tick}" in problem
+
+
+def test_an_hourly_tick_names_the_lost_half_hour_slots() -> None:
+    problem = OWNER.tick_problem(3600)
+    assert problem is not None
+    assert "5110 slots in 2026" in problem and "e.g. 08:30" in problem  # 14 a day x 365
+
+
 # --------------------------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------------------------
@@ -299,14 +350,15 @@ def test_a_schedule_must_fit_the_budget_at_config_load() -> None:
     assert _with(de, rate_budget={"daily_request_budget": 336}).schedule == OWNER  # exactly fits
     with pytest.raises(ValidationError, match=r"autoscout24_de: the discovery schedule .* 336 requests"):
         _with(de, rate_budget={"daily_request_budget": 335})
-    # Italy fetches detail pages: 600 leaves only 300 for search pages (half), less than 336.
-    with pytest.raises(ValidationError, match=r"more than the 300 .*\(half of it"):
-        _with(it, rate_budget={"daily_request_budget": 600})
+    # Italy fetches detail pages: one run's detail allowance (10) must be left beyond the 336.
+    assert _with(it, rate_budget={"daily_request_budget": 346}).rate_budget.daily_request_budget == 346
+    with pytest.raises(ValidationError, match=r"more than the 335 .*max_detail_jobs_per_run 10"):
+        _with(it, rate_budget={"daily_request_budget": 345})
     # An explicit schedule is never stretched to fit: the cure is the budget, pages or window.
     hourly = OWNER.model_copy(update={"interval_minutes": 60})
-    assert _with(it, rate_budget={"daily_request_budget": 600}, schedule=hourly).schedule == hourly
+    assert _with(it, rate_budget={"daily_request_budget": 345}, schedule=hourly).schedule == hourly
     with pytest.raises(ValidationError, match="discovery schedule"):
-        _with(it, rate_budget={"max_search_pages_per_run": 20})
+        _with(de, rate_budget={"max_search_pages_per_run": 20})  # 560 > 350
 
 
 def test_registry_load_names_the_schedule_problem(tmp_path: Path) -> None:
@@ -393,7 +445,9 @@ def _record(cfg: SourceConfig) -> Any:
     )
 
 
-async def _ensure_with_profiles(monkeypatch: pytest.MonkeyPatch, enabled: int) -> tuple[Any, list[str]]:
+async def _ensure_with_profiles(
+    monkeypatch: pytest.MonkeyPatch, enabled: int, tick: int = 900
+) -> tuple[Any, list[str]]:
     created: list[str] = []
 
     @asynccontextmanager
@@ -411,7 +465,7 @@ async def _ensure_with_profiles(monkeypatch: pytest.MonkeyPatch, enabled: int) -
     monkeypatch.setattr(scheduler.sources_repo, "ensure_schedule", fake_ensure)
     keys = ("autoscout24_de", "autoscout24_it", "example_dealer_template_de")
     db: Any = object()
-    result = await scheduler.ensure_schedules(db, db, [_record(CONFIGS[k]) for k in keys], 900)
+    result = await scheduler.ensure_schedules(db, db, [_record(CONFIGS[k]) for k in keys], tick)
     return result, created
 
 
@@ -424,3 +478,150 @@ async def test_ensure_schedules_refuses_a_window_over_budget(monkeypatch: pytest
     fits, created = await _ensure_with_profiles(monkeypatch, enabled=1)
     assert fits == scheduler.EnsuredSchedules(ensured=3)
     assert created == ["autoscout24_de", "autoscout24_it", "example_dealer_template_de"]
+
+
+async def test_ensure_schedules_refuses_a_window_its_ticks_cannot_reach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SCHEDULER_INTERVAL_SECONDS=3600 would silently drop every :30 slot (14 of 28 runs a day):
+    both windows are refused (reported, no row created or changed); the plain source is ensured."""
+    result, created = await _ensure_with_profiles(monkeypatch, enabled=1, tick=3600)
+    assert result == scheduler.EnsuredSchedules(ensured=1, off_tick=("autoscout24_de", "autoscout24_it"))
+    assert created == ["example_dealer_template_de"]
+
+
+# --------------------------------------------------------------------------------------------
+# The search pages of the day's remaining runs are reserved against detail pages
+# --------------------------------------------------------------------------------------------
+
+
+def _reserve(cfg: SourceConfig, now: datetime) -> SearchReserve | None:
+    """What `persistence.budgets.DbBudgetGate` passes for a detail request (one profile)."""
+    assert cfg.schedule is not None
+    runs, until = cfg.schedule.runs_left_today(now)
+    if not runs or until is None:
+        return None
+    return SearchReserve(requests=runs * cfg.rate_budget.max_search_pages_per_run, until=until)
+
+
+def test_a_detail_request_may_not_use_the_remaining_runs_search_pages() -> None:
+    it = CONFIGS["autoscout24_it"]
+    budget = it.rate_budget
+    now = local(2026, 10, 20, 12, 5)  # 12:00 has run; 12:00 ... 21:30 = 20 runs x 12 = 240 reserved
+    reserve = _reserve(it, now)
+    assert reserve == SearchReserve(requests=240, until=local(2026, 10, 20, 22))
+    state = HostBudgetState(
+        source_key=it.source_key, host="www.autoscout24.it", budget_day=now.date(), requests_today=359
+    )
+    assert isinstance(decide(state, now, budget, purpose="detail", search_reserve=reserve), Allow)  # 599
+    full = state.model_copy(update={"requests_today": 360})  # 360 + 240 = 600
+    denied = decide(full, now, budget, purpose="detail", search_reserve=reserve)
+    assert denied == Deny(reason=DenyReason.BUDGET_EXHAUSTED, until=local(2026, 10, 20, 22))
+    assert isinstance(decide(full, now, budget, purpose="search", search_reserve=reserve), Allow)
+    assert isinstance(decide(full, now, budget, purpose="detail"), Allow)  # no window: no reserve
+    # After the window the reserve is gone; the daily budget still ends at the next UTC midnight.
+    assert _reserve(it, local(2026, 10, 20, 22, 1)) is None
+    spent = full.model_copy(update={"requests_today": 600})
+    assert decide(spent, now, budget, purpose="detail", search_reserve=reserve) == Deny(
+        reason=DenyReason.BUDGET_EXHAUSTED, until=next_utc_midnight(now)
+    )
+
+
+def _simulate_day(*, backlog: int, first_run: int, per_run: int, reserve: bool) -> tuple[int, int, int]:
+    """One UTC budget day of autoscout24_it (shipped configuration, one profile) on the pure gate.
+
+    ``backlog`` detail jobs are released at 00:00 UTC (refused the day before); each run queues a
+    detail job per new or changed card (``first_run``, then ``per_run``), each its own job with a
+    fresh run usage, fetched at the 20 s spacing until the next slot. A slot is skipped once the
+    day's budget is used up (`sources_repo._skip_reason`). Returns (search requests, detail
+    requests, runs that fetched all 12 pages).
+    """
+    cfg = CONFIGS["autoscout24_it"]
+    budget, window = cfg.rate_budget, cfg.schedule
+    assert window is not None
+    pages = budget.max_search_pages_per_run
+    step = timedelta(seconds=budget.min_delay_seconds)
+    state = HostBudgetState(source_key=cfg.source_key, host="www.autoscout24.it")
+    pending, search, detail, full_runs = backlog, 0, 0, 0
+
+    def request(now: datetime, purpose: FetchPurpose, usage: RunUsage, sr: SearchReserve | None) -> bool:
+        nonlocal state
+        if not isinstance(
+            decide(state, now, budget, purpose=purpose, run_usage=usage, search_reserve=sr), Allow
+        ):
+            return False
+        state = start_request(state, now, budget, purpose=purpose, run_usage=usage, search_reserve=sr)
+        state = state.model_copy(update={"in_flight_until": None})
+        return True
+
+    def details(now: datetime, until: datetime) -> None:
+        nonlocal pending, detail
+        while pending and now + step <= until:
+            if not request(now, "detail", RunUsage(), _reserve(cfg, now) if reserve else None):
+                return  # released until the gate's time; the rest of the queue waits too
+            pending, detail, now = pending - 1, detail + 1, now + step
+
+    day = date(2026, 10, 20)
+    slots = window.slot_windows(day)
+    details(datetime(2026, 10, 20, tzinfo=UTC), slots[0][0])
+    for index, (slot, run_end) in enumerate(slots):
+        now = slot
+        if state.budget_day == day and state.requests_today >= budget.daily_request_budget:
+            continue  # slot_skipped: daily_budget_exhausted
+        fetched = 0
+        while fetched < pages and request(now, "search", RunUsage(search_pages=fetched), None):
+            fetched, now = fetched + 1, now + step
+        search += fetched
+        full_runs += fetched == pages
+        pending += first_run if index == 0 else per_run
+        details(now, run_end)
+    return search, detail, full_runs
+
+
+@pytest.mark.parametrize(
+    ("backlog", "first_run", "per_run"),
+    [
+        (0, 240, 20),  # activation day: every card is new, then 20 new or changed cards a run
+        (0, 20, 14),  # 14 a run already starved the 21:30 run before
+        (400, 20, 20),  # yesterday's refused detail jobs come back at 00:00 UTC (02:00 Skopje)
+    ],
+)
+def test_busy_detail_days_never_starve_the_window(backlog: int, first_run: int, per_run: int) -> None:
+    search, detail, full_runs = _simulate_day(
+        backlog=backlog, first_run=first_run, per_run=per_run, reserve=True
+    )
+    assert full_runs == 28 and search == 336  # every slot up to 21:30 ran all 12 pages
+    assert detail <= 600 - 336 and search + detail <= 600
+    # Without the reserve (the defect): detail pages used the budget and evening slots starved.
+    unreserved = _simulate_day(backlog=backlog, first_run=first_run, per_run=per_run, reserve=False)
+    assert unreserved[2] < 28
+
+
+# --------------------------------------------------------------------------------------------
+# A slot's run may start only while the slot is live (checked when the job starts)
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_slot_job_started_outside_its_run_window_is_expired() -> None:
+    slot = local(2026, 10, 20, 21, 30)
+    assert discovery._slot_expired(OWNER, slot, local(2026, 10, 20, 21, 59)) is None
+    assert discovery._slot_expired(None, slot, local(2026, 10, 21, 2)) is None  # no window
+    assert discovery._slot_expired(OWNER, None, local(2026, 10, 21, 2)) is None  # crawl once
+    late = discovery._slot_expired(OWNER, slot, local(2026, 10, 20, 22))
+    assert late is not None and late.startswith(f"slot_expired: {slot.isoformat()}")
+    assert "run window ended 2026-10-20T20:00:00+00:00" in late
+    # The 02:00 Skopje release of a budget refusal (00:00 UTC) and the next slot's time alike.
+    assert discovery._slot_expired(OWNER, slot, datetime(2026, 10, 21, tzinfo=UTC)) is not None
+    assert discovery._slot_expired(OWNER, local(2026, 10, 20, 9), local(2026, 10, 20, 9, 30)) is not None
+    moved = discovery._slot_expired(OWNER, local(2026, 10, 20, 9, 10), local(2026, 10, 20, 9, 15))
+    assert moved is not None and "no longer a slot of the window" in moved
+
+
+def test_a_deferral_is_measured_from_database_time() -> None:
+    now = local(2026, 10, 20, 21, 40)
+    assert discovery._retry_instant(timedelta(minutes=30), now) == local(2026, 10, 20, 22, 10)
+    assert discovery._retry_instant(None, now) == now
+    assert discovery._retry_instant(local(2026, 10, 20, 21), now) == now  # never earlier than now
+    assert discovery._retry_instant(datetime(2026, 10, 21, tzinfo=UTC), now) == datetime(
+        2026, 10, 21, tzinfo=UTC
+    )

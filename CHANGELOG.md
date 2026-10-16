@@ -20,14 +20,34 @@ owner's local time, Europe/Skopje).
   the next slot or the window end; outside the window the schedule waits for the next day's start.
   After downtime ONE job runs for the slot that is live now and the missed slots are a recorded
   gap (never a burst). A source without the block keeps the budget-stretched global interval.
+- **The window holds when a run starts, not only when it is queued.** The discovery handler
+  re-checks the job's slot against database time before any request: a job claimed after its
+  slot's run window (released by the budget gate to 00:00 UTC, retried after a 429 or a transient
+  failure, reclaimed after a lost lease, or queued too long) fetches nothing, completes with a
+  `cancelled` run and the gap `slot_expired: <slot> ...` on the schedule. A first-page refusal or
+  failure whose retry would start at or after the run-window end ends the job the same way
+  instead of deferring it (a 429 still backs the schedule off as a failed run).
 - **Budget fit, never stretched.** Loading the YAML refuses a window whose day of runs (the most
   slots in any UTC budget day) x `max_search_pages_per_run` exceeds the search share of
-  `daily_request_budget` (all of it for `card_only`, half otherwise), naming the numbers; the
-  registry load error now carries the validator messages. The YAML cannot know the enabled
-  search profiles, so that check counts one; the scheduler re-checks with the real count:
-  `ensure_schedules` refuses the source (`WorkspaceTick.schedules_over_budget`, a warning log, no
-  row created or changed) and `advance_schedule` skips the run of an existing row
-  (`slot_skipped: schedule_over_budget`).
+  `daily_request_budget` (all of it for `card_only`; otherwise all but one run's detail allowance,
+  `max_detail_jobs_per_run`), naming the numbers; the registry load error now carries the
+  validator messages. The YAML cannot know the enabled search profiles, so that check counts one;
+  the scheduler re-checks with the real count: `ensure_schedules` refuses the source
+  (`WorkspaceTick.schedules_over_budget`, a warning log, no row created or changed) and
+  `advance_schedule` skips the run of an existing row (`slot_skipped: schedule_over_budget`).
+- **The remaining runs' search pages are reserved at runtime.** Detail pages are not capped per
+  run (one job per new or changed card, plus stale refreshes and rechecks), and search and detail
+  share one daily counter. For a source with a window the budget gate now refuses a detail request
+  once the day's requests plus what the day's remaining runs still need (runs left x search pages
+  x enabled profiles, `rate_limits.SearchReserve`) reach the budget, until the last run window of
+  the day ends (or the next UTC day); search requests are not affected. A busy detail day (the
+  first day after enabling, a backlog released at 00:00 UTC) can no longer starve the evening runs.
+- **Slots the scheduler cannot reach are refused.** The scheduler wakes only on its
+  `SCHEDULER_INTERVAL_SECONDS` UTC grid, so a slot whose run window holds no tick would be lost
+  silently (e.g. a 10-minute interval, or `SCHEDULER_INTERVAL_SECONDS=3600` with 30-minute slots).
+  `ensure_schedules` refuses such a window (`WorkspaceTick.schedules_off_tick`, a warning log, no
+  row created or changed) and the tick leaves its due schedules unadvanced (skipped
+  `schedule_off_tick`); `sources inspect` names the problem.
 - **Existing schedule rows follow the configuration.** `ensure_schedule` moves a row whose
   interval or future due time no longer matches the configured cadence (a changed or removed
   window, a changed interval) to the new interval and next slot, under a row lock and audited
@@ -36,15 +56,18 @@ owner's local time, Europe/Skopje).
 - **AutoScout24 IT/DE configuration.** Both get the window (30 min, 08:00-22:00,
   Europe/Skopje): 28 runs x 12 search pages = 336 search requests a day. `autoscout24_de`
   (card_only) `daily_request_budget` 200 -> 350. `autoscout24_it` (fetches detail pages)
-  200 -> 672: under the budget rule a fetch source's search pages may use half of the budget, so
-  336 search requests need 672 (the other half covers the at most 10 detail pages per run, 280 a
+  200 -> 600 (the owner's figure): 336 for search, 264 for detail pages, which the reserve above
+  keeps from the runs up to 21:30 (a day with more detail pages leaves the rest for the next UTC
   day). Spacing (20 s), one connection per host, robots and every gate are unchanged; both stay
   disabled.
 - `tzdata` is a runtime dependency so zoneinfo works in a container image without system zone
   files; `sources inspect` shows the discovery cadence.
-- Tests: slot math (window edges, DST, downtime, UTC budget day), configuration validation and
-  row reconciliation (unit), and windowed schedules on PostgreSQL with a frozen clock
-  (`tests/integration/repos_sources_listings/test_schedule_windows.py`, scheduler tests).
+- Tests: slot math (window edges, DST, downtime, UTC budget day), configuration validation, row
+  reconciliation, tick reachability, the search reserve over a simulated busy day and slot expiry
+  (unit); windowed schedules on PostgreSQL with a frozen clock, a moved window with the same
+  interval, the gate's reserve
+  (`tests/integration/repos_sources_listings/test_schedule_windows.py`), and expired or
+  past-window jobs fetching nothing, the off-tick refusal (pipeline scheduler tests).
 
 Owner decisions of 2026-10-16 („не треба да бидат строги правилата ... само за да имаме
 орјентација", „Цените се извадени од Reklama5"; ADR 0005).
