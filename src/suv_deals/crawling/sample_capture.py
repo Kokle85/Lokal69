@@ -115,12 +115,23 @@ _CHALLENGE_MARKERS: Final = (
 # starts inside an escape: masking must never eat the escape's letters and leave a dangling
 # backslash (the saved page would no longer parse). One escape per match keeps the scan linear
 # (a long run of escapes, such as escaped CJK text, is consumed token by token, never rescanned).
+_ESCAPE: Final = rb"\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|\\[\\/\"'bfnrt]"
 _EMAIL: Final = re.compile(
-    rb"(?P<escape>\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|\\[\\/\"'bfnrt])"
+    rb"(?P<escape>" + _ESCAPE + rb")"
     rb"|(?P<address>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,5})"
 )
-_PHONE: Final = re.compile(rb"(?<![\w+])\+\d{1,3}[\s().\-/]{0,3}(?:\d[\s().\-/]{0,3}){6,13}\d")
-_TEL: Final = re.compile(rb"tel:[^\"'\s<>]{1,40}", re.IGNORECASE)
+_PHONE_NUMBER: Final = rb"\+\d{1,3}[\s().\-/]{0,3}(?:\d[\s().\-/]{0,3}){6,13}\d"
+# A number right after an escape ("\u003cbr\u003e+39 ..." or "\n+39 ..." in embedded JSON) follows
+# the escape's last letter, which the word-boundary lookbehind would take for part of a word: the
+# escape is matched first, kept, and a number directly after it is masked too.
+_PHONE: Final = re.compile(
+    rb"(?P<escape>" + _ESCAPE + rb")(?P<after>" + _PHONE_NUMBER + rb")?"
+    rb"|(?<![\w+])(?P<phone>" + _PHONE_NUMBER + rb")"
+)
+# The value stops at a backslash: inside JSON (href=\"tel:...\") the closing quote is escaped, and
+# swallowing its backslash would end the JSON string early. \uXXXX escapes inside the value are
+# masked with it.
+_TEL: Final = re.compile(rb"tel:(?:\\u[0-9A-Fa-f]{4}|[^\\\"'\s<>]){1,40}", re.IGNORECASE)
 _ABSOLUTE_URL: Final = re.compile(r"https?://([a-z0-9.-]{3,253})(/[^\s\"'<>]*)?", re.IGNORECASE)
 _RELATIVE_PATH: Final = re.compile(r"(?<=[\s\"'(=>,])(/[^\s\"'<>]*)")
 _JSON_TYPE: Final = re.compile(r'"@type"\s*:\s*"([A-Za-z]{2,40})"')
@@ -516,12 +527,21 @@ def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[st
 def redact_html(body: bytes) -> bytes:
     """Mask e-mail addresses, international phone numbers and ``tel:`` links before saving.
 
-    An escape sequence right before an address (``\\u003e`` in embedded JSON) is kept intact, so
-    masking never turns valid JSON or script text into an invalid escape.
+    An escape sequence right before an address or a phone number (``\\u003e`` in embedded JSON) is
+    kept intact (the number after it is still masked), and a ``tel:`` value never takes the
+    backslash of an escaped closing quote, so masking never turns valid JSON or script text into an
+    invalid escape.
     """
     masked = _EMAIL.sub(lambda m: m.group("escape") or b"[redacted-email]", body)
-    masked = _PHONE.sub(b"[redacted-phone]", masked)
+    masked = _PHONE.sub(_mask_phone, masked)
     return _TEL.sub(b"tel:[redacted]", masked)
+
+
+def _mask_phone(match: re.Match[bytes]) -> bytes:
+    escape = match.group("escape")
+    if escape is None:
+        return b"[redacted-phone]"
+    return escape + (b"[redacted-phone]" if match.group("after") is not None else b"")
 
 
 def challenge_reason(body: bytes) -> str | None:

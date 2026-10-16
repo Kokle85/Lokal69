@@ -5,9 +5,9 @@ Only key names, nesting and value kinds come from the captures (Next.js ``__NEXT
 ``Product.offers.itemOffered`` Car on Italian detail pages). Every listing value is INVENTED
 (price 7400, 143200 km, 09-2018, synthetic UUIDs, timestamps and slugs) and differs from the
 captured listings; only generic engine specifications (a 1.5 dCi with 81 kW / 1461 cm3, a TCe 140
-with 103 kW / 1332 cm3) are model facts any brochure states. The seller/location objects carry
-obvious placeholders, so the tests can prove that no seller name, phone, street or link is ever
-copied. No real page content, dealer, address or photo URL is stored here.
+with 103 kW / 1332 cm3) and a generic Euro class label are model facts any brochure states. The
+seller/location objects carry obvious placeholders, so the tests can prove that no seller name,
+phone, street or link is ever copied. No real page content, dealer, address or photo URL is stored here.
 """
 
 from __future__ import annotations
@@ -58,8 +58,14 @@ def card(
     slug: str = "renault-captur-captur-1-5-dci-synthetic-diesel-bianco-cat_ma60mo20235",
     vat_label: str | None = None,
     conditional: bool = False,
+    damaged: bool | None = None,
+    url: str | None = None,
 ) -> dict[str, Any]:
-    """One ``pageProps.listings[]`` entry (Italian or German wording via the arguments)."""
+    """One ``pageProps.listings[]`` entry (Italian or German wording via the arguments).
+
+    ``damaged`` sets ``vehicle.isCurrentlyDamaged`` (absent when None); ``url`` replaces the card's
+    ``url`` verbatim (identity tests).
+    """
     lid = listing_id or uuid_for(n)
     prefix = "/annunci/" if country == "IT" else "/angebote/"
     thousands = f"{km:,}".replace(",", ".")
@@ -94,13 +100,15 @@ def card(
     }
     if displacement is not None:
         vehicle["engineDisplacementInCCM"] = displacement
+    if damaged is not None:
+        vehicle["isCurrentlyDamaged"] = damaged
     mm, yyyy = first_registration.split("-")
     return {
         "id": lid,
         "title": f"{make} {model}",
         "identifier": {"legacyId": None, "crossReferenceId": "SYN-1"},
         "price": price_obj,
-        "url": f"{prefix}{slug}-{url_id or lid}",
+        "url": url if url is not None else f"{prefix}{slug}-{url_id or lid}",
         "vehicle": vehicle,
         "searchResultType": result_type,
         "searchResultSection": section,
@@ -202,12 +210,20 @@ def detail_page(
     final_price: bool = True,
     ld_identifier: str | None = None,
     ld_production_date: str = "2018-09-01",
+    damaged: bool | None = None,
+    euro: str | None = "Euro 6",
+    euro_is_fallback: bool = False,
+    euro_directive: bool = True,
+    include_price_raw: bool = True,
+    ld_currency: str = "EUR",
 ) -> str:
     """An Italian ``/annunci/`` detail page: ``listingDetails`` and/or the JSON-LD Product/Offer/Car.
 
     The defaults are a clean page (no net-price wording, no commercial registration, a final and
     unconditional price); ``ld_identifier`` / ``ld_production_date`` let the JSON-LD Car disagree
-    with ``__NEXT_DATA__``.
+    with ``__NEXT_DATA__``. ``euro`` is the stated emission class (both places the real page has
+    it; ``euro_directive=False`` keeps only ``rawData.environment``), ``damaged`` sets
+    ``rawData.condition.damage.isCurrentlyDamaged``.
     """
     lid = listing_id or uuid_for(n)
     url = f"https://{IT_HOST}/annunci/renault-captur-synthetic-diesel-bianco-cat_ma60mo20235-{lid}"
@@ -247,7 +263,7 @@ def detail_page(
         "offers": {
             "@type": "Offer",
             "price": price,
-            "priceCurrency": "EUR",
+            "priceCurrency": ld_currency,
             "itemCondition": "UsedCondition",
             "url": url,
             "availability": "InStock",
@@ -264,7 +280,7 @@ def detail_page(
             "itemOffered": car,
         },
     }
-    details = {
+    details: dict[str, Any] = {
         "id": nd_id or lid,
         "status": status,
         "title": "Renault Captur",
@@ -280,7 +296,7 @@ def detail_page(
             "isFinalPrice": final_price,
             "public": {
                 "price": f"€ {price}",
-                "priceRaw": price,
+                "priceRaw": price if include_price_raw else None,
                 "taxDeductible": True,
                 "negotiable": False,
                 "onRequestOnly": False,
@@ -337,13 +353,26 @@ def detail_page(
                     "firstRegistrationDate": {"raw": "2018-09-01", "formatted": "09/2018"},
                     "mileageInKm": {"raw": km},
                     "numberOfPreviousOwnersExtended": {"raw": 2},
-                    "damage": {"isCurrentlyDamaged": None, "accidentFree": True},
+                    "damage": {"isCurrentlyDamaged": damaged, "accidentFree": True},
                 },
                 "bodyType": {"formatted": "SUV/Fuoristrada/Pick-up", "raw": "Offroad"},
                 "productionDate": {"formatted": "03/2018", "raw": "2018-03-01"},
             },
         },
     }
+    if euro is not None:
+        label: dict[str, Any] = {
+            "description": None,
+            "formatted": euro,
+            "label": euro.upper().replace(" ", ""),
+            "isFallback": euro_is_fallback,
+        }
+        details["vehicle"]["rawData"]["environment"] = {
+            "particulateFilter": False,
+            "environmentLabelsWithFallback": [{"norm": "EU_Directive_70_220_EEC_LDV", **label}],
+        }
+        if euro_directive:
+            details["vehicle"]["environmentEuDirective"] = {**label, "co2EfficiencyClass": label["label"]}
     next_data = {
         "props": {"pageProps": {"pageid": "detail", "listingDetails": details}},
         "page": "/details/[...slug]",

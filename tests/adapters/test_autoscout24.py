@@ -41,7 +41,9 @@ from suv_deals.domain.enums import (
     BodyType,
     ClaimStatus,
     Completeness,
+    Confidence,
     Drive,
+    EligibilityState,
     Fuel,
     Gearbox,
     PriceBasis,
@@ -51,12 +53,17 @@ from suv_deals.domain.enums import (
     TechnicalStatus,
     VatTreatment,
 )
+from suv_deals.domain.filters import ReasonCode, screen
+from suv_deals.domain.import_estimate import facts_from_listing
 from suv_deals.domain.profiles import SearchProfile, load_business_config
 from suv_deals.domain.sources import SourceConfig
+from suv_deals.domain.taxonomy import load_taxonomy
 from suv_deals.errors import ValidationFailed
 
 REPO = Path(__file__).resolve().parents[2]
 REGISTRY = load_registry(REPO / "config")
+BUSINESS = load_business_config(REPO / "config")
+TAXONOMY = load_taxonomy(REPO / "config" / "vehicle_taxonomy.yaml")
 OWNER_MODELS = (
     "renault/captur",
     "nissan/qashqai",
@@ -447,6 +454,34 @@ def test_cards_with_bad_identity_are_dropped(override: dict[str, Any], reason: s
     assert parsed.page.next_cursor == "model:1:partial"  # an unreadable card: not complete coverage
 
 
+_DE_SLUG = "renault-captur-synthetic-benzin-grau"
+
+
+@pytest.mark.parametrize(
+    ("country", "url"),
+    [
+        # card_only Germany: these guards are the only URL validation (no detail-path policy).
+        ("DE", f"https://{IT_HOST}/angebote/{_DE_SLUG}-{uuid_for(2)}"),  # absolute, another host
+        ("DE", f"https://evil.example/angebote/{_DE_SLUG}-{uuid_for(2)}"),
+        ("DE", f"//evil.example/angebote/{_DE_SLUG}-{uuid_for(2)}"),  # protocol-relative
+        ("DE", f"/lst/{_DE_SLUG}-{uuid_for(2)}"),  # not a listing path
+        ("DE", f"/angebote/../lst/{_DE_SLUG}-{uuid_for(2)}"),  # leaves the listing path
+        ("DE", f"/angebote/{_DE_SLUG}-{uuid_for(2)}?x=1"),  # a query string
+        ("IT", f"/angebote/{_DE_SLUG}-{uuid_for(2)}"),  # the other country's listing path
+    ],
+)
+def test_cards_with_a_foreign_host_or_path_are_dropped(country: str, url: str) -> None:
+    """Regression guard: the card's href prefix, host and canonical path checks were untested."""
+    adapter = _de() if country == "DE" else _it()
+    request = _request(adapter)
+    listings = [card(1, country=country), card(2, country=country, url=url)]
+    parsed = adapter.parse_search(request, raw_document(request.url, search_page(listings)))
+    assert parsed.page.access_state == AccessState.OK
+    assert parsed.dropped == {"invalid_url": 1}
+    assert [o.source_listing_id for o in parsed.page.observations] == [uuid_for(1)]
+    assert parsed.page.next_cursor == "model:1:partial"
+
+
 @pytest.mark.parametrize(
     ("price", "warning"),
     [
@@ -466,6 +501,41 @@ def test_placeholder_and_absurd_prices_carry_no_amount(price: int | None, warnin
     assert observation.card_price_minor is None and observation.card_currency is None
     assert warning in parsed.cards[0].listing.warnings
     assert parsed.cards[0].listing.price.amount_minor is None
+
+
+@pytest.mark.parametrize("country", ["IT", "DE"])
+def test_a_currently_damaged_card_is_no_full_asking_price(country: str) -> None:
+    """Regression guard: ``vehicle.isCurrentlyDamaged`` (on most captured DE cards) turns the card
+    price into PARTS_OR_DAMAGED, which screening rejects; a conditional price stays UNKNOWN."""
+    adapter = _de() if country == "DE" else _it()
+    request = _request(adapter)
+    listings = [
+        card(1, country=country, damaged=True),
+        card(2, country=country, damaged=False),
+        card(3, country=country),  # field absent (null on some captured cards)
+        card(4, country=country, damaged=True, conditional=True),
+    ]
+    parsed = adapter.parse_search(request, raw_document(request.url, search_page(listings)))
+    damaged, undamaged, unknown, conditional = (c.listing for c in parsed.cards)
+    assert damaged.price.type == PriceType.PARTS_OR_DAMAGED and damaged.price.amount_minor == 740000
+    assert damaged.condition.damaged_vehicle == ClaimStatus.SELLER_CLAIMED
+    assert "condition.damaged_vehicle" in damaged.provenance
+    for listing in (undamaged, unknown):
+        assert listing.price.type == PriceType.FULL_VEHICLE_ASKING
+        assert listing.condition.damaged_vehicle == ClaimStatus.UNKNOWN
+    assert conditional.price.type == PriceType.UNKNOWN
+    assert conditional.condition.damaged_vehicle == ClaimStatus.SELLER_CLAIMED
+    result = screen(
+        damaged.model_copy(update={"price": damaged.price.model_copy(update={"amount_minor": 280000})}),
+        BUSINESS,
+        [],
+        NOW.date(),
+        TAXONOMY,
+    )
+    assert result.state == EligibilityState.REJECTED
+    assert ReasonCode.PRICE_TYPE_PARTS_OR_DAMAGED in {r.code for r in result.reasons}
+    if country == "DE":  # card_only: the damaged facts are what ingestion stores
+        assert parsed.page.observations[0].card_listing == damaged
 
 
 def test_price_sanity_bounds() -> None:
@@ -714,6 +784,42 @@ async def test_every_model_answering_404_is_route_drift() -> None:
     assert "all 3 model searches answered HTTP 404" in (pages[-1].access_evidence or "")
 
 
+async def test_a_404_on_the_last_model_after_answering_models_is_a_skip() -> None:
+    """Regression guard: the last configured model (an unverified slug) answering 404 after the
+    others answered is a skipped model and a partial walk, never route drift."""
+    adapter = _it()
+    last = adapter.models[-1]
+    request = adapter.build_search(_profile(), f"model:{len(adapter.models) - 1}")
+    missing = raw_document(request.url, "<html><body>Not found</body></html>", status=404)
+    pages = await _walk(adapter, _pages_for(adapter, **{last.model: missing}))
+    assert len(pages) == len(adapter.models)
+    final = pages[-1]
+    assert final.access_state == AccessState.OK and not final.has_more and not final.observations
+    assert final.completeness == Completeness.PARTIAL and final.next_cursor is None
+    assert f"model search {last.label} answered HTTP 404" in (final.access_evidence or "")
+
+
+async def test_one_answering_model_keeps_a_404_walk_from_being_drift() -> None:
+    """Pins the drift threshold: only EVERY model answering 404 is drift; one answering model is
+    enough for the 404s around it to be skipped slugs."""
+    adapter = _it(search={**_it().config.search, "models": "nissan/qashqai nissan/juke kia/sportage"})
+    missing = {
+        m.model: raw_document(
+            adapter.build_search(_profile(), None if i == 0 else f"model:{i}").url,
+            "<html><body>Pagina non trovata</body></html>",
+            status=404,
+            access_state=AccessState.NOT_FOUND,
+        )
+        for i, m in enumerate(adapter.models)
+        if i > 0
+    }
+    pages = await _walk(adapter, _pages_for(adapter, **missing))
+    assert [p.access_state for p in pages] == [AccessState.OK] * 3
+    assert pages[1].next_cursor == "model:2:partial:nf1"
+    assert pages[-1].completeness == Completeness.PARTIAL and not pages[-1].has_more
+    assert "kia/sportage answered HTTP 404" in (pages[-1].access_evidence or "")
+
+
 async def test_a_404_on_the_verified_model_slug_is_route_drift() -> None:
     adapter = _it()
     request = adapter.build_search(_profile(), None)  # renault/captur, verified on the captures
@@ -755,6 +861,18 @@ async def test_results_without_any_organic_card_are_drift() -> None:
     mixed = [card(1), card(2, result_type="TopSpot")]
     page = adapter.parse_search(request, raw_document(request.url, search_page(mixed))).page
     assert page.access_state == AccessState.OK and len(page.observations) == 1
+
+
+@pytest.mark.parametrize("section", ["Top", "Tail", "Similar"])
+def test_organic_cards_outside_the_main_section_are_no_results(section: str) -> None:
+    """Regression guard: only Organic cards of the Main section are results of the model search."""
+    adapter = _it()
+    request = _request(adapter)
+    listings = [card(1), card(2, section=section)]
+    parsed = adapter.parse_search(request, raw_document(request.url, search_page(listings)))
+    assert parsed.page.access_state == AccessState.OK
+    assert parsed.dropped == {"not_organic": 1}
+    assert [o.source_listing_id for o in parsed.page.observations] == [uuid_for(1)]
 
 
 async def test_a_block_stops_the_walk_immediately() -> None:
@@ -801,6 +919,7 @@ def test_italian_detail_page() -> None:
     assert listing.condition.accident_free == ClaimStatus.SELLER_CLAIMED
     assert listing.documentation.previous_owners == 2
     assert listing.documentation.inspection_expiry.value == "2027-10"
+    assert listing.documentation.emissions_class == "Euro 6"
     assert listing.co2.g_per_km == Decimal(105)
     assert listing.source_published_at.value is not None
     assert not listing.conflicts
@@ -818,6 +937,145 @@ def test_net_price_wording_and_a_commercial_registration_are_flagged() -> None:
     assert listing.price.basis == PriceBasis.NET
     assert {"SELLER_TEXT_NET_PRICE_WORDING", "COMMERCIAL_REGISTRATION_SUSPECTED"} <= set(listing.warnings)
     assert listing.description_excerpt is None
+
+
+def _screen(listing: Any) -> Any:
+    return screen(listing, BUSINESS, [], NOW.date(), TAXONOMY)
+
+
+@pytest.mark.parametrize(
+    "wording",
+    [
+        "Il prezzo pubblicizzato è escluso IVA.",
+        "Prezzo IVA 22% esclusa.",
+        "Prezzo IVA al 22% esclusa.",
+        "Prezzo escl. IVA.",
+        "Prezzo IVA non inclusa.",
+        "IVA non compresa nel prezzo.",
+        "Prezzo non comprensivo di IVA.",
+        "Prezzo senza IVA.",
+        "Prezzo netto, IVA da aggiungere.",
+        "Prezzo al netto di IVA.",
+        "Preis exkl. MwSt.",
+        "Preis ohne MwSt.",
+    ],
+)
+def test_net_price_wordings_on_a_vat_deductible_page_need_facts(wording: str) -> None:
+    """Regression: these wordings were missed, so a net amount on a page with the captured price
+    shape (``taxDeductible`` true, ``netPriceRaw`` null, ``isFinalPrice`` true) was screened as a
+    payable gross price (eligible_primary) instead of a net-only price that needs facts."""
+    page = detail_page(price=2900, description=f"<p>Synthetic description. {wording}</p>")
+    listing = _it().parse_detail(raw_document(detail_url(), page)).listing
+    assert listing is not None
+    assert (listing.price.basis, listing.price.vat_treatment) == (PriceBasis.NET, VatTreatment.VAT_SHOWN)
+    assert "SELLER_TEXT_NET_PRICE_WORDING" in listing.warnings
+    result = _screen(listing)
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert ReasonCode.PRICE_BASIS_NET_ONLY in {r.code for r in result.reasons}
+
+
+@pytest.mark.parametrize(
+    "wording",
+    [
+        "Auto disponibile.",
+        "Prezzo IVA inclusa.",
+        "IVA esposta.",
+        "IVA deducibile.",
+        "Regime del margine, senza IVA esposta.",
+        "MwSt. ausweisbar.",
+        "Differenzbesteuert, ohne MwSt.-Ausweis.",
+    ],
+)
+def test_vat_shown_and_gross_wordings_keep_the_site_final_price(wording: str) -> None:
+    """The site's 'IVA deducibile' flag on a final price (VAT shown, VAT included) stays the
+    payable amount; only net wording moves the basis."""
+    page = detail_page(price=2900, description=f"<p>Synthetic description. {wording}</p>")
+    listing = _it().parse_detail(raw_document(detail_url(), page)).listing
+    assert listing is not None
+    assert (listing.price.basis, listing.price.vat_treatment) == (PriceBasis.UNKNOWN, VatTreatment.VAT_SHOWN)
+    assert "SELLER_TEXT_NET_PRICE_WORDING" not in listing.warnings
+    assert _screen(listing).state == EligibilityState.ELIGIBLE_PRIMARY
+
+
+def test_the_stated_euro_class_reaches_the_import_estimate() -> None:
+    """Regression: the IT page states the Euro class, but it was dropped, so the import gate was
+    always EURO_CLASS_UNKNOWN for AutoScout24 listings."""
+    listing = _it().parse_detail(raw_document(detail_url(), detail_page(euro="Euro 3"))).listing
+    assert listing is not None
+    assert listing.documentation.emissions_class == "Euro 3"
+    prov = listing.provenance["documentation.emissions_class"]
+    assert prov.confidence == Confidence.MEDIUM
+    assert (prov.selector or "").endswith("environmentEuDirective")
+    assert facts_from_listing(listing, payable=None).emissions_class == "Euro 3"
+    # Only rawData.environment carries it: still read.
+    raw_only = detail_page(euro="Euro 5", euro_directive=False)
+    listing = _it().parse_detail(raw_document(detail_url(), raw_only)).listing
+    assert listing is not None and listing.documentation.emissions_class == "Euro 5"
+    assert "environmentLabelsWithFallback" in (
+        listing.provenance["documentation.emissions_class"].selector or ""
+    )
+
+
+@pytest.mark.parametrize("page", [detail_page(euro="Euro 6", euro_is_fallback=True), detail_page(euro=None)])
+def test_a_fallback_or_missing_euro_class_stays_unknown(page: str) -> None:
+    """A class filled in from model data (``isFallback`` true) is not stated for this car."""
+    listing = _it().parse_detail(raw_document(detail_url(), page)).listing
+    assert listing is not None and listing.documentation.emissions_class is None
+    assert "documentation.emissions_class" not in listing.provenance
+
+
+@pytest.mark.parametrize(
+    ("price", "warning"),
+    [
+        (1, "PRICE_PLACEHOLDER"),
+        (0, "PRICE_MISSING_OR_ZERO"),
+        (99, "PRICE_PLACEHOLDER"),
+        (1234, "PRICE_PLACEHOLDER"),
+        (123456, "PRICE_PLACEHOLDER"),
+        (5_000_000, "PRICE_IMPLAUSIBLE"),
+    ],
+)
+def test_placeholder_and_absurd_detail_prices_carry_no_amount(price: int, warning: str) -> None:
+    """Regression guard: the detail page (the revision that is screened) applies the same price
+    sanity bounds as the card; without them a placeholder became a full asking price."""
+    listing = _it().parse_detail(raw_document(detail_url(), detail_page(price=price))).listing
+    assert listing is not None
+    assert listing.price.amount_minor is None and listing.price.type == PriceType.UNKNOWN
+    assert warning in listing.warnings
+    assert "price.amount_minor" not in listing.provenance
+
+
+def test_a_detail_price_only_in_another_currency_is_missing() -> None:
+    page = detail_page(include_price_raw=False, ld_currency="CHF")
+    listing = _it().parse_detail(raw_document(detail_url(), page)).listing
+    assert listing is not None
+    assert listing.price.amount_minor is None and "PRICE_MISSING" in listing.warnings
+    # Without priceRaw a EUR JSON-LD offer is the fallback amount.
+    fallback = _it().parse_detail(raw_document(detail_url(), detail_page(include_price_raw=False))).listing
+    assert fallback is not None and fallback.price.amount_minor == 740000
+    assert fallback.provenance["price.amount_minor"].selector == "json_ld:Offer.price"
+
+
+@pytest.mark.parametrize(
+    ("damaged", "expected"),
+    [
+        (True, PriceType.PARTS_OR_DAMAGED),
+        (False, PriceType.FULL_VEHICLE_ASKING),
+        (None, PriceType.FULL_VEHICLE_ASKING),
+    ],
+)
+def test_a_currently_damaged_detail_listing_is_no_full_asking_price(
+    damaged: bool | None, expected: PriceType
+) -> None:
+    """Regression guard: ``rawData.condition.damage.isCurrentlyDamaged`` true downgrades the price."""
+    listing = _it().parse_detail(raw_document(detail_url(), detail_page(damaged=damaged))).listing
+    assert listing is not None
+    assert listing.price.type == expected
+    claimed = ClaimStatus.SELLER_CLAIMED if damaged else ClaimStatus.UNKNOWN
+    assert listing.condition.damaged_vehicle == claimed
+    conditional = detail_page(damaged=damaged, conditional=True)
+    listing = _it().parse_detail(raw_document(detail_url(), conditional)).listing
+    assert listing is not None and listing.price.type == PriceType.UNKNOWN
 
 
 def test_a_conditional_detail_price_is_no_full_asking_price() -> None:

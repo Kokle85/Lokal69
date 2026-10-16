@@ -86,8 +86,8 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
         assert config.terms_decision_actor and "owner" in config.terms_decision_actor
         assert config.robots_checked_at is not None and config.robots_summary
         if config.source_key in IMPLEMENTED_MARKETPLACES:
-            # Real adapter (2026-10-16), still gated: untested live and disabled until the owner's
-            # live smoke run.
+            # Real adapter (2026-10-16), still gated: untested and disabled until saved fixtures,
+            # the owner's live smoke run and enabling (register steps 5-7).
             assert "adapter has not passed fixture tests" in activation_problems(config)
         else:
             assert "adapter is unimplemented" in activation_problems(config)

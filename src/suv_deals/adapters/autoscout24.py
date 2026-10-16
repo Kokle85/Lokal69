@@ -18,8 +18,9 @@ only; no page content is kept in the repository):
 - Italian detail pages ``/annunci/<slug>-<uuid>`` publish ``props.pageProps.listingDetails`` with
   language-neutral raw values (``vehicle.rawPowerInKw``, ``rawDisplacementInCCM``,
   ``firstRegistrationDateRaw``, ``fuelCategory.raw``, ``rawData.engine.transmissionType.raw``,
-  ``driveTrain``) and a JSON-LD ``Product`` whose ``offers.itemOffered`` is the ``Car`` (read with
-  the shared schema.org reader as a fallback and a cross-check).
+  ``driveTrain``, ``environmentEuDirective`` for the stated Euro class) and a JSON-LD ``Product``
+  whose ``offers.itemOffered`` is the ``Car`` (read with the shared schema.org reader as a fallback
+  and a cross-check).
 
 Personal data is never read into any model: of the ``seller`` object only ``type`` / ``isDealer``
 is used and of ``location`` only ``countryCode``. Names, phones, links, streets and coordinates
@@ -193,9 +194,19 @@ MAX_PLAUSIBLE_PRICE_EUR: Final = 1_000_000
 _PLACEHOLDER_PRICES: Final = frozenset({1234, 12345, 123456, 1234567, 11111, 111111, 1111111})
 #: Seller wording that states the advertised price excludes VAT (Italian and German). Only the flag
 #: is kept; the description itself is never stored (it carries the dealer's contact details).
+#: "IVA esposta/deducibile" (VAT shown: the price includes it), "senza IVA esposta" (margin scheme)
+#: and "ohne MwSt.-Ausweis" (no VAT shown) are NOT net wording.
 _NET_WORDING: Final = re.compile(
-    r"al\s+netto\s+(?:dell['\u2019\s]?\s*)?iva|iva\s+esclusa|esclusa\s+iva|oltre\s+(?:l['\u2019]\s*)?iva|"
-    r"pi[uù]\s+iva|\+\s*iva\b|zzgl\.?\s*(?:\d{1,2}\s*%\s*)?(?:mwst|ust)|netto\s*preis|nettopreis",
+    r"\bal\s+netto\s+(?:dell['\u2019\s]?\s*|di\s+)?iva\b"
+    r"|\bescl(?:us[oa]|\.)?\s*(?:l['\u2019]\s*)?iva\b"
+    r"|\biva\s*(?:al\s*)?(?:\d{1,2}(?:[.,]\d{1,2})?\s*%\s*)?(?:esclus[oa]\b|escl\b)"
+    r"|\biva\s+non\s+(?:inclus[oa]|compres[oa])\b"
+    r"|\bnon\s+comprensiv[oa]\s+(?:di\s+|dell['\u2019]\s*)iva\b"
+    r"|\bsenza\s+(?:l['\u2019]\s*)?iva\b(?!\s+(?:esposta|deducibile|detraibile))"
+    r"|\boltre\s+(?:l['\u2019]\s*)?iva\b|\bpi[uù]\s+iva\b|\+\s*iva\b|\bprezzo\s+netto\b"
+    r"|\b(?:zzgl|exkl)\.?\s*(?:\d{1,2}\s*%\s*)?(?:mwst|ust)\b"
+    r"|\b(?:exklusive|ohne)\s+(?:\d{1,2}\s*%\s*)?(?:mwst|ust)\b(?![.\s-]*ausweis)"
+    r"|\bnetto\s*-?\s*preis|\bnettopreis",
     re.IGNORECASE,
 )
 #: Commercial (N1) registration markers in the version text or description ("AUTOCARRO", "N1",
@@ -1446,6 +1457,7 @@ class AutoScout24Adapter:
         documentation = Documentation(
             previous_owners=owners if owners is not None and 0 <= owners <= 50 else None,
             inspection_expiry=inspection,
+            emissions_class=self._detail_euro_class(nd, raw, facts),
         )
         co2 = self._detail_co2(raw, fuel, facts)
 
@@ -1707,6 +1719,37 @@ class AutoScout24Adapter:
             vat_treatment=vat,
             net_amount_minor=net_minor,
         )
+
+    @staticmethod
+    def _detail_euro_class(nd: dict[str, Any], raw: dict[str, Any], facts: _Facts) -> str | None:
+        """The listing's Euro emission class ("Euro 6"), or None.
+
+        ``vehicle.environmentEuDirective`` (or ``rawData.environment.environmentLabelsWithFallback``)
+        holds the class the listing states; a value marked ``isFallback`` is filled in from model
+        data, not stated for this car, and is never used (the same rule as the CO2 value).
+        """
+        labels = _get(raw, "environment", "environmentLabelsWithFallback")
+        candidates = (
+            (nd.get("environmentEuDirective"), f"{_DETAIL_PROV}.vehicle.environmentEuDirective"),
+            (
+                labels[0] if isinstance(labels, list) and labels else None,
+                f"{_DETAIL_PROV}.vehicle.rawData.environment.environmentLabelsWithFallback[0]",
+            ),
+        )
+        for node, selector in candidates:
+            if not isinstance(node, dict) or node.get("isFallback") is not False:
+                continue
+            text = bounded(_str(node.get("formatted")) or _str(node.get("label")), 40)
+            if text:
+                facts.prov(
+                    "documentation.emissions_class",
+                    selector,
+                    text,
+                    confidence=Confidence.MEDIUM,
+                    transformation="listing-stated class (isFallback false)",
+                )
+                return text
+        return None
 
     @staticmethod
     def _detail_co2(raw: dict[str, Any], fuel: Fuel, facts: _Facts) -> Co2Info:

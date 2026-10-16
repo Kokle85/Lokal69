@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -10,20 +11,22 @@ from tests.integration.repos_sources_listings.support import (
     HOST,
     Env,
     card,
+    claim_detail,
     discover,
     ingest,
     later,
     page,
+    run_detail,
     source_config,
     start_run,
     vehicle,
 )
 
-from suv_deals.domain.enums import CoverageMode
+from suv_deals.domain.enums import CoverageMode, JobType
 from suv_deals.errors import ValidationFailed
-from suv_deals.persistence import listings_repo, sources_repo
+from suv_deals.persistence import database, jobs, listings_repo, sources_repo
 from suv_deals.persistence.database import Database
-from suv_deals.persistence.sources_repo import RunOutcome
+from suv_deals.persistence.sources_repo import CrawlRunRecord, RunOutcome
 from suv_deals.persistence.transactions import unit_of_work
 
 pytestmark = pytest.mark.db
@@ -239,6 +242,148 @@ async def test_card_only_card_facts_ride_in_a_no_fetch_detail_job(db: Database, 
     report = await ingest(db, env, await start(), page(key, [stray], fetched_at=later(10)))
     assert report.new_listings == 1 and report.detail_jobs == ()
     assert any("name another listing" in w for w in report.warnings)
+
+
+async def _card_only_source(db: Database, env: Env) -> tuple[str, Callable[[], Awaitable[CrawlRunRecord]]]:
+    """A synthetic card_only source and a function that starts one of its crawl runs."""
+    key = unique("cardonly").lower()
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.sync_sources_from_yaml(
+            conn,
+            env.system,
+            [
+                source_config(env.source_key),
+                source_config(key, detail_mode="card_only", allowed_detail_paths=()),
+            ],
+        )
+        source = await sources_repo.get_source_by_key(conn, env.system, key)
+
+    async def start() -> CrawlRunRecord:
+        async with unit_of_work(db, env.system) as conn:
+            return await sources_repo.start_crawl_run(
+                conn,
+                env.system,
+                source_id=source.id,
+                profile_id=env.profiles["primary"],
+                coverage_mode=CoverageMode.ROLLING_PAGES,
+                adapter_version="fixture@1.0.0",
+            )
+
+    return key, start
+
+
+async def test_card_only_facts_outside_the_card_hash_are_refreshed(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """Regression: a card_only card whose hash (title, price, km, URL) stayed the same never queued
+    a job, so changed facts outside the hash (damage, first registration, ...), a parser fix or a
+    card-facts revision that was never promoted were never ingested."""
+    key, start = await _card_only_source(db, env)
+    slid = unique("SYN")
+    facts = vehicle(slid).model_copy(update={"source_key": key})
+    first = await ingest(
+        db, env, await start(), page(key, [card(slid).model_copy(update={"card_listing": facts})])
+    )
+    assert len(first.detail_jobs) == 1
+    listing_id = first.detail_jobs[0].listing_id
+    job = await claim_detail(db, env)
+    assert job.listing_id == listing_id
+    await run_detail(db, env, job, listing_id, facts)  # what the no-fetch card-facts job ingests
+
+    # The same card with the same facts: nothing to do.
+    same = await ingest(
+        db,
+        env,
+        await start(),
+        page(key, [card(slid).model_copy(update={"card_listing": facts})], fetched_at=later(5)),
+    )
+    assert (same.unchanged_listings, same.detail_jobs, same.detail_jobs_deduplicated) == (1, (), 0)
+
+    # Same card hash, corrected first registration: a card-facts job with the new facts.
+    corrected = vehicle(slid, first_registration="2010-05").model_copy(update={"source_key": key})
+    again = await ingest(
+        db,
+        env,
+        await start(),
+        page(key, [card(slid).model_copy(update={"card_listing": corrected})], fetched_at=later(10)),
+    )
+    assert again.unchanged_listings == 1 and len(again.detail_jobs) == 1
+    ref = again.detail_jobs[0]
+    assert job.generation is not None
+    assert ref.reason == listings_repo.CARD_FACTS_CHANGED and ref.generation == job.generation + 1
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (ref.job_id,))
+    assert payload["card_listing"]["vehicle"]["first_registration"]["value"] == "2010-05"
+
+
+async def test_an_unpromoted_card_only_listing_gets_its_facts_again(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """Regression: when the first card-facts job ended without a revision (cancelled, dead letter,
+    quarantined), the unchanged card never queued another one."""
+    key, start = await _card_only_source(db, env)
+    slid = unique("SYN")
+    facts = vehicle(slid).model_copy(update={"source_key": key})
+    observation = card(slid).model_copy(update={"card_listing": facts})
+    first = await ingest(db, env, await start(), page(key, [observation]))
+    [ref] = first.detail_jobs
+    seed.conn.execute(
+        "update ops.jobs set state = 'cancelled', completed_at = now() where id = %s", (ref.job_id,)
+    )
+    again = await ingest(db, env, await start(), page(key, [observation], fetched_at=later(5)))
+    assert again.unchanged_listings == 1 and len(again.detail_jobs) == 1
+    assert again.detail_jobs[0].reason == listings_repo.CARD_FACTS_CHANGED
+    # A card without facts (a fetch-mode source) is unaffected: still no job for an unchanged card.
+    run = await start_run(db, env)
+    fetch_slid = unique("SYN")
+    await ingest(db, env, run, page(env.source_key, [card(fetch_slid)]))
+    unchanged = await ingest(
+        db, env, await start_run(db, env), page(env.source_key, [card(fetch_slid)], fetched_at=later(5))
+    )
+    assert (unchanged.unchanged_listings, unchanged.detail_jobs) == (1, ())
+
+
+async def test_card_facts_survive_a_claim_between_the_waiting_job_read_and_its_patch(
+    db: Database, env: Env, seed: Seed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a worker claimed the waiting card_only job after it was read but before the newer
+    card facts were patched in; the patch matched no row, the newer card counted as deduplicated
+    and the claimed job ingested the older facts, for good."""
+    key, start = await _card_only_source(db, env)
+    slid = unique("SYN")
+    old_facts = vehicle(slid, price_minor=299000).model_copy(update={"source_key": key})
+    first = await ingest(
+        db,
+        env,
+        await start(),
+        page(key, [card(slid, price_minor=299000).model_copy(update={"card_listing": old_facts})]),
+    )
+    [waiting] = first.detail_jobs
+    original = database.fetch_one  # what listings_repo calls
+    claimed: list[Any] = []
+
+    async def racing_fetch_one(conn: Any, query: Any, params: Any = None) -> Any:
+        row = await original(conn, query, params)
+        if query is listings_repo._WAITING_DETAIL_SQL and row is not None and not claimed:
+            # A detail worker claims the job on its own connection right now.
+            claimed.append(
+                await jobs.claim(db, env.workspace_id, "racing-worker", [JobType.DETAIL], lease_seconds=120)
+            )
+        return row
+
+    monkeypatch.setattr(listings_repo, "fetch_one", racing_fetch_one)
+    new_facts = vehicle(slid, price_minor=250000).model_copy(update={"source_key": key})
+    newer = card(slid, price_minor=250000).model_copy(update={"card_listing": new_facts})
+    second = await ingest(db, env, await start(), page(key, [newer], fetched_at=later(5)))
+    monkeypatch.setattr(listings_repo, "fetch_one", original)
+
+    assert claimed and claimed[0] is not None and claimed[0].id == waiting.job_id
+    assert second.detail_jobs_deduplicated == 0 and len(second.detail_jobs) == 1
+    [ref] = second.detail_jobs
+    assert ref.job_id != waiting.job_id and ref.generation > waiting.generation
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (ref.job_id,))
+    assert payload["card_listing"]["price"]["amount_minor"] == 250000
+    # The claimed job keeps the facts it was claimed with (the newer generation wins later).
+    assert claimed[0].payload["card_listing"]["price"]["amount_minor"] == 299000
 
 
 async def test_page_validation(db: Database, env: Env) -> None:

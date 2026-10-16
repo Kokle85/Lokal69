@@ -7,6 +7,9 @@ slots and due times):
    own workspace-scoped transactions.
 2. A schedule row exists for every enabled acquisition source x enabled search profile (partition
    ``default``; coverage mode from the adapter's capabilities). Creating one never schedules a job.
+   Its interval is ``SCHEDULER_INTERVAL_SECONDS``, stretched for a source whose search pages per
+   run would not fit its daily request budget at that cadence
+   (`domain.sources.discovery_interval_seconds`; a row keeps the interval it was created with).
 3. For each due schedule, ONE short transaction runs `sources_repo.advance_schedule`: lock the
    schedule, re-check the source (enabled, activation gate, not paused, not access-blocked or
    parser-unhealthy, terms decision), the profile, backlog, backoff and today's request budget,
@@ -40,6 +43,7 @@ from suv_deals.adapters.registry import build_adapter, registry_problems
 from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import CoverageMode, SourceMode
+from suv_deals.domain.sources import discovery_interval_seconds
 from suv_deals.errors import AppError, DependencyUnavailable, NotFound
 from suv_deals.observability.logging import log_context
 from suv_deals.observability.metrics import AppMetrics
@@ -141,6 +145,9 @@ async def ensure_schedules(
             mode = _coverage_mode(source)
             if mode is None:
                 continue
+            interval = discovery_interval_seconds(
+                source.source_config(), interval_seconds, profiles=len(profiles)
+            )
             for profile in profiles:
                 await sources_repo.ensure_schedule(
                     conn,
@@ -149,7 +156,7 @@ async def ensure_schedules(
                     profile.id,
                     DEFAULT_PARTITION,
                     coverage_mode=mode,
-                    interval_seconds=interval_seconds,
+                    interval_seconds=interval,
                 )
                 ensured += 1
     return ensured

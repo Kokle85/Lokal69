@@ -30,6 +30,11 @@ allowed_search_paths:
 allowed_detail_paths:
   # '+' occurs in real listing slugs (2026-10-16 captures); the URL must still end in the listing UUID.
   - '^/annunci/[A-Za-z0-9][A-Za-z0-9._~%+-]{0,300}/?$'
+# Cadence (domain.sources.discovery_interval_seconds): 12 pages per run would need 12 x 96 = 1152
+# requests a day at the global 15-minute schedule, so the scheduler runs this source every 3 hours
+# instead: 8 runs x 12 pages = 96 search requests, leaving 104 of the 200 daily requests for the
+# detail pages the runs queue (a first run may queue more than that; the rest wait for the next
+# UTC day's budget).
 rate_budget:
   min_delay_seconds: 20            # per-host spacing (shared rate limiter)
   max_search_pages_per_run: 12     # one search page for each of the 12 configured models

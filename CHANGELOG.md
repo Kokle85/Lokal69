@@ -34,8 +34,9 @@ Owner decisions of 2026-10-16 („не треба да бидат строги �
   supported economics counts only well-matched candidates.
 
 AutoScout24 Italy and Germany adapter (2026-10-16), built from owner-captured pages (structure
-only; no captured page is committed). Both sources stay `enabled: false` and `untested` until the
-owner's live smoke run.
+only; no captured page is committed). Both sources stay `enabled: false` and `untested`: next
+come saved spec-31 fixtures (register step 5, then `fixture_tested`; `crawl once` refuses an
+`untested` or disabled source), then the owner's live smoke and enabling (steps 6-7).
 
 - **`adapters/autoscout24.py` (`autoscout24@1.0.0`).** One adapter for `autoscout24_public_it` and
   `autoscout24_public_de`. Search pages are read from `__NEXT_DATA__` `props.pageProps.listings`
@@ -49,33 +50,51 @@ owner's live smoke run.
   (drive, kW, cm3, first registration, production year, fuel incl. plug-in flag, gearbox, km,
   body) with the JSON-LD Car as fallback and cross-check (disagreements are field conflicts; a
   JSON-LD Car naming another listing is refused). Net-price seller wording ("al netto dell'IVA",
-  "zzgl. MwSt.") sets `price.basis = net` without storing the description, so screening treats
-  the amount as a lower bound and the listing becomes `needs_facts`; commercial (N1, "AUTOCARRO")
-  registrations are flagged. A conditional price ("Prezzo con condizioni", `isConditionalPrice`)
+  "escluso IVA", "IVA 22% esclusa", "IVA non inclusa", "senza IVA", "prezzo netto", "zzgl."/"exkl."/
+  "ohne MwSt.") sets `price.basis = net` without storing the description, so screening treats
+  the amount as a lower bound and the listing becomes `needs_facts` (the site's "IVA deducibile"
+  flag on a final price stays VAT shown, gross); commercial (N1, "AUTOCARRO") registrations are
+  flagged. A conditional price ("Prezzo con condizioni", `isConditionalPrice`)
   is never a full asking price, on cards and on detail pages alike (`PRICE_CONDITIONAL`, type
-  `unknown`); `prices.isFinalPrice: false` warns `PRICE_NOT_FINAL`. Germany stays `card_only`:
-  its detail URLs are identity only and `fetch_detail`/`parse_detail` refuse without any request.
+  `unknown`); `prices.isFinalPrice: false` warns `PRICE_NOT_FINAL`. The Euro class the listing
+  states (`environmentEuDirective`, never a model-data fallback) fills
+  `documentation.emissions_class`, so the MK import gate can check the Euro minimum. Germany stays
+  `card_only`: its detail URLs are identity only and `fetch_detail`/`parse_detail` refuse without
+  any request.
 - **Card-sourced revisions for `card_only` sources.** `SearchObservation.card_listing` carries a
   card_only card's own facts (make/model, first registration, km, price, fuel, gearbox, kW, cm3,
   seller type, country; `FACTS_FROM_SEARCH_CARD`). `listings_repo.ingest_search_page` puts them
   in the payload of the new/changed-card detail job (a waiting job takes over newer facts) and
   `crawling.detail` ingests them through `ingest_detail` WITHOUT any request, so German listings
   get revisions and are screened (no drive or body type on cards: those stay unknown). Jobs
-  without card facts still complete as `card_only_source` skips.
+  without card facts still complete as `card_only_source` skips. An unchanged card whose facts
+  differ from the listing's current revision (facts outside the card hash such as damage or first
+  registration, a parser fix, or a revision never promoted) queues a `card_facts_changed` job; a
+  waiting job that a worker claims before the newer facts are patched in no longer swallows them
+  (a new job is queued).
 - **Per-model searches.** `search.models` lists the owner's twelve models (Captur, Qashqai, Juke,
   Sportage, Mokka, Mokka X, Duster, 2008, ix35, Antara, Yeti, SX4 S-Cross); one discovery run walks
-  them with an opaque `model:<n>` cursor through the existing traversal (no scheduler change), one
-  page per model, newest first (`sort=age&desc=1`) with the profile's price band and km ceiling
+  them with an opaque `model:<n>` cursor through the existing traversal, one page per model,
+  newest first (`sort=age&desc=1`) with the profile's price band and km ceiling
   (`pricefrom`/`priceto`/`kmto`) and `ustate=U` on Italy. `max_search_pages_per_run: 12`, 20 s
   spacing. A model slug answering a genuine 404 is skipped (counted in the cursor, `:nf<k>`); a
   policy refusal is never a skipped model; a 404 of the captured `renault/captur` route or of
   every model, and a page whose listings have no Organic/Main card while results are reported,
   are drift (`unexpected_content`). Any incomplete model page makes the run partial, so absence
   marking only follows a complete walk. Unverified slugs are named in the config notes.
+  The scheduler sizes a source's cadence to its daily request budget
+  (`domain.sources.discovery_interval_seconds`): a source whose search pages per run (times its
+  enabled profiles) do not fit at `SCHEDULER_INTERVAL_SECONDS` runs less often instead of
+  exhausting the budget in the first hours of each UTC day (Germany every 90 minutes, 192 of 200
+  requests; Italy every 3 hours, half of the budget left for detail pages); with the one enabled
+  profile every other shipped source keeps the global interval. New schedule rows only: an
+  existing row keeps the interval it was created with.
 - **Fix: capture redaction broke JSON escapes.** `sample_capture.redact_html` swallowed the letters
   of a `\u003e`/`\n` escape before an e-mail address, leaving `\[redacted-email]` (invalid JSON
   in saved pages); escapes are now matched as whole tokens and kept intact, in linear time (long
-  escape runs such as escaped CJK text no longer rescan quadratically).
+  escape runs such as escaped CJK text no longer rescan quadratically). International phone
+  numbers right after an escape (`\u003cbr\u003e+39 ...`, `\n+39 ...`) are masked too, and a
+  `tel:` value no longer takes the backslash of an escaped closing quote (`href=\"tel:...\"`).
 - **Fix: the schema.org reader missed `Product.offers.itemOffered`.** `_extract` now yields the
   offered Car with its Offer (only from a non-vehicle node: a Car naming itself again as its
   offered item stays one vehicle), so the generic dealer adapter reads model, km, fuel, gearbox,

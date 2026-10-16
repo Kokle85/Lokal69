@@ -114,6 +114,21 @@ def test_source_register_live_smoke_is_the_gated_crawl_once_procedure() -> None:
     assert "insufficient_comparables" in register  # F2: no MK evidence -> no valuation
 
 
+def test_untested_sources_name_the_fixture_step_before_the_live_smoke() -> None:
+    """Regression: the AutoScout24 rows named the live smoke as the next step, but ``crawl once``
+    refuses an ``untested`` source until the step-5 fixture set made it ``fixture_tested``."""
+    register = _text("docs/source_access_register.md").splitlines()
+    gates = _text("ACTIVATION_GATES.md").splitlines()
+    rows = [
+        next(line for line in register if line.startswith(f"| `{key}` |"))
+        for key in ("autoscout24_de", "autoscout24_it")
+    ]
+    rows.append(next(line for line in gates if line.startswith("| `autoscout24_de`, `autoscout24_it` |")))
+    for row in rows:
+        assert "untested" in row and "step 5" in row
+        assert row.index("fixture_tested") < row.index("live smoke")
+
+
 @pytest.mark.parametrize("relative", ["docs/seller_email_activation.md", "docs/runbook.md"])
 def test_vehicle_documents_are_a_documented_manual_step(relative: str) -> None:
     text = _text(relative)

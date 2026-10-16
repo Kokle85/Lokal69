@@ -385,6 +385,32 @@ def test_redaction_keeps_a_json_escape_before_an_address_intact(escape: bytes) -
     assert parsed["description"].endswith("[redacted-email]</p>")
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [b"\\u003cbr\\u003e", b"Contatti\\n", b"Contatti\\t", b"Contatti\\u003e", b"Contatti \\\\"],
+)
+def test_redaction_masks_a_phone_number_right_after_a_json_escape(prefix: bytes) -> None:
+    """Regression: the phone pattern's word-boundary lookbehind saw the escape's last letter
+    (``e`` of ``\\u003e``, ``n`` of ``\\n``) and left the number in clear in embedded JSON."""
+    document = b'{"description":"Synthetic text' + prefix + b'+39 333 1234567"}'
+    masked = redact_html(document)
+    assert b"1234567" not in masked
+    assert masked == b'{"description":"Synthetic text' + prefix + b'[redacted-phone]"}'
+    json.loads(masked)  # still valid JSON
+
+
+@pytest.mark.parametrize(
+    "number", [b"+39 333 1234567", b"+393331234567", b"0212345678", b"\\u002b393331234567"]
+)
+def test_redaction_of_a_tel_link_inside_json_keeps_the_escaped_quote(number: bytes) -> None:
+    """Regression: the ``tel:`` value took the backslash of the escaped closing quote
+    (``href=\\"tel:...\\"``), which ended the JSON string early (the saved page no longer parsed)."""
+    document = b'{"d":"\\u003ca href=\\"tel:' + number + b'\\"\\u003ex\\u003c/a\\u003e"}'
+    masked = redact_html(document)
+    assert b"1234567" not in masked and b"393331234567" not in masked
+    assert json.loads(masked)["d"] == '<a href="tel:[redacted]">x</a>'
+
+
 def test_redaction_keeps_an_escaped_backslash_and_the_escape_after_it() -> None:
     """``\\\\`` then ``\\u003e`` before an address: both escapes stay whole (still valid JSON)."""
     document = b'{"t":"a\\\\\\u003eprivacy@sample-dealer.example.it"}'

@@ -45,7 +45,8 @@ def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli) -> None:
     assert result.exit_code == 3
     assert "refused: source autoscout24_de is not active" in result.output
     # The owner recorded a terms decision on 2026-10-10 (proceed_acknowledged) and the adapter exists
-    # (2026-10-16); the source stays disabled and gated until the owner's live smoke run.
+    # (2026-10-16); the source stays disabled and gated until saved fixtures (fixture_tested),
+    # the owner's live smoke run and enabling (register steps 5-7).
     assert "adapter has not passed fixture tests" in result.output
     assert "source is disabled in configuration" in result.output
 

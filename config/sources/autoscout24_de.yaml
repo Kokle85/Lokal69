@@ -29,6 +29,10 @@ allowed_hosts:
 allowed_search_paths:
   - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
 allowed_detail_paths: []   # card_only: /angebote/ URLs are identity only, never fetched
+# Cadence (domain.sources.discovery_interval_seconds): 12 pages per run would need 12 x 96 = 1152
+# requests a day at the global 15-minute schedule, so the scheduler runs this source every 90
+# minutes instead: 16 runs x 12 pages = 192 of the 200 daily requests (card_only: no detail
+# fetches), spread over the whole UTC day.
 rate_budget:
   min_delay_seconds: 20            # per-host spacing (shared rate limiter)
   max_search_pages_per_run: 12     # one search page for each of the 12 configured models

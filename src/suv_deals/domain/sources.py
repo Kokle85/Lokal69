@@ -7,8 +7,9 @@ owner acknowledgement audits a decision; it is not legal permission.
 from __future__ import annotations
 
 from datetime import datetime
+from math import ceil
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -112,6 +113,35 @@ def activation_problems(cfg: SourceConfig) -> list[str]:
     if not cfg.allowed_detail_paths and cfg.detail_mode == "fetch":
         problems.append("no allowed detail paths")
     return problems
+
+
+SECONDS_PER_DAY: Final = 86_400
+
+
+def discovery_interval_seconds(cfg: SourceConfig, base_seconds: int, *, profiles: int = 1) -> int:
+    """Seconds between the scheduled discovery runs of each of a source's ``profiles`` schedules.
+
+    The global scheduler interval (``base_seconds``), unless a day of full runs at that cadence
+    (``max_search_pages_per_run`` pages per run and schedule) would need more search requests than
+    the source's ``daily_request_budget``. Such a source is slowed down instead of running into the
+    budget every morning and leaving the rest of the day unscanned: its search pages may use the
+    whole budget when it is ``card_only`` (it makes no other requests) and half of it otherwise
+    (the other half is left for the detail pages its runs queue). The result is a whole number of
+    scheduler intervals and at most one run a day.
+    """
+    base = max(base_seconds, 60)
+    budget = cfg.rate_budget
+    pages = budget.max_search_pages_per_run * max(profiles, 1)
+    if (
+        budget.daily_request_budget <= 0
+        or pages * ceil(SECONDS_PER_DAY / base) <= budget.daily_request_budget
+    ):
+        return base
+    share = (
+        budget.daily_request_budget if cfg.detail_mode == "card_only" else budget.daily_request_budget // 2
+    )
+    runs = max(share // pages, 1)
+    return min(ceil(ceil(SECONDS_PER_DAY / runs) / base) * base, SECONDS_PER_DAY)
 
 
 def load_source_configs(sources_dir: Path) -> list[SourceConfig]:

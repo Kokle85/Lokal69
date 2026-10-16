@@ -266,7 +266,8 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   yet.
 - **Which sources are truly working?** None live. The generic dealer adapter is `fixture_verified`
   on synthetic pages; the AutoScout24 IT/DE adapter is built from owner captures (2026-10-16) and
-  tested on synthetic pages, but both sources stay disabled and untested until a live smoke run;
+  tested on synthetic pages, but both sources stay disabled and untested until saved fixtures
+  (register step 5), a live smoke run and enabling;
   10 of 14 registered sources have no adapter; mobile.de is included by owner decision
   (2026-10-10) but stays disabled until its adapter is built from real page captures.
 - **When was each last checked?** No source has ever been checked live. The source register

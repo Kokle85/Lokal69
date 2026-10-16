@@ -160,7 +160,8 @@ Each step only needs the steps above it; any step can stop without affecting the
   on synthetic pages, and the AutoScout24 adapter (`autoscout24@1.0.0`, used by `autoscout24_it`
   and `autoscout24_de`), built from owner-captured pages and tested on synthetic pages with that
   structure but never run live (`technical_status: untested`, disabled; `doctor` lists them as
-  "not active" until their live smoke run). The other 10 sources have no adapter
+  "not active" until steps 5-7 below: saved fixtures, live smoke, enabling). The other 10
+  sources have no adapter
   (`adapter_version: unimplemented`; `sources inspect` and `doctor` say "not activatable (no
   adapter)"), so configuration alone can never activate them.
 - **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
@@ -221,7 +222,7 @@ Each step only needs the steps above it; any step can stop without affecting the
 |---|---|---|---|
 | `example_dealer_template_de`, `example_dealer_template_ch` | `schemaorg_dealer@1.1.0` (fixture_verified) | none (templates) | a real permitted dealer: copy, steps 1-7 |
 | `mobile_de_public`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; CH terms not identified |
-| `autoscout24_de`, `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures), untested live | proceed_acknowledged (owner, 2026-10-10) | disabled until the owner's live smoke run; per-model searches (12 models, one page each per run); `autoscout24_de` card_only (robots) |
+| `autoscout24_de`, `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures), untested live | proceed_acknowledged (owner, 2026-10-10) | `untested`: step 5 first (saved spec-31 fixtures with `MANIFEST.yaml`, then `fixture_tested`; `crawl once` refuses an `untested` or disabled source), then steps 6-7 (live smoke, enable); per-model searches (12 models, one page each per run, every 90 min DE / 3 h IT to fit the 200-request daily budget); `autoscout24_de` card_only (robots) |
 | `subito_it`, `automobile_it`, `carforyou_ch`, `tutti_ch`, `comparis_ch` | placeholder | pending | domain, terms, routes unverified; an adapter |
 | `pazar3_mk`, `reklama5_mk` (MK comparables) | placeholder | pending | terms and an adapter; until then MK evidence comes from `suv-deals market import` |
 | `mobile_de_api` | skeleton (raises until entitlement) | pending | gate 5 |

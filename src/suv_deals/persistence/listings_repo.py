@@ -16,8 +16,10 @@ Search pages (`ingest_search_page`)
     get a detail FETCH: when their adapter supplies the card's own facts
     (``SearchObservation.card_listing``) the job carries them in its payload (``card_listing``) and
     the detail handler ingests them as a card-sourced revision without any request; a job already
-    waiting takes over the newer card facts instead of a second job. Without card facts no job is
-    queued.
+    waiting takes over the newer card facts instead of a second job (a new job when a worker
+    claimed it meanwhile). An unchanged card queues a ``card_facts_changed`` job when its facts'
+    semantic hash differs from the listing's current revision (or no revision was promoted), since
+    the card hash does not cover every card fact. Without card facts no job is queued.
 
 Detail pages (`ingest_detail`, one transaction after the network fetch)
     Locks ``ops.jobs`` (lease revalidated), then ``app.sources`` (share), then ``app.listings``,
@@ -596,24 +598,28 @@ async def _enqueue_detail(
 
     ``card_listing`` (card_only sources): the card's facts as JSON for a no-fetch ingestion. A job
     that is already waiting is deduplicated as usual but takes over the newer card facts, so the
-    latest card is what gets ingested.
+    latest card is what gets ingested. The waiting-job read takes no lock, so a worker may claim
+    that job in between: when the patch then matches no waiting row, the claimed job runs with
+    the older facts and a new job is queued for the newer card instead of a silent deduplication.
     """
     waiting = await fetch_one(
         conn, _WAITING_DETAIL_SQL, {"workspace_id": actor.workspace_id, "listing_id": listing.id}
     )
     if waiting is not None:
-        if card_listing is not None:
-            await conn.execute(
-                "update ops.jobs set payload = payload || %(patch)s"
-                " where workspace_id = %(workspace_id)s and id = %(id)s"
-                " and state in ('queued', 'retry_wait')",
-                {
-                    "workspace_id": actor.workspace_id,
-                    "id": waiting["id"],
-                    "patch": Jsonb({"card_listing": card_listing}),
-                },
-            )
-        return None
+        if card_listing is None:
+            return None
+        patched = await conn.execute(
+            "update ops.jobs set payload = payload || %(patch)s"
+            " where workspace_id = %(workspace_id)s and id = %(id)s"
+            " and state in ('queued', 'retry_wait')",
+            {
+                "workspace_id": actor.workspace_id,
+                "id": waiting["id"],
+                "patch": Jsonb({"card_listing": card_listing}),
+            },
+        )
+        if patched.rowcount:
+            return None
     generation = await _allocate(conn, actor.workspace_id, listing.id)
     payload: dict[str, Any] = {
         "listing_id": str(listing.id),
@@ -1019,6 +1025,12 @@ async def ingest_search_page(
                 card_facts, problem = _card_facts(source, card)
                 if problem is not None:
                     warnings.append(problem)
+                if reason is None and card_facts is not None:
+                    # The card is the only source of a card_only listing's facts, and the card hash
+                    # covers only title, price, km and URL: facts outside it (damage, registration,
+                    # fuel, ...), a parser fix or a revision that was never promoted are refreshed
+                    # when they differ from the current revision.
+                    reason = await _card_facts_reason(conn, ws, listing, card_facts)
             if reason is not None and (source.detail_mode == "fetch" or card_facts is not None):
                 ref = await _enqueue_detail(
                     conn,
@@ -1077,6 +1089,32 @@ async def ingest_search_page(
 
 #: Card facts larger than this never ride in a job payload (the job payload cap is 64 KiB).
 _MAX_CARD_FACTS_BYTES: Final = 48 * 1024
+#: Detail-job reason of a card_only listing whose unchanged card shows facts that differ from its
+#: current revision.
+CARD_FACTS_CHANGED: Final = "card_facts_changed"
+
+
+async def _card_facts_reason(
+    conn: Conn, workspace_id: UUID, listing: ListingRecord, card_facts: dict[str, Any]
+) -> str | None:
+    """``card_facts_changed`` when an unchanged card's facts are not the listing's current revision.
+
+    The facts are compared by the same semantic hash the no-fetch ingestion stores (timing,
+    provenance and wording excluded), so an identical card queues nothing.
+    """
+    try:
+        semantic = NormalizedListing.model_validate(card_facts).semantic_hash()
+    except ValidationError:
+        return None  # the job would dead-letter them as card_facts_invalid
+    if listing.current_revision_id is None:
+        return CARD_FACTS_CHANGED
+    row = await fetch_one(
+        conn,
+        "select semantic_hash from app.listing_revisions where workspace_id = %(workspace_id)s"
+        " and listing_id = %(listing_id)s and id = %(id)s",
+        {"workspace_id": workspace_id, "listing_id": listing.id, "id": listing.current_revision_id},
+    )
+    return None if row is not None and row["semantic_hash"] == semantic else CARD_FACTS_CHANGED
 
 
 def _card_facts(source: SourceRecord, card: _Card) -> tuple[dict[str, Any] | None, str | None]:
