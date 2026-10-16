@@ -23,6 +23,12 @@ owner's own estimates; ADR 0004).
   `..._to_verify.json` (four models, not to be imported until confirmed).
 - Tests: owner-estimate selection and proceeds, canonical names, the estimate files, and a pipeline
   test on PostgreSQL (fallback used without MK ads; MK asking prices win).
+- **`scripts/readiness_check.sh` (owner-run).** One run reports tools, `doctor`, the crawler
+  container, the firewall check and a reachability probe of Reklama5, Pazar3, AutoScout24 IT/DE/CH,
+  CarForYou and Tutti, directly and through Crawl4AI (`capture-samples --via crawl4ai`: headless,
+  honest User-Agent, no stealth). Report: `captures/readiness/<UTC>/report.txt`.
+- **Home-page probe paths.** Reklama5, Pazar3, AutoScout24 CH, CarForYou and Tutti now list their
+  host and `^/$` only, for that probe; they stay disabled with no detail path.
 
 Owner re-confirmation of 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат") and a
 robots.txt re-check of the same day. Nothing is enabled, fetched or activated.

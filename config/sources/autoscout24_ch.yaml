@@ -25,8 +25,12 @@ source_timezone: Europe/Zurich
 robots_checked_at: 2026-10-14T00:00:00Z
 robots_summary: >-
   robots.txt re-checked 2026-10-14, unchanged since 2026-10-06 (fact, not permission; sha256 ac07ed51...): no 'User-agent: *' group (only Googlebot and grapeshot groups), so it sets no rules for our user agent (RFC 9309 2.2.1); robots silence is never permission. The Swiss site's search/detail routes have not been verified, so hosts and paths stay empty.
-allowed_hosts: []
-allowed_search_paths: []
+# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
+# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+allowed_hosts:
+  - 'www.autoscout24.ch'
+allowed_search_paths:
+  - '^/$'
 allowed_detail_paths: []
 search: {}
 notes: >-

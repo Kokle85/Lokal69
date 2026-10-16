@@ -331,6 +331,7 @@ def test_dockerfile_and_dockerignore() -> None:
         "migrate.sh",
         "rollback.sh",
         "crawler_firewall.sh",
+        "readiness_check.sh",
     ],
 )
 def test_shell_scripts_parse(script: str) -> None:
@@ -340,7 +341,8 @@ def test_shell_scripts_parse(script: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "script", ["backup.sh", "restore_check.sh", "verify_release.sh", "crawler_firewall.sh"]
+    "script",
+    ["backup.sh", "restore_check.sh", "verify_release.sh", "crawler_firewall.sh", "readiness_check.sh"],
 )
 def test_scripts_have_help(script: str) -> None:
     result = subprocess.run(
@@ -593,3 +595,25 @@ def test_backup_and_isolated_restore_round_trip(source_database: str, tmp_path: 
     assert tampered.returncode == 1
     assert "FAIL  dump_sha256" in tampered.stdout
     assert _restore_databases() == before
+
+
+def test_readiness_check_masks_secret_shaped_output() -> None:
+    text = (SCRIPTS / "readiness_check.sh").read_text(encoding="utf-8")
+    start = text.index("scrub() {")
+    body = text[start : text.index("\n}\n", start) + 3]
+    sample = (
+        "postgresql://suv:pw123@db.example.supabase.co:5432/postgres Bearer abcdefghijkl12345 "
+        "CRAWL4AI_API_TOKEN=abc123 suvmcp_ABCDEFGH1234 eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4"
+    )
+    result = subprocess.run(
+        ["bash", "-c", body + "\nscrub"], input=sample, capture_output=True, text=True, check=True
+    )
+    for secret in ("pw123", "abcdefghijkl12345", "abc123", "ABCDEFGH1234", "SflKxwRJSMeKKF2QT4"):
+        assert secret not in result.stdout
+
+
+def test_readiness_check_probes_only_through_capture_samples() -> None:
+    text = (SCRIPTS / "readiness_check.sh").read_text(encoding="utf-8")
+    assert "curl" not in text.replace('curl -sS -m 10 "$crawler_url/health"', "")  # no direct site fetch
+    assert text.count("capture-samples") >= 2 and "--via crawl4ai" in text
+    assert "enable_stealth" not in text and "proxy" not in text.lower()

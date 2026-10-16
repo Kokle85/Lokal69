@@ -9,6 +9,11 @@ Run it on the owner's own machine, one source and one search path at a time::
 rails are described in `suv_deals.crawling.sample_capture`. No database is used, no source flag or
 gate changes, and nothing is published. Report the printed counts and statuses; the saved pages
 stay on this machine (``<repo>/captures``, git-ignored).
+
+``--via crawl4ai`` loads the pages through the self-hosted Crawl4AI browser instead (headless,
+honest User-Agent, no stealth; robots.txt is still read directly). It answers whether a page that
+needs JavaScript, or a site that refuses plain HTTP clients, works through the crawler the worker
+uses. Host processes reach the crawler at ``CRAWL4AI_BASE_URL=http://127.0.0.1:11235``.
 """
 
 # ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
@@ -16,6 +21,7 @@ stay on this machine (``<repo>/captures``, git-ignored).
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -84,6 +90,13 @@ _EXIT_FOR_STOP: Final[Mapping[str | None, int]] = {
     default=None,
     help="Output root (default: <repo>/captures, git-ignored).",
 )
+@click.option(
+    "--via",
+    type=click.Choice(["httpx", "crawl4ai"]),
+    default="httpx",
+    show_default=True,
+    help="Plain HTTPS client, or the self-hosted Crawl4AI browser (no stealth) for the pages.",
+)
 @click.option("--yes", is_flag=True, help="Confirm the requests to the source and the files written.")
 @pass_cli
 def capture_samples_command(
@@ -94,6 +107,7 @@ def capture_samples_command(
     query: str | None,
     detail_limit: int,
     out_dir: Path | None,
+    via: str,
     yes: bool,
 ) -> None:
     """Save a few reviewed pages of one source to this machine for parser work (owner-run)."""
@@ -109,7 +123,12 @@ def capture_samples_command(
         import anyio
 
         from suv_deals.clock import SystemClock
-        from suv_deals.crawling.sample_capture import CaptureRefused, capture_samples, httpx_page_fetcher
+        from suv_deals.crawling.sample_capture import (
+            CaptureRefused,
+            capture_samples,
+            crawl4ai_page_fetcher,
+            httpx_page_fetcher,
+        )
         from suv_deals.domain.enums import TermsDecision
         from suv_deals.domain.sources import load_source_configs
         from suv_deals.settings import REPO_ROOT
@@ -128,8 +147,26 @@ def capture_samples_command(
                 "must be recorded in config first"
             )
         root = out_dir if out_dir is not None else REPO_ROOT / "captures"
+        if via == "crawl4ai":
+            root = root / "via-crawl4ai"
         try:
-            async with httpx_page_fetcher() as fetcher:
+            async with AsyncExitStack() as stack:
+                fetcher = await stack.enter_async_context(httpx_page_fetcher())
+                if via == "crawl4ai":
+                    from suv_deals.adapters.crawl4ai_client import Crawl4AIClient
+
+                    client = await stack.enter_async_context(Crawl4AIClient.from_settings(settings))
+                    health = await client.health()
+                    if not health.ok:
+                        fail(
+                            "the Crawl4AI crawler is not healthy at the configured CRAWL4AI_BASE_URL "
+                            "(start it: docker compose up -d crawl4ai; host processes use "
+                            "http://127.0.0.1:11235); nothing was requested from the source",
+                            EXIT_UNAVAILABLE,
+                        )
+                    fetcher = await stack.enter_async_context(
+                        crawl4ai_page_fetcher(client, source_key=cfg.source_key, robots_fetcher=fetcher)
+                    )
                 outcome = await capture_samples(
                     cfg,
                     search_path=search_path,
@@ -142,7 +179,7 @@ def capture_samples_command(
                 )
         except CaptureRefused as exc:
             fail(str(exc), EXIT_PROBLEMS)
-        _print_outcome(outcome)
+        _print_outcome(outcome, via=via)
         return _EXIT_FOR_STOP.get(outcome.stop_kind, EXIT_PROBLEMS)
 
     run_async(body)
@@ -156,8 +193,8 @@ def _status(status: int | None) -> str:
     return "no response" if status is None else f"HTTP {status}"
 
 
-def _print_outcome(result: CaptureOutcome) -> None:
-    echo(f"capture-samples: {result.source_key} ({result.host})")
+def _print_outcome(result: CaptureOutcome, *, via: str = "httpx") -> None:
+    echo(f"capture-samples: {result.source_key} ({result.host}) via {via}")
     echo(
         f"  robots.txt : {_status(result.robots_status)}, {result.robots_availability}, "
         f"sha256 {(result.robots_sha256 or '-')[:12]}"

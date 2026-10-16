@@ -14,16 +14,20 @@ from typing import Any
 
 import pytest
 
+from suv_deals.adapters.base import FetchOutcome, RawDocument
+from suv_deals.adapters.crawl4ai_client import CrawlFetchResult
 from suv_deals.crawling.robots import RobotsFetchResponse
 from suv_deals.crawling.sample_capture import (
     CaptureOutcome,
     CaptureRefused,
     capture_samples,
     challenge_reason,
+    crawl4ai_page_fetcher,
     offer_stats,
     outline_html,
     redact_html,
 )
+from suv_deals.domain.enums import AccessState
 from suv_deals.domain.sources import SourceConfig
 
 HOST = "www.sample-market.it"
@@ -512,3 +516,101 @@ async def test_refused_detail_links_are_described_without_their_slug(tmp_path: P
         "/annunci/ 2 segment(s) path_not_allowed [digit,dot,hyphen,lower,upper] trailing-slash": 1
     }
     assert "Sample.Car" not in json.dumps(outcome.detail_misses)
+
+
+# ---------------------------------------------------------------------------------------------
+# --via crawl4ai: pages through the crawler's browser, robots.txt still fetched directly
+# ---------------------------------------------------------------------------------------------
+
+
+class FakeCrawler:
+    """Stands in for `Crawl4AIClient.fetch_detailed`; answers by URL, records every request."""
+
+    def __init__(self, pages: dict[str, tuple[int | None, bytes, str | None, bool]]) -> None:
+        self.pages = pages  # url -> (status, html, final_url, infrastructure_failure)
+        self.requests: list[str] = []
+
+    async def fetch_detailed(self, url: str, *, purpose: str, source_key: str) -> CrawlFetchResult:
+        self.requests.append(url)
+        status, body, final, infra = self.pages.get(url, (404, b"not found", None, False))
+        outcome = FetchOutcome(
+            requested_url=url,
+            fetched_at=datetime(2026, 10, 16, 9, 0, tzinfo=UTC),
+            final_url=final,
+            http_status=status,
+            success=status is not None and 200 <= status < 300,
+            access_state=AccessState.OK if status == 200 else AccessState.TRANSIENT_ERROR,
+            error_code="crawler_unreachable" if infra else None,
+            infrastructure_failure=infra,
+        )
+        document = RawDocument(
+            url=url,
+            final_url=final,
+            fetched_at=datetime(2026, 10, 16, 9, 0, tzinfo=UTC),
+            html=body.decode("utf-8") if status is not None else None,
+            fetch=outcome,
+        )
+        return CrawlFetchResult(document=document)
+
+
+async def _run_via_crawler(
+    crawler: FakeCrawler, robots_site: FakeSite, tmp_path: Path, *, detail_limit: int = 1
+) -> CaptureOutcome:
+    async def sleep(seconds: float) -> None:
+        return None
+
+    async with crawl4ai_page_fetcher(
+        crawler,  # type: ignore[arg-type]  # duck-typed fake of Crawl4AIClient
+        source_key="sample_market_it",
+        robots_fetcher=robots_site,
+    ) as fetcher:
+        return await capture_samples(
+            sample_source(),
+            search_path="/lst/toyota/rav-4",
+            detail_limit=detail_limit,
+            out_root=tmp_path,
+            fetcher=fetcher,
+            clock=FrozenClock(),
+            sleep=sleep,
+            resolver=_resolver,
+        )
+
+
+async def test_crawler_route_reads_robots_directly_and_pages_through_the_browser(tmp_path: Path) -> None:
+    robots_site = FakeSite({ROBOTS: RobotsFetchResponse(200, ALLOW_ALL, None)})
+    crawler = FakeCrawler(
+        {SEARCH: (200, SEARCH_HTML, SEARCH, False), DETAIL_1: (200, DETAIL_HTML, DETAIL_1, False)}
+    )
+    outcome = await _run_via_crawler(crawler, robots_site, tmp_path)
+    assert robots_site.requests == [ROBOTS]
+    assert crawler.requests == [SEARCH, DETAIL_1]
+    assert outcome.stop_kind is None
+    assert [step.status for step in outcome.steps] == [200, 200]
+
+
+async def test_crawler_route_reports_a_final_url_on_another_host_as_a_refused_redirect(
+    tmp_path: Path,
+) -> None:
+    robots_site = FakeSite({ROBOTS: RobotsFetchResponse(200, ALLOW_ALL, None)})
+    crawler = FakeCrawler({SEARCH: (200, SEARCH_HTML, "https://consent.other.example/wall", False)})
+    outcome = await _run_via_crawler(crawler, robots_site, tmp_path)
+    assert crawler.requests == [SEARCH]
+    assert outcome.steps[0].status == 307
+    assert outcome.stop_kind is not None and outcome.stop_kind.startswith("redirect")
+
+
+async def test_crawler_route_treats_crawler_failure_as_network_error_not_a_block(tmp_path: Path) -> None:
+    robots_site = FakeSite({ROBOTS: RobotsFetchResponse(200, ALLOW_ALL, None)})
+    crawler = FakeCrawler({SEARCH: (None, b"", None, True)})
+    outcome = await _run_via_crawler(crawler, robots_site, tmp_path)
+    assert outcome.stop_kind == "network_error"
+    assert outcome.steps[0].error is not None and outcome.steps[0].error.startswith("crawler:")
+
+
+async def test_crawler_route_detects_a_challenge_page(tmp_path: Path) -> None:
+    robots_site = FakeSite({ROBOTS: RobotsFetchResponse(200, ALLOW_ALL, None)})
+    challenge = b"<html><head><title>Just a moment...</title></head><body>cf-chl</body></html>"
+    crawler = FakeCrawler({SEARCH: (403, challenge, SEARCH, False)})
+    outcome = await _run_via_crawler(crawler, robots_site, tmp_path)
+    assert outcome.stop_kind == "access_blocked"
+    assert crawler.requests == [SEARCH]

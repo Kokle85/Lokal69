@@ -138,7 +138,9 @@ def test_autoscout_ch_is_reviewed_separately() -> None:
     assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
     assert cfg.robots_summary is not None
     assert "User-agent: *" in cfg.robots_summary and "fact, not permission" in cfg.robots_summary
-    assert cfg.allowed_hosts == () and "adapter is unimplemented" in activation_problems(cfg)
+    # Home page only, for the owner-run reachability probe (2026-10-16); no crawl route.
+    assert cfg.allowed_hosts == ("www.autoscout24.ch",) and cfg.allowed_search_paths == ("^/$",)
+    assert cfg.allowed_detail_paths == () and "adapter is unimplemented" in activation_problems(cfg)
 
 
 @pytest.mark.parametrize("key", sorted(CH_MARKETPLACE_CANDIDATES))
@@ -152,7 +154,12 @@ def test_swiss_marketplace_candidates_are_gated_placeholders(key: str) -> None:
         "unimplemented",
     )
     assert cfg.enabled is False and cfg.terms_status == TermsStatus.UNREVIEWED
-    assert cfg.allowed_hosts == () and cfg.search == {}
+    # CarForYou and Tutti: home page only, for the owner-run reachability probe (2026-10-16); no
+    # crawl route. Comparis stays empty (its robots.txt disallows the marketplace endpoints).
+    probed = key != "comparis_ch"
+    assert cfg.allowed_hosts == ((domain,) if probed else ())
+    assert cfg.allowed_search_paths == (("^/$",) if probed else ())
+    assert cfg.allowed_detail_paths == () and cfg.search == {}
     assert cfg.source_timezone == "Europe/Zurich"
     assert cfg.notes is not None and cfg.robots_summary is not None
     # Review attempt of 2026-10-14: the domain is named, what could not be verified says so, and the
@@ -162,7 +169,8 @@ def test_swiss_marketplace_candidates_are_gated_placeholders(key: str) -> None:
     assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
     gate = gate_status(cfg)
     assert not gate.adapter_implemented and not gate.active
-    assert {"adapter is unimplemented", "terms not reviewed", "no allowed hosts"} <= set(gate.problems)
+    assert {"adapter is unimplemented", "terms not reviewed", "no allowed detail paths"} <= set(gate.problems)
+    assert ("no allowed hosts" in gate.problems) is not probed
 
 
 def test_comparis_is_flagged_as_an_aggregator() -> None:

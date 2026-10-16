@@ -49,7 +49,7 @@ from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 import httpx
 
 from suv_deals.adapters.base import FetchPurpose
-from suv_deals.adapters.crawl4ai_client import DEFAULT_USER_AGENT
+from suv_deals.adapters.crawl4ai_client import DEFAULT_USER_AGENT, Crawl4AIClient
 from suv_deals.clock import Clock, ensure_utc
 from suv_deals.crawling.rate_limits import effective_delay_seconds
 from suv_deals.crawling.robots import (
@@ -941,6 +941,41 @@ async def httpx_page_fetcher(
         yield fetch
 
 
+@asynccontextmanager
+async def crawl4ai_page_fetcher(
+    client: Crawl4AIClient,
+    *,
+    source_key: str,
+    robots_fetcher: PageFetcher,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> AsyncIterator[PageFetcher]:
+    """Pages through the self-hosted Crawl4AI browser (headless, honest User-Agent, no stealth).
+
+    robots.txt is still fetched directly (``robots_fetcher``): the crawler renders pages, not plain
+    files. The browser follows redirects itself, so a final URL on another host is reported as a
+    redirect (never kept); a crawler-side failure is a network error, never a source block.
+    """
+
+    async def fetch(url: str) -> RobotsFetchResponse:
+        if urlsplit(url).path == "/robots.txt":
+            return await robots_fetcher(url)
+        result = await client.fetch_detailed(url, purpose="search", source_key=source_key)
+        document = result.document
+        outcome = document.fetch
+        if outcome.infrastructure_failure or outcome.http_status is None:
+            return RobotsFetchResponse(None, None, f"crawler:{outcome.error_code or 'no_response'}")
+        final = document.final_url
+        if final and (urlsplit(final).hostname or "").lower() != (urlsplit(url).hostname or "").lower():
+            return RobotsFetchResponse(307, None, None, final)
+        body = (document.html or "").encode("utf-8")
+        truncated = len(body) > max_bytes
+        return RobotsFetchResponse(
+            outcome.http_status, body[:max_bytes], TRUNCATED if truncated else None, None
+        )
+
+    yield fetch
+
+
 __all__ = [
     "CAPTURE_USER_AGENT",
     "CaptureOutcome",
@@ -949,6 +984,7 @@ __all__ = [
     "SampleStep",
     "capture_samples",
     "challenge_reason",
+    "crawl4ai_page_fetcher",
     "httpx_page_fetcher",
     "outline_html",
     "redact_html",

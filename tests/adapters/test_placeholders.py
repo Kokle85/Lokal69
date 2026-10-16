@@ -53,6 +53,12 @@ CONFIGURED_HOSTS = {
     "autoscout24_it": "www.autoscout24.it",
     "subito_it": "www.subito.it",
     "automobile_it": "www.automobile.it",
+    # home page only, for the owner-run reachability probe (2026-10-16)
+    "autoscout24_ch": "www.autoscout24.ch",
+    "carforyou_ch": "www.carforyou.ch",
+    "tutti_ch": "www.tutti.ch",
+    "reklama5_mk": "www.reklama5.mk",
+    "pazar3_mk": "www.pazar3.mk",
 }
 
 

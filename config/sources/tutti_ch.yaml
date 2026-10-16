@@ -32,8 +32,12 @@ robots_summary: >-
   unavailable (no robots restriction), but a 403 on the pages themselves is an access block that
   stops the source.
 source_timezone: Europe/Zurich
-allowed_hosts: []
-allowed_search_paths: []
+# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
+# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+allowed_hosts:
+  - 'www.tutti.ch'
+allowed_search_paths:
+  - '^/$'
 allowed_detail_paths: []
 search: {}
 notes: >-

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from tests.cli.conftest import Cli, all_output
+
+from suv_deals.crawling.url_policy import SourceUrlPolicy
+from suv_deals.domain.sources import load_source_configs
+
+REPO = Path(__file__).resolve().parents[2]
 
 NETWORK_ON = {"SOURCE_NETWORK_ENABLED": "true"}
 
@@ -70,3 +77,31 @@ def test_help_names_the_switch_and_the_guard(run_cli: Cli) -> None:
     assert result.exit_code == 0
     assert "--search-path" in result.output
     assert "--detail-limit" in result.output
+
+
+def test_crawler_route_needs_a_healthy_crawler_before_any_request(run_cli: Cli) -> None:
+    # Nothing listens on port 9 of loopback: the health probe fails and nothing is fetched.
+    result = run_cli(
+        "capture-samples",
+        "--source",
+        "autoscout24_it",
+        "--search-path",
+        "/lst/toyota/rav-4",
+        "--via",
+        "crawl4ai",
+        "--yes",
+        env={**NETWORK_ON, "CRAWL4AI_BASE_URL": "http://127.0.0.1:9"},
+    )
+    assert result.exit_code == 4
+    assert "not healthy" in all_output(result)
+    assert "nothing was requested" in all_output(result)
+
+
+def test_home_page_probe_is_reviewed_for_the_mk_and_swiss_sources() -> None:
+    configs = {c.source_key: c for c in load_source_configs(REPO / "config" / "sources")}
+    for key in ("reklama5_mk", "pazar3_mk", "autoscout24_ch", "carforyou_ch", "tutti_ch"):
+        cfg = configs[key]
+        assert not cfg.enabled  # a reachability probe only; no crawl route
+        assert list(cfg.allowed_search_paths) == ["^/$"]
+        assert not cfg.allowed_detail_paths  # no detail page of these sites is reviewed
+        SourceUrlPolicy.from_source(cfg).check(f"https://{cfg.allowed_hosts[0]}/", "search")

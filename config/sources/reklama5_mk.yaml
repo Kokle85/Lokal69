@@ -31,8 +31,12 @@ robots_summary: >-
   SemrushBot, AhrefsBot, PetalBot, Sogou, Baiduspider and contabo disallowed). It therefore sets no
   rules for our user agent (RFC 9309); robots silence is never permission.
 source_timezone: Europe/Skopje
-allowed_hosts: []
-allowed_search_paths: []
+# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
+# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+allowed_hosts:
+  - 'www.reklama5.mk'
+allowed_search_paths:
+  - '^/$'
 allowed_detail_paths: []
 search: {}
 notes: >-

@@ -133,6 +133,14 @@ or WSL restart, before the worker crawls. On Windows use Docker Engine inside th
 distribution, not Docker Desktop: Docker Desktop keeps its bridges in its own VM, where these
 `iptables` rules cannot be applied from the WSL shell.
 
+Readiness in one run: `scripts/readiness_check.sh` (owner-run, from the repository root) reports the
+tools, `doctor`, the crawler container and health, this firewall check (`--check`, adds nothing),
+and probes each candidate source with `capture-samples`: robots.txt plus one reviewed page, once
+directly and once `--via crawl4ai` (the crawler's headless browser, honest User-Agent, no stealth),
+25 s apart; the first block or challenge stops a probe. It writes
+`captures/readiness/<UTC>/report.txt` (statuses and counts only; secret-shaped text is masked).
+`--no-sudo`, `--no-probe` and `--with-tests` adjust it.
+
 Container DNS keeps working: Docker's embedded resolver (127.0.0.11) answers inside the container
 namespace and forwards from the daemon's namespace. The worker <-> crawler traffic stays on the
 internal bridge and never targets a host address. Persist the rules with the host's firewall

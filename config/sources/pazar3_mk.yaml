@@ -30,8 +30,12 @@ robots_summary: >-
   Cloudflare 'Sorry, you have been blocked' page on 2026-10-14; no robots rules could be read.
   pazar3.mk redirects to www.pazar3.mk.
 source_timezone: Europe/Skopje
-allowed_hosts: []
-allowed_search_paths: []
+# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
+# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+allowed_hosts:
+  - 'www.pazar3.mk'
+allowed_search_paths:
+  - '^/$'
 allowed_detail_paths: []
 search: {}
 notes: >-

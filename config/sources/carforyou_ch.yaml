@@ -32,8 +32,12 @@ robots_summary: >-
   host name (TLS verification stays on; it is never bypassed). Under the robots module an
   unreachable robots.txt means complete disallow until a fetch succeeds.
 source_timezone: Europe/Zurich
-allowed_hosts: []
-allowed_search_paths: []
+# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
+# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+allowed_hosts:
+  - 'www.carforyou.ch'
+allowed_search_paths:
+  - '^/$'
 allowed_detail_paths: []
 search: {}
 notes: >-
