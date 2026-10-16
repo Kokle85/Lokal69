@@ -8,7 +8,7 @@ country: DE
 role: acquisition
 mode: public_html
 adapter: autoscout24_public_de
-adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+adapter_version: "autoscout24@1.0.0"   # built from owner captures 2026-10-16; no live smoke run yet
 enabled: false
 technical_status: untested
 terms_status: restricted
@@ -28,7 +28,19 @@ allowed_hosts:
   - 'www.autoscout24.de'
 allowed_search_paths:
   - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
-allowed_detail_paths: []
-search: {}
+allowed_detail_paths: []   # card_only: /angebote/ URLs are identity only, never fetched
+rate_budget:
+  min_delay_seconds: 20            # per-host spacing (shared rate limiter)
+  max_search_pages_per_run: 12     # one search page for each of the 12 configured models
+  max_detail_jobs_per_run: 0       # card_only
+  daily_request_budget: 200
+search:
+  # One search page per model per run (newest first), in this order. Slug verification
+  # (2026-10-16, from the owner-captured pages' links and taxonomy): see notes.
+  models: >-
+    renault/captur nissan/qashqai nissan/juke kia/sportage opel/mokka opel/mokka-x
+    dacia/duster peugeot/2008 hyundai/ix35 opel/antara skoda/yeti suzuki/sx4-s-cross
+  sort: age
+  desc: "1"
 notes: >-
-  AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or country-specific (autoscout24.de) and business-use terms apply must be verified before a decision.
+  Adapter autoscout24@1.0.0 (2026-10-16) built from an owner-captured search page /lst/renault/captur (structure only, nothing stored): same Next.js app as autoscout24.it, results in script#__NEXT_DATA__ props.pageProps.listings[20] with id (UUID equal to the URL's trailing UUID), url /angebote/<slug>-<uuid> (slugs may contain '+'), price.priceRaw, vatLabel 'inkl. MwSt.', vehicle (transmission Schaltgetriebe/Automatik/Halbautomatik, fuel Benzin/Diesel/...), tracking (firstRegistration MM-YYYY, fuelType code, mileage, price) and vehicleDetails pills ('103 kW (140 PS)'); only Organic/Main cards are results; no drive or body type on cards. The captured pageQuery (sort, desc, cy, damaged_listing, ...) has no ustate key, so no offer-state filter is sent here (an offerType other than U is flagged on the card instead). pricefrom/priceto/kmto are the keys autoscout24.it serves; on .de they are UNVERIFIED until the live smoke run (the site's server-normalised pageQuery will show whether they took effect). Model slugs: renault/captur verified by the capture and dacia/duster verified as a /lst/dacia/duster link on it; all others UNVERIFIED (lower-cased site labels; a 404 skips that model): nissan/qashqai, nissan/juke, kia/sportage, opel/mokka, opel/mokka-x, peugeot/2008, hyundai/ix35, opel/antara, skoda/yeti, suzuki/sx4-s-cross. Search URLs never carry cat= (robots.txt). AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or country-specific (autoscout24.de) and business-use terms apply must be verified before a decision.

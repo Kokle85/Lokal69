@@ -10,6 +10,7 @@ import pytest
 from tests.adapters.conftest import raw_document
 
 from suv_deals.adapters import (
+    autoscout24,
     autoscout_public,
     ch_marketplaces,
     it_marketplaces,
@@ -27,10 +28,9 @@ from suv_deals.domain.profiles import load_business_config
 from suv_deals.errors import DependencyUnavailable, ValidationFailed
 
 REPO = Path(__file__).resolve().parents[2]
+# AutoScout24 Italy and Germany have a real adapter (`adapters.autoscout24`, 2026-10-16).
 PLACEHOLDER_SOURCES = (
     "mobile_de_public",
-    "autoscout24_de",
-    "autoscout24_it",
     "autoscout24_ch",
     "subito_it",
     "automobile_it",
@@ -49,8 +49,6 @@ DOCUMENTED_URLS = {
 
 CONFIGURED_HOSTS = {
     "mobile_de_public": "suchen.mobile.de",
-    "autoscout24_de": "www.autoscout24.de",
-    "autoscout24_it": "www.autoscout24.it",
     "subito_it": "www.subito.it",
     "automobile_it": "www.automobile.it",
     # home page only, for the owner-run reachability probe (2026-10-16)
@@ -114,7 +112,8 @@ def test_no_guessed_urls_or_selectors_in_placeholder_modules(module: object) -> 
 
 
 def test_each_autoscout_country_is_registered_separately() -> None:
-    keys = {cls.ADAPTER_KEY: cls.COUNTRY for cls in autoscout_public.AUTOSCOUT24_ADAPTERS}
+    classes = (*autoscout24.AUTOSCOUT24_ADAPTERS, *autoscout_public.AUTOSCOUT24_PLACEHOLDERS)
+    keys = {cls.ADAPTER_KEY: cls.COUNTRY for cls in classes}
     assert keys == {
         "autoscout24_public_de": "DE",
         "autoscout24_public_it": "IT",
@@ -122,6 +121,10 @@ def test_each_autoscout_country_is_registered_separately() -> None:
     }
     for key in keys:
         assert key in ADAPTERS
+    # Switzerland stays an unimplemented placeholder; Italy and Germany are real adapters.
+    assert ADAPTERS["autoscout24_public_ch"].ADAPTER_VERSION == "unimplemented"
+    assert ADAPTERS["autoscout24_public_it"] is autoscout24.AutoScout24ItAdapter
+    assert ADAPTERS["autoscout24_public_de"] is autoscout24.AutoScout24DeAdapter
 
 
 def test_swiss_marketplace_placeholders_are_registered_for_ch_only() -> None:
@@ -139,9 +142,10 @@ def test_country_and_role_are_enforced() -> None:
     registry = load_registry(REPO / "config")
     de_cfg = registry.config("autoscout24_de")
     with pytest.raises(ValidationFailed):
-        autoscout_public.AutoScout24ItPublicAdapter(
-            de_cfg.model_copy(update={"adapter": "autoscout24_public_it"})
-        )
+        autoscout24.AutoScout24ItAdapter(de_cfg.model_copy(update={"adapter": "autoscout24_public_it"}))
+    ch_cfg = registry.config("autoscout24_ch")
+    with pytest.raises(ValidationFailed):
+        autoscout_public.AutoScout24ChPublicAdapter(ch_cfg.model_copy(update={"country": "DE"}))
     pazar = registry.config("pazar3_mk")
     with pytest.raises(ValidationFailed):
         mk_comparables.Pazar3Adapter(pazar.model_copy(update={"role": "acquisition"}))

@@ -110,7 +110,13 @@ _CHALLENGE_MARKERS: Final = (
     b"_incapsula_resource",
     b"px-captcha",
 )
-_EMAIL: Final = re.compile(rb"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,5}")
+# A JSON/JS escape directly before an address (">privacy@x.it" inside __NEXT_DATA__, "\n" in a
+# script string) is matched as its own group and written back unchanged: masking must never eat
+# the escape's letters and leave a dangling backslash (the saved page would no longer parse).
+_EMAIL: Final = re.compile(
+    rb"(?P<escapes>(?:\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|\\[\\/\"'bfnrt])*)"
+    rb"(?P<address>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,5})"
+)
 _PHONE: Final = re.compile(rb"(?<![\w+])\+\d{1,3}[\s().\-/]{0,3}(?:\d[\s().\-/]{0,3}){6,13}\d")
 _TEL: Final = re.compile(rb"tel:[^\"'\s<>]{1,40}", re.IGNORECASE)
 _ABSOLUTE_URL: Final = re.compile(r"https?://([a-z0-9.-]{3,253})(/[^\s\"'<>]*)?", re.IGNORECASE)
@@ -506,8 +512,12 @@ def outline_html(body: bytes, *, base_url: str) -> tuple[dict[str, Any], list[st
 
 
 def redact_html(body: bytes) -> bytes:
-    """Mask e-mail addresses, international phone numbers and ``tel:`` links before saving."""
-    masked = _EMAIL.sub(b"[redacted-email]", body)
+    """Mask e-mail addresses, international phone numbers and ``tel:`` links before saving.
+
+    An escape sequence right before an address (``\\u003e`` in embedded JSON) is kept intact, so
+    masking never turns valid JSON or script text into an invalid escape.
+    """
+    masked = _EMAIL.sub(lambda m: m.group("escapes") + b"[redacted-email]", body)
     masked = _PHONE.sub(b"[redacted-phone]", masked)
     return _TEL.sub(b"tel:[redacted]", masked)
 

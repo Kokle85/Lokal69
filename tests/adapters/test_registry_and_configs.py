@@ -69,6 +69,10 @@ OWNER_DECIDED_SOURCES = frozenset(
 )
 
 
+#: Marketplace sources with a real adapter (built from owner captures, not yet smoke-tested live).
+IMPLEMENTED_MARKETPLACES = frozenset({"autoscout24_de", "autoscout24_it"})
+
+
 @pytest.mark.parametrize("path", CONFIG_FILES, ids=lambda p: p.name)
 def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
     config = SourceConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
@@ -81,7 +85,12 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
         assert config.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
         assert config.terms_decision_actor and "owner" in config.terms_decision_actor
         assert config.robots_checked_at is not None and config.robots_summary
-        assert "adapter is unimplemented" in activation_problems(config)
+        if config.source_key in IMPLEMENTED_MARKETPLACES:
+            # Real adapter (2026-10-16), still gated: untested live and disabled until the owner's
+            # live smoke run.
+            assert "adapter has not passed fixture tests" in activation_problems(config)
+        else:
+            assert "adapter is unimplemented" in activation_problems(config)
     else:
         assert config.terms_decision == TermsDecision.PENDING
         assert config.terms_decision_actor is None
@@ -281,7 +290,9 @@ def test_registry_builds_every_adapter_and_nothing_is_active() -> None:
     assert all(not g.active and g.problems for g in gates)
     assert all("source is disabled in configuration" in g.problems for g in gates)
     implemented = {g.source_key for g in gates if g.adapter_implemented}
-    assert implemented == {"example_dealer_template_de", "example_dealer_template_ch"}
+    assert (
+        implemented == {"example_dealer_template_de", "example_dealer_template_ch"} | IMPLEMENTED_MARKETPLACES
+    )
     json.dumps([g.as_dict() for g in gates])  # serialisable for API/MCP/status pages
 
 

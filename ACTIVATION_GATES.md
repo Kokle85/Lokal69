@@ -217,7 +217,8 @@ Each step only needs the steps above it; any step can stop without affecting the
 | Source | Adapter | Terms decision | What blocks it |
 |---|---|---|---|
 | `example_dealer_template_de`, `example_dealer_template_ch` | `schemaorg_dealer@1.1.0` (fixture_verified) | none (templates) | a real permitted dealer: copy, steps 1-7 |
-| `mobile_de_public`, `autoscout24_de`, `autoscout24_it`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; `autoscout24_de` card_only (robots); CH terms not identified |
+| `mobile_de_public`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; CH terms not identified |
+| `autoscout24_de`, `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures), untested live | proceed_acknowledged (owner, 2026-10-10) | disabled until the owner's live smoke run; per-model searches (12 models, one page each per run); `autoscout24_de` card_only (robots) |
 | `subito_it`, `automobile_it`, `carforyou_ch`, `tutti_ch`, `comparis_ch` | placeholder | pending | domain, terms, routes unverified; an adapter |
 | `pazar3_mk`, `reklama5_mk` (MK comparables) | placeholder | pending | terms and an adapter; until then MK evidence comes from `suv-deals market import` |
 | `mobile_de_api` | skeleton (raises until entitlement) | pending | gate 5 |

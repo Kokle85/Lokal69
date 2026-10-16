@@ -367,6 +367,28 @@ def test_redaction_masks_contacts_and_keeps_prices() -> None:
     assert b"02 1234567" not in masked
 
 
+@pytest.mark.parametrize(
+    "escape",
+    [b"\\u003e", b"\\u003E", b"\\n", b"\\t", b"\\/", b'\\"', b"\\\\", b"\\u003e\\u003c"],
+)
+def test_redaction_keeps_a_json_escape_before_an_address_intact(escape: bytes) -> None:
+    """Regression: the local part used to swallow the letters of ``\\u003e`` (or ``\\n``) before an
+    address in embedded JSON, leaving ``\\[redacted-email]``: an invalid escape that broke the saved
+    page's ``__NEXT_DATA__``."""
+    document = b'{"description":"<p>Contatti' + escape + b'privacy@sample-dealer.example.it</p>"}'
+    masked = redact_html(b"<script id='__NEXT_DATA__'>" + document + b"</script>")
+    inner = masked.removeprefix(b"<script id='__NEXT_DATA__'>").removesuffix(b"</script>")
+    assert b"privacy@" not in inner and b"sample-dealer" not in inner
+    assert escape + b"[redacted-email]" in inner
+    parsed = json.loads(inner)  # still valid JSON
+    assert parsed["description"].endswith("[redacted-email]</p>")
+
+
+def test_redaction_of_plain_and_html_addresses_is_unchanged() -> None:
+    masked = redact_html(b"<a href='mailto:info@sample.example.it'>info@sample.example.it</a> x@y.example")
+    assert masked == (b"<a href='mailto:[redacted-email]'>[redacted-email]</a> [redacted-email]")
+
+
 def test_challenge_reason_is_specific() -> None:
     assert challenge_reason(b"<title>Access Denied</title>") == "title:access denied"
     assert challenge_reason(b"<html><body>cf_chl_opt = {}</body></html>") == "marker:cf_chl_opt"

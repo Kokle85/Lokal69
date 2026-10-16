@@ -50,9 +50,12 @@ def test_registry_reports_activatability_and_seller_contact_evidence() -> None:
 
 def test_doctor_names_unimplemented_sources_not_activatable(run_cli: Cli) -> None:
     findings = _source_findings(run_cli, BASE_ENV)
-    for key in ("pazar3_mk", "reklama5_mk", "subito_it", "autoscout24_de"):
+    for key in ("pazar3_mk", "reklama5_mk", "subito_it", "mobile_de_public", "autoscout24_ch"):
         assert findings[key]["detail"].startswith("not activatable (no adapter"), findings[key]
     assert findings["example_dealer_template_de"]["detail"].startswith("not active:")
+    # AutoScout24 Italy and Germany have an adapter (2026-10-16): activatable, still gated.
+    for key in ("autoscout24_de", "autoscout24_it"):
+        assert findings[key]["detail"].startswith("not active:"), findings[key]
 
 
 def test_doctor_reports_recipient_evidence_producers(run_cli: Cli) -> None:

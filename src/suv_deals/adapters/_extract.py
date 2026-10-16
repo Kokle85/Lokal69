@@ -765,6 +765,46 @@ def _strip_wrappers(text: str) -> str:
     return text.strip()
 
 
+#: Keys an ``itemOffered`` node inherits from the node that offers it when it has none of its own.
+#: ``url`` comes from the Offer first (the offer's page), then from the offering node.
+_INHERITED_BY_ITEM = ("url", "brand", "description", "identifier", "sku", "productID", "dateModified")
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def _offered_items(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Typed ``offers[].itemOffered`` nodes of ``node`` (schema.org Product -> Offer -> Car).
+
+    A vehicle published as ``Product.offers.itemOffered`` (AutoScout24 Italy detail pages) carries
+    the vehicle facts while its price sits on the Offer. The item is yielded as a DERIVED copy that
+    carries that Offer (without the item, so nothing recurses) as its own ``offers`` and inherits
+    ``_INHERITED_BY_ITEM`` keys it lacks, so a reader sees one vehicle node with its offer. An item
+    that has its own ``offers`` is yielded unchanged.
+    """
+    for offer in _as_list(node.get("offers")):
+        if not isinstance(offer, dict):
+            continue
+        for item in _as_list(offer.get("itemOffered")):
+            if not isinstance(item, dict) or "@type" not in item:
+                continue
+            if item.get("offers") not in (None, "", [], {}):
+                yield item
+                continue
+            derived = dict(item)
+            derived["offers"] = {k: v for k, v in offer.items() if k != "itemOffered"}
+            for key in _INHERITED_BY_ITEM:
+                if derived.get(key) not in (None, "", [], {}):
+                    continue
+                inherited = offer.get(key) if key == "url" else None
+                if inherited in (None, "", [], {}):
+                    inherited = node.get(key)
+                if inherited not in (None, "", [], {}):
+                    derived[key] = inherited
+            yield derived
+
+
 def _flatten(value: Any, depth: int = 0) -> Iterator[dict[str, Any]]:
     if depth > _MAX_DEPTH:
         return
@@ -777,9 +817,22 @@ def _flatten(value: Any, depth: int = 0) -> Iterator[dict[str, Any]]:
             yield from _flatten(graph, depth + 1)
         if "@type" in value:
             yield value
+            if value.get("offers") is not None:
+                for item in _offered_items(value):
+                    yield from _flatten(item, depth + 1)
         main = value.get("mainEntity")
         if isinstance(main, dict | list):
             yield from _flatten(main, depth + 1)
+
+
+def offers_typed_item(node: dict[str, Any], types: frozenset[str]) -> bool:
+    """True when ``node.offers[].itemOffered`` holds a node of one of ``types`` (local names)."""
+    for offer in _as_list(node.get("offers")):
+        if isinstance(offer, dict):
+            for item in _as_list(offer.get("itemOffered")):
+                if isinstance(item, dict) and local_type_names(item) & types:
+                    return True
+    return False
 
 
 def parse_json_ld_blocks(blocks: Iterable[str]) -> JsonLd:

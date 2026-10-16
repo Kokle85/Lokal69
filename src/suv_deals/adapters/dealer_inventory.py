@@ -61,6 +61,7 @@ from suv_deals.adapters._extract import (
     local_type_names,
     miles_to_km,
     normalize_vin,
+    offers_typed_item,
     parse_page,
     parse_partial_date,
     parse_source_timestamp,
@@ -73,6 +74,7 @@ from suv_deals.adapters._extract import (
 )
 from suv_deals.adapters._health import assess_samples
 from suv_deals.adapters._policy import UrlPolicy, build_identity, clean_provider_id
+from suv_deals.adapters._vocabulary import drive_word, gearbox_word
 from suv_deals.adapters.base import (
     CanonicalIdentity,
     CrawlClient,
@@ -103,6 +105,7 @@ from suv_deals.domain.enums import (
     Fuel,
     Gearbox,
     OdometerClaim,
+    Precision,
     PriceBasis,
     PriceType,
     SellerType,
@@ -517,6 +520,41 @@ def _money_minor(amount: Decimal, currency: str) -> int | None:
         return Money.of(amount, currency).to_minor()
     except ValidationFailed:
         return None
+
+
+def _first_registration(
+    raw: str, col: _Collector, *, selector: str, confidence: Confidence, note: str | None = None
+) -> PartialDate:
+    """A first-registration date that is parseable and not in the future, else unknown (warned).
+
+    With ``note`` (a date taken from a key that is not ``dateVehicleFirstRegistered``) a day-01 date
+    is read at month precision: the day is a filler, not a registration day.
+    """
+    parsed = parse_partial_date(raw)
+    if parsed is None:
+        col.warn("FIRST_REGISTRATION_UNPARSEABLE")
+        return PartialDate()
+    transformation = f"precision={parsed.precision.value}"
+    if note is not None:
+        if parsed.value is not None and parsed.precision == Precision.DAY and parsed.value.endswith("-01"):
+            parsed = PartialDate(value=parsed.value[:7], precision=Precision.MONTH)
+            transformation = f"{note}; day 01 read as month precision"
+        else:
+            transformation = f"{note}; {transformation}"
+    # Compare at the stated precision: "2026-10" is not future on 2026-10-06, "2026-10-20" is.
+    stated = parsed.value or ""
+    if stated > col.observed_at.date().isoformat()[: len(stated)]:
+        col.warn("FIRST_REGISTRATION_IN_FUTURE")
+        return PartialDate()
+    col.prov(
+        "vehicle.first_registration",
+        ExtractionMethod.JSON_LD,
+        confidence,
+        selector=selector,
+        raw=raw,
+        transformation=transformation,
+    )
+    return parsed
 
 
 def _inspection_note(result: InspectionParse, text: str) -> str:
@@ -1086,12 +1124,16 @@ class SchemaOrgDealerAdapter:
     def _vehicle_nodes(page: PageView) -> list[dict[str, Any]]:
         nodes = page.json_ld.nodes
         vehicles = [n for n in nodes if local_type_names(n) & _VEHICLE_TYPES]
+        # A Product whose Offer offers a Car (``Product.offers.itemOffered``) is represented by the
+        # derived vehicle node `_extract` yields for that item; counting it again would make the
+        # page's single vehicle ambiguous.
         products = [
             n
             for n in nodes
             if local_type_names(n) & _PRODUCT_TYPES
             and not local_type_names(n) & _VEHICLE_TYPES
             and n.get("offers") is not None
+            and not offers_typed_item(n, _VEHICLE_TYPES)
         ]
         return vehicles + products
 
@@ -1452,38 +1494,39 @@ class SchemaOrgDealerAdapter:
             col.prov(
                 "vehicle.model_year", jl, Confidence.HIGH, selector="json_ld:vehicleModelDate", raw=model_year
             )
-        production_year = year_from(scalar(_get(vehicle, "productionDate")))
-        if production_year:
-            col.prov(
-                "vehicle.production_year",
-                jl,
-                Confidence.HIGH,
-                selector="json_ld:productionDate",
-                raw=production_year,
-            )
-
-        first_reg = PartialDate()
         reg_raw = text_of(_get(vehicle, "dateVehicleFirstRegistered"))
-        if reg_raw:
-            parsed = parse_partial_date(reg_raw)
-            observed = col.observed_at
-            # Compare at the stated precision: "2026-10" is not future on 2026-10-06, "2026-10-20" is.
-            stated = parsed.value if parsed is not None else None
-            observed_text = observed.date().isoformat()[: len(stated)] if stated else ""
-            if parsed is None:
-                col.warn("FIRST_REGISTRATION_UNPARSEABLE")
-            elif stated is not None and stated > observed_text:
-                col.warn("FIRST_REGISTRATION_IN_FUTURE")
-            else:
-                first_reg = parsed
+        production_raw = text_of(_get(vehicle, "productionDate"))
+        production_year: int | None = None
+        if production_raw and reg_raw:
+            production_year = year_from(production_raw)
+            if production_year:
                 col.prov(
-                    "vehicle.first_registration",
+                    "vehicle.production_year",
                     jl,
                     Confidence.HIGH,
-                    selector="json_ld:dateVehicleFirstRegistered",
-                    raw=reg_raw,
-                    transformation=f"precision={parsed.precision.value}",
+                    selector="json_ld:productionDate",
+                    raw=production_year,
                 )
+
+        first_reg = PartialDate()
+        if reg_raw:
+            first_reg = _first_registration(
+                reg_raw, col, selector="json_ld:dateVehicleFirstRegistered", confidence=Confidence.HIGH
+            )
+        elif production_raw:
+            # Some marketplaces (AutoScout24 Italy) publish the FIRST-REGISTRATION date as
+            # ``productionDate`` and no ``dateVehicleFirstRegistered``; the real production year
+            # differs. Without a registration date it is read as the first registration, labelled
+            # and at low confidence, and never as the production year.
+            first_reg = _first_registration(
+                production_raw,
+                col,
+                selector="json_ld:productionDate",
+                confidence=Confidence.LOW,
+                note="productionDate read as first registration (no dateVehicleFirstRegistered)",
+            )
+            if first_reg.value is not None:
+                col.warn("FIRST_REGISTRATION_FROM_PRODUCTION_DATE")
 
         body = BodyType.UNKNOWN
         body_raw = text_of(_get(vehicle, "bodyType"))
@@ -1536,7 +1579,9 @@ class SchemaOrgDealerAdapter:
         gearbox_subtype: str | None = None
         trans_raw = text_of(_get(vehicle, "vehicleTransmission"))
         if trans_raw:
-            mapped_gear = _first_rule(_GEARBOX_RULES, trans_raw)
+            # A marketplace label ("Manuale", "Schaltgetriebe") first, then the wording rules.
+            word_gear = gearbox_word(trans_raw)
+            mapped_gear = word_gear or _first_rule(_GEARBOX_RULES, trans_raw)
             if mapped_gear is None:
                 col.warn("GEARBOX_UNMAPPED")
             else:
@@ -1547,7 +1592,7 @@ class SchemaOrgDealerAdapter:
                     Confidence.HIGH,
                     selector="json_ld:vehicleTransmission",
                     raw=trans_raw,
-                    transformation=f"wording -> {mapped_gear.value}",
+                    transformation=f"{'localised label' if word_gear else 'wording'} -> {mapped_gear.value}",
                 )
             sub = _GEARBOX_SUBTYPE.search(trans_raw)
             if sub:
@@ -1566,6 +1611,18 @@ class SchemaOrgDealerAdapter:
                     selector="json_ld:driveWheelConfiguration",
                     raw=drive_raw,
                     transformation="schema.org DriveWheelConfigurationValue",
+                )
+            elif (word_drive := drive_word(drive_raw)) is not None:
+                # A localised marketplace label ("Anteriore", "Allrad"): no schema.org enumeration
+                # member, so low confidence like any wording; "4x4" is read as all-wheel drive.
+                drive = word_drive
+                col.prov(
+                    "vehicle.drive",
+                    jl,
+                    Confidence.LOW,
+                    selector="json_ld:driveWheelConfiguration",
+                    raw=drive_raw,
+                    transformation=f"localised label -> {word_drive.value}; permanent/selectable unverified",
                 )
             else:
                 mapped_drive = _first_rule(_DRIVE_RULES, drive_raw)

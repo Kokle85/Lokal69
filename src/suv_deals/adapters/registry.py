@@ -19,11 +19,8 @@ import yaml
 from pydantic import ValidationError
 
 from suv_deals.adapters._placeholder import UNIMPLEMENTED, PlaceholderAdapter
-from suv_deals.adapters.autoscout_public import (
-    AutoScout24ChPublicAdapter,
-    AutoScout24DePublicAdapter,
-    AutoScout24ItPublicAdapter,
-)
+from suv_deals.adapters.autoscout24 import AutoScout24Adapter, AutoScout24DeAdapter, AutoScout24ItAdapter
+from suv_deals.adapters.autoscout_public import AutoScout24ChPublicAdapter
 from suv_deals.adapters.base import SourceAdapter
 from suv_deals.adapters.ch_marketplaces import (
     CarForYouChPublicAdapter,
@@ -39,14 +36,14 @@ from suv_deals.domain.enums import TechnicalStatus, TermsDecision, TermsStatus
 from suv_deals.domain.sources import SourceConfig, activation_problems, load_source_configs
 from suv_deals.errors import AppError, NotFound, SourcePaused, ValidationFailed
 
-AdapterClass = type[SchemaOrgDealerAdapter] | type[PlaceholderAdapter]
+AdapterClass = type[SchemaOrgDealerAdapter] | type[AutoScout24Adapter] | type[PlaceholderAdapter]
 
 ADAPTERS: MappingProxyType[str, AdapterClass] = MappingProxyType(
     {
         SchemaOrgDealerAdapter.ADAPTER_KEY: SchemaOrgDealerAdapter,
         MobileDePublicAdapter.ADAPTER_KEY: MobileDePublicAdapter,
-        AutoScout24DePublicAdapter.ADAPTER_KEY: AutoScout24DePublicAdapter,
-        AutoScout24ItPublicAdapter.ADAPTER_KEY: AutoScout24ItPublicAdapter,
+        AutoScout24DeAdapter.ADAPTER_KEY: AutoScout24DeAdapter,
+        AutoScout24ItAdapter.ADAPTER_KEY: AutoScout24ItAdapter,
         AutoScout24ChPublicAdapter.ADAPTER_KEY: AutoScout24ChPublicAdapter,
         SubitoPublicAdapter.ADAPTER_KEY: SubitoPublicAdapter,
         AutomobileItPublicAdapter.ADAPTER_KEY: AutomobileItPublicAdapter,

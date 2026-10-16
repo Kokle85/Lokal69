@@ -33,6 +33,43 @@ Owner decisions of 2026-10-16 („не треба да бидат строги �
   review queue and the MCP typed warnings read the stored flag, and the 15-day evaluation's best
   supported economics counts only well-matched candidates.
 
+AutoScout24 Italy and Germany adapter (2026-10-16), built from owner-captured pages (structure
+only; no captured page is committed). Both sources stay `enabled: false` and `untested` until the
+owner's live smoke run.
+
+- **`adapters/autoscout24.py` (`autoscout24@1.0.0`).** One adapter for `autoscout24_public_it` and
+  `autoscout24_public_de`. Search pages are read from `__NEXT_DATA__` `props.pageProps.listings`
+  (Organic/Main cards only): listing UUID (must equal the URL's trailing UUID), canonical URL,
+  bounded title, make/model, first registration, km, EUR price, fuel (code cross-checked with the
+  localised label), gearbox (IT/DE labels), kW, cm3, seller type and country. Seller names, phones,
+  links, streets and coordinates are never read into a model. Missing or invalid `__NEXT_DATA__`,
+  missing listings while results are reported, or a page of unreadable cards is drift
+  (`unexpected_content`); challenge pages and 401/403 are access blocks. Placeholder and absurd
+  prices carry no amount. Italian `/annunci/` detail pages are parsed from `listingDetails.vehicle`
+  (drive, kW, cm3, first registration, production year, fuel incl. plug-in flag, gearbox, km,
+  body) with the JSON-LD Car as fallback and cross-check (disagreements are field conflicts);
+  net-price seller wording and commercial (N1, "AUTOCARRO") registrations are flagged without
+  storing the description. Germany stays `card_only`: its detail URLs are identity only and
+  `fetch_detail`/`parse_detail` refuse without any request.
+- **Per-model searches.** `search.models` lists the owner's twelve models (Captur, Qashqai, Juke,
+  Sportage, Mokka, Mokka X, Duster, 2008, ix35, Antara, Yeti, SX4 S-Cross); one discovery run walks
+  them with an opaque `model:<n>` cursor through the existing traversal (no scheduler change), one
+  page per model, newest first (`sort=age&desc=1`) with the profile's price band and km ceiling
+  (`pricefrom`/`priceto`/`kmto`) and `ustate=U` on Italy. `max_search_pages_per_run: 12`, 20 s
+  spacing. A model slug answering 404 is skipped; any incomplete model page makes the run partial,
+  so absence marking only follows a complete walk. Unverified slugs are named in the config notes.
+- **Fix: capture redaction broke JSON escapes.** `sample_capture.redact_html` swallowed the letters
+  of a `>`/`\n` escape before an e-mail address, leaving `\[redacted-email]` (invalid JSON in
+  saved pages); the escape is now kept intact.
+- **Fix: the schema.org reader missed `Product.offers.itemOffered`.** `_extract` now yields the
+  offered Car with its Offer, so the generic dealer adapter reads model, km, fuel, gearbox, drive,
+  cm3, kW (KWT preferred), body and first registration on such pages; `productionDate` is read as
+  the first registration (labelled, low confidence) only when no `dateVehicleFirstRegistered`
+  exists, and localised drive/gearbox labels use small exact-word maps (`adapters/_vocabulary.py`).
+- Tests: synthetic AutoScout24 pages with the captured structure (`tests/adapters/`), covering IT
+  and DE search cards, the IT detail page, drift and blocks, model mismatch, prices, the model walk,
+  query building and that Germany never fetches a detail page.
+
 Owner decision of 2026-10-16 ("Моја проценка": the MK prices of the owner's model list are the
 owner's own estimates; ADR 0004).
 

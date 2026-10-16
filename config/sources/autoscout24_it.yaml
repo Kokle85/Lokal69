@@ -8,7 +8,7 @@ country: IT
 role: acquisition
 mode: public_html
 adapter: autoscout24_public_it
-adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+adapter_version: "autoscout24@1.0.0"   # built from owner captures 2026-10-15/16; no live smoke run yet
 enabled: false
 technical_status: untested
 terms_status: restricted
@@ -28,7 +28,21 @@ allowed_hosts:
 allowed_search_paths:
   - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
 allowed_detail_paths:
-  - '^/annunci/[A-Za-z0-9][A-Za-z0-9._~%-]{0,300}/?$'
-search: {}
+  # '+' occurs in real listing slugs (2026-10-16 captures); the URL must still end in the listing UUID.
+  - '^/annunci/[A-Za-z0-9][A-Za-z0-9._~%+-]{0,300}/?$'
+rate_budget:
+  min_delay_seconds: 20            # per-host spacing (shared rate limiter)
+  max_search_pages_per_run: 12     # one search page for each of the 12 configured models
+  max_detail_jobs_per_run: 10
+  daily_request_budget: 200
+search:
+  # One search page per model per run (newest first), in this order. Slug verification
+  # (2026-10-16, from the owner-captured pages' links and taxonomy): see notes.
+  models: >-
+    renault/captur nissan/qashqai nissan/juke kia/sportage opel/mokka opel/mokka-x
+    dacia/duster peugeot/2008 hyundai/ix35 opel/antara skoda/yeti suzuki/sx4-s-cross
+  sort: age
+  desc: "1"
+  ustate: U   # used cars only: the site's own pageQuery carries ustate (default N,U)
 notes: >-
-  AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or Italy-specific (autoscout24.it) and business-use terms apply must be verified before a decision. Owner-run capture 2026-10-15 (suv-deals capture-samples, structure only): /lst/<make>/<model> answers HTTP 200 (a hyphenated model slug such as rav-4 is redirected with 308 to rav4) and publishes its results as schema.org JSON-LD: a SearchResultsPage whose mainEntity is an ItemList of 20 ListItem entries, each with a relative url /annunci/<slug> and an item typed Car/Product carrying name, brand, model, fuelType, vehicleTransmission, vehicleConfiguration, mileageFromOdometer (QuantitativeValue), image, additionalProperty and offers (Offer: price, priceCurrency, url, availability, itemCondition, seller AutoDealer). Listing links appear only in that JSON-LD; the page's <a> links are facets and dealer pages. robots.txt unchanged (sha256 7c78475c...). Search filter parameters, pagination and detail pages are not verified yet.
+  Adapter autoscout24@1.0.0 (2026-10-16) built from owner-captured pages (structure only, nothing stored): a search page /lst/renault/captur?body=4&kmto=200000 and an /annunci/ detail page (Renault Captur 1.5 dCi). Verified facts: search pages carry their results in script#__NEXT_DATA__ (props.pageProps.numberOfResults, numberOfPages, pageQuery, listings[20]); each listing has id (UUID, equal to the URL's trailing UUID), url /annunci/<slug>-<uuid>, price.priceRaw (integer EUR), vehicle (make, model, modelGroup, transmission Manuale/Automatico/Semiautomatico, fuel Benzina/Diesel/GPL/Elettrica/Benzina, mileageInKm, engineDisplacementInCCM, offerType), tracking (firstRegistration MM-YYYY, fuelType code, mileage, price) and vehicleDetails pills ('81 kW (110 CV)'); only searchResultType Organic / searchResultSection Main are results. The server-normalised pageQuery shows the query keys the site serves: sort, desc, ustate (default N,U), kmto, body (body=4 is turned into the path facet /bt_suv-fuoristrada-pick-up, which the search path policy refuses, so it is not sent); pricefrom/priceto are the site's price filter keys (verified by the owner on autoscout24.it). Detail pages publish listingDetails.vehicle (rawPowerInKw, rawDisplacementInCCM, firstRegistrationDateRaw, fuelCategory.raw, rawData.engine.transmissionType.raw, driveTrain 'Anteriore') and a JSON-LD Product whose offers.itemOffered is the Car (productionDate there is the FIRST-REGISTRATION date). Model slugs: renault/captur verified by the search capture; nissan/qashqai, kia/sportage and peugeot/2008 verified as /lst/<make>/<model> links on the captured Italian pages; UNVERIFIED (lower-cased site labels, to be confirmed by the live smoke run; a 404 skips that model): nissan/juke, opel/mokka, opel/mokka-x, dacia/duster (verified on .de only), hyundai/ix35, opel/antara, skoda/yeti, suzuki/sx4-s-cross. All nine make labels are in the site's taxonomy. Every URL still passes the URL policy and robots.txt at runtime. AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or Italy-specific (autoscout24.it) and business-use terms apply must be verified before a decision. Owner-run capture 2026-10-15 (suv-deals capture-samples, structure only): /lst/<make>/<model> answers HTTP 200 (a hyphenated model slug such as rav-4 is redirected with 308 to rav4) and publishes its results as schema.org JSON-LD: a SearchResultsPage whose mainEntity is an ItemList of 20 ListItem entries, each with a relative url /annunci/<slug> and an item typed Car/Product carrying name, brand, model, fuelType, vehicleTransmission, vehicleConfiguration, mileageFromOdometer (QuantitativeValue), image, additionalProperty and offers (Offer: price, priceCurrency, url, availability, itemCondition, seller AutoDealer). Listing links appear only in that JSON-LD; the page's <a> links are facets and dealer pages. robots.txt unchanged (sha256 7c78475c...). Pagination beyond page 1 is not used: one page per model and run.
