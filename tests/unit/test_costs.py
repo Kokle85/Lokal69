@@ -579,7 +579,8 @@ def test_material_support_levels() -> None:
     quoted = run(_quoted_lines(), buy=purchase(status=S.QUOTED))
     assert quoted.material_support == "quote_supported"
     assert quoted.unsupported_material == (
-        "proceeds: owner estimate (realized-proceeds basis) (not an approved/realized basis)",
+        "proceeds: owner estimate (the owner's assumption; not MK market evidence) "
+        "(not an approved/realized basis)",
     )
     approved = [
         ln if ln.category != C.REPAIRS else line(C.REPAIRS, "300.00", assumption_approved=True)

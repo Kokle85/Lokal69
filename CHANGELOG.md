@@ -7,6 +7,23 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (working tree on top of `7f7e187`, not committed)
 
+Owner decision of 2026-10-16 ("Моја проценка": the MK prices of the owner's model list are the
+owner's own estimates; ADR 0004).
+
+- **Owner estimates as the MK resale fallback.** A valuation whose MK comparable set has no asking
+  price or sale uses the owner's matching `owner_estimate` rows as proceeds (basis
+  `owner_estimate`, labelled as the owner's assumption, no negotiation discount, never approved,
+  research still needed, warning `PROCEEDS_FROM_OWNER_ESTIMATE`). Real MK evidence always wins.
+- **Canonical model names.** Comparables compare make/model by taxonomy names (`Mokka X` ->
+  `Mokka`, `Skoda` -> `Škoda`), and the candidate lookup reads both spellings. Criteria version
+  `mk-comparables@1.2.0`.
+- **Taxonomy `2026-10-16.1`.** Renault Captur, Nissan Juke, Opel Mokka (alias Mokka X) and
+  Peugeot 2008 added as crossovers.
+- **Estimate files.** `data/market/owner_estimates_mk_2026-10-16.json` (nine confirmed models) and
+  `..._to_verify.json` (four models, not to be imported until confirmed).
+- Tests: owner-estimate selection and proceeds, canonical names, the estimate files, and a pipeline
+  test on PostgreSQL (fallback used without MK ads; MK asking prices win).
+
 Owner re-confirmation of 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат") and a
 robots.txt re-check of the same day. Nothing is enabled, fetched or activated.
 

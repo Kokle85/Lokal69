@@ -420,6 +420,8 @@ class ProceedsEstimate(_Contract):
         return self
 
     def label(self) -> str:
+        if self.basis == "owner_estimate":
+            return "owner estimate (the owner's assumption; not MK market evidence)"
         if self.basis != "mk_asking_prices":
             return f"{self.basis.replace('_', ' ')} (realized-proceeds basis)"
         if self.negotiation_discount_pct is None:

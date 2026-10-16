@@ -56,6 +56,7 @@ TERMINOLOGY_NOTE: Final = (
 )
 FIXTURE_LABEL: Final = "SYNTHETIC FIXTURE: never a real opportunity; never notified."
 ASKING_PROCEEDS_NOTICE: Final = "Asking-price evidence is not a realized sale price."
+OWNER_ESTIMATE_PROCEEDS_NOTICE: Final = "The owner's own estimate: an orientation, not MK market evidence."
 _FIGURE_STATES: Final = frozenset({ValuationState.ESTIMATED, ValuationState.QUOTE_SUPPORTED})
 _NO_FIGURE_STATES: Final = frozenset(
     {ValuationState.NOT_STARTED, ValuationState.INCOMPLETE, ValuationState.INVALID}
@@ -225,6 +226,8 @@ class ProceedsView(ViewModel):
             notice=(
                 ASKING_PROCEEDS_NOTICE
                 if proceeds.basis == "mk_asking_prices"
+                else OWNER_ESTIMATE_PROCEEDS_NOTICE
+                if proceeds.basis == "owner_estimate"
                 else "Realized-proceeds basis; check the cited evidence."
             ),
         )

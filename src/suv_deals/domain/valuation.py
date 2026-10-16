@@ -578,6 +578,11 @@ def _consistency_warnings(
     payable = screening.eur_payable
     if payable is not None and purchase is not None and scenarios.currency == "EUR" and purchase > payable:
         warnings.append("PURCHASE_ABOVE_SCREENED_PAYABLE: re-screen the listing at the modelled price")
+    if scenarios.proceeds_basis == "owner_estimate":
+        warnings.append(
+            "PROCEEDS_FROM_OWNER_ESTIMATE: the MK resale value is the owner's own estimate, "
+            "not MK market evidence"
+        )
     if scenarios.threshold.proposed_only:
         warnings.append("CONTRIBUTION_THRESHOLD_PROPOSED: EUR threshold is not owner-approved")
     return warnings

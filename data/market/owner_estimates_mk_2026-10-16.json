@@ -1,0 +1,215 @@
+{
+  "format": "suv_deals.market_import/1",
+  "evidence_kind": "owner_estimate",
+  "observations": [
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "7500",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Captur I 2013-2014, 1.5 dCi manual, 170-180k km, EUR 7,500-9,000: low end (older, more km).",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Renault",
+        "model": "Captur",
+        "generation": "J87",
+        "first_registration": "2013",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1461,
+        "mileage_km": "180000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "9000",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Captur I 2013-2014, 1.5 dCi manual, 170-180k km, EUR 7,500-9,000: high end (newer, fewer km).",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Renault",
+        "model": "Captur",
+        "generation": "J87",
+        "first_registration": "2014",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1461,
+        "mileage_km": "170000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "7900",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Qashqai I facelift 2012, 1.5 dCi manual, 194k km, EUR 7,900. Power 81 kW (110 hp) and front drive assumed from the standard 1.5 dCi version.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Nissan",
+        "model": "Qashqai",
+        "generation": "J10",
+        "facelift": "yes",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1461,
+        "power_kw": 81,
+        "mileage_km": "194000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "9300",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Qashqai I facelift 2012, 1.6 dCi manual, 180-190k km (midpoint), EUR 9,300. Power 96 kW (130 hp) and front drive assumed (a 4x4 version also exists).",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Nissan",
+        "model": "Qashqai",
+        "generation": "J10",
+        "facelift": "yes",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1598,
+        "power_kw": 96,
+        "mileage_km": "185000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "8150",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Juke I 2012, 1.5 dCi manual, 187k km, EUR 8,150.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Nissan",
+        "model": "Juke",
+        "generation": "F15",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1461,
+        "mileage_km": "187000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "9000",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Sportage III 2013, 1.7 CRDi manual (front drive), 190-200k km (midpoint), EUR 9,000.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Kia",
+        "model": "Sportage",
+        "generation": "SL",
+        "first_registration": "2013",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1685,
+        "mileage_km": "195000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "9330",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Mokka 2015, 1.6 CDTI 136 hp manual, 190-200k km (midpoint), EUR 9,330. Front drive assumed (a 4x4 version also exists).",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Opel",
+        "model": "Mokka",
+        "generation": "J13",
+        "facelift": "no",
+        "first_registration": "2015",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1598,
+        "power_kw": 100,
+        "mileage_km": "195000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "9800",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Mokka X 2017 (the Mokka facelift), 1.6 CDTI manual, 180k km, EUR 9,800. Front drive assumed (a 4x4 version also exists).",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Opel",
+        "model": "Mokka",
+        "generation": "J13",
+        "facelift": "yes",
+        "first_registration": "2017",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1598,
+        "mileage_km": "180000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "8600",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Duster I 2012, 1.5 dCi 110 hp 4x4 manual, 190-200k km (midpoint), EUR 8,600.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Dacia",
+        "model": "Duster",
+        "generation": "HS",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "4wd",
+        "engine_displacement_cm3": 1461,
+        "power_kw": 81,
+        "mileage_km": "195000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "8950",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's own MK resale estimate of 2026-10-16 (not an ad, not a sale). Peugeot 2008 2014, 1.6 HDi 92 hp automatic, 183k km, EUR 8,950.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Peugeot",
+        "model": "2008",
+        "generation": "A94",
+        "first_registration": "2014",
+        "fuel": "diesel",
+        "gearbox": "automatic",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1560,
+        "power_kw": 68,
+        "mileage_km": "183000"
+      }
+    }
+  ]
+}

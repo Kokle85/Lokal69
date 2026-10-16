@@ -29,6 +29,7 @@ from suv_deals.domain.comparables import (
     quantile,
     select_comparables,
 )
+from suv_deals.domain.costs import ProceedsEstimate, proceeds_supported
 from suv_deals.domain.enums import (
     Availability,
     ClaimStatus,
@@ -45,6 +46,7 @@ from suv_deals.domain.enums import (
 from suv_deals.domain.listings import NormalizedListing, PartialDate, VehicleSpec
 from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.profiles import BusinessConfig, load_business_config
+from suv_deals.domain.taxonomy import default_taxonomy
 from suv_deals.errors import ValidationFailed
 
 AS_OF = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
@@ -1111,3 +1113,113 @@ def test_inverse_direction_rate_converts_by_stored_direction() -> None:
     o = obs(amount="625000", currency="MKD")
     result = select_comparables(target(), [o], Windows(min_sample=1), AS_OF, [inverse])
     assert result.selected[0].amount_eur == Decimal("10000.000000")
+
+
+# ---------------------------------------------------------------------------------------------
+# Owner estimates as the fallback orientation (owner decision 2026-10-16) and canonical names
+# ---------------------------------------------------------------------------------------------
+
+
+def _estimate(amount: str = "9000", **kw: Any) -> MarketObservation:
+    return obs(kind=EvidenceKind.OWNER_ESTIMATE, amount=amount, url=None, **kw)
+
+
+def test_owner_estimate_selection_holds_only_estimates_and_is_never_adequate() -> None:
+    asking = obs(amount="9100")
+    estimates = [_estimate("8800"), _estimate("9000"), _estimate("9300", km="190000")]
+    result = select_comparables(target(), [asking, *estimates], DEFAULT, AS_OF, owner_estimates=True)
+    assert {s.observation_id for s in result.selected} == {e.id for e in estimates}
+    assert reasons_of(result, asking.id) == (ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND,)
+    # Three estimates meet min_sample 3, yet an assumption is never an adequate market sample.
+    assert result.status == "small_sample"
+    assert result.research_needed
+    stats = result.stats_for(EvidenceKind.OWNER_ESTIMATE)
+    assert stats is not None and stats.sample_label == "small_sample" and stats.median == Decimal("9000.00")
+    assert result.stats_for(EvidenceKind.ASKING_PRICE) is None
+    assert result.adequacy_count == 0
+    assert result.mk_band_fit == "unknown"
+    assert any(w.startswith("OWNER_ESTIMATES_ONLY") for w in result.warnings)
+
+
+def test_market_selection_still_never_holds_an_owner_estimate() -> None:
+    estimate = _estimate()
+    result = select_comparables(target(), [estimate], DEFAULT, AS_OF)
+    assert result.selected == ()
+    assert reasons_of(result, estimate.id) == (ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND,)
+    unknown = comparables_module.proceeds_from_owner_estimates(result)
+    assert unknown.status == CostLineStatus.UNKNOWN and unknown.base is None
+
+
+def test_owner_estimate_widening_stops_at_the_first_admitted_estimate() -> None:
+    close = _estimate("9000", year=2011)
+    far = _estimate("7600", year=2013)  # needs the widened year window
+    result = select_comparables(target(), [close, far], DEFAULT, AS_OF, owner_estimates=True)
+    assert [s.observation_id for s in result.selected] == [close.id]
+    assert result.widening_steps == ()
+    assert ExclusionReason.YEAR_OUT_OF_WINDOW in reasons_of(result, far.id)
+    # Only the far estimate: widened (labelled) to reach one reference point.
+    alone = select_comparables(target(), [far], DEFAULT, AS_OF, owner_estimates=True)
+    assert [s.observation_id for s in alone.selected] == [far.id]
+    assert [step.dimension for step in alone.widening_steps] == ["mileage", "year"]
+    assert alone.selected[0].match_level == "widened"
+    assert alone.stats_for(EvidenceKind.OWNER_ESTIMATE).sample_label == "single_observation"  # type: ignore[union-attr]
+
+
+def test_owner_estimates_keep_the_strict_matching_rules() -> None:
+    petrol = _estimate(fuel=Fuel.PETROL)
+    automatic = _estimate(gearbox=Gearbox.AUTOMATIC)
+    two_wd = _estimate(drive=Drive.FWD)
+    result = select_comparables(target(), [petrol, automatic, two_wd], DEFAULT, AS_OF, owner_estimates=True)
+    assert result.selected == ()
+    assert result.status == "insufficient_comparables"
+    assert ExclusionReason.FUEL_MISMATCH in reasons_of(result, petrol.id)
+    assert ExclusionReason.GEARBOX_MISMATCH in reasons_of(result, automatic.id)
+    assert ExclusionReason.DRIVE_MISMATCH in reasons_of(result, two_wd.id)
+
+
+def test_proceeds_from_owner_estimates_are_labelled_and_fit_the_cost_model() -> None:
+    estimates = [_estimate("8600", km="170000"), _estimate("9300", km="195000")]
+    result = select_comparables(target(), estimates, DEFAULT, AS_OF, owner_estimates=True)
+    proceeds = comparables_module.proceeds_from_owner_estimates(result)
+    assert proceeds.status == CostLineStatus.ESTIMATED
+    assert proceeds.basis == "owner_estimate" and proceeds.evidence_kind == EvidenceKind.OWNER_ESTIMATE
+    assert (proceeds.low, proceeds.base, proceeds.high) == (
+        Money.of("8600", "EUR"),
+        Money.of("8950", "EUR"),
+        Money.of("9300", "EUR"),
+    )
+    assert proceeds.negotiation_discount_pct is None and not proceeds.discount_approved
+    assert proceeds.comparable_set_id is None and proceeds.research_needed
+    assert set(proceeds.evidence_ids) == {str(e.id) for e in estimates}
+    assert proceeds.labels[0] == comparables_module.OWNER_ESTIMATE_LABEL
+    estimate = ProceedsEstimate(**proceeds.as_proceeds_estimate_kwargs())
+    assert estimate.label() == comparables_module.OWNER_ESTIMATE_LABEL
+    assert not proceeds_supported(estimate)  # never an approved basis for an alert
+
+
+def test_owner_estimate_proceeds_without_a_match_are_unknown() -> None:
+    result = select_comparables(target(), [], DEFAULT, AS_OF, owner_estimates=True)
+    proceeds = comparables_module.proceeds_from_owner_estimates(result)
+    assert proceeds.status == CostLineStatus.UNKNOWN
+    assert proceeds.low is proceeds.base is proceeds.high is None
+    assert proceeds.research_needed
+
+
+def test_taxonomy_compares_canonical_make_and_model_names() -> None:
+    mokka = target(make="Opel", model="Mokka X", generation=None)
+    row = obs(make="Opel", model="Mokka", generation=None)
+    plain = select_comparables(mokka, [row], Windows(min_sample=1), AS_OF)
+    assert reasons_of(plain, row.id) == (ExclusionReason.WRONG_MODEL,)
+    canonical = select_comparables(mokka, [row], Windows(min_sample=1), AS_OF, taxonomy=default_taxonomy())
+    assert [s.observation_id for s in canonical.selected] == [row.id]
+    assert (canonical.target.make, canonical.target.model) == ("Opel", "Mokka")
+
+
+def test_canonical_names_keep_unknown_or_missing_names() -> None:
+    taxonomy = default_taxonomy()
+    assert comparables_module.canonical_names(taxonomy, "Skoda", "Yeti 1.6 TDI") == ("Škoda", "Yeti")
+    assert comparables_module.canonical_names(taxonomy, "Example", "Trail") == ("Example", "Trail")
+    assert comparables_module.canonical_names(taxonomy, "Opel", None) == ("Opel", None)
+    assert comparables_module.canonical_names(None, "Opel", "Mokka X") == ("Opel", "Mokka X")
+    unchanged = target()
+    assert unchanged.with_canonical_names(taxonomy) is unchanged

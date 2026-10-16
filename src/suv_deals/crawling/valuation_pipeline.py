@@ -15,7 +15,12 @@ network I/O.
 2. **Compute** (pure domain code):
 
    - comparables: `select_comparables` (tight first, labelled widening, explicit exclusions; no
-     adequate set -> ``insufficient_comparables`` and ``research_needed``; nothing is fabricated);
+     adequate set -> ``insufficient_comparables`` and ``research_needed``; nothing is fabricated).
+     Make and model are compared by their canonical taxonomy names, and the candidates are read
+     under both the listing's own and the canonical names. When the set holds NO MK asking or
+     sale evidence at all, the proceeds fall back to the owner's matching estimates
+     (`proceeds_from_owner_estimates`, basis ``owner_estimate``, labelled as the owner's
+     assumption, never approved, research still needed); real market evidence always wins;
    - tax: only an ACTIVE, approved rule set is ever selected (`select_rule_set`); without one, every
      import category stays ``unknown`` (never invented, never zero) and the reason is recorded.
      The engine inputs come from the SAME builder the import-cost calculator uses
@@ -72,11 +77,13 @@ from pydantic import BaseModel, ConfigDict
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.comparables import (
+    MAX_CANDIDATES,
     YEAR_WIDEN_STEP,
     ComparableSetResult,
     ComparableTarget,
     MarketObservation,
     proceeds_from_comparables,
+    proceeds_from_owner_estimates,
     select_comparables,
 )
 from suv_deals.domain.costs import (
@@ -122,6 +129,7 @@ from suv_deals.domain.tax_engine import (
     select_rule_set,
 )
 from suv_deals.domain.tax_engine import calculate as calculate_tax
+from suv_deals.domain.taxonomy import VehicleTaxonomy, default_taxonomy
 from suv_deals.domain.valuation import FxDependency, ScreeningInput, Valuation, assemble_valuation
 from suv_deals.errors import NotFound, ValidationFailed, VersionConflict
 from suv_deals.observability.logging import log_context
@@ -271,18 +279,22 @@ async def _read(
         config_record, config = await config_repo.current_config(conn, actor)
         as_of = ensure_utc(await db_now(conn))
         target = ComparableTarget.from_listing(normalized, listing_id=listing.id, is_fixture=is_fixture)
-        candidates = [
-            c
+        canonical = target.with_canonical_names(_taxonomy(ctx))
+        found: dict[UUID, MarketObservation] = {}
+        for lookup in [target] if canonical == target else [target, canonical]:
             for c in await market_repo.list_candidate_comparables(
                 conn,
                 actor,
-                target,
+                lookup,
                 as_of=as_of,
                 max_age_days=config.comparable_max_age_days,
                 year_window=config.comparable_year_window + YEAR_WIDEN_STEP,
-            )
-            if c.is_fixture == is_fixture  # never mix fixture and real evidence (spec 18)
-        ]
+            ):
+                if c.is_fixture == is_fixture:  # never mix fixture and real evidence (spec 18)
+                    found.setdefault(c.id, c)
+        # Same order and bound as one lookup: newest first, at most MAX_CANDIDATES.
+        candidates = sorted(found.values(), key=lambda c: (-c.observed_at.timestamp(), str(c.id)))
+        candidates = candidates[:MAX_CANDIDATES]
         rule_sets = await valuation_repo.list_rule_sets(
             conn, actor, jurisdiction=options.tax_jurisdiction, statuses=[TaxRuleStatus.ACTIVE]
         )
@@ -459,6 +471,11 @@ def _input_warnings(built: BuiltTaxInputs, *, calculated: bool) -> tuple[str, ..
     return tuple(dict.fromkeys(n[:500] for n in notes))
 
 
+def _taxonomy(ctx: RuntimeContext) -> VehicleTaxonomy:
+    """The runtime's taxonomy override, else the repository taxonomy (canonical model names)."""
+    return ctx.taxonomy if ctx.taxonomy is not None else default_taxonomy()
+
+
 def _selection(ctx: RuntimeContext, reads: ValuationReads) -> tuple[RuleSelection, StoredRuleSet | None]:
     options = ctx.options
     selection = select_rule_set(
@@ -546,8 +563,11 @@ async def _value_and_commit(
         reads.normalized, listing_id=reads.listing.id, is_fixture=reads.is_fixture
     )
     stored_rates = list(reads.reference_rates.values())
-    result = select_comparables(
-        target, reads.candidates, reads.config, reads.as_of, [r.rate for r in stored_rates]
+    taxonomy = _taxonomy(ctx)
+    rates = [r.rate for r in stored_rates]
+    result = select_comparables(target, reads.candidates, reads.config, reads.as_of, rates, taxonomy=taxonomy)
+    estimates = select_comparables(
+        target, reads.candidates, reads.config, reads.as_of, rates, owner_estimates=True, taxonomy=taxonomy
     )
     selection, stored_rule = _selection(ctx, reads)
     country = reads.normalized.location.country or reads.source.country
@@ -575,9 +595,18 @@ async def _value_and_commit(
         )
     )
     purchase = _purchase(screening, revision.id, reads.import_values)
+    # No MK asking or sale evidence at all: the owner's estimate is the only orientation (labelled;
+    # it never overrides market evidence). Its FX rate, if any, is a dependency like a comparable's.
+    fallback = proceeds_from_owner_estimates(estimates)
+    use_estimates = (
+        fallback.status != CostLineStatus.UNKNOWN
+        and proceeds_from_comparables(result, reads.config.negotiation_discount_pct).status
+        == CostLineStatus.UNKNOWN
+    )
+    priced = [*result.selected, *(estimates.selected if use_estimates else ())]
     comparable_rates = [
         reads.reference_rates[c]
-        for c in sorted({s.observation.amount.currency for s in result.selected if s.observation.amount})
+        for c in sorted({s.observation.amount.currency for s in priced if s.observation.amount})
         if c in reads.reference_rates
     ]
     all_rates = stored_rates + ([reads.customs_rate] if reads.customs_rate is not None else [])
@@ -610,11 +639,14 @@ async def _value_and_commit(
             proceeds: ProceedsEstimate | None = None
             scenarios = None
             if stored_set is not None:
-                proceeds = ProceedsEstimate(
-                    **proceeds_from_comparables(
+                basis = (
+                    fallback
+                    if use_estimates
+                    else proceeds_from_comparables(
                         result, reads.config.negotiation_discount_pct, comparable_set_id=stored_set.id
-                    ).as_proceeds_estimate_kwargs()
+                    )
                 )
+                proceeds = ProceedsEstimate(**basis.as_proceeds_estimate_kwargs())
                 scenarios = compute_scenarios(
                     purchase,
                     lines,

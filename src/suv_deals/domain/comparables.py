@@ -26,7 +26,14 @@ Business rules (spec 15):
   and the others are recorded as ``DUPLICATE_OF_CLUSTER`` with the kept id.
 - Evidence kinds are never mixed: statistics are computed per ``EvidenceKind``. Removed or
   sold-claimed listings stay *asking-price* evidence; an advertised price at removal is never a
-  sale price. ``owner_estimate`` is an assumption, not a comparable.
+  sale price. ``owner_estimate`` is an assumption, not a comparable: it never enters a market
+  set. ``select_comparables(..., owner_estimates=True)`` instead selects ONLY the owner's
+  estimates (same matching rules, never ``adequate``, always ``research_needed``) so a valuation
+  without any MK market evidence can still show a labelled owner-estimate orientation
+  (``proceeds_from_owner_estimates``); it never replaces asking-price or sale evidence.
+- Names: with a ``taxonomy`` the make and model of the target and of every candidate are compared
+  by their canonical taxonomy names (``Skoda``/``Škoda``, ``Mokka X``/``Mokka``), so an imported
+  MK row and a foreign listing that spell the same model differently still match.
 - Statistics: n, min, max and median always (for n >= 1); quartiles only when n >= 5. Small
   samples are labelled; seller-reported sale statistics are labelled ``unverified_claims`` at any
   size; every individual point stays visible next to the aggregate. The MK band fit compares
@@ -58,6 +65,7 @@ from suv_deals.clock import ensure_utc
 from suv_deals.domain.enums import (
     Availability,
     ClaimStatus,
+    Confidence,
     CostLineStatus,
     Drive,
     EvidenceKind,
@@ -71,9 +79,10 @@ from suv_deals.domain.enums import (
 from suv_deals.domain.listings import NormalizedListing, VehicleSpec
 from suv_deals.domain.money import FxRate, Money, convert_to_eur, to_decimal
 from suv_deals.domain.profiles import MK_ASKING_BAND_MAX_EUR, MK_ASKING_BAND_MIN_EUR
+from suv_deals.domain.taxonomy import VehicleTaxonomy
 from suv_deals.errors import ValidationFailed
 
-CRITERIA_VERSION: Final = "mk-comparables@1.1.0"
+CRITERIA_VERSION: Final = "mk-comparables@1.2.0"
 
 #: Relative engine tolerances (spec 15 work package: displacement 10 %, power 15 %).
 DISPLACEMENT_TOLERANCE: Final = Decimal("0.10")
@@ -95,6 +104,9 @@ MATCH_WEIGHTS: Final[dict[str, Decimal]] = {
 }
 #: Evidence kinds whose selected count can make a set adequate (seller sale claims are unverified).
 ADEQUACY_KINDS: Final = (EvidenceKind.ASKING_PRICE, EvidenceKind.VERIFIED_SALE)
+#: The only kind an owner-estimate selection counts (it is never an adequate market sample).
+OWNER_ESTIMATE_KINDS: Final = (EvidenceKind.OWNER_ESTIMATE,)
+OWNER_ESTIMATE_LABEL: Final = "owner estimate (the owner's assumption; not MK market evidence)"
 _AMOUNT_QUANTUM: Final = Decimal("0.000001")
 _CENT: Final = Decimal("0.01")
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
@@ -299,6 +311,29 @@ class ComparableTarget(BaseModel):
             is_fixture=is_fixture,
         )
 
+    def with_canonical_names(self, taxonomy: VehicleTaxonomy | None) -> ComparableTarget:
+        """This target with the taxonomy's canonical make and model (see `canonical_names`)."""
+        make, model = canonical_names(taxonomy, self.make, self.model)
+        if (make, model) == (self.make, self.model):
+            return self
+        return self.model_copy(update={"make": make, "model": model})
+
+
+def canonical_names(
+    taxonomy: VehicleTaxonomy | None, make: str | None, model: str | None
+) -> tuple[str | None, str | None]:
+    """The taxonomy's canonical make and model (``Skoda``/``Mokka X`` -> ``Škoda``/``Mokka``).
+
+    Only a confident match of both fields counts (a model name that starts with a known alias);
+    anything else keeps the names as given, so an unknown model still matches only itself.
+    """
+    if taxonomy is None or not make or not model:
+        return make, model
+    match = taxonomy.match_vehicle(make, model, None, None)
+    if match.confidence != Confidence.HIGH or match.make is None or match.model is None:
+        return make, model
+    return match.make, match.model
+
 
 # ---------------------------------------------------------------------------------------------
 # Output models
@@ -474,12 +509,20 @@ def select_comparables(
     config: ComparableConfig,
     as_of: datetime,
     fx_rates: Sequence[FxRate] = (),
+    *,
+    owner_estimates: bool = False,
+    taxonomy: VehicleTaxonomy | None = None,
 ) -> ComparableSetResult:
     """Select, exclude and summarise MK comparables for ``target`` (spec 15).
 
     Deterministic: the same inputs always produce the same result, independent of candidate
     order. Raises ``ValidationFailed`` for malformed input (duplicate ids, too many candidates,
     naive ``as_of``).
+
+    ``owner_estimates=True`` selects only ``owner_estimate`` rows (every other kind is excluded
+    as ``NOT_COMPARABLE_EVIDENCE_KIND``): widening stops at the first admitted estimate, the
+    status is never ``adequate`` and research stays needed. ``taxonomy`` compares make and model
+    by canonical names (module docstring).
     """
     as_of = _aware(as_of)
     if len(candidates) > MAX_CANDIDATES:
@@ -488,6 +531,7 @@ def select_comparables(
     if len(set(ids)) != len(ids):
         raise ValidationFailed("duplicate market observation ids in comparable candidates")
     criteria = _criteria(config)
+    target = target.with_canonical_names(taxonomy)
     warnings = _target_warnings(target)
     currencies = {
         c.amount.currency for c in candidates if c.amount is not None and c.amount.currency != "EUR"
@@ -495,11 +539,16 @@ def select_comparables(
     rates, fx_warnings = _usable_rates(fx_rates, as_of, currencies)
     warnings.extend(fx_warnings)
 
+    kinds = OWNER_ESTIMATE_KINDS if owner_estimates else ADEQUACY_KINDS
+    names = _NameResolver(taxonomy)
     ordered = sorted(candidates, key=lambda c: str(c.id))
-    evaluations = [_evaluate(target, obs, criteria, as_of, rates) for obs in ordered]
+    evaluations = [
+        _evaluate(target, obs, criteria, as_of, rates, kinds=kinds, names=names) for obs in ordered
+    ]
     duplicates = _dedupe(evaluations)
 
-    level, steps = _widen(evaluations, duplicates, criteria)
+    # An owner estimate is one reference point per model: admit the closest, never widen for more.
+    level, steps = _widen(evaluations, duplicates, criteria, kinds, 1 if owner_estimates else None)
 
     selected: list[SelectedComparable] = []
     excluded: list[ExcludedComparable] = []
@@ -547,9 +596,9 @@ def select_comparables(
         for kind in EvidenceKind
         if any(s.evidence_kind == kind for s in selected)
     )
-    adequacy = _adequacy_count(selected)
+    adequacy = _adequacy_count(selected, kinds)
     status: ComparableStatus
-    if adequacy >= criteria.min_sample:
+    if adequacy >= criteria.min_sample and not owner_estimates:
         status = "adequate"
     elif adequacy > 0:
         status = "small_sample"
@@ -557,6 +606,10 @@ def select_comparables(
         status = "insufficient_comparables"
     if any(s.evidence_kind == EvidenceKind.SELLER_REPORTED_SALE for s in selected):
         warnings.append("SELLER_REPORTED_SALES_UNVERIFIED: seller sale claims never make a set adequate")
+    if owner_estimates:
+        warnings.append(
+            "OWNER_ESTIMATES_ONLY: the owner's own estimates, not MK market evidence; research needed"
+        )
     asking_amounts = sorted(s.amount_eur for s in selected if s.evidence_kind == EvidenceKind.ASKING_PRICE)
     fit, basis = _band_fit(
         next((s for s in stats if s.evidence_kind == EvidenceKind.ASKING_PRICE), None),
@@ -574,9 +627,25 @@ def select_comparables(
         widening_steps=tuple(steps),
         mk_band_fit=fit,
         mk_band_fit_basis=basis,
-        research_needed=status != "adequate",
+        research_needed=owner_estimates or status != "adequate",
         warnings=tuple(warnings),
     )
+
+
+class _NameResolver:
+    """Canonical (make, model) per raw pair, memoised for one selection (internal)."""
+
+    __slots__ = ("_cache", "_taxonomy")
+
+    def __init__(self, taxonomy: VehicleTaxonomy | None) -> None:
+        self._taxonomy = taxonomy
+        self._cache: dict[tuple[str | None, str | None], tuple[str | None, str | None]] = {}
+
+    def __call__(self, make: str | None, model: str | None) -> tuple[str | None, str | None]:
+        key = (make, model)
+        if key not in self._cache:
+            self._cache[key] = canonical_names(self._taxonomy, make, model)
+        return self._cache[key]
 
 
 def _criteria(config: ComparableConfig) -> MatchingCriteria:
@@ -667,10 +736,13 @@ def _evaluate(
     criteria: MatchingCriteria,
     as_of: datetime,
     rates: list[FxRate],
+    *,
+    kinds: tuple[EvidenceKind, ...],
+    names: _NameResolver,
 ) -> _Evaluation:
     ev = _Evaluation(obs)
-    _prefilter(ev, target, criteria, as_of, rates)
-    _match_identity(ev, target)
+    _prefilter(ev, target, criteria, as_of, rates, kinds=kinds)
+    _match_identity(ev, target, names)
     _match_engine(ev, target)
     _match_powertrain(ev, target)
     _match_year(ev, target, criteria)
@@ -686,13 +758,16 @@ def _prefilter(
     criteria: MatchingCriteria,
     as_of: datetime,
     rates: list[FxRate],
+    *,
+    kinds: tuple[EvidenceKind, ...],
 ) -> None:
     obs = ev.obs
     if obs.market != "MK":
         ev.prefilter.append(ExclusionReason.WRONG_MARKET)
     if obs.is_fixture != target.is_fixture:
         ev.prefilter.append(ExclusionReason.FIXTURE_MISMATCH)
-    if obs.evidence_kind == EvidenceKind.OWNER_ESTIMATE:
+    # A market set never holds an owner estimate; an owner-estimate set holds nothing else.
+    if (obs.evidence_kind == EvidenceKind.OWNER_ESTIMATE) != (kinds == OWNER_ESTIMATE_KINDS):
         ev.prefilter.append(ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND)
     if obs.amount is None or obs.amount.amount == 0:
         # A zero amount is "price on request" or a parse artefact: unknown, never EUR 0.
@@ -717,10 +792,11 @@ def _prefilter(
         )
 
 
-def _match_identity(ev: _Evaluation, target: ComparableTarget) -> None:
+def _match_identity(ev: _Evaluation, target: ComparableTarget, names: _NameResolver) -> None:
     vehicle = ev.obs.vehicle
+    c_make_name, c_model_name = names(vehicle.make, vehicle.model)
     t_make, t_model = _norm(target.make), _norm(target.model)
-    c_make, c_model = _norm(vehicle.make), _norm(vehicle.model)
+    c_make, c_model = _norm(c_make_name), _norm(c_model_name)
     if not (t_make and t_model and c_make and c_model):
         ev.reject(ExclusionReason.MODEL_UNKNOWN, "make or model missing on target or comparable")
     elif (t_make, t_model) != (c_make, c_model):
@@ -1066,9 +1142,15 @@ def _dedupe(evaluations: list[_Evaluation]) -> dict[UUID, UUID]:
 
 
 def _widen(
-    evaluations: list[_Evaluation], duplicates: dict[UUID, UUID], criteria: MatchingCriteria
+    evaluations: list[_Evaluation],
+    duplicates: dict[UUID, UUID],
+    criteria: MatchingCriteria,
+    kinds: tuple[EvidenceKind, ...],
+    required: int | None,
 ) -> tuple[int, list[WideningStep]]:
-    """Apply widening steps one dimension at a time while the adequacy count is below minimum."""
+    """Apply widening steps one dimension at a time while the count of ``kinds`` is below
+    ``required`` (default ``min_sample``)."""
+    needed = criteria.min_sample if required is None else required
     eligible = [
         ev
         for ev in evaluations
@@ -1077,14 +1159,14 @@ def _widen(
 
     def adequacy_at(level: int) -> tuple[int, int]:
         admitted = [ev for ev in eligible if ev.required_level() <= level]
-        counts = {kind: sum(1 for ev in admitted if ev.obs.evidence_kind == kind) for kind in ADEQUACY_KINDS}
+        counts = {kind: sum(1 for ev in admitted if ev.obs.evidence_kind == kind) for kind in kinds}
         return len(admitted), max(counts.values())
 
     level = 0
     steps: list[WideningStep] = []
     _, adequacy = adequacy_at(level)
     max_level = len(_WIDEN_ORDER)
-    while adequacy < criteria.min_sample and level < max_level:
+    while adequacy < needed and level < max_level:
         if not any(ev.required_level() > level for ev in eligible):
             break  # nothing further could be admitted; do not record empty widening
         level += 1
@@ -1140,9 +1222,11 @@ def _match_level(differences: Iterable[MatchDifference]) -> MatchLevel:
     return level
 
 
-def _adequacy_count(selected: Iterable[SelectedComparable]) -> int:
+def _adequacy_count(
+    selected: Iterable[SelectedComparable], kinds: tuple[EvidenceKind, ...] = ADEQUACY_KINDS
+) -> int:
     items = list(selected)
-    return max(sum(1 for s in items if s.evidence_kind == kind) for kind in ADEQUACY_KINDS)
+    return max(sum(1 for s in items if s.evidence_kind == kind) for kind in kinds)
 
 
 def _kind_order(kind: EvidenceKind) -> int:
@@ -1158,7 +1242,9 @@ def _stats(kind: EvidenceKind, items: list[SelectedComparable], min_sample: int)
     values = sorted(s.amount_eur for s in items)
     n = len(values)
     label: SampleLabel
-    if kind not in ADEQUACY_KINDS:
+    if kind == EvidenceKind.OWNER_ESTIMATE:
+        label = "single_observation" if n == 1 else "small_sample"  # an assumption is never adequate
+    elif kind not in ADEQUACY_KINDS:
         label = "unverified_claims"  # seller sale claims never become an adequate sample
     elif n == 1:
         label = "single_observation"
@@ -1240,7 +1326,7 @@ def _band_fit(
 # Proceeds
 # ---------------------------------------------------------------------------------------------
 
-ProceedsBasis = Literal["mk_asking_prices", "verified_sales"]
+ProceedsBasis = Literal["mk_asking_prices", "verified_sales", "owner_estimate"]
 DISCOUNT_UNKNOWN_LABEL: Final = "asking-based; discount unknown"
 
 
@@ -1421,6 +1507,51 @@ def proceeds_from_comparables(
         labels=tuple(labels),
         research_needed=result.research_needed,
         sensitivity=sensitivity,
+    )
+
+
+def proceeds_from_owner_estimates(result: ComparableSetResult) -> ComparableProceeds:
+    """Labelled proceeds from an owner-estimate selection (``select_comparables(owner_estimates=True)``).
+
+    The orientation used only while a target has no MK market evidence at all: base = median of
+    the matched estimates, low/high = min/max (quartiles from n >= 5). No negotiation discount
+    applies (an estimate is not an asking price), it is never an approved assumption and research
+    stays needed. No matched estimate -> ``unknown``. A market selection never holds estimates,
+    so it also returns ``unknown``.
+    """
+    estimate = result.stats_for(EvidenceKind.OWNER_ESTIMATE)
+    if estimate is None:
+        return ComparableProceeds(
+            status=CostLineStatus.UNKNOWN,
+            low=None,
+            base=None,
+            high=None,
+            basis="owner_estimate",
+            evidence_kind=None,
+            sample_size=0,
+            negotiation_discount_pct=None,
+            evidence_ids=(),
+            labels=("no matching owner estimate", "research needed; no MK comparable proceeds evidence"),
+            research_needed=True,
+        )
+    low, high = _range(estimate)
+    spread = (
+        "low/high are the first/third quartiles"
+        if estimate.n >= QUARTILE_MIN_SAMPLE
+        else "low/high are min/max of the matched estimates"
+    )
+    return ComparableProceeds(
+        status=CostLineStatus.ESTIMATED,
+        low=low,
+        base=Money.of(estimate.median, "EUR"),
+        high=high,
+        basis="owner_estimate",
+        evidence_kind=EvidenceKind.OWNER_ESTIMATE,
+        sample_size=estimate.n,
+        negotiation_discount_pct=None,
+        evidence_ids=tuple(str(p.observation_id) for p in estimate.points),
+        labels=(OWNER_ESTIMATE_LABEL, f"{estimate.n} matched estimate(s); {spread}", "research needed"),
+        research_needed=True,
     )
 
 

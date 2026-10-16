@@ -325,7 +325,7 @@
             "additionalProperties": false,
             "properties": {
               "criteria_version": {
-                "default": "mk-comparables@1.1.0",
+                "default": "mk-comparables@1.2.0",
                 "type": "string"
               },
               "displacement_tolerance": {
