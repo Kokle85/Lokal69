@@ -10,15 +10,18 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from hypothesis import given, settings
+from hypothesis import find, given, settings
 from hypothesis import strategies as st
 
 from suv_deals.domain.comparables import (
     ADEQUACY_KINDS,
+    ORIENTATION_HARD,
     QUARTILE_MIN_SAMPLE,
     ComparableTarget,
     ExclusionReason,
     MarketObservation,
+    ad_url_key,
+    orient_comparables,
     quantile,
     select_comparables,
 )
@@ -52,6 +55,20 @@ class Windows:
 
 
 _2WD = {Drive.FWD, Drive.RWD}
+_DUPLICATE_REASONS = {ExclusionReason.DUPLICATE_OF_CLUSTER, ExclusionReason.DUPLICATE_OF_URL}
+#: The only reasons an orientation excludes a candidate: the prefilter, identity, condition and duplicates.
+_ORIENTATION_EXCLUSIONS = {
+    ExclusionReason.WRONG_MARKET,
+    ExclusionReason.FIXTURE_MISMATCH,
+    ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND,
+    ExclusionReason.PRICE_MISSING,
+    ExclusionReason.CURRENCY_UNCONVERTIBLE,
+    ExclusionReason.OBSERVED_AFTER_AS_OF,
+    ExclusionReason.STALE,
+    *ORIENTATION_HARD,
+    *_DUPLICATE_REASONS,
+}
+_ORIENTATION_KINDS = [EvidenceKind.ASKING_PRICE, EvidenceKind.OWNER_ESTIMATE]
 
 
 @st.composite
@@ -62,7 +79,18 @@ def observation(draw: Any, index: int) -> MarketObservation:
     return MarketObservation(
         id=UUID(int=index + 1),
         source_key="fixture_mk_synthetic",
-        url="https://mk-market.example/synthetic",
+        # Unique, shared (re-recorded ad) and missing ad URLs, so URL dedup is exercised without
+        # collapsing every sample into one observation per kind.
+        url=draw(
+            st.sampled_from(
+                [
+                    f"https://mk-market.example/synthetic?ad={index}",
+                    f"https://mk-market.example/synthetic?ad={index}",
+                    "https://www.mk-market.example/synthetic/?ad=shared#photos",
+                    None,
+                ]
+            )
+        ),
         observed_at=AS_OF - timedelta(hours=draw(st.integers(-48, 24 * 120))),
         evidence_kind=draw(st.sampled_from(list(EvidenceKind))),
         amount=amount,
@@ -88,9 +116,55 @@ def observation(draw: Any, index: int) -> MarketObservation:
 
 
 @st.composite
+def near_match(draw: Any, index: int) -> MarketObservation:
+    """An observation that passes every hard check against ``TARGET`` (so selected sets of two or
+    more of one kind, adequate sets and the quartile branch are actually reached)."""
+    year = draw(st.integers(2010, 2012))
+    km = draw(st.integers(160_000, 215_000))
+    return MarketObservation(
+        id=UUID(int=index + 1),
+        source_key="fixture_mk_synthetic",
+        url=draw(
+            st.sampled_from(
+                [
+                    f"https://mk-market.example/synthetic?ad={index}",
+                    f"https://mk-market.example/synthetic?ad={index}",
+                    "https://www.mk-market.example/synthetic/?ad=shared#photos",
+                    None,
+                ]
+            )
+        ),
+        observed_at=AS_OF - timedelta(days=draw(st.integers(1, 80))),
+        evidence_kind=draw(
+            st.sampled_from(
+                [EvidenceKind.ASKING_PRICE, EvidenceKind.ASKING_PRICE, EvidenceKind.VERIFIED_SALE]
+            )
+        ),
+        amount=Money.of(draw(st.integers(6_000, 14_000)), "EUR"),
+        price_basis=PriceBasis.GROSS,
+        vehicle=VehicleSpec(
+            make="Example",
+            model="Trail",
+            generation="G2",
+            facelift=Tristate.NO,
+            engine_displacement_cm3=1995,
+            power_kw=103,
+            fuel=Fuel.DIESEL,
+            gearbox=Gearbox.MANUAL,
+            drive=Drive.AWD,
+            first_registration=PartialDate(value=str(year), precision="year"),
+            mileage_km=Decimal(km),
+        ),
+        cluster_id=draw(st.one_of(st.none(), st.integers(1, 4).map(lambda n: UUID(int=10_000 + n)))),
+        availability=Availability.AVAILABLE,
+    )
+
+
+@st.composite
 def candidate_sets(draw: Any) -> list[MarketObservation]:
     size = draw(st.integers(0, 14))
-    return [draw(observation(i)) for i in range(size)]
+    # Near matches are drawn twice as often as free observations.
+    return [draw(st.one_of(observation(i), near_match(i), near_match(i))) for i in range(size)]
 
 
 @settings(max_examples=150, deadline=None)
@@ -105,7 +179,7 @@ def test_partition_and_invariants(cands: list[MarketObservation], min_sample: in
     assert len(result.selected) + len(result.excluded) == len(cands)
     for item in result.excluded:
         assert item.reasons
-        assert (item.duplicate_of is not None) == (ExclusionReason.DUPLICATE_OF_CLUSTER in item.reasons)
+        assert (item.duplicate_of is not None) == bool(_DUPLICATE_REASONS & set(item.reasons))
     for sel in result.selected:
         obs = sel.observation
         # hard boundaries are never crossed
@@ -120,9 +194,15 @@ def test_partition_and_invariants(cands: list[MarketObservation], min_sample: in
         assert sel.weight > 0
         if sel.widened_dimensions:
             assert sel.match_level == "widened"
-    # one kept observation per (cluster, kind)
+    # one kept observation per (cluster, kind) and per (ad URL, kind)
     kept = [(s.observation.cluster_id, s.evidence_kind) for s in result.selected if s.observation.cluster_id]
     assert len(kept) == len(set(kept))
+    ads = [
+        (ad_url_key(s.observation.url), s.evidence_kind)
+        for s in result.selected
+        if s.observation.url is not None
+    ]
+    assert len(ads) == len(set(ads))
 
 
 @settings(max_examples=150, deadline=None)
@@ -172,6 +252,47 @@ def test_order_independent(cands: list[MarketObservation], seed: Any) -> None:
     )
 
 
+@settings(max_examples=150, deadline=None)
+@given(cands=candidate_sets(), kind=st.sampled_from(_ORIENTATION_KINDS), limit=st.integers(1, 8))
+def test_orientation_invariants(cands: list[MarketObservation], kind: EvidenceKind, limit: int) -> None:
+    result = orient_comparables(TARGET, cands, Windows(3), AS_OF, kind=kind, limit=limit)
+    points = {p.observation_id for p in result.points}
+    excluded = {e.observation_id for e in result.excluded}
+    assert points.isdisjoint(excluded)
+    # every candidate is excluded or eligible; the nearest ``limit`` eligible ones are the points
+    assert result.eligible_count + len(result.excluded) == len(cands)
+    assert len(result.points) == min(limit, result.eligible_count)
+    for item in result.excluded:
+        assert item.reasons and set(item.reasons) <= _ORIENTATION_EXCLUSIONS
+        assert (item.duplicate_of is not None) == bool(_DUPLICATE_REASONS & set(item.reasons))
+    distances = [p.distance for p in result.points]
+    assert distances == sorted(distances) and all(d >= 0 for d in distances)
+    assert [p.rank for p in result.points] == list(range(1, len(result.points) + 1))
+    for point in result.points:
+        obs = point.observation
+        assert obs.evidence_kind == point.evidence_kind == kind  # one evidence kind only
+        assert (obs.vehicle.make, obs.vehicle.model) == ("Example", "Trail")  # same model always
+        assert obs.amount is not None and obs.amount.amount > 0
+        assert AS_OF - timedelta(days=90) <= obs.observed_at <= AS_OF
+    ads = [ad_url_key(p.observation.url) for p in result.points if p.observation.url is not None]
+    assert len(ads) == len(set(ads))  # a re-recorded ad counts once
+    # A candidate the strict set selects is never excluded by the orientation of its kind.
+    strict = select_comparables(TARGET, cands, Windows(3), AS_OF)
+    assert not {s.observation_id for s in strict.selected if s.evidence_kind == kind} & excluded
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    cands=candidate_sets(), kind=st.sampled_from(_ORIENTATION_KINDS), seed=st.randoms(use_true_random=False)
+)
+def test_orientation_order_independent(cands: list[MarketObservation], kind: EvidenceKind, seed: Any) -> None:
+    shuffled = list(cands)
+    seed.shuffle(shuffled)
+    assert orient_comparables(TARGET, cands, Windows(3), AS_OF, kind=kind) == orient_comparables(
+        TARGET, shuffled, Windows(3), AS_OF, kind=kind
+    )
+
+
 @settings(max_examples=200, deadline=None)
 @given(
     values=st.lists(st.integers(1, 10_000_000), min_size=1, max_size=40),
@@ -183,3 +304,15 @@ def test_quantile_monotone_and_bounded(values: list[int], p1: int, p2: int) -> N
     lo, hi = sorted((Decimal(p1) / 100, Decimal(p2) / 100))
     q_lo, q_hi = quantile(ordered, lo), quantile(ordered, hi)
     assert ordered[0] <= q_lo <= q_hi <= ordered[-1]
+
+
+def test_the_generator_reaches_adequate_sets_and_quartiles() -> None:
+    """Guard: the strategies above produce multi-member, adequate and quartile-size sets."""
+
+    def quartile_sized(cands: list[MarketObservation]) -> bool:
+        stats = select_comparables(TARGET, cands, Windows(3), AS_OF).stats_for(EvidenceKind.ASKING_PRICE)
+        return stats is not None and stats.n >= QUARTILE_MIN_SAMPLE
+
+    example = find(candidate_sets(), quartile_sized, settings=settings(max_examples=500, database=None))
+    result = select_comparables(TARGET, example, Windows(3), AS_OF)
+    assert result.status == "adequate"

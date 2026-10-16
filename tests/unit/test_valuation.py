@@ -691,3 +691,94 @@ def test_a_customs_rate_expires_with_its_month() -> None:
     assert _expiry(None, None, None, [september], 7, as_of=AS_OF) == (None, [])
     valuation = assemble(tax=None, comparable=None, scenario_set=None, fx_rates=[_customs(date(2026, 10, 1))])
     assert valuation.expires_at is not None and valuation.expires_at <= datetime(2026, 11, 1, tzinfo=UTC)
+
+
+# --------------------------------------------------------------------------- MK orientation (ADR 0005)
+
+
+def _asking_proceeds(**kw: Any) -> ProceedsEstimate:
+    values: dict[str, Any] = {
+        "status": S.ESTIMATED,
+        "currency": "EUR",
+        "base": eur("9000.00"),
+        "basis": "mk_asking_prices",
+        "evidence_ids": ("SYNTHETIC-mk-ad-1",),
+    }
+    values.update(kw)
+    return ProceedsEstimate(**values)
+
+
+def test_asking_price_orientation_is_not_incomplete_for_its_proceeds() -> None:
+    calc = active_calc()
+    set_ = scenarios(calc, sell=_asking_proceeds())
+    insufficient = comparable(quality="insufficient_comparables", sample_size=0, fresh_until=None)
+    strict = assemble(tax=calc, scenario_set=set_, comparable=insufficient)
+    assert strict.state == ValuationState.INCOMPLETE
+    assert "proceeds: insufficient_comparables for an asking-price basis" in strict.unknowns
+
+    oriented = assemble(tax=calc, scenario_set=set_, comparable=insufficient, proceeds_orientation=True)
+    assert oriented.state == ValuationState.ESTIMATED
+    assert not any("insufficient_comparables" in u for u in oriented.unknowns)
+    assert any(w.startswith("PROCEEDS_FROM_MK_ORIENTATION") for w in oriented.warnings)
+    assert any(w.startswith("INSUFFICIENT_COMPARABLES") for w in oriented.warnings)  # spec-15 set
+    assert oriented.base_contribution is not None
+    # The keyword is no dependency: the proceeds are already in cost_inputs_sha256.
+    assert oriented.dependency_fingerprint == strict.dependency_fingerprint
+
+
+def test_orientation_is_never_alert_eligible() -> None:
+    calc = active_calc()
+    sell = _asking_proceeds(
+        low=eur("8800.00"),
+        negotiation_discount_pct=Decimal("5"),
+        discount_approved=True,
+        assumption_approved=True,
+    )
+    ready = scenarios(calc, quoted=True, threshold=APPROVED, sell=sell)
+    assert assemble(tax=calc, scenario_set=ready).alert_eligible  # the same figures from a real set
+    oriented = assemble(tax=calc, scenario_set=ready, proceeds_orientation=True)
+    assert oriented.state == ValuationState.QUOTE_SUPPORTED
+    assert not oriented.alert_eligible and not oriented.can_notify
+
+
+def test_orientation_flag_only_labels_an_asking_price_basis() -> None:
+    valuation = assemble(proceeds_orientation=True)  # owner_estimate basis (builder default)
+    assert not any(w.startswith("PROCEEDS_FROM_MK_ORIENTATION") for w in valuation.warnings)
+    assert any(w.startswith("PROCEEDS_FROM_OWNER_ESTIMATE") for w in valuation.warnings)
+
+
+def test_proceeds_freshness_joins_the_expiry_deadlines() -> None:
+    soon = AS_OF + timedelta(days=1)
+    valuation = assemble(proceeds_fresh_until=soon)
+    assert valuation.expires_at == soon
+    later = assemble(proceeds_fresh_until=AS_OF + timedelta(days=30))
+    assert later.expires_at == AS_OF + timedelta(days=3)  # the comparable freshness stays earliest
+    expired = assemble(proceeds_fresh_until=AS_OF - timedelta(days=1))
+    assert expired.state == ValuationState.STALE and not expired.alert_eligible
+    assert expired.stale_reason is not None
+    assert "MK orientation / owner estimate evidence freshness" in expired.stale_reason
+    assert expired.dependency_fingerprint == assemble().dependency_fingerprint
+
+
+def test_orientation_and_owner_estimate_valuations_stay_research_candidates() -> None:
+    # ADR 0004/0005: figures from proceeds outside a spec-15 comparable set are an orientation.
+    calc = active_calc()
+    insufficient = comparable(quality="insufficient_comparables", sample_size=0, fresh_until=None)
+    oriented = assemble(
+        tax=calc,
+        scenario_set=scenarios(calc, sell=_asking_proceeds()),
+        comparable=insufficient,
+        proceeds_orientation=True,
+    )
+    assert oriented.state == ValuationState.ESTIMATED and oriented.base_contribution is not None
+    assert oriented.research_candidate
+    estimate = assemble(proceeds_fallback=True)  # the owner's estimates as the ADR 0004 fallback
+    assert estimate.state == ValuationState.ESTIMATED and estimate.base_contribution is not None
+    assert estimate.research_candidate
+    assert not assemble().research_candidate  # the same basis passed as the caller's own input
+    approved = assemble(tax=calc, scenario_set=_alert_ready(calc), proceeds_fallback=True)
+    assert approved.research_candidate and not approved.alert_eligible
+    assert (
+        approved.dependency_fingerprint
+        == assemble(tax=calc, scenario_set=_alert_ready(calc)).dependency_fingerprint
+    )

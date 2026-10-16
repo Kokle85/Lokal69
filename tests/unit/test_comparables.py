@@ -19,13 +19,20 @@ from suv_deals.domain import comparables as comparables_module
 from suv_deals.domain.comparables import (
     CRITERIA_VERSION,
     DISCOUNT_UNKNOWN_LABEL,
+    ORIENTATION_CLOSE,
+    ORIENTATION_LABEL,
+    ORIENTATION_LIMIT,
+    ORIENTATION_VERSION,
     ComparableTarget,
     ConditionSummary,
     DifferenceSeverity,
     ExclusionReason,
     MarketObservation,
     MatchingCriteria,
+    orient_comparables,
+    orientation_warning,
     proceeds_from_comparables,
+    proceeds_from_orientation,
     quantile,
     select_comparables,
 )
@@ -117,10 +124,12 @@ def obs(
     }
     extra = {k: vehicle.pop(k) for k in list(vehicle) if k not in VehicleSpec.model_fields}
     spec.update(vehicle)
+    oid = oid or uid()
     data: dict[str, Any] = {
-        "id": oid or uid(),
+        "id": oid,
         "source_key": "fixture_mk_synthetic",
-        "url": "https://mk-market.example/synthetic/listing",
+        # One ad per observation (URL duplicates are tested with an explicit ``url=``).
+        "url": f"https://mk-market.example/synthetic/listing?ad={oid.int}",
         "observed_at": observed_at or AS_OF - timedelta(days=3),
         "evidence_kind": kind,
         "amount": None if amount is None else Money.of(amount, currency),
@@ -559,6 +568,154 @@ def test_invalid_newest_does_not_hide_valid_cluster_member() -> None:
     result = select_comparables(target(), [valid_old, newest_no_price], Windows(min_sample=1), AS_OF)
     assert selected_ids(result) == {valid_old.id}
     assert reasons_of(result, newest_no_price.id) == (ExclusionReason.PRICE_MISSING,)
+
+
+AD = "https://www.reklama5.example/AdDetails?ad=4711"  # SYNTHETIC ad URL shape (query = ad id)
+
+
+@pytest.mark.parametrize(
+    ("url", "key"),
+    [
+        ("https://www.reklama5.example/AdDetails?ad=4711", "reklama5.example/AdDetails?ad=4711"),
+        ("http://reklama5.example/AdDetails?ad=4711#photos", "reklama5.example/AdDetails?ad=4711"),
+        ("https://WWW.Reklama5.Example:443/AdDetails/?ad=4711", "reklama5.example/AdDetails?ad=4711"),
+        ("https://user:secret@pazar3.example/ad/77/", "pazar3.example/ad/77"),
+        ("https://pazar3.example/", "pazar3.example"),
+        ("https://pazar3.example/ad/77?", "pazar3.example/ad/77"),
+        (None, None),
+        ("https:///no-host", None),
+        ("https://[::1", None),  # malformed IPv6 host: no key, never an error
+    ],
+)
+def test_ad_url_key_normalises_only_what_names_the_same_ad(url: str | None, key: str | None) -> None:
+    assert comparables_module.ad_url_key(url) == key
+
+
+def test_ad_url_key_keeps_the_query_and_the_path_case() -> None:
+    key = comparables_module.ad_url_key
+    assert key("https://reklama5.example/AdDetails?ad=1") != key("https://reklama5.example/AdDetails?ad=2")
+    assert key("https://pazar3.example/Ad/1") != key("https://pazar3.example/ad/1")
+
+
+def test_same_ad_url_recorded_daily_counts_once_and_keeps_the_newest() -> None:
+    days = [obs(url=AD, observed_at=AS_OF - timedelta(days=d), amount=str(9000 + d * 10)) for d in (5, 3, 1)]
+    other = obs()
+    result = select_comparables(target(), [*days, other], DEFAULT, AS_OF)
+    newest = days[-1]
+    assert selected_ids(result) == {newest.id, other.id}
+    for older in days[:-1]:
+        dup = next(e for e in result.excluded if e.observation_id == older.id)
+        assert dup.reasons == (ExclusionReason.DUPLICATE_OF_URL,)
+        assert dup.duplicate_of == newest.id
+        assert any(d.startswith("DUPLICATE_OF_URL: same ad url re-recorded") for d in dup.details)
+        assert not any(AD in d for d in dup.details)  # the URL is never echoed
+    assert result.stats_for(EvidenceKind.ASKING_PRICE).n == 2  # type: ignore[union-attr]
+
+
+def test_url_variants_of_one_ad_are_duplicates_but_other_ads_are_not() -> None:
+    a = obs(url="https://reklama5.example/AdDetails?ad=4711", observed_at=AS_OF - timedelta(days=2))
+    b = obs(url="http://www.reklama5.example/AdDetails/?ad=4711#top", observed_at=AS_OF - timedelta(days=1))
+    c = obs(url="https://reklama5.example/AdDetails?ad=4712", observed_at=AS_OF - timedelta(days=2))
+    result = select_comparables(target(), [a, b, c], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {b.id, c.id}
+    assert reasons_of(result, a.id) == (ExclusionReason.DUPLICATE_OF_URL,)
+
+
+def test_url_duplicates_tie_break_by_id() -> None:
+    a = obs(url=AD, oid=uid(9101))
+    b = obs(url=AD, oid=uid(9102))
+    result = select_comparables(target(), [b, a], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {a.id}
+    assert reasons_of(result, b.id) == (ExclusionReason.DUPLICATE_OF_URL,)
+
+
+def test_url_dedupe_is_per_evidence_kind() -> None:
+    asking = obs(url=AD)
+    sale = obs(url=AD, kind=EvidenceKind.VERIFIED_SALE, amount="8600")
+    result = select_comparables(target(), [asking, sale], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {asking.id, sale.id}
+
+
+def test_newer_url_record_without_price_does_not_hide_the_valid_one() -> None:
+    valid_old = obs(url=AD, observed_at=AS_OF - timedelta(days=5))
+    newest_no_price = obs(url=AD, observed_at=AS_OF - timedelta(days=1), amount=None)
+    result = select_comparables(target(), [valid_old, newest_no_price], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {valid_old.id}
+    assert reasons_of(result, newest_no_price.id) == (ExclusionReason.PRICE_MISSING,)
+
+
+def test_newer_re_record_failing_a_hard_check_never_hides_the_complete_one() -> None:
+    # ADR 0005 decision 6: the newest row that passes the hard checks is kept, not just the newest.
+    old_full = obs(url=AD, observed_at=AS_OF - timedelta(days=2))
+    new_gap = obs(url=AD, observed_at=AS_OF - timedelta(days=1), km=None)  # lost its mileage
+    new_far = obs(url=AD, observed_at=AS_OF - timedelta(hours=1), year=2016)  # out of every window
+    result = select_comparables(target(), [old_full, new_gap, new_far], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {old_full.id}
+    assert set(reasons_of(result, new_gap.id)) == {
+        ExclusionReason.MILEAGE_UNKNOWN,
+        ExclusionReason.DUPLICATE_OF_URL,
+    }
+    assert set(reasons_of(result, new_far.id)) == {
+        ExclusionReason.YEAR_OUT_OF_WINDOW,
+        ExclusionReason.DUPLICATE_OF_URL,
+    }
+    assert {e.duplicate_of for e in result.excluded} == {old_full.id}
+    assert any(
+        d.startswith(f"DUPLICATE_OF_URL: same ad url re-recorded; kept {old_full.id}")
+        for e in result.excluded
+        for d in e.details
+    )
+
+
+def test_without_an_eligible_re_record_the_newest_is_kept() -> None:
+    older = obs(url=AD, observed_at=AS_OF - timedelta(days=2), km=None)
+    newer = obs(url=AD, observed_at=AS_OF - timedelta(days=1), km=None)
+    result = select_comparables(target(), [older, newer], Windows(min_sample=1), AS_OF)
+    assert result.selected == ()
+    assert reasons_of(result, newer.id) == (ExclusionReason.MILEAGE_UNKNOWN,)
+    assert set(reasons_of(result, older.id)) == {
+        ExclusionReason.MILEAGE_UNKNOWN,
+        ExclusionReason.DUPLICATE_OF_URL,
+    }
+
+
+def test_owner_estimates_without_url_or_cluster_are_never_deduplicated() -> None:
+    # ADR 0005 decision 5 (open point): a re-import with revised values is counted together with
+    # the old rows until they turn stale.
+    old = obs(
+        kind=EvidenceKind.OWNER_ESTIMATE, url=None, amount="9000", observed_at=AS_OF - timedelta(days=80)
+    )
+    new = obs(
+        kind=EvidenceKind.OWNER_ESTIMATE, url=None, amount="8000", observed_at=AS_OF - timedelta(days=1)
+    )
+    strict = select_comparables(target(), [old, new], DEFAULT, AS_OF, owner_estimates=True)
+    assert selected_ids(strict) == {old.id, new.id}
+    oriented = orient_comparables(target(), [old, new], DEFAULT, AS_OF, kind=EvidenceKind.OWNER_ESTIMATE)
+    assert {p.observation_id for p in oriented.points} == {old.id, new.id}
+    assert proceeds_from_orientation(oriented).base == Money.of("8500.00", "EUR")
+
+
+def test_observations_without_url_are_never_url_duplicates() -> None:
+    a, b = obs(url=None), obs(url=None)
+    result = select_comparables(target(), [a, b], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {a.id, b.id}
+
+
+def test_cluster_and_url_links_are_transitive() -> None:
+    cluster = uid(504)
+    a = obs(url=AD, cluster=cluster, observed_at=AS_OF - timedelta(days=4))
+    b = obs(url=AD, observed_at=AS_OF - timedelta(days=3))
+    c = obs(cluster=cluster, observed_at=AS_OF - timedelta(days=1))
+    result = select_comparables(target(), [a, b, c], Windows(min_sample=1), AS_OF)
+    assert selected_ids(result) == {c.id}
+    assert reasons_of(result, a.id) == (
+        ExclusionReason.DUPLICATE_OF_CLUSTER,
+        ExclusionReason.DUPLICATE_OF_URL,
+    )
+    assert reasons_of(result, b.id) == (ExclusionReason.DUPLICATE_OF_URL,)
+    assert {e.duplicate_of for e in result.excluded} == {c.id}
+    shuffled = select_comparables(target(), [c, b, a], Windows(min_sample=1), AS_OF)
+    assert shuffled == result
 
 
 # --------------------------------------------------------------------------------------------- evidence kinds
@@ -1223,3 +1380,317 @@ def test_canonical_names_keep_unknown_or_missing_names() -> None:
     assert comparables_module.canonical_names(None, "Opel", "Mokka X") == ("Opel", "Mokka X")
     unchanged = target()
     assert unchanged.with_canonical_names(taxonomy) is unchanged
+
+
+# ---------------------------------------------------------------------------------------------
+# MK price orientation: a framework, not strict rules (owner decision 2026-10-16, ADR 0005)
+# ---------------------------------------------------------------------------------------------
+
+
+def orient(cands: list[MarketObservation], kind: EvidenceKind = EvidenceKind.ASKING_PRICE, **kw: Any) -> Any:
+    t = kw.pop("tgt", None) or target()
+    return orient_comparables(t, cands, DEFAULT, AS_OF, kind=kind, **kw)
+
+
+def codes(point: Any) -> set[str]:
+    return {d.code for d in point.differences}
+
+
+def test_orientation_labels_every_relaxed_difference_instead_of_excluding() -> None:
+    petrol = obs(fuel=Fuel.PETROL, amount="8000")
+    g1 = obs(generation="G1", amount="7000")
+    old = obs(year=2008, km="250000", amount="6000")
+    automatic_fwd = obs(gearbox=Gearbox.AUTOMATIC, drive=Drive.FWD, amount="8500")
+    unknowns = obs(fuel=Fuel.UNKNOWN, year=None, km=None, amount="9500")
+    other_engine = obs(engine_displacement_cm3=1598, power_kw=85, amount="8700")
+    facelift = obs(facelift=Tristate.YES, amount="9100")
+    cands = [petrol, g1, old, automatic_fwd, unknowns, other_engine, facelift]
+    strict = select_comparables(target(), cands, DEFAULT, AS_OF)
+    # Only the facelift difference is a strict (labelled) widening step; the rest is excluded.
+    assert selected_ids(strict) == {facelift.id}
+    result = orient(cands, limit=10)
+    assert result.excluded == () and result.eligible_count == 7
+    by_id = {p.observation_id: p for p in result.points}
+    assert "orientation_fuel_mismatch" in codes(by_id[petrol.id])
+    assert by_id[petrol.id].distance == Decimal("5.25")  # fuel 5 + 7,500 km / 30,000 km
+    assert "orientation_wrong_generation" in codes(by_id[g1.id])
+    assert {"orientation_year_differs", "orientation_mileage_differs"} <= codes(by_id[old.id])
+    assert by_id[old.id].distance == Decimal("5.083333")  # 3 years + 62,500 km / 30,000 km
+    assert {"orientation_gearbox_mismatch", "orientation_drive_mismatch"} <= codes(by_id[automatic_fwd.id])
+    assert {
+        "orientation_fuel_unverified",
+        "orientation_year_unknown",
+        "orientation_mileage_unknown",
+    } <= codes(by_id[unknowns.id])
+    assert by_id[unknowns.id].distance == Decimal(3)
+    assert "orientation_engine_mismatch" in codes(by_id[other_engine.id])
+    assert "orientation_facelift_differs" in codes(by_id[facelift.id])
+    fuel = next(d for d in by_id[petrol.id].differences if d.code == "orientation_fuel_mismatch")
+    assert (fuel.dimension, fuel.severity, fuel.target, fuel.comparable) == (
+        "fuel",
+        DifferenceSeverity.DIFFERS,
+        "diesel",
+        "petrol",
+    )
+    unverified = next(d for d in by_id[unknowns.id].differences if d.code == "orientation_year_unknown")
+    assert unverified.severity == DifferenceSeverity.UNVERIFIED
+    # The strict labels stay next to the orientation labels.
+    assert "engine_code_unverified" in codes(by_id[petrol.id])
+
+
+def test_orientation_keeps_identity_condition_market_and_freshness_hard() -> None:
+    other_model = obs(model="Other")
+    no_model = obs(model=None)
+    damaged = obs(condition=ConditionSummary(damaged_vehicle=ClaimStatus.SELLER_CLAIMED))
+    stale = obs(observed_at=AS_OF - timedelta(days=200))
+    future = obs(observed_at=AS_OF + timedelta(days=1))
+    no_price = obs(amount=None)
+    mkd = obs(amount="500000", currency="MKD")  # no recorded EUR/MKD rate
+    foreign = obs(market="DE")
+    fixture = obs(is_fixture=True)
+    kept = obs()
+    result = orient([other_model, no_model, damaged, stale, future, no_price, mkd, foreign, fixture, kept])
+    assert [p.observation_id for p in result.points] == [kept.id]
+    reasons = {e.observation_id: e.reasons for e in result.excluded}
+    assert reasons[other_model.id] == (ExclusionReason.WRONG_MODEL,)
+    assert reasons[no_model.id] == (ExclusionReason.MODEL_UNKNOWN,)
+    assert reasons[damaged.id] == (ExclusionReason.CONDITION_MISMATCH,)
+    assert reasons[stale.id] == (ExclusionReason.STALE,)
+    assert reasons[future.id] == (ExclusionReason.OBSERVED_AFTER_AS_OF,)
+    assert reasons[no_price.id] == (ExclusionReason.PRICE_MISSING,)
+    assert reasons[mkd.id] == (ExclusionReason.CURRENCY_UNCONVERTIBLE,)
+    assert reasons[foreign.id] == (ExclusionReason.WRONG_MARKET,)
+    assert reasons[fixture.id] == (ExclusionReason.FIXTURE_MISMATCH,)
+
+
+def test_orientation_holds_exactly_one_evidence_kind() -> None:
+    asking = obs()
+    verified = obs(kind=EvidenceKind.VERIFIED_SALE)
+    claimed = obs(kind=EvidenceKind.SELLER_REPORTED_SALE)
+    estimate = obs(kind=EvidenceKind.OWNER_ESTIMATE, url=None)
+    cands = [asking, verified, claimed, estimate]
+    over_asking = orient(cands)
+    assert [p.observation_id for p in over_asking.points] == [asking.id]
+    assert {e.observation_id for e in over_asking.excluded} == {verified.id, claimed.id, estimate.id}
+    assert all(e.reasons == (ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND,) for e in over_asking.excluded)
+    over_estimates = orient(cands, kind=EvidenceKind.OWNER_ESTIMATE)
+    assert [p.observation_id for p in over_estimates.points] == [estimate.id]
+    assert all(p.evidence_kind == EvidenceKind.OWNER_ESTIMATE for p in over_estimates.points)
+    for bad in (EvidenceKind.VERIFIED_SALE, EvidenceKind.SELLER_REPORTED_SALE):
+        with pytest.raises(ValidationFailed):
+            orient(cands, kind=bad)
+
+
+def test_orientation_ranks_nearest_first_and_keeps_the_limit() -> None:
+    exact = obs(km="187500", amount="9000")
+    km_off = obs(km="217500", amount="9200")  # +1.0
+    year_off = obs(year=2013, km="187500", amount="9400")  # +2.0
+    petrol = obs(fuel=Fuel.PETROL, km="187500", amount="7000")  # +5.0
+    far = [obs(year=2005, km="187500", amount=str(5000 + i)) for i in range(3)]  # +6.0
+    result = orient([far[0], petrol, year_off, exact, far[1], km_off, far[2]])
+    assert result.limit == ORIENTATION_LIMIT == 5
+    assert result.eligible_count == 7 and len(result.points) == 5
+    assert [p.observation_id for p in result.points[:4]] == [exact.id, km_off.id, year_off.id, petrol.id]
+    assert [p.rank for p in result.points] == [1, 2, 3, 4, 5]
+    assert [p.distance for p in result.points[:4]] == [Decimal(0), Decimal(1), Decimal(2), Decimal(5)]
+    assert result.points[0].distance == result.nearest_distance
+    assert result.points[4].observation_id in {f.id for f in far}
+    assert len(orient([exact, km_off], limit=1).points) == 1
+    for bad in (0, 51):
+        with pytest.raises(ValidationFailed):
+            orient([exact], limit=bad)
+
+
+def test_orientation_tie_break_is_newer_first_then_smallest_id() -> None:
+    older = obs(oid=uid(9201), observed_at=AS_OF - timedelta(days=9))
+    newer_b = obs(oid=uid(9203), observed_at=AS_OF - timedelta(days=2))
+    newer_a = obs(oid=uid(9202), observed_at=AS_OF - timedelta(days=2))
+    result = orient([older, newer_b, newer_a])
+    assert [p.observation_id for p in result.points] == [newer_a.id, newer_b.id, older.id]
+
+
+def test_orientation_is_independent_of_candidate_order() -> None:
+    cands = [obs(year=2008 + i % 6, km=str(150000 + 9000 * i), amount=str(7000 + 150 * i)) for i in range(12)]
+    cands += [obs(fuel=Fuel.PETROL), obs(model="Other"), obs(url=AD), obs(url=AD)]
+    first = orient(cands)
+    shuffled = list(cands)
+    random.Random(7).shuffle(shuffled)
+    assert orient(shuffled) == first
+
+
+def test_orientation_counts_a_daily_re_recorded_ad_once() -> None:
+    days = [obs(url=AD, observed_at=AS_OF - timedelta(days=d), amount="9000") for d in (3, 2, 1)]
+    result = orient(days)
+    assert [p.observation_id for p in result.points] == [days[-1].id]
+    assert {e.reasons for e in result.excluded} == {(ExclusionReason.DUPLICATE_OF_URL,)}
+    assert {e.duplicate_of for e in result.excluded} == {days[-1].id}
+
+
+def test_orientation_uses_canonical_names_and_reports_fx() -> None:
+    mokka = target(make="Opel", model="Mokka X", generation=None)
+    row = obs(make="Opel", model="Mokka", generation=None, amount="553500", currency="MKD")
+    rate = FxRate(
+        base="EUR",
+        quote="MKD",
+        rate=Decimal("61.5"),
+        rate_date=date(2026, 10, 5),
+        retrieved_at=datetime(2026, 10, 5, 16, tzinfo=UTC),
+        provider="SYNTHETIC rate",
+        purpose=FxPurpose.REFERENCE,
+    )
+    plain = orient_comparables(mokka, [row], DEFAULT, AS_OF, [rate], kind=EvidenceKind.ASKING_PRICE)
+    assert plain.points == () and plain.excluded[0].reasons == (ExclusionReason.WRONG_MODEL,)
+    result = orient_comparables(
+        mokka, [row], DEFAULT, AS_OF, [rate], kind=EvidenceKind.ASKING_PRICE, taxonomy=default_taxonomy()
+    )
+    assert result.points[0].amount_eur == Decimal("9000.000000")
+    assert any(w.startswith("FX_RATE_USED") for w in result.warnings)
+
+
+def test_orientation_warnings_and_freshness() -> None:
+    newest, oldest = obs(observed_at=AS_OF - timedelta(days=1)), obs(observed_at=AS_OF - timedelta(days=20))
+    close = orient([newest, oldest])
+    assert close.version == ORIENTATION_VERSION
+    assert close.warnings[0].startswith("ORIENTATION_ONLY")
+    assert not any(w.startswith("ORIENTATION_DISTANT") for w in close.warnings)
+    assert close.fresh_until == oldest.observed_at + timedelta(days=DEFAULT.comparable_max_age_days)
+    distant = orient([obs(fuel=Fuel.PETROL)])
+    assert distant.nearest_distance is not None and distant.nearest_distance > ORIENTATION_CLOSE
+    assert any(w.startswith("ORIENTATION_DISTANT") for w in distant.warnings)
+    empty = orient([])
+    assert empty.points == () and empty.fresh_until is None and empty.nearest_distance is None
+    assert any(w.startswith("ORIENTATION_EMPTY") for w in empty.warnings)
+    with pytest.raises(ValidationFailed):
+        orient_comparables(target(), [], DEFAULT, datetime(2026, 10, 6), kind=EvidenceKind.ASKING_PRICE)
+    o = obs()
+    with pytest.raises(ValidationFailed):
+        orient([o, o])
+
+
+def test_orientation_warning_summarises_the_points() -> None:
+    result = orient([obs(fuel=Fuel.PETROL, km="187500"), obs(year=2014, km="187500"), obs(km="187500")])
+    text = orientation_warning(result)
+    assert text.startswith("MK_ORIENTATION:asking_price: 3 nearest same-model MK point(s), distance 0-5")
+    assert "differs: fuel_mismatch x1, year_differs x1" in text
+    assert ORIENTATION_VERSION in text and len(text) <= 500
+    assert orientation_warning(orient([])).startswith("MK_ORIENTATION:asking_price: no same-model MK point")
+
+
+def test_proceeds_from_asking_orientation_are_labelled_and_never_supported() -> None:
+    result = orient([obs(fuel=Fuel.PETROL, amount=a) for a in ("7000", "8000", "9000")])
+    proceeds = proceeds_from_orientation(result)
+    assert proceeds.status == CostLineStatus.ESTIMATED
+    assert proceeds.basis == "mk_asking_prices" and proceeds.evidence_kind == EvidenceKind.ASKING_PRICE
+    assert (proceeds.low, proceeds.base, proceeds.high) == (
+        Money.of("7000.00", "EUR"),
+        Money.of("8000.00", "EUR"),
+        Money.of("9000.00", "EUR"),
+    )
+    assert proceeds.labels[:2] == (ORIENTATION_LABEL, DISCOUNT_UNKNOWN_LABEL)
+    assert any(label.startswith("3 nearest same-model point(s), distance") for label in proceeds.labels)
+    assert proceeds.comparable_set_id is None and proceeds.research_needed
+    assert set(proceeds.evidence_ids) == {str(p.observation_id) for p in result.points}
+    estimate = ProceedsEstimate(**proceeds.as_proceeds_estimate_kwargs())
+    assert estimate.comparable_set_id is None
+    assert not proceeds_supported(estimate)
+    discounted = proceeds_from_orientation(
+        result, Decimal("7.5"), discount_approved=True, sensitivity_discounts_pct=[Decimal("10")]
+    )
+    assert discounted.negotiation_discount_pct == Decimal("7.5") and discounted.discount_approved
+    assert discounted.base == Money.of("8000.00", "EUR")  # applied once, by the scenario engine
+    assert any("7.5% negotiation discount (approved)" in label for label in discounted.labels)
+    assert discounted.sensitivity[0].base_after_discount == Money.of("7200.00", "EUR")
+    assert not proceeds_supported(ProceedsEstimate(**discounted.as_proceeds_estimate_kwargs()))
+    with pytest.raises(ValidationFailed):
+        proceeds_from_orientation(result, None, discount_approved=True)
+    with pytest.raises(ValidationFailed):
+        proceeds_from_orientation(result, Decimal("100"))
+
+
+def test_proceeds_from_orientation_use_quartiles_from_five_points() -> None:
+    result = orient([obs(amount=a) for a in ("8000", "8500", "9000", "9500", "10000", "12000")], limit=5)
+    proceeds = proceeds_from_orientation(result)
+    assert proceeds.sample_size == 5
+    assert "low/high are the first/third quartiles" in proceeds.labels
+
+
+def test_proceeds_from_owner_estimate_orientation_and_empty_orientation() -> None:
+    estimates = [
+        obs(kind=EvidenceKind.OWNER_ESTIMATE, url=None, gearbox=Gearbox.AUTOMATIC, amount=a)
+        for a in ("8600", "9300")
+    ]
+    result = orient(estimates, kind=EvidenceKind.OWNER_ESTIMATE)
+    proceeds = proceeds_from_orientation(result, Decimal("10"))  # no discount for an estimate
+    assert proceeds.basis == "owner_estimate" and proceeds.evidence_kind == EvidenceKind.OWNER_ESTIMATE
+    assert proceeds.negotiation_discount_pct is None and not proceeds.discount_approved
+    assert proceeds.base == Money.of("8950.00", "EUR")
+    assert comparables_module.OWNER_ESTIMATE_LABEL in proceeds.labels
+    estimate = ProceedsEstimate(**proceeds.as_proceeds_estimate_kwargs())
+    assert not proceeds_supported(estimate)
+    for kind, basis in (
+        (EvidenceKind.ASKING_PRICE, "mk_asking_prices"),
+        (EvidenceKind.OWNER_ESTIMATE, "owner_estimate"),
+    ):
+        unknown = proceeds_from_orientation(orient([], kind=kind))
+        assert unknown.status == CostLineStatus.UNKNOWN and unknown.basis == basis
+        assert unknown.low is unknown.base is unknown.high is None and unknown.research_needed
+        assert ProceedsEstimate(**unknown.as_proceeds_estimate_kwargs()).status == CostLineStatus.UNKNOWN
+
+
+def test_orientation_re_record_with_a_model_typo_never_hides_the_valid_one() -> None:
+    old = obs(url=AD, observed_at=AS_OF - timedelta(days=2))
+    typo = obs(url=AD, observed_at=AS_OF - timedelta(days=1), model="Trial")
+    result = orient([old, typo])
+    assert [p.observation_id for p in result.points] == [old.id]
+    assert set(next(e for e in result.excluded if e.observation_id == typo.id).reasons) == {
+        ExclusionReason.WRONG_MODEL,
+        ExclusionReason.DUPLICATE_OF_URL,
+    }
+
+
+def test_orientation_keeps_the_row_of_an_ad_the_strict_set_keeps() -> None:
+    old_full = obs(url=AD, observed_at=AS_OF - timedelta(days=2))
+    new_gap = obs(url=AD, observed_at=AS_OF - timedelta(days=1), km=None)  # orientation-eligible
+    strict = select_comparables(target(), [old_full, new_gap], Windows(min_sample=1), AS_OF)
+    oriented = orient([old_full, new_gap])
+    assert selected_ids(strict) == {p.observation_id for p in oriented.points} == {old_full.id}
+    alone = orient([obs(url=AD, observed_at=AS_OF - timedelta(days=2), km=None), new_gap])
+    assert [p.observation_id for p in alone.points] == [new_gap.id]  # neither is strict: newest
+
+
+def test_orientation_closeness_counts_unknowns_as_the_mismatch_they_may_hide() -> None:
+    near = obs(year=2013, km="187500")  # 2 years: distance 2
+    close = orient([near])
+    assert close.nearest_distance == close.nearest_verified_distance == Decimal(2)
+    assert close.close and not any(w.startswith("ORIENTATION_DISTANT") for w in close.warnings)
+    # Only make, model and year known: distance exactly ORIENTATION_CLOSE, but it may be a petrol.
+    unknown = obs(fuel=Fuel.UNKNOWN, gearbox=Gearbox.UNKNOWN, drive=Drive.UNKNOWN, km=None)
+    blind = orient([unknown])
+    assert blind.nearest_distance == ORIENTATION_CLOSE
+    assert blind.nearest_verified_distance == Decimal(10)  # fuel 5 + gearbox 2 + drive 2 + km 1
+    assert not blind.close
+    assert any(w.startswith("ORIENTATION_DISTANT") for w in blind.warnings)
+    # A known near-variant is not close either (gearbox 2 + 2 years + 7,500 km = 4.25).
+    variant = orient([obs(gearbox=Gearbox.AUTOMATIC, year=2013)])
+    assert variant.nearest_distance == Decimal("4.25") and not variant.close
+    # A verified-close point anywhere among the eligible ones makes the orientation close, even
+    # when an unknown ranks first.
+    fuel_unknown = obs(fuel=Fuel.UNKNOWN, km="187500")  # distance 1, verified 5
+    third_year = obs(year=2014, km="187500")  # distance 3, verified 3
+    mixed = orient([fuel_unknown, third_year])
+    assert [p.observation_id for p in mixed.points] == [fuel_unknown.id, third_year.id]
+    assert mixed.nearest_verified_distance == Decimal(3) and mixed.close
+
+
+def test_orientation_target_side_unknowns_are_never_close() -> None:
+    # Target-side unknowns add the same amount to every point; the closeness test counts them as
+    # mismatches. The fallback order is unaffected: the strict owner estimates need the same
+    # fields known (ADR 0004 ``*_UNVERIFIED``).
+    blind_target = target(fuel=Fuel.UNKNOWN, gearbox=Gearbox.UNKNOWN, drive=Drive.UNKNOWN)
+    ad = obs(year=2013, km="187500")
+    result = orient([ad], tgt=blind_target)
+    assert result.nearest_distance == Decimal(5) and not result.close
+    estimate = obs(kind=EvidenceKind.OWNER_ESTIMATE, url=None)
+    strict = select_comparables(blind_target, [estimate], DEFAULT, AS_OF, owner_estimates=True)
+    assert strict.selected == ()
+    assert ExclusionReason.FUEL_UNVERIFIED in reasons_of(strict, estimate.id)

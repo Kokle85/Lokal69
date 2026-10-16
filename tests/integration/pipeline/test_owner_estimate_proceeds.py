@@ -1,9 +1,11 @@
-"""The owner's MK estimates are the proceeds orientation only while there is NO MK market evidence.
+"""The owner's MK estimates value a listing when no spec-15 MK asking price or sale matches it.
 
 Owner decision 2026-10-16: the owner's own MK resale estimates (``owner_estimate``) value a
-listing when no MK asking price or sale matches it, labelled as the owner's assumption (never
-approved, research still needed); any matching MK asking price wins. The listings are the
-SYNTHETIC fixture dealer pages, the estimates SYNTHETIC rows of the fixture lineage.
+listing when no spec-15 MK asking price or sale matches it and no CLOSE MK asking-price
+orientation exists (ADR 0005: a distant orientation yields to a strictly matched estimate),
+labelled as the owner's assumption (never approved, research still needed); any matching MK
+asking price wins. The listings are the SYNTHETIC fixture dealer pages, the estimates SYNTHETIC
+rows of the fixture lineage.
 """
 
 from __future__ import annotations
@@ -115,12 +117,14 @@ async def test_mk_asking_prices_win_over_the_owner_estimate(db_url: str, seed: S
         await _record_estimate(env, "12000")
         await seed_comparables(env)
         valued = await _value(env)
+        # Strict spec-15 sets only (a relaxed orientation for an unmatched listing has no set id).
         asking = [
             v
             for v in valued
             if v.inputs.proceeds is not None
             and v.inputs.proceeds.basis == "mk_asking_prices"
             and v.inputs.proceeds.status == CostLineStatus.ESTIMATED
+            and v.inputs.proceeds.comparable_set_id is not None
         ]
         assert asking, [v.inputs.proceeds for v in valued]
         # Wherever an MK asking price matched, the (higher) estimate never replaced it.
@@ -131,5 +135,30 @@ async def test_mk_asking_prices_win_over_the_owner_estimate(db_url: str, seed: S
             assert proceeds.evidence_kind == EvidenceKind.ASKING_PRICE
             warnings = stored.valuation.warnings
             assert not any(w.startswith("PROCEEDS_FROM_OWNER_ESTIMATE") for w in warnings)
+    finally:
+        await env.close()
+
+
+async def test_owner_estimate_freshness_bounds_the_valuation(db_url: str, seed: Seed) -> None:
+    env = await build_env(db_url, seed, name="Owner estimate freshness")
+    try:
+        estimate = _estimate("9300").model_copy(
+            update={"observed_at": datetime.now(UTC) - timedelta(days=85)}
+        )
+
+        async def insert(conn: Conn) -> None:
+            await market_repo.insert_market_observation(conn, env.owner, estimate, confidence=Confidence.LOW)
+
+        await run(env.ctx, env.owner, insert)
+        valued = await _value(env)
+        from_estimate = [
+            v for v in valued if v.inputs.proceeds is not None and v.inputs.proceeds.basis == "owner_estimate"
+        ]
+        assert from_estimate, [v.inputs.proceeds for v in valued]
+        deadline = estimate.observed_at + timedelta(days=90)
+        for stored in from_estimate:
+            expires_at = stored.valuation.expires_at
+            assert expires_at is not None and abs(expires_at - deadline) < timedelta(seconds=1)
+            assert stored.valuation.research_candidate
     finally:
         await env.close()

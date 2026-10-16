@@ -2017,7 +2017,9 @@ async def _costs(conn: Conn, actor: ActorContext, listing_id: UUID) -> CostEvide
     if stored is None or stored.valuation.scenarios is None:
         return None
     approved = stored.valuation.state in (ValuationState.ESTIMATED, ValuationState.QUOTE_SUPPORTED)
-    return CostEvidence.from_scenario_set(stored.valuation.scenarios, tax_rule_approved=approved)
+    return CostEvidence.from_scenario_set(
+        stored.valuation.scenarios, tax_rule_approved=approved, proceeds=stored.inputs.proceeds
+    )
 
 
 async def read_readiness_inputs(

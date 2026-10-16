@@ -161,7 +161,8 @@ class TestHonestZeroDeals:
         assert "no vehicle passed the primary price/mileage/SUV rules in the window" in report.reasons
         assert report.best_supported_economics is None
         assert any(
-            "unknown - no candidate has a complete valuation" in line for line in report.summary_lines()
+            "unknown - no well-matched candidate has a complete valuation" in line
+            for line in report.summary_lines()
         )
 
     def test_eligible_but_no_comparables(self) -> None:
@@ -218,6 +219,29 @@ class TestDealsAndEconomics:
         )
         assert report.best_supported_economics is not None
         assert report.best_supported_economics.candidate_id == eur.candidate_id
+
+    def test_orientation_figures_are_never_best_supported_economics(self) -> None:
+        # ADR 0005: an estimated valuation whose proceeds are an MK orientation or the owner's
+        # estimates has no adequate/small-sample comparable set; its figures are not "supported".
+        oriented = valued("3130", "4000", comparable_status="insufficient_comparables")
+        unmatched = valued("2500", "3000", comparable_status=None)
+        report = build_evaluation_report(
+            now=T0 + timedelta(days=2),
+            activations=ACTIVE,
+            scans=regular_scans(10),
+            candidates=[oriented, unmatched],
+        )
+        assert report.best_supported_economics is None
+        assert any("no well-matched candidate" in line for line in report.summary_lines())
+        matched = valued("100", "500")
+        with_matched = build_evaluation_report(
+            now=T0 + timedelta(days=2),
+            activations=ACTIVE,
+            scans=regular_scans(10),
+            candidates=[oriented, matched],
+        )
+        assert with_matched.best_supported_economics is not None
+        assert with_matched.best_supported_economics.candidate_id == matched.candidate_id
 
     def test_unknown_economics_never_carry_figures(self) -> None:
         with pytest.raises(ValueError):

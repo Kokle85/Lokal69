@@ -2,6 +2,11 @@
 
 Status: accepted (owner decision of 2026-10-16). Date: 2026-10-16.
 
+> Decisions 1 and 2 are refined by [ADR 0005](0005-mk-price-orientation-framework.md) (same
+> day): the MK rules are a framework for orientation, a close same-model MK asking-price
+> orientation now comes before the strictly matched estimates, and a relaxed orientation over
+> the estimates is the last fallback. The estimates were read from Reklama5 asking prices.
+
 ## Context
 
 On 2026-10-16 the owner sent the models to search abroad together with MK resale prices

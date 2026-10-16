@@ -18,6 +18,7 @@ import pytest
 from psycopg.types.json import Jsonb
 from tests.integration.db.helpers import Seed, sha, unique
 from tests.integration.repos_valuation_reviews.builders import (
+    CURSOR_SECRET,
     T0,
     RealWorld,
     add_revision,
@@ -49,8 +50,10 @@ from suv_deals.errors import NotFound, ValidationFailed, VersionConflict
 from suv_deals.integrations import event_bridge as eb
 from suv_deals.integrations.secret_box import SecretBox
 from suv_deals.integrations.webhook_signing import parse_whsec
+from suv_deals.mcp.schemas import DealsListCandidatesInput
 from suv_deals.persistence import market_repo, reviews_repo, subscriptions_repo, valuation_repo
-from suv_deals.persistence.database import Conn, Database
+from suv_deals.persistence.database import Conn, Database, fetch_one
+from suv_deals.persistence.queries import candidates
 from suv_deals.persistence.valuation_repo import CostEvidenceInput, DependencyChange
 
 pytestmark = pytest.mark.db
@@ -162,6 +165,58 @@ async def test_case_view_marks_a_stale_valuation_as_research_only(db: Database, 
     stale = await run(db, reader, lambda c: reviews_repo.get_case(c, reader, created.case_id))  # type: ignore[arg-type]
     assert stale.valuation is not None and stale.valuation.state == ValuationState.STALE
     assert stale.valuation.research_candidate and stale.candidate.research_candidate
+
+
+async def test_a_figure_valuation_from_the_proceeds_fallback_reads_as_research_only(
+    db: Database, world: RealWorld
+) -> None:
+    # ADR 0004/0005: an ESTIMATED valuation whose proceeds are the MK orientation / owner-estimate
+    # fallback keeps its figures but stays a research candidate on every owner-facing read.
+    now = datetime.now(UTC).replace(microsecond=0)
+    bundle = await complete_valuation(db, world, as_of=now)
+    assert bundle.valuation.state == ValuationState.ESTIMATED
+    assert not bundle.valuation.research_candidate
+    fallback = bundle.valuation.model_copy(update={"research_candidate": True})
+    sys_actor = system(world.workspace_id)
+    stored = await run(
+        db,
+        sys_actor,
+        lambda c: valuation_repo.persist_valuation(c, sys_actor, fallback, bundle.refs, bundle.inputs),
+    )
+    created = await open_case(db, world, valuation_id=stored.id)
+    assert created.case_id is not None
+    reader = viewer(world.workspace_id)
+    case = await run(db, reader, lambda c: reviews_repo.get_case(c, reader, created.case_id))  # type: ignore[arg-type]
+    assert case.valuation is not None and case.valuation.state == ValuationState.ESTIMATED
+    assert case.valuation.base_contribution.amount is not None  # figures stay
+    assert case.valuation.research_candidate and case.candidate.research_candidate
+    listed = await run(
+        db,
+        reader,
+        lambda c: candidates.list_candidates(c, reader, DealsListCandidatesInput(), secret=CURSOR_SECRET),
+    )
+    summaries = [i for i in listed.data.items if i.listing_id == world.listing_id]
+    assert summaries and all(i.research_candidate for i in summaries)
+    ref_row = await run(
+        db,
+        reader,
+        lambda c: fetch_one(
+            c,
+            candidates._VALUATION_REF_SQL,
+            {"ws": world.workspace_id, "listing_id": world.listing_id, "revision_id": world.revision_id},
+        ),
+    )
+    ref = candidates._valuation_ref(ref_row)  # the candidate detail's latest valuation
+    assert ref is not None and ref.state == ValuationState.ESTIMATED and ref.research_candidate
+    queue = await run(
+        db,
+        reader,
+        lambda c: reviews_repo.list_pending_queue(
+            c, reader, reviews_repo.ReviewQueueFilters(), None, secret=CURSOR_SECRET
+        ),
+    )
+    items = [i for i in queue.page.items if i.listing_id == world.listing_id]
+    assert items and all(i.research_candidate for i in items)
 
 
 # --------------------------------------------------------------------------------------------

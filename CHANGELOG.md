@@ -7,6 +7,32 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (working tree on top of `7f7e187`, not committed)
 
+Owner decisions of 2026-10-16 („не треба да бидат строги правилата ... само за да имаме
+орјентација", „Цените се извадени од Reklama5"; ADR 0005).
+
+- **MK price orientation framework.** When the spec-15 comparable set gives no proceeds, a
+  separate relaxed orientation (`orient_comparables`, `mk-orientation@1.0.0`) uses the 5 nearest
+  same-model MK points: only make/model, market, lineage, price/FX, freshness and condition stay
+  hard; every other difference is labelled with a PROPOSED distance penalty. Fallback order: a
+  close asking-price orientation (distance <= 4), the strictly matched owner estimates, any
+  asking-price orientation, the relaxed owner-estimate orientation. Warnings
+  `PROCEEDS_FROM_MK_ORIENTATION` and `MK_ORIENTATION:<kind>`; never alert eligible, never inquiry
+  evidence (it cannot make a candidate `KNOWN_COSTS_EXCEED_PROCEEDS`); orientation and
+  owner-estimate proceeds expire with their oldest point. The candidate read covers ±10 years.
+- **Duplicates by ad URL.** The same ad recorded on several days counts once (`DUPLICATE_OF_URL`,
+  query string kept as the ad id). The newest row that passes the mode's hard checks is kept, so
+  a newer re-record that lost its mileage, has a model typo or an out-of-window year never hides
+  the valid older one. Criteria version `mk-comparables@1.3.0`.
+- **Orientation closeness and labels.** "Close" (fallback step 1) is tested on the verified
+  distance: an unknown fuel, gearbox or drive counts as the mismatch it may hide, so an ad of
+  unknown fuel never beats a strictly matched owner estimate. The orientation's own labels
+  (`ORIENTATION_ONLY`, `ORIENTATION_DISTANT`, `ORIENTATION_EMPTY`, FX notes) reach the valuation
+  warnings.
+- **Fallback valuations stay research candidates.** A valuation whose proceeds come from any
+  fallback step keeps its figures but stays `research_candidate`; the candidate list/detail, the
+  review queue and the MCP typed warnings read the stored flag, and the 15-day evaluation's best
+  supported economics counts only well-matched candidates.
+
 Owner decision of 2026-10-16 ("Моја проценка": the MK prices of the owner's model list are the
 owner's own estimates; ADR 0004).
 

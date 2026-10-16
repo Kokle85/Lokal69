@@ -19,7 +19,9 @@ from pydantic import ValidationError
 from suv_deals.domain.comparables import (
     ComparableTarget,
     MarketObservation,
+    orient_comparables,
     proceeds_from_comparables,
+    proceeds_from_orientation,
     select_comparables,
 )
 from suv_deals.domain.costs import (
@@ -250,8 +252,12 @@ COMPARABLES = select_comparables(
 )
 
 
-def _scenarios(purchase: str = "2750", transport: str | None = None) -> Any:
-    proceeds = ProceedsEstimate(**proceeds_from_comparables(COMPARABLES, None).as_proceeds_estimate_kwargs())
+def _scenarios(
+    purchase: str = "2750", transport: str | None = None, proceeds: ProceedsEstimate | None = None
+) -> Any:
+    proceeds = proceeds or ProceedsEstimate(
+        **proceeds_from_comparables(COMPARABLES, None).as_proceeds_estimate_kwargs()
+    )
     lines = []
     for category in sorted(REQUIRED_CATEGORIES):
         if category == CostCategory.TRANSPORT and transport is not None:
@@ -868,6 +874,44 @@ def test_known_costs_exceeding_proceeds_disprove_the_opportunity() -> None:
         best_case_known_costs=Money.of("9999", "CHF"), best_case_proceeds=Money.of("9500", "EUR")
     )
     assert not other_ccy.disproves_opportunity()
+
+
+def test_orientation_and_owner_estimate_proceeds_never_disprove_the_opportunity() -> None:
+    # ADR 0005: an MK orientation and the owner's estimates are no market evidence. Strict
+    # comparable proceeds carry their comparable_set_id; orientation/estimate proceeds never do.
+    strict = ProceedsEstimate(
+        **proceeds_from_comparables(
+            COMPARABLES, None, comparable_set_id=UUID(int=77)
+        ).as_proceeds_estimate_kwargs()
+    )
+    disproving = CostEvidence.from_scenario_set(
+        _scenarios(transport="7000", proceeds=strict), proceeds=strict
+    )
+    assert disproving.disproves_opportunity()
+    orientation = orient_comparables(
+        TARGET,
+        [_observation(1, "8500"), _observation(2, "9000"), _observation(3, "9500")],
+        CONFIG,
+        NOW,
+        kind=EvidenceKind.ASKING_PRICE,
+    )
+    oriented = ProceedsEstimate(**proceeds_from_orientation(orientation).as_proceeds_estimate_kwargs())
+    assert oriented.base == strict.base and oriented.comparable_set_id is None
+    estimate = ProceedsEstimate(
+        status=CostLineStatus.ESTIMATED, currency="EUR", base=Money.of("9000", "EUR"), basis="owner_estimate"
+    )
+    for proceeds in (oriented, estimate):
+        scenarios = _scenarios(transport="7000", proceeds=proceeds)
+        for costs in (
+            CostEvidence.from_scenario_set(scenarios, proceeds=proceeds),
+            # The owner-estimate basis is recognised from the scenarios alone as well.
+            *([CostEvidence.from_scenario_set(scenarios)] if proceeds is estimate else []),
+        ):
+            assert costs.best_case_proceeds is None and not costs.disproves_opportunity()
+            decision = readiness(costs=costs)
+            assert decision.readiness != InquiryReadiness.NOT_ELIGIBLE
+            assert "KNOWN_COSTS_EXCEED_PROCEEDS" not in decision.codes()
+            assert "PROCEEDS_UNKNOWN" in decision.codes()
 
 
 def test_unknown_costs_are_listed_never_zero() -> None:

@@ -9,7 +9,9 @@ network I/O.
    the fixture lineage (the listing's frozen ``is_fixture`` from ingest; a source that is CURRENTLY
    ``mode: fixture`` also makes the result a fixture, fail-safe), the business configuration, MK comparable
    candidates of the same fixture lineage (`market_repo.list_candidate_comparables`, year window
-   including the one permitted widening step), ONE latest reference FX observation per currency that
+   ``ORIENTATION_READ_YEAR_WINDOW``, the repository maximum, so the MK orientation also sees other
+   model years; the strict set records them as ``YEAR_OUT_OF_WINDOW`` exclusions), ONE latest
+   reference FX observation per currency that
    is needed (comparable currencies, the purchase currency, the tax rule currency), and the ACTIVE tax
    rule sets of the jurisdiction.
 2. **Compute** (pure domain code):
@@ -17,10 +19,18 @@ network I/O.
    - comparables: `select_comparables` (tight first, labelled widening, explicit exclusions; no
      adequate set -> ``insufficient_comparables`` and ``research_needed``; nothing is fabricated).
      Make and model are compared by their canonical taxonomy names, and the candidates are read
-     under both the listing's own and the canonical names. When the set holds NO MK asking or
-     sale evidence at all, the proceeds fall back to the owner's matching estimates
-     (`proceeds_from_owner_estimates`, basis ``owner_estimate``, labelled as the owner's
-     assumption, never approved, research still needed); real market evidence always wins;
+     under both the listing's own and the canonical names. Real spec-15 market evidence always
+     wins. Only when the set gives NO proceeds (no MK asking price or sale) the MK price
+     framework of ADR 0005 orients the proceeds, in this order: (a) the relaxed orientation over
+     MK asking prices (`orient_comparables`) when some point is verified within
+     ``ORIENTATION_CLOSE`` (an unknown fuel, gearbox or drive counted as a mismatch); else (b)
+     the owner's estimates under the strict rules (`proceeds_from_owner_estimates`); else (c)
+     the asking-price orientation even when distant; else (d) the relaxed orientation over the
+     owner's estimates (`fallback_proceeds`). Every fallback is labelled, never approved, keeps
+     research needed (the valuation stays a ``research_candidate`` even with figures), never
+     makes an alert, carries no comparable set id (so inquiry readiness never treats it as
+     market evidence), cites its points' FX rates as dependencies and expires with its oldest
+     point (``proceeds_fresh_until``);
    - tax: only an ACTIVE, approved rule set is ever selected (`select_rule_set`); without one, every
      import category stays ``unknown`` (never invented, never zero) and the reason is recorded.
      The engine inputs come from the SAME builder the import-cost calculator uses
@@ -67,8 +77,9 @@ network I/O.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID
 
@@ -79,10 +90,15 @@ from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.comparables import (
     MAX_CANDIDATES,
     YEAR_WIDEN_STEP,
+    ComparableProceeds,
     ComparableSetResult,
     ComparableTarget,
     MarketObservation,
+    OrientationResult,
+    orient_comparables,
+    orientation_warning,
     proceeds_from_comparables,
+    proceeds_from_orientation,
     proceeds_from_owner_estimates,
     select_comparables,
 )
@@ -98,6 +114,7 @@ from suv_deals.domain.costs import (
 from suv_deals.domain.enums import (
     CostLineStatus,
     EligibilityState,
+    EvidenceKind,
     FxPurpose,
     JobState,
     SourceMode,
@@ -156,6 +173,9 @@ from suv_deals.workers.runtime import Disposition, JobExecution, JobOutcome, Run
 logger = logging.getLogger(__name__)
 
 PURCHASE_EVIDENCE_PREFIX: Final = "listing_revision:"
+#: Registration-year window of the candidate read: the repository maximum
+#: (`market_repo.list_candidate_comparables`), so the MK orientation sees other model years.
+ORIENTATION_READ_YEAR_WINDOW: Final = 10
 _FIGURE_STATES: Final = frozenset({ValuationState.ESTIMATED, ValuationState.QUOTE_SUPPORTED})
 _COMPARABLE_METRIC: Final = {
     "adequate": "sufficient",
@@ -288,7 +308,9 @@ async def _read(
                 lookup,
                 as_of=as_of,
                 max_age_days=config.comparable_max_age_days,
-                year_window=config.comparable_year_window + YEAR_WIDEN_STEP,
+                year_window=max(
+                    config.comparable_year_window + YEAR_WIDEN_STEP, ORIENTATION_READ_YEAR_WINDOW
+                ),
             ):
                 if c.is_fixture == is_fixture:  # never mix fixture and real evidence (spec 18)
                     found.setdefault(c.id, c)
@@ -551,6 +573,68 @@ def _fx_ids(valuation: Valuation, stored: list[StoredFxRate]) -> tuple[UUID, ...
     return tuple(ids)
 
 
+@dataclass(frozen=True, slots=True)
+class ProceedsFallback:
+    """Proceeds that do not come from the spec-15 comparable set (module docstring, ADR 0005)."""
+
+    proceeds: ComparableProceeds
+    #: The observations the proceeds use (their FX rates are valuation dependencies).
+    observations: tuple[MarketObservation, ...]
+    #: The oldest used observation plus ``comparable_max_age_days``.
+    fresh_until: datetime | None
+    #: Set when the proceeds come from a relaxed orientation.
+    orientation: OrientationResult | None = None
+
+    @classmethod
+    def of(cls, orientation: OrientationResult, proceeds: ComparableProceeds) -> ProceedsFallback:
+        return cls(
+            proceeds=proceeds,
+            observations=tuple(p.observation for p in orientation.points),
+            fresh_until=orientation.fresh_until,
+            orientation=orientation,
+        )
+
+
+def fallback_proceeds(
+    target: ComparableTarget,
+    candidates: Sequence[MarketObservation],
+    *,
+    config: BusinessConfig,
+    as_of: datetime,
+    rates: Sequence[FxRate],
+    taxonomy: VehicleTaxonomy | None,
+    estimates: ComparableSetResult,
+) -> ProceedsFallback | None:
+    """The ADR 0005 fallback order for a valuation whose comparable set gives no proceeds:
+    (a) a close asking-price orientation (``OrientationResult.close``: some point verified within
+    ``ORIENTATION_CLOSE``), (b) the strictly matched owner estimates (``estimates``), (c) any
+    asking-price orientation, (d) the relaxed owner-estimate orientation. ``None`` = no fallback
+    at all. Pure (the pipeline's compute step)."""
+    discount = config.negotiation_discount_pct
+    asking = orient_comparables(
+        target, candidates, config, as_of, rates, kind=EvidenceKind.ASKING_PRICE, taxonomy=taxonomy
+    )
+    if asking.close:
+        return ProceedsFallback.of(asking, proceeds_from_orientation(asking, discount))
+    owner = proceeds_from_owner_estimates(estimates)
+    if owner.status != CostLineStatus.UNKNOWN:
+        used = tuple(s.observation for s in estimates.selected)
+        oldest = min(o.observed_at for o in used)
+        return ProceedsFallback(
+            proceeds=owner,
+            observations=used,
+            fresh_until=oldest + timedelta(days=estimates.criteria.max_age_days),
+        )
+    if asking.points:
+        return ProceedsFallback.of(asking, proceeds_from_orientation(asking, discount))
+    loose = orient_comparables(
+        target, candidates, config, as_of, rates, kind=EvidenceKind.OWNER_ESTIMATE, taxonomy=taxonomy
+    )
+    if loose.points:
+        return ProceedsFallback.of(loose, proceeds_from_orientation(loose))
+    return None
+
+
 async def _value_and_commit(
     ctx: RuntimeContext, execution: JobExecution, reads: ValuationReads, stored_profile: StoredCostProfile
 ) -> ValuationRun:
@@ -595,20 +679,39 @@ async def _value_and_commit(
         )
     )
     purchase = _purchase(screening, revision.id, reads.import_values)
-    # No MK asking or sale evidence at all: the owner's estimate is the only orientation (labelled;
-    # it never overrides market evidence). Its FX rate, if any, is a dependency like a comparable's.
-    fallback = proceeds_from_owner_estimates(estimates)
-    use_estimates = (
-        fallback.status != CostLineStatus.UNKNOWN
+    # No proceeds from the spec-15 set: the ADR 0005 fallback (labelled; it never overrides market
+    # evidence). The FX rates of the points it uses are dependencies like a comparable's.
+    fallback = (
+        fallback_proceeds(
+            target,
+            reads.candidates,
+            config=reads.config,
+            as_of=reads.as_of,
+            rates=rates,
+            taxonomy=taxonomy,
+            estimates=estimates,
+        )
+        if not rejected
         and proceeds_from_comparables(result, reads.config.negotiation_discount_pct).status
         == CostLineStatus.UNKNOWN
+        else None
     )
-    priced = [*result.selected, *(estimates.selected if use_estimates else ())]
+    orientation = None if fallback is None else fallback.orientation
+    priced = [s.observation for s in result.selected] + list(
+        () if fallback is None else fallback.observations
+    )
     comparable_rates = [
         reads.reference_rates[c]
-        for c in sorted({s.observation.amount.currency for s in priced if s.observation.amount})
+        for c in sorted({o.amount.currency for o in priced if o.amount})
         if c in reads.reference_rates
     ]
+    if orientation is not None:
+        # The summary plus the orientation's own labels (ORIENTATION_ONLY / _DISTANT, FX notes).
+        input_warnings = (
+            *input_warnings,
+            orientation_warning(orientation)[:500],
+            *(w[:500] for w in orientation.warnings),
+        )
     all_rates = stored_rates + ([reads.customs_rate] if reads.customs_rate is not None else [])
     screening_input = ScreeningInput(
         eligibility=screening.state,
@@ -640,8 +743,8 @@ async def _value_and_commit(
             scenarios = None
             if stored_set is not None:
                 basis = (
-                    fallback
-                    if use_estimates
+                    fallback.proceeds
+                    if fallback is not None
                     else proceeds_from_comparables(
                         result, reads.config.negotiation_discount_pct, comparable_set_id=stored_set.id
                     )
@@ -680,6 +783,10 @@ async def _value_and_commit(
                 fixture_inputs=reads.is_fixture,
                 tax_unavailable_reason=None if calc is not None else selection.reason,
                 input_warnings=input_warnings,
+                proceeds_orientation=orientation is not None
+                and orientation.evidence_kind == EvidenceKind.ASKING_PRICE,
+                proceeds_fallback=fallback is not None,
+                proceeds_fresh_until=None if fallback is None else fallback.fresh_until,
             )
             refs = valuation_repo.ValuationRefs(
                 listing_id=reads.listing.id,

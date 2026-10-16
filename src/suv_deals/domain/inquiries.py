@@ -53,7 +53,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.comparables import ComparableSetResult
-from suv_deals.domain.costs import ScenarioSet
+from suv_deals.domain.costs import ProceedsEstimate, ScenarioSet
 from suv_deals.domain.enums import (
     Availability,
     ClaimStatus,
@@ -749,13 +749,28 @@ class CostEvidence(BaseModel):
 
     @classmethod
     def from_scenario_set(
-        cls, scenarios: ScenarioSet, *, tax_rule_approved: bool | None = None
+        cls,
+        scenarios: ScenarioSet,
+        *,
+        tax_rule_approved: bool | None = None,
+        proceeds: ProceedsEstimate | None = None,
     ) -> CostEvidence:
+        """Cost evidence of one scenario set.
+
+        ``proceeds`` are the scenarios' proceeds input. Only MK market evidence counts as
+        supported proceeds here: proceeds without a ``comparable_set_id`` (an MK price
+        orientation or the owner's estimates, ADR 0005) and any ``owner_estimate`` basis are
+        orientation, not evidence, so ``best_case_proceeds`` stays unknown and they can never
+        make a candidate ``KNOWN_COSTS_EXCEED_PROCEEDS`` (not eligible).
+        """
         upside = scenarios.scenario(ScenarioName.UPSIDE)
+        market = scenarios.proceeds_basis != "owner_estimate" and (
+            proceeds is None or proceeds.comparable_set_id is not None
+        )
         return cls(
             currency=scenarios.currency,
             best_case_known_costs=upside.known_subtotal,
-            best_case_proceeds=upside.expected_realized_proceeds,
+            best_case_proceeds=upside.expected_realized_proceeds if market else None,
             unknown_cost_items=tuple(dict.fromkeys(u.item for u in scenarios.unknown_lines)),
             complete=scenarios.complete,
             threshold_approved=scenarios.threshold.approval_status == "approved"

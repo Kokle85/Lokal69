@@ -22,8 +22,11 @@ Business rules (spec 15):
   only while the adequacy count is below ``comparable_min_sample``. Every widened step and every
   comparable admitted only by a widened step carry explicit labels.
 - An unknown target generation labels every selected comparable ``generation_unverified``.
-- Duplicates are removed per vehicle cluster *and* evidence kind: the newest observation is kept
-  and the others are recorded as ``DUPLICATE_OF_CLUSTER`` with the kept id.
+- Duplicates are removed per evidence kind, by vehicle cluster *and* by ad URL (``ad_url_key``:
+  the same ad recorded again on a later day): linked rows form one group (transitively), the
+  newest observation that passes the hard checks is kept (none passes: the newest; equal times:
+  the smallest id) and the others are recorded as ``DUPLICATE_OF_CLUSTER`` and/or
+  ``DUPLICATE_OF_URL`` with the kept id.
 - Evidence kinds are never mixed: statistics are computed per ``EvidenceKind``. Removed or
   sold-claimed listings stay *asking-price* evidence; an advertised price at removal is never a
   sale price. ``owner_estimate`` is an assumption, not a comparable: it never enters a market
@@ -47,16 +50,28 @@ Business rules (spec 15):
   currency the latest *reference* rate dated on or before ``as_of`` (customs/payment rates and
   later-dated rates are never used), independent of input order; the rate used is reported and
   an old rate is flagged. An unconvertible currency excludes the candidate; it is never zero.
+
+MK price orientation (owner decision 2026-10-16, ADR 0005): the MK resale rules are a framework
+for orientation, not a strict gate. ``orient_comparables`` is a SEPARATE, never-persisted relaxed
+view over one evidence kind (MK asking prices or the owner's estimates): only the same canonical
+make and model, the MK market, the fixture lineage, a convertible price, observation on or
+before ``as_of``, freshness and condition (damaged versus running) stay hard. Every other
+mismatch or unknown (generation, facelift, engine, fuel, gearbox, drive, year, mileage) is a
+labelled ``orientation_*`` difference with a documented distance penalty; the
+``ORIENTATION_LIMIT`` nearest points are kept. The penalties and the limit are PROPOSED, not
+statistically validated. The strict spec 15 ``ComparableSetResult`` above is never changed by it.
 """
 
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Iterable, Sequence
-from datetime import datetime, timedelta
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from enum import StrEnum
 from typing import Any, Final, Literal, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -82,7 +97,7 @@ from suv_deals.domain.profiles import MK_ASKING_BAND_MAX_EUR, MK_ASKING_BAND_MIN
 from suv_deals.domain.taxonomy import VehicleTaxonomy
 from suv_deals.errors import ValidationFailed
 
-CRITERIA_VERSION: Final = "mk-comparables@1.2.0"
+CRITERIA_VERSION: Final = "mk-comparables@1.3.0"
 
 #: Relative engine tolerances (spec 15 work package: displacement 10 %, power 15 %).
 DISPLACEMENT_TOLERANCE: Final = Decimal("0.10")
@@ -148,6 +163,7 @@ class ExclusionReason(StrEnum):
     OBSERVED_AFTER_AS_OF = "OBSERVED_AFTER_AS_OF"
     STALE = "STALE"
     DUPLICATE_OF_CLUSTER = "DUPLICATE_OF_CLUSTER"
+    DUPLICATE_OF_URL = "DUPLICATE_OF_URL"
     MODEL_UNKNOWN = "MODEL_UNKNOWN"
     WRONG_MODEL = "WRONG_MODEL"
     WRONG_GENERATION = "WRONG_GENERATION"
@@ -545,7 +561,7 @@ def select_comparables(
     evaluations = [
         _evaluate(target, obs, criteria, as_of, rates, kinds=kinds, names=names) for obs in ordered
     ]
-    duplicates = _dedupe(evaluations)
+    duplicates = _dedupe(evaluations, _strict_eligible)
 
     # An owner estimate is one reference point per model: admit the closest, never widen for more.
     level, steps = _widen(evaluations, duplicates, criteria, kinds, 1 if owner_estimates else None)
@@ -554,15 +570,14 @@ def select_comparables(
     excluded: list[ExcludedComparable] = []
     for ev in evaluations:
         reasons = list(ev.prefilter) + list(ev.hard) + list(ev.widen_failures)
-        duplicate_of = duplicates.get(ev.obs.id)
-        if duplicate_of is not None:
-            reasons.append(ExclusionReason.DUPLICATE_OF_CLUSTER)
+        dup = duplicates.get(ev.obs.id)
+        duplicate_of = None if dup is None else dup[0]
+        if dup is not None:
+            reasons.extend(dup[1])
         if ev.required_level() > level:
             reasons.extend(_unadmitted_reasons(ev, level))
         if reasons:
-            notes = list(ev.notes)
-            if duplicate_of is not None:
-                notes.append(f"DUPLICATE_OF_CLUSTER: cluster {ev.obs.cluster_id}; kept newer {duplicate_of}")
+            notes = list(ev.notes) + _duplicate_notes(ev, dup)
             excluded.append(
                 ExcludedComparable(
                     observation_id=ev.obs.id,
@@ -1121,29 +1136,108 @@ def _context(ev: _Evaluation) -> None:
         add("availability", "reserved")
 
 
-def _dedupe(evaluations: list[_Evaluation]) -> dict[UUID, UUID]:
-    """Return {duplicate id: kept id}. Only valid evidence (no prefilter reason) is deduplicated."""
-    groups: dict[tuple[UUID, EvidenceKind], list[_Evaluation]] = {}
-    for ev in evaluations:
-        if ev.prefilter or ev.obs.cluster_id is None:
-            continue
-        groups.setdefault((ev.obs.cluster_id, ev.obs.evidence_kind), []).append(ev)
-    duplicates: dict[UUID, UUID] = {}
-    for members in groups.values():
+#: ``_dedupe`` result: {duplicate id: (kept id, duplicate reasons)}.
+_Duplicates = dict[UUID, tuple[UUID, tuple[ExclusionReason, ...]]]
+
+
+def _dedupe(evaluations: list[_Evaluation], eligible: Callable[[_Evaluation], bool]) -> _Duplicates:
+    """Duplicates per evidence kind, by vehicle cluster and by ad URL (module docstring).
+
+    Only valid evidence (no prefilter reason) is deduplicated, so a newer row without a price
+    never hides a valid older one. Rows linked by a shared cluster or a shared ``ad_url_key`` of
+    the same kind form one group, transitively (union-find): A (url u, cluster c), B (url u) and
+    C (cluster c) are one ad. The kept row is the newest member that is ``eligible`` in the
+    caller's mode (no hard reason it cannot shed: a newer re-record that lost its mileage never
+    hides the complete older one), preferring one that also passes the strict checks (so the
+    orientation keeps the same row of an ad as the strict set whenever the strict set can use
+    it); only when no member is eligible the newest one is kept. Equal times keep the
+    lexicographically smallest id. Every other member records
+    ``DUPLICATE_OF_CLUSTER`` when it shares a cluster with another member and
+    ``DUPLICATE_OF_URL`` when it shares an ad URL.
+    """
+    valid = [ev for ev in evaluations if not ev.prefilter]
+    parent: dict[UUID, UUID] = {ev.obs.id: ev.obs.id for ev in valid}
+
+    def find(item: UUID) -> UUID:
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    clusters: dict[tuple[UUID, EvidenceKind], list[UUID]] = {}
+    urls: dict[tuple[str, EvidenceKind], list[UUID]] = {}
+    for ev in valid:
+        if ev.obs.cluster_id is not None:
+            clusters.setdefault((ev.obs.cluster_id, ev.obs.evidence_kind), []).append(ev.obs.id)
+        key = ad_url_key(ev.obs.url)
+        if key is not None:
+            urls.setdefault((key, ev.obs.evidence_kind), []).append(ev.obs.id)
+    shared_cluster: set[UUID] = set()
+    shared_url: set[UUID] = set()
+    for groups, shared in ((clusters, shared_cluster), (urls, shared_url)):
+        for linked in groups.values():
+            if len(linked) < 2:
+                continue
+            shared.update(linked)
+            for other_id in linked[1:]:
+                a, b = find(linked[0]), find(other_id)
+                if a != b:
+                    low, high = sorted((a, b), key=str)
+                    parent[high] = low
+    components: dict[UUID, list[_Evaluation]] = {}
+    for ev in valid:
+        components.setdefault(find(ev.obs.id), []).append(ev)
+    duplicates: _Duplicates = {}
+    for members in components.values():
         if len(members) < 2:
             continue
-        # Newest observation wins; equal times fall back to the lexicographically smallest id.
+        # The newest eligible observation wins (else the newest); equal times fall back to the
+        # lexicographically smallest id (stable sort).
         by_id = sorted(members, key=lambda e: str(e.obs.id))
-        ranked = sorted(by_id, key=lambda e: e.obs.observed_at, reverse=True)  # stable sort
+        ranked = sorted(
+            by_id, key=lambda e: (eligible(e), _strict_eligible(e), e.obs.observed_at), reverse=True
+        )
         keep = ranked[0].obs.id
         for other in ranked[1:]:
-            duplicates[other.obs.id] = keep
+            oid = other.obs.id
+            reasons = tuple(
+                reason
+                for reason, shared in (
+                    (ExclusionReason.DUPLICATE_OF_CLUSTER, shared_cluster),
+                    (ExclusionReason.DUPLICATE_OF_URL, shared_url),
+                )
+                if oid in shared
+            )
+            duplicates[oid] = (keep, reasons)
     return duplicates
+
+
+def _strict_eligible(ev: _Evaluation) -> bool:
+    """A row the strict set could select at some widening level (``select_comparables``)."""
+    return not (ev.hard or ev.widen_failures)
+
+
+def _orientation_eligible(ev: _Evaluation) -> bool:
+    """A row an orientation could use (``orient_comparables``: only ``ORIENTATION_HARD`` is hard)."""
+    return not any(r in ORIENTATION_HARD for r in ev.hard)
+
+
+def _duplicate_notes(ev: _Evaluation, dup: tuple[UUID, tuple[ExclusionReason, ...]] | None) -> list[str]:
+    """Exclusion details of a duplicate (the ad URL itself is never echoed)."""
+    if dup is None:
+        return []
+    kept, reasons = dup
+    notes: list[str] = []
+    if ExclusionReason.DUPLICATE_OF_CLUSTER in reasons:
+        notes.append(f"DUPLICATE_OF_CLUSTER: cluster {ev.obs.cluster_id}; kept {kept}")
+    if ExclusionReason.DUPLICATE_OF_URL in reasons:
+        notes.append(f"DUPLICATE_OF_URL: same ad url re-recorded; kept {kept}")
+    return notes
 
 
 def _widen(
     evaluations: list[_Evaluation],
-    duplicates: dict[UUID, UUID],
+    duplicates: _Duplicates,
     criteria: MatchingCriteria,
     kinds: tuple[EvidenceKind, ...],
     required: int | None,
@@ -1580,6 +1674,463 @@ def _discounted(money: Money, pct: Decimal) -> Money:
 
 
 # ---------------------------------------------------------------------------------------------
+# MK price orientation (owner decision 2026-10-16, ADR 0005)
+# ---------------------------------------------------------------------------------------------
+
+ORIENTATION_VERSION: Final = "mk-orientation@1.0.0"
+#: The nearest points an orientation keeps (PROPOSED, not statistically validated).
+ORIENTATION_LIMIT: Final = 5
+ORIENTATION_MAX_LIMIT: Final = 50
+#: Distance up to which an asking-price orientation counts as close: the valuation pipeline
+#: prefers it to the owner's estimates only up to here (PROPOSED, not statistically validated).
+#: The closeness test uses the VERIFIED distance (``OrientationResult.nearest_verified_distance``:
+#: an unknown fuel, gearbox or drive counted as a mismatch), so an ad that may be a petrol is
+#: never close to a diesel and an unknown never looks closer than a known near-variant.
+ORIENTATION_CLOSE: Final = Decimal(4)
+#: Continuous distance terms (PROPOSED): 1 point per registration year of difference and per
+#: 30,000 km of mileage difference, so a candidate inside the default tight windows (+/-1 year,
+#: +/-30,000 km) scores at most 2 from year and mileage.
+ORIENTATION_YEAR_POINTS: Final = Decimal(1)
+ORIENTATION_MILEAGE_UNIT_KM: Final = Decimal(30000)
+#: A known pre/post facelift difference of the same generation (PROPOSED).
+ORIENTATION_FACELIFT_POINTS: Final = Decimal(1)
+#: Distance penalty per strict-matching reason that orientation turns into a labelled difference
+#: (PROPOSED, not statistically validated). A different fuel scores above ``ORIENTATION_CLOSE``
+#: on its own, so a diesel is never "close" to a petrol. Unknowns score 1 in the ranking: they
+#: cannot be shown to differ. A target-side unknown adds the same amount to every candidate (no
+#: ranking effect). The closeness test counts every unknown fuel, gearbox or drive (either side)
+#: as its mismatch instead (``OrientationResult.nearest_verified_distance``).
+#: Unknowns strict matching only labels (generation, facelift, engine code/values) score 0.
+ORIENTATION_PENALTIES: Final[dict[ExclusionReason, Decimal]] = {
+    ExclusionReason.FUEL_MISMATCH: Decimal(5),
+    ExclusionReason.WRONG_GENERATION: Decimal(3),
+    ExclusionReason.ENGINE_MISMATCH: Decimal(2),
+    ExclusionReason.GEARBOX_MISMATCH: Decimal(2),
+    ExclusionReason.DRIVE_MISMATCH: Decimal(2),
+    ExclusionReason.FUEL_UNVERIFIED: Decimal(1),
+    ExclusionReason.GEARBOX_UNVERIFIED: Decimal(1),
+    ExclusionReason.DRIVE_UNVERIFIED: Decimal(1),
+    ExclusionReason.YEAR_UNKNOWN: Decimal(1),
+    ExclusionReason.MILEAGE_UNKNOWN: Decimal(1),
+}
+#: Strict reasons that stay hard in an orientation (besides every prefilter and duplicate reason).
+ORIENTATION_HARD: Final = frozenset(
+    {ExclusionReason.MODEL_UNKNOWN, ExclusionReason.WRONG_MODEL, ExclusionReason.CONDITION_MISMATCH}
+)
+ORIENTATION_LABEL: Final = (
+    "MK orientation (relaxed same-model framework over the nearest MK points; not a spec-15 comparable set)"
+)
+
+_ORIENTATION_DIMENSION: Final[dict[ExclusionReason, str]] = {
+    ExclusionReason.FUEL_MISMATCH: "fuel",
+    ExclusionReason.FUEL_UNVERIFIED: "fuel",
+    ExclusionReason.WRONG_GENERATION: "generation",
+    ExclusionReason.ENGINE_MISMATCH: "engine",
+    ExclusionReason.GEARBOX_MISMATCH: "gearbox",
+    ExclusionReason.GEARBOX_UNVERIFIED: "gearbox",
+    ExclusionReason.DRIVE_MISMATCH: "drive",
+    ExclusionReason.DRIVE_UNVERIFIED: "drive",
+    ExclusionReason.YEAR_UNKNOWN: "year",
+    ExclusionReason.MILEAGE_UNKNOWN: "mileage",
+}
+_ORIENTATION_UNKNOWN: Final = frozenset(
+    {
+        ExclusionReason.FUEL_UNVERIFIED,
+        ExclusionReason.GEARBOX_UNVERIFIED,
+        ExclusionReason.DRIVE_UNVERIFIED,
+        ExclusionReason.YEAR_UNKNOWN,
+        ExclusionReason.MILEAGE_UNKNOWN,
+    }
+)
+#: The closeness test counts an unknown powertrain dimension as the mismatch it may hide.
+_ORIENTATION_WORST_CASE: Final[dict[ExclusionReason, ExclusionReason]] = {
+    ExclusionReason.FUEL_UNVERIFIED: ExclusionReason.FUEL_MISMATCH,
+    ExclusionReason.GEARBOX_UNVERIFIED: ExclusionReason.GEARBOX_MISMATCH,
+    ExclusionReason.DRIVE_UNVERIFIED: ExclusionReason.DRIVE_MISMATCH,
+}
+_ORIENTATION_PREFIX: Final = "orientation_"
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+class OrientationPoint(BaseModel):
+    """One MK point of an orientation: its distance and every labelled difference."""
+
+    model_config = _FROZEN
+
+    rank: int = Field(ge=1)
+    observation_id: UUID
+    evidence_kind: EvidenceKind
+    amount_eur: Decimal  # EUR equivalent, 6 decimal places (as in a comparable set)
+    distance: Decimal = Field(ge=0)  # 6 decimal places; 0 = no penalised difference
+    differences: tuple[MatchDifference, ...] = Field(max_length=50)
+    observation: MarketObservation
+
+
+class OrientationResult(BaseModel):
+    """A relaxed same-model MK orientation (``orient_comparables``). Never persisted as a set."""
+
+    model_config = _FROZEN
+
+    version: str = ORIENTATION_VERSION
+    as_of: datetime
+    target: ComparableTarget
+    evidence_kind: EvidenceKind
+    limit: int = Field(ge=1, le=ORIENTATION_MAX_LIMIT)
+    max_age_days: int = Field(ge=1)
+    eligible_count: int = Field(ge=0)
+    points: tuple[OrientationPoint, ...]  # nearest first, at most ``limit``
+    excluded: tuple[ExcludedComparable, ...]
+    #: The smallest distance of any eligible point with every unknown fuel, gearbox or drive
+    #: (on either side) counted as the mismatch it may hide (``None`` without points). Only the
+    #: closeness test uses it; the ranking uses ``distance``.
+    nearest_verified_distance: Decimal | None = None
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def nearest_distance(self) -> Decimal | None:
+        return self.points[0].distance if self.points else None
+
+    @property
+    def close(self) -> bool:
+        """Some eligible point is verified within ``ORIENTATION_CLOSE`` (fallback step a)."""
+        return (
+            self.nearest_verified_distance is not None and self.nearest_verified_distance <= ORIENTATION_CLOSE
+        )
+
+    @property
+    def fresh_until(self) -> datetime | None:
+        """The oldest used point's evidence-age deadline (``None`` without points)."""
+        if not self.points:
+            return None
+        oldest = min(p.observation.observed_at for p in self.points)
+        return oldest + timedelta(days=self.max_age_days)
+
+
+def orient_comparables(
+    target: ComparableTarget,
+    candidates: Sequence[MarketObservation],
+    config: ComparableConfig,
+    as_of: datetime,
+    fx_rates: Sequence[FxRate] = (),
+    *,
+    kind: EvidenceKind,
+    taxonomy: VehicleTaxonomy | None = None,
+    limit: int = ORIENTATION_LIMIT,
+) -> OrientationResult:
+    """The ``limit`` nearest same-model MK points of one evidence ``kind`` (module docstring).
+
+    ``kind`` is ``asking_price`` (MK asking prices) or ``owner_estimate`` (the owner's
+    estimates); every other kind is excluded as ``NOT_COMPARABLE_EVIDENCE_KIND``. Hard: the
+    prefilter (market, fixture lineage, price, FX, after ``as_of``, stale), the canonical make
+    and model, condition and duplicates (cluster and ad URL, as in ``select_comparables``).
+    Everything else adds a labelled ``orientation_*`` difference and its ``ORIENTATION_PENALTIES``
+    distance; year and mileage add continuous terms. Ranking: distance, then the newer
+    observation, then the id -- deterministic and independent of candidate order.
+    """
+    as_of = _aware(as_of)
+    if len(candidates) > MAX_CANDIDATES:
+        raise ValidationFailed(f"too many comparable candidates (max {MAX_CANDIDATES})")
+    ids = [c.id for c in candidates]
+    if len(set(ids)) != len(ids):
+        raise ValidationFailed("duplicate market observation ids in comparable candidates")
+    if kind not in (EvidenceKind.ASKING_PRICE, EvidenceKind.OWNER_ESTIMATE):
+        raise ValidationFailed("an orientation is over MK asking prices or the owner's estimates only")
+    if isinstance(limit, bool) or not 1 <= limit <= ORIENTATION_MAX_LIMIT:
+        raise ValidationFailed(f"orientation limit must be within [1, {ORIENTATION_MAX_LIMIT}]")
+    criteria = _criteria(config)
+    target = target.with_canonical_names(taxonomy)
+    currencies = {
+        c.amount.currency for c in candidates if c.amount is not None and c.amount.currency != "EUR"
+    }
+    rates, warnings = _usable_rates(fx_rates, as_of, currencies)
+    kinds = OWNER_ESTIMATE_KINDS if kind == EvidenceKind.OWNER_ESTIMATE else (kind,)
+    names = _NameResolver(taxonomy)
+    evaluations: list[_Evaluation] = []
+    for obs in sorted(candidates, key=lambda c: str(c.id)):
+        ev = _evaluate(target, obs, criteria, as_of, rates, kinds=kinds, names=names)
+        # The prefilter only separates estimates from market rows: sales never orient asking prices.
+        if obs.evidence_kind != kind and ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND not in ev.prefilter:
+            ev.prefilter.append(ExclusionReason.NOT_COMPARABLE_EVIDENCE_KIND)
+        evaluations.append(ev)
+    duplicates = _dedupe(evaluations, _orientation_eligible)
+
+    eligible: list[tuple[Decimal, _Evaluation, tuple[MatchDifference, ...]]] = []
+    verified: list[Decimal] = []
+    excluded: list[ExcludedComparable] = []
+    for ev in evaluations:
+        dup = duplicates.get(ev.obs.id)
+        reasons = [*ev.prefilter, *(r for r in ev.hard if r in ORIENTATION_HARD), *(dup[1] if dup else ())]
+        if reasons:
+            excluded.append(
+                ExcludedComparable(
+                    observation_id=ev.obs.id,
+                    evidence_kind=ev.obs.evidence_kind,
+                    reasons=tuple(sorted(set(reasons), key=_REASON_ORDER.__getitem__)),
+                    duplicate_of=None if dup is None else dup[0],
+                    details=tuple((list(ev.notes) + _duplicate_notes(ev, dup))[:30]),
+                )
+            )
+            continue
+        distance, differences = _orientation_terms(ev, target, criteria)
+        eligible.append((distance, ev, differences))
+        verified.append(distance + _orientation_worst_case(ev))
+
+    eligible.sort(key=lambda item: (item[0], -_micros(item[1].obs.observed_at), str(item[1].obs.id)))
+    points: list[OrientationPoint] = []
+    for rank, (distance, ev, differences) in enumerate(eligible[:limit], start=1):
+        assert ev.amount_eur is not None  # guaranteed by the prefilter
+        points.append(
+            OrientationPoint(
+                rank=rank,
+                observation_id=ev.obs.id,
+                evidence_kind=ev.obs.evidence_kind,
+                amount_eur=ev.amount_eur,
+                distance=distance,
+                differences=differences[:50],
+                observation=ev.obs,
+            )
+        )
+    notes = [
+        f"ORIENTATION_ONLY: no spec-15 comparable; relaxed same-model orientation ({ORIENTATION_VERSION}) "
+        f"over MK {kind.value} evidence; research needed"
+    ]
+    nearest_verified = min(verified, default=None)
+    if not points:
+        notes.append(f"ORIENTATION_EMPTY: no same-model MK {kind.value} point")
+    elif nearest_verified is None or nearest_verified > ORIENTATION_CLOSE:
+        notes.append(
+            f"ORIENTATION_DISTANT: no point is verified within distance {_num(ORIENTATION_CLOSE)} "
+            f"(nearest {_num(points[0].distance)}, verified {_num(nearest_verified or Decimal(0))}; "
+            "e.g. another fuel or generation, or an unknown fuel, gearbox or drive)"
+        )
+    excluded.sort(key=lambda e: str(e.observation_id))
+    return OrientationResult(
+        as_of=as_of,
+        target=target,
+        evidence_kind=kind,
+        limit=limit,
+        max_age_days=criteria.max_age_days,
+        eligible_count=len(eligible),
+        points=tuple(points),
+        excluded=tuple(excluded),
+        nearest_verified_distance=nearest_verified,
+        warnings=tuple(notes + warnings),
+    )
+
+
+def _orientation_terms(
+    ev: _Evaluation, target: ComparableTarget, criteria: MatchingCriteria
+) -> tuple[Decimal, tuple[MatchDifference, ...]]:
+    """Distance and labelled differences of one eligible candidate (``orient_comparables``)."""
+    vehicle = ev.obs.vehicle
+    differences = list(ev.differences)
+    distance = Decimal(0)
+    values: dict[str, tuple[str | None, str | None]] = {
+        "fuel": (target.fuel.value, vehicle.fuel.value),
+        "gearbox": (target.gearbox.value, vehicle.gearbox.value),
+        "drive": (target.drive.value, vehicle.drive.value),
+        "generation": (target.generation, vehicle.generation),
+        "engine": (
+            _engine_text(target.engine_code, target.engine_displacement_cm3, target.power_kw),
+            _engine_text(vehicle.engine_code, vehicle.engine_displacement_cm3, vehicle.power_kw),
+        ),
+        "year": (None if target.year is None else str(target.year), None),
+        "mileage": (None if target.mileage_km is None else _km(target.mileage_km), None),
+    }
+    for reason in sorted(set(ev.hard), key=_REASON_ORDER.__getitem__):
+        penalty = ORIENTATION_PENALTIES.get(reason)
+        if penalty is None:
+            continue
+        distance += penalty
+        dimension = _ORIENTATION_DIMENSION[reason]
+        t_value, c_value = values[dimension]
+        differences.append(
+            MatchDifference(
+                dimension=dimension,
+                code=f"{_ORIENTATION_PREFIX}{reason.value.lower()}",
+                severity=DifferenceSeverity.UNVERIFIED
+                if reason in _ORIENTATION_UNKNOWN
+                else DifferenceSeverity.DIFFERS,
+                target=_bounded(t_value, 200) if t_value else None,
+                comparable=_bounded(c_value, 200) if c_value else None,
+            )
+        )
+    facelift = ev.needs.get("facelift")
+    if facelift is not None:
+        distance += ORIENTATION_FACELIFT_POINTS
+        differences.append(
+            facelift.model_copy(
+                update={
+                    "code": f"{_ORIENTATION_PREFIX}facelift_differs",
+                    "severity": DifferenceSeverity.DIFFERS,
+                }
+            )
+        )
+    c_year, _source = _vehicle_year(vehicle)
+    if target.year is not None and c_year is not None:
+        years = abs(c_year - target.year)
+        distance += Decimal(years) * ORIENTATION_YEAR_POINTS
+        if years > criteria.year_window:
+            differences.append(
+                MatchDifference(
+                    dimension="year",
+                    code=f"{_ORIENTATION_PREFIX}year_differs",
+                    severity=DifferenceSeverity.DIFFERS,
+                    target=str(target.year),
+                    comparable=str(c_year),
+                )
+            )
+    c_km = vehicle.mileage_km
+    if target.mileage_km is not None and c_km is not None:
+        km = abs(c_km - target.mileage_km)
+        distance += km / ORIENTATION_MILEAGE_UNIT_KM
+        if km > criteria.mileage_window_km:
+            differences.append(
+                MatchDifference(
+                    dimension="mileage",
+                    code=f"{_ORIENTATION_PREFIX}mileage_differs",
+                    severity=DifferenceSeverity.DIFFERS,
+                    target=_km(target.mileage_km),
+                    comparable=_km(c_km),
+                )
+            )
+    return distance.quantize(_AMOUNT_QUANTUM, rounding=ROUND_HALF_EVEN), tuple(differences)
+
+
+def _orientation_worst_case(ev: _Evaluation) -> Decimal:
+    """Extra distance of the closeness test: each unknown fuel, gearbox or drive counted as the
+    mismatch it may hide (``ORIENTATION_PENALTIES`` of the mismatch less that of the unknown)."""
+    return sum(
+        (
+            ORIENTATION_PENALTIES[_ORIENTATION_WORST_CASE[reason]] - ORIENTATION_PENALTIES[reason]
+            for reason in set(ev.hard)
+            if reason in _ORIENTATION_WORST_CASE
+        ),
+        Decimal(0),
+    )
+
+
+def proceeds_from_orientation(
+    result: OrientationResult,
+    negotiation_discount_pct: Decimal | None = None,
+    *,
+    discount_approved: bool = False,
+    sensitivity_discounts_pct: Sequence[Decimal] = (),
+) -> ComparableProceeds:
+    """Labelled proceeds from an orientation's points (never a spec-15 comparable basis).
+
+    base = median of the points' EUR amounts; low/high = first/third quartiles from n >= 5,
+    else min/max. Asking prices: basis ``mk_asking_prices``, the negotiation discount passed
+    through undiscounted (the scenario engine applies it once). Owner estimates: basis
+    ``owner_estimate``, no discount (the discount arguments are ignored). Always
+    ``research_needed`` and never a ``comparable_set_id`` (inquiries rely on that: such proceeds
+    are no market evidence). No point -> ``unknown``.
+    """
+    asking = result.evidence_kind == EvidenceKind.ASKING_PRICE
+    discount = _discount(negotiation_discount_pct, "negotiation_discount_pct") if asking else None
+    if asking and discount_approved and discount is None:
+        raise ValidationFailed("an approved discount needs a value")
+    hypotheticals = (
+        tuple(_pct(d, "sensitivity_discounts_pct") for d in sensitivity_discounts_pct) if asking else ()
+    )
+    basis: ProceedsBasis = "mk_asking_prices" if asking else "owner_estimate"
+    if not result.points:
+        return ComparableProceeds(
+            status=CostLineStatus.UNKNOWN,
+            low=None,
+            base=None,
+            high=None,
+            basis=basis,
+            evidence_kind=None,
+            sample_size=0,
+            negotiation_discount_pct=discount,
+            discount_approved=discount_approved and asking,
+            evidence_ids=(),
+            labels=(
+                "no same-model MK orientation point",
+                "research needed; no MK comparable proceeds evidence",
+            ),
+            research_needed=True,
+        )
+    values = sorted(p.amount_eur for p in result.points)
+    n = len(values)
+    if n >= QUARTILE_MIN_SAMPLE:
+        low, high = quantile(values, Decimal("0.25")), quantile(values, Decimal("0.75"))
+        spread = "low/high are the first/third quartiles"
+    else:
+        low, high = values[0], values[-1]
+        spread = "low/high are min/max of the orientation points"
+    distances = [p.distance for p in result.points]
+    labels = [ORIENTATION_LABEL]
+    if asking:
+        if discount is None:
+            labels.append(DISCOUNT_UNKNOWN_LABEL)
+        else:
+            state = "approved" if discount_approved else "unapproved assumption"
+            labels.append(f"less {discount}% negotiation discount ({state}) applied by the scenario engine")
+    else:
+        labels.append(OWNER_ESTIMATE_LABEL)
+    labels += [
+        f"{n} nearest same-model point(s), distance {_num(min(distances))}-{_num(max(distances))}",
+        spread,
+        "research needed",
+    ]
+    base = Money.of(_cents(quantile(values, Decimal("0.5"))), "EUR")
+    return ComparableProceeds(
+        status=CostLineStatus.ESTIMATED,
+        low=Money.of(_cents(low), "EUR"),
+        base=base,
+        high=Money.of(_cents(high), "EUR"),
+        basis=basis,
+        evidence_kind=result.evidence_kind,
+        sample_size=n,
+        negotiation_discount_pct=discount,
+        discount_approved=discount_approved and asking,
+        evidence_ids=tuple(str(p.observation_id) for p in result.points),
+        comparable_set_id=None,
+        labels=tuple(labels),
+        research_needed=True,
+        sensitivity=tuple(
+            SensitivityPoint(discount_pct=d, base_after_discount=_discounted(base, d)) for d in hypotheticals
+        ),
+    )
+
+
+def orientation_warning(result: OrientationResult) -> str:
+    """One valuation warning (at most 500 characters) that summarises an orientation."""
+    head = f"MK_ORIENTATION:{result.evidence_kind.value}"
+    if not result.points:
+        return _bounded(f"{head}: no same-model MK point ({result.version})", 500)
+    distances = [p.distance for p in result.points]
+    counts: Counter[str] = Counter()
+    for point in result.points:
+        counts.update(
+            {
+                d.code.removeprefix(_ORIENTATION_PREFIX)
+                for d in point.differences
+                if d.code.startswith(_ORIENTATION_PREFIX)
+            }
+        )
+    differs = ", ".join(f"{code} x{counts[code]}" for code in sorted(counts)) or "none"
+    return _bounded(
+        f"{head}: {len(result.points)} nearest same-model MK point(s), distance "
+        f"{_num(min(distances))}-{_num(max(distances))} ({result.version}); differs: {differs}; "
+        "a framework orientation, not a spec-15 comparable set",
+        500,
+    )
+
+
+def _micros(value: datetime) -> int:
+    """Integer microseconds since the epoch (exact; never a float timestamp)."""
+    return (value - _EPOCH) // timedelta(microseconds=1)
+
+
+def _num(value: Decimal) -> str:
+    text = format(value.normalize(), "f")
+    return text if "." not in text else text.rstrip("0").rstrip(".")
+
+
+# ---------------------------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------------------------
 
@@ -1598,6 +2149,28 @@ def _norm(text: str | None) -> str:
     decomposed = unicodedata.normalize("NFKD", text)
     stripped = "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
     return " ".join("".join(c if c.isalnum() else " " for c in stripped).split())
+
+
+def ad_url_key(url: str | None) -> str | None:
+    """The identity of an ad URL for duplicate detection (``None`` = no usable key).
+
+    Host (lowercased, a leading ``www.`` removed) + path (trailing ``/`` removed) + the query
+    string VERBATIM: a Reklama5 ad is ``/AdDetails?ad=<id>``, so dropping the query would merge
+    every ad into one. Scheme, port, userinfo and fragment are dropped, so ``http``/``https``,
+    ``www.``, a trailing slash and ``#photos`` all name the same ad.
+    """
+    if url is None:
+        return None
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    host = host.removeprefix("www.")
+    path = parts.path.rstrip("/")
+    return f"{host}{path}?{parts.query}" if parts.query else f"{host}{path}"
 
 
 def _engine_code(text: str | None) -> str:

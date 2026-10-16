@@ -335,7 +335,7 @@ class EvaluationReport(BaseModel):
         if best is None:
             unknowns = ", ".join(name for name, _ in self.most_common_unknowns[:3]) or "not recorded"
             lines.append(
-                "Best supported economics: unknown - no candidate has a complete valuation "
+                "Best supported economics: unknown - no well-matched candidate has a complete valuation "
                 f"(most common unknowns: {unknowns})."
             )
         else:
@@ -455,10 +455,12 @@ def _economics_key(candidate: EvaluationCandidate) -> tuple[Decimal, Decimal, st
 
 
 def _best_economics(candidates: Sequence[EvaluationCandidate]) -> EconomicsSummary | None:
+    # Only well-matched candidates have SUPPORTED economics: figures from an MK orientation or
+    # the owner's estimates (no adequate/small-sample comparable set; ADR 0004/0005) do not count.
     complete = [
         c
         for c in candidates
-        if c.eligible_primary
+        if c.well_matched
         and c.valuation_complete
         and c.conservative_contribution is not None
         and c.base_contribution is not None

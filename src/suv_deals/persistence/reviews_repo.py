@@ -147,6 +147,15 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 _ELIGIBLE: Final = frozenset({EligibilityState.ELIGIBLE_PRIMARY, EligibilityState.ELIGIBLE_MANUAL_PROFILE})
 _UNUSABLE_VALUATION: Final = frozenset({ValuationState.STALE, ValuationState.INVALID})
 _FIGURE_STATES: Final = frozenset({ValuationState.ESTIMATED, ValuationState.QUOTE_SUPPORTED})
+
+
+def _research_candidate(state: ValuationState, stored_flag: object) -> bool:
+    """A research candidate: no figure state, or the stored valuation document's own
+    ``research_candidate`` flag (a figure valuation from the MK orientation / owner-estimate
+    fallback is still research, ADR 0004/0005)."""
+    return state not in _FIGURE_STATES or stored_flag is True
+
+
 _COMPARABLE_STATUS: Final[dict[str, str]] = {
     "adequate": "adequate",
     "small": "small_sample",
@@ -1331,7 +1340,8 @@ select c.id, c.row_version, c.listing_id, c.revision_id, r.revision_number, c.va
        c.readiness, c.priority, c.ranking, c.claim_holder, c.claim_expires_at,
        r.normalized ->> 'title' as title, r.make, r.model, r.seller_country, r.asking_minor,
        r.currency, r.mileage_km, l.screening ->> 'eur_amount' as eur_amount, c.is_fixture,
-       c.created_at, c.updated_at
+       c.created_at, c.updated_at,
+       coalesce((v.scenarios -> 'valuation' ->> 'research_candidate') = 'true', false) as valuation_research
   from app.review_cases c
   join app.listings l on l.workspace_id = c.workspace_id and l.id = c.listing_id
   join app.listing_revisions r on r.workspace_id = c.workspace_id and r.id = c.revision_id
@@ -1404,7 +1414,7 @@ def _queue_item(row: Mapping[str, Any], caller: UUID, now: datetime) -> ReviewQu
         ),
         payable_eur=_eur_amount(row["eur_amount"]),
         mileage_km=_plain(row["mileage_km"]),
-        research_candidate=valuation_state not in _FIGURE_STATES,
+        research_candidate=_research_candidate(valuation_state, row["valuation_research"]),
         is_fixture=row["is_fixture"],
         created_at=ensure_utc(row["created_at"]),
         updated_at=ensure_utc(row["updated_at"]),
@@ -1539,9 +1549,10 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
         if case.valuation_id is not None:
             valuation = await fetch_one(
                 conn,
-                "select id, state, is_fixture, created_at, expires_at, dependency_fingerprint, currency,"
-                " base_contribution_minor, conservative_contribution_minor from app.valuations"
-                " where workspace_id = %(ws)s and id = %(id)s",
+                "select v.id, v.state, v.is_fixture, v.created_at, v.expires_at, v.dependency_fingerprint,"
+                " v.currency, v.base_contribution_minor, v.conservative_contribution_minor,"
+                " coalesce((v.scenarios -> 'valuation' ->> 'research_candidate') = 'true', false)"
+                " as research from app.valuations v where v.workspace_id = %(ws)s and v.id = %(id)s",
                 {"ws": actor.workspace_id, "id": case.valuation_id},
             )
         decisions = await fetch_all(
@@ -1557,6 +1568,7 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
     valuation_state = (
         ValuationState(valuation["state"]) if valuation is not None else ValuationState.NOT_STARTED
     )
+    research = _research_candidate(valuation_state, None if valuation is None else valuation["research"])
     normalized = listing["normalized"]
     payable_eur = _eur_amount(listing["eur_amount"])
     summary = CandidateSummary(
@@ -1612,7 +1624,7 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
             source_paused=bool(listing["source_paused"]),
         ),
         rank=_rank_summary(row.ranking),
-        research_candidate=valuation_state not in _FIGURE_STATES,
+        research_candidate=research,
         quarantined=bool(listing["quarantined"]),
         is_fixture=case.is_fixture,
     )
@@ -1623,7 +1635,7 @@ async def get_case(conn: Conn, actor: ActorContext, case_id: UUID) -> ReviewCase
         valuation_ref = ValuationRef(
             valuation_id=valuation["id"],
             state=valuation_state,
-            research_candidate=valuation_state not in _FIGURE_STATES,
+            research_candidate=research,
             is_fixture=valuation["is_fixture"],
             created_at=ensure_utc(valuation["created_at"]),
             expires_at=None if valuation["expires_at"] is None else ensure_utc(valuation["expires_at"]),

@@ -11,7 +11,9 @@ States (spec 14): ``not_started`` | ``incomplete`` | ``estimated`` | ``quote_sup
 - ``incomplete``: a material input is unknown (tax, costs, proceeds, eligibility facts).
   Such a valuation is a ``research_candidate`` with unknown costs: never a quantified
   opportunity, and it carries no contribution figures (unknown is never zero).
-- ``estimated``: complete scenarios; some cost inputs are estimates.
+- ``estimated``: complete scenarios; some cost inputs are estimates. When the proceeds are the
+  MK orientation / owner-estimate fallback (no spec-15 comparable set; ADR 0004/0005) the
+  valuation stays a ``research_candidate`` with its figures.
 - ``quote_supported``: complete; every material cost line is quoted/actual or computed by
   an ACTIVE approved tax rule.
 - ``stale``: a dependency changed or a freshness deadline passed (quote expiry, FX age,
@@ -346,9 +348,11 @@ def _expiry(
     fx_max_age_days: int,
     *,
     as_of: datetime,
+    proceeds_fresh_until: datetime | None = None,
 ) -> tuple[datetime | None, list[str]]:
-    """Earliest of quote expiries, FX max-age deadlines, comparable freshness, tax rule end and
-    the end of a customs rate's month.
+    """Earliest of quote expiries, FX max-age deadlines, comparable freshness, the freshness of
+    proceeds evidence outside the comparable set (an MK orientation or the owner's estimates),
+    tax rule end and the end of a customs rate's month.
 
     A customs rate is a monthly list rate, valid in its own month only: a valuation that read it
     expires when the month ends. A rate whose month had already ended at ``as_of`` sets no
@@ -374,6 +378,10 @@ def _expiry(
             )
     if comparable is not None and comparable.fresh_until is not None:
         deadlines.append((comparable.fresh_until, "comparable freshness"))
+    if proceeds_fresh_until is not None:
+        deadlines.append(
+            (ensure_utc(proceeds_fresh_until), "MK orientation / owner estimate evidence freshness")
+        )
     if tax is not None and tax.rule_valid_to is not None:
         deadlines.append(
             (_midnight(tax.rule_valid_to), f"tax rule {tax.rule_set_id}@{tax.version} validity end")
@@ -400,6 +408,9 @@ def assemble_valuation(
     fixture_inputs: bool = False,
     tax_unavailable_reason: str | None = None,
     input_warnings: Sequence[str] = (),
+    proceeds_orientation: bool = False,
+    proceeds_fallback: bool = False,
+    proceeds_fresh_until: datetime | None = None,
 ) -> Valuation:
     """Assemble a valuation with state, unknowns, expiry and dependency fingerprint. Pure.
 
@@ -412,6 +423,21 @@ def assemble_valuation(
     ``input_warnings`` are the caller's own labels on its inputs (e.g. the import-tax input
     builder's assumptions and the Euro import gate); they are recorded as warnings only and
     never change the state, the figures or the fingerprint.
+
+    ``proceeds_orientation``: the scenarios' ``mk_asking_prices`` proceeds come from a relaxed MK
+    orientation (``comparables.orient_comparables``, ADR 0005), not from the comparable set. The
+    material unknown "insufficient_comparables for an asking-price basis" is then not added (the
+    orientation IS the labelled asking-price basis), ``PROCEEDS_FROM_MK_ORIENTATION`` is warned,
+    ``INSUFFICIENT_COMPARABLES`` stays (the spec-15 set is still insufficient), the valuation
+    is never alert eligible and stays a ``research_candidate`` even with figures.
+    ``proceeds_fallback``: the proceeds are any ADR 0004/0005 fallback outside the comparable set
+    (an orientation or the owner's estimates); the valuation then stays a ``research_candidate``
+    even with figures and is never alert eligible (an owner-approved ``owner_estimate`` basis
+    passed by a caller is not a fallback). ``proceeds_fresh_until`` is the evidence-age deadline
+    of proceeds that do not come from the comparable set (orientation points or the owner's estimates: the
+    oldest used observation plus ``comparable_max_age_days``); it joins the expiry deadlines.
+    None of them changes the dependency fingerprint: the proceeds amounts and evidence ids are
+    already in ``cost_inputs_sha256``.
     """
     as_of = ensure_utc(as_of)
     deps = build_dependencies(
@@ -452,9 +478,12 @@ def assemble_valuation(
                 scenarios,
                 fixture=fixture,
                 tax_unavailable_reason=tax_unavailable_reason,
+                proceeds_orientation=proceeds_orientation,
             )
         )
-        warnings.extend(_consistency_warnings(screening, comparable, scenarios))
+        warnings.extend(
+            _consistency_warnings(screening, comparable, scenarios, proceeds_orientation=proceeds_orientation)
+        )
         if unknowns:
             state = ValuationState.INCOMPLETE
         elif scenarios.material_support == "quote_supported":
@@ -468,7 +497,12 @@ def assemble_valuation(
     if state in _FIGURE_STATES and scenarios is not None:
         for name in figures:
             figures[name] = scenarios.scenario(name).contribution_before_business_tax
-    research_candidate = state == ValuationState.INCOMPLETE
+    # Fallback proceeds outside a spec-15 comparable set (an MK orientation or the owner's
+    # estimates, ADR 0004/0005) are an orientation only: the valuation stays a research candidate
+    # even with figures.
+    research_candidate = state == ValuationState.INCOMPLETE or (
+        scenarios is not None and (proceeds_orientation or proceeds_fallback)
+    )
     alert_eligible = (
         state in _FIGURE_STATES
         and not fixture
@@ -476,13 +510,21 @@ def assemble_valuation(
         and scenarios.threshold.alert_eligible
         and tax is not None
         and tax.production_ready
+        and not proceeds_orientation
+        and not proceeds_fallback
     )
 
     expires_at: datetime | None = None
     expiry_reasons: list[str] = []
     if state not in (ValuationState.INVALID, ValuationState.NOT_STARTED):
         expires_at, expiry_reasons = _expiry(
-            scenarios, comparable, tax, deps.fx, fx_max_age_days, as_of=as_of
+            scenarios,
+            comparable,
+            tax,
+            deps.fx,
+            fx_max_age_days,
+            as_of=as_of,
+            proceeds_fresh_until=proceeds_fresh_until,
         )
     stale_at: datetime | None = None
     stale_reason: str | None = None
@@ -526,6 +568,7 @@ def _material_unknowns(
     *,
     fixture: bool,
     tax_unavailable_reason: str | None,
+    proceeds_orientation: bool = False,
 ) -> list[str]:
     unknowns: list[str] = []
     if screening.eligibility == EligibilityState.NEEDS_FACTS:
@@ -558,7 +601,7 @@ def _material_unknowns(
                 "amounts are not production-supported"
             )
     insufficient = comparable is None or comparable.quality == "insufficient_comparables"
-    if insufficient and scenarios.proceeds_basis == "mk_asking_prices":
+    if insufficient and scenarios.proceeds_basis == "mk_asking_prices" and not proceeds_orientation:
         unknowns.append("proceeds: insufficient_comparables for an asking-price basis")
     if not scenarios.complete and not scenarios.unknown_lines:
         unknowns.append("scenarios incomplete")
@@ -566,7 +609,11 @@ def _material_unknowns(
 
 
 def _consistency_warnings(
-    screening: ScreeningInput, comparable: ComparableReference | None, scenarios: ScenarioSet
+    screening: ScreeningInput,
+    comparable: ComparableReference | None,
+    scenarios: ScenarioSet,
+    *,
+    proceeds_orientation: bool = False,
 ) -> list[str]:
     warnings: list[str] = []
     if comparable is None or comparable.quality == "insufficient_comparables":
@@ -580,8 +627,14 @@ def _consistency_warnings(
         warnings.append("PURCHASE_ABOVE_SCREENED_PAYABLE: re-screen the listing at the modelled price")
     if scenarios.proceeds_basis == "owner_estimate":
         warnings.append(
-            "PROCEEDS_FROM_OWNER_ESTIMATE: the MK resale value is the owner's own estimate, "
-            "not MK market evidence"
+            "PROCEEDS_FROM_OWNER_ESTIMATE: the MK resale value is the owner's own estimate "
+            "(the owner's reference prices of 2026-10-16 were read from Reklama5 asking prices, not "
+            "realized sales; no negotiation discount is applied), not MK market evidence"
+        )
+    if proceeds_orientation and scenarios.proceeds_basis == "mk_asking_prices":
+        warnings.append(
+            "PROCEEDS_FROM_MK_ORIENTATION: the MK resale value is a relaxed same-model orientation over "
+            "MK asking prices, not a spec-15 comparable set"
         )
     if scenarios.threshold.proposed_only:
         warnings.append("CONTRIBUTION_THRESHOLD_PROPOSED: EUR threshold is not owner-approved")

@@ -96,6 +96,7 @@ from suv_deals.persistence.queries._common import (
     plain_decimal,
     rendering,
     require_secret,
+    research_candidate,
     utc_or_none,
 )
 from suv_deals.views.candidates import (
@@ -171,7 +172,8 @@ select l.id as listing_id, l.source_id, s.source_key, s.country as source_countr
        c.id as case_id, c.row_version as case_version, c.state as case_state,
        c.status as case_status, c.profile_key as case_profile, c.queue_label as case_queue_label,
        c.ranking as case_ranking, c.is_fixture as case_fixture, c.updated_at as case_updated_at,
-       v.id as valuation_id, v.state as valuation_state, v.is_fixture as valuation_fixture
+       v.id as valuation_id, v.state as valuation_state, v.is_fixture as valuation_fixture,
+       v.research as valuation_research
   from app.listings l
   join app.sources s on s.workspace_id = l.workspace_id and s.id = l.source_id
   join app.listing_revisions r
@@ -186,7 +188,8 @@ select l.id as listing_id, l.source_id, s.source_key, s.country as source_countr
      order by coalesce(c.profile_key = l.eligibility_profile, false) desc, c.updated_at desc, c.id
      limit 1) c on true
   left join lateral (
-    select v.id, v.state, v.is_fixture, v.created_at
+    select v.id, v.state, v.is_fixture, v.created_at,
+           coalesce((v.scenarios -> 'valuation' ->> 'research_candidate') = 'true', false) as research
       from app.valuations v
      where v.workspace_id = l.workspace_id and v.listing_id = l.id
        and v.listing_revision_id = l.current_revision_id
@@ -339,7 +342,7 @@ def _summary(row: Mapping[str, Any], *, now: datetime) -> CandidateSummary:
             source_paused=bool(row["source_paused"]),
         ),
         rank=_rank_summary(row["case_ranking"]),
-        research_candidate=valuation_state not in FIGURE_STATES,
+        research_candidate=research_candidate(valuation_state, row["valuation_research"]),
         quarantined=bool(row["quarantined"]),
         is_fixture=_is_fixture(row),
     )
@@ -485,7 +488,8 @@ select a.occurred_at, a.metadata
 """
 _VALUATION_REF_SQL: Final = """
 select v.id, v.state, v.is_fixture, v.created_at, v.expires_at, v.dependency_fingerprint, v.currency,
-       v.base_contribution_minor, v.conservative_contribution_minor
+       v.base_contribution_minor, v.conservative_contribution_minor,
+       coalesce((v.scenarios -> 'valuation' ->> 'research_candidate') = 'true', false) as research
   from app.valuations v
  where v.workspace_id = %(ws)s and v.listing_id = %(listing_id)s and v.listing_revision_id = %(revision_id)s
  order by v.created_at desc, v.id desc
@@ -586,7 +590,7 @@ def _valuation_ref(row: Mapping[str, Any] | None) -> ValuationRef | None:
     return ValuationRef(
         valuation_id=row["id"],
         state=state,
-        research_candidate=state not in FIGURE_STATES,
+        research_candidate=research_candidate(state, row["research"]),
         is_fixture=row["is_fixture"],
         created_at=ensure_utc(row["created_at"]),
         expires_at=utc_or_none(row["expires_at"]),

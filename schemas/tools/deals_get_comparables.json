@@ -325,7 +325,7 @@
             "additionalProperties": false,
             "properties": {
               "criteria_version": {
-                "default": "mk-comparables@1.2.0",
+                "default": "mk-comparables@1.3.0",
                 "type": "string"
               },
               "displacement_tolerance": {
@@ -608,6 +608,7 @@
                       "OBSERVED_AFTER_AS_OF",
                       "STALE",
                       "DUPLICATE_OF_CLUSTER",
+                      "DUPLICATE_OF_URL",
                       "MODEL_UNKNOWN",
                       "WRONG_MODEL",
                       "WRONG_GENERATION",

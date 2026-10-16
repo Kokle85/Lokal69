@@ -772,10 +772,11 @@ def test_price_history_changes(listing: NormalizedListing) -> None:
 
 def comparable_candidates() -> list[MarketObservation]:
     def obs(kind: EvidenceKind, amount: str, fuel: Fuel = Fuel.DIESEL) -> MarketObservation:
+        oid = uuid4()
         return MarketObservation(
-            id=uuid4(),
+            id=oid,
             source_key="pazar3_mk",
-            url="https://mk.example/ad/1",
+            url=f"https://mk.example/ad/{oid.hex[:12]}",
             observed_at=NOW - timedelta(days=3),
             evidence_kind=kind,
             amount=eur(amount),

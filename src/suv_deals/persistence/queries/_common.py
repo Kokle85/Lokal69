@@ -52,6 +52,14 @@ from suv_deals.views.common import ResponseEnvelope, ResponseWarning, envelope
 #: Valuation states that carry contribution figures (everything else is a research candidate).
 FIGURE_STATES: Final = frozenset({ValuationState.ESTIMATED, ValuationState.QUOTE_SUPPORTED})
 
+
+def research_candidate(state: ValuationState, stored_flag: object) -> bool:
+    """A research candidate: no figure state, or the stored valuation document's own
+    ``research_candidate`` flag (a figure valuation from the MK orientation / owner-estimate
+    fallback is still research, ADR 0004/0005)."""
+    return state not in FIGURE_STATES or stored_flag is True
+
+
 CursorSecret = bytes | Sequence[bytes]
 
 
@@ -330,6 +338,7 @@ __all__ = [
     "plain_decimal",
     "rendering",
     "require_secret",
+    "research_candidate",
     "text_list",
     "utc_or_none",
 ]
