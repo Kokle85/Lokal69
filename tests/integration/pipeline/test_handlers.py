@@ -5,7 +5,10 @@ SYNTHETIC fixture source only; nothing is fetched from a network.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
+from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,9 +31,22 @@ from suv_deals.adapters.base import DiscoveryPage, FetchPurpose, ParserHealth, R
 from suv_deals.adapters.fixture_client import FixtureCrawlClient
 from suv_deals.clock import SystemClock
 from suv_deals.crawling import discovery
-from suv_deals.crawling.detail import CARD_ONLY_SKIP
+from suv_deals.crawling.detail import CARD_FACTS, CARD_ONLY_SKIP
 from suv_deals.crawling.scheduler import run_scheduler_tick
-from suv_deals.domain.enums import AccessState, JobState, JobType, SourceMode
+from suv_deals.domain.enums import (
+    AccessState,
+    Fuel,
+    Gearbox,
+    JobState,
+    JobType,
+    OdometerClaim,
+    Precision,
+    PriceBasis,
+    PriceType,
+    SellerType,
+    SourceMode,
+)
+from suv_deals.domain.listings import LocationInfo, NormalizedListing, PartialDate, PriceInfo, VehicleSpec
 from suv_deals.errors import VersionConflict
 from suv_deals.persistence import jobs, listings_repo
 from suv_deals.persistence.database import Conn
@@ -138,6 +154,81 @@ async def test_card_only_source_never_fetches_detail_pages(env: PipelineEnv) -> 
         env.scalar("select count(*) from app.listing_revisions where workspace_id = %s", env.workspace_id)
         == 0
     )
+
+
+def _card_facts(source_key: str, slid: str, url: str) -> dict[str, Any]:
+    """SYNTHETIC search-card facts of one listing (no drive, no body type: cards show neither)."""
+    observed = datetime(2026, 10, 1, 8, 0, tzinfo=UTC)
+    listing = NormalizedListing(
+        source_key=source_key,
+        source_listing_id=slid,
+        canonical_url=url,
+        observed_at=observed,
+        title="Example Trail 2.0 (synthetic card)",
+        location=LocationInfo(country="DE"),
+        seller_type=SellerType.DEALER,
+        vehicle=VehicleSpec(
+            make="Example",
+            model="Trail",
+            fuel=Fuel.DIESEL,
+            gearbox=Gearbox.MANUAL,
+            power_kw=103,
+            first_registration=PartialDate(value="2012-05", precision=Precision.MONTH),
+            mileage_km=Decimal(187500),
+            mileage_claim=OdometerClaim.SELLER_REPORTED,
+        ),
+        price=PriceInfo(
+            amount_minor=275000,
+            currency="EUR",
+            basis=PriceBasis.GROSS,
+            type=PriceType.FULL_VEHICLE_ASKING,
+            raw_text="€ 2.750",
+        ),
+        warnings=("FACTS_FROM_SEARCH_CARD",),
+        parser_version="synthetic-card@1.0.0",
+    )
+    return listing.model_dump(mode="json")
+
+
+async def test_card_only_card_facts_become_a_revision_without_any_fetch(env: PipelineEnv) -> None:
+    await tick(env)
+    await worker(env, "worker-discovery", JobType.DISCOVERY).run_until_idle()
+    env.seed.conn.execute("update app.sources set detail_mode = 'card_only' where id = %s", (env.source_id,))
+    [row] = env.rows(
+        "select l.id, l.canonical_url, s.source_key from app.listings l join app.sources s"
+        " on s.id = l.source_id where l.workspace_id = %s and l.source_listing_id = 'TEST-204'",
+        env.workspace_id,
+    )
+    facts = _card_facts(row["source_key"], "TEST-204", row["canonical_url"])
+    env.seed.conn.execute(
+        "update ops.jobs set payload = payload || jsonb_build_object('card_listing', %s::jsonb)"
+        " where listing_id = %s and job_type = 'detail' and state = 'queued'",
+        (json.dumps(facts), row["id"]),
+    )
+    fetches_before = env.scalar(
+        "select count(*) from ops.fetch_attempts where workspace_id = %s", env.workspace_id
+    )
+    reports = await worker(env, "worker-detail", JobType.DETAIL).run_until_idle()
+    assert len(reports) == 5 and all(r.state == JobState.SUCCEEDED for r in reports)
+    [ingested] = [r for r in reports if r.details.get("facts") == CARD_FACTS]
+    assert ingested.details["listing_id"] == str(row["id"]) and ingested.details["revision_id"]
+    assert sum(r.details == {"skipped": CARD_ONLY_SKIP} for r in reports) == 4
+    assert (
+        env.scalar("select count(*) from ops.fetch_attempts where workspace_id = %s", env.workspace_id)
+        == fetches_before
+    )
+    [revision] = env.rows(
+        "select make, model, registration_year, registration_month, asking_minor, gearbox,"
+        " normalized from app.listing_revisions where listing_id = %s",
+        row["id"],
+    )
+    assert (revision["make"], revision["model"], revision["gearbox"]) == ("Example", "Trail", "manual")
+    assert (revision["registration_year"], revision["registration_month"]) == (2012, 5)
+    assert revision["asking_minor"] == 275000
+    assert revision["normalized"]["vehicle"]["power_kw"] == 103
+    assert "FACTS_FROM_SEARCH_CARD" in revision["normalized"]["warnings"]
+    listing = by_slid(env)["TEST-204"]
+    assert listing["current_revision_id"] is not None and listing["eligibility_state"] is not None
 
 
 async def test_login_wall_on_a_detail_page_blocks_the_job_and_pauses_the_route(env: PipelineEnv) -> None:

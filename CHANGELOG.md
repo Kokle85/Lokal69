@@ -47,26 +47,44 @@ owner's live smoke run.
   (`unexpected_content`); challenge pages and 401/403 are access blocks. Placeholder and absurd
   prices carry no amount. Italian `/annunci/` detail pages are parsed from `listingDetails.vehicle`
   (drive, kW, cm3, first registration, production year, fuel incl. plug-in flag, gearbox, km,
-  body) with the JSON-LD Car as fallback and cross-check (disagreements are field conflicts);
-  net-price seller wording and commercial (N1, "AUTOCARRO") registrations are flagged without
-  storing the description. Germany stays `card_only`: its detail URLs are identity only and
-  `fetch_detail`/`parse_detail` refuse without any request.
+  body) with the JSON-LD Car as fallback and cross-check (disagreements are field conflicts; a
+  JSON-LD Car naming another listing is refused). Net-price seller wording ("al netto dell'IVA",
+  "zzgl. MwSt.") sets `price.basis = net` without storing the description, so screening treats
+  the amount as a lower bound and the listing becomes `needs_facts`; commercial (N1, "AUTOCARRO")
+  registrations are flagged. A conditional price ("Prezzo con condizioni", `isConditionalPrice`)
+  is never a full asking price, on cards and on detail pages alike (`PRICE_CONDITIONAL`, type
+  `unknown`); `prices.isFinalPrice: false` warns `PRICE_NOT_FINAL`. Germany stays `card_only`:
+  its detail URLs are identity only and `fetch_detail`/`parse_detail` refuse without any request.
+- **Card-sourced revisions for `card_only` sources.** `SearchObservation.card_listing` carries a
+  card_only card's own facts (make/model, first registration, km, price, fuel, gearbox, kW, cm3,
+  seller type, country; `FACTS_FROM_SEARCH_CARD`). `listings_repo.ingest_search_page` puts them
+  in the payload of the new/changed-card detail job (a waiting job takes over newer facts) and
+  `crawling.detail` ingests them through `ingest_detail` WITHOUT any request, so German listings
+  get revisions and are screened (no drive or body type on cards: those stay unknown). Jobs
+  without card facts still complete as `card_only_source` skips.
 - **Per-model searches.** `search.models` lists the owner's twelve models (Captur, Qashqai, Juke,
   Sportage, Mokka, Mokka X, Duster, 2008, ix35, Antara, Yeti, SX4 S-Cross); one discovery run walks
   them with an opaque `model:<n>` cursor through the existing traversal (no scheduler change), one
   page per model, newest first (`sort=age&desc=1`) with the profile's price band and km ceiling
   (`pricefrom`/`priceto`/`kmto`) and `ustate=U` on Italy. `max_search_pages_per_run: 12`, 20 s
-  spacing. A model slug answering 404 is skipped; any incomplete model page makes the run partial,
-  so absence marking only follows a complete walk. Unverified slugs are named in the config notes.
+  spacing. A model slug answering a genuine 404 is skipped (counted in the cursor, `:nf<k>`); a
+  policy refusal is never a skipped model; a 404 of the captured `renault/captur` route or of
+  every model, and a page whose listings have no Organic/Main card while results are reported,
+  are drift (`unexpected_content`). Any incomplete model page makes the run partial, so absence
+  marking only follows a complete walk. Unverified slugs are named in the config notes.
 - **Fix: capture redaction broke JSON escapes.** `sample_capture.redact_html` swallowed the letters
-  of a `>`/`\n` escape before an e-mail address, leaving `\[redacted-email]` (invalid JSON in
-  saved pages); the escape is now kept intact.
+  of a `\u003e`/`\n` escape before an e-mail address, leaving `\[redacted-email]` (invalid JSON
+  in saved pages); escapes are now matched as whole tokens and kept intact, in linear time (long
+  escape runs such as escaped CJK text no longer rescan quadratically).
 - **Fix: the schema.org reader missed `Product.offers.itemOffered`.** `_extract` now yields the
-  offered Car with its Offer, so the generic dealer adapter reads model, km, fuel, gearbox, drive,
-  cm3, kW (KWT preferred), body and first registration on such pages; `productionDate` is read as
-  the first registration (labelled, low confidence) only when no `dateVehicleFirstRegistered`
-  exists, and localised drive/gearbox labels use small exact-word maps (`adapters/_vocabulary.py`).
-- Tests: synthetic AutoScout24 pages with the captured structure (`tests/adapters/`), covering IT
+  offered Car with its Offer (only from a non-vehicle node: a Car naming itself again as its
+  offered item stays one vehicle), so the generic dealer adapter reads model, km, fuel, gearbox,
+  drive, cm3, kW (KWT preferred) and body on such pages; localised drive/gearbox labels use small
+  exact-word maps (`adapters/_vocabulary.py`). The generic reader keeps `productionDate` as the
+  production year, never a first registration; only the AutoScout24 adapter reads Italy's
+  `productionDate` (which holds the registration date) as first registration.
+- Tests: synthetic AutoScout24 pages with the captured structure and invented values
+  (`tests/adapters/`; only generic engine specifications match a real car), covering IT
   and DE search cards, the IT detail page, drift and blocks, model mismatch, prices, the model walk,
   query building and that Germany never fetches a detail page.
 

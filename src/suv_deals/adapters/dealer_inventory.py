@@ -105,7 +105,6 @@ from suv_deals.domain.enums import (
     Fuel,
     Gearbox,
     OdometerClaim,
-    Precision,
     PriceBasis,
     PriceType,
     SellerType,
@@ -522,25 +521,12 @@ def _money_minor(amount: Decimal, currency: str) -> int | None:
         return None
 
 
-def _first_registration(
-    raw: str, col: _Collector, *, selector: str, confidence: Confidence, note: str | None = None
-) -> PartialDate:
-    """A first-registration date that is parseable and not in the future, else unknown (warned).
-
-    With ``note`` (a date taken from a key that is not ``dateVehicleFirstRegistered``) a day-01 date
-    is read at month precision: the day is a filler, not a registration day.
-    """
+def _first_registration(raw: str, col: _Collector, *, selector: str, confidence: Confidence) -> PartialDate:
+    """A first-registration date that is parseable and not in the future, else unknown (warned)."""
     parsed = parse_partial_date(raw)
     if parsed is None:
         col.warn("FIRST_REGISTRATION_UNPARSEABLE")
         return PartialDate()
-    transformation = f"precision={parsed.precision.value}"
-    if note is not None:
-        if parsed.value is not None and parsed.precision == Precision.DAY and parsed.value.endswith("-01"):
-            parsed = PartialDate(value=parsed.value[:7], precision=Precision.MONTH)
-            transformation = f"{note}; day 01 read as month precision"
-        else:
-            transformation = f"{note}; {transformation}"
     # Compare at the stated precision: "2026-10" is not future on 2026-10-06, "2026-10-20" is.
     stated = parsed.value or ""
     if stated > col.observed_at.date().isoformat()[: len(stated)]:
@@ -552,7 +538,7 @@ def _first_registration(
         confidence,
         selector=selector,
         raw=raw,
-        transformation=transformation,
+        transformation=f"precision={parsed.precision.value}",
     )
     return parsed
 
@@ -1494,39 +1480,26 @@ class SchemaOrgDealerAdapter:
             col.prov(
                 "vehicle.model_year", jl, Confidence.HIGH, selector="json_ld:vehicleModelDate", raw=model_year
             )
-        reg_raw = text_of(_get(vehicle, "dateVehicleFirstRegistered"))
-        production_raw = text_of(_get(vehicle, "productionDate"))
-        production_year: int | None = None
-        if production_raw and reg_raw:
-            production_year = year_from(production_raw)
-            if production_year:
-                col.prov(
-                    "vehicle.production_year",
-                    jl,
-                    Confidence.HIGH,
-                    selector="json_ld:productionDate",
-                    raw=production_year,
-                )
+        # ``productionDate`` is the production year here and never a first registration: a generic
+        # dealer's year of manufacture must not become a day-precision registration date (vehicle
+        # age for MK import costs). Marketplaces that put the registration date in productionDate
+        # (AutoScout24 Italy) read it in their own adapter.
+        production_year = year_from(scalar(_get(vehicle, "productionDate")))
+        if production_year:
+            col.prov(
+                "vehicle.production_year",
+                jl,
+                Confidence.HIGH,
+                selector="json_ld:productionDate",
+                raw=production_year,
+            )
 
         first_reg = PartialDate()
+        reg_raw = text_of(_get(vehicle, "dateVehicleFirstRegistered"))
         if reg_raw:
             first_reg = _first_registration(
                 reg_raw, col, selector="json_ld:dateVehicleFirstRegistered", confidence=Confidence.HIGH
             )
-        elif production_raw:
-            # Some marketplaces (AutoScout24 Italy) publish the FIRST-REGISTRATION date as
-            # ``productionDate`` and no ``dateVehicleFirstRegistered``; the real production year
-            # differs. Without a registration date it is read as the first registration, labelled
-            # and at low confidence, and never as the production year.
-            first_reg = _first_registration(
-                production_raw,
-                col,
-                selector="json_ld:productionDate",
-                confidence=Confidence.LOW,
-                note="productionDate read as first registration (no dateVehicleFirstRegistered)",
-            )
-            if first_reg.value is not None:
-                col.warn("FIRST_REGISTRATION_FROM_PRODUCTION_DATE")
 
         body = BodyType.UNKNOWN
         body_raw = text_of(_get(vehicle, "bodyType"))

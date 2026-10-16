@@ -12,8 +12,12 @@ Search pages (`ingest_search_page`)
     is enqueued (spec 9 "Detail fetch rules") for a newly seen listing or a changed card hash
     (the card hash covers price, mileage, title, URL and the source modification marker) unless a
     detail job of the listing is already waiting; the job's dedup key binds identity, incarnation
-    and a freshly allocated detail generation -- never a semantic hash. ``card_only`` sources get no
-    detail jobs.
+    and a freshly allocated detail generation -- never a semantic hash. ``card_only`` sources never
+    get a detail FETCH: when their adapter supplies the card's own facts
+    (``SearchObservation.card_listing``) the job carries them in its payload (``card_listing``) and
+    the detail handler ingests them as a card-sourced revision without any request; a job already
+    waiting takes over the newer card facts instead of a second job. Without card facts no job is
+    queued.
 
 Detail pages (`ingest_detail`, one transaction after the network fetch)
     Locks ``ops.jobs`` (lease revalidated), then ``app.sources`` (share), then ``app.listings``,
@@ -69,6 +73,7 @@ Scopes: ingestion is system work (system principals or ``config:admin``); detail
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -585,25 +590,45 @@ async def _enqueue_detail(
     job_type: JobType = JobType.DETAIL,
     run_id: UUID | None = None,
     priority: int = 0,
+    card_listing: dict[str, Any] | None = None,
 ) -> DetailJobRef | None:
-    """Detail/recheck job bound to identity + incarnation + a fresh generation (None = deduplicated)."""
+    """Detail/recheck job bound to identity + incarnation + a fresh generation (None = deduplicated).
+
+    ``card_listing`` (card_only sources): the card's facts as JSON for a no-fetch ingestion. A job
+    that is already waiting is deduplicated as usual but takes over the newer card facts, so the
+    latest card is what gets ingested.
+    """
     waiting = await fetch_one(
         conn, _WAITING_DETAIL_SQL, {"workspace_id": actor.workspace_id, "listing_id": listing.id}
     )
     if waiting is not None:
+        if card_listing is not None:
+            await conn.execute(
+                "update ops.jobs set payload = payload || %(patch)s"
+                " where workspace_id = %(workspace_id)s and id = %(id)s"
+                " and state in ('queued', 'retry_wait')",
+                {
+                    "workspace_id": actor.workspace_id,
+                    "id": waiting["id"],
+                    "patch": Jsonb({"card_listing": card_listing}),
+                },
+            )
         return None
     generation = await _allocate(conn, actor.workspace_id, listing.id)
+    payload: dict[str, Any] = {
+        "listing_id": str(listing.id),
+        "source_listing_id": listing.source_listing_id,
+        "incarnation": listing.incarnation,
+        "url": url,
+        "reason": reason,
+        "run_id": None if run_id is None else str(run_id),
+    }
+    if card_listing is not None:
+        payload["card_listing"] = card_listing
     spec = jobs.JobSpec(
         job_type=job_type,
         dedup_key=f"{job_type.value}:{listing.id}:i{listing.incarnation}:g{generation}",
-        payload={
-            "listing_id": str(listing.id),
-            "source_listing_id": listing.source_listing_id,
-            "incarnation": listing.incarnation,
-            "url": url,
-            "reason": reason,
-            "run_id": None if run_id is None else str(run_id),
-        },
+        payload=payload,
         priority=priority,
         source_id=listing.source_id,
         listing_id=listing.id,
@@ -989,9 +1014,20 @@ async def ingest_search_page(
                     counts["aliases"] += await _record_alias(
                         conn, ws, source.id, listing, card, run_id, observed_at
                     )
-            if reason is not None and source.detail_mode == "fetch":
+            card_facts: dict[str, Any] | None = None
+            if source.detail_mode == "card_only":
+                card_facts, problem = _card_facts(source, card)
+                if problem is not None:
+                    warnings.append(problem)
+            if reason is not None and (source.detail_mode == "fetch" or card_facts is not None):
                 ref = await _enqueue_detail(
-                    conn, actor, listing, reason=reason, url=card.identity.canonical_url, run_id=run_id
+                    conn,
+                    actor,
+                    listing,
+                    reason=reason,
+                    url=card.identity.canonical_url,
+                    run_id=run_id,
+                    card_listing=card_facts,
                 )
                 if ref is None:
                     counts["dedup"] += 1
@@ -1037,6 +1073,24 @@ async def ingest_search_page(
         identity_collisions=tuple(collisions),
         warnings=tuple(warnings[:50]),
     )
+
+
+#: Card facts larger than this never ride in a job payload (the job payload cap is 64 KiB).
+_MAX_CARD_FACTS_BYTES: Final = 48 * 1024
+
+
+def _card_facts(source: SourceRecord, card: _Card) -> tuple[dict[str, Any] | None, str | None]:
+    """The card_only card's own facts as job-payload JSON, or the reason they are not used."""
+    facts = card.observation.card_listing
+    if facts is None:
+        return None, None
+    slid = card.identity.source_listing_id
+    if facts.source_key != source.source_key or facts.source_listing_id != slid:
+        return None, f"card facts of {slid[:80]} name another listing; not ingested"[:300]
+    dumped = facts.model_dump(mode="json")
+    if len(json.dumps(dumped, separators=(",", ":"))) > _MAX_CARD_FACTS_BYTES:
+        return None, f"card facts of {slid[:80]} are too large; not ingested"[:300]
+    return dumped, None
 
 
 async def _insert_card(  # noqa: PLR0917 - private helper

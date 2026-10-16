@@ -375,9 +375,10 @@ state of every gate, its missing dependency and the smallest owner action are in
   address unreachable. No live crawl before both are recorded.
 - **Each source**, in this order (`docs/source_access_register.md` steps 1-7): a terms decision
   and robots handling; an **adapter implementation with a real `adapter_version`, verified routes
-  and saved fixtures** (12 of the 14 registered sources are `adapter_version: unimplemented`
+  and saved fixtures** (10 of the 14 registered sources are `adapter_version: unimplemented`
   today, both MK comparable sources included: `sources inspect <key>` and `doctor` report them as
-  "not activatable (no adapter)"; configuration alone can never activate them); then the gated
+  "not activatable (no adapter)"; configuration alone can never activate them; `autoscout24_it`
+  and `autoscout24_de` have an adapter but are disabled and untested live); then the gated
   live smoke `suv-deals crawl once --source <key> --max-pages 1` with `SOURCE_NETWORK_ENABLED=true`
   and its evidence record (register step 6).
 - **Supabase**: migrations + `doctor` + restore drill (section 7).

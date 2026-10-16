@@ -2,10 +2,12 @@
 
 Only key names, nesting and value kinds come from the captures (Next.js ``__NEXT_DATA__`` with
 ``props.pageProps.listings`` on search pages, ``props.pageProps.listingDetails`` plus a JSON-LD
-``Product.offers.itemOffered`` Car on Italian detail pages). Every value is a neutral example
-(price 8000, 155300 km, 04-2019, synthetic UUIDs) and the seller/location objects carry obvious
-placeholders, so the tests can prove that no seller name, phone, street or link is ever copied.
-No real page content, dealer, address or photo URL is stored here.
+``Product.offers.itemOffered`` Car on Italian detail pages). Every listing value is INVENTED
+(price 7400, 143200 km, 09-2018, synthetic UUIDs, timestamps and slugs) and differs from the
+captured listings; only generic engine specifications (a 1.5 dCi with 81 kW / 1461 cm3, a TCe 140
+with 103 kW / 1332 cm3) are model facts any brochure states. The seller/location objects carry
+obvious placeholders, so the tests can prove that no seller name, phone, street or link is ever
+copied. No real page content, dealer, address or photo URL is stored here.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ def uuid_for(n: int) -> str:
 
 
 def _json(value: Any) -> str:
-    # The real pages escape "<" inside the JSON (<), so no "</script>" can occur in it.
+    # The real pages escape "<" inside the JSON (\u003c), so no "</script>" can occur in it.
     return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")
 
 
@@ -36,12 +38,12 @@ def card(
     model: str = "Captur",
     model_group: str | None = "Captur",
     version: str = "Captur 1.5 dCi 110CV Synthetic Edition",
-    price: int | None = 8000,
+    price: int | None = 7400,
     price_formatted: str | None = None,
     tracking_price: str | None = None,
-    km: int = 155300,
+    km: int = 143200,
     km_text: str | None = None,
-    first_registration: str = "04-2019",
+    first_registration: str = "09-2018",
     fuel_code: str = "d",
     fuel_text: str = "Diesel",
     transmission: str = "Manuale",
@@ -185,19 +187,28 @@ def detail_page(
     nd_id: str | None = None,
     include_next_data: bool = True,
     include_json_ld: bool = True,
-    km: int = 155300,
+    km: int = 143200,
     ld_km: int | None = None,
     power_kw: int = 81,
     ld_power_kw: int | None = None,
     drive: str = "Anteriore",
     fuel_code: str = "D",
     plugin: bool = False,
-    price: int = 8000,
-    description: str = "<p>Synthetic description. Prezzo al netto dell'IVA.</p>",
-    version: str = "Captur 1.5 dci 110CV AUTOCARRO Synthetic",
+    price: int = 7400,
+    description: str = "<p>Synthetic description.</p>",
+    version: str = "Captur 1.5 dci 110CV Synthetic",
     status: str = "Active",
+    conditional: bool = False,
+    final_price: bool = True,
+    ld_identifier: str | None = None,
+    ld_production_date: str = "2018-09-01",
 ) -> str:
-    """An Italian ``/annunci/`` detail page: ``listingDetails`` and/or the JSON-LD Product/Offer/Car."""
+    """An Italian ``/annunci/`` detail page: ``listingDetails`` and/or the JSON-LD Product/Offer/Car.
+
+    The defaults are a clean page (no net-price wording, no commercial registration, a final and
+    unconditional price); ``ld_identifier`` / ``ld_production_date`` let the JSON-LD Car disagree
+    with ``__NEXT_DATA__``.
+    """
     lid = listing_id or uuid_for(n)
     url = f"https://{IT_HOST}/annunci/renault-captur-synthetic-diesel-bianco-cat_ma60mo20235-{lid}"
     car = {
@@ -207,12 +218,12 @@ def detail_page(
         "model": "Captur",
         "color": "Bianco",
         "bodyType": "SUV/Fuoristrada/Pick-up",
-        "identifier": lid,
-        "productionDate": "2019-04-01",
+        "identifier": ld_identifier or lid,
+        "productionDate": ld_production_date,
         "driveWheelConfiguration": drive,
         "vehicleTransmission": "Manuale",
         "numberOfDoors": 5,
-        "seatingCapacity": 4,
+        "seatingCapacity": 5,
         "mileageFromOdometer": {"@type": "QuantitativeValue", "value": ld_km or km, "unitText": "KMT"},
         "vehicleEngine": [
             {
@@ -225,7 +236,7 @@ def detail_page(
                 "engineDisplacement": {"@type": "QuantitativeValue", "value": 1461, "unitCode": "CMQ"},
             }
         ],
-        "emissionsCO2": 98,
+        "emissionsCO2": 105,
     }
     product = {
         "@context": "https://schema.org",
@@ -257,10 +268,16 @@ def detail_page(
         "id": nd_id or lid,
         "status": status,
         "title": "Renault Captur",
-        "createdTimestampWithOffset": "2026-07-31T19:03:43.142Z",
+        "createdTimestampWithOffset": "2026-01-01T00:00:00Z",
         "description": description,
+        "price": {
+            "priceFormatted": f"€ {price}",
+            "priceEvaluation": 0,
+            "isVatLabelLegallyRequired": False,
+            "isConditionalPrice": conditional,
+        },
         "prices": {
-            "isFinalPrice": True,
+            "isFinalPrice": final_price,
             "public": {
                 "price": f"€ {price}",
                 "priceRaw": price,
@@ -294,8 +311,8 @@ def detail_page(
             "rawPowerInKw": power_kw,
             "rawPowerInHp": 110,
             "rawDisplacementInCCM": 1461,
-            "firstRegistrationDateRaw": "2019-04-01",
-            "firstRegistrationDate": "04/2019",
+            "firstRegistrationDateRaw": "2018-09-01",
+            "firstRegistrationDate": "09/2018",
             "productionYear": "2018",
             "mileageInKmRaw": km,
             "mileageInKm": f"{km} km",
@@ -304,8 +321,8 @@ def detail_page(
             "driveTrain": drive,
             "bodyType": "SUV/Fuoristrada/Pick-up",
             "offerType": "U",
-            "numberOfSeats": 4,
-            "nextVehicleSafetyInspection": "04/2027",
+            "numberOfSeats": 5,
+            "nextVehicleSafetyInspection": "10/2027",
             "rawData": {
                 "engine": {
                     "transmissionType": {"raw": "Manual", "formatted": "Manuale"},
@@ -314,16 +331,16 @@ def detail_page(
                 "fuels": {
                     "isPluginHybrid": {"raw": plugin},
                     "fuelCategory": {"raw": fuel_code},
-                    "primary": {"co2emissionInGramPerKmWithFallback": {"raw": 98, "isFallback": False}},
+                    "primary": {"co2emissionInGramPerKmWithFallback": {"raw": 105, "isFallback": False}},
                 },
                 "condition": {
-                    "firstRegistrationDate": {"raw": "2019-04-01", "formatted": "04/2019"},
+                    "firstRegistrationDate": {"raw": "2018-09-01", "formatted": "09/2018"},
                     "mileageInKm": {"raw": km},
-                    "numberOfPreviousOwnersExtended": {"raw": 1},
+                    "numberOfPreviousOwnersExtended": {"raw": 2},
                     "damage": {"isCurrentlyDamaged": None, "accidentFree": True},
                 },
                 "bodyType": {"formatted": "SUV/Fuoristrada/Pick-up", "raw": "Offroad"},
-                "productionDate": {"formatted": "01/2018", "raw": "2018-01-01"},
+                "productionDate": {"formatted": "03/2018", "raw": "2018-03-01"},
             },
         },
     }

@@ -229,10 +229,10 @@ def test_the_generic_reader_finds_the_car_offered_by_a_product() -> None:
     assert v.mileage_km == Decimal(155300)
     assert (v.fuel, v.gearbox, v.drive, v.body_type) == (Fuel.DIESEL, Gearbox.MANUAL, Drive.FWD, BodyType.SUV)
     assert (v.engine_displacement_cm3, v.power_kw) == (1461, 81)  # the KWT entry, not 110 "BHP"
-    assert v.first_registration.value == "2019-04"  # productionDate, labelled, month precision
-    assert v.production_year is None
-    assert "FIRST_REGISTRATION_FROM_PRODUCTION_DATE" in listing.warnings
-    assert "productionDate" in (listing.provenance["vehicle.first_registration"].transformation or "")
+    # The GENERIC reader keeps schema.org semantics: productionDate is the production year and
+    # never a first registration (only the AutoScout24 adapter reads it as a registration date).
+    assert v.first_registration.value is None and v.production_year == 2019
+    assert "vehicle.first_registration" not in listing.provenance
     assert (listing.price.amount_minor, listing.price.currency) == (800000, "EUR")
     assert listing.source_listing_id == "0a1b2c3d"  # Car.identifier
     assert "MAKE_MODEL_MISSING" not in listing.warnings and "MILEAGE_MISSING" not in listing.warnings
@@ -254,3 +254,41 @@ def test_flatten_yields_the_offered_item_with_its_offer() -> None:
     assert car["offers"]["price"] == 8000 and "itemOffered" not in car["offers"]
     assert car["url"] == DETAIL_URL and car["brand"]["name"] == "Synthetic"
     assert offers_typed_item(nodes[0], frozenset({"Car"}))
+
+
+def test_a_vehicle_naming_itself_as_its_offered_item_stays_one_vehicle_node() -> None:
+    """Regression: a dealer Car whose Offer names the Car again inline was split into two nodes."""
+    car = {
+        "@context": "https://schema.org",
+        "@type": "Car",
+        "name": "Synthetic SUV 1.5",
+        "brand": {"@type": "Brand", "name": "Synthetic"},
+        "model": "Model",
+        "mileageFromOdometer": {"@type": "QuantitativeValue", "value": 120000, "unitCode": "KMT"},
+        "offers": {
+            "@type": "Offer",
+            "price": 9000,
+            "priceCurrency": "EUR",
+            "itemOffered": {"@type": "Car", "name": "Synthetic SUV 1.5"},
+        },
+    }
+    nodes = parse_json_ld_blocks([json.dumps(car)]).nodes
+    assert [sorted(local_type_names(n)) for n in nodes] == [["Car"]]
+    html = (
+        f"{SYNTHETIC_MARKER}\n<!doctype html><html lang='it'><head><title>Synthetic</title>"
+        f"<script type='application/ld+json'>{json.dumps(car)}</script></head>"
+        "<body><h1>Synthetic SUV</h1><p>Synthetic detail body with enough visible text.</p></body></html>"
+    )
+    parsed = SchemaOrgDealerAdapter(_config()).parse_detail(raw_document(DETAIL_URL, html))
+    assert parsed.listing is not None, parsed.errors
+    assert (parsed.listing.price.amount_minor, parsed.listing.vehicle.mileage_km) == (900000, Decimal(120000))
+
+
+def test_a_generic_production_date_is_never_a_first_registration() -> None:
+    """Regression: a dealer's year of manufacture became a day-precision registration date."""
+    adapter = SchemaOrgDealerAdapter(_config())
+    html = _detail_html({"productionDate": "2018-11-20"})
+    listing = adapter.parse_detail(raw_document(DETAIL_URL, html)).listing
+    assert listing is not None
+    assert (listing.vehicle.first_registration.value, listing.vehicle.production_year) == (None, 2018)
+    assert "FIRST_REGISTRATION_FROM_PRODUCTION_DATE" not in listing.warnings

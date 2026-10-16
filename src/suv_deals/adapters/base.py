@@ -127,6 +127,10 @@ class SearchObservation(BaseModel):
     position: int = Field(ge=0)
     card_hash: str = Field(min_length=64, max_length=64)
     card_hash_material: dict[str, str | None]
+    #: The vehicle facts the card itself shows, set ONLY by adapters of ``detail_mode: card_only``
+    #: sources (detail pages are never fetched there). Ingestion turns them into a card-sourced
+    #: revision (``FACTS_FROM_SEARCH_CARD``) through a no-fetch detail job; not part of the card hash.
+    card_listing: NormalizedListing | None = None
 
 
 class DiscoveryPage(BaseModel):

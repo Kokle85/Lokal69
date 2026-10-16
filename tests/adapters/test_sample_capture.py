@@ -8,6 +8,7 @@ checked without touching a marketplace.
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -382,6 +383,23 @@ def test_redaction_keeps_a_json_escape_before_an_address_intact(escape: bytes) -
     assert escape + b"[redacted-email]" in inner
     parsed = json.loads(inner)  # still valid JSON
     assert parsed["description"].endswith("[redacted-email]</p>")
+
+
+def test_redaction_keeps_an_escaped_backslash_and_the_escape_after_it() -> None:
+    """``\\\\`` then ``\\u003e`` before an address: both escapes stay whole (still valid JSON)."""
+    document = b'{"t":"a\\\\\\u003eprivacy@sample-dealer.example.it"}'
+    masked = redact_html(document)
+    assert masked == b'{"t":"a\\\\\\u003e[redacted-email]"}'
+    assert json.loads(masked)["t"] == "a\\>[redacted-email]"
+
+
+def test_redaction_is_linear_in_long_escape_runs() -> None:
+    """Regression: an unbounded escape prefix rescanned every run to its end (quadratic time)."""
+    body = b'<script>{"t":"' + b"\\u4e2d" * 50_000 + b'x@y.example"}</script>'
+    started = time.perf_counter()
+    masked = redact_html(body)
+    assert time.perf_counter() - started < 1.0
+    assert masked.endswith(b'\\u4e2d[redacted-email]"}</script>')
 
 
 def test_redaction_of_plain_and_html_addresses_is_unchanged() -> None:

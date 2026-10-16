@@ -110,12 +110,14 @@ _CHALLENGE_MARKERS: Final = (
     b"_incapsula_resource",
     b"px-captcha",
 )
-# A JSON/JS escape directly before an address (">privacy@x.it" inside __NEXT_DATA__, "\n" in a
-# script string) is matched as its own group and written back unchanged: masking must never eat
-# the escape's letters and leave a dangling backslash (the saved page would no longer parse).
+# A JSON/JS escape sequence ("\u003e" in "\u003eprivacy@x.it" inside __NEXT_DATA__, "\n" in a
+# script string) is matched as ONE token and written back unchanged, so an address match never
+# starts inside an escape: masking must never eat the escape's letters and leave a dangling
+# backslash (the saved page would no longer parse). One escape per match keeps the scan linear
+# (a long run of escapes, such as escaped CJK text, is consumed token by token, never rescanned).
 _EMAIL: Final = re.compile(
-    rb"(?P<escapes>(?:\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|\\[\\/\"'bfnrt])*)"
-    rb"(?P<address>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,5})"
+    rb"(?P<escape>\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|\\[\\/\"'bfnrt])"
+    rb"|(?P<address>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,5})"
 )
 _PHONE: Final = re.compile(rb"(?<![\w+])\+\d{1,3}[\s().\-/]{0,3}(?:\d[\s().\-/]{0,3}){6,13}\d")
 _TEL: Final = re.compile(rb"tel:[^\"'\s<>]{1,40}", re.IGNORECASE)
@@ -517,7 +519,7 @@ def redact_html(body: bytes) -> bytes:
     An escape sequence right before an address (``\\u003e`` in embedded JSON) is kept intact, so
     masking never turns valid JSON or script text into an invalid escape.
     """
-    masked = _EMAIL.sub(lambda m: m.group("escapes") + b"[redacted-email]", body)
+    masked = _EMAIL.sub(lambda m: m.group("escape") or b"[redacted-email]", body)
     masked = _PHONE.sub(b"[redacted-phone]", masked)
     return _TEL.sub(b"tel:[redacted]", masked)
 

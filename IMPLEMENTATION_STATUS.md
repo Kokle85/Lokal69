@@ -61,7 +61,7 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 | Item | Status | Category | Evidence | What is missing |
 |---|---|---|---|---|
 | U1 | `implemented` | done, tested offline | Audit and additive adoption plan: docs/decisions/0002-spec-v1.1-adoption.md; v1.0 components and data kept; forward-only migrations (`tests/unit/test_migrations_ascii.py`, `tests/integration/db/test_schema_catalogue.py`) | - |
-| U2 | `fixture_verified` (dealer search/detail slice on synthetic sources); live `blocked` | tested offline; activation-pending (live source) | `tests/adapters/test_dealer_search.py`, `tests/adapters/test_dealer_detail.py`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`; first/last-seen and availability evidence `tests/integration/repos_sources_listings/test_availability_events.py`, `tests/unit/test_lifecycle.py`; lags and coverage gaps `tests/integration/read_queries/test_views.py`, `tests/integration/repos_sources_listings/test_schedules.py` | an actually working live source (gate `source_access`); 12 of 14 sources have no adapter |
+| U2 | `fixture_verified` (dealer search/detail slice on synthetic sources); live `blocked` | tested offline; activation-pending (live source) | `tests/adapters/test_dealer_search.py`, `tests/adapters/test_dealer_detail.py`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`; first/last-seen and availability evidence `tests/integration/repos_sources_listings/test_availability_events.py`, `tests/unit/test_lifecycle.py`; lags and coverage gaps `tests/integration/read_queries/test_views.py`, `tests/integration/repos_sources_listings/test_schedules.py` | an actually working live source (gate `source_access`); 10 of 14 sources have no adapter (AutoScout24 IT/DE are implemented but untested live and disabled) |
 | U3 | `integration_verified` | tested offline | inquiry readiness separate from profit readiness; CoC/document unknowns resolvable by the inquiry; hard price/mileage rules kept (`tests/unit/test_inquiries.py`, `tests/integration/v11_inquiries/test_qualification_and_reservation.py`, `tests/integration/v11_runtime/test_plan_and_send.py`) | real readiness needs MK evidence, FX rates and an active source (gate `seller_inquiry`) |
 | U4 | `integration_verified` (code); activation `blocked` | tested offline; activation-pending (real account, canary) | sender binding, technical verification from the desktop worker's evidence, standing authorization, no-approval automatic mode, process gate, reservation gate `activation_canary_incomplete` (`tests/integration/v11_inquiries/test_senders_and_contacts.py`, `test_d2_activation_canary_gate.py`, `tests/cli/test_inquiry_commands.py`, `tests/integration/v11_runtime/test_operator_and_policy.py`) | no real account bound or verified; `gmail_api` cannot be activated with this build (OPS-09) |
 | U5 | `integration_verified` (synthetic dealer pages) | tested offline; activation-pending (real permitted source) | exact-ad seller, recipient and language evidence produced by detail ingest (`tests/integration/v11_runtime/test_d2_seller_evidence_pipeline.py`, `tests/adapters/test_d2_seller_contact_evidence.py`); Swiss DE/FR/IT from text evidence (`tests/unit/test_language.py`); deterministic DE/IT/FR/verified-EN templates and the informational Macedonian preview (`tests/unit/test_seller_templates.py`, `tests/unit/test_mime_builder.py`) | evidence from a real permitted source; only adapters declaring `seller_contact_evidence` (today the dealer adapter) produce it |
@@ -75,8 +75,9 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 
 ## What is NOT done or NOT verified
 
-- **Live crawling.** No source was fetched live; no live smoke ever ran. 12 of the 14 registered
-  sources have no adapter. No permitted dealer has been selected.
+- **Live crawling.** No source was fetched live; no live smoke ever ran. 10 of the 14 registered
+  sources have no adapter; `autoscout24_it` and `autoscout24_de` have one (built from owner
+  captures 2026-10-16) but stay disabled and untested live. No permitted dealer has been selected.
 - **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
   path** (ADR 0002 addendum). `mobile_de_public`, `autoscout24_de`, `autoscout24_it` and
   `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
@@ -264,9 +265,10 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   (docs/schema.md section 9; `20261013000100_import_values` applied 2026-10-14) and serves nothing
   yet.
 - **Which sources are truly working?** None live. The generic dealer adapter is `fixture_verified`
-  on synthetic pages; 12 of 14 registered sources have no adapter; mobile.de and AutoScout24 are
-  included by owner decision (2026-10-10) but stay disabled until their adapters are built from
-  real page captures.
+  on synthetic pages; the AutoScout24 IT/DE adapter is built from owner captures (2026-10-16) and
+  tested on synthetic pages, but both sources stay disabled and untested until a live smoke run;
+  10 of 14 registered sources have no adapter; mobile.de is included by owner decision
+  (2026-10-10) but stays disabled until its adapter is built from real page captures.
 - **When was each last checked?** No source has ever been checked live. The source register
   (docs/source_access_register.md) is dated 2026-10-06: terms were reviewed that day for
   `mobile_de_public`, `autoscout24_de` and `autoscout24_it` only (all restrictive) and every other

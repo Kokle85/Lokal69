@@ -155,9 +155,12 @@ Each step only needs the steps above it; any step can stop without affecting the
 ## 4. `source_access` (per source)
 
 - **State:** `blocked`. 14 sources are registered in `config/sources/*.yaml`; all are
-  `enabled: false` and none was ever fetched live. Only the generic dealer adapter
-  (`schemaorg_dealer@1.1.0`, used by the two dealer templates) is implemented; it is
-  `fixture_verified` on synthetic pages. The other 12 sources have no adapter
+  `enabled: false` and none was ever fetched live. Two adapters are implemented: the generic
+  dealer adapter (`schemaorg_dealer@1.1.0`, used by the two dealer templates), `fixture_verified`
+  on synthetic pages, and the AutoScout24 adapter (`autoscout24@1.0.0`, used by `autoscout24_it`
+  and `autoscout24_de`), built from owner-captured pages and tested on synthetic pages with that
+  structure but never run live (`technical_status: untested`, disabled; `doctor` lists them as
+  "not active" until their live smoke run). The other 10 sources have no adapter
   (`adapter_version: unimplemented`; `sources inspect` and `doctor` say "not activatable (no
   adapter)"), so configuration alone can never activate them.
 - **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the

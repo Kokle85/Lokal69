@@ -770,6 +770,10 @@ def _strip_wrappers(text: str) -> str:
 _INHERITED_BY_ITEM = ("url", "brand", "description", "identifier", "sku", "productID", "dateModified")
 
 
+#: schema.org vehicle types (local names); a vehicle node never yields derived offered items.
+_VEHICLE_TYPE_NAMES = frozenset({"Car", "Vehicle", "MotorizedVehicle"})
+
+
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
@@ -817,7 +821,9 @@ def _flatten(value: Any, depth: int = 0) -> Iterator[dict[str, Any]]:
             yield from _flatten(graph, depth + 1)
         if "@type" in value:
             yield value
-            if value.get("offers") is not None:
+            # Only a non-vehicle node (a Product wrapping its Car) yields its offered items: a
+            # vehicle that names itself again under offers.itemOffered stays ONE vehicle node.
+            if value.get("offers") is not None and not local_type_names(value) & _VEHICLE_TYPE_NAMES:
                 for item in _offered_items(value):
                     yield from _flatten(item, depth + 1)
         main = value.get("mainEntity")

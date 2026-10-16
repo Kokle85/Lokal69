@@ -267,29 +267,29 @@ def test_italian_search_page_cards() -> None:
     assert first.canonical_url == (
         f"https://{IT_HOST}/annunci/renault-captur-captur-1-5-dci-synthetic-diesel-bianco-cat_ma60mo20235-{uuid_for(1)}"
     )
-    assert (first.card_price_minor, first.card_currency, first.card_price_raw) == (800000, "EUR", "€ 8.000")
-    assert (first.card_mileage_km, first.card_mileage_raw) == (Decimal(155300), "155.300 km")
+    assert (first.card_price_minor, first.card_currency, first.card_price_raw) == (740000, "EUR", "€ 7.400")
+    assert (first.card_mileage_km, first.card_mileage_raw) == (Decimal(143200), "143.200 km")
     assert first.title == "Renault Captur Captur 1.5 dCi 110CV Synthetic Edition"
     assert first.card_hash_material["source_listing_id"] == uuid_for(1)
 
     listing = parsed.cards[0].listing
     vehicle = listing.vehicle
     assert (vehicle.make, vehicle.model) == ("Renault", "Captur")
-    assert vehicle.first_registration.value == "2019-04"
+    assert vehicle.first_registration.value == "2018-09"
     assert (vehicle.fuel, vehicle.gearbox, vehicle.power_kw, vehicle.engine_displacement_cm3) == (
         Fuel.DIESEL,
         Gearbox.MANUAL,
         81,
         1461,
     )
-    assert vehicle.mileage_km == Decimal(155300)
+    assert vehicle.mileage_km == Decimal(143200)
     assert (vehicle.drive, vehicle.body_type) == (Drive.UNKNOWN, BodyType.UNKNOWN)  # not on cards
     assert (listing.seller_type, listing.location.country, listing.language) == (
         SellerType.DEALER,
         "IT",
         "it",
     )
-    assert (listing.price.amount_minor, listing.price.currency) == (800000, "EUR")
+    assert (listing.price.amount_minor, listing.price.currency) == (740000, "EUR")
     assert listing.price.type == PriceType.FULL_VEHICLE_ASKING
     assert listing.source_listing_id == uuid_for(1) and listing.parser_version == ADAPTER_VERSION
     assert "FACTS_FROM_SEARCH_CARD" in listing.warnings
@@ -339,8 +339,8 @@ def test_german_search_page_cards_are_identity_only() -> None:
             power="103 kW (140 PS)",
             displacement="1.332 cm³",
             vat_label="inkl. MwSt.",
-            price=14881,
-            slug="renault-captur-business-edition-tce-140-led+kamera-benzin-rot-cat_ma60gr201269ge1121mt3779tr480701",
+            price=13950,
+            slug="renault-captur-synthetic-edition-tce-140-led+kamera-benzin-grau-cat_ma60mo99999",
         ),
         card(
             2,
@@ -372,6 +372,12 @@ def test_german_search_page_cards_are_identity_only() -> None:
     assert (first.price.basis, first.price.vat_treatment) == (PriceBasis.GROSS, VatTreatment.VAT_SHOWN)
     assert (first.location.country, first.language) == ("DE", "de")
     assert "OFFER_TYPE_N" in parsed.cards[2].listing.warnings
+    # card_only: the card's facts travel with the observation (the only source of vehicle facts),
+    # so ingestion can store a card-sourced revision; the Italian source fetches details instead.
+    assert [o.card_listing for o in parsed.page.observations] == [c.listing for c in parsed.cards]
+    it = _it()
+    it_page = it.parse_search(_request(it), raw_document(_request(it).url, search_page([card(1)]))).page
+    assert it_page.observations[0].card_listing is None
 
 
 async def test_the_german_source_never_fetches_or_parses_a_detail_page() -> None:
@@ -481,7 +487,7 @@ def test_conditional_prices_and_disagreeing_card_values() -> None:
     assert conditional.price.type == PriceType.UNKNOWN and "PRICE_CONDITIONAL" in conditional.warnings
     assert parsed.page.observations[0].card_price_minor is None  # never screened as an asking price
     assert {c.field for c in disagreeing.conflicts} == {"price.amount_minor", "vehicle.mileage_km"}
-    assert disagreeing.vehicle.mileage_km == Decimal(155300)  # tracking digits; the conflict is recorded
+    assert disagreeing.vehicle.mileage_km == Decimal(143200)  # tracking digits; the conflict is recorded
     assert (
         fuel_conflict.vehicle.fuel == Fuel.UNKNOWN
         and "VEHICLE_FUEL_SOURCES_DISAGREE" in fuel_conflict.warnings
@@ -685,8 +691,70 @@ async def test_an_unknown_model_slug_is_skipped_not_fatal() -> None:
     assert len(pages) == len(adapter.models)
     skipped = pages[2]
     assert skipped.access_state == AccessState.OK and not skipped.observations
-    assert "HTTP 404" in (skipped.access_evidence or "") and skipped.next_cursor == "model:3:partial"
+    assert "HTTP 404" in (skipped.access_evidence or "") and skipped.next_cursor == "model:3:partial:nf1"
     assert pages[-1].completeness == Completeness.PARTIAL
+
+
+async def test_every_model_answering_404_is_route_drift() -> None:
+    """Regression: a search route drifting to 404 for every model looked like a healthy empty walk."""
+    adapter = _it(search={**_it().config.search, "models": "nissan/qashqai nissan/juke kia/sportage"})
+    missing = {
+        m.model: raw_document(
+            adapter.build_search(_profile(), None if i == 0 else f"model:{i}").url,
+            "<html><body>Pagina non trovata</body></html>",
+            status=404,
+            access_state=AccessState.NOT_FOUND,
+        )
+        for i, m in enumerate(adapter.models)
+    }
+    pages = await _walk(adapter, _pages_for(adapter, **missing))
+    assert len(pages) == 3
+    assert [p.access_state for p in pages] == [AccessState.OK, AccessState.OK, AccessState.UNEXPECTED_CONTENT]
+    assert pages[1].next_cursor == "model:2:partial:nf2"
+    assert "all 3 model searches answered HTTP 404" in (pages[-1].access_evidence or "")
+
+
+async def test_a_404_on_the_verified_model_slug_is_route_drift() -> None:
+    adapter = _it()
+    request = adapter.build_search(_profile(), None)  # renault/captur, verified on the captures
+    missing = raw_document(request.url, "<html><body>Not found</body></html>", status=404)
+    pages = await _walk(adapter, _pages_for(adapter, captur=missing))
+    assert len(pages) == 1 and pages[0].access_state == AccessState.UNEXPECTED_CONTENT
+    assert "verified model search renault/captur" in (pages[0].access_evidence or "")
+
+
+async def test_a_policy_refusal_answering_404_is_never_a_skipped_model() -> None:
+    """Regression: an off-policy redirect to a 404 was reported OK and the walk went on."""
+    adapter = _it()
+    request = adapter.build_search(_profile(), "model:2")
+    refused = raw_document(
+        request.url,
+        "<html><body>Not found</body></html>",
+        status=404,
+        final_url="https://www.autoscout24.com/lst/nissan/juke",
+        access_state=AccessState.POLICY_DENIED,
+    )
+    page = adapter.parse_search(request, refused).page
+    assert page.access_state == AccessState.POLICY_DENIED and not page.has_more
+    assert page.completeness == Completeness.BLOCKED
+
+
+async def test_results_without_any_organic_card_are_drift() -> None:
+    """Regression: renamed result-type keys dropped every card into a 'complete', healthy page."""
+    adapter = _it()
+    request = _request(adapter)
+    cards = []
+    for n in range(5):
+        renamed = card(n + 1)
+        renamed["resultType"] = renamed.pop("searchResultType")
+        cards.append(renamed)
+    page = adapter.parse_search(request, raw_document(request.url, search_page(cards))).page
+    assert page.access_state == AccessState.UNEXPECTED_CONTENT and not page.observations
+    assert "no Organic/Main card among 5 listings" in (page.access_evidence or "")
+    # Sponsored cards next to organic ones are still dropped quietly.
+    mixed = [card(1), card(2, result_type="TopSpot")]
+    page = adapter.parse_search(request, raw_document(request.url, search_page(mixed))).page
+    assert page.access_state == AccessState.OK and len(page.observations) == 1
 
 
 async def test_a_block_stops_the_walk_immediately() -> None:
@@ -711,25 +779,87 @@ def test_italian_detail_page() -> None:
     v = listing.vehicle
     assert (v.make, v.model) == ("Renault", "Captur")
     assert (v.drive, v.power_kw, v.engine_displacement_cm3) == (Drive.FWD, 81, 1461)
-    assert (v.first_registration.value, v.production_year) == ("2019-04", 2018)
+    assert (v.first_registration.value, v.production_year) == ("2018-09", 2018)
     assert (v.fuel, v.gearbox, v.mileage_km, v.body_type, v.seats) == (
         Fuel.DIESEL,
         Gearbox.MANUAL,
-        Decimal(155300),
+        Decimal(143200),
         BodyType.SUV,
-        4,
+        5,
     )
-    assert (listing.price.amount_minor, listing.price.currency) == (800000, "EUR")
+    assert (listing.price.amount_minor, listing.price.currency) == (740000, "EUR")
     assert listing.price.vat_treatment == VatTreatment.VAT_SHOWN
-    assert listing.price.basis == PriceBasis.NET  # seller wording "al netto dell'IVA"
-    assert {"SELLER_TEXT_NET_PRICE_WORDING", "COMMERCIAL_REGISTRATION_SUSPECTED"} <= set(listing.warnings)
+    # A clean page: no seller wording moves the price basis, nothing flags a commercial vehicle.
+    assert (listing.price.basis, listing.price.type) == (PriceBasis.UNKNOWN, PriceType.FULL_VEHICLE_ASKING)
+    assert not {
+        "SELLER_TEXT_NET_PRICE_WORDING",
+        "COMMERCIAL_REGISTRATION_SUSPECTED",
+        "PRICE_CONDITIONAL",
+        "PRICE_NOT_FINAL",
+    } & set(listing.warnings)
     assert (listing.seller_type, listing.location.country) == (SellerType.DEALER, "IT")
     assert listing.condition.accident_free == ClaimStatus.SELLER_CLAIMED
-    assert listing.documentation.previous_owners == 1
-    assert listing.documentation.inspection_expiry.value == "2027-04"
-    assert listing.co2.g_per_km == Decimal(98)
+    assert listing.documentation.previous_owners == 2
+    assert listing.documentation.inspection_expiry.value == "2027-10"
+    assert listing.co2.g_per_km == Decimal(105)
     assert listing.source_published_at.value is not None
     assert not listing.conflicts
+
+
+def test_net_price_wording_and_a_commercial_registration_are_flagged() -> None:
+    page = detail_page(
+        description="<p>Synthetic description. Prezzo al netto dell'IVA.</p>",
+        version="Captur 1.5 dci 110CV AUTOCARRO Synthetic",
+    )
+    listing = _it().parse_detail(raw_document(detail_url(), page)).listing
+    assert listing is not None
+    # The seller says the price excludes VAT: the basis becomes NET (screening then treats the
+    # amount as a lower bound and the listing needs facts), and the description is never stored.
+    assert listing.price.basis == PriceBasis.NET
+    assert {"SELLER_TEXT_NET_PRICE_WORDING", "COMMERCIAL_REGISTRATION_SUSPECTED"} <= set(listing.warnings)
+    assert listing.description_excerpt is None
+
+
+def test_a_conditional_detail_price_is_no_full_asking_price() -> None:
+    """Regression: the card withheld a "Prezzo con condizioni" price, the detail page stored it."""
+    listing = _it().parse_detail(raw_document(detail_url(), detail_page(conditional=True))).listing
+    assert listing is not None
+    assert listing.price.type == PriceType.UNKNOWN and "PRICE_CONDITIONAL" in listing.warnings
+    assert listing.price.amount_minor == 740000  # kept as evidence, never as an asking price
+
+
+def test_a_non_final_detail_price_is_flagged() -> None:
+    listing = _it().parse_detail(raw_document(detail_url(), detail_page(final_price=False))).listing
+    assert listing is not None
+    assert "PRICE_NOT_FINAL" in listing.warnings
+    assert listing.price.type == PriceType.FULL_VEHICLE_ASKING
+
+
+def test_a_json_ld_car_of_another_listing_is_refused() -> None:
+    page = detail_page(ld_identifier=uuid_for(2))
+    parsed = _it().parse_detail(raw_document(detail_url(), page))
+    assert parsed.listing is None
+    assert parsed.errors == ("LISTING_ID_MISMATCH: JSON-LD Car.identifier is not the URL's listing",)
+
+
+def test_first_registration_sources_that_disagree_are_a_conflict() -> None:
+    page = detail_page(ld_production_date="2019-02-01")
+    listing = _it().parse_detail(raw_document(detail_url(), page)).listing
+    assert listing is not None
+    assert listing.vehicle.first_registration.value == "2018-09"  # __NEXT_DATA__ wins
+    [conflict] = [c for c in listing.conflicts if c.field == "vehicle.first_registration"]
+    assert conflict.values == ["2018-09", "2019-02"]
+    assert "VEHICLE_FIRST_REGISTRATION_SOURCES_DISAGREE" in listing.warnings
+
+
+def test_card_commercial_marker_flags_only_marked_cards() -> None:
+    adapter = _it()
+    request = _request(adapter)
+    listings = [card(1), card(2, version="Captur 1.5 dCi 110CV AUTOCARRO N1 Synthetic")]
+    parsed = adapter.parse_search(request, raw_document(request.url, search_page(listings)))
+    plain_card, marked = (c.listing for c in parsed.cards)
+    assert "COMMERCIAL_REGISTRATION_SUSPECTED" not in plain_card.warnings
+    assert "COMMERCIAL_REGISTRATION_SUSPECTED" in marked.warnings
 
 
 def test_detail_falls_back_to_json_ld() -> None:
@@ -747,12 +877,12 @@ def test_detail_falls_back_to_json_ld() -> None:
     assert (v.fuel, v.gearbox, v.mileage_km, v.body_type) == (
         Fuel.DIESEL,
         Gearbox.MANUAL,
-        Decimal(155300),
+        Decimal(143200),
         BodyType.SUV,
     )
-    assert v.first_registration.value == "2019-04" and v.production_year is None
+    assert v.first_registration.value == "2018-09" and v.production_year is None
     assert "productionDate" in (listing.provenance["vehicle.first_registration"].transformation or "")
-    assert listing.price.amount_minor == 800000
+    assert listing.price.amount_minor == 740000
     assert "NEXT_DATA_MISSING_JSON_LD_FALLBACK" in listing.warnings
 
 
@@ -763,7 +893,7 @@ def test_detail_sources_that_disagree_are_conflicts() -> None:
     ).listing
     assert listing is not None
     assert {c.field for c in listing.conflicts} == {"vehicle.mileage_km", "vehicle.power_kw"}
-    assert listing.vehicle.mileage_km == Decimal(155300) and listing.vehicle.power_kw == 81
+    assert listing.vehicle.mileage_km == Decimal(143200) and listing.vehicle.power_kw == 81
 
 
 @pytest.mark.parametrize(

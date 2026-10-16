@@ -8,7 +8,10 @@ hash), so A -> B -> A changes and late completions are handled by `listings_repo
 Phases (no transaction is open during network I/O):
 
 1. **Preflight** (short read): the listing and its source; a ``card_only`` source never fetches detail
-   pages (the job completes as skipped); otherwise the source must allow network work
+   pages: a job that carries the search card's own facts (payload ``card_listing``, queued by
+   `listings_repo.ingest_search_page`) ingests them as a card-sourced revision through
+   `ingest_detail` without any request, any other job completes as skipped; otherwise the source
+   must allow network work
    (`lock_source(for_network=True)`, activation gate) and ``SOURCE_NETWORK_ENABLED`` must be true for
    a real source (`RuntimeContext.crawl_session`).
 2. **Network**: ``adapter.fetch_detail`` through the policy-enforcing client and the persistent budget
@@ -46,7 +49,7 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from suv_deals.adapters.base import ParsedListing, RawDocument
 from suv_deals.crawling.mk_evidence import MK_COMPARABLE_ROLE, mk_observation
@@ -56,6 +59,7 @@ from suv_deals.crawling.seller_evidence import record_seller_evidence
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import AccessState, JobState
 from suv_deals.domain.identity import PromotionOutcome
+from suv_deals.domain.listings import NormalizedListing
 from suv_deals.errors import SourcePaused, ValidationFailed
 from suv_deals.observability.logging import log_context
 from suv_deals.persistence import jobs, listings_repo, market_repo, sources_repo, storage
@@ -80,6 +84,8 @@ from suv_deals.workers.runtime import (
 logger = logging.getLogger(__name__)
 
 CARD_ONLY_SKIP: Final = "card_only_source"
+#: ``details.facts`` of a card_only job that ingested the search card's own facts.
+CARD_FACTS: Final = "search_card"
 _INGESTIBLE: Final = frozenset({AccessState.OK, AccessState.REMOVED, AccessState.NOT_FOUND})
 
 
@@ -90,6 +96,8 @@ class DetailPayload(BaseModel):
 
     listing_id: UUID | None = None
     reason: str | None = None
+    #: card_only sources: the search card's own facts (a `NormalizedListing` as JSON).
+    card_listing: dict[str, Any] | None = None
 
 
 def _ingestible(parsed: ParsedListing) -> bool:
@@ -181,7 +189,9 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
         raise ValidationFailed("a detail job needs its listing and generation")
     listing, source = await _preflight(ctx, actor, listing_id)
     if source.detail_mode == "card_only":
-        return await _finish(ctx, execution, Disposition.complete({"skipped": CARD_ONLY_SKIP}))
+        if payload.card_listing is None or source.role == MK_COMPARABLE_ROLE:
+            return await _finish(ctx, execution, Disposition.complete({"skipped": CARD_ONLY_SKIP}))
+        return await _ingest_card_facts(ctx, execution, listing, source, payload.card_listing)
     if source.activation_problems():
         raise SourcePaused(f"source {source.source_key} is gated")
     session = await ctx.open_crawl_session(job.workspace_id, source)
@@ -277,6 +287,72 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
             "eligibility": None if result.eligibility_state is None else result.eligibility_state.value,
             "valuation_job_id": None if result.valuation_job_id is None else str(result.valuation_job_id),
             "seller_evidence": seller_evidence,
+        },
+    )
+
+
+async def _ingest_card_facts(
+    ctx: RuntimeContext,
+    execution: JobExecution,
+    listing: ListingRecord,
+    source: SourceRecord,
+    raw_facts: dict[str, Any],
+) -> JobOutcome:
+    """A card_only listing's search-card facts as a card-sourced revision (no request is made).
+
+    The facts were parsed from a search page already fetched under the source's gates; they go
+    through `ingest_detail` like a detail parse (generation order, identity conflicts, parser-health
+    quarantine, screening, valuation job), so a German listing can be screened without its
+    robots-disallowed detail page. Facts of another listing or unreadable facts are a dead letter.
+    """
+    job = execution.job
+    try:
+        normalized = NormalizedListing.model_validate(raw_facts)
+    except ValidationError:
+        return await _finish(ctx, execution, Disposition.dead("card_facts_invalid"))
+    if (
+        normalized.source_key != source.source_key
+        or normalized.source_listing_id != listing.source_listing_id
+    ):
+        return await _finish(ctx, execution, Disposition.dead("card_facts_mismatch"))
+    parsed = ParsedListing(
+        page_type="detail", access_state=AccessState.OK, listing=normalized, warnings=normalized.warnings
+    )
+    observation_id = uuid4()  # fixed per job run: a re-run commit is idempotent
+
+    async def commit() -> IngestDetailResult:
+        execution.check_lease()
+        async with job_unit_of_work(ctx.db, job) as (conn, _locked):
+            context = (
+                await listings_repo.load_screening_context(conn, execution.actor, taxonomy=ctx.taxonomy)
+                if ctx.taxonomy is not None
+                else None
+            )
+            return await listings_repo.ingest_detail(
+                conn,
+                execution.actor,
+                job,
+                listing.id,
+                parsed,
+                DetailSnapshotRef(
+                    parser_version=normalized.parser_version,
+                    observation_id=observation_id,
+                    observed_at=normalized.observed_at,
+                ),
+                screening_context=context,
+                complete_job=True,
+            )
+
+    result = await retry_transient(commit)
+    return JobOutcome(
+        state=JobState.SUCCEEDED,
+        details={
+            "listing_id": str(result.listing_id),
+            "facts": CARD_FACTS,
+            "outcome": str(result.outcome),
+            "revision_id": None if result.revision_id is None else str(result.revision_id),
+            "eligibility": None if result.eligibility_state is None else result.eligibility_state.value,
+            "valuation_job_id": None if result.valuation_job_id is None else str(result.valuation_job_id),
         },
     )
 
@@ -457,6 +533,7 @@ async def _record_fetch(
 
 
 __all__ = [
+    "CARD_FACTS",
     "CARD_ONLY_SKIP",
     "DetailPayload",
     "apply_budget_refusal",

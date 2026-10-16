@@ -16,6 +16,7 @@ from tests.integration.repos_sources_listings.support import (
     page,
     source_config,
     start_run,
+    vehicle,
 )
 
 from suv_deals.domain.enums import CoverageMode
@@ -181,6 +182,63 @@ async def test_card_only_source_gets_no_detail_jobs(db: Database, env: Env, seed
         )
     report = await ingest(db, env, run, page(key, [card(unique("SYN"))]))
     assert report.new_listings == 1 and report.detail_jobs == ()
+
+
+async def test_card_only_card_facts_ride_in_a_no_fetch_detail_job(db: Database, env: Env, seed: Seed) -> None:
+    """card_only sources: the card's own facts become the job payload, newer facts replace waiting ones."""
+    key = unique("cardfacts").lower()
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.sync_sources_from_yaml(
+            conn,
+            env.system,
+            [
+                source_config(env.source_key),
+                source_config(key, detail_mode="card_only", allowed_detail_paths=()),
+            ],
+        )
+        source = await sources_repo.get_source_by_key(conn, env.system, key)
+
+    async def start() -> Any:
+        async with unit_of_work(db, env.system) as conn:
+            return await sources_repo.start_crawl_run(
+                conn,
+                env.system,
+                source_id=source.id,
+                profile_id=env.profiles["primary"],
+                coverage_mode=CoverageMode.ROLLING_PAGES,
+                adapter_version="fixture@1.0.0",
+            )
+
+    slid = unique("SYN")
+    facts = vehicle(slid).model_copy(update={"source_key": key})
+    first = card(slid).model_copy(update={"card_listing": facts})
+    report = await ingest(db, env, await start(), page(key, [first]))
+    assert report.new_listings == 1 and len(report.detail_jobs) == 1
+    job_id = report.detail_jobs[0].job_id
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (job_id,))
+    assert payload["card_listing"]["source_listing_id"] == slid
+    assert payload["card_listing"]["vehicle"]["make"] == "Volkswagen"
+
+    # The card changes while the job still waits: no second job, the waiting one takes the new facts.
+    newer = vehicle(slid, price_minor=255000).model_copy(update={"source_key": key})
+    changed = card(slid, price_minor=255000).model_copy(update={"card_listing": newer})
+    again = await ingest(db, env, await start(), page(key, [changed], fetched_at=later(5)))
+    assert (again.changed_listings, again.detail_jobs, again.detail_jobs_deduplicated) == (1, (), 1)
+    assert (
+        seed.scalar(
+            "select count(*) from ops.jobs where listing_id = %s", (report.detail_jobs[0].listing_id,)
+        )
+        == 1
+    )
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (job_id,))
+    assert payload["card_listing"]["price"]["amount_minor"] == 255000
+
+    # Facts that name another listing are never queued.
+    other = unique("SYN")
+    stray = card(other).model_copy(update={"card_listing": facts})
+    report = await ingest(db, env, await start(), page(key, [stray], fetched_at=later(10)))
+    assert report.new_listings == 1 and report.detail_jobs == ()
+    assert any("name another listing" in w for w in report.warnings)
 
 
 async def test_page_validation(db: Database, env: Env) -> None:

@@ -27,8 +27,11 @@ are skipped at parse time. Titles and version texts are untrusted seller text (b
 removed, injection-like wording flagged, never interpreted).
 
 Discovery walks the configured models with an opaque cursor (``model:<n>``, ``:partial`` once
-any earlier model page was incomplete): one search page per model per run, newest first, with
-the profile's price band and mileage ceiling as site filters. The source's per-run search-page
+any earlier model page was incomplete, ``:nf<k>`` after k models answered HTTP 404): one search
+page per model per run, newest first, with the profile's price band and mileage ceiling as site
+filters. A genuine 404 skips an unknown model slug; a 404 of the slug verified on the captures
+(``renault/captur``) or of every configured model is route drift, and so is a result page whose
+listings carry no Organic/Main card at all. The source's per-run search-page
 budget must cover every model; the shared rate limiter keeps its per-host spacing between them.
 Detail pages are fetched for Italy only: the German site's robots.txt disallows ``/angebote/``,
 so that source is ``card_only`` and its detail URLs are identity only, never requested.
@@ -53,7 +56,7 @@ from typing import Any, ClassVar, Final
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
-from suv_deals.adapters._access import AccessClassification, classify_document
+from suv_deals.adapters._access import AccessClassification, classify_document, classify_status_only
 from suv_deals.adapters._extract import (
     PageView,
     bounded,
@@ -139,7 +142,10 @@ _SLUG: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _USTATE: Final = re.compile(r"[A-Z](?:,[A-Z]){0,5}")
 _UUID: Final = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 _URL_UUID_TAIL: Final = re.compile(r"-([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})/?$")
-_CURSOR: Final = re.compile(r"model:(\d{1,3})(:partial)?")
+_CURSOR: Final = re.compile(r"model:(\d{1,3})(:partial)?(?::nf(\d{1,3}))?")
+#: Model slugs whose search route was verified on owner captures (IT and DE, 2026-10-15/16): a 404
+#: there is route drift, not an unknown model.
+VERIFIED_MODEL_SLUGS: Final = frozenset({"renault/captur"})
 _NEXT_DATA: Final = re.compile(
     r"<script\b[^>]{0,300}\bid\s*=\s*[\"']__NEXT_DATA__[\"'][^>]{0,300}>(.*?)</script\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -256,13 +262,14 @@ def _clean_text(raw: str | None, limit: int) -> tuple[str | None, bool]:
     return text, cleaned.active_markup or bool(injection_signals(cleaned.text))
 
 
-def _cursor_index(cursor: str | None) -> tuple[int, bool]:
+def _cursor_index(cursor: str | None) -> tuple[int, bool, int]:
+    """``(model index, an earlier model page was incomplete, earlier models that answered 404)``."""
     if cursor is None:
-        return 0, False
+        return 0, False, 0
     match = _CURSOR.fullmatch(cursor)
     if match is None:
         raise ValidationFailed("AutoScout24 discovery cursor is not a model cursor")
-    return int(match.group(1)), match.group(2) is not None
+    return int(match.group(1)), match.group(2) is not None, int(match.group(3) or 0)
 
 
 def price_problem(amount: int) -> str | None:
@@ -547,7 +554,7 @@ class AutoScout24Adapter:
             raise ValidationFailed(f"source {self.source_key} has no AutoScout24 models configured")
         if self.config.country not in profile.source_countries:
             raise ValidationFailed(f"profile {profile.key.value} does not search {self.config.country}")
-        index, _partial = _cursor_index(cursor)
+        index, _partial, _not_found = _cursor_index(cursor)
         if index >= len(self.models):
             raise ValidationFailed("AutoScout24 discovery cursor points past the configured models")
         params = self.query(profile)
@@ -610,13 +617,24 @@ class AutoScout24Adapter:
 
     def parse_search(self, request: SearchRequest, document: RawDocument) -> SearchParse:
         """Classify and parse one fetched model search page (pure; used by `discover`)."""
-        index, partial_before = _cursor_index(request.cursor)
+        index, partial_before, _not_found = _cursor_index(request.cursor)
         model = self.models[index] if index < len(self.models) else None
         has_more = model is not None and index + 1 < len(self.models)
         label = model.label if model is not None else urlsplit(request.url).path
 
-        if document.fetch.http_status == 404:
-            # An unknown model slug: skip this model, keep walking the others (not a block).
+        status_only = classify_status_only(document)
+        if status_only is not None and status_only.access_state == AccessState.NOT_FOUND:
+            # Only a genuine 404 of our own request (never a policy refusal that happened to answer
+            # 404) is an unknown model slug: skip it and keep walking. A 404 of a verified slug, or
+            # every configured model answering 404, is route drift and stops the walk.
+            if model is not None and model.label in VERIFIED_MODEL_SLUGS:
+                return self._drift(
+                    request, document, f"drift: verified model search {label} answered HTTP 404"
+                )
+            if not has_more and _not_found + 1 >= len(self.models):
+                return self._drift(
+                    request, document, f"drift: all {len(self.models)} model searches answered HTTP 404"
+                )
             return self._model_page(
                 request,
                 document,
@@ -625,6 +643,7 @@ class AutoScout24Adapter:
                 has_more=has_more,
                 notes=[f"model search {label} answered HTTP 404 (model slug not found); skipped"],
                 model=model,
+                not_found=True,
             )
 
         page = parse_page(document.html)
@@ -673,6 +692,12 @@ class AutoScout24Adapter:
                 dropped[result] += 1
             else:
                 cards.append(result)
+        if listings and organic == 0 and (reported or 0) > 0:
+            # Results are reported but no card carries the Organic/Main markers: the site renamed
+            # or changed them. Dropping every card silently would look like an empty, healthy page.
+            return self._drift(
+                request, document, f"drift: no Organic/Main card among {len(listings)} listings"
+            )
         unreadable = {k: v for k, v in dropped.items() if k not in ("not_organic", "model_mismatch")}
         if organic and not cards and unreadable:
             reasons = ", ".join(f"{k}={v}" for k, v in sorted(unreadable.items()))
@@ -717,10 +742,16 @@ class AutoScout24Adapter:
         cards: tuple[CardResult, ...] = (),
         dropped: dict[str, int] | None = None,
         reported: int | None = None,
+        not_found: bool = False,
     ) -> SearchParse:
-        _, partial_before = _cursor_index(request.cursor)
+        _, partial_before, not_found_before = _cursor_index(request.cursor)
         partial = partial or partial_before
-        next_cursor = f"model:{index + 1}{':partial' if partial else ''}" if has_more else None
+        missing = not_found_before + (1 if not_found else 0)
+        next_cursor = (
+            f"model:{index + 1}{':partial' if partial else ''}{f':nf{missing}' if missing else ''}"
+            if has_more
+            else None
+        )
         if has_more:
             completeness = Completeness.PARTIAL  # the traversal continues with the next model
         else:
@@ -903,6 +934,9 @@ class AutoScout24Adapter:
             position=position,
             card_hash=digest,
             card_hash_material=normalized,
+            # card_only (Germany): the card is the only source of vehicle facts, so they travel
+            # with the observation and become a card-sourced revision (no detail page is fetched).
+            card_listing=listing if self.config.detail_mode == "card_only" else None,
         )
         return CardResult(observation=observation, listing=listing)
 
@@ -1620,6 +1654,15 @@ class AutoScout24Adapter:
             amount,
             transformation="integer EUR x 100",
         )
+        # The same flags as on the card: a conditional price ("Prezzo con condizioni", only with
+        # the dealer's financing or trade-in) is no full asking price, so the detail page must not
+        # undo the card's protection. ``prices.isFinalPrice`` false means extra costs may apply.
+        price_type = PriceType.FULL_VEHICLE_ASKING
+        if _get(details, "price", "isConditionalPrice") is True:
+            price_type = PriceType.UNKNOWN
+            facts.warn("PRICE_CONDITIONAL")
+        if _get(details, "prices", "isFinalPrice") is False:
+            facts.warn("PRICE_NOT_FINAL")
         negotiable = _get(public, "negotiable")
         basis = PriceBasis.UNKNOWN
         vat = VatTreatment.UNKNOWN
@@ -1655,7 +1698,7 @@ class AutoScout24Adapter:
             amount_minor=amount * 100,
             currency="EUR",
             basis=basis,
-            type=PriceType.FULL_VEHICLE_ASKING,
+            type=price_type,
             negotiable=Tristate.YES
             if negotiable is True
             else Tristate.NO
