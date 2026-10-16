@@ -53,9 +53,20 @@ def test_doctor_names_unimplemented_sources_not_activatable(run_cli: Cli) -> Non
     for key in ("pazar3_mk", "reklama5_mk", "subito_it", "mobile_de_public", "autoscout24_ch"):
         assert findings[key]["detail"].startswith("not activatable (no adapter"), findings[key]
     assert findings["example_dealer_template_de"]["detail"].startswith("not active:")
-    # AutoScout24 Italy and Germany have an adapter (2026-10-16): activatable, still gated.
+    # AutoScout24 Italy and Germany have an adapter (2026-10-16) that passed its saved synthetic
+    # fixture set (step 5, fixture_tested): activatable, and the disabled switch is the only gate.
     for key in ("autoscout24_de", "autoscout24_it"):
-        assert findings[key]["detail"].startswith("not active:"), findings[key]
+        assert findings[key]["detail"] == "not active: 1 gate problem(s)", findings[key]
+
+
+def test_doctor_verbose_names_the_disabled_switch_as_the_only_autoscout24_gate(run_cli: Cli) -> None:
+    result = run_cli("doctor", "--no-db", "--json", "--verbose", env=BASE_ENV)
+    findings = {f["name"]: f for f in json.loads(result.output)["findings"] if f["area"] == "sources"}
+    for key in ("autoscout24_de", "autoscout24_it"):
+        assert findings[key]["status"] == "info"
+        assert findings[key]["detail"] == (
+            "not active: 1 gate problem(s) - source is disabled in configuration"
+        ), findings[key]
 
 
 def test_doctor_reports_recipient_evidence_producers(run_cli: Cli) -> None:

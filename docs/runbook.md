@@ -378,9 +378,10 @@ state of every gate, its missing dependency and the smallest owner action are in
   and saved fixtures** (10 of the 14 registered sources are `adapter_version: unimplemented`
   today, both MK comparable sources included: `sources inspect <key>` and `doctor` report them as
   "not activatable (no adapter)"; configuration alone can never activate them; `autoscout24_it`
-  and `autoscout24_de` have an adapter but are disabled and untested live); then the gated
+  and `autoscout24_de` have an adapter that passed step 5 on SYNTHETIC saved fixtures on 2026-10-16
+  (`fixture_tested`, not a live verification) and stay disabled); then the gated
   live smoke `suv-deals crawl once --source <key> --max-pages 1` with `SOURCE_NETWORK_ENABLED=true`
-  and its evidence record (register step 6).
+  and its evidence record (register step 6; for AutoScout24 the exact commands are in 9.1).
 - **Supabase**: migrations + `doctor` + restore drill (section 7).
 - **MCP auth**: a real client (`docs/connect_mcp.md`).
 - **MCP Events / Slack**: the docs/notification_bridge.md canary; the Slack seller-reply route has
@@ -388,6 +389,82 @@ state of every gate, its missing dependency and the smallest owner action are in
 - **Tax rules**: docs/tax_rule_approval.md.
 - **Seller email**: docs/seller_email_activation.md (gates `seller_email_sender` and
   `seller_inquiry`).
+
+### 9.1 AutoScout24 live smoke (activation step 6, owner, WSL machine)
+
+State on 2026-10-16: `autoscout24_it` and `autoscout24_de` passed activation step 5 on SYNTHETIC
+saved fixtures (`tests/adapters/fixtures/autoscout24_it/` and `autoscout24_de/`, each with a
+`MANIFEST.yaml`; `uv run pytest tests/adapters -q`), so both are `technical_status:
+fixture_tested`. That is **not a live verification**: nothing was fetched from either site. Both
+stay `enabled: false`; `sources inspect <key>` and `doctor --verbose` show exactly one gate problem,
+"source is disabled in configuration", and `crawl once` refuses them.
+
+The next step is the owner's live smoke, ONE source at a time, `autoscout24_it` first, from the
+repository root on the WSL machine, with the crawler running on the host
+(`http://127.0.0.1:11235`, section 3.1), `CRAWL4AI_API_TOKEN` and `DATABASE_URL` in `.env` (never
+on the command line) and the business configuration recorded (`suv-deals config apply`). The
+enable switch in step 1 is a LOCAL edit for the smoke only: never commit it.
+
+```bash
+# 0. Preconditions: crawler firewall (3.2), crawler health/contract, the source's gate view.
+sudo scripts/crawler_firewall.sh --check
+SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
+  uv run suv-deals doctor --process worker --crawler
+uv run suv-deals sources inspect autoscout24_it
+
+# 1. Switch ONE source on locally (uncommitted) and sync the runtime registry.
+sed -i 's/^enabled: false$/enabled: true/' config/sources/autoscout24_it.yaml
+git diff config/sources/autoscout24_it.yaml
+uv run suv-deals sources sync --dry-run
+uv run suv-deals sources sync --yes
+
+# 2. One bounded discovery (one model page: renault/captur), then the detail pages it queued.
+SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
+  uv run suv-deals crawl once --source autoscout24_it --max-pages 1
+SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
+  uv run suv-deals worker --drain --queues detail
+
+# 3. Look at the result.
+uv run suv-deals sources inspect autoscout24_it --from-db
+uv run suv-deals doctor --verbose
+git rev-parse HEAD
+
+# 4. Switch it off again (always; also after a refusal, a block or a failure).
+git checkout -- config/sources/autoscout24_it.yaml
+uv run suv-deals sources sync --yes
+uv run suv-deals sources inspect autoscout24_it --from-db
+```
+
+- `git diff` in step 1 must show exactly one changed line (`enabled: true`). `sources sync
+  --dry-run` lists `autoscout24_it` among the updated sources and prints no `not enabled
+  autoscout24_it` line; the `--yes` run writes it (audited in the workspace registry). With several active workspaces add
+  `--workspace <id>` to `sources sync`, `sources inspect --from-db` and `crawl once`.
+- `crawl once` takes no URL: the adapter builds the search for the first configured model
+  (`/lst/renault/captur`, the slug verified on the owner's captures) with the primary profile's
+  price band, `kmto` and `sort=age&desc=1&ustate=U`; `--max-pages 1` means ONE search request,
+  through the URL policy, robots.txt and the persistent budget gate (20 s spacing, 200 requests a
+  day). Expected: `Job state: succeeded`, `pages: 1`, `completeness: budget_limited` (12 models,
+  capped at one page). The worker then fetches the `/annunci/` detail pages that one search page
+  queued: at most `max_detail_jobs_per_run` (10), 20 s apart; add `--max-jobs 1` to stop after the
+  first one.
+- A 403, a challenge page or a login wall stops the run and records the source as
+  `access_blocked` (disabled, one operational review item; `technical_denial_policy:
+  stop_and_report`); a 429 stops it too (back-off, `Retry-After` honoured). Do not retry and change
+  nothing else; run step 4 and report what was printed. Never use another network, a proxy or
+  other browser settings to get past a block.
+- Report back, for the evidence record (spec 31): the printed `crawl once` lines (job id, state,
+  pages, completeness), the `worker` table, the `sources inspect --from-db` JSON and the
+  `git rev-parse HEAD` output. From these the operator records step 6 (`technical_status:
+  live_smoke_passed`, committed with the evidence) or fixes the parser first. Enabling for real
+  (step 7) is a separate, committed configuration revision; until then step 4 keeps the source
+  off, and a detail job still queued is blocked as `source_paused` when a worker reaches it
+  (nothing is fetched).
+- `doctor` reads the YAML: between steps 1 and 4 it reports `autoscout24_it` as `active
+  (public_html)`, after step 4 again `not active: 1 gate problem(s)`.
+- `autoscout24_de` follows later the same way (replace the key in every command). It is
+  `card_only`: `worker --drain --queues detail` then only ingests the search cards' own facts and
+  makes no request (robots.txt disallows `/angebote/`); the smoke also shows whether the site
+  applies `pricefrom`/`priceto`/`kmto` on .de (the page's server-normalised `pageQuery`).
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

@@ -124,10 +124,12 @@ def test_real_configs_build_the_adapter_but_stay_disabled_and_gated(key: str) ->
     assert isinstance(adapter, AutoScout24ItAdapter | AutoScout24DeAdapter)
     assert isinstance(adapter, SourceAdapter)
     assert cfg.adapter_version == ADAPTER_VERSION == adapter.adapter_version
-    assert cfg.enabled is False and cfg.technical_status == TechnicalStatus.UNTESTED
+    # Activation step 5 (2026-10-16): fixture_tested on the saved SYNTHETIC fixture set; still
+    # disabled, so not active (the owner's live smoke and enabling are steps 6-7).
+    assert cfg.enabled is False and cfg.technical_status == TechnicalStatus.FIXTURE_TESTED
     gate = gate_status(cfg)
     assert gate.adapter_implemented and gate.activatable and not gate.active
-    assert "adapter has not passed fixture tests" in gate.problems
+    assert gate.problems == ("source is disabled in configuration",)
     # Every owner model is searched, once per run, within the per-run page budget and spacing.
     assert tuple(m.label for m in adapter.models) == OWNER_MODELS
     assert cfg.rate_budget.max_search_pages_per_run >= len(adapter.models)
@@ -323,7 +325,7 @@ def test_no_personal_data_reaches_any_model() -> None:
         + [o.model_dump(mode="json") for o in parsed.page.observations]
         + [parsed.page.model_dump(mode="json")]
     )
-    for placeholder in (*SELLER_PLACEHOLDERS, "SYNZIP", "Synthville", "/concessionari/", "images.invalid"):
+    for placeholder in (*SELLER_PLACEHOLDERS, "SYNZIP", "Synthville", "/concessionari/", "images.example"):
         assert placeholder not in dumped
     detail = adapter.parse_detail(raw_document(detail_url(), detail_page()))
     assert detail.listing is not None

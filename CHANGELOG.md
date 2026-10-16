@@ -33,10 +33,55 @@ Owner decisions of 2026-10-16 („не треба да бидат строги �
   review queue and the MCP typed warnings read the stored flag, and the 15-day evaluation's best
   supported economics counts only well-matched candidates.
 
+AutoScout24 activation step 5 (2026-10-16): saved SYNTHETIC fixtures, `fixture_tested`. Not a
+live verification; both sources stay `enabled: false`, and the next step is the owner's live smoke.
+
+- **Saved fixture sets** `tests/adapters/fixtures/autoscout24_it/` (31 pages) and
+  `autoscout24_de/` (20 pages), each with a `MANIFEST.yaml` (`source_key` of the real source,
+  `designation: synthetic`, created 2026-10-16, `parser_version: autoscout24@1.0.0`, a
+  description per page) and routes on the source's own host that pass its URL policy (the
+  adapter's own primary-profile search URL for each of the 12 models, `?fixture=<case>` variants
+  for the rest). Generated deterministically by `tests/adapters/autoscout24_fixture_set.py` from
+  the existing synthetic builders (structure of the owner's captures, invented values only, every
+  file starting with the synthetic marker); a test keeps the committed files equal to the
+  generator output. Italy covers the spec 31 set: normal search, the second model page of the
+  walk, a paginated result, an empty result, non-organic results only, normal detail,
+  missing-price (on request, no amount), contradictory mileage, net and gross wording,
+  conditional price, damaged vehicle, removed listing (200, 410, 404 with wording), plain 404,
+  a detail redirected to the result list, login wall, CAPTCHA (200/403/503), 429, 503, empty
+  shell, malformed and changed markup, a detail of another listing, a non-active status and
+  prompt injection/XSS. Germany is `card_only`, so the detail categories do not apply: the
+  MANIFEST names the card-level stand-in for each (missing-price, contradictory-mileage,
+  net/gross and damaged cards, a removed card, 404 model pages) next to the same search, block
+  and drift cases.
+- **Tests.** `tests/adapters/test_autoscout24_fixtures.py` runs the real adapter over every route
+  through the offline `FixtureCrawlClient` (cards and facts, price types, VAT basis, warnings,
+  conflicts, drift/`unexpected_content`, access blocks, removal, the 404 model skip, injection
+  flagged and stripped and never obeyed, no seller data in any model, the full 12-model walk,
+  Germany never requesting a detail page, required coverage for both sources).
+  `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` (DB) runs one capped
+  discovery (what `crawl once --max-pages 1` enqueues) and its detail jobs through the worker over
+  the saved pages, with the real configuration switched to `mode: fixture` and enabled IN MEMORY
+  for a throwaway workspace. `test_fixture_manifests.py`: a marketplace fixture directory may name
+  only its own source's configured host(s); the marker, no other real host, `.example`-only
+  e-mail addresses and no phone numbers are checked as before (dealer fixture checks unchanged).
+- **Configuration.** `config/sources/autoscout24_it.yaml` and `autoscout24_de.yaml`:
+  `technical_status: fixture_tested` (comment names the fixture set and date); `enabled: false`
+  unchanged, so `gate_status` lists exactly one problem ("source is disabled in configuration"),
+  `doctor` reports "not active: 1 gate problem(s)" and `crawl once` still refuses both.
+- **Docs.** docs/runbook.md section 9.1 has the owner's live smoke commands (a local, uncommitted
+  `enabled: true` for ONE source, `sources sync --yes`, `crawl once --source autoscout24_it
+  --max-pages 1` and `worker --drain --queues detail` with `SOURCE_NETWORK_ENABLED=true` and
+  `CRAWL4AI_BASE_URL`, `sources inspect --from-db`, `doctor`, and switching it off again);
+  ACTIVATION_GATES.md, the source register and IMPLEMENTATION_STATUS.md record step 5.
+- Test builders: the card's placeholder image moved to the reserved host `images.example`, cards
+  carry German `ariaLabel`s on .de, `search_page(page_query=...)`, and `detail_page` gained
+  `on_request`, `ld_price` and verbatim script overrides; the JSON-LD block escapes `<` like the
+  application state.
+
 AutoScout24 Italy and Germany adapter (2026-10-16), built from owner-captured pages (structure
-only; no captured page is committed). Both sources stay `enabled: false` and `untested`: next
-come saved spec-31 fixtures (register step 5, then `fixture_tested`; `crawl once` refuses an
-`untested` or disabled source), then the owner's live smoke and enabling (steps 6-7).
+only; no captured page is committed). Both sources stayed `enabled: false` and `untested` at that
+point; step 5 (above) followed the same day.
 
 - **`adapters/autoscout24.py` (`autoscout24@1.0.0`).** One adapter for `autoscout24_public_it` and
   `autoscout24_public_de`. Search pages are read from `__NEXT_DATA__` `props.pageProps.listings`

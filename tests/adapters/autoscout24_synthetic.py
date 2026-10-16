@@ -19,6 +19,13 @@ SYNTHETIC_MARKER = "<!-- SYNTHETIC FIXTURE: not a real vehicle or offer -->"
 IT_HOST = "www.autoscout24.it"
 DE_HOST = "www.autoscout24.de"
 SELLER_PLACEHOLDERS = ("Synthetic Dealer Srl", "Mario Synthetic", "Via Synthetic 1", "[redacted-phone]")
+#: Placeholder image URL on a reserved example-style host (never fetched, never stored).
+IMAGE_URL = "https://images.example/listing-images/synthetic.jpg"
+#: ``vehicleDetails[].ariaLabel`` wording per country (labels only; the adapter reads ``iconName``).
+_ARIA = {
+    "IT": ("Chilometraggio", "Cambio", "Anno", "Carburante", "Potenza"),
+    "DE": ("Kilometerstand", "Getriebe", "Erstzulassung", "Kraftstoff", "Leistung"),
+}
 
 
 def uuid_for(n: int) -> str:
@@ -103,6 +110,7 @@ def card(
     if damaged is not None:
         vehicle["isCurrentlyDamaged"] = damaged
     mm, yyyy = first_registration.split("-")
+    aria = _ARIA.get(country, _ARIA["IT"])
     return {
         "id": lid,
         "title": f"{make} {model}",
@@ -122,11 +130,11 @@ def card(
             "modelTaxonomy": "[make_id:60, model_group_id:201269, variant_id:, generation_id:];",
         },
         "vehicleDetails": [
-            {"data": vehicle["mileageInKm"], "iconName": "mileage_odometer", "ariaLabel": "Chilometraggio"},
-            {"data": transmission, "iconName": "gearbox", "ariaLabel": "Cambio"},
-            {"data": f"{mm}/{yyyy}", "iconName": "calendar", "ariaLabel": "Anno"},
-            {"data": fuel_text, "iconName": "gas_pump", "ariaLabel": "Carburante"},
-            {"data": power, "iconName": "speedometer", "ariaLabel": "Potenza"},
+            {"data": vehicle["mileageInKm"], "iconName": "mileage_odometer", "ariaLabel": aria[0]},
+            {"data": transmission, "iconName": "gearbox", "ariaLabel": aria[1]},
+            {"data": f"{mm}/{yyyy}", "iconName": "calendar", "ariaLabel": aria[2]},
+            {"data": fuel_text, "iconName": "gas_pump", "ariaLabel": aria[3]},
+            {"data": power, "iconName": "speedometer", "ariaLabel": aria[4]},
         ],
         "seller": {
             "id": "synthetic-seller",
@@ -142,7 +150,7 @@ def card(
             "city": "Synthville",
             "street": SELLER_PLACEHOLDERS[2],
         },
-        "images": ["https://images.invalid/listing-images/synthetic.jpg"],
+        "images": [IMAGE_URL],
         "trackingParameters": [{"key": "boost_level", "value": "t50"}],
     }
 
@@ -157,14 +165,21 @@ def search_page(
     next_data: str | None = None,
     include_next_data: bool = True,
     title: str = "Synthetic results",
+    page_query: dict[str, str] | None = None,
 ) -> str:
-    """A search page with ``__NEXT_DATA__``; ``next_data`` replaces the script body verbatim."""
+    """A search page with ``__NEXT_DATA__``; ``next_data`` replaces the script body verbatim.
+
+    ``page_query`` replaces the server-normalised query (default: the Italian keys).
+    """
+    query = page_query
+    if query is None:
+        query = {"sort": "age", "desc": "1", "ustate": "U", "kmto": "200000", "cy": "I", "atype": "C"}
     props: dict[str, Any] = {
         "pageid": pageid,
         "numberOfResults": len(listings or []) if number_of_results is None else number_of_results,
         "numberOfPages": number_of_pages,
         "numberOfOcsResults": 0,
-        "pageQuery": {"sort": "age", "desc": "1", "ustate": "U", "kmto": "200000", "cy": "I", "atype": "C"},
+        "pageQuery": query,
         "listings": listings,
     }
     if listings is None:
@@ -216,6 +231,10 @@ def detail_page(
     euro_directive: bool = True,
     include_price_raw: bool = True,
     ld_currency: str = "EUR",
+    on_request: bool = False,
+    ld_price: bool = True,
+    next_data_override: str | None = None,
+    json_ld_override: str | None = None,
 ) -> str:
     """An Italian ``/annunci/`` detail page: ``listingDetails`` and/or the JSON-LD Product/Offer/Car.
 
@@ -223,7 +242,9 @@ def detail_page(
     unconditional price); ``ld_identifier`` / ``ld_production_date`` let the JSON-LD Car disagree
     with ``__NEXT_DATA__``. ``euro`` is the stated emission class (both places the real page has
     it; ``euro_directive=False`` keeps only ``rawData.environment``), ``damaged`` sets
-    ``rawData.condition.damage.isCurrentlyDamaged``.
+    ``rawData.condition.damage.isCurrentlyDamaged``. ``on_request`` publishes no amount anywhere and
+    sets ``prices.public.onRequestOnly``; ``ld_price=False`` drops the JSON-LD ``Offer.price``.
+    ``next_data_override`` / ``json_ld_override`` replace the script bodies verbatim (drift cases).
     """
     lid = listing_id or uuid_for(n)
     url = f"https://{IT_HOST}/annunci/renault-captur-synthetic-diesel-bianco-cat_ma60mo20235-{lid}"
@@ -254,15 +275,17 @@ def detail_page(
         ],
         "emissionsCO2": 105,
     }
+    price_text = "Prezzo su richiesta" if on_request else f"€ {price}"
+    offer_price: dict[str, Any] = {} if on_request or not ld_price else {"price": price}
     product = {
         "@context": "https://schema.org",
         "@type": "Product",
         "brand": {"@type": "Brand", "name": "Renault"},
-        "name": f"Renault per € {price}",
+        "name": f"Renault per {price_text}",
         "description": description,
         "offers": {
             "@type": "Offer",
-            "price": price,
+            **offer_price,
             "priceCurrency": ld_currency,
             "itemCondition": "UsedCondition",
             "url": url,
@@ -287,7 +310,7 @@ def detail_page(
         "createdTimestampWithOffset": "2026-01-01T00:00:00Z",
         "description": description,
         "price": {
-            "priceFormatted": f"€ {price}",
+            "priceFormatted": price_text,
             "priceEvaluation": 0,
             "isVatLabelLegallyRequired": False,
             "isConditionalPrice": conditional,
@@ -295,11 +318,11 @@ def detail_page(
         "prices": {
             "isFinalPrice": final_price,
             "public": {
-                "price": f"€ {price}",
-                "priceRaw": price if include_price_raw else None,
+                "price": price_text,
+                "priceRaw": price if include_price_raw and not on_request else None,
                 "taxDeductible": True,
                 "negotiable": False,
-                "onRequestOnly": False,
+                "onRequestOnly": on_request,
                 "netPrice": None,
                 "netPriceRaw": None,
                 "vatRate": None,
@@ -378,13 +401,14 @@ def detail_page(
         "page": "/details/[...slug]",
         "buildId": "synthetic",
     }
-    ld_script = (
-        f"<script type='application/ld+json'>{json.dumps(product)}</script>" if include_json_ld else ""
+    # "<" is escaped like the application state, so seller text can never close the script element.
+    ld_body = (
+        json_ld_override if json_ld_override is not None else json.dumps(product).replace("<", "\\u003c")
     )
+    nd_body = next_data_override if next_data_override is not None else _json(next_data)
+    ld_script = f"<script type='application/ld+json'>{ld_body}</script>" if include_json_ld else ""
     nd_script = (
-        f'<script id="__NEXT_DATA__" type="application/json">{_json(next_data)}</script>'
-        if include_next_data
-        else ""
+        f'<script id="__NEXT_DATA__" type="application/json">{nd_body}</script>' if include_next_data else ""
     )
     return (
         f"{SYNTHETIC_MARKER}\n<!doctype html><html lang='it-IT'><head><title>Renault Captur synthetic</title>"

@@ -158,9 +158,12 @@ Each step only needs the steps above it; any step can stop without affecting the
   `enabled: false` and none was ever fetched live. Two adapters are implemented: the generic
   dealer adapter (`schemaorg_dealer@1.1.0`, used by the two dealer templates), `fixture_verified`
   on synthetic pages, and the AutoScout24 adapter (`autoscout24@1.0.0`, used by `autoscout24_it`
-  and `autoscout24_de`), built from owner-captured pages and tested on synthetic pages with that
-  structure but never run live (`technical_status: untested`, disabled; `doctor` lists them as
-  "not active" until steps 5-7 below: saved fixtures, live smoke, enabling). The other 10
+  and `autoscout24_de`), built from owner-captured pages and never run live. Step 5 below is done
+  for both (2026-10-16): SYNTHETIC saved fixtures with `MANIFEST.yaml` covering the spec 31 set
+  (`tests/adapters/fixtures/autoscout24_it/`, `autoscout24_de/`), so both are `technical_status:
+  fixture_tested` - not a live verification. Both stay disabled: `doctor` lists them as "not
+  active" with one gate problem ("source is disabled in configuration") until steps 6-7 (the
+  owner's live smoke, docs/runbook.md section 9.1, then enabling). The other 10
   sources have no adapter
   (`adapter_version: unimplemented`; `sources inspect` and `doctor` say "not activatable (no
   adapter)"), so configuration alone can never activate them.
@@ -209,7 +212,9 @@ Each step only needs the steps above it; any step can stop without affecting the
      `SUV_DEALS_ENABLE_SOURCE_NETWORK=true` exported for that run only),
      `uv run suv-deals crawl once --source <key> --max-pages 1`, then
      `uv run suv-deals worker --drain --queues detail`; check `suv-deals sources inspect <key>
-     --from-db` and `doctor`. Then `technical_status: live_smoke_passed`.
+     --from-db` and `doctor`. Then `technical_status: live_smoke_passed`. For AutoScout24 the
+     exact owner commands (local uncommitted `enabled: true`, sync, smoke, switch-off) are in
+     docs/runbook.md section 9.1.
   7. Enable through an auditable configuration revision (`sources sync --yes`).
 - **Verified when:** `access_state: ok`, healthy parser outcomes, and the persisted listing,
   revision and evidence ids of the smoke.
@@ -222,7 +227,7 @@ Each step only needs the steps above it; any step can stop without affecting the
 |---|---|---|---|
 | `example_dealer_template_de`, `example_dealer_template_ch` | `schemaorg_dealer@1.1.0` (fixture_verified) | none (templates) | a real permitted dealer: copy, steps 1-7 |
 | `mobile_de_public`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; CH terms not identified |
-| `autoscout24_de`, `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures), untested live | proceed_acknowledged (owner, 2026-10-10) | `untested`: step 5 first (saved spec-31 fixtures with `MANIFEST.yaml`, then `fixture_tested`; `crawl once` refuses an `untested` or disabled source), then steps 6-7 (live smoke, enable); per-model searches (12 models, one page each per run, every 90 min DE / 3 h IT to fit the 200-request daily budget); `autoscout24_de` card_only (robots) |
+| `autoscout24_de`, `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures); `fixture_tested` (step 5 done 2026-10-16 on SYNTHETIC saved fixtures), never run live | proceed_acknowledged (owner, 2026-10-10) | `enabled: false` only (the one remaining gate problem; `crawl once` refuses a disabled source): step 5 is done (saved spec-31 fixtures with `MANIFEST.yaml`, `fixture_tested`, synthetic, not a live verification); next the owner's live smoke (step 6, `autoscout24_it` first, exact commands in docs/runbook.md section 9.1), then enabling (step 7); per-model searches (12 models, one page each per run, every 90 min DE / 3 h IT to fit the 200-request daily budget); `autoscout24_de` card_only (robots) |
 | `subito_it`, `automobile_it`, `carforyou_ch`, `tutti_ch`, `comparis_ch` | placeholder | pending | domain, terms, routes unverified; an adapter |
 | `pazar3_mk`, `reklama5_mk` (MK comparables) | placeholder | pending | terms and an adapter; until then MK evidence comes from `suv-deals market import` |
 | `mobile_de_api` | skeleton (raises until entitlement) | pending | gate 5 |
@@ -534,4 +539,4 @@ Append one row per completed activation step (newest last). Ids, versions, hashe
 
 | Date (UTC) | Gate / step | Commit | Evidence (ids, codes) | Recorded by |
 |---|---|---|---|---|
-| - | none yet | - | - | - |
+| 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 31 pages, DE 20 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |

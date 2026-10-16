@@ -38,17 +38,17 @@ def _config_with(tmp_path: Path, **source: object) -> Path:
     return target
 
 
-def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli) -> None:
-    result = run_cli(
-        "crawl", "once", "--source", "autoscout24_de", "--profile", "primary", "--max-pages", "1"
-    )
+@pytest.mark.parametrize("key", ["autoscout24_de", "autoscout24_it"])
+def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli, key: str) -> None:
+    result = run_cli("crawl", "once", "--source", key, "--profile", "primary", "--max-pages", "1")
     assert result.exit_code == 3
-    assert "refused: source autoscout24_de is not active" in result.output
-    # The owner recorded a terms decision on 2026-10-10 (proceed_acknowledged) and the adapter exists
-    # (2026-10-16); the source stays disabled and gated until saved fixtures (fixture_tested),
-    # the owner's live smoke run and enabling (register steps 5-7).
-    assert "adapter has not passed fixture tests" in result.output
-    assert "source is disabled in configuration" in result.output
+    assert f"refused: source {key} is not active" in result.output
+    # The owner recorded a terms decision on 2026-10-10 (proceed_acknowledged), the adapter exists
+    # (2026-10-16) and passed its saved synthetic fixture set (step 5, fixture_tested); the source
+    # stays disabled until the owner's live smoke run and enabling (register steps 6-7), and the
+    # disabled switch is the only refusal left.
+    assert "adapter has not passed fixture tests" not in result.output
+    assert f"refused: source {key} is not active: source is disabled in configuration" in result.output
 
 
 def test_crawl_once_refuses_a_source_without_an_adapter(run_cli: Cli) -> None:

@@ -18,10 +18,13 @@ answered the spec 34 final-status questions. These checks pin the structure, not
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
+import click
 import pytest
 
+from suv_deals.cli import cli
 from suv_deals.persistence.gates import SPEC_GATES
 
 REPO = Path(__file__).resolve().parents[2]
@@ -114,9 +117,11 @@ def test_source_register_live_smoke_is_the_gated_crawl_once_procedure() -> None:
     assert "insufficient_comparables" in register  # F2: no MK evidence -> no valuation
 
 
-def test_untested_sources_name_the_fixture_step_before_the_live_smoke() -> None:
-    """Regression: the AutoScout24 rows named the live smoke as the next step, but ``crawl once``
-    refuses an ``untested`` source until the step-5 fixture set made it ``fixture_tested``."""
+def test_autoscout24_rows_record_step_5_and_name_the_live_smoke_next() -> None:
+    """Step 5 (saved spec-31 fixtures) is done for both AutoScout24 sources on SYNTHETIC pages, so
+    they are ``fixture_tested``; the rows must say so, never claim a live verification, and name
+    the owner's live smoke (step 6) as the next step (earlier regression: the live smoke was named
+    while ``crawl once`` still refused the ``untested`` sources)."""
     register = _text("docs/source_access_register.md").splitlines()
     gates = _text("ACTIVATION_GATES.md").splitlines()
     rows = [
@@ -125,8 +130,52 @@ def test_untested_sources_name_the_fixture_step_before_the_live_smoke() -> None:
     ]
     rows.append(next(line for line in gates if line.startswith("| `autoscout24_de`, `autoscout24_it` |")))
     for row in rows:
-        assert "untested" in row and "step 5" in row
+        assert "fixture_tested" in row and "step 5" in row and "2026-10-16" in row
+        assert "SYNTHETIC" in row.upper() and "live smoke" in row
         assert row.index("fixture_tested") < row.index("live smoke")
+        assert "live_smoke_passed" not in row and "live-verified" not in row
+        assert "docs/runbook.md section 9.1" in row
+
+
+def _shell_commands(block: str) -> list[str]:
+    """The commands of a bash block, with backslash continuations joined."""
+    joined = block.replace("\\\n", " ")
+    return [line.strip() for line in joined.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+def test_runbook_autoscout24_smoke_commands_match_the_real_cli() -> None:
+    """The owner's live smoke (runbook 9.1) may only use commands and options the CLI really has."""
+    runbook = _text("docs/runbook.md")
+    section = runbook[runbook.index("### 9.1 AutoScout24 live smoke") : runbook.index("## 10.")]
+    block = section[
+        section.index("```bash") + len("```bash") : section.index("```", section.index("```bash") + 7)
+    ]
+    commands = [c for c in _shell_commands(block) if "suv-deals " in c]
+    used: set[str] = set()
+    for line in commands:
+        tokens = shlex.split(line.split("suv-deals ", 1)[1], comments=True)
+        command: click.Command = cli
+        path: list[str] = []
+        while isinstance(command, click.Group) and tokens and tokens[0] in command.commands:
+            path.append(tokens[0])
+            command = command.commands[tokens.pop(0)]
+        assert not isinstance(command, click.Group), line
+        options = {opt for param in command.params for opt in (*param.opts, *param.secondary_opts)}
+        for token in tokens:
+            if token.startswith("-"):
+                assert token.split("=", 1)[0] in options, (line, token)
+        used.add(" ".join(path))
+    assert {"sources sync", "sources inspect", "crawl once", "worker", "doctor"} <= used
+    # The network switch is per command, the source switch a local uncommitted edit undone at the end.
+    smoke = [c for c in commands if " crawl once " in f" {c} " or " worker " in f" {c} "]
+    assert smoke and all("SOURCE_NETWORK_ENABLED=true" in c and "CRAWL4AI_BASE_URL=" in c for c in smoke), (
+        smoke
+    )
+    assert "crawl once --source autoscout24_it --max-pages 1" in block
+    assert "worker --drain --queues detail" in block
+    assert "sources sync --yes" in block and "sources inspect autoscout24_it --from-db" in block
+    assert "git checkout -- config/sources/autoscout24_it.yaml" in block
+    assert block.index("enabled: true") < block.index("crawl once") < block.index("git checkout --")
 
 
 @pytest.mark.parametrize("relative", ["docs/seller_email_activation.md", "docs/runbook.md"])

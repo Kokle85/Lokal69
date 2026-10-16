@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 import os
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -213,8 +213,15 @@ async def build_env(
     clock: Clock | None = None,
     options: RuntimeOptions | None = None,
     name: str = "Pipeline",
+    fixture_dirs: Sequence[Path] = (DEALER_DE,),
+    repository_taxonomy: bool = False,
 ) -> PipelineEnv:
-    """A workspace with an owner, the business config, the fixture source and a runtime."""
+    """A workspace with an owner, the business config, the fixture source and a runtime.
+
+    ``fixture_dirs`` are the saved fixture directories the runtime serves (default: the synthetic
+    dealer); ``repository_taxonomy`` screens with ``config/vehicle_taxonomy.yaml`` instead of the
+    synthetic "Example Trail" taxonomy (for fixtures of real makes and models).
+    """
     ws = seed.workspace(f"{name} {uuid.uuid4().hex[:6]}")
     owner_id = seed.user()
     seed.membership(ws, owner_id, "owner")
@@ -224,8 +231,8 @@ async def build_env(
         application_name="suv-deals-pipeline-test",
         clock=clock or SystemClock(),
         options=options or RuntimeOptions(job_lease_seconds=120, heartbeat_seconds=40),
-        fixture_dirs=[DEALER_DE],
-        taxonomy=synthetic_taxonomy(),
+        fixture_dirs=list(fixture_dirs),
+        taxonomy=None if repository_taxonomy else synthetic_taxonomy(),
     )
     env = PipelineEnv(
         ctx=ctx,
@@ -251,10 +258,11 @@ async def build_env(
     )
     env.profiles = {p.profile_key.value: p.id for p in result.profiles}
     actor = env.system
+    config = source or fixture_source_config()
 
     async def sync(conn: Conn) -> UUID:
-        await sources_repo.sync_sources_from_yaml(conn, actor, [source or fixture_source_config()])
-        return (await sources_repo.get_source_by_key(conn, actor, SOURCE_KEY)).id
+        await sources_repo.sync_sources_from_yaml(conn, actor, [config])
+        return (await sources_repo.get_source_by_key(conn, actor, config.source_key)).id
 
     env.source_id = await run(ctx, actor, sync)
     return env

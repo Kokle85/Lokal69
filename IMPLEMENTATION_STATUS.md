@@ -77,7 +77,9 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 
 - **Live crawling.** No source was fetched live; no live smoke ever ran. 10 of the 14 registered
   sources have no adapter; `autoscout24_it` and `autoscout24_de` have one (built from owner
-  captures 2026-10-16) but stay disabled and untested live. No permitted dealer has been selected.
+  captures 2026-10-16) and passed activation step 5 on SYNTHETIC saved fixtures the same day
+  (`fixture_tested`, not a live verification), but stay disabled and untested live: the next step
+  is the owner's live smoke (docs/runbook.md section 9.1). No permitted dealer has been selected.
 - **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
   path** (ADR 0002 addendum). `mobile_de_public`, `autoscout24_de`, `autoscout24_it` and
   `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
@@ -266,15 +268,17 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   yet.
 - **Which sources are truly working?** None live. The generic dealer adapter is `fixture_verified`
   on synthetic pages; the AutoScout24 IT/DE adapter is built from owner captures (2026-10-16) and
-  tested on synthetic pages, but both sources stay disabled and untested until saved fixtures
-  (register step 5), a live smoke run and enabling;
+  passed its saved SYNTHETIC fixture sets (register step 5, 2026-10-16: `autoscout24_it` and
+  `autoscout24_de` are `fixture_tested`), but both sources stay disabled until the owner's live
+  smoke run (step 6, docs/runbook.md section 9.1) and enabling (step 7);
   10 of 14 registered sources have no adapter; mobile.de is included by owner decision
   (2026-10-10) but stays disabled until its adapter is built from real page captures.
 - **When was each last checked?** No source has ever been checked live. The source register
   (docs/source_access_register.md) is dated 2026-10-06: terms were reviewed that day for
   `mobile_de_public`, `autoscout24_de` and `autoscout24_it` only (all restrictive) and every other
   source is "not reviewed"; the only recorded robots.txt reading is `autoscout24_ch` (2026-10-06,
-  a fact, not a permission). The fixture suites last passed on 2026-10-10 (docs/qa_evidence.md).
+  a fact, not a permission). The fixture suites last passed on 2026-10-10 (docs/qa_evidence.md);
+  the AutoScout24 saved-fixture tests (activation step 5) were added and passed on 2026-10-16.
 - **Which calculations are evidence-supported?** Parsing, screening, comparables, costs, tax
   arithmetic, FX conversion and scenarios are deterministic and tested on synthetic data. No real
   valuation is evidence-supported: no MK market evidence exists in a real workspace (so every

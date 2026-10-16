@@ -70,6 +70,8 @@ OWNER_DECIDED_SOURCES = frozenset(
 
 
 #: Marketplace sources with a real adapter (built from owner captures, not yet smoke-tested live).
+#: Activation step 5 (2026-10-16): their SYNTHETIC saved-fixture sets pass, so they are
+#: ``fixture_tested``; they stay disabled until the owner's live smoke (step 6) and enabling (step 7).
 IMPLEMENTED_MARKETPLACES = frozenset({"autoscout24_de", "autoscout24_it"})
 
 
@@ -78,7 +80,12 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
     config = SourceConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert path.stem == config.source_key
     assert config.enabled is False
-    assert config.technical_status == TechnicalStatus.UNTESTED
+    expected_status = (
+        TechnicalStatus.FIXTURE_TESTED
+        if config.source_key in IMPLEMENTED_MARKETPLACES
+        else TechnicalStatus.UNTESTED
+    )
+    assert config.technical_status == expected_status
     if config.source_key in OWNER_DECIDED_SOURCES:
         # Owner decision 2026-10-10 (ADR 0002 addendum): an audited acknowledgement with an actor,
         # never legal permission; the source stays disabled and gated (unimplemented adapter).
@@ -86,9 +93,10 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
         assert config.terms_decision_actor and "owner" in config.terms_decision_actor
         assert config.robots_checked_at is not None and config.robots_summary
         if config.source_key in IMPLEMENTED_MARKETPLACES:
-            # Real adapter (2026-10-16), still gated: untested and disabled until saved fixtures,
-            # the owner's live smoke run and enabling (register steps 5-7).
-            assert "adapter has not passed fixture tests" in activation_problems(config)
+            # Real adapter (2026-10-16), fixture_tested (step 5): the only gate left closed is the
+            # owner's enable switch, which stays off until the live smoke (step 6).
+            assert activation_problems(config) == []
+            assert gate_status(config).problems == ("source is disabled in configuration",)
         else:
             assert "adapter is unimplemented" in activation_problems(config)
     else:
@@ -101,7 +109,9 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
         )
     assert config.robots_policy == "obey" and config.technical_denial_policy == "stop_and_report"
     assert config.adapter in ADAPTERS
-    assert activation_problems(config), "every candidate source must still be gated"
+    assert not gate_status(config).active, "every candidate source must still be gated"
+    if config.source_key not in IMPLEMENTED_MARKETPLACES:
+        assert activation_problems(config), "an untested source fails a gate besides the switch"
 
 
 def test_expected_source_set() -> None:
