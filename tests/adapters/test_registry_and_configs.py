@@ -251,7 +251,6 @@ def test_mk_comparable_terms_reviewed_facts_only(key: str, status: TermsStatus, 
     assert cfg.terms_decision_note is not None and "Само факти" in cfg.terms_decision_note
     assert "no retained page snapshots" in " ".join(cfg.terms_decision_note.split())
     assert cfg.robots_checked_at == datetime(2026, 10, 16, tzinfo=UTC)
-    assert cfg.allowed_search_paths == ("^/$",) and cfg.allowed_detail_paths == ()
     problems = activation_problems(cfg)
     assert "terms not reviewed" not in problems and "adapter is unimplemented" in problems
 

@@ -33,13 +33,18 @@ robots_summary: >-
   2026-10-14 robots.txt, the home page and a candidate terms page answered HTTP 403 with a
   Cloudflare block to the build environment. pazar3.mk redirects to www.pazar3.mk.
 source_timezone: Europe/Skopje
-# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
-# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+# Reviewed 2026-10-16 from the owner's captured home page, for owner-run sample captures only
+# (`capture-samples`); the source stays disabled. The car category is /oglasi/vozila/avtomobili;
+# a make/model level below it is a hypothesis mirroring the ad URLs and is verified by the first
+# capture. Ads: /oglas/vozila/avtomobili/<make>/<model>/.../<numeric id>. robots.txt is checked
+# before every page.
 allowed_hosts:
   - 'www.pazar3.mk'
 allowed_search_paths:
   - '^/$'
-allowed_detail_paths: []
+  - '^/oglasi/vozila/avtomobili(/[a-z0-9-]{1,40}){0,2}$'
+allowed_detail_paths:
+  - '^/oglas/vozila/avtomobili(/[A-Za-z0-9._~%-]{1,80}){3,10}/[0-9]{1,12}$'
 search: {}
 notes: >-
   Comparable-source candidate (spec sections 5 and 15): asking prices only, never acquisition. No
@@ -55,5 +60,6 @@ notes: >-
   Crawl4AI. Only the Crawl4AI (rendered) page carried ads in JSON-LD: an ItemList of Product items
   with an Offer (price and priceCurrency EUR or MKD; 123456789 is a placeholder price, not a price)
   and ad URLs of the form /oglas/vozila/avtomobili/<make>/<model>/.../<id>. The car category is
-  /oglasi/vozila/avtomobili. The per-model search route and the ad page structure are not verified
-  yet, so only the home page is allowed. Any block met by the crawler stops the source.
+  /oglasi/vozila/avtomobili. The per-model search route and the ad page structure are verified from
+  owner-run sample captures (the paths allowed for them are below). Any block met by the crawler
+  stops the source.

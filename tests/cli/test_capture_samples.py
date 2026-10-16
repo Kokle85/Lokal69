@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from tests.cli.conftest import Cli, all_output
 
-from suv_deals.crawling.url_policy import SourceUrlPolicy
+from suv_deals.adapters.base import FetchPurpose
+from suv_deals.crawling.url_policy import PolicyDenied, SourceUrlPolicy
 from suv_deals.domain.sources import load_source_configs
 
 REPO = Path(__file__).resolve().parents[2]
@@ -97,11 +99,55 @@ def test_crawler_route_needs_a_healthy_crawler_before_any_request(run_cli: Cli) 
     assert "nothing was requested" in all_output(result)
 
 
-def test_home_page_probe_is_reviewed_for_the_mk_and_swiss_sources() -> None:
+def test_home_page_probe_is_reviewed_for_the_swiss_sources() -> None:
     configs = {c.source_key: c for c in load_source_configs(REPO / "config" / "sources")}
-    for key in ("reklama5_mk", "pazar3_mk", "autoscout24_ch", "carforyou_ch", "tutti_ch"):
+    for key in ("autoscout24_ch", "carforyou_ch", "tutti_ch"):
         cfg = configs[key]
         assert not cfg.enabled  # a reachability probe only; no crawl route
         assert list(cfg.allowed_search_paths) == ["^/$"]
         assert not cfg.allowed_detail_paths  # no detail page of these sites is reviewed
         SourceUrlPolicy.from_source(cfg).check(f"https://{cfg.allowed_hosts[0]}/", "search")
+
+
+@pytest.mark.parametrize(
+    ("key", "allowed", "refused"),
+    [
+        (
+            "reklama5_mk",
+            [
+                ("/", "search"),
+                ("/Search?q=Renault+Captur", "search"),
+                ("/AdDetails?ad=1234567", "detail"),
+            ],
+            [("/Register", "search"), ("/Help/TermsOfService", "detail"), ("/AdDetails", "search")],
+        ),
+        (
+            "pazar3_mk",
+            [
+                ("/", "search"),
+                ("/oglasi/vozila/avtomobili", "search"),
+                ("/oglasi/vozila/avtomobili/renault/captur", "search"),
+                ("/oglas/vozila/avtomobili/renault/captur/prodazba/skopje/aerodrom/slug/1234567", "detail"),
+            ],
+            [
+                ("/oglasi/zivealista", "search"),
+                ("/oglas/zivealista/kukji-vili/prodazba/skopje/sopiste/slug/123", "detail"),
+                ("/oglas/vozila/avtomobili/renault/captur/prodazba/skopje/aerodrom/slug/abc", "detail"),
+            ],
+        ),
+    ],
+)
+def test_mk_sample_capture_paths_are_reviewed(
+    key: str, allowed: list[tuple[str, FetchPurpose]], refused: list[tuple[str, FetchPurpose]]
+) -> None:
+    # 2026-10-16: search and ad paths read from the owner's captured home pages, for owner-run
+    # sample captures; the sources stay disabled (no adapter) and store facts only.
+    cfg = {c.source_key: c for c in load_source_configs(REPO / "config" / "sources")}[key]
+    assert not cfg.enabled and cfg.adapter_version == "unimplemented"
+    policy = SourceUrlPolicy.from_source(cfg)
+    host = cfg.allowed_hosts[0]
+    for path, purpose in allowed:
+        policy.check(f"https://{host}{path}", purpose)
+    for path, purpose in refused:
+        with pytest.raises(PolicyDenied):
+            policy.check(f"https://{host}{path}", purpose)

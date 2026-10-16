@@ -35,13 +35,17 @@ robots_summary: >-
   disallowed). It therefore sets no rules for our user agent (RFC 9309); robots silence is never
   permission.
 source_timezone: Europe/Skopje
-# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
-# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+# Reviewed 2026-10-16 from the owner's captured home page, for owner-run sample captures only
+# (`capture-samples`); the source stays disabled. The home page's search form submits GET /Search
+# (fields q, cat, city) and ads are linked as /AdDetails?ad=<id>. The query string is not part of
+# the path match; robots.txt sets no rule for our user agent.
 allowed_hosts:
   - 'www.reklama5.mk'
 allowed_search_paths:
   - '^/$'
-allowed_detail_paths: []
+  - '^/Search$'
+allowed_detail_paths:
+  - '^/AdDetails$'
 search: {}
 notes: >-
   Comparable-source candidate (spec sections 5 and 15): asking prices only, never acquisition.
@@ -57,5 +61,6 @@ notes: >-
   answered HTTP 200 both directly and via Crawl4AI; it links searches as /Search?... and ads as
   /AdDetails?ad=<id> and carries no JSON-LD. On 2026-10-14 every HTML page answered a Cloudflare
   managed challenge to the build environment (a cloud data-centre network), so captures are
-  owner-run; any block met there stops the source the same way. The search route, the car
-  category and the ad page structure are not verified yet, so only the home page is allowed.
+  owner-run; any block met there stops the source the same way. The search route
+  (/Search) and ad pages (/AdDetails) are allowed for owner-run sample captures only; the car
+  category id and the ad page structure are verified from those captures.
