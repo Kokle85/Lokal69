@@ -34,16 +34,23 @@ allowed_search_paths:
 allowed_detail_paths:
   # '+' occurs in real listing slugs (2026-10-16 captures); the URL must still end in the listing UUID.
   - '^/annunci/[A-Za-z0-9][A-Za-z0-9._~%+-]{0,300}/?$'
-# Cadence (domain.sources.discovery_interval_seconds): 12 pages per run would need 12 x 96 = 1152
-# requests a day at the global 15-minute schedule, so the scheduler runs this source every 3 hours
-# instead: 8 runs x 12 pages = 96 search requests, leaving 104 of the 200 daily requests for the
-# detail pages the runs queue (a first run may queue more than that; the rest wait for the next
-# UTC day's budget).
+# Discovery schedule, owner decision 2026-10-16 (verbatim): "сакам на секои 30 минуту да го
+# наместиш само од 08:00 до 22:00" (every 30 minutes, only from 08:00 to 22:00, owner's local time).
+# Slots 08:00, 08:30, ..., 21:30 Europe/Skopje (22:00 is the exclusive end; CET/CEST handled):
+# 28 runs a day x 12 search pages = 336 search requests a day, all inside one UTC budget day.
+# This source fetches detail pages, so its search pages may use half of the daily budget
+# (domain.sources.schedule_budget_problem): 2 x 336 = 672, the other half for the detail pages
+# the runs queue (at most 10 per run, 280 a day).
+schedule:
+  interval_minutes: 30
+  window_start: "08:00"
+  window_end: "22:00"
+  timezone: Europe/Skopje
 rate_budget:
   min_delay_seconds: 20            # per-host spacing (shared rate limiter)
   max_search_pages_per_run: 12     # one search page for each of the 12 configured models
   max_detail_jobs_per_run: 10
-  daily_request_budget: 200
+  daily_request_budget: 672        # 336 search + 336 for detail pages (see schedule above)
 search:
   # One search page per model per run (newest first), in this order. Slug verification
   # (2026-10-16, from the owner-captured pages' links and taxonomy): see notes.

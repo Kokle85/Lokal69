@@ -47,7 +47,7 @@ One image, one settings model, separate processes (spec §4):
 |---|---|---|---|
 | API + MCP | `suv-deals api serve` | DB, auth config | `/api`, `/healthz` (liveness), `/readyz` (DB + schema + critical config), `/mcp`. Binds `127.0.0.1:8000` by default; containers bind `0.0.0.0` with `--allow-non-loopback` behind a `127.0.0.1`-only published port. HTTPS terminates at the reverse proxy. |
 | Worker | `suv-deals worker --queues discovery,detail,recheck,valuation,seller_inquiry_plan,seller_inquiry_send,seller_inquiry_reconcile,seller_reply_process` (the default without `--queues`) | DB; crawler when the network is enabled; the sender route's key when `SELLER_EMAIL_PROVIDER=gmail_api` | Leases + heartbeats; SIGTERM finishes the current job. `--drain` processes due jobs and exits. It must claim the four `seller_*` types too: without them inquiries are never planned, sent or reconciled and seller replies are never processed (they stay `queued`). |
-| Scheduler | `suv-deals scheduler` | DB | One discovery job per due 15-minute slot; missed slots become coverage gaps, never bursts. `--once` for a single tick. |
+| Scheduler | `suv-deals scheduler` | DB | Ticks every 15 minutes; one discovery job per due slot of each source's cadence (2.2); missed slots become coverage gaps, never bursts. `--once` for a single tick. |
 | Reconciler | `suv-deals reconcile --loop` | DB; HTTPS egress to `www.ecb.europa.eu` only when `FX_FETCH_ENABLED=true` | Reapers, housekeeping (incl. inserting missing spec 32 activation gates), stale-detail and valuation sweeps, and the gated ECB EUR->CHF refresh (at most every 6 h); `--dry-run` reports a pass and rolls it back (no FX fetch). |
 | Dispatcher | `suv-deals dispatcher` | DB; route secrets | Only the selected, verified route; `--once` for one pass. |
 | Crawler | `unclecode/crawl4ai:0.9.4` (pinned digest in production) | its own token | Private network; never receives database or Supabase keys. |
@@ -80,6 +80,55 @@ types) and `suv-deals api serve --app-factory suv_deals.<module>:<factory>` (a w
 `SUPABASE_PUBLISHABLE_KEY` belongs to the dashboard frontend only (browser-safe). The backend
 uses a LOGIN member of `suv_backend` or `SET ROLE suv_backend` (ADR 0001); it does not need the
 Supabase secret key unless evidence objects go to Supabase Storage.
+
+### 2.2 Discovery cadence and discovery windows
+
+Each enabled source gets one schedule per enabled search profile. Its cadence comes from the
+source's YAML (`config/sources/<key>.yaml`):
+
+- **No `schedule` block** (every source except AutoScout24 IT/DE): a run every
+  `SCHEDULER_INTERVAL_SECONDS` (15 minutes) on the UTC grid, slowed down automatically when a day
+  of runs would not fit the source's `daily_request_budget` (`discovery_interval_seconds`).
+- **A `schedule` block** (an owner decision; AutoScout24 IT and DE since 2026-10-16, "сакам на
+  секои 30 минуту да го наместиш само од 08:00 до 22:00"):
+
+  ```yaml
+  schedule:
+    interval_minutes: 30      # must divide the day (15, 20, 30, 60, 90, 120, ...)
+    window_start: "08:00"     # first slot; quote the times (YAML reads 22:00 as a number)
+    window_end: "22:00"       # exclusive end ("24:00" = midnight); the window cannot cross midnight
+    timezone: Europe/Skopje   # IANA zone; CET/CEST changes are handled
+  ```
+
+  Slots are wall-clock times in that zone: 08:00, 08:30, ..., 21:30 (28 runs a day, in summer and
+  winter time alike; 22:00 itself is not a slot). A slot's run may start until the next slot or
+  the window end; outside the window the schedule is due at the next day's 08:00. After downtime
+  only the slot that is live now runs once (the missed slots are a recorded gap,
+  `scheduler_missed_slots`, never a burst). The scheduler ticks on the 15-minute UTC grid, so a
+  :00/:30 Skopje slot starts within a second of its time.
+
+  An explicit window is never stretched to fit the budget. Loading the YAML checks that one day
+  of runs (the most slots in any UTC day, the budget day) x `max_search_pages_per_run` fits the
+  `daily_request_budget` (all of it for `card_only`, half of it otherwise: the rest is for detail
+  pages); a window that does not fit is a configuration error naming the numbers. The YAML does
+  not know how many search profiles are enabled, so that check counts one; the scheduler
+  re-checks with the workspace's enabled profiles. If they would overspend (e.g. a second profile
+  doubles 336 search requests a day), `ensure_schedules` refuses the source (log line
+  "discovery schedule refused", `schedules_over_budget` in the tick report) and every run of an
+  existing schedule is skipped as `slot_skipped: schedule_over_budget` until the budget, window
+  or profiles change. Today's request budget is still enforced per request as before.
+
+**Changing a window** (or removing it, or changing a budget):
+
+1. Edit the `schedule` block / `rate_budget` in `config/sources/<key>.yaml`, keeping the comment
+   with the owner's decision and the arithmetic (runs x pages <= budget share).
+2. `uv run suv-deals sources inspect <key>` shows the cadence ("discovery: every 30 min from
+   08:00 to 22:00 Europe/Skopje; 28 runs a day ..."); a window that does not fit fails here with
+   the reason.
+3. `uv run suv-deals sources sync --dry-run`, then `--yes` (audited `source.sync_update`).
+4. The next scheduler tick moves the existing schedule rows to the new interval and next slot
+   (audited `schedule.reconfigure` with the before/after interval and due time); no migration,
+   no restart, no new rows. A slot already run is never run again.
 
 ## 3. Local versus VPS
 

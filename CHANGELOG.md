@@ -7,6 +7,45 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (on top of `7f7e187`)
 
+Owner decision of 2026-10-16 („сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00"):
+discovery of AutoScout24 Italy and Germany every 30 minutes, only from 08:00 to 22:00 (the
+owner's local time, Europe/Skopje).
+
+- **Discovery windows (`schedule` in a source's YAML).** `domain.sources.DiscoverySchedule`
+  (`interval_minutes` dividing the day, quoted `window_start`/`window_end` with an exclusive end,
+  an IANA `timezone`; frozen, extra keys refused): run slots are wall-clock times in that zone,
+  computed with zoneinfo from database time (no migration, no new column): 08:00, 08:30, ...,
+  21:30, 28 a day in CET and CEST alike (the DST changes of 2026-10-25 and 2027-03-28 are
+  tested; a repeated or skipped hour inside a window is run once at most). A slot may start until
+  the next slot or the window end; outside the window the schedule waits for the next day's start.
+  After downtime ONE job runs for the slot that is live now and the missed slots are a recorded
+  gap (never a burst). A source without the block keeps the budget-stretched global interval.
+- **Budget fit, never stretched.** Loading the YAML refuses a window whose day of runs (the most
+  slots in any UTC budget day) x `max_search_pages_per_run` exceeds the search share of
+  `daily_request_budget` (all of it for `card_only`, half otherwise), naming the numbers; the
+  registry load error now carries the validator messages. The YAML cannot know the enabled
+  search profiles, so that check counts one; the scheduler re-checks with the real count:
+  `ensure_schedules` refuses the source (`WorkspaceTick.schedules_over_budget`, a warning log, no
+  row created or changed) and `advance_schedule` skips the run of an existing row
+  (`slot_skipped: schedule_over_budget`).
+- **Existing schedule rows follow the configuration.** `ensure_schedule` moves a row whose
+  interval or future due time no longer matches the configured cadence (a changed or removed
+  window, a changed interval) to the new interval and next slot, under a row lock and audited
+  (`schedule.reconfigure`, before/after values); an unchanged row is not touched, and a slot
+  already run is never run again. Before, a row kept the interval it was created with.
+- **AutoScout24 IT/DE configuration.** Both get the window (30 min, 08:00-22:00,
+  Europe/Skopje): 28 runs x 12 search pages = 336 search requests a day. `autoscout24_de`
+  (card_only) `daily_request_budget` 200 -> 350. `autoscout24_it` (fetches detail pages)
+  200 -> 672: under the budget rule a fetch source's search pages may use half of the budget, so
+  336 search requests need 672 (the other half covers the at most 10 detail pages per run, 280 a
+  day). Spacing (20 s), one connection per host, robots and every gate are unchanged; both stay
+  disabled.
+- `tzdata` is a runtime dependency so zoneinfo works in a container image without system zone
+  files; `sources inspect` shows the discovery cadence.
+- Tests: slot math (window edges, DST, downtime, UTC budget day), configuration validation and
+  row reconciliation (unit), and windowed schedules on PostgreSQL with a frozen clock
+  (`tests/integration/repos_sources_listings/test_schedule_windows.py`, scheduler tests).
+
 Owner decisions of 2026-10-16 („не треба да бидат строги правилата ... само за да имаме
 орјентација", „Цените се извадени од Reklama5"; ADR 0005).
 
@@ -157,8 +196,8 @@ point; step 5 (above) followed the same day.
   enabled profiles) do not fit at `SCHEDULER_INTERVAL_SECONDS` runs less often instead of
   exhausting the budget in the first hours of each UTC day (Germany every 90 minutes, 192 of 200
   requests; Italy every 3 hours, half of the budget left for detail pages); with the one enabled
-  profile every other shipped source keeps the global interval. New schedule rows only: an
-  existing row keeps the interval it was created with.
+  profile every other shipped source keeps the global interval. Superseded for AutoScout24 by the
+  owner's 08:00-22:00 discovery window (entry above).
 - **Fix: capture redaction broke JSON escapes.** `sample_capture.redact_html` swallowed the letters
   of a `\u003e`/`\n` escape before an e-mail address, leaving `\[redacted-email]` (invalid JSON
   in saved pages); escapes are now matched as whole tokens and kept intact, in linear time (long

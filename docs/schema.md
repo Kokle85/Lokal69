@@ -512,7 +512,12 @@ completion cannot overwrite the result.
 Exhausted waiting jobs are reconciled into `dead_letter` through `jobs_exhausted_idx`.
 
 **Scheduler.** `INSERT ... (scheduled_slot = :slot) ON CONFLICT DO NOTHING`, then advance
-`ops.source_schedules.next_due_at` in the same short transaction.
+`ops.source_schedules.next_due_at` in the same short transaction. A source's discovery window
+(the `schedule` block of its YAML, owner decision 2026-10-16; docs/runbook.md 2.2) needs no
+column and no migration: the slots are computed in Python from database time and the window
+stored in `app.sources.config`; the row's `interval_seconds` holds the window interval and
+`next_due_at` the next window slot (`sources_repo.ensure_schedule` updates both, audited
+`schedule.reconfigure`, when the configuration changes).
 
 ## 8. Decisions and deviations
 

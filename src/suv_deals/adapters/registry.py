@@ -233,7 +233,16 @@ def load_registry(config_dir: Path) -> SourceRegistry:
     try:
         configs = load_source_configs(sources_dir)
     except ValidationError as exc:
-        raise ValidationFailed(f"invalid source configuration: {exc.error_count()} error(s)") from None
+        # Name what is wrong (e.g. a discovery schedule that does not fit the budget): field
+        # locations and validator messages only, without the raw inputs (source configurations
+        # hold no secrets; a message may name a value such as a time zone).
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or exc.title}: {error['msg']}"
+            for error in exc.errors(include_url=False, include_input=False)[:3]
+        )
+        raise ValidationFailed(
+            f"invalid source configuration: {exc.error_count()} error(s): {details}"[:1500]
+        ) from None
     except yaml.YAMLError:
         raise ValidationFailed("invalid source configuration: a YAML file could not be parsed") from None
     except ValueError as exc:

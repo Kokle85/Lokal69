@@ -41,6 +41,19 @@ Scheduling (spec 9 "Scheduling", one short transaction, no network I/O)
     (5) the caller commits before any network request. Slots come from database time. Missed slots
     after downtime are recorded as a coverage gap; they are never replayed as a traffic burst.
 
+    Slots of a source WITHOUT a ``schedule`` block are the ``interval_seconds`` grid in UTC
+    (``date_bin`` from 2000-01-01). A source WITH one (`domain.sources.DiscoverySchedule`, an owner
+    decision) has wall-clock slots inside a daily window in its own time zone, computed in Python
+    from database time and the source's stored configuration (no column of its own): only the
+    slot that is live now (started, before the next slot and the window end) is enqueued; outside
+    the window the due time moves to the next slot (the next day's window start). Such a run is
+    re-checked against the daily request budget with the workspace's enabled profiles
+    (``schedule_over_budget``).
+
+    `ensure_schedule` brings an existing row in line with the configured cadence (interval and
+    due time; audited ``schedule.reconfigure``), so a changed interval or window takes effect
+    without recreating rows.
+
 Watermarks and coverage (spec 9 "Discovery watermarks")
     `finish_crawl_run`: only a COMPLETE traversal advances the complete watermark (never
     backwards) or, for ``rolling_pages``, records the page depth and the last complete traversal
@@ -60,7 +73,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -85,7 +98,13 @@ from suv_deals.domain.enums import (
     TermsDecision,
     TermsStatus,
 )
-from suv_deals.domain.sources import RateBudget, SourceConfig, activation_problems
+from suv_deals.domain.sources import (
+    DiscoverySchedule,
+    RateBudget,
+    SourceConfig,
+    activation_problems,
+    schedule_budget_problem,
+)
 from suv_deals.errors import (
     AppError,
     ErrorCode,
@@ -353,6 +372,18 @@ class SourceRecord(BaseModel):
             return RateBudget.model_validate(self.config.get("rate_budget") or {})
         except ValidationError:
             return RateBudget()
+
+    def discovery_schedule(self) -> DiscoverySchedule | None:
+        """The explicit discovery window of the source (``schedule`` in its YAML), if any.
+
+        An invalid stored schedule raises (fail closed: never fall back to another cadence)."""
+        raw = self.config.get("schedule")
+        if raw is None:
+            return None
+        try:
+            return DiscoverySchedule.model_validate(raw)
+        except ValidationError as exc:
+            raise ValidationFailed("the stored discovery schedule of the source is invalid") from exc
 
     def tracking_params(self) -> tuple[str, ...]:
         raw = self.config.get("tracking_params")
@@ -653,7 +684,9 @@ def _sync_values(cfg: SourceConfig) -> dict[str, Any]:
         "allowed_detail_paths": list(cfg.allowed_detail_paths),
         "source_timezone": cfg.source_timezone,
         "detail_mode": cfg.detail_mode,
-        "config": cfg.model_dump(mode="json"),
+        # ``schedule`` is stored only when set, so a source without one keeps its stored
+        # configuration (and registry version) unchanged.
+        "config": cfg.model_dump(mode="json", exclude={"schedule"} if cfg.schedule is None else None),
     }
 
 
@@ -1686,6 +1719,45 @@ def _schedule_select(where: str, *, lock: str = "") -> sql.Composable:
     return _where("ops.source_schedules", _SCHEDULE_COLUMNS, where, lock)
 
 
+async def _database_now(conn: Conn) -> datetime:
+    row = await fetch_one(conn, "select now() as now")
+    assert row is not None
+    return ensure_utc(row["now"])
+
+
+def _grid_slot(instant: datetime, interval: timedelta) -> datetime:
+    """``date_bin(interval, instant, 2000-01-01Z)``: the UTC slot grid of `jobs.current_slot`."""
+    origin = datetime(2000, 1, 1, tzinfo=UTC)
+    return origin + ((ensure_utc(instant) - origin) // interval) * interval
+
+
+def _first_due(window: DiscoverySchedule, now: datetime, last_slot: datetime | None) -> datetime:
+    """When a windowed schedule is next due: its live slot if not handled yet, else the next slot."""
+    live = window.live_slot(now)
+    if live is not None and (last_slot is None or live > last_slot):
+        return live
+    return window.next_slot_after(now)
+
+
+def _cadence_due(
+    record: ScheduleRecord, interval_seconds: int, window: DiscoverySchedule | None, now: datetime
+) -> datetime:
+    """The due time that matches the configured cadence (``record.next_due_at`` when it does).
+
+    A due row (``next_due_at <= now``) is left alone: `advance_schedule` applies the current
+    cadence. A future due time is wrong when it is not the window's next slot, or (no window)
+    later than one interval after the last handled slot (now, if none): e.g. the interval or
+    window changed, or the window was removed.
+    """
+    due = record.next_due_at
+    if due <= now:
+        return due
+    if window is not None:
+        return due if due == window.next_slot_after(now) else _first_due(window, now, record.last_slot)
+    bound = now if record.last_slot is None else record.last_slot + timedelta(seconds=interval_seconds)
+    return min(due, bound)
+
+
 async def ensure_schedule(
     conn: Conn,
     actor: ActorContext,
@@ -1695,14 +1767,26 @@ async def ensure_schedule(
     *,
     coverage_mode: CoverageMode,
     interval_seconds: int = 900,
+    window: DiscoverySchedule | None = None,
+    now: datetime | None = None,
 ) -> ScheduleRecord:
-    """Create the schedule row of (source, profile, partition) if missing (due immediately)."""
+    """Create the schedule row of (source, profile, partition) if missing, and keep it in line with
+    the configured cadence.
+
+    A new row is due immediately, or, with a discovery ``window``, at its live slot (now) or its
+    next slot. An existing row whose interval differs from the configured one, or whose future
+    due time does not match the configured cadence (`_cadence_due`), is updated under a row lock
+    and audited (``schedule.reconfigure``); an unchanged row is not touched. ``now`` replaces
+    database time (tests with a frozen clock; production passes nothing).
+    """
     _require_system_or_admin(actor)
     if not _PARTITION_RE.fullmatch(partition_key):
         raise ValidationFailed("partition_key must be 1-80 characters of letters, digits and _ : . -")
     if not 60 <= interval_seconds <= 86_400:
         raise ValidationFailed("interval_seconds must be between 60 and 86400")
-    params = {
+    if window is not None and interval_seconds != window.interval_seconds:
+        raise ValidationFailed("interval_seconds must be the discovery window's interval")
+    params: dict[str, Any] = {
         "workspace_id": actor.workspace_id,
         "source_id": source_id,
         "profile_id": profile_id,
@@ -1710,25 +1794,69 @@ async def ensure_schedule(
         "coverage_mode": CoverageMode(coverage_mode).value,
         "interval": interval_seconds,
     }
+    where = "source_id = %(source_id)s and profile_id = %(profile_id)s and partition_key = %(partition_key)s"
     async with mapped_errors():
+        at = await _database_now(conn) if now is None else ensure_utc(now)
+        if window is not None:
+            params["due"] = _first_due(window, at, None)
+        else:
+            params["due"] = None if now is None else at
         await conn.execute(
             "insert into ops.source_schedules (workspace_id, source_id, profile_id, partition_key,"
             " interval_seconds, next_due_at, coverage_mode)"
             " values (%(workspace_id)s, %(source_id)s, %(profile_id)s, %(partition_key)s, %(interval)s,"
-            " now(), %(coverage_mode)s)"
+            " coalesce(%(due)s::timestamptz, now()), %(coverage_mode)s)"
             " on conflict (workspace_id, source_id, profile_id, partition_key) do nothing",
             params,
         )
-        row = await fetch_one(
+        row = await fetch_one(conn, _schedule_select(where), params)
+        assert row is not None
+        record = ScheduleRecord.model_validate(row)
+        if (
+            record.interval_seconds == interval_seconds
+            and _cadence_due(record, interval_seconds, window, at) == record.next_due_at
+        ):
+            return record
+        # The configured cadence changed: re-read under the row lock (a racing scheduler may have
+        # advanced or reconfigured it meanwhile) and update it once.
+        row = await fetch_one(conn, _schedule_select(where, lock=" for update"), params)
+        assert row is not None
+        record = ScheduleRecord.model_validate(row)
+        due = _cadence_due(record, interval_seconds, window, at)
+        if record.interval_seconds == interval_seconds and due == record.next_due_at:
+            return record
+        updated = await fetch_one(
             conn,
-            _schedule_select(
-                "source_id = %(source_id)s and profile_id = %(profile_id)s"
-                " and partition_key = %(partition_key)s"
-            ),
-            params,
+            sql.SQL(
+                "update ops.source_schedules set interval_seconds = %(interval)s, next_due_at = %(due)s,"
+                " row_version = row_version + 1"
+                " where workspace_id = %(workspace_id)s and id = %(id)s returning {columns}"
+            ).format(columns=_cols(_SCHEDULE_COLUMNS)),
+            {**params, "id": record.id, "due": due},
         )
-    assert row is not None
-    return ScheduleRecord.model_validate(row)
+        assert updated is not None
+        result = ScheduleRecord.model_validate(updated)
+        await audit.record(
+            conn,
+            actor,
+            "schedule.reconfigure",
+            "source_schedule",
+            record.id,
+            prior_version=record.row_version,
+            new_version=result.row_version,
+            reason="the discovery cadence in the source configuration changed",
+            metadata={
+                "source_id": str(source_id),
+                "profile_id": str(profile_id),
+                "partition_key": partition_key,
+                "interval_seconds_before": record.interval_seconds,
+                "interval_seconds_after": result.interval_seconds,
+                "next_due_at_before": record.next_due_at.isoformat(),
+                "next_due_at_after": result.next_due_at.isoformat(),
+                "cadence": "global interval" if window is None else window.describe(),
+            },
+        )
+    return result
 
 
 async def get_schedule(conn: Conn, actor: ActorContext, schedule_id: UUID) -> ScheduleRecord:
@@ -1767,16 +1895,14 @@ async def due_schedules(conn: Conn, actor: ActorContext, *, limit: int = 100) ->
 
 
 async def _skip_reason(
-    conn: Conn, actor: ActorContext, schedule: ScheduleRecord, now: datetime
+    conn: Conn,
+    actor: ActorContext,
+    schedule: ScheduleRecord,
+    *,
+    source: SourceRecord,
+    window: DiscoverySchedule | None,
+    now: datetime,
 ) -> str | None:
-    source_row = await fetch_one(
-        conn,
-        _source_select("id = %(id)s", lock=" for share"),
-        {"workspace_id": actor.workspace_id, "id": schedule.source_id},
-    )
-    if source_row is None:  # pragma: no cover - composite FK
-        return "source_missing"
-    source = SourceRecord.model_validate(source_row)
     profile = await fetch_one(
         conn,
         "select enabled from app.search_profiles where workspace_id = %(workspace_id)s and id = %(id)s",
@@ -1796,6 +1922,18 @@ async def _skip_reason(
         return "activation_gate_failed"
     if profile is None or not profile["enabled"]:
         return "profile_disabled"
+    if window is not None:
+        # An explicit window is never stretched: with more enabled profiles than its daily budget
+        # allows, its runs are refused (re-checked when each run is scheduled).
+        enabled = await fetch_one(
+            conn,
+            "select count(*) as profiles from app.search_profiles"
+            " where workspace_id = %(workspace_id)s and enabled",
+            {"workspace_id": actor.workspace_id},
+        )
+        profiles = 1 if enabled is None else int(enabled["profiles"])
+        if schedule_budget_problem(window, source.rate_budget(), source.detail_mode, profiles=profiles):
+            return "schedule_over_budget"
     if schedule.backoff_until is not None and schedule.backoff_until > now:
         return "backoff"
     backlog = await fetch_one(
@@ -1829,13 +1967,27 @@ async def _skip_reason(
     return None
 
 
+async def _set_due(conn: Conn, actor: ActorContext, schedule: ScheduleRecord, due: datetime) -> None:
+    await conn.execute(
+        "update ops.source_schedules set next_due_at = %(due)s, row_version = row_version + 1"
+        " where workspace_id = %(workspace_id)s and id = %(id)s",
+        {"workspace_id": actor.workspace_id, "id": schedule.id, "due": due},
+    )
+
+
 async def advance_schedule(
-    conn: Conn, actor: ActorContext, schedule_id: UUID, slot: datetime | None = None
+    conn: Conn,
+    actor: ActorContext,
+    schedule_id: UUID,
+    slot: datetime | None = None,
+    *,
+    now: datetime | None = None,
 ) -> ScheduleAdvance:
     """Spec 9 scheduling steps 1-4 in the caller's short transaction (see module docstring).
 
     Returns ``enqueued`` (job created), ``already_scheduled`` (a racing scheduler won the slot),
     ``not_due`` or ``skipped`` (with the reason; the slot is consumed and recorded as a gap).
+    ``now`` replaces database time (tests with a frozen clock; production passes nothing).
     """
     _require_system_or_admin(actor)
     async with mapped_errors():
@@ -1847,32 +1999,63 @@ async def advance_schedule(
         if row is None:
             raise NotFound("Schedule not found")
         schedule = ScheduleRecord.model_validate(row)
-        now_row = await fetch_one(conn, "select now() as now")
-        assert now_row is not None
-        now = ensure_utc(now_row["now"])
-        current = await jobs.current_slot(conn, schedule.interval) if slot is None else ensure_utc(slot)
-        if schedule.next_due_at > now:
-            return ScheduleAdvance(
-                schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=schedule.next_due_at
-            )
-        if schedule.last_slot is not None and current <= schedule.last_slot:
-            # Due by time but this slot was already handled (e.g. the interval changed): move the
-            # due time to the next slot so the schedule does not stay due forever.
-            due = schedule.last_slot + schedule.interval
-            await conn.execute(
-                "update ops.source_schedules set next_due_at = %(due)s, row_version = row_version + 1"
-                " where workspace_id = %(workspace_id)s and id = %(id)s",
-                {"workspace_id": actor.workspace_id, "id": schedule.id, "due": due},
-            )
-            return ScheduleAdvance(schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=due)
-        next_due = current + schedule.interval
+        at = await _database_now(conn) if now is None else ensure_utc(now)
+        source = await _load_source(conn, actor.workspace_id, schedule.source_id, lock=" for share")
+        window = source.discovery_schedule()
+        last = schedule.last_slot
+        if window is None:
+            if slot is not None:
+                current = ensure_utc(slot)
+            elif now is not None:
+                current = _grid_slot(at, schedule.interval)
+            else:
+                current = await jobs.current_slot(conn, schedule.interval)
+            if schedule.next_due_at > at:
+                return ScheduleAdvance(
+                    schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=schedule.next_due_at
+                )
+            if last is not None and current <= last:
+                # Due by time but this slot was already handled (e.g. the interval changed): move the
+                # due time to the next slot so the schedule does not stay due forever.
+                due = last + schedule.interval
+                await _set_due(conn, actor, schedule, due)
+                return ScheduleAdvance(
+                    schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=due
+                )
+            next_due = current + schedule.interval
+            missed = last is not None and current > last + schedule.interval
+        else:
+            live = ensure_utc(slot) if slot is not None else window.live_slot(at)
+            if schedule.next_due_at > at:
+                return ScheduleAdvance(
+                    schedule_id=schedule.id,
+                    outcome="not_due",
+                    slot=live if live is not None else window.next_slot_after(at),
+                    next_due_at=schedule.next_due_at,
+                )
+            if live is None:
+                # Outside the window (or after the live part of the last slot): nothing runs now;
+                # the schedule waits for the next slot (the next day's window start after it).
+                due = window.next_slot_after(at)
+                await _set_due(conn, actor, schedule, due)
+                return ScheduleAdvance(schedule_id=schedule.id, outcome="not_due", slot=due, next_due_at=due)
+            current = live
+            if last is not None and current <= last:
+                due = window.next_slot_after(max(last, at))
+                await _set_due(conn, actor, schedule, due)
+                return ScheduleAdvance(
+                    schedule_id=schedule.id, outcome="not_due", slot=current, next_due_at=due
+                )
+            # One run for the live slot at most; slots missed during downtime are never replayed.
+            next_due = window.next_slot_after(current)
+            missed = last is not None and current > window.next_slot_after(last)
         gaps: list[str] = []
-        if schedule.last_slot is not None and current > schedule.last_slot + schedule.interval:
+        if missed:
             gaps.append(
-                f"scheduler_missed_slots: {schedule.last_slot.isoformat()} .. {current.isoformat()}"
+                f"scheduler_missed_slots: {last.isoformat() if last else '-'} .. {current.isoformat()}"
                 " not scheduled"
             )
-        reason = await _skip_reason(conn, actor, schedule, now)
+        reason = await _skip_reason(conn, actor, schedule, source=source, window=window, now=at)
         job_id: UUID | None = None
         outcome: ScheduleOutcome = "skipped"
         if reason is not None:

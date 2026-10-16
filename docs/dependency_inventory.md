@@ -60,11 +60,12 @@ Direct dependencies (pyproject `[project.dependencies]`) and their locked versio
 | prometheus-client | 0.26.0 | >=0.23,<1 |
 | lxml | 6.1.3 | >=6.0,<7 |
 | anyio | 4.15.1 | >=4.10,<5 |
+| tzdata | 2026.5 (IANA time zones for `zoneinfo`: the per-source discovery windows, also where the image has no system zone database) | >=2025.2 |
 
 Other locked transitive packages of the runtime closure: annotated-doc 0.0.5, annotated-types
 0.8.0, attrs 26.1.0, certifi 2026.7.22, httpx2-jsfetch 1.0, idna 3.20, jsonschema-specifications
 2025.9.1, referencing 0.37.0, rpds-py 2026.9.1, truststore 0.10.4, typing-extensions 4.16.0,
-typing-inspection 0.4.4, tzdata 2026.5, pywin32 312 (Windows only).
+typing-inspection 0.4.4, pywin32 312 (Windows only).
 
 ## 5. Python development dependencies
 

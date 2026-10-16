@@ -1091,6 +1091,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "standardwebhooks" },
     { name = "starlette" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1124,6 +1125,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.2,<7" },
     { name = "standardwebhooks", specifier = ">=1.1,<2" },
     { name = "starlette", specifier = ">=1.7,<2" },
+    { name = "tzdata", specifier = ">=2025.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.54,<0.55" },
 ]
 

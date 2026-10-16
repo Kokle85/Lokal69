@@ -7,17 +7,37 @@ slots and due times):
    own workspace-scoped transactions.
 2. A schedule row exists for every enabled acquisition source x enabled search profile (partition
    ``default``; coverage mode from the adapter's capabilities). Creating one never schedules a job.
-   Its interval is ``SCHEDULER_INTERVAL_SECONDS``, stretched for a source whose search pages per
-   run would not fit its daily request budget at that cadence
-   (`domain.sources.discovery_interval_seconds`; a row keeps the interval it was created with).
+   Cadence, per source:
+
+   - Without a ``schedule`` block in its YAML: every ``SCHEDULER_INTERVAL_SECONDS`` on the UTC
+     slot grid, stretched for a source whose search pages per run would not fit its daily request
+     budget at that cadence (`domain.sources.discovery_interval_seconds`).
+   - With one (`domain.sources.DiscoverySchedule`, an owner decision; AutoScout24 IT/DE: every 30
+     minutes from 08:00 to 22:00 Europe/Skopje, slots 08:00 ... 21:30): fixed wall-clock slots
+     inside the daily window in the schedule's time zone, DST-correct (zoneinfo). Outside the
+     window the schedule is due at the next day's window start. An explicit schedule is never
+     stretched: if a day of its runs x search pages x enabled profiles does not fit the budget
+     (`domain.sources.schedule_budget_problem`), its schedules are refused here (reported in
+     ``WorkspaceTick.schedules_over_budget``, nothing is created or changed) and every run of an
+     existing row is skipped (``schedule_over_budget``) until the budget, window or profiles
+     change.
+
+   An existing row follows a changed interval or window (`sources_repo.ensure_schedule` updates
+   its interval and due time, audited ``schedule.reconfigure``).
 3. For each due schedule, ONE short transaction runs `sources_repo.advance_schedule`: lock the
    schedule, re-check the source (enabled, activation gate, not paused, not access-blocked or
-   parser-unhealthy, terms decision), the profile, backlog, backoff and today's request budget,
-   insert the slot's discovery job through the slot-unique key, and advance ``next_due_at`` in the
-   same transaction (both commit or neither does). The commit happens before any network request.
-4. Missed slots after downtime are recorded as a coverage gap. Exactly one job is enqueued for the
-   CURRENT slot: the scheduler never replays missed slots as a burst (never silently increases
+   parser-unhealthy, terms decision), the profile, a windowed schedule's budget fit, backlog,
+   backoff and today's request budget, insert the slot's discovery job through the slot-unique
+   key, and advance ``next_due_at`` in the same transaction (both commit or neither does). The
+   commit happens before any network request.
+4. Missed slots after downtime are recorded as a coverage gap. At most one job is enqueued, for the
+   CURRENT slot (a windowed schedule: only while that slot is live, i.e. before the next slot and
+   the window end): the scheduler never replays missed slots as a burst (never silently increases
    traffic to catch up). Racing schedulers get ``already_scheduled`` for the same slot.
+
+The process wakes on the ``SCHEDULER_INTERVAL_SECONDS`` UTC grid (15 minutes by default), so a
+window slot is picked up by the first tick at or after it: Europe/Skopje's :00/:30 slots fall on
+that grid exactly.
 
 Real sources are not scheduled at all while ``SOURCE_NETWORK_ENABLED=false`` (their schedules stay
 due and visibly unscanned); fixture sources run offline, and never in production, whose processes
@@ -43,7 +63,7 @@ from suv_deals.adapters.registry import build_adapter, registry_problems
 from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import CoverageMode, SourceMode
-from suv_deals.domain.sources import discovery_interval_seconds
+from suv_deals.domain.sources import discovery_interval_seconds, schedule_budget_problem
 from suv_deals.errors import AppError, DependencyUnavailable, NotFound
 from suv_deals.observability.logging import log_context
 from suv_deals.observability.metrics import AppMetrics
@@ -67,6 +87,9 @@ class WorkspaceTick(BaseModel):
 
     workspace_id: UUID
     schedules_ensured: int = 0
+    # Sources whose explicit discovery schedule does not fit their daily request budget with the
+    # workspace's enabled profiles: none of their schedules was created or changed.
+    schedules_over_budget: tuple[str, ...] = ()
     enqueued: tuple[UUID, ...] = ()
     already_scheduled: int = 0
     not_due: int = 0
@@ -97,6 +120,15 @@ class SchedulerTickReport(BaseModel):
         return "partial" if failed else "ok"
 
 
+class EnsuredSchedules(BaseModel):
+    """What `ensure_schedules` did: rows ensured, and sources refused for their budget."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ensured: int = 0
+    over_budget: tuple[str, ...] = ()
+
+
 def _slot_of(now: datetime, interval: timedelta) -> datetime:
     epoch = datetime(2000, 1, 1, tzinfo=now.tzinfo)
     steps = (now - epoch) // interval
@@ -123,13 +155,21 @@ def _coverage_mode(source: SourceRecord) -> CoverageMode | None:
 
 
 async def ensure_schedules(
-    db: Database, actor: ActorContext, sources: list[SourceRecord], interval_seconds: int
-) -> int:
+    db: Database,
+    actor: ActorContext,
+    sources: list[SourceRecord],
+    interval_seconds: int,
+    *,
+    now: datetime | None = None,
+) -> EnsuredSchedules:
     """Make sure a schedule row exists for every enabled acquisition or MK comparable source x
-    enabled profile.
+    enabled profile, with the source's configured cadence.
 
-    Idempotent (``ensure_schedule`` inserts with ``ON CONFLICT DO NOTHING``); returns the number of
-    schedule rows ensured. A new row is due immediately but schedules nothing by itself.
+    Idempotent (``ensure_schedule`` inserts with ``ON CONFLICT DO NOTHING`` and only touches an
+    existing row whose cadence changed). A new row schedules nothing by itself. A source with an
+    explicit discovery schedule that does not fit its daily request budget with the enabled
+    profiles is refused (logged, reported, no row created or changed). ``now`` replaces database
+    time (tests with a frozen clock).
     """
     # MK comparable sources are crawled too (their detail pages become market evidence, never
     # acquisition revisions: `crawling.mk_evidence`; F2, wave D2).
@@ -137,17 +177,30 @@ async def ensure_schedules(
         s for s in sources if s.enabled and not s.paused and s.role in ("acquisition", "mk_comparable")
     ]
     if not eligible:
-        return 0
+        return EnsuredSchedules()
     ensured = 0
+    over_budget: list[str] = []
     async with unit_of_work(db, actor) as conn:
         profiles = [p for p in await config_repo.list_profiles(conn, actor) if p.enabled]
         for source in eligible:
             mode = _coverage_mode(source)
             if mode is None:
                 continue
-            interval = discovery_interval_seconds(
-                source.source_config(), interval_seconds, profiles=len(profiles)
-            )
+            config = source.source_config()
+            window = config.schedule
+            if window is not None:
+                problem = schedule_budget_problem(
+                    window, config.rate_budget, config.detail_mode, profiles=len(profiles)
+                )
+                if problem is not None:
+                    # Never overspend and never silently stretch an owner schedule: refuse it.
+                    logger.warning(
+                        "discovery schedule refused: it does not fit the daily request budget",
+                        extra={"source_key": source.source_key, "problem": problem},
+                    )
+                    over_budget.append(source.source_key)
+                    continue
+            interval = discovery_interval_seconds(config, interval_seconds, profiles=len(profiles))
             for profile in profiles:
                 await sources_repo.ensure_schedule(
                     conn,
@@ -157,9 +210,11 @@ async def ensure_schedules(
                     DEFAULT_PARTITION,
                     coverage_mode=mode,
                     interval_seconds=interval,
+                    window=window,
+                    now=now,
                 )
                 ensured += 1
-    return ensured
+    return EnsuredSchedules(ensured=ensured, over_budget=tuple(over_budget))
 
 
 async def tick_workspace(
@@ -221,7 +276,8 @@ async def tick_workspace(
             skipped[result.skip_reason or "skipped"] += 1
     return WorkspaceTick(
         workspace_id=workspace_id,
-        schedules_ensured=ensured,
+        schedules_ensured=ensured.ensured,
+        schedules_over_budget=ensured.over_budget,
         enqueued=tuple(enqueued),
         already_scheduled=already,
         not_due=not_due,
@@ -314,6 +370,7 @@ async def run_scheduler_process(settings: Settings, *, stop: anyio.Event | None 
 
 
 __all__ = [
+    "EnsuredSchedules",
     "SchedulerTickReport",
     "WorkspaceTick",
     "ensure_schedules",

@@ -2,19 +2,28 @@
 
 The end-to-end slot/dedup behaviour lives in ``test_e2e_fixture_pipeline``; these tests cover what
 one tick must never do: let one failing schedule stop the others, or create jobs that can only
-block (a fixture source in production, whose processes load no fixture data).
+block (a fixture source in production, whose processes load no fixture data), and how a source
+with an explicit discovery window (owner decision 2026-10-16) is ensured: with the window's
+interval and due time, or refused when the enabled profiles would overspend its budget.
 """
 
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
+from tests.integration.db.helpers import Seed
 from tests.integration.pipeline.support import (
     REPO,
+    SOURCE_KEY,
     PipelineEnv,
+    build_env,
+    fixture_source_config,
     jobs_of,
     pipeline_settings,
     run,
@@ -22,9 +31,10 @@ from tests.integration.pipeline.support import (
 )
 
 from suv_deals.clock import SystemClock
-from suv_deals.crawling.scheduler import run_scheduler_tick
+from suv_deals.crawling.scheduler import ensure_schedules, run_scheduler_tick
 from suv_deals.domain.enums import JobType, ProfileKey
 from suv_deals.domain.profiles import load_business_config
+from suv_deals.domain.sources import DiscoverySchedule
 from suv_deals.persistence import config_repo, sources_repo
 from suv_deals.persistence.errors_map import TransientConflict
 from suv_deals.workers.reconciliation import ReconcileOptions, Reconciler
@@ -116,3 +126,87 @@ async def test_fixture_sources_never_get_jobs_in_production(env: PipelineEnv) ->
     # The same pass in a process that has the fixture data queues them (the gate is the cause).
     with_fixtures = await Reconciler(env.ctx, ReconcileOptions()).reconcile_workspace(env.workspace_id)
     assert with_fixtures.stale_detail_jobs == 3
+
+
+# --------------------------------------------------------------------------------------------
+# Explicit discovery windows (owner decision 2026-10-16)
+# --------------------------------------------------------------------------------------------
+
+SKOPJE = ZoneInfo("Europe/Skopje")
+WINDOW = DiscoverySchedule(
+    interval_minutes=30, window_start="08:00", window_end="22:00", timezone="Europe/Skopje"
+)
+
+
+def _local(day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
+    return datetime(2026, 10, day, hour, minute, second, tzinfo=SKOPJE).astimezone(UTC)
+
+
+@pytest.fixture
+async def windowed(db_url: str, seed: Seed) -> AsyncIterator[PipelineEnv]:
+    """The fixture source with the owner's window (2 search pages x 28 runs = 56 of the 100
+    search requests a fetch source may use of its 200-request budget)."""
+    built = await build_env(db_url, seed, source=fixture_source_config(schedule=WINDOW), name="Window")
+    try:
+        yield built
+    finally:
+        await built.close()
+
+
+async def _ensure(env: PipelineEnv, now: datetime | None) -> Any:
+    record = await run(
+        env.ctx, env.system, lambda c: sources_repo.get_source_record(c, env.system, env.source_id)
+    )
+    return await ensure_schedules(env.ctx.db, env.system, [record], 900, now=now)
+
+
+def _schedules(env: PipelineEnv) -> list[dict[str, Any]]:
+    return env.rows(
+        "select id, interval_seconds, next_due_at, last_slot from ops.source_schedules"
+        " where workspace_id = %s and source_id = %s",
+        env.workspace_id,
+        env.source_id,
+    )
+
+
+async def test_ensure_schedules_creates_a_windowed_schedule(windowed: PipelineEnv) -> None:
+    """Frozen clock: created at 07:00 local, the schedule is due at 08:00 with the 30-minute
+    interval, runs the 08:00 slot and is then due at 08:30; a later ensure changes nothing."""
+    result = await _ensure(windowed, _local(20, 7))
+    assert result.ensured == 1 and result.over_budget == ()
+    [row] = _schedules(windowed)
+    assert row["interval_seconds"] == 1800 and row["next_due_at"] == _local(20, 8)
+    advance = await run(
+        windowed.ctx,
+        windowed.system,
+        lambda c: sources_repo.advance_schedule(c, windowed.system, row["id"], now=_local(20, 8, 0, 1)),
+    )
+    assert advance.outcome == "enqueued" and advance.slot == _local(20, 8)
+    slots = windowed.rows(
+        "select scheduled_slot from ops.jobs where workspace_id = %s and job_type = 'discovery'",
+        windowed.workspace_id,
+    )
+    assert [j["scheduled_slot"] for j in slots] == [_local(20, 8)]
+    again = await _ensure(windowed, _local(20, 8, 10))
+    assert again.ensured == 1
+    [after] = _schedules(windowed)
+    assert after["next_due_at"] == _local(20, 8, 30) and after["last_slot"] == _local(20, 8)
+    audits = windowed.scalar(
+        "select count(*) from ops.audit_events where workspace_id = %s and action = 'schedule.reconfigure'",
+        windowed.workspace_id,
+    )
+    assert audits == 0
+
+
+async def test_a_window_over_budget_is_refused_and_reported(windowed: PipelineEnv) -> None:
+    """Two enabled profiles need 2 x 56 = 112 search requests a day, more than the 100 allowed:
+    the tick reports the source and creates no schedule (never stretched, never overspent)."""
+    await enable_manual_profile(windowed)
+    tick = await run_scheduler_tick(
+        windowed.ctx.db, windowed.ctx.settings, SystemClock(), workspace_ids=[windowed.workspace_id]
+    )
+    [mine] = tick.workspaces
+    assert mine.error is None
+    assert mine.schedules_over_budget == (SOURCE_KEY,) and mine.schedules_ensured == 0
+    assert mine.enqueued == () and _schedules(windowed) == []
+    assert jobs_of(windowed, JobType.DISCOVERY) == []

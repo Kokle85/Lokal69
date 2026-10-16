@@ -184,6 +184,14 @@ def inspect(
         f"{budget.max_detail_jobs_per_run} detail job(s)/run, {budget.daily_request_budget} requests/day, "
         f"min delay {budget.min_delay_seconds}s"
     )
+    if config.schedule is not None:
+        window = config.schedule
+        echo(
+            f"discovery         : {window.describe()}; {window.runs_per_day} runs a day x "
+            f"{budget.max_search_pages_per_run} search page(s) per enabled profile"
+        )
+    else:
+        echo("discovery         : global scheduler interval, stretched to fit the daily budget")
     echo(f"active            : {str(gate.active).lower()}")
     if not gate.activatable:
         echo(
