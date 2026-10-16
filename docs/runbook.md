@@ -474,7 +474,10 @@ The next step is the owner's live smoke, ONE source at a time, `autoscout24_it` 
 repository root on the WSL machine, with the crawler running on the host
 (`http://127.0.0.1:11235`, section 3.1), `CRAWL4AI_API_TOKEN` and `DATABASE_URL` in `.env` (never
 on the command line) and the business configuration recorded (`suv-deals config apply`). The
-enable switch in step 1 is a LOCAL edit for the smoke only: never commit it.
+enable switch in step 1 is a LOCAL edit for the smoke only: never commit it. No `suv-deals
+scheduler` process (and no Compose service running it) may run during the smoke: with the source
+switched on, it would queue a full 12-model run at the next half-hour slot between 08:00 and 22:00
+Europe/Skopje (section 2.2).
 
 ```bash
 # 0. Preconditions: crawler firewall (3.2), crawler health/contract, the source's gate view.
@@ -515,8 +518,8 @@ uv run suv-deals sources inspect autoscout24_it --from-db
 - `crawl once` takes no URL: the adapter builds the search for the first configured model
   (`/lst/renault/captur`, the slug verified on the owner's captures) with the primary profile's
   price band, `kmto` and `sort=age&desc=1&ustate=U`; `--max-pages 1` means ONE search request,
-  through the URL policy, robots.txt and the persistent budget gate (20 s spacing, 200 requests a
-  day). Expected: `Job state: succeeded`, `pages: 1`, `completeness: budget_limited` (12 models,
+  through the URL policy, robots.txt and the persistent budget gate (20 s spacing; daily budget
+  600 requests for .it, 350 for .de). Expected: `Job state: succeeded`, `pages: 1`, `completeness: budget_limited` (12 models,
   capped at one page).
 - The search page queues one detail job per new or changed organic card: on a first run every
   card, up to about 20. `max_detail_jobs_per_run` (10) does NOT bound that: each detail job is
