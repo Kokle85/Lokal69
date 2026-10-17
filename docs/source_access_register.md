@@ -1,6 +1,6 @@
 # Source access register
 
-Status date: 2026-10-06; robots.txt of mobile.de and AutoScout24 re-checked 2026-10-14; terms and robots.txt of every other marketplace and MK source reviewed 2026-10-14 (docs/research/source_terms_review_2026-10-14.md). MK terms read by the owner and the owner-network reachability probe recorded 2026-10-16 (Reklama5, Pazar3, Swiss sources). Spec sections 5, 8, 24, 25, 31 and 32.
+Status date: 2026-10-06; robots.txt of mobile.de and AutoScout24 re-checked 2026-10-14; terms and robots.txt of every other marketplace and MK source reviewed 2026-10-14 (docs/research/source_terms_review_2026-10-14.md). MK terms read by the owner and the owner-network reachability probe recorded 2026-10-16 (Reklama5, Pazar3, Swiss sources). The owner's live smoke of `autoscout24_it` recorded 2026-10-17. Spec sections 5, 8, 24, 25, 31 and 32.
 
 The machine-readable source of truth is `config/sources/*.yaml` (validated by
 `suv_deals.domain.sources.SourceConfig`). Current gate status is computed by
@@ -45,7 +45,7 @@ and this page must be corrected.
 
 ## Register
 
-Every source below is `enabled: false`. No source is active; the only live-verified one is `autoscout24_it` (the owner's live smoke, step 6, passed on 2026-10-17: "Live smoke evidence" below). On 2026-10-14 the owner decided to include every marketplace and MK comparable source ("сакам сите да го вклучиш"); each carries `terms_decision: proceed_acknowledged` with the owner as actor, which is an audit record and opens no gate by itself.
+Every source below is `enabled: false`. No source is active or live-verified. `autoscout24_it` passed the owner's live smoke (step 6) on 2026-10-17; its evidence record is not complete yet ("Live smoke evidence" below). On 2026-10-14 the owner decided to include every marketplace and MK comparable source ("сакам сите да го вклучиш"); each carries `terms_decision: proceed_acknowledged` with the owner as actor, which is an audit record and opens no gate by itself.
 
 **Consequence for valuations (F2, wave D2).** Both MK comparable sources are placeholders, so no
 MK market evidence is crawled. Until the owner records some (`suv-deals market import FILE
@@ -58,7 +58,7 @@ detail pages stored as `asking_price` market observations, never as acquisition 
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `mobile_de_public` | DE | acquisition | public_html | `mobile_de_public`: placeholder (`unimplemented`, raises `AdapterUnimplemented`) | restricted: the public terms contain a scraping restriction in section 11 | **proceed_acknowledged** (owner, 2026-10-10, re-confirmed 2026-10-14: include; terms risk accepted - an audit record, not permission) | https://www.mobile.de/service/agbPublic | 2026-10-06 | untested | obey. robots.txt **changed**: the 2026-10-14 re-check shows the `*` group now disallows `/fahrzeuge/search.html`, `/fahrzeuge/searchresults.html`, `isSearchRequest=true`, `pageNumber=` and `/fahrzeuge/details.html` except the single form `details.html?id=<n>&vip=1`. The search allow-list is therefore empty | **Discovery is blocked by robots.txt**; the owner's approval does not override it. Routes that remain: the official Search API (`mobile_de_api`, needs an agreement with mobile.de) or listing links the owner supplies (a detail page only in the robots-allowed `?id=<n>&vip=1` form, through a feature that does not exist yet). Access blocks stop the source; no evasion. |
 | `autoscout24_de` | DE | acquisition | public_html | `autoscout24_public_de`: **implemented** (`autoscout24@1.0.0`, 2026-10-16, from owner captures; search cards only) and **fixture-tested** on its SYNTHETIC saved fixture set (`tests/adapters/fixtures/autoscout24_de/`, 2026-10-16); not live-tested | restricted: the consumer terms, sections 8.2-8.3, restrict automated queries and the creation or commercial use of a derived database | **proceed_acknowledged** (owner, 2026-10-10, re-confirmed 2026-10-14) | https://www.autoscout24.com/company/agb/ | 2026-10-06 | fixture_tested (step 5 done 2026-10-16 on synthetic saved fixtures; not a live verification) | obey. robots.txt checked 2026-10-10 and re-checked 2026-10-14 (unchanged): the `*` group disallows `/angebote/` (detail pages), `/lst?`, `/lst/?` and `cat=`; `/lst/<make>/<model>` search pages are allowed, so the source is **card_only**. A query on `/lst/<make>/<model>` (including the seller-country filter `cy=D`) is not disallowed | **Step 5 done 2026-10-16**: saved SYNTHETIC fixtures under `tests/adapters/fixtures/autoscout24_de/` with `MANIFEST.yaml` (search-side spec-31 set; the detail categories do not apply to a card_only source and card-level equivalents stand in for them), then `technical_status: fixture_tested`. The only gate left closed is `enabled: false` (`crawl once` refuses a disabled source). Next, **steps 6-7**, after `autoscout24_it`: the owner's live smoke (docs/runbook.md section 9.1 with this key; one model page, `renault/captur`, the slug already verified on the capture) to confirm the live page structure, then enabling. That smoke cannot confirm the search filters (`pricefrom`/`priceto`/`kmto` and `cy` stay unverified on .de: the page's `pageQuery` is not recorded, and the stored card prices, mileages and seller countries are only an indirect check) nor the unverified model slugs (only a full 12-model walk requests them; a wrong slug answers 404 and is skipped). No detail fetches ever. Search parameters: the primary profile's price band (`pricefrom`/`priceto`), `kmto`, `sort=age&desc=1` and, since 2026-10-17, the seller-country filter `cy=D` (`search.cy`). `D` is the value of the site's `pageQuery` on the capture, but that request sent no `cy`, so it was the server's default there; the owner's 12-model live smoke of `autoscout24_it` that day, sent without `cy`, got listings from other countries. Whether an explicit `cy=D` narrows the results is **unverified** until a live 12-model walk of this source shows only DE seller countries among the ingested cards. Cadence (owner decision 2026-10-16, "сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00"): every 30 minutes from 08:00 to 22:00 Europe/Skopje (slots 08:00 ... 21:30, `schedule` block), 28 runs x 12 pages = 336 search requests a day within the 350-request daily budget. |
-| `autoscout24_it` | IT | acquisition | public_html | `autoscout24_public_it`: **implemented** (`autoscout24@1.0.0`, 2026-10-16, from owner captures; search cards and `/annunci/` detail pages), **fixture-tested** on its SYNTHETIC saved fixture set (`tests/adapters/fixtures/autoscout24_it/`, 2026-10-16) and **live smoke passed** (the owner's, 2026-10-17) | restricted (same sections 8.2-8.3) | **proceed_acknowledged** (owner, 2026-10-10, re-confirmed 2026-10-14) | https://www.autoscout24.com/company/agb/ | 2026-10-06 | live_smoke_passed (step 6 done 2026-10-17, the owner's live smoke; step 5 done 2026-10-16 on synthetic saved fixtures) | obey. robots.txt checked 2026-10-10 and re-checked 2026-10-14 (unchanged): `/lst/<make>/<model>` search and `/annunci/` detail pages are not disallowed for `*`; a query is disallowed only on the bare `/lst?` and `/lst/?` paths, so `/lst/<make>/<model>?...&cy=I` stays allowed. Fetched and stored by the worker itself on 2026-10-17 (HTTP 200, SHA-256 `7c78475c...`, unchanged since 2026-10-06) | **Steps 5-6 done.** Step 5 (2026-10-16): saved SYNTHETIC fixtures under `tests/adapters/fixtures/autoscout24_it/` with `MANIFEST.yaml` covering the spec-31 set (normal, second-model and paginated search, empty result, normal, missing-price, contradictory-mileage, net/gross, conditional, damaged and removed detail, login wall, CAPTCHA/block, malformed and changed markup, injection), then `technical_status: fixture_tested`. Step 6 (2026-10-17): the owner's live smoke (docs/runbook.md section 9.1, a 12-model `crawl once --max-pages 12` and `worker --drain --queues detail --max-jobs 5` at commit `25f43f8`: robots.txt fetched by the worker, 12 search pages HTTP 200, `complete`, 15 cards, 5 detail pages ingested, no block; evidence in "Live smoke evidence" below), then `technical_status: live_smoke_passed`. The only gate left closed is `enabled: false` (`crawl once` refuses a disabled source). Next, **step 7**: enabling through a committed configuration revision (`enabled: true`), the owner's decision. Model slugs: the owner's two 12-model walks of 2026-10-17 requested all twelve and every one answered HTTP 200; `opel/mokka`, `opel/mokka-x` and `suzuki/sx4-s-cross` returned no card in either walk (no listing of those newer models in the band), so no result has confirmed those three yet. One search page per configured model per run (12 models, `max_search_pages_per_run: 12`, 20 s spacing) with the primary profile's price band (`pricefrom`/`priceto`), `kmto`, `sort=age&desc=1`, `ustate=U` and, since 2026-10-17, the seller-country filter `cy=I` (`search.cy`). **Live finding 2026-10-17** (the owner's first 12-model walk, `crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages ingested), sent without a country filter: three of the five ingested listings came from other countries, two Dutch dealers (rejected by screening as `COUNTRY_NOT_IN_PROFILE`) and a German listing (accepted by the country rule, screened `needs_facts`), so foreign cards spent the request budget and could hide Italian ones. **`cy=I` verified the same day** by the second walk (the step-6 smoke, with `cy=I`): 15 cards instead of 49, every one already seen by the unfiltered walk; of the five listings ingested from that walk the two Italian sellers' are among the 15 and the three foreign ones are not ("listings not seen in a complete scan": 3). So German sellers come in only through the `card_only` `autoscout24_de` (no detail page) and Swiss sellers through neither AutoScout24 source (`autoscout24_ch` is blocked). Cadence (owner decision 2026-10-16, "сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00"): every 30 minutes from 08:00 to 22:00 Europe/Skopje (slots 08:00 ... 21:30, `schedule` block), 28 runs x 12 pages = 336 search requests a day of the 600-request daily budget; the other 264 are for detail pages, and the budget gate keeps detail requests from using what the day's remaining runs still need. |
+| `autoscout24_it` | IT | acquisition | public_html | `autoscout24_public_it`: **implemented** (`autoscout24@1.0.0`, 2026-10-16, from owner captures; search cards and `/annunci/` detail pages), **fixture-tested** on its SYNTHETIC saved fixture set (`tests/adapters/fixtures/autoscout24_it/`, 2026-10-16) and **live smoke passed** (the owner's, 2026-10-17) | restricted (same sections 8.2-8.3) | **proceed_acknowledged** (owner, 2026-10-10, re-confirmed 2026-10-14) | https://www.autoscout24.com/company/agb/ | 2026-10-06 | live_smoke_passed (step 6 done 2026-10-17, the owner's live smoke; step 5 done 2026-10-16 on synthetic saved fixtures) | obey. robots.txt checked 2026-10-10 and re-checked 2026-10-14 (unchanged): `/lst/<make>/<model>` search and `/annunci/` detail pages are not disallowed for `*`; a query is disallowed only on the bare `/lst?` and `/lst/?` paths, so `/lst/<make>/<model>?...&cy=I` stays allowed. Fetched and stored by the worker itself on 2026-10-17 (HTTP 200, SHA-256 `7c78475c...`, unchanged since 2026-10-06) | **Steps 5-6 done.** Step 5 (2026-10-16): saved SYNTHETIC fixtures under `tests/adapters/fixtures/autoscout24_it/` with `MANIFEST.yaml` covering the spec-31 set (normal, second-model and paginated search, empty result, normal, missing-price, contradictory-mileage, net/gross, conditional, damaged and removed detail, login wall, CAPTCHA/block, malformed and changed markup, injection), then `technical_status: fixture_tested`. Step 6 (2026-10-17): the owner's live smoke (docs/runbook.md section 9.1, a 12-model `crawl once --max-pages 12` and `worker --drain --queues detail --max-jobs 5` at commit `25f43f8`: robots.txt fetched by the worker, 12 search pages HTTP 200, `complete`, 15 cards, 5 detail pages ingested, no block; evidence in "Live smoke evidence" below, two items still missing there), then `technical_status: live_smoke_passed`. The only gate left closed is `enabled: false` (`crawl once` refuses a disabled source). Next, **step 7**: enabling through a committed configuration revision (`enabled: true`), the owner's decision. Model slugs: the owner's two 12-model walks of 2026-10-17 requested all twelve and every one answered HTTP 200; `renault/captur` (verified on the capture), `opel/mokka`, `opel/mokka-x` and `suzuki/sx4-s-cross` returned no card in either walk, and whether the site answers an unknown slug with 404 has never been observed, so no result has confirmed the last three yet. One search page per configured model per run (12 models, `max_search_pages_per_run: 12`, 20 s spacing) with the primary profile's price band (`pricefrom`/`priceto`), `kmto`, `sort=age&desc=1`, `ustate=U` and, since 2026-10-17, the seller-country filter `cy=I` (`search.cy`). **Live finding 2026-10-17** (the owner's first 12-model walk, `crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages ingested), sent without a country filter: three of the five ingested listings came from other countries, two Dutch dealers (rejected by screening as `COUNTRY_NOT_IN_PROFILE`) and a German listing (accepted by the country rule, screened `needs_facts`), so foreign cards spent the request budget and could hide Italian ones. **`cy=I` strongly indicated the same day**, not yet confirmed by seller country: the second walk (the step-6 smoke, with `cy=I`) returned 15 cards instead of 49, every one already seen by the unfiltered walk; of the five listings ingested from that walk the two with an Italian seller are among the 15 and the three foreign ones are not ("listings not seen in a complete scan": 3). The seller countries of the other 13 cards (their detail jobs are queued) settle it. If it holds, German sellers come in only through the `card_only` `autoscout24_de` (no detail page) and Swiss sellers through neither AutoScout24 source (`autoscout24_ch` is blocked). Cadence (owner decision 2026-10-16, "сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00"): every 30 minutes from 08:00 to 22:00 Europe/Skopje (slots 08:00 ... 21:30, `schedule` block), 28 runs x 12 pages = 336 search requests a day of the 600-request daily budget; the other 264 are for detail pages, and the budget gate keeps detail requests from using what the day's remaining runs still need. |
 | `autoscout24_ch` | CH | acquisition | public_html | `autoscout24_public_ch`: placeholder | unreviewed: the Swiss site's GTC (`/de/legal/gtc`) and every other HTML page answered a Cloudflare challenge to our user agent on 2026-10-14, so the terms could not be read; operator lead (unverified): SMG Swiss Marketplace Group AG, Zurich | **proceed_acknowledged** (owner, 2026-10-10, re-confirmed 2026-10-14); terms still unreviewed, which keeps it gated | not readable (`https://www.autoscout24.ch/de/legal/gtc`) | not reviewed | untested | obey. robots.txt re-checked 2026-10-10 and 2026-10-14 (unchanged): no `User-agent: *` group (a fact, not permission); routes not verified. Owner network 2026-10-16: robots.txt HTTP 200 (unchanged), home page HTTP 403 directly and an unfollowed redirect via Crawl4AI, so the probe stopped: **blocked, stays off** | The owner reads the GTC in a normal browser and the terms are recorded; verify routes; build from real captures. A challenge page met by the crawler stops it (no evasion). |
 | `subito_it` | IT | acquisition | public_html | `subito_it_public`: placeholder | **restricted** (reviewed 2026-10-14): the general terms (updated 2026-09-22) bind users who only consult listings (art. 3) and expressly prohibit robots, spiders, scrapers and other automated tools to access the site or extract data (art. 5) and use of content by unauthorised aggregators or third parties (art. 10). Operator: Subito.it S.r.l., Milano (Adevinta) | **proceed_acknowledged** (owner, 2026-10-14) | https://info.subito.it/policies/condizioni-generali.htm | 2026-10-14 | untested | obey. robots.txt checked 2026-10-14: the `*` group allows `/` but disallows `/vi/`, `/li?`, `/utente/` and the pagination forms `*/?o=*`, `*&o=*`; its header comment forbids automatic access without permission. The home page answered HTTP 403 (Akamai) to our user agent | Verify routes and build from real captures; the site currently refuses the crawler technically, which stops the source (no evasion). Permission from Subito is the lower-risk route. |
 | `automobile_it` | IT | acquisition | public_html | `automobile_it_public`: placeholder | **restricted** (reviewed 2026-10-14): the terms (in force since 2021-06-29) prohibit robots, spiders, scrapers and automated tools without prior written consent and circumventing access limits (art. 4), searching other than via the site's search bar or with 'searchware' (art. 11) and using protected content (art. 14). Operator: Marktplaats B.V., Amsterdam (Adevinta) | **proceed_acknowledged** (owner, 2026-10-14) | https://www.automobile.it/policies/condizioni | 2026-10-14 | untested | obey. robots.txt checked 2026-10-14: the `*` group disallows `/api/*`, `/rest/*`, `*?b=*`, `*?d=*`, dealer-catalogue and private-area paths; nothing else. The home page answered HTTP 200 | Verify routes and build from real captures. |
@@ -75,56 +75,83 @@ detail pages stored as `asking_price` market observations, never as acquisition 
 
 Spec 31 exact-build evidence, one record per source (one source never proves another). Ids,
 versions, hashes and codes only: no page, body or listing text is kept (`SNAPSHOT_STORAGE=disabled`).
+Sources of each fact: the `sources smoke-evidence` and `sources inspect --from-db` JSON of the run
+(the owner's files) and, where marked, the owner's terminal output.
 
-**`autoscout24_it`, 2026-10-17: passed** (the owner, WSL machine, docs/runbook.md section 9.1).
+**`autoscout24_it`, 2026-10-17: the smoke passed; the evidence record is not complete yet** (the
+items still missing are listed at the end; until they are recorded the source is not
+`live_verified`).
 
 - Build: commit `25f43f8a1451f534cb49e1b93659f904f263742a`, `build_id: dev` (run from the checkout
   with `uv`, no application image). Crawler: the owner's Crawl4AI on the host
-  (`http://127.0.0.1:11235`; the worker's crawler contract check reported `ready: true`); its image
-  digest is not recorded (`CRAWL4AI_IMAGE_DIGEST` unset, gate `existing_crawler`).
+  (`http://127.0.0.1:11235`; the worker's crawler contract check logged `ready: true`, terminal
+  output); its image digest is not recorded.
 - Configuration: revision 1 (`360d0a9d-b46d-4442-bb8b-309751cde88e`, hash `ebf0d4bc...`),
   `adapter_version` and `parser_version` `autoscout24@1.0.0`, registry version 6 during the smoke (a
   local, uncommitted `enabled: true`); switched off again afterwards (`enabled: false`, `state:
-  disabled`).
-- Commands: `crawl once --source autoscout24_it --max-pages 12`, then `worker --drain --queues
-  detail --max-jobs 5`; `suv-deals scheduler` was not running.
+  disabled`, terminal output).
+- Commands (terminal output): `crawl once --source autoscout24_it --max-pages 12`, then `worker
+  --drain --queues detail --max-jobs 5`; no `suv-deals scheduler` among them.
 - Discovery: job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, crawl run
   `46f4bdec-1a91-4702-8ecb-1dff3f5a7255`, 11:50:56-11:55:32 UTC, outcome `complete`, `access_state:
   ok`, 12 pages, 15 cards, no gap reason; no new or changed listing (every card had been seen by the
-  unfiltered walk that morning).
+  unfiltered walk that morning), so the run queued no detail job.
 - robots.txt: requested by the worker before the first page (fetch
   `03976780-d703-4d0c-bcb3-c6838b10e05d`, `purpose: robots`, HTTP 200, `access_state: ok`, 11:50:56
   UTC), revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (`availability: available`, parsed, not
   truncated, SHA-256 `7c78475c525adef6bf88187d53e75e9eb7b4ae9fdbe4f05215fb5ddafb396478`: the file of
   the 2026-10-06/10/14 readings, `robots_changed: false`), user agent `SUVDealResearch/0.1`.
 - Search: 12 fetches `purpose: search`, HTTP 200, `access_state: ok`, 20-23 s apart, one per
-  configured model, each `https://www.autoscout24.it/lst/<make>/<model>?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&ustate=U&cy=I`.
-- Detail pages: 5 detail jobs succeeded, 11:55:37-11:57:12 UTC, under that robots revision
-  (`18d1926b-b0b8-4846-85ae-199881d2e6fd`, `25b5786b-5581-4358-ba14-327a9f7b8f65`,
-  `2b6d3ec8-7d98-46e8-a26f-b74269540d18`, `3130e66f-77cb-49dc-9eb3-514820b0a8a3`,
-  `36096ba2-f3fe-4689-8aa1-f6cd335b056a`); the unfiltered morning walk had queued them.
-- Persisted listings and revisions of cards this run observed (field-evidence ids in the
-  `smoke-evidence` JSON): listing `19651894-7f11-4049-b6f1-4b14cfa2bded`, revision
-  `3170f0e5-c12c-4d61-8a1a-149f891bbe7c` (200,000 km: `rejected`); listing
+  configured model. No URL is stored; the adapter builds each as
+  `https://www.autoscout24.it/lst/<make>/<model>?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&ustate=U&cy=I`
+  from the configuration and the primary profile.
+- Detail pages: 5 detail jobs succeeded (worker table: `18d1926b-b0b8-4846-85ae-199881d2e6fd`,
+  `25b5786b-5581-4358-ba14-327a9f7b8f65`, `2b6d3ec8-7d98-46e8-a26f-b74269540d18`,
+  `3130e66f-77cb-49dc-9eb3-514820b0a8a3`, `36096ba2-f3fe-4689-8aa1-f6cd335b056a`; job times
+  11:55:37-11:57:12 UTC, the same UTC day as the robots revision above). The unfiltered morning walk
+  had queued them, for five listings this run no longer returned (three Peugeot 2008, a Kia
+  Sportage, a Hyundai ix35), so this run's JSON lists neither the jobs nor their fetches;
+  `requests_today` going from 18 to 36 counts their five requests.
+- Persisted revisions: this run created none (no new or changed card). The revisions on record for
+  its cards come from the morning walk's detail jobs: listing `19651894-7f11-4049-b6f1-4b14cfa2bded`,
+  revision `3170f0e5-c12c-4d61-8a1a-149f891bbe7c` (200,000 km: `rejected`); listing
   `620f99bb-d563-4a37-b56c-6ffcc522fc8c`, revision `2c03793a-2d66-46cc-b8d5-e5af9675de72` (199,999
-  km, EUR 3,000: `eligible_primary`).
-- Budget after the smoke: `requests_today` 36 of 600 (both walks of the day, robots request
-  included), 22.0 MB of 200 MB, circuit closed.
+  km, EUR 3,000: `eligible_primary`). The revision and field-evidence ids of the five ingests above
+  are not recorded yet (first missing item below).
+- Budget after the smoke: `requests_today` 36 of 600, the day's runs together (the one-page smoke 1,
+  the morning walk 12 + 5, this smoke 1 robots + 12 + 5); 22.0 MB of 200 MB; circuit closed.
 - Filters, indirect checks only (the page's `pageQuery` is not recorded): every priced card is
-  within EUR 2,500-3,000 and at most 200,000 km (`kmto` is inclusive; screening rejects exactly
-  200,000); one card carries no price and is decided by its detail page. `cy=I`: 15 cards instead
-  of the unfiltered walk's 49, and of the five listings ingested from that walk the two Italian
-  sellers' are among them while the two Dutch and the German one are not.
+  within EUR 2,500-3,000 and at most 200,000 km (five at exactly 200,000; `kmto` is inclusive and
+  screening rejects exactly 200,000); one card carries no price and is decided by its detail page.
+- Seller-country filter `cy=I`: strongly indicated, not yet confirmed by seller country. This run
+  returned 15 cards against the unfiltered walk's 49, all 15 among those 49; of the five listings
+  ingested from the morning walk, the two whose seller is Italian (the morning check) are among the
+  15 and the three foreign ones (two Dutch dealers, a German listing) are not (the run's "listings
+  not seen in a complete scan": 3). The seller country is known for 2 of the 15 cards; the queued
+  detail jobs of the other 13 settle it.
+- Model slugs: all twelve answered HTTP 200 in both walks of the day. `renault/captur` (verified on
+  the owner's capture), `opel/mokka`, `opel/mokka-x` and `suzuki/sx4-s-cross` returned no card in
+  either; whether the site answers an unknown slug with 404 has never been observed, so a 0-card
+  answer confirms nothing. `hyundai/ix35` returned cards only in the unfiltered walk.
+- Parser: no parse failure (12 of 12 search pages complete without a gap, all 10 detail jobs of the
+  day succeeded); the parser-health sample has not run yet (`parser_health.status: unknown`).
 - Earlier attempts the same day, not counted for step 6 because they predate the worker's robots
-  check: the one-page smoke (run `6c2e6770-d6b4-4c1c-9fdc-1ee482014536`, 09:19 UTC, 0 cards in the
-  band) and the unfiltered 12-model walk (run `ac1a09b6-6899-4b80-a3ba-7d617e95bd84`, 09:28 UTC, 49
-  cards, 49 detail jobs queued, 5 detail pages ingested and checked by hand: the 200,000 km Qashqai
-  rejected, the 199,999 km Yeti eligible, two Dutch dealers rejected as `COUNTRY_NOT_IN_PROFILE`, a
-  German Yeti `needs_facts`).
-- Left over: 39 detail jobs queued by the unfiltered walk (13 for cards the filtered walk returned
-  as well, 26 for listings it no longer returns, mostly foreign sellers). They wait while the
-  source is disabled and are fetched once it is enabled (about 39 of the 264 daily detail
-  requests, once).
+  check: the one-page smoke (run `6c2e6770-d6b4-4c1c-9fdc-1ee482014536`, 09:19 UTC, `renault/captur`
+  only, 0 cards in the band) and the unfiltered 12-model walk (run
+  `ac1a09b6-6899-4b80-a3ba-7d617e95bd84`, 09:28 UTC, 49 cards, 49 detail jobs queued, 5 detail pages
+  ingested and checked by hand: the 200,000 km Qashqai rejected, the 199,999 km Yeti eligible, two
+  Dutch dealers rejected as `COUNTRY_NOT_IN_PROFILE`, a German Yeti `needs_facts`).
+- Left over: 39 detail jobs queued by the unfiltered walk (13 for cards this run returned as well,
+  26 for listings it no longer returns). They stay queued only while no worker claims them: a
+  worker that reaches one while the source is disabled blocks it (`source_paused`; `suv-deals jobs
+  unblock` puts it back). Once the source is enabled the worker fetches them (about 39 of the 264
+  daily detail requests, once).
+- Missing for a complete record: (1) the revision and field-evidence ids and the seller countries of
+  the five ingests above (`sources smoke-evidence autoscout24_it --run-id
+  ac1a09b6-6899-4b80-a3ba-7d617e95bd84`, whose detail jobs they are; the seller country is printed
+  per revision); (2) the crawler's image digest and the `existing_crawler` evidence that
+  docs/runbook.md section 3 requires before any live crawl (`doctor --process worker --crawler`, the
+  firewall check), which the smokes of 2026-10-17 ran without recording here.
 
 ### Synthetic fixture sources (tests only)
 
@@ -161,7 +188,7 @@ No Swiss source is enabled, verified or active.
 |---|---|
 | implemented | Code exists and passes unit tests. Placeholders are **not** implemented. |
 | fixture_verified | Passes the saved-fixture suite (`tests/adapters`). This is true for the generic `schemaorg_dealer` adapter on synthetic fixtures and, since 2026-10-16, for the AutoScout24 adapter on its synthetic saved fixture sets (`technical_status: fixture_tested`). |
-| live_verified | Passed a permitted low-volume live smoke with recorded evidence. Only `autoscout24_it` (step 6, 2026-10-17; still disabled, so not active). |
+| live_verified | Passed a permitted low-volume live smoke with recorded evidence. **No source has this yet**: `autoscout24_it` passed its live smoke on 2026-10-17, and its evidence record is still incomplete ("Live smoke evidence"). |
 | active | Enabled, every gate satisfied and running on schedule. **No source is active.** |
 | blocked | A specific dependency (terms decision, entitlement, route verification) prevents activation. |
 

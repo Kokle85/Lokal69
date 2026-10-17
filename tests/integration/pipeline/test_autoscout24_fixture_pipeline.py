@@ -189,11 +189,19 @@ def _check_smoke_evidence(
     assert {j["id"] for j in evidence["detail_jobs"]} == detail_jobs
     listings = by_slid(env)
     assert {item["listing_id"] for item in evidence["listings"]} == {str(r["id"]) for r in listings.values()}
+    countries = {
+        str(r["id"]): r["seller_country"]
+        for r in env.rows(
+            "select id, seller_country from app.listing_revisions where workspace_id = %s", env.workspace_id
+        )
+    }
     printed_evidence: set[str] = set()
     for item in evidence["listings"]:
         revisions = item["revisions"]
         assert revisions and all(r["job_id"] in detail_jobs and r["evidence_ids"] for r in revisions)
         assert item["current_revision_id"] in {r["revision_id"] for r in revisions}
+        # The seller country of each revision (runbook 9.1: the check of the cy search filter).
+        assert all(r["seller_country"] == countries[r["revision_id"]] is not None for r in revisions)
         assert item["card_price_minor"] is not None and item["is_fixture"] is True
         printed_evidence.update(e for r in revisions for e in r["evidence_ids"])
     stored = env.rows("select id from app.field_evidence where workspace_id = %s", env.workspace_id)

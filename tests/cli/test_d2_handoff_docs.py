@@ -156,8 +156,12 @@ def test_autoscout24_it_rows_record_step_6_and_name_enabling_next() -> None:
         assert "step 7" in row and "the owner's decision" in row
         assert "`enabled: false`" in row
         assert "docs/runbook.md section 9.1" in row
-        assert "`cy=I`" in row and "verified" in row
+        # The 49 -> 15 cards drop strongly indicates the seller-country filter; the seller
+        # countries of the cards confirm it, so no row may call it verified yet.
+        assert "`cy=I` strongly indicated" in row and "`cy=I` verified" not in row
     assert "Live smoke evidence" in register_row
+    # The evidence record still lacks items, so nothing claims live_verified.
+    assert "not complete yet" in _text("docs/source_access_register.md")
     assert "evidence log" in gates_row
     register = _text("docs/source_access_register.md")
     record = register[register.index("### Live smoke evidence") : register.index("### Synthetic fixture")]

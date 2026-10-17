@@ -1108,7 +1108,8 @@ _SMOKE_LISTINGS_SQL: Final = (
 )
 _SMOKE_REVISIONS_SQL: Final = (
     "select r.id as revision_id, r.listing_id, r.revision_number, r.observed_at, r.parser_version,"
-    " r.asking_minor, r.currency, r.price_basis, r.price_type, r.mileage_km, r.quarantined, j.id as job_id,"
+    " r.asking_minor, r.currency, r.price_basis, r.price_type, r.mileage_km, r.seller_country,"
+    " r.quarantined, j.id as job_id,"
     " array(select e.id from app.field_evidence e where e.workspace_id = r.workspace_id"
     "   and e.listing_id = r.listing_id and e.revision_id = r.id order by e.field_path, e.id) as evidence_ids"
     " from ops.jobs j join app.listing_revisions r on r.workspace_id = j.workspace_id"
@@ -1153,7 +1154,8 @@ async def smoke_evidence(
     revision, the source's adapter version, the run (job, outcome, access state, versions, timing),
     the detail jobs the run queued, the redacted fetch outcomes of the run and of those jobs (no URL
     and no body is stored), and every listing the run observed (canonical URL, card price and
-    mileage) with the revisions those detail jobs wrote and their field-evidence ids. The fetch
+    mileage) with the revisions those detail jobs wrote (seller country included, the check of a
+    seller-country search filter) and their field-evidence ids. The fetch
     outcomes include the run's robots.txt request (``purpose: robots``) when the run had to fetch
     it; ``robots_revisions`` names, per host of the source, the robots revision in effect when the
     run ended (time, HTTP status, SHA-256, availability; no body).

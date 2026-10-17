@@ -443,7 +443,9 @@ state of every gate, its missing dependency and the smallest owner action are in
 
 - **Crawler**: `doctor --crawler` against the real runtime, plus the host firewall rules of
   section 3.2 (DOCKER-USER **and** INPUT) with the in-container verification showing every host
-  address unreachable. No live crawl before both are recorded.
+  address unreachable. No live crawl before both are recorded. (The owner's AutoScout24 Italy
+  smokes of 2026-10-17 ran without this evidence recorded in the repository: record it before
+  enabling any source.)
 - **Each source**, in this order (`docs/source_access_register.md` steps 1-7): a terms decision
   and robots handling; an **adapter implementation with a real `adapter_version`, verified routes
   and saved fixtures** (10 of the 14 registered sources are `adapter_version: unimplemented`
@@ -472,8 +474,10 @@ stay `enabled: false`; `sources inspect <key>` and `doctor --verbose` show exact
 
 State on 2026-10-17: `autoscout24_it` passed step 6, the owner's live smoke below run as a
 12-model walk at commit `25f43f8` (evidence: docs/source_access_register.md, "Live smoke
-evidence"), and is `technical_status: live_smoke_passed`, still disabled until the owner enables
-it (step 7). `autoscout24_de` is next: the same commands with its key.
+evidence", two items still missing there), and is `technical_status: live_smoke_passed`, still
+disabled until the owner enables it (step 7). `autoscout24_de` is next: the same commands with
+its key. `sources smoke-evidence` prints each revision's seller country (since the commit after
+`87fee45`), the check of the `cy` filter.
 
 The owner's live smoke runs ONE source at a time (`autoscout24_it` first, done; `autoscout24_de`
 next), from the repository root on the WSL machine, with the crawler running on the host
@@ -580,11 +584,12 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `I` / `D` is what the sites' normalised query (`pageQuery`) carried on the owner's captures,
   but those requests sent no `cy`: it was the server's default for them, and the crawler's
   requests without `cy` evidently got a different one. Whether an explicit `cy` narrows the
-  results was therefore unverified. On .it it does: the owner's second 12-model walk of
-  2026-10-17, with `cy=I`, returned 15 cards instead of the unfiltered walk's 49, and of the five
-  listings ingested from that walk the two Italian sellers' were among them while the three
-  foreign ones were not. On .de it stays **unverified** until a live walk of `autoscout24_de`
-  shows it.
+  results was therefore unverified. On .it it is strongly indicated, not yet confirmed: the
+  owner's second 12-model walk of 2026-10-17, with `cy=I`, returned 15 cards instead of the
+  unfiltered walk's 49, and of the five listings ingested from that walk the two with an Italian
+  seller were among them while the three foreign ones were not; the seller countries of the other
+  13 cards (their detail pages) confirm it. On .de it stays **unverified** until a live walk of
+  `autoscout24_de` shows it.
   robots.txt disallows a query on the bare `/lst?` and `/lst/?` paths (and, on autoscout24.de, any
   URL with `cat=`), not on `/lst/<make>/<model>`, so the filtered `/lst/<make>/<model>?...` URL
   still passes the URL policy and robots.txt.
@@ -641,7 +646,7 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   card outside the primary profile's price band or above its mileage ceiling means that filter
   was ignored; and, for `cy`, the ingested listings' seller countries (previous bullet). Every
   value inside is consistent with the filters, never proof of them. These filters stay unverified
-  until such evidence is recorded; for `cy` on .it it was, on 2026-10-17 (the `cy` bullet above).
+  until such evidence is recorded (for `cy` on .it see the `cy` bullet above).
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

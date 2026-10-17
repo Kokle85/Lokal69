@@ -29,9 +29,9 @@ and 17 with migration `20261013000100_import_values`, applied to the hosted Supa
 States are those of spec 32: `implemented`, `fixture_verified`, `integration_verified`,
 `live_verified`, `active`, `blocked`, `not_requested`. Here `fixture_verified` means proven on
 saved or synthetic fixtures, and `integration_verified` means proven against a real PostgreSQL
-(16 and 17.11) with every external service replaced by a fake. **Nothing is `active`; the only `live_verified`
-item is the AutoScout24 Italy source** (`autoscout24_it`: the owner's live smoke, activation step 6,
-passed on 2026-10-17; still disabled). Apart from the owner's AutoScout24 Italy smokes that day (on
+(16 and 17.11) with every external service replaced by a fake. **Nothing is `live_verified` or `active`.** The
+furthest live step: the AutoScout24 Italy source (`autoscout24_it`) passed the owner's live smoke
+(activation step 6) on 2026-10-17; its evidence record still lacks two items and it stays disabled. Apart from the owner's AutoScout24 Italy smokes that day (on
 the owner's workstation and Crawl4AI), no marketplace was crawled, no e-mail was sent or read, and
 no Slack, dot or Outlook on a real PC was used. Every source is disabled and every external effect
 is off by default.
@@ -47,7 +47,7 @@ is off by default.
 | M0 Audit and reuse | done | docs/architecture.md, docs/dependency_inventory.md, docs/source_access_register.md, docs/decisions/0001 and 0002, docs/research/ | - |
 | M1 Domain contracts and deterministic tests | done | `src/suv_deals/domain/`; `tests/unit`, `tests/property` (price EUR 2,500-3,000 inclusive, mileage strictly under 200,000 km, unknown is never zero) | - |
 | M2 Database and reliability foundation | done | 17 forward-only migrations (all applied to the hosted project, the newest `20261013000100_import_values` on 2026-10-14), RLS on every `app`/`ops` table, durable jobs with leases, idempotency, outbox, audit; `tests/integration/db`, `tests/integration/persistence_core` on PostgreSQL 16 and 17.11 | - |
-| M3 Crawl4AI integration and first source | code done, exit **blocked** | Crawl4AI 0.9.4 REST client, URL policy, robots, rate limits, parser health, scheduler; generic dealer adapter `fixture_verified` (`tests/adapters`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`) | a permitted live search/detail smoke on one real source (gates `existing_crawler`, `source_access`) |
+| M3 Crawl4AI integration and first source | code done, exit **blocked** | Crawl4AI 0.9.4 REST client, URL policy, robots, rate limits, parser health, scheduler; generic dealer adapter `fixture_verified` (`tests/adapters`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`) | the evidence of the first live search/detail smoke (`autoscout24_it` passed it on 2026-10-17; its record lacks the five ingests' revision ids and the `existing_crawler` evidence) (gates `existing_crawler`, `source_access`) |
 | M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 10 of 14 sources have no adapter (AutoScout24 IT/DE got one on 2026-10-16, built from owner captures; IT passed the owner's live smoke on 2026-10-17; both disabled until the owner enables them); mobile.de and AutoScout24 (2026-10-10) and every other marketplace and MK source (2026-10-14) are included by owner decision, but their adapters still need real page captures; no MK evidence in any real workspace |
 | M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine 1.1, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_tax_engine_extensions.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`); the North Macedonian DRAFT rule set golden-tested (`tests/unit/test_mk_rule_draft.py`) and the import-cost calculator (`tests/unit/test_import_estimate.py`, `tests/integration/import_costs`, `tests/mcp/test_calc_tools.py`, `tests/api/test_import_cost_routes.py`, `tests/cli/test_import_cost_db_commands.py`); the owner's recorded purchase price and estimated customs value per listing (`tests/integration/import_costs/test_import_values.py`, `tests/api/test_import_values_routes.py`, `tests/integration/pipeline/test_import_tax_valuation.py`); transport fixed at EUR 700 | the owner's review, approval and activation of a rule set (gate `tax_rules`), approval of the cost profile and the other cost assumptions (gate `cost_assumptions`) |
 | M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 + 1 MCP tools (the +1 is the calculator `deals_estimate_import_costs`), scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
@@ -283,8 +283,9 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   worker fetched and stored robots.txt, unchanged since 2026-10-06). The source register
   (docs/source_access_register.md) is dated 2026-10-06: terms were reviewed that day for
   `mobile_de_public`, `autoscout24_de` and `autoscout24_it` only (all restrictive) and every other
-  source is "not reviewed"; the only recorded robots.txt reading is `autoscout24_ch` (2026-10-06,
-  a fact, not a permission). The fixture suites last passed on 2026-10-10 (docs/qa_evidence.md);
+  source is "not reviewed"; the recorded robots.txt readings are `autoscout24_ch` (2026-10-06,
+  a fact, not a permission) and, since 2026-10-17, the worker's own revision for
+  `www.autoscout24.it`. The fixture suites last passed on 2026-10-10 (docs/qa_evidence.md);
   the AutoScout24 saved-fixture tests (activation step 5) were added and passed on 2026-10-16.
 - **Which calculations are evidence-supported?** Parsing, screening, comparables, costs, tax
   arithmetic, FX conversion and scenarios are deterministic and tested on synthetic data. No real

@@ -13,9 +13,12 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 2026-10-06), 12 search pages HTTP 200, `complete`, `access_state: ok`, 15 cards, 5 detail pages
 ingested, no block; the source was switched off again. `config/sources/autoscout24_it.yaml` is now
 `technical_status: live_smoke_passed` and stays `enabled: false` (enabling is step 7, the owner's
-decision). The same walk verified the seller-country filter `cy=I` (15 cards instead of the
-unfiltered walk's 49; its three foreign listings gone, its two Italian ones kept) and requested all
-twelve model slugs (every one HTTP 200). Evidence: docs/source_access_register.md "Live smoke
+decision). The same walk strongly indicates that the seller-country filter `cy=I` works (15 cards
+instead of the unfiltered walk's 49; its three foreign listings gone, its two Italian ones kept;
+the seller countries of the other cards confirm it once their detail pages are read) and
+requested all twelve model slugs (every one HTTP 200). The evidence record still lacks the five
+ingests' revision ids and the crawler gate evidence; `sources smoke-evidence` now prints each
+revision's seller country. Evidence: docs/source_access_register.md "Live smoke
 evidence" and the ACTIVATION_GATES.md evidence log; runbook 9.1 now says how the owner writes the
 status into the database with its time (`sources set-technical-status`, before the next sync).
 
