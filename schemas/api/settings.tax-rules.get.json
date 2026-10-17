@@ -1,0 +1,560 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/settings/tax-rules",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/settings/tax-rules`` (owner only).",
+        "properties": {
+          "calculator": {
+            "additionalProperties": false,
+            "description": "Which rule set the import-cost calculator uses today (its own selection).",
+            "properties": {
+              "jurisdiction": {
+                "pattern": "^[A-Z]{2}$",
+                "type": "string"
+              },
+              "mode": {
+                "enum": [
+                  "active",
+                  "indicative_preview",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "on_date": {
+                "format": "date",
+                "type": "string"
+              },
+              "reason": {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              "rule_set": {
+                "maxLength": 290,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "draft",
+                  "under_review",
+                  "approved",
+                  "active",
+                  "superseded",
+                  "expired",
+                  "revoked",
+                  "unapproved",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "vehicle_category": {
+                "maxLength": 80,
+                "type": "string"
+              }
+            },
+            "required": [
+              "jurisdiction",
+              "vehicle_category",
+              "on_date",
+              "mode",
+              "rule_set",
+              "status",
+              "reason"
+            ],
+            "title": "CalculatorSelectionView",
+            "type": "object"
+          },
+          "file_notes": {
+            "description": "Draft files that are unreadable or ignored (never stored from here).",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "production_note": {
+            "default": "Valuations and alerts use only an ACTIVE, owner-approved rule set. Drafts, rule sets under review and approved-but-inactive versions are never used for them; the import-cost calculator shows them only as a labelled INDICATIVE PREVIEW.",
+            "type": "string"
+          },
+          "rule_sets": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One rule-set version: a stored one (``origin: stored``) or a repository draft file that\nthis workspace does not hold yet (``origin: draft_file``).",
+              "properties": {
+                "allowed_actions": {
+                  "items": {
+                    "enum": [
+                      "store",
+                      "under_review",
+                      "approved",
+                      "active",
+                      "revoked"
+                    ],
+                    "type": "string"
+                  },
+                  "maxItems": 5,
+                  "type": "array"
+                },
+                "approval": {
+                  "additionalProperties": false,
+                  "description": "The recorded approval: the approver's name, the authenticated approving principal and the\nreview record bound to the content hash.",
+                  "properties": {
+                    "approved_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "approved_by": {
+                      "maxLength": 200,
+                      "type": "string"
+                    },
+                    "approved_by_principal": {
+                      "format": "uuid",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "review_record": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "content_sha256": {
+                          "pattern": "^[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "evidence_refs": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "maxItems": 50,
+                          "type": "array"
+                        },
+                        "notes": {
+                          "maxLength": 2000,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "professional_review": {
+                          "maxLength": 500,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "reviewed_at": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "reviewer": {
+                          "maxLength": 200,
+                          "type": "string"
+                        },
+                        "scope": {
+                          "maxLength": 2000,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "reviewer",
+                        "reviewed_at",
+                        "content_sha256",
+                        "scope",
+                        "professional_review",
+                        "evidence_refs",
+                        "notes"
+                      ],
+                      "title": "ReviewRecordView",
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "approved_by",
+                    "approved_at",
+                    "approved_by_principal",
+                    "review_record"
+                  ],
+                  "title": "RuleApprovalView",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "components": {
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "One component as the reviewer lists it (no rates: those are in the rule-set file).",
+                    "properties": {
+                      "category": {
+                        "enum": [
+                          "purchase",
+                          "bank_fx_charges",
+                          "travel_inspection",
+                          "transport",
+                          "export_plates_insurance",
+                          "customs_broker",
+                          "import_duty",
+                          "motor_vehicle_tax",
+                          "import_vat",
+                          "other_import_charges",
+                          "homologation_registration",
+                          "repairs",
+                          "preparation",
+                          "risk_reserve",
+                          "storage_holding",
+                          "selling_costs",
+                          "refundable_deposit"
+                        ],
+                        "type": "string"
+                      },
+                      "id": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "intermediate": {
+                        "description": "A helper value: never counted in a total.",
+                        "type": "boolean"
+                      },
+                      "kind": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
+                      "label": {
+                        "maxLength": 200,
+                        "type": "string"
+                      },
+                      "legal_reference": {
+                        "maxLength": 500,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "uncertain": {
+                        "description": "The label or legal reference is marked UNCERTAIN.",
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "label",
+                      "category",
+                      "kind",
+                      "intermediate",
+                      "legal_reference",
+                      "uncertain"
+                    ],
+                    "title": "RuleComponentSummary",
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                },
+                "content_sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "currency": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": {
+                  "maxLength": 2000,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "file_name": {
+                  "description": "Draft file name under config/tax_rules/drafts.",
+                  "maxLength": 160,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "is_fixture": {
+                  "type": "boolean"
+                },
+                "jurisdiction": {
+                  "pattern": "^[A-Z]{2}$",
+                  "type": "string"
+                },
+                "label": {
+                  "maxLength": 290,
+                  "type": "string"
+                },
+                "origin": {
+                  "enum": [
+                    "stored",
+                    "draft_file"
+                  ],
+                  "type": "string"
+                },
+                "production_selectable": {
+                  "description": "ACTIVE, owner-approved and not a fixture: valuations may select it in its period.",
+                  "type": "boolean"
+                },
+                "rule_set_id": {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                "sha256_sealed": {
+                  "description": "The hash is sealed (the version left draft).",
+                  "type": "boolean"
+                },
+                "sources": {
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "One legal source of a rule set (official URL, title, retrieval time, document hash).",
+                    "properties": {
+                      "retrieved_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      },
+                      "title": {
+                        "maxLength": 300,
+                        "type": "string"
+                      },
+                      "url": {
+                        "maxLength": 2048,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "url",
+                      "title",
+                      "retrieved_at",
+                      "sha256"
+                    ],
+                    "title": "RuleSourceView",
+                    "type": "object"
+                  },
+                  "maxItems": 50,
+                  "type": "array"
+                },
+                "status": {
+                  "enum": [
+                    "draft",
+                    "under_review",
+                    "approved",
+                    "active",
+                    "superseded",
+                    "expired",
+                    "revoked",
+                    "unapproved"
+                  ],
+                  "type": "string"
+                },
+                "uncertain_items": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 200,
+                  "type": "array"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "valid_from": {
+                  "format": "date",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "valid_to": {
+                  "description": "Exclusive end; null = open.",
+                  "format": "date",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "vehicle_categories": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "version": {
+                  "maxLength": 80,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "file_name",
+                "rule_set_id",
+                "version",
+                "label",
+                "jurisdiction",
+                "vehicle_categories",
+                "status",
+                "is_fixture",
+                "valid_from",
+                "valid_to",
+                "currency",
+                "description",
+                "content_sha256",
+                "sha256_sealed",
+                "sources",
+                "components",
+                "uncertain_items",
+                "approval",
+                "allowed_actions",
+                "production_selectable",
+                "created_at",
+                "updated_at"
+              ],
+              "title": "TaxRuleSetSummaryView",
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          }
+        },
+        "required": [
+          "rule_sets",
+          "file_notes",
+          "calculator",
+          "production_note"
+        ],
+        "title": "TaxRuleSetsView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "settings.tax-rules.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only: stored tax rule-set versions and repository drafts not stored yet (status, dates, content hash, sources, components, approval, UNCERTAIN items) and the calculator's selection."
+}

@@ -1,0 +1,396 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/lifecycle/lags",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "deals:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/lifecycle/lags``: separate lags per spec 37.9, unknown never shown as zero.",
+        "properties": {
+          "mail_reply_detection_lag": {
+            "additionalProperties": false,
+            "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+            "properties": {
+              "configured_interval_seconds": {
+                "description": "Context only; never an observed latency guarantee.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "name": {
+                "enum": [
+                  "source_scan_lag",
+                  "detection_delay",
+                  "detail_freshness",
+                  "mail_reply_detection_lag",
+                  "notification_processing_lag",
+                  "mailbox_sync_lag",
+                  "backlog_age"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "reason": {
+                "maxLength": 500,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "measured",
+                  "unknown",
+                  "inconsistent"
+                ],
+                "type": "string"
+              },
+              "value_seconds": {
+                "description": "Only a measured lag has a value; never zero for unknown.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "value_seconds",
+              "reason",
+              "configured_interval_seconds",
+              "note"
+            ],
+            "title": "LagView",
+            "type": "object"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "notification_processing_lag": {
+            "additionalProperties": false,
+            "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+            "properties": {
+              "configured_interval_seconds": {
+                "description": "Context only; never an observed latency guarantee.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "name": {
+                "enum": [
+                  "source_scan_lag",
+                  "detection_delay",
+                  "detail_freshness",
+                  "mail_reply_detection_lag",
+                  "notification_processing_lag",
+                  "mailbox_sync_lag",
+                  "backlog_age"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "reason": {
+                "maxLength": 500,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "measured",
+                  "unknown",
+                  "inconsistent"
+                ],
+                "type": "string"
+              },
+              "value_seconds": {
+                "description": "Only a measured lag has a value; never zero for unknown.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "value_seconds",
+              "reason",
+              "configured_interval_seconds",
+              "note"
+            ],
+            "title": "LagView",
+            "type": "object"
+          },
+          "sources": {
+            "items": {
+              "additionalProperties": false,
+              "description": "Per-source scan lag (time since the last complete, finished crawl run).",
+              "properties": {
+                "last_complete_scan_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_successful_scan_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "source_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "source_key": {
+                  "maxLength": 80,
+                  "type": "string"
+                },
+                "source_scan_lag": {
+                  "additionalProperties": false,
+                  "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+                  "properties": {
+                    "configured_interval_seconds": {
+                      "description": "Context only; never an observed latency guarantee.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "name": {
+                      "enum": [
+                        "source_scan_lag",
+                        "detection_delay",
+                        "detail_freshness",
+                        "mail_reply_detection_lag",
+                        "notification_processing_lag",
+                        "mailbox_sync_lag",
+                        "backlog_age"
+                      ],
+                      "type": "string"
+                    },
+                    "note": {
+                      "maxLength": 500,
+                      "type": "string"
+                    },
+                    "reason": {
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "measured",
+                        "unknown",
+                        "inconsistent"
+                      ],
+                      "type": "string"
+                    },
+                    "value_seconds": {
+                      "description": "Only a measured lag has a value; never zero for unknown.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "status",
+                    "value_seconds",
+                    "reason",
+                    "configured_interval_seconds",
+                    "note"
+                  ],
+                  "title": "LagView",
+                  "type": "object"
+                },
+                "state": {
+                  "enum": [
+                    "running",
+                    "paused",
+                    "disabled",
+                    "blocked",
+                    "parser_unhealthy",
+                    "not_scanned"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source_id",
+                "source_key",
+                "state",
+                "last_successful_scan_at",
+                "last_complete_scan_at",
+                "source_scan_lag"
+              ],
+              "title": "SourceLagView",
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "v11_tables": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "present": {
+                  "type": "boolean"
+                },
+                "relation": {
+                  "maxLength": 80,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "relation",
+                "present"
+              ],
+              "title": "V11TableState",
+              "type": "object"
+            },
+            "maxItems": 50,
+            "type": "array"
+          }
+        },
+        "required": [
+          "sources",
+          "notification_processing_lag",
+          "mail_reply_detection_lag",
+          "v11_tables",
+          "notes"
+        ],
+        "title": "CoverageLagsView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "lifecycle.lags.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Separate scan, notification and mail-reply lags; unknown is never shown as zero."
+}

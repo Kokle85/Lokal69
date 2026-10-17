@@ -1,0 +1,72 @@
+# AutoScout24 Germany public listings (DE). Candidate acquisition source - DISABLED.
+# Each AutoScout24 country is registered and gated separately.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: autoscout24_de
+display_name: "AutoScout24 Germany public listings (DE)"
+country: DE
+role: acquisition
+mode: public_html
+adapter: autoscout24_public_de
+adapter_version: "autoscout24@1.0.0"   # built from owner captures 2026-10-16; no live smoke run yet
+enabled: false
+# Activation step 5 done 2026-10-16: the SYNTHETIC saved-fixture set
+# tests/adapters/fixtures/autoscout24_de/ (MANIFEST.yaml, spec-31 coverage) passes
+# tests/adapters/test_autoscout24_fixtures.py. Not a live verification: the owner's live smoke
+# (step 6) is next; the source stays disabled until then.
+technical_status: fixture_tested
+terms_status: restricted
+terms_url: https://www.autoscout24.com/company/agb/
+terms_reviewed_at: 2026-10-06T00:00:00Z
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-10)"
+terms_decision_note: >-
+  Owner decision 2026-10-10, re-confirmed 2026-10-14 ("ги одобрувам mobile.de, AutoScout24 да се скенираат"): include this source despite the restricted terms; the owner accepts that risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
+technical_denial_policy: stop_and_report
+robots_policy: obey
+robots_checked_at: 2026-10-14T00:00:00Z
+robots_summary: >-
+  robots.txt re-checked 2026-10-14, unchanged since 2026-10-06 (fact, not permission; sha256 46a815f9...): the 'User-agent: *' group disallows detail pages (/angebote/), a query on the bare search path (/lst? and /lst/?), any URL with a 'cat=' parameter, /detailsuche and API paths. Search pages with make/model path segments (/lst/<make>/<model>?...) are not disallowed. Therefore this source is card_only: search-result cards only, no detail fetches.
+detail_mode: card_only
+allowed_hosts:
+  - 'www.autoscout24.de'
+allowed_search_paths:
+  - '^/lst/[a-z0-9-]+(/[a-z0-9-]+){0,2}$'
+allowed_detail_paths: []   # card_only: /angebote/ URLs are identity only, never fetched
+# Discovery schedule, owner decision 2026-10-16 (verbatim): "сакам на секои 30 минуту да го
+# наместиш само од 08:00 до 22:00" (every 30 minutes, only from 08:00 to 22:00, owner's local time).
+# Slots 08:00, 08:30, ..., 21:30 Europe/Skopje (22:00 is the exclusive end; CET/CEST handled):
+# 28 runs a day x 12 search pages = 336 requests a day, all inside one UTC budget day, within the
+# 350 budget (card_only: no detail fetches, so search pages may use the whole budget).
+schedule:
+  interval_minutes: 30
+  window_start: "08:00"
+  window_end: "22:00"
+  timezone: Europe/Skopje
+rate_budget:
+  min_delay_seconds: 20            # per-host spacing (shared rate limiter)
+  max_search_pages_per_run: 12     # one search page for each of the 12 configured models
+  max_detail_jobs_per_run: 0       # card_only
+  daily_request_budget: 350        # 336 search requests a day (see schedule above)
+search:
+  # One search page per model per run (newest first), in this order. Slug verification
+  # (2026-10-16, from the owner-captured pages' links and taxonomy): see notes.
+  models: >-
+    renault/captur nissan/qashqai nissan/juke kia/sportage opel/mokka opel/mokka-x
+    dacia/duster peugeot/2008 hyundai/ix35 opel/antara skoda/yeti suzuki/sx4-s-cross
+  sort: age
+  desc: "1"
+  # Sellers in Germany only (the adapter accepts no other value here). Live finding of the
+  # owner's 12-model smoke of autoscout24_it on 2026-10-17 (crawl once --max-pages 12: 12 search
+  # pages HTTP 200, complete, 49 cards, 5 detail pages ingested), sent without a country filter:
+  # three of the five ingested Italian-site listings came from other countries (two Dutch
+  # dealers, rejected by screening as COUNTRY_NOT_IN_PROFILE; a German listing, accepted by the
+  # country rule). The same search app serves .de, and its captured pageQuery carries cy=D, but
+  # that request sent no cy: D was the server's default there. Whether an explicit cy=D narrows
+  # the results is UNVERIFIED until a live 12-model walk of this source shows only DE seller
+  # countries among the ingested cards. robots.txt disallows a query only on the bare /lst? and
+  # /lst/? paths (and any cat= URL), not on /lst/<make>/<model>, so the URL still passes the
+  # search path policy and robots.txt.
+  cy: D
+notes: >-
+  Adapter autoscout24@1.0.0 (2026-10-16) built from an owner-captured search page /lst/renault/captur (structure only, nothing stored): same Next.js app as autoscout24.it, results in script#__NEXT_DATA__ props.pageProps.listings[20] with id (UUID equal to the URL's trailing UUID), url /angebote/<slug>-<uuid> (slugs may contain '+'), price.priceRaw, vatLabel 'inkl. MwSt.', vehicle (transmission Schaltgetriebe/Automatik/Halbautomatik, fuel Benzin/Diesel/...), tracking (firstRegistration MM-YYYY, fuelType code, mileage, price) and vehicleDetails pills ('103 kW (140 PS)'); only Organic/Main cards are results; no drive or body type on cards. The captured pageQuery (sort, desc, cy, damaged_listing, ...) has no ustate key, so no offer-state filter is sent here (an offerType other than U is flagged on the card instead); its cy is D (seller country Germany; the server's default there, as the capture's request sent no cy), sent since 2026-10-17 with its effect UNVERIFIED (see search.cy). pricefrom/priceto/kmto are the keys autoscout24.it serves; on .de they are UNVERIFIED (the adapter does not record the server-normalised pageQuery and raw pages are not kept; only the stored card prices and mileages hint whether they took effect). Model slugs: renault/captur verified by the capture and dacia/duster verified as a /lst/dacia/duster link on it; all others UNVERIFIED (lower-cased site labels; a 404 skips that model): nissan/qashqai, nissan/juke, kia/sportage, opel/mokka, opel/mokka-x, peugeot/2008, hyundai/ix35, opel/antara, skoda/yeti, suzuki/sx4-s-cross. Search URLs never carry cat= (robots.txt). AutoScout24 consumer terms at https://www.autoscout24.com/company/agb/ (checked 2026-10-06) restrict automated queries and the creation/commercial use of a derived database in sections 8.2-8.3. Whether these or country-specific (autoscout24.de) and business-use terms apply must be verified before a decision.

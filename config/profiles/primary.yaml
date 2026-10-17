@@ -1,0 +1,13 @@
+# Confirmed core configuration (spec section 3). Changing these values fails baseline validation.
+key: primary
+label: "Primary target EUR 2,500-3,000, < 200,000 km"
+queue_label: "Primary queue"
+enabled: true
+min_price_eur: "2500.00"   # inclusive
+max_price_eur: "3000.00"   # inclusive
+max_mileage_km_exclusive: "200000"   # 200,000 km itself fails
+source_countries: [DE, IT, CH]
+body_types: [suv, offroad, crossover]
+require_taxonomy_match: true
+fx_max_age_days: 7
+fx_boundary_margin_pct: "3"

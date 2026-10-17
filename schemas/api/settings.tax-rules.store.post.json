@@ -1,0 +1,248 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "IDEMPOTENCY_CONFLICT",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "optional",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/api/settings/tax-rules/store",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /api/settings/tax-rules/store`` (owner only): store one repository DRAFT file\nin the workspace as status ``draft``. Only a file NAME that ``GET /api/settings/tax-rules``\nlists (no path, no upload); ``content_sha256`` is the content hash the owner saw.",
+    "properties": {
+      "content_sha256": {
+        "description": "Lower-case SHA-256 hex.",
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "file_name": {
+        "maxLength": 160,
+        "minLength": 6,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,150}\\.json$",
+        "type": "string"
+      },
+      "idempotency_key": {
+        "description": "Client-chosen key scoped to the caller and operation; a retry with the same key and request returns the original result.",
+        "maxLength": 128,
+        "minLength": 8,
+        "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "file_name",
+      "content_sha256",
+      "idempotency_key"
+    ],
+    "title": "TaxRuleStoreRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "Result of an owner act on a rule set (store a draft or a lifecycle transition).",
+        "properties": {
+          "action": {
+            "enum": [
+              "store",
+              "under_review",
+              "approved",
+              "active",
+              "revoked"
+            ],
+            "type": "string"
+          },
+          "approved_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_by": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "changed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 290,
+            "type": "string"
+          },
+          "previous_status": {
+            "description": "Null when a draft file was stored.",
+            "enum": [
+              "draft",
+              "under_review",
+              "approved",
+              "active",
+              "superseded",
+              "expired",
+              "revoked",
+              "unapproved",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "production_effect": {
+            "maxLength": 500,
+            "type": "string"
+          },
+          "rule_set_id": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "sha256_sealed": {
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "draft",
+              "under_review",
+              "approved",
+              "active",
+              "superseded",
+              "expired",
+              "revoked",
+              "unapproved"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "maxLength": 80,
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "rule_set_id",
+          "version",
+          "label",
+          "previous_status",
+          "status",
+          "content_sha256",
+          "sha256_sealed",
+          "approved_by",
+          "approved_at",
+          "changed_at",
+          "production_effect"
+        ],
+        "title": "TaxRuleChangeResult",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "settings.tax-rules.store.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only: store one repository draft file (by name, content hash bound) as a draft."
+}

@@ -1,0 +1,7 @@
+# SYNTHETIC FIXTURE: robots.txt of the fictional dealer.example (tests only, never fetched).
+# Allows the reviewed search and detail paths; disallows one search variant and one listing so
+# the worker's robots guard can be shown to refuse them without a request.
+User-agent: *
+Disallow: /suche?typ=robots-gesperrt
+Disallow: /fahrzeug/TEST-230
+Disallow: /intern/

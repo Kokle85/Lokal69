@@ -1,0 +1,54 @@
+# TEMPLATE: how a permitted German dealer inventory website would be configured for the
+# generic schema.org adapter (adapters/dealer_inventory.py). This is NOT a real source:
+# hosts/paths are empty and it stays disabled. Copy it to a new file per dealer.
+#
+# Activation steps for a real dealer (see docs/source_access_register.md):
+#  1. Record the dealer's terms/permission: terms_status, terms_url, terms_reviewed_at,
+#     terms_decision (+ terms_decision_actor, terms_decision_note). An owner
+#     acknowledgement is an audit record, not legal permission.
+#  2. Verify that the dealer publishes schema.org JSON-LD (Car/Vehicle/Product + offers,
+#     ItemList on result pages) on the permitted pages.
+#  3. Fill allowed_hosts (exact hostnames), allowed_search_paths and allowed_detail_paths
+#     (anchored regexes on the URL path), and search.search_url from the dealer's real,
+#     permitted result page. Never guess them.
+#  4. Check robots.txt for those paths (robots_policy: obey).
+#  5. Save permitted fixtures under tests/adapters/fixtures/<source_key>/ with a MANIFEST.yaml,
+#     run the fixture tests, then set technical_status: fixture_tested.
+#  6. Run a live low-volume smoke; only then set technical_status: live_smoke_passed and enabled: true.
+#
+# Example shapes (commented out; do not uncomment with invented values):
+#   allowed_hosts: ["<dealer-host>"]
+#   allowed_search_paths: ["/<verified-result-path>"]
+#   allowed_detail_paths: ["/<verified-detail-prefix>/[A-Za-z0-9-]{3,60}"]
+#   search:
+#     search_url: "https://<dealer-host>/<verified-result-path>"
+#     page_param: "<verified page parameter>"        # optional
+#     detail_id_regex: "/<prefix>/(?P<id>[A-Za-z0-9-]+)$"  # optional, operator-verified
+#     provides_listing_ids: "true"                     # optional
+source_key: example_dealer_template_de
+display_name: "Example dealer template (DE) - not a real source"
+country: DE
+role: acquisition
+mode: public_html
+adapter: schemaorg_dealer
+adapter_version: schemaorg_dealer@1.1.0
+enabled: false
+# The generic adapter code is fixture-verified against synthetic fixture sources, but this
+# template has no captured pages of any real dealer, so the source itself is untested.
+technical_status: untested
+terms_status: unreviewed
+terms_url: null
+terms_reviewed_at: null
+terms_decision: pending
+terms_decision_actor: null
+terms_decision_note: null
+technical_denial_policy: stop_and_report
+robots_policy: obey
+source_timezone: Europe/Berlin
+allowed_hosts: []
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Template only. Duplicate per permitted dealer and fill hosts/paths/search_url from verified,
+  permitted pages.

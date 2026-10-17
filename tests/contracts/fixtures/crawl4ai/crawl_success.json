@@ -1,0 +1,103 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "success": true,
+    "results": [
+      {
+        "cache_status": "miss",
+        "cached_at": null,
+        "cleaned_html": "<div><h1>Toyota RAV4 2.2 D-4D 4x4</h1><p>2.950 EUR</p><p>187.500 km</p></div>",
+        "console_messages": null,
+        "crawl_stats": {
+          "attempts": 1,
+          "retries": 0,
+          "proxies_used": [
+            {
+              "proxy": null,
+              "status_code": 200,
+              "blocked": false,
+              "reason": ""
+            }
+          ],
+          "fallback_fetch_used": false,
+          "resolved_by": "direct"
+        },
+        "dispatch_result": null,
+        "downloaded_files": null,
+        "error_message": "",
+        "extracted_content": null,
+        "fit_html": null,
+        "head_fingerprint": null,
+        "html": "<!DOCTYPE html><html lang=\"de\"><head><meta charset=\"utf-8\"><title>Toyota RAV4 2.2 D-4D 4x4</title><script type=\"application/ld+json\">{\"@type\":\"Car\",\"name\":\"Toyota RAV4\"}</script></head><body><main><h1>Toyota RAV4 2.2 D-4D 4x4</h1><p class=\"price\">2.950 EUR</p><p class=\"mileage\">187.500 km</p><p>Erstzulassung 03/2009</p></main></body></html>",
+        "js_execution_result": null,
+        "links": {
+          "internal": [
+            {
+              "href": "https://www.dealer-example.com/suche",
+              "text": "Zurueck zur Suche",
+              "title": "",
+              "base_domain": "dealer-example.com",
+              "head_data": null,
+              "head_extraction_status": null,
+              "head_extraction_error": null,
+              "intrinsic_score": null,
+              "contextual_score": null,
+              "total_score": null
+            }
+          ],
+          "external": []
+        },
+        "markdown": {
+          "raw_markdown": "# Toyota RAV4 2.2 D-4D 4x4\n\n2.950 EUR\n\n187.500 km\n\nErstzulassung 03/2009\n",
+          "markdown_with_citations": "# Toyota RAV4 2.2 D-4D 4x4\n\n2.950 EUR\n\n187.500 km\n",
+          "references_markdown": "",
+          "fit_markdown": null,
+          "fit_html": null
+        },
+        "media": {
+          "images": [],
+          "videos": [],
+          "audios": []
+        },
+        "metadata": {
+          "title": "Toyota RAV4 2.2 D-4D 4x4",
+          "description": null,
+          "keywords": null,
+          "author": null
+        },
+        "mhtml": null,
+        "network_requests": null,
+        "pdf": null,
+        "redirected_status_code": 200,
+        "redirected_url": "https://www.dealer-example.com/fahrzeug/12345",
+        "response_headers": {
+          "content-type": "text/html; charset=utf-8",
+          "etag": "\"abc123\"",
+          "last-modified": "Mon, 05 Oct 2026 08:00:00 GMT",
+          "set-cookie": "session=secret-value; HttpOnly",
+          "server": "nginx"
+        },
+        "screenshot": null,
+        "session_id": null,
+        "ssl_certificate": null,
+        "status_code": 200,
+        "success": true,
+        "tables": [],
+        "url": "https://www.dealer-example.com/fahrzeug/12345"
+      }
+    ],
+    "server_processing_time_s": 2.418,
+    "server_memory_delta_mb": 12.5,
+    "server_peak_memory_mb": 412.0
+  },
+  "note": "section 6: result keys exactly as CrawlResult.model_dump()"
+}

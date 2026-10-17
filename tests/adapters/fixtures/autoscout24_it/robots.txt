@@ -1,0 +1,7 @@
+# SYNTHETIC FIXTURE: not the real robots.txt of www.autoscout24.it (tests only, never fetched).
+# Written from the rules recorded in config/sources/autoscout24_it.yaml
+# (robots_summary); no file captured from the website is stored here.
+User-agent: *
+Disallow: /lst?
+Disallow: /lst/?
+Disallow: /ricerca-avanzata

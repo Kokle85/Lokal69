@@ -1,0 +1,42 @@
+{
+  "name": "suv-deals-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Private review dashboard for the SUV deal-discovery system (spec section 23). Calls only the BFF routes of docs/api_contract.md.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && node scripts/check-security.mjs --dist",
+    "preview": "vite preview",
+    "typecheck": "tsc -b",
+    "lint": "oxlint --deny-warnings src e2e && node scripts/check-security.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.117.3",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-router": "8.4.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "jsdom": "29.1.1",
+    "oxlint": "1.87.0",
+    "typescript": "6.0.3",
+    "vite": "8.3.3",
+    "vitest": "5.0.3"
+  }
+}

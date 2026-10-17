@@ -1,0 +1,16 @@
+{
+  "label": "shape from 0.9.4 source (slowapi); body wording and Retry-After header UNVERIFIED",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 429,
+  "headers": {
+    "content-type": "application/json",
+    "retry-after": "60"
+  },
+  "body": {
+    "detail": "1000 per 1 minute"
+  }
+}

@@ -1,0 +1,3 @@
+# SYNTHETIC FIXTURE: robots.txt of the fictional concessionario.example (tests only, never fetched).
+User-agent: *
+Disallow: /area-riservata/

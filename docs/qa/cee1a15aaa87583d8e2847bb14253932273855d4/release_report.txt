@@ -1,0 +1,64 @@
+suv-deals release verification
+commit=cee1a15aaa87583d8e2847bb14253932273855d4
+dirty_working_tree=no
+verified_at=20261010T114656Z
+uv_lock_sha256=7208784c0b71f57c30b036fd528c4f76988584f6254b37e3b72625cab6be108f
+dashboard_lock_sha256=a3552484bb771f16a222ab6473b153be1b4368723c24fa7d2fe0ff039916a01d
+uv_version=uv 0.11.32 (x86_64-unknown-linux-gnu)
+node_version=v22.22.0
+npm_version=10.9.4
+python_version=3.13.16
+app_version=0.1.0
+release_image_digest=not recorded
+crawl4ai_image_digest=not recorded
+release_facts:
+  config_yaml_sha256=ebf0d4bcd014c4fc93f099bd91ec51ffd23ccb29b3edf3bcf83c83f5e7264af0
+  mcp_sdk=2.3.0 mcp_protocol=2026-07-28
+  source automobile_it adapter=automobile_it_public@unimplemented mode=public_html enabled=false
+  source autoscout24_ch adapter=autoscout24_public_ch@unimplemented mode=public_html enabled=false
+  source autoscout24_de adapter=autoscout24_public_de@unimplemented mode=public_html enabled=false
+  source autoscout24_it adapter=autoscout24_public_it@unimplemented mode=public_html enabled=false
+  source carforyou_ch adapter=carforyou_ch_public@unimplemented mode=public_html enabled=false
+  source comparis_ch adapter=comparis_ch_public@unimplemented mode=public_html enabled=false
+  source example_dealer_template_ch adapter=schemaorg_dealer@schemaorg_dealer@1.1.0 mode=public_html enabled=false
+  source example_dealer_template_de adapter=schemaorg_dealer@schemaorg_dealer@1.1.0 mode=public_html enabled=false
+  source mobile_de_api adapter=mobile_de_api@unimplemented mode=official_api enabled=false
+  source mobile_de_public adapter=mobile_de_public@unimplemented mode=public_html enabled=false
+  source pazar3_mk adapter=pazar3_mk@unimplemented mode=public_html enabled=false
+  source reklama5_mk adapter=reklama5_mk@unimplemented mode=public_html enabled=false
+  source subito_it adapter=subito_it_public@unimplemented mode=public_html enabled=false
+  source tutti_ch adapter=tutti_ch_public@unimplemented mode=public_html enabled=false
+  stored_configuration_revision=record per environment (suv-deals config apply --dry-run)
+migrations:
+  20261006000100_extensions_roles.sql sha256=462183a5661d19700c27bc3d41744ec1bd88e34ae56f0b00252b245f290a60b4
+  20261006000200_core_tables.sql sha256=8c3266797713ba2aadc2e71ef4d2bdd478c512a13fa4263af8c5f4a0df6d7687
+  20261006000300_queue_and_crawl_ops.sql sha256=8a2e6ec563c54793ee15cabf558ad0deda0a93af4ddcdac0b685d1be906bf5f5
+  20261006000400_listings.sql sha256=d437afbf1dec879d5e27e2d1c4fd7c7b2bbcab88acb9e8cd50c3c3ae73beda2f
+  20261006000500_market_and_valuation.sql sha256=2d9dacfbc32501bad1a63252a0847c3c28739d848d94390fef9cc93aefb35ff1
+  20261006000600_reviews_and_notifications.sql sha256=62ac896020eb3cbacbae6e496759e86a63479147cd5f48e8a2a8bed85072483d
+  20261006000700_outbox_events_and_auth_ops.sql sha256=2195e76d5f059fd2bfbbc9ff2b206a8c570c42e16c3bc7fc3e937fb77e212a76
+  20261006000800_security_rls_grants.sql sha256=39573bc296e6629ad2a4537abb5efae201f10262f3a36ef1097424793a50507a
+  20261006000900_backend_role_membership.sql sha256=347dc84906a23e56c62c2b4e8c0f024b17c6f9f11d29f9e1050b2141bb8776fd
+  20261006000950_host_budgets_inflight_and_idempotency_scope.sql sha256=902d845aef3941030d8d7ee1fc1670e1373234a3edb7e323d084415e79cd9768
+  20261006001000_seller_inquiries.sql sha256=27caaa22fb84d696f6262d3d515bd3f4f1a0c14a2487204cf1d327f549ab0454
+  20261007000100_v11_integration_foundation.sql sha256=0f6ea83a7e3142ddab3499bd098eeff5635847f38917a323c3565af309807fab
+  20261007000200_fixture_lineage_and_guards.sql sha256=286f3de0ed900e400e22d3ff131fb3e17bbf09fce8796326868b36bc08b4ed29
+  20261007000400_mail_worker_credential_kind.sql sha256=44c614a40325202fabf8244a2a18439dcd9dc5f78b729ca503488a9ba778437e
+  20261008000100_inquiry_quota_backstop.sql sha256=c3c218ffe8d0c38703b1a953bbf79e3f2520fcb6ee757fae8434cb4beabb6fe8
+  20261008000200_inquiry_hardening.sql sha256=5729a0a9a3978f852b28ec9641eedd717c7da596e51fbf8b14956f92b23859f4
+steps:
+  lint=passed
+  typecheck=passed
+  schemas=passed
+  tests_without_db=passed
+  tests_db_pg16=passed
+  tests_db_pg17=passed
+  desktop_tests=passed
+  dashboard_ci=passed
+  dashboard_build=passed
+  dashboard_test=passed
+  dashboard_lint=passed
+  dashboard_audit=passed
+  e2e_pg16=passed
+  e2e_pg17=passed
+result=verified

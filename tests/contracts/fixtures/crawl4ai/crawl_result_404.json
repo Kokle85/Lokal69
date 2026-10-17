@@ -1,0 +1,99 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "success": true,
+    "results": [
+      {
+        "cache_status": "miss",
+        "cached_at": null,
+        "cleaned_html": "<div><h1>Toyota RAV4 2.2 D-4D 4x4</h1><p>2.950 EUR</p><p>187.500 km</p></div>",
+        "console_messages": null,
+        "crawl_stats": {
+          "attempts": 1,
+          "retries": 0,
+          "proxies_used": [
+            {
+              "proxy": null,
+              "status_code": 200,
+              "blocked": false,
+              "reason": ""
+            }
+          ],
+          "fallback_fetch_used": false,
+          "resolved_by": "direct"
+        },
+        "dispatch_result": null,
+        "downloaded_files": null,
+        "error_message": "",
+        "extracted_content": null,
+        "fit_html": null,
+        "head_fingerprint": null,
+        "html": "<!DOCTYPE html><html><head><title>Seite nicht gefunden</title></head><body><h1>404</h1><p>Das Fahrzeug ist leider nicht mehr verfuegbar oder die Adresse ist falsch.</p><a href=\"/suche\">Zur Fahrzeugsuche</a></body></html>",
+        "js_execution_result": null,
+        "links": {
+          "internal": [
+            {
+              "href": "https://www.dealer-example.com/suche",
+              "text": "Zurueck zur Suche",
+              "title": "",
+              "base_domain": "dealer-example.com",
+              "head_data": null,
+              "head_extraction_status": null,
+              "head_extraction_error": null,
+              "intrinsic_score": null,
+              "contextual_score": null,
+              "total_score": null
+            }
+          ],
+          "external": []
+        },
+        "markdown": {
+          "raw_markdown": "# 404\n\nDas Fahrzeug ist leider nicht mehr verfuegbar.\n",
+          "markdown_with_citations": "",
+          "references_markdown": "",
+          "fit_markdown": null,
+          "fit_html": null
+        },
+        "media": {
+          "images": [],
+          "videos": [],
+          "audios": []
+        },
+        "metadata": {
+          "title": "Toyota RAV4 2.2 D-4D 4x4",
+          "description": null,
+          "keywords": null,
+          "author": null
+        },
+        "mhtml": null,
+        "network_requests": null,
+        "pdf": null,
+        "redirected_status_code": 404,
+        "redirected_url": "https://www.dealer-example.com/fahrzeug/12345",
+        "response_headers": {
+          "content-type": "text/html; charset=utf-8"
+        },
+        "screenshot": null,
+        "session_id": null,
+        "ssl_certificate": null,
+        "status_code": 404,
+        "success": true,
+        "tables": [],
+        "url": "https://www.dealer-example.com/fahrzeug/12345"
+      }
+    ],
+    "server_processing_time_s": 2.418,
+    "server_memory_delta_mb": 12.5,
+    "server_peak_memory_mb": 412.0
+  },
+  "note": "section 8: 404 target probably success=true with status_code 404 (UNVERIFIED live)"
+}

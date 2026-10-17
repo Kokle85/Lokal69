@@ -1,0 +1,420 @@
+"""Source configs, adapter registry and activation gate status (spec sections 5 and 32)."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+import yaml
+from tests.adapters.conftest import enabled_fixture_config, fixture_config
+
+from suv_deals.adapters.base import SourceAdapter
+from suv_deals.adapters.dealer_inventory import SchemaOrgDealerAdapter
+from suv_deals.adapters.registry import (
+    ADAPTERS,
+    build_active_adapter,
+    build_adapter,
+    describe_gates,
+    gate_status,
+    load_registry,
+    registry_problems,
+)
+from suv_deals.domain.enums import SourceMode, TechnicalStatus, TermsDecision, TermsStatus
+from suv_deals.domain.sources import SourceConfig, activation_problems
+from suv_deals.errors import SourcePaused, ValidationFailed
+
+REPO = Path(__file__).resolve().parents[2]
+SOURCES_DIR = REPO / "config" / "sources"
+CONFIG_FILES = sorted(SOURCES_DIR.glob("*.yaml"))
+EXPECTED_SOURCES = {
+    "mobile_de_public",
+    "autoscout24_de",
+    "autoscout24_it",
+    "autoscout24_ch",
+    "subito_it",
+    "automobile_it",
+    "pazar3_mk",
+    "reklama5_mk",
+    "mobile_de_api",
+    "example_dealer_template_de",
+    "carforyou_ch",
+    "tutti_ch",
+    "comparis_ch",
+    "example_dealer_template_ch",
+}
+CH_MARKETPLACE_CANDIDATES = {
+    "carforyou_ch": ("carforyou_ch_public", "www.carforyou.ch"),
+    "tutti_ch": ("tutti_ch_public", "www.tutti.ch"),
+    "comparis_ch": ("comparis_ch_public", "www.comparis.ch"),
+}
+
+
+OWNER_DECIDED_SOURCES = frozenset(
+    {
+        "mobile_de_public",
+        "autoscout24_de",
+        "autoscout24_it",
+        "autoscout24_ch",
+        # Owner decision 2026-10-14: include every remaining marketplace and MK comparable source.
+        "subito_it",
+        "automobile_it",
+        "comparis_ch",
+        "carforyou_ch",
+        "tutti_ch",
+        "pazar3_mk",
+        "reklama5_mk",
+    }
+)
+
+
+#: Marketplace sources with a real adapter (built from owner captures). Activation step 5
+#: (2026-10-16): their SYNTHETIC saved-fixture sets pass (``fixture_tested``); step 6, the owner's
+#: live smoke, passed for autoscout24_it on 2026-10-17 (``live_smoke_passed``). Both stay disabled
+#: until enabling (step 7).
+IMPLEMENTED_MARKETPLACES = frozenset({"autoscout24_de", "autoscout24_it"})
+LIVE_SMOKE_PASSED = frozenset({"autoscout24_it"})
+
+
+@pytest.mark.parametrize("path", CONFIG_FILES, ids=lambda p: p.name)
+def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
+    config = SourceConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert path.stem == config.source_key
+    assert config.enabled is False
+    expected_status = (
+        TechnicalStatus.LIVE_SMOKE_PASSED
+        if config.source_key in LIVE_SMOKE_PASSED
+        else TechnicalStatus.FIXTURE_TESTED
+        if config.source_key in IMPLEMENTED_MARKETPLACES
+        else TechnicalStatus.UNTESTED
+    )
+    assert config.technical_status == expected_status
+    if config.source_key in OWNER_DECIDED_SOURCES:
+        # Owner decision 2026-10-10 (ADR 0002 addendum): an audited acknowledgement with an actor,
+        # never legal permission; the source stays disabled and gated (unimplemented adapter).
+        assert config.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
+        assert config.terms_decision_actor and "owner" in config.terms_decision_actor
+        assert config.robots_checked_at is not None and config.robots_summary
+        if config.source_key in IMPLEMENTED_MARKETPLACES:
+            # Real adapter (2026-10-16), fixture_tested (step 5) or live_smoke_passed (step 6): the
+            # only gate left closed is the owner's enable switch (step 7).
+            assert activation_problems(config) == []
+            assert gate_status(config).problems == ("source is disabled in configuration",)
+        else:
+            assert "adapter is unimplemented" in activation_problems(config)
+    else:
+        assert config.terms_decision == TermsDecision.PENDING
+        assert config.terms_decision_actor is None
+        assert (
+            config.allowed_hosts == ()
+            and config.allowed_search_paths == ()
+            and config.allowed_detail_paths == ()
+        )
+    assert config.robots_policy == "obey" and config.technical_denial_policy == "stop_and_report"
+    assert config.adapter in ADAPTERS
+    assert not gate_status(config).active, "every candidate source must still be gated"
+    if config.source_key not in IMPLEMENTED_MARKETPLACES:
+        assert activation_problems(config), "an untested source fails a gate besides the switch"
+
+
+def test_expected_source_set() -> None:
+    assert {p.stem for p in CONFIG_FILES} == EXPECTED_SOURCES
+
+
+def test_mobile_de_public_terms_record() -> None:
+    cfg = load_registry(REPO / "config").config("mobile_de_public")
+    assert cfg.terms_status == TermsStatus.RESTRICTED
+    assert cfg.terms_url == "https://www.mobile.de/service/agbPublic"
+    assert cfg.terms_reviewed_at == datetime(2026, 10, 6, tzinfo=UTC)
+    assert cfg.adapter_version == "unimplemented"
+    assert cfg.notes is not None and "section 11" in cfg.notes
+
+
+def test_mobile_de_public_search_is_robots_disallowed() -> None:
+    # robots.txt re-check of 2026-10-14: suchen.mobile.de disallows /fahrzeuge/search.html for
+    # every generic crawler, so no search route may be configured; the owner's approval of the
+    # same day does not override robots.txt.
+    cfg = load_registry(REPO / "config").config("mobile_de_public")
+    assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
+    assert cfg.robots_summary is not None and "disallows /fahrzeuge/search.html" in cfg.robots_summary
+    assert cfg.allowed_search_paths == ()
+    assert cfg.terms_decision_note is not None and "re-confirmed 2026-10-14" in cfg.terms_decision_note
+    assert activation_problems(cfg), "the source stays gated"
+
+
+@pytest.mark.parametrize("key", ["autoscout24_de", "autoscout24_it"])
+def test_autoscout_eu_terms_record(key: str) -> None:
+    cfg = load_registry(REPO / "config").config(key)
+    assert cfg.terms_status == TermsStatus.RESTRICTED
+    assert cfg.terms_url == "https://www.autoscout24.com/company/agb/"
+    assert cfg.notes is not None and "8.2-8.3" in cfg.notes and "verified" in cfg.notes
+
+
+def test_autoscout_ch_is_reviewed_separately() -> None:
+    cfg = load_registry(REPO / "config").config("autoscout24_ch")
+    assert cfg.terms_status == TermsStatus.UNREVIEWED
+    assert "terms not reviewed" in activation_problems(cfg)
+    assert cfg.notes is not None and "Swiss" in cfg.notes
+    assert cfg.source_timezone == "Europe/Zurich"
+    # The robots record is a fact, never permission; it does not open any gate.
+    assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
+    assert cfg.robots_summary is not None
+    assert "User-agent: *" in cfg.robots_summary and "fact, not permission" in cfg.robots_summary
+    # Home page only, for the owner-run reachability probe (2026-10-16); no crawl route.
+    assert cfg.allowed_hosts == ("www.autoscout24.ch",) and cfg.allowed_search_paths == ("^/$",)
+    assert cfg.allowed_detail_paths == () and "adapter is unimplemented" in activation_problems(cfg)
+
+
+@pytest.mark.parametrize("key", sorted(CH_MARKETPLACE_CANDIDATES))
+def test_swiss_marketplace_candidates_are_gated_placeholders(key: str) -> None:
+    cfg = load_registry(REPO / "config").config(key)
+    adapter_key, domain = CH_MARKETPLACE_CANDIDATES[key]
+    assert (cfg.country, cfg.role, cfg.adapter, cfg.adapter_version) == (
+        "CH",
+        "acquisition",
+        adapter_key,
+        "unimplemented",
+    )
+    assert cfg.enabled is False and cfg.terms_status == TermsStatus.UNREVIEWED
+    # CarForYou and Tutti: home page only, for the owner-run reachability probe (2026-10-16); no
+    # crawl route. Comparis stays empty (its robots.txt disallows the marketplace endpoints).
+    probed = key != "comparis_ch"
+    assert cfg.allowed_hosts == ((domain,) if probed else ())
+    assert cfg.allowed_search_paths == (("^/$",) if probed else ())
+    assert cfg.allowed_detail_paths == () and cfg.search == {}
+    assert cfg.source_timezone == "Europe/Zurich"
+    assert cfg.notes is not None and cfg.robots_summary is not None
+    # Review attempt of 2026-10-14: the domain is named, what could not be verified says so, and the
+    # robots record names the host it was (or could not be) read from.
+    assert domain in cfg.notes + cfg.robots_summary
+    assert "unverified" in cfg.notes.lower() and "terms" in cfg.notes
+    assert cfg.robots_checked_at == datetime(2026, 10, 14, tzinfo=UTC)
+    gate = gate_status(cfg)
+    assert not gate.adapter_implemented and not gate.active
+    assert {"adapter is unimplemented", "terms not reviewed", "no allowed detail paths"} <= set(gate.problems)
+    assert ("no allowed hosts" in gate.problems) is not probed
+
+
+def test_comparis_is_flagged_as_an_aggregator() -> None:
+    notes = load_registry(REPO / "config").config("comparis_ch").notes or ""
+    assert "aggregator" in notes and "attribution" in notes and "original source" in notes
+
+
+def test_swiss_dealer_template() -> None:
+    template = load_registry(REPO / "config").config("example_dealer_template_ch")
+    assert (template.country, template.adapter, template.adapter_version) == (
+        "CH",
+        "schemaorg_dealer",
+        "schemaorg_dealer@1.1.0",
+    )
+    assert (template.crawl_locale, template.source_timezone) == ("de-CH", "Europe/Zurich")
+    assert template.enabled is False and template.allowed_hosts == () and template.search == {}
+    assert template.technical_status == TechnicalStatus.UNTESTED
+    notes = template.notes or ""
+    assert all(code in notes for code in ("de-CH", "fr-CH", "it-CH"))
+    assert isinstance(build_adapter(template), SchemaOrgDealerAdapter)
+    with pytest.raises(SourcePaused):
+        build_active_adapter(template)
+
+
+@pytest.mark.parametrize(
+    ("key", "terms_url", "host"),
+    [
+        ("subito_it", "https://info.subito.it/policies/condizioni-generali.htm", "www.subito.it"),
+        ("automobile_it", "https://www.automobile.it/policies/condizioni", "www.automobile.it"),
+    ],
+)
+def test_italian_marketplace_terms_reviewed(key: str, terms_url: str, host: str) -> None:
+    # Terms review of 2026-10-14: both general terms prohibit robots/scrapers; the owner decided to
+    # include the sources anyway (an audit record, not permission). Routes stay unverified.
+    cfg = load_registry(REPO / "config").config(key)
+    assert cfg.terms_status == TermsStatus.RESTRICTED and cfg.terms_url == terms_url
+    assert cfg.terms_reviewed_at == datetime(2026, 10, 14, tzinfo=UTC)
+    assert cfg.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
+    assert cfg.allowed_hosts == (host,)
+    assert cfg.allowed_search_paths == () and cfg.allowed_detail_paths == ()
+    assert "terms not reviewed" not in activation_problems(cfg)
+    assert {"adapter is unimplemented", "no allowed search paths"} <= set(activation_problems(cfg))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "mobile_de_api",
+        "carforyou_ch",
+        "tutti_ch",
+        "comparis_ch",
+    ],
+)
+def test_unreviewed_sources(key: str) -> None:
+    cfg = load_registry(REPO / "config").config(key)
+    assert cfg.terms_status == TermsStatus.UNREVIEWED and cfg.terms_url is None
+
+
+@pytest.mark.parametrize(
+    ("key", "status", "terms_url"),
+    [
+        ("reklama5_mk", TermsStatus.RESTRICTED, "https://reklama5.mk/Help/TermsOfService"),
+        (
+            "pazar3_mk",
+            TermsStatus.NO_RESTRICTION_FOUND,
+            "https://www.pazar3.mk/korisnicka-poddrska/politika-na-privatnost",
+        ),
+    ],
+)
+def test_mk_comparable_terms_reviewed_facts_only(key: str, status: TermsStatus, terms_url: str) -> None:
+    # Terms read by the owner on 2026-10-16 (the pages answer 403 to the build environment). Reklama5
+    # forbids copying content of other people's ads; Pazar3 publishes only a privacy policy. Owner
+    # decision of the same day for both: store facts only. The sources stay disabled and gated.
+    cfg = load_registry(REPO / "config").config(key)
+    assert cfg.terms_status == status and cfg.terms_url == terms_url
+    assert cfg.terms_reviewed_at == datetime(2026, 10, 16, tzinfo=UTC)
+    assert cfg.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
+    assert cfg.terms_decision_note is not None and "Само факти" in cfg.terms_decision_note
+    assert "no retained page snapshots" in " ".join(cfg.terms_decision_note.split())
+    assert cfg.robots_checked_at == datetime(2026, 10, 16, tzinfo=UTC)
+    problems = activation_problems(cfg)
+    assert "terms not reviewed" not in problems and "adapter is unimplemented" in problems
+
+
+def test_roles_and_modes() -> None:
+    registry = load_registry(REPO / "config")
+    assert {c.source_key for c in registry.configs if c.role == "mk_comparable"} == {
+        "pazar3_mk",
+        "reklama5_mk",
+    }
+    assert all(registry.config(k).country == "MK" for k in ("pazar3_mk", "reklama5_mk"))
+    assert registry.config("mobile_de_api").mode == SourceMode.OFFICIAL_API
+    template = registry.config("example_dealer_template_de")
+    assert template.adapter == "schemaorg_dealer" and template.adapter_version == "schemaorg_dealer@1.1.0"
+
+
+def test_registry_builds_every_adapter_and_nothing_is_active() -> None:
+    registry = load_registry(REPO / "config")
+    assert {c.source_key for c in registry.configs} == EXPECTED_SOURCES
+    for cfg in registry.configs:
+        adapter = registry.adapter(cfg.source_key)
+        assert isinstance(adapter, SourceAdapter)
+        assert adapter.source_key == cfg.source_key
+        with pytest.raises(SourcePaused):
+            registry.active_adapter(cfg.source_key)
+    assert registry.active_source_keys() == []
+    gates = registry.gates()
+    assert all(not g.active and g.problems for g in gates)
+    assert all("source is disabled in configuration" in g.problems for g in gates)
+    implemented = {g.source_key for g in gates if g.adapter_implemented}
+    assert (
+        implemented == {"example_dealer_template_de", "example_dealer_template_ch"} | IMPLEMENTED_MARKETPLACES
+    )
+    json.dumps([g.as_dict() for g in gates])  # serialisable for API/MCP/status pages
+
+
+def test_load_registry_accepts_the_sources_dir_itself() -> None:
+    assert {c.source_key for c in load_registry(SOURCES_DIR).configs} == EXPECTED_SOURCES
+
+
+def test_adapter_keys_match_classes() -> None:
+    for key, cls in ADAPTERS.items():
+        assert key == cls.ADAPTER_KEY
+
+
+def test_registry_problems() -> None:
+    cfg = fixture_config("fixture_dealer_de")
+    assert registry_problems(cfg) == []
+    assert "not registered" in registry_problems(cfg.model_copy(update={"adapter": "nope_adapter"}))[0]
+    assert (
+        "does not match"
+        in registry_problems(cfg.model_copy(update={"adapter_version": "schemaorg_dealer@9"}))[0]
+    )
+    assert "not supported" in registry_problems(cfg.model_copy(update={"mode": SourceMode.OFFICIAL_API}))[0]
+    with pytest.raises(ValidationFailed):
+        build_adapter(cfg.model_copy(update={"adapter_version": "schemaorg_dealer@9"}))
+
+
+def test_fixture_source_activation_requires_explicit_records() -> None:
+    disabled = fixture_config("fixture_dealer_de")
+    assert isinstance(build_adapter(disabled), SchemaOrgDealerAdapter)
+    with pytest.raises(SourcePaused):
+        build_active_adapter(disabled)
+    pending = disabled.model_copy(update={"enabled": True})
+    with pytest.raises(SourcePaused, match="terms"):
+        build_active_adapter(pending)
+    enabled = enabled_fixture_config("fixture_dealer_de")
+    assert activation_problems(enabled) == []
+    assert isinstance(build_active_adapter(enabled), SchemaOrgDealerAdapter)
+    status = gate_status(enabled)
+    assert status.active and status.gates_satisfied
+    # Re-validating the in-memory record through the model also passes the activation guard.
+    SourceConfig.model_validate(enabled.model_dump())
+    # An owner acknowledgement of a restriction is an audit record; the gate still needs every other fact.
+    acknowledged = enabled.model_copy(
+        update={
+            "terms_status": TermsStatus.RESTRICTED,
+            "terms_decision": TermsDecision.PROCEED_ACKNOWLEDGED,
+            "technical_status": TechnicalStatus.UNTESTED,
+        }
+    )
+    assert "adapter has not passed fixture tests" in activation_problems(acknowledged)
+    assert describe_gates([enabled, disabled])[1].active is False
+
+
+@pytest.mark.parametrize(
+    ("files", "message"),
+    [
+        ({"a.yaml": {"source_key": "Bad Key"}}, "invalid source configuration"),
+        (
+            {
+                "a.yaml": {
+                    "source_key": "dup_source",
+                    "display_name": "Synthetic A",
+                    "country": "DE",
+                    "role": "acquisition",
+                    "mode": "public_html",
+                    "adapter": "mobile_de_public",
+                    "adapter_version": "unimplemented",
+                },
+                "b.yaml": {
+                    "source_key": "dup_source",
+                    "display_name": "Synthetic B",
+                    "country": "DE",
+                    "role": "acquisition",
+                    "mode": "public_html",
+                    "adapter": "mobile_de_public",
+                    "adapter_version": "unimplemented",
+                },
+            },
+            "duplicate",
+        ),
+        (
+            {
+                "a.yaml": {
+                    "source_key": "odd_source",
+                    "display_name": "Synthetic A",
+                    "country": "DE",
+                    "role": "acquisition",
+                    "mode": "public_html",
+                    "adapter": "not_registered",
+                    "adapter_version": "unimplemented",
+                }
+            },
+            "unregistered",
+        ),
+    ],
+)
+def test_load_registry_rejects_invalid_directories(
+    tmp_path: Path, files: dict[str, object], message: str
+) -> None:
+    for name, data in files.items():
+        (tmp_path / name).write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValidationFailed, match=message):
+        load_registry(tmp_path)
+
+
+def test_source_access_register_lists_every_source() -> None:
+    register = (REPO / "docs" / "source_access_register.md").read_text(encoding="utf-8")
+    for key in EXPECTED_SOURCES:
+        assert f"`{key}`" in register, key
+    lowered = register.lower()
+    assert "not legal permission" in lowered
+    assert "public accessibility is not permission" in lowered

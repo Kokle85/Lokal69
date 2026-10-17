@@ -1,0 +1,18 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "GET",
+    "path": "/health"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "status": "ok",
+    "timestamp": 1791280800.123,
+    "version": "0.9.4"
+  },
+  "note": "section 3: verified /health body of the 0.9.4 server"
+}

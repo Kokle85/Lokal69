@@ -1,0 +1,51 @@
+# Supabase CLI configuration for LOCAL development (`npx supabase start`).
+# Hosted projects are configured in the Supabase dashboard; keep them consistent
+# with the choices recorded here and in docs/schema.md.
+#
+# Data access model: BFF-only (docs/decisions/0001-bff-only-data-access.md).
+# The private schemas `app` and `ops` are intentionally NOT listed in
+# [api].schemas, so the Data API (PostgREST/GraphQL) never exposes them. The
+# migrations additionally revoke every privilege on them from anon,
+# authenticated and service_role. Do not add "app" or "ops" below; on a hosted
+# project, do not add them under Dashboard -> Data API -> Exposed schemas.
+
+project_id = "suv-deals"
+
+[api]
+enabled = true
+port = 54321
+# Only Supabase defaults; app/ops are private (BFF-only).
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+# Supabase ships PostgreSQL 15 and 17 images (no 16). The migrations are tested
+# on plain PostgreSQL 16 via tests/db_harness.py and use only features available
+# in 15+; re-run the database test suite against the real stack before activation.
+major_version = 17
+
+[db.seed]
+# Local development only: one synthetic workspace, no users or credentials.
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[studio]
+enabled = true
+
+[auth]
+enabled = true
+# The dashboard dev server origin; adjust locally if it differs.
+site_url = "http://127.0.0.1:8000"
+additional_redirect_urls = []
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+# Private system: accounts are created deliberately by the owner, never by open sign-up.
+enable_signup = false
+enable_anonymous_sign_ins = false
+
+[auth.email]
+enable_signup = false
+enable_confirmations = true

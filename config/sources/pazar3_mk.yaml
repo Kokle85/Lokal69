@@ -1,0 +1,65 @@
+# Pazar3 (MK). Comparable-evidence candidate (role mk_comparable), never an acquisition source.
+# DISABLED; exact public routes and terms must be verified first. Asking prices from this
+# source are asking prices, not realized sales (spec section 15).
+source_key: pazar3_mk
+display_name: "Pazar3 public listings (MK comparables)"
+country: MK
+role: mk_comparable
+mode: public_html
+adapter: pazar3_mk
+adapter_version: unimplemented
+enabled: false
+technical_status: untested
+terms_status: no_restriction_found
+terms_url: https://www.pazar3.mk/korisnicka-poddrska/politika-na-privatnost
+terms_reviewed_at: 2026-10-16T00:00:00Z
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decisions recorded 2026-10-14 and 2026-10-16)"
+terms_decision_note: >-
+  Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
+  terms risk (audit record, not legal permission). Owner decision 2026-10-16 ("Само факти", the same
+  rule as Reklama5): store facts only, namely make, model, year, mileage, fuel, gearbox, asking price
+  and the ad URL. No ad text, photos, seller names or contact data, and no retained page snapshots.
+  Collection stays low-volume (one pass a day per reference model), obeys robots.txt on every fetch,
+  never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any access block.
+technical_denial_policy: stop_and_report
+robots_policy: obey
+robots_checked_at: 2026-10-16T00:00:00Z
+robots_summary: >-
+  robots.txt of www.pazar3.mk answered HTTP 200 on 2026-10-16 from the owner's network (fact, not
+  permission; sha256 8633e9afc044...), and the home page was allowed for our user agent (the probe
+  obeys robots.txt before every page). The rules themselves are not recorded here yet; they are
+  read again before every fetch and are to be recorded with the first search-page capture. On
+  2026-10-14 robots.txt, the home page and a candidate terms page answered HTTP 403 with a
+  Cloudflare block to the build environment. pazar3.mk redirects to www.pazar3.mk.
+source_timezone: Europe/Skopje
+# Reviewed 2026-10-16 from the owner's captured home page, for owner-run sample captures only
+# (`capture-samples`); the source stays disabled. The car category is /oglasi/vozila/avtomobili;
+# a make/model level below it is a hypothesis mirroring the ad URLs and is verified by the first
+# capture. Ads: /oglas/vozila/avtomobili/<make>/<model>/.../<numeric id>. robots.txt is checked
+# before every page.
+allowed_hosts:
+  - 'www.pazar3.mk'
+allowed_search_paths:
+  - '^/$'
+  - '^/oglasi/vozila/avtomobili(/[a-z0-9-]{1,40}){0,2}$'
+allowed_detail_paths:
+  - '^/oglas/vozila/avtomobili(/[A-Za-z0-9._~%-]{1,80}){3,10}/[0-9]{1,12}$'
+search: {}
+notes: >-
+  Comparable-source candidate (spec sections 5 and 15): asking prices only, never acquisition. No
+  separate terms page was found: the footer link to the advertising rules
+  (/korisnicka-poddrska/pravila-i-uslovi-za-oglasuvanje) opens the same privacy policy (owner,
+  2026-10-16). The privacy policy ("Последна промена на: 28.05.2025"; operator ПАЗАР3.КОМ ДООЕЛ,
+  Ресен), read by the owner on 2026-10-16, refers to "Условите за користење на веб страната" but
+  contains no clause on automated access, robots, scraping or reuse of ad content. It says that
+  visitors' personal data are not collected and that the seller decides whether a phone number is
+  shown. Recorded as no_restriction_found, which is not a licence; the referenced terms of use are
+  to be read if they are ever published separately. Reachability 2026-10-16 from the owner's
+  network (scripts/readiness_check.sh): the home page answered HTTP 200 both directly and via
+  Crawl4AI. Only the Crawl4AI (rendered) page carried ads in JSON-LD: an ItemList of Product items
+  with an Offer (price and priceCurrency EUR or MKD; 123456789 is a placeholder price, not a price)
+  and ad URLs of the form /oglas/vozila/avtomobili/<make>/<model>/.../<id>. The car category is
+  /oglasi/vozila/avtomobili. The per-model search route and the ad page structure are verified from
+  owner-run sample captures (the paths allowed for them are below). Any block met by the crawler
+  stops the source.

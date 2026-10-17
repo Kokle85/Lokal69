@@ -1,0 +1,82 @@
+<!-- SYNTHETIC FIXTURE: not a real vehicle or offer -->
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Example Trail 2.0 Diesel 4x4 - Example Fixture Autohaus (synthetisch)</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Car",
+  "name": "Example Trail 2.0 Diesel 4x4",
+  "sku": "TEST-204",
+  "url": "https://dealer.example/fahrzeug/TEST-204",
+  "brand": {"@type": "Brand", "name": "Example"},
+  "model": "Trail",
+  "vehicleConfiguration": "Comfort",
+  "vehicleModelDate": "2011",
+  "dateVehicleFirstRegistered": "2011-05",
+  "bodyType": "SUV / Geländewagen",
+  "numberOfDoors": 5,
+  "vehicleSeatingCapacity": 5,
+  "fuelType": "Diesel",
+  "vehicleTransmission": "Schaltgetriebe (6-Gang)",
+  "driveWheelConfiguration": "https://schema.org/AllWheelDriveConfiguration",
+  "vehicleEngine": {
+    "@type": "EngineSpecification",
+    "engineDisplacement": {"@type": "QuantitativeValue", "value": 1995, "unitCode": "CMQ"},
+    "enginePower": [
+      {"@type": "QuantitativeValue", "value": 140, "unitCode": "BHP"},
+      {"@type": "QuantitativeValue", "value": 103, "unitCode": "KWT"}
+    ]
+  },
+  "mileageFromOdometer": {"@type": "QuantitativeValue", "value": 187500, "unitCode": "KMT"},
+  "vehicleIdentificationNumber": "XXXSYNTH000000204",
+  "numberOfPreviousOwners": 2,
+  "color": "Grau",
+  "itemCondition": "https://schema.org/UsedCondition",
+  "description": "SYNTHETIC TEST DATA. Unfallfrei laut Verkäufer, Scheckheft gepflegt. Zahnriemen bei 150.000 km gewechselt.",
+  "offers": {
+    "@type": "Offer",
+    "price": 2750.00,
+    "priceCurrency": "EUR",
+    "availability": "https://schema.org/InStock",
+    "itemCondition": "https://schema.org/UsedCondition",
+    "priceSpecification": {
+      "@type": "UnitPriceSpecification",
+      "price": 2750.00,
+      "priceCurrency": "EUR",
+      "valueAddedTaxIncluded": true
+    },
+    "seller": {
+      "@type": "AutoDealer",
+      "name": "Example Fixture Autohaus (synthetisch)",
+      "address": {"@type": "PostalAddress", "addressCountry": "DE", "addressLocality": "Musterstadt", "addressRegion": "Beispielland"}
+    }
+  }
+}
+</script>
+</head>
+<body>
+<header><a href="/">Example Fixture Autohaus</a> <a href="/login">Login</a></header>
+<main>
+<h1>Example Trail 2.0 Diesel 4x4</h1>
+<p class="price">2.750 &euro; <small>inkl. 19% MwSt.</small></p>
+<ul class="specs">
+  <li>Kilometerstand: 187.500&nbsp;km</li>
+  <li>Erstzulassung: 05/2011</li>
+  <li>Leistung: 103 kW (140 PS)</li>
+  <li>Getriebe: Schaltgetriebe</li>
+</ul>
+<div itemprop="description">Unfallfrei laut Verk&auml;ufer, Scheckheft gepflegt.</div>
+<section class="contact">
+  <h2>Kontakt</h2>
+  <form action="/anfrage" method="post">
+    <input type="text" name="name"> <textarea name="nachricht"></textarea>
+    <div class="g-recaptcha" data-sitekey="synthetic-not-a-key"></div>
+    <button>Anfrage senden</button>
+  </form>
+</section>
+</main>
+</body>
+</html>

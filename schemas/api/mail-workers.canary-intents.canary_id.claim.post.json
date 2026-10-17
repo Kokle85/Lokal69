@@ -1,0 +1,103 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "required",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/canary-intents/{canary_id}/claim",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/canary-intents/{canary_id}/claim`` (never replayed).",
+    "properties": {
+      "canary_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "claim_attempt_id": {
+        "pattern": "^[0-9a-f]{32}$",
+        "type": "string"
+      },
+      "mailbox_binding_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "type": "string"
+      },
+      "worker_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "schema_version",
+      "canary_id",
+      "claim_attempt_id",
+      "mailbox_binding_id",
+      "worker_id"
+    ],
+    "title": "MailWorkerCanaryClaimRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of the canary claim (== ``wire.CanaryClaimDecision``).",
+    "properties": {
+      "canary_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "proceed": {
+        "type": "boolean"
+      },
+      "refusal_reason": {
+        "default": null,
+        "enum": [
+          "intent_expired",
+          "account_mismatch",
+          "kill_switch",
+          "binding_mismatch",
+          "intent_invalid",
+          "outlook_not_classic",
+          "mailbox_unavailable",
+          "duplicate_intent",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "required": [
+      "canary_id",
+      "proceed"
+    ],
+    "title": "mail-workers.canary-intents.canary_id.claim.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Fresh server revalidation immediately before the canary's .Send (never replayed)."
+}
