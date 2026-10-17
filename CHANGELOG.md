@@ -19,7 +19,8 @@ search fetch, `requests_today` was 1). robots.txt was obeyed only inside Crawl4A
   reused while fresh, otherwise fetched through `robots.fetch_robots` (URL policy `robots` purpose:
   exactly `/robots.txt`; same-host redirects only, at most five hops, public DNS before every hop,
   fail closed) as a request of its own through the persistent budget gate (`purpose: robots`,
-  counted in `requests_today`, spaced like any request), stored with
+  counted in `requests_today`, spaced like any request, including the Crawl-delay of the revision
+  it replaces at the daily refresh), stored with
   `sources_repo.record_robots_revision` and logged as a fetch attempt (`purpose: robots`, linked to
   the job and the crawl run) before the gate is released. Every search and detail URL (and a
   same-host redirect target) is evaluated with `robots.evaluate` for our product token
@@ -45,10 +46,15 @@ search fetch, `requests_today` was 1). robots.txt was obeyed only inside Crawl4A
   robots module. Crawl4AI's own `check_robots_txt` stays on as a second line.
 - **Changes are audited, nothing switches.** A changed revision raises the existing
   `source.robots_changed` audit for every source on the host; nothing is enabled or disabled. A
-  robots outage (no body, not parsed) is stored but compared with nothing, so neither the outage
-  nor the recovery raises a review item, while a robots.txt that disappears does.
+  robots outage (no body, not parsed) and an access denial (401/403/407 without a body, e.g. a WAF
+  block) are stored but compared with nothing, so neither the outage or block nor the recovery
+  raises a review item, while a robots.txt that disappears does. A non-standard status (outside
+  100..599, e.g. 999) is stored without a status: unreachable, the 30-minute retry, never a
+  validation dead letter.
 - **Evidence.** `sources smoke-evidence` prints the robots fetch among the fetches and
-  `robots_revisions` (per host: time, HTTP status, SHA-256, availability; no body);
+  `robots_revisions` (per host: time, HTTP status, SHA-256, availability incl. `access_denied`;
+  no body). The stored SHA-256 and truncation flag are the robots module's own (bytes as fetched,
+  the hash `capture-samples` reports);
   `sources inspect --from-db` shows the stored revision. A robots refusal is not counted as a
   parser failure.
 - **Fixtures.** Every saved fixture set serves a SYNTHETIC `robots.txt` route (dealer sets;

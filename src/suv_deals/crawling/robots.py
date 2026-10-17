@@ -68,6 +68,10 @@ ROBOTS_MAX_AGE: Final = timedelta(hours=24)  # RFC 9309 2.4: do not use a cached
 # first bytes as body; that body is still parsed (RFC 9309 2.5). Any other error_kind on a
 # 2xx means the body is incomplete or unreliable.
 TRUNCATED_ERROR_KIND: Final = "truncated"
+# 4xx answers that are an access denial (spec 5), not "no robots.txt": classified `unavailable`
+# like every 4xx here, but they say nothing about the directives (the worker's robots guard treats
+# them as an access block; the stored revision is never compared for a robots change).
+ACCESS_DENIED_STATUSES: Final = frozenset({401, 403, 407})
 _UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _PERCENT = re.compile(r"%([0-9A-Fa-f]{2})")
 _PRODUCT_TOKEN = re.compile(r"[A-Za-z_-]+")

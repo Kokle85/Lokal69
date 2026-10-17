@@ -485,7 +485,8 @@ to a host the worker reads the host's robots.txt ITSELF, directly from the machi
 `suv-deals` (not through Crawl4AI; the netguard HTTPS client with the crawler's honest User-Agent,
 no proxy), stores the revision (`ops.robots_revisions`) and logs the request as a fetch attempt with
 `purpose: robots`. The request counts in the host's daily budget and is spaced like a page (20 s,
-or the robots `Crawl-delay` when larger). A revision is reused for the rest of its UTC day, so the
+or the robots `Crawl-delay` when larger; the daily refresh is spaced by the Crawl-delay of the
+revision it replaces). A revision is reused for the rest of its UTC day, so the
 first request of each UTC day fetches robots.txt again and the detail jobs of the same day reuse it.
 Every search and detail URL is checked against it for `SUVDealResearch`; Crawl4AI's own robots
 check stays on as well. The machine therefore needs direct outbound HTTPS to the source host (the
@@ -538,9 +539,13 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   20 s later (the command waits). Expected: `Job state: succeeded`, `pages: 1`, `completeness:
   budget_limited` (12 models, capped at one page).
 - Expected in step 3 (robots): `sources inspect autoscout24_it --from-db` shows `robots.fetch_status:
-  200`, `robots.revision_hash` (the SHA-256 of the stored robots.txt) and `robots.last_checked_at`
-  (the time of the `crawl once`); `rate_budget.requests_today` counts the robots request too (2
-  after `crawl once`, plus one per detail page). `sources smoke-evidence` lists the robots request
+  200`, `robots.revision_hash` (the SHA-256 of robots.txt as fetched: the same value
+  `capture-samples` prints as `sha256 <first 12 characters>`) and `robots.last_checked_at` (the
+  time of the `crawl once`); `rate_budget.requests_today` counts the robots request too: it GROWS
+  by 2 with `crawl once` (the robots request and the search page), plus one per detail page. It
+  counts every request to the host in the current UTC day, so a smoke repeated on the day of an
+  earlier attempt starts from that day's count (the 2026-10-17 attempt used 1: a repeat that day
+  shows 3 after `crawl once`). `sources smoke-evidence` lists the robots request
   first among `fetches` (`purpose: robots`, `http_status: 200`, `access_state: ok`, the discovery
   job and run ids), then the search fetch and the detail fetches, and `robots_revisions` names the
   revision in effect (`host`, `fetched_at`, `http_status`, `content_hash`, `availability:
@@ -551,7 +556,8 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   the `smoke-evidence` JSON): robots.txt unreachable (5xx, 429, no answer) is a complete disallow:
   `Job state: queued (ROBOTS_UNREACHABLE)` and nothing else is requested (the job would wait 30
   minutes); a 401/403 to robots.txt is an access block like a 403 page (`blocked
-  (access_blocked)`); a search URL robots.txt disallows is never requested (`completeness: failed`,
+  (access_blocked)`; `robots_revisions` shows `availability: access_denied`, and neither the block
+  nor its recovery counts as a robots change); a search URL robots.txt disallows is never requested (`completeness: failed`,
   gap `robots.txt (robots_disallowed)` in the run, a `search` fetch with `error_code:
   robots_disallowed` and no `http_status`).
 - The search page queues one detail job per new or changed organic card: on a first run every

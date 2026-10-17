@@ -36,7 +36,7 @@ from suv_deals.crawling.policy_client import (
     PolicyEnforcingCrawlClient,
     RobotsUnavailable,
 )
-from suv_deals.crawling.rate_limits import BudgetDecision, DenyReason, WaitReason
+from suv_deals.crawling.rate_limits import BudgetDecision, DenyReason, Wait, WaitReason
 from suv_deals.crawling.robots import (
     ROBOTS_MAX_BYTES,
     TRUNCATED_ERROR_KIND,
@@ -46,6 +46,7 @@ from suv_deals.crawling.robots import (
     parse_robots_txt,
 )
 from suv_deals.crawling.robots_guard import (
+    DIRECT_TRANSPORT_LABEL,
     ROBOTS_RETRY_INTERVAL,
     CrawlClientRobotsTransport,
     RobotsGuard,
@@ -58,8 +59,9 @@ from suv_deals.crawling.robots_guard import (
 from suv_deals.crawling.url_policy import SourceUrlPolicy
 from suv_deals.domain.enums import AccessState
 from suv_deals.domain.sources import RateBudget
+from suv_deals.integrations.safe_http import DEFAULT_USER_AGENT as SAFE_HTTP_DEFAULT_USER_AGENT
 from suv_deals.integrations.safe_http import SafeHttpClient
-from suv_deals.workers.runtime import refusal_disposition
+from suv_deals.workers.runtime import refusal_disposition, robots_transport
 
 NOW = datetime(2026, 10, 17, 8, 0, 0, tzinfo=UTC)
 HOST = "dealer.example"
@@ -406,6 +408,87 @@ async def test_the_robots_crawl_delay_spaces_the_following_requests() -> None:
     assert (await world.fetch(SEARCH)).fetch.access_state == AccessState.OK
 
 
+async def test_the_daily_robots_refetch_keeps_the_hosts_crawl_delay() -> None:
+    """The first request of a new UTC day fetches robots.txt again; that robots request is spaced
+    by the Crawl-delay of the revision it replaces, not only by the source's 20 s."""
+    rules = b"User-agent: *\nCrawl-delay: 60\nDisallow: /intern/\n"
+    world = World(transport=Transport(RobotsFetchResponse(200, rules, None)))
+    world.clock.advance(timedelta(hours=15, minutes=57, seconds=50))  # 23:57:50 UTC
+    with pytest.raises(BudgetRefused):  # robots.txt, then the page waits 60 s
+        await world.fetch(SEARCH)
+    world.pass_time(60)
+    assert (await world.fetch(SEARCH)).fetch.access_state == AccessState.OK  # 23:58:50
+    world.pass_time(60)
+    assert (await world.fetch(DETAIL, "detail")).fetch.access_state == AccessState.OK  # 23:59:50
+    last_page = world.clock.now()
+    world.pass_time(25)  # 00:00:15: a new UTC day, the revision is stale
+    with pytest.raises(BudgetRefused) as spaced:
+        await world.fetch(DETAIL, "detail")
+    robots_request = world.gate.requests[-1]
+    assert robots_request.purpose == "robots" and robots_request.crawl_delay == Decimal(60)
+    assert spaced.value.reason == WaitReason.MIN_DELAY.value
+    assert spaced.value.until == last_page + timedelta(seconds=60)  # not 20 s after the last page
+    assert world.transport.calls == [ROBOTS_URL]  # not requested before the host's delay
+    world.pass_time(35)
+    with pytest.raises(BudgetRefused):  # robots.txt now, the page 60 s later
+        await world.fetch(DETAIL, "detail")
+    assert world.transport.calls == [ROBOTS_URL, ROBOTS_URL]
+    assert world.gate.requests[-1].purpose == "detail"
+    assert world.gate.requests[-1].crawl_delay == Decimal(60)
+
+
+# robots.txt with rules for our product token only: everything is allowed for `*`.
+TOKEN_RULES = (
+    b"User-agent: *\nAllow: /\n\n"
+    b"User-agent: OtherBot\nCrawl-delay: 90\n\n"
+    b"User-agent: SUVDealResearch\nDisallow: /suche?typ=suv\nCrawl-delay: 45\n"
+)
+
+
+async def test_urls_are_evaluated_for_our_product_token() -> None:
+    world = World(transport=Transport(RobotsFetchResponse(200, TOKEN_RULES, None)))
+    assert world.guard.user_agent == DEFAULT_USER_AGENT
+    document = await world.fetch(SEARCH)
+    # Allowed for `*`, disallowed for SUVDealResearch: never requested, reported as robots_disallowed.
+    assert world.inner.calls == [] and world.purposes() == ["robots"]
+    assert document.fetch.access_state == AccessState.POLICY_DENIED
+    assert document.fetch.error_code == "robots_disallowed"
+    # Our group's Crawl-delay (45 s) spaces the next page, neither `*` (none) nor OtherBot (90 s).
+    with pytest.raises(BudgetRefused) as spaced:
+        await world.fetch(DETAIL, "detail")
+    page_request = world.gate.requests[-1]
+    assert page_request.purpose == "detail" and page_request.crawl_delay == Decimal(45)
+    assert spaced.value.until == NOW + timedelta(seconds=45)
+    world.pass_time(45)
+    assert (await world.fetch(DETAIL, "detail")).fetch.access_state == AccessState.OK
+    assert world.inner.calls == [(DETAIL, "detail")]
+
+
+async def test_the_revision_is_recorded_while_the_robots_request_holds_the_host() -> None:
+    """A worker waiting for the host must find the new revision once the robots request ends,
+    so the revision and the fetch attempt are stored before the gate is released."""
+    world = World()
+    seen: list[tuple[bool, BudgetDecision]] = []
+    record = world.store.record
+
+    async def record_holding_the_host(revision: RobotsRevision, outcome: FetchOutcome) -> bool:
+        state = world.gate.state(SOURCE, HOST)
+        leased = state.in_flight_until is not None and world.clock.now() < state.in_flight_until
+        other = await world.gate.acquire(
+            BudgetRequest(source_key=SOURCE, host=HOST, purpose="detail", url=DETAIL)
+        )
+        seen.append((leased, other))
+        return await record(revision, outcome)
+
+    world.store.record = record_holding_the_host  # type: ignore[method-assign]
+    with pytest.raises(BudgetRefused):
+        await world.fetch(SEARCH)
+    [(leased, other)] = seen
+    assert leased
+    assert isinstance(other, Wait) and other.reason == WaitReason.NAVIGATION_IN_FLIGHT
+    assert world.gate.state(SOURCE, HOST).in_flight_until is None  # released after recording
+
+
 async def test_no_robots_request_without_budget() -> None:
     world = World(budget=RateBudget(min_delay_seconds=20, daily_request_budget=0))
     with pytest.raises(BudgetRefused) as refused:
@@ -530,6 +613,33 @@ async def test_the_direct_transport_sends_the_honest_user_agent_and_reads_the_bo
     assert request.headers["user-agent"] == DEFAULT_USER_AGENT
     assert request.headers["host"] == HOST and request.url.path == "/robots.txt"
     assert not any(h in request.headers for h in ("cookie", "authorization", "proxy-authorization"))
+
+
+async def test_the_runtime_robots_transport_is_the_honest_direct_client() -> None:
+    """`workers.runtime.robots_transport` builds the only transport real sources use: the crawler's
+    User-Agent (not the SafeHttp default), identity encoding, no credentials, bodies capped."""
+    seen: list[httpx.Request] = []
+    huge = b"# x\n" * (ROBOTS_MAX_BYTES // 2)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=huge if len(seen) > 1 else RULES)
+
+    transport = robots_transport(public_dns, transport=httpx.MockTransport(handler))
+    try:
+        assert transport.label == DIRECT_TRANSPORT_LABEL
+        response = await transport.get(ROBOTS_URL, source_key=SOURCE)
+        assert (response.status, response.body, response.error_kind) == (200, RULES, None)
+        capped = await transport.get(ROBOTS_URL, source_key=SOURCE)
+        assert capped.error_kind == TRUNCATED_ERROR_KIND and len(capped.body or b"") == ROBOTS_MAX_BYTES
+    finally:
+        await transport.aclose()
+    for request in seen:
+        assert request.headers["user-agent"] == DEFAULT_USER_AGENT
+        assert request.headers["user-agent"] != SAFE_HTTP_DEFAULT_USER_AGENT
+        assert request.headers["accept-encoding"] == "identity"
+        assert request.headers["host"] == HOST and request.url.path == "/robots.txt"
+        assert not any(h in request.headers for h in ("cookie", "authorization", "proxy-authorization"))
 
 
 async def test_the_direct_transport_hands_redirects_to_the_robots_module() -> None:

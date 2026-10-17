@@ -7,10 +7,13 @@
   table has no availability column; the stored row determines it exactly as
   `robots.fetch_robots` wrote it: a body means ``available`` (the rules are parsed again from the
   stored body), no body with ``parse_ok`` means ``unavailable`` (4xx or too many redirects: no
-  robots restriction), no body without ``parse_ok`` means ``unreachable`` (complete disallow).
-- `record` stores one fetched revision (`sources_repo.record_robots_revision`: bounded body,
-  SHA-256, the ``source.robots_changed`` audit for every source on the host when robots.txt
-  changed; nothing is enabled or disabled automatically) and its fetch attempt
+  robots restriction; a 401/403/407 stays an access denial for the guard by its status), no body
+  without ``parse_ok`` means ``unreachable`` (complete disallow).
+- `record` stores one fetched revision (`sources_repo.record_robots_revision`: bounded body, the
+  robots module's SHA-256 of the bytes as fetched and its truncation flag, the
+  ``source.robots_changed`` audit for every source on the host when robots.txt changed; nothing is
+  enabled or disabled automatically; a status outside 100..599 is stored as none) and its fetch
+  attempt
   (`sources_repo.record_fetch_attempt`, ``purpose: robots``, linked to the job and crawl run that
   made it, so ``sources smoke-evidence`` lists it) in one short transaction, never across network
   I/O.
@@ -104,6 +107,12 @@ class DbRobotsStore:
         body = revision.body
         if body is not None:
             body = body.encode("utf-8")[:ROBOTS_MAX_BYTES].decode("utf-8", errors="ignore")
+        # A non-standard status (e.g. a vendor 999) is no HTTP status code: stored as none, so the
+        # row reads back as unreachable like the robots module classified it (the fetch attempt's
+        # error code keeps the number: ``robots_http_999``).
+        status = revision.http_status
+        if status is not None and not 100 <= status <= 599:
+            status = None
 
         async def once() -> bool:
             async with unit_of_work(self._db, self._actor) as conn:
@@ -112,10 +121,14 @@ class DbRobotsStore:
                     self._actor,
                     host=revision.host,
                     fetched_at=revision.fetched_at,
-                    http_status=revision.http_status,
+                    http_status=status,
                     body=body,
                     parse_ok=revision.parse_ok,
                     user_agent=self.user_agent,
+                    # The robots module's own values: SHA-256 of the bytes as fetched (the value
+                    # capture-samples reports) and whether the fetcher or the parser cut the body.
+                    content_hash=None if body is None else revision.content_hash,
+                    body_truncated=revision.body_truncated,
                 )
                 await sources_repo.record_fetch_attempt(
                     conn,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -12,7 +13,17 @@ from tests.integration.persistence_core.support import member
 from tests.integration.repos_sources_listings.support import HOST, T0, Env, source_config
 
 from suv_deals.adapters.base import FetchOutcome, ParserHealth
-from suv_deals.crawling.robots import RobotsAvailability, evaluate
+from suv_deals.clock import FrozenClock
+from suv_deals.crawling.robots import (
+    ROBOTS_MAX_BYTES,
+    TRUNCATED_ERROR_KIND,
+    RobotsAvailability,
+    RobotsFetchResponse,
+    evaluate,
+    fetch_robots,
+)
+from suv_deals.crawling.robots_guard import robots_fetch_outcome
+from suv_deals.crawling.url_policy import SourceUrlPolicy
 from suv_deals.domain.enums import (
     AccessState,
     GateStatus,
@@ -410,6 +421,96 @@ async def test_an_unreachable_robots_fetch_is_stored_but_never_a_change(
     assert not evaluate(available, f"https://{HOST}/vehicles/private/1", "SUVDealResearch/0.1").allowed
     assert evaluate(available, f"https://{HOST}/vehicles/1", "SUVDealResearch/0.1").allowed
     assert down is not None and down.availability == RobotsAvailability.UNREACHABLE
+
+
+@pytest.mark.parametrize("status", [401, 403, 407])
+async def test_an_access_denial_on_robots_txt_is_never_a_change(
+    db: Database, env: Env, seed: Seed, status: int
+) -> None:
+    """A 401/403/407 answer (a WAF block, no body) says nothing about the directives: neither the
+    block nor the recovery with the same robots.txt is a change; a later 4xx "no robots.txt" is
+    still compared with the last revision that was read."""
+    rules = "User-agent: *\nDisallow: /vehicles/private/\n"
+
+    async def record(hours: int, http_status: int | None, body: str | None) -> Any:
+        async with unit_of_work(db, env.system) as conn:
+            return await sources_repo.record_robots_revision(
+                conn,
+                env.system,
+                host=HOST,
+                fetched_at=T0 + timedelta(hours=hours),
+                http_status=http_status,
+                body=body,
+                parse_ok=True,
+            )
+
+    first = await record(0, 200, rules)
+    denied = await record(1, status, None)
+    back = await record(2, 200, rules)
+    assert not first.changed and not denied.changed and denied.previous_hash == sha(rules)
+    assert not back.changed and back.previous_hash == sha(rules)
+    denied_again = await record(3, status, None)
+    gone = await record(4, 404, None)  # compared with the 200, not with the denial
+    assert not denied_again.changed and gone.changed and gone.previous_hash == sha(rules)
+    count = seed.scalar(
+        "select count(*) from ops.audit_events where target_id = %s and action = 'source.robots_changed'",
+        (env.source_id,),
+    )
+    assert count == 1  # only the disappeared robots.txt
+
+
+async def test_the_worker_stores_the_robots_modules_hash_and_truncation(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """`DbRobotsStore` stores the robots module's SHA-256 of the bytes as fetched (the value
+    capture-samples reports) and its truncation flag, not values recomputed from the cleaned text."""
+    policy = SourceUrlPolicy("robots_hash", allowed_hosts=(HOST,), search_paths=("/vehicles",))
+    store = robots_store.DbRobotsStore(
+        db, env.system, source_id=env.source_id, user_agent="SUVDealResearch/0.1 (+test)"
+    )
+
+    async def fetched(raw: bytes, kind: str | None, hours: int) -> Any:
+        async def fetcher(url: str) -> RobotsFetchResponse:
+            del url
+            return RobotsFetchResponse(200, raw, kind)
+
+        revision = await fetch_robots(
+            policy, HOST, fetcher, resolver=None, clock=FrozenClock(T0 + timedelta(hours=hours))
+        )
+        hops = [(revision.robots_url, RobotsFetchResponse(200, raw, kind))]
+        return revision, await store.record(revision, robots_fetch_outcome(revision, hops))
+
+    # A BOM, a CRLF and a NUL: the retained text differs from the bytes as fetched.
+    raw = b"\xef\xbb\xbfUser-agent: *\r\nDisallow: /vehicles/private/\x00\n"
+    revision, changed = await fetched(raw, None, 0)
+    assert not changed and revision.content_hash == hashlib.sha256(raw).hexdigest()
+    assert revision.body is not None and sha(revision.body) != revision.content_hash
+    row = seed.conn.execute(
+        "select content_hash, body_truncated from ops.robots_revisions where workspace_id = %s"
+        " and host = %s order by fetched_at desc limit 1",
+        (env.workspace_id, HOST),
+    ).fetchone()
+    assert row == (revision.content_hash, False)
+    latest = await store.latest(HOST)
+    assert latest is not None and latest.content_hash == revision.content_hash
+    # The same bytes again: no change (both sides hashed the same way).
+    _again, changed = await fetched(raw, None, 1)
+    assert not changed
+
+    # A robots.txt the fetcher cut at the parse limit is stored and read back as truncated.
+    big = (b"User-agent: *\nDisallow: /vehicles/private/\n" + b"# padding\n" * ROBOTS_MAX_BYTES)[
+        :ROBOTS_MAX_BYTES
+    ]
+    cut, changed = await fetched(big, TRUNCATED_ERROR_KIND, 2)
+    assert changed and cut.body_truncated
+    row = seed.conn.execute(
+        "select content_hash, body_truncated from ops.robots_revisions where workspace_id = %s"
+        " and host = %s order by fetched_at desc limit 1",
+        (env.workspace_id, HOST),
+    ).fetchone()
+    assert row == (hashlib.sha256(big).hexdigest(), True)
+    latest = await store.latest(HOST)
+    assert latest is not None and latest.body_truncated
 
 
 async def test_fetch_attempt_is_redacted(db: Database, env: Env, seed: Seed) -> None:

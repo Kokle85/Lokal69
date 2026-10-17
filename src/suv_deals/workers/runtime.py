@@ -73,6 +73,8 @@ from suv_deals.persistence.storage import SnapshotStore, snapshot_store_from_set
 from suv_deals.settings import REPO_ROOT, Settings
 
 if TYPE_CHECKING:  # the inquiry workers import this module; avoid the cycle at runtime
+    import httpx
+
     from suv_deals.workers.inquiry_handlers import InquiryRuntime
 
 logger = logging.getLogger(__name__)
@@ -325,17 +327,22 @@ class RuntimeContext:
             await self.db.close()
 
 
-def robots_transport(resolver: Resolver = system_resolver) -> SafeHttpRobotsTransport:
+def robots_transport(
+    resolver: Resolver = system_resolver, *, transport: httpx.AsyncBaseTransport | None = None
+) -> SafeHttpRobotsTransport:
     """The live robots.txt fetcher: `SafeHttpClient` (public IP pinned, TLS verified, no proxy, no
     redirect followed by itself) with the crawler's honest User-Agent; bodies capped at
-    `robots.ROBOTS_MAX_BYTES`, one request at most `robots.DEFAULT_FETCH_TIMEOUT_S` long."""
+    `robots.ROBOTS_MAX_BYTES`, one request at most `robots.DEFAULT_FETCH_TIMEOUT_S` long.
+    ``transport`` replaces the network transport (tests only: what the factory sends)."""
     limits = HttpLimits(
         connect_timeout_s=10.0,
         read_timeout_s=DEFAULT_FETCH_TIMEOUT_S,
         total_timeout_s=DEFAULT_FETCH_TIMEOUT_S,
         max_response_bytes=ROBOTS_MAX_BYTES,
     )
-    http = SafeHttpClient(resolver=resolver, limits=limits, user_agent=DEFAULT_USER_AGENT)
+    http = SafeHttpClient(
+        resolver=resolver, limits=limits, transport=transport, user_agent=DEFAULT_USER_AGENT
+    )
     return SafeHttpRobotsTransport(http, timeout_s=DEFAULT_FETCH_TIMEOUT_S, closer=http.aclose)
 
 

@@ -8,8 +8,9 @@ detail URL BEFORE the page's own budget request. The guard
    one (``ops.robots_revisions`` through a `RobotsStore`) while it is fresh, else
 2. fetches robots.txt as a request of its own: `robots.robots_url_for` (the URL policy's
    ``robots`` purpose allows exactly ``/robots.txt``), the budget gate (``purpose: robots``:
-   counted in the host's daily budget and spaced like every other request; a refusal raises
-   `BudgetRefused` and nothing is fetched), then `robots.fetch_robots` through a
+   counted in the host's daily budget and spaced like every other request, including the
+   Crawl-delay of the revision it replaces; a refusal raises `BudgetRefused` and nothing is
+   fetched), then `robots.fetch_robots` through a
    `RobotsTransport` (redirects only to the same host, at most five hops, public DNS checked
    before every hop, fail closed), and records the revision and the fetch attempt
    (``purpose: robots``) before the gate is released;
@@ -43,6 +44,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Final, Protocol, runtime_checkable
 
 import anyio
@@ -53,6 +55,7 @@ from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.crawling.policy_client import BudgetGate, BudgetRefused, BudgetRequest, RobotsCheck
 from suv_deals.crawling.rate_limits import Allow, next_utc_midnight, parse_retry_after
 from suv_deals.crawling.robots import (
+    ACCESS_DENIED_STATUSES,
     DEFAULT_FETCH_TIMEOUT_S,
     ROBOTS_MAX_AGE,
     ROBOTS_MAX_BYTES,
@@ -76,8 +79,6 @@ logger = logging.getLogger(__name__)
 ROBOTS_RETRY_INTERVAL: Final = timedelta(minutes=30)
 #: A revision fetched up to this much "in the future" (clock skew between workers) is still used.
 _CLOCK_SKEW: Final = timedelta(minutes=5)
-#: Answers to the robots request that are an access denial (spec 5), not "no robots restriction".
-ACCESS_DENIED_STATUSES: Final = frozenset({401, 403, 407})
 _MAX_RETRY_AFTER: Final = 30 * 86_400
 _TRANSIENT_KINDS: Final = frozenset(
     {"timeout", "fetch_exception", "network", DenialReason.DNS_RESOLUTION_FAILED.value}
@@ -340,13 +341,26 @@ class RobotsGuard:
         if stored is not None and revision_is_fresh(stored, now):
             self._cache[host] = stored
             return stored, None
-        return await self._fetch(source_key, policy, host, gate)
+        # The revision being replaced (stale, but the newest known) still states the host's
+        # Crawl-delay for our token: the robots request is spaced by it like a page would be
+        # (the first request of a UTC day may follow the previous day's last page closely).
+        known = [r for r in (cached, stored) if r is not None]
+        previous = max(known, key=lambda r: r.fetched_at) if known else None
+        delay = None if previous is None else crawl_delay(previous, self._user_agent)
+        return await self._fetch(source_key, policy, host, gate, delay)
 
     async def _fetch(
-        self, source_key: str, policy: SourceUrlPolicy, host: str, gate: BudgetGate
+        self,
+        source_key: str,
+        policy: SourceUrlPolicy,
+        host: str,
+        gate: BudgetGate,
+        delay: Decimal | None = None,
     ) -> tuple[RobotsRevision, FetchOutcome]:
         robots_url = robots_url_for(policy, host)  # PolicyDenied: never requested
-        request = BudgetRequest(source_key=source_key, host=host, purpose="robots", url=robots_url)
+        request = BudgetRequest(
+            source_key=source_key, host=host, purpose="robots", url=robots_url, crawl_delay=delay
+        )
         decision = await gate.acquire(request)
         if not isinstance(decision, Allow):
             raise BudgetRefused(decision, now=ensure_utc(self._clock.now()))

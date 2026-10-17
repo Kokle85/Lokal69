@@ -84,6 +84,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from suv_deals.adapters.base import FetchOutcome, FetchPurpose, ParserHealth
 from suv_deals.clock import ensure_utc
+from suv_deals.crawling.robots import ACCESS_DENIED_STATUSES
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import (
     AccessState,
@@ -143,6 +144,7 @@ MAX_ROBOTS_BODY_BYTES: Final = 512 * 1024
 MAX_BACKOFF: Final = timedelta(days=1)
 _HOST_RE: Final = re.compile(r"^[a-z0-9.-]{1,253}$")
 _CODE_RE: Final = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 _PARTITION_RE: Final = re.compile(r"^[A-Za-z0-9_:.-]{1,80}$")
 _HEADER_ALLOWLIST: Final = frozenset(
     {"content-type", "retry-after", "last-modified", "etag", "x-robots-tag", "x-robots-status"}
@@ -1129,11 +1131,14 @@ _SMOKE_CONFIG_SQL: Final = (
 
 def _robots_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
     """One stored robots revision for the smoke evidence (no body; availability as the worker's
-    robots guard reads it: a body = available, no body but parsed = unavailable (no robots.txt:
-    no restriction), neither = unreachable (complete disallow))."""
+    robots guard reads it: a body = available, a 401/403/407 without a body = access_denied (an
+    access block, says nothing about the directives), any other no body but parsed = unavailable
+    (no robots.txt: no restriction), neither = unreachable (complete disallow))."""
     evidence = {k: v for k, v in row.items() if k != "has_body"}
     if row["has_body"]:
         evidence["availability"] = "available"
+    elif row["http_status"] in ACCESS_DENIED_STATUSES:
+        evidence["availability"] = "access_denied"
     else:
         evidence["availability"] = "unavailable" if row["parse_ok"] else "unreachable"
     return evidence
@@ -1583,32 +1588,48 @@ async def record_robots_revision(
     body: str | None,
     parse_ok: bool,
     user_agent: str | None = None,
+    content_hash: str | None = None,
+    body_truncated: bool = False,
 ) -> RobotsRevisionResult:
-    """Store one robots.txt fetch (bounded body + SHA-256 of the full body); report changes.
+    """Store one robots.txt fetch (bounded body + SHA-256); report changes.
+
+    ``content_hash`` is the robots module's SHA-256 of the robots.txt bytes as fetched
+    (`crawling.robots.RobotsRevision.content_hash`, the value ``capture-samples`` reports too);
+    without it the SHA-256 of ``body`` (UTF-8) is stored. ``body_truncated`` records that the
+    fetcher or the parser cut the body (the stored body is also flagged when it exceeds the
+    column bound).
 
     A changed robots revision invalidates stale activation evidence (spec 5): the affected
     sources get a ``source.robots_changed`` audit event for review; nothing is auto-enabled.
 
-    A fetch that could not read robots.txt at all (no body and ``parse_ok`` false: 5xx, 429,
-    network failure; `crawling.robots.RobotsAvailability.UNREACHABLE`) is stored but says nothing
-    about the directives: it is never compared, and later fetches are compared with the last
-    revision that was read (a body, or a 4xx "no robots.txt"). An outage therefore raises no
-    review item, while a disappeared or changed robots.txt does.
+    A fetch that did not read robots.txt is stored but says nothing about the directives: it is
+    never compared, and later fetches are compared with the last revision that was read (a body,
+    or a 4xx "no robots.txt"). That covers an unreachable robots.txt (no body and ``parse_ok``
+    false: 5xx, 429, network failure; `crawling.robots.RobotsAvailability.UNREACHABLE`) and an
+    access denial (401/403/407 without a body, `crawling.robots.ACCESS_DENIED_STATUSES`). An
+    outage or a block, and their recovery, therefore raise no review item, while a disappeared or
+    changed robots.txt does.
     """
     _require_system_or_admin(actor)
     name = _clean_host(host)
     if http_status is not None and not 100 <= http_status <= 599:
         raise ValidationFailed("http_status must be an HTTP status code")
-    content_hash = None if body is None else hashlib.sha256(body.encode("utf-8")).hexdigest()
-    stored, truncated = _bounded_body(body)
-    read = body is not None or parse_ok
+    if content_hash is not None and (body is None or not _SHA256_RE.fullmatch(content_hash)):
+        raise ValidationFailed("content_hash must be the SHA-256 of a stored robots.txt body")
+    if content_hash is None and body is not None:
+        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    stored, cut = _bounded_body(body)
+    truncated = cut or (body is not None and body_truncated)
+    denied = body is None and http_status in ACCESS_DENIED_STATUSES
+    read = body is not None or (parse_ok and not denied)
     async with mapped_errors():
         previous = await fetch_one(
             conn,
             "select content_hash from ops.robots_revisions where workspace_id = %(workspace_id)s"
-            " and host = %(host)s and (body is not null or parse_ok)"
+            " and host = %(host)s and (body is not null"
+            " or (parse_ok and not coalesce(http_status = any(%(denied)s::int[]), false)))"
             " order by fetched_at desc, id desc limit 1",
-            {"workspace_id": actor.workspace_id, "host": name},
+            {"workspace_id": actor.workspace_id, "host": name, "denied": sorted(ACCESS_DENIED_STATUSES)},
         )
         row = await fetch_one(
             conn,

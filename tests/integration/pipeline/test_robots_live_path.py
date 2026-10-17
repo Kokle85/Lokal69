@@ -46,6 +46,8 @@ from suv_deals.adapters.fixture_client import FixtureCrawlClient
 from suv_deals.cli import cli
 from suv_deals.clock import SystemClock
 from suv_deals.crawling.rate_limits import next_utc_midnight
+from suv_deals.crawling.robots import RobotsFetchResponse
+from suv_deals.crawling.robots_guard import CrawlClientRobotsTransport
 from suv_deals.crawling.scheduler import run_scheduler_tick
 from suv_deals.domain.enums import JobState, JobType, SourceMode
 from suv_deals.persistence import listings_repo
@@ -395,6 +397,74 @@ async def test_an_access_denial_on_robots_txt_stops_and_reports(
             HOST,
         )
         assert blocked
+        # The evidence names the answer an access denial, not "no robots.txt" (no restriction).
+        evidence = await asyncio.to_thread(_cli_json, db_url, env, "smoke-evidence", SOURCE_KEY)
+        [shown] = evidence["robots_revisions"]
+        assert (shown["http_status"], shown["content_hash"], shown["availability"]) == (
+            403,
+            None,
+            "access_denied",
+        )
+        assert _robots_audits(env) == []  # an access denial says nothing about the directives
+    finally:
+        await env.close()
+
+
+async def test_a_non_standard_status_on_robots_txt_is_unreachable_and_recorded(
+    env: PipelineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vendor status (999) on robots.txt is no HTTP status code: the revision is stored without
+    one (unreachable: complete disallow), the counted robots request is logged, and the job waits
+    for the 30-minute retry instead of dying on a validation error."""
+
+    async def vendor_status(
+        self: CrawlClientRobotsTransport, url: str, *, source_key: str
+    ) -> RobotsFetchResponse:
+        del self, url, source_key
+        return RobotsFetchResponse(999, b"Request denied", None)
+
+    monkeypatch.setattr(CrawlClientRobotsTransport, "get", vendor_status)
+    report = await _discover(env)
+    assert report.state == JobState.QUEUED and report.code == "ROBOTS_UNREACHABLE"
+    assert _requests(env) == []  # no page request (and robots.txt came from the patched transport)
+    [revision] = _revisions(env)
+    assert revision["http_status"] is None and revision["body"] is None and not revision["parse_ok"]
+    [robots] = _fetches(env)
+    assert (robots["purpose"], robots["http_status"], robots["error_code"]) == (
+        "robots",
+        None,
+        "robots_http_999",
+    )
+    assert _requests_today(env) == 1  # the counted request is in the evidence
+    [job] = jobs_of(env, JobType.DISCOVERY)
+    assert job["state"] == "queued" and job["attempts"] == 0
+    [run_row] = env.rows("select outcome from ops.crawl_runs where workspace_id = %s", env.workspace_id)
+    assert run_row["outcome"] == "cancelled"
+
+
+async def test_rules_for_our_product_token_apply_in_the_worker(
+    db_url: str, seed: Seed, tmp_path: Path
+) -> None:
+    """robots.txt allows everything for `*` but disallows the search for SUVDealResearch: the
+    worker evaluates our group, so the search page is never requested."""
+    directory = _copy_set(
+        tmp_path,
+        robots=(
+            "# SYNTHETIC FIXTURE: rules for our product token only\n"
+            "User-agent: *\nAllow: /\n\n"
+            "User-agent: SUVDealResearch\nDisallow: /suche?typ=suv\nCrawl-delay: 45\n"
+        ),
+    )
+    env = await build_env(db_url, seed, fixture_dirs=[directory])
+    try:
+        report = await _discover(env)
+        assert report.state == JobState.SUCCEEDED and report.details["completeness"] == "failed"
+        assert _requests(env) == [(ROBOTS_URL, "robots")]
+        assert [(f["purpose"], f["access_state"], f["error_code"]) for f in _fetches(env)] == [
+            ("robots", "ok", None),
+            ("search", "policy_denied", "robots_disallowed"),
+        ]
+        assert _requests_today(env) == 1
     finally:
         await env.close()
 
