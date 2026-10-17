@@ -17,9 +17,9 @@ enabled: false
 # a 12-model `crawl once --max-pages 12`, then `worker --drain --queues detail --max-jobs 5`):
 # the worker fetched robots.txt itself (HTTP 200, available, sha256 7c78475c..., unchanged), 12
 # search pages HTTP 200, access ok, complete, 15 cards, 5 detail pages ingested, no block; the
-# source was switched off again. Run ids and the evidence record (two items still missing):
-# docs/source_access_register.md ("Live smoke evidence"). Still disabled: enabling is step 7, a
-# separate owner decision.
+# source was switched off again. Run ids and the evidence record: docs/source_access_register.md
+# ("Live smoke evidence") and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json. Still
+# disabled: enabling is step 7, a separate owner decision.
 technical_status: live_smoke_passed
 terms_status: restricted
 terms_url: https://www.autoscout24.com/company/agb/
@@ -72,17 +72,17 @@ search:
   # Sellers in Italy only (the adapter accepts no other value here). Live finding of the owner's
   # 12-model smoke on 2026-10-17 (crawl once --max-pages 12: 12 search pages HTTP 200, complete,
   # 49 cards, 5 detail pages ingested), sent without a country filter: three of the five
-  # ingested listings came from other countries, two Dutch dealers (rejected by screening as
-  # COUNTRY_NOT_IN_PROFILE) and a German listing (accepted by the country rule, needs_facts).
+  # ingested listings came from other countries, a Dutch and a Belgian one (rejected by screening
+  # as COUNTRY_NOT_IN_PROFILE) and a German one (accepted by the country rule, needs_facts).
   # Each model's one page of 20 newest cards can fill with foreign listings, spending the request
   # budget and hiding Italian ones. The site's normalised query (pageQuery) on the owner's
   # capture carries cy=I, but that request sent no cy: I was the server's default there, while
   # the crawler's requests got foreign sellers. STRONGLY INDICATED the same day, not yet confirmed
   # by seller country (owner's second 12-model walk with cy=I, run 46f4bdec): 15 cards instead
-  # of 49, every one already seen in the unfiltered walk; of the five listings ingested from that
-  # walk, the two with an Italian seller (Qashqai, Yeti) are among the 15 and the three foreign
-  # ones are not (that run's "listings not seen in a complete scan": 3); the seller countries of
-  # the other 13 cards confirm it. If it holds, German sellers come in only through
+  # of 49, every one already seen in the unfiltered walk; of the listings whose seller country
+  # is known, the 2 it returned are Italian (Qashqai, Yeti) and the 7 it no longer returned are
+  # foreign (NL, BE, DE, BE, AT, BE, FR; one more was removed from the site, HTTP 410); the
+  # seller countries of the other 13 cards confirm it. If it holds, German sellers come in only through
   # autoscout24_de (card_only, no detail page) and Swiss sellers through neither AutoScout24
   # source (autoscout24_ch is blocked). robots.txt disallows a query only on the bare /lst? and /lst/?
   # paths, not on /lst/<make>/<model>, so the URL still passes the search path policy and robots.txt.

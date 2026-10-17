@@ -59,8 +59,8 @@ search:
   # Sellers in Germany only (the adapter accepts no other value here). Live finding of the
   # owner's 12-model smoke of autoscout24_it on 2026-10-17 (crawl once --max-pages 12: 12 search
   # pages HTTP 200, complete, 49 cards, 5 detail pages ingested), sent without a country filter:
-  # three of the five ingested Italian-site listings came from other countries (two Dutch
-  # dealers, rejected by screening as COUNTRY_NOT_IN_PROFILE; a German listing, accepted by the
+  # three of the five ingested Italian-site listings came from other countries (a Dutch and a
+  # Belgian one, rejected by screening as COUNTRY_NOT_IN_PROFILE; a German one, accepted by the
   # country rule). The same search app serves .de, and its captured pageQuery carries cy=D, but
   # that request sent no cy: D was the server's default there. Whether an explicit cy=D narrows
   # the results is UNVERIFIED until a live 12-model walk of this source shows only DE seller

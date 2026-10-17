@@ -160,8 +160,12 @@ def test_autoscout24_it_rows_record_step_6_and_name_enabling_next() -> None:
         # countries of the cards confirm it, so no row may call it verified yet.
         assert "`cy=I` strongly indicated" in row and "`cy=I` verified" not in row
     assert "Live smoke evidence" in register_row
-    # The evidence record still lacks items, so nothing claims live_verified.
-    assert "not complete yet" in _text("docs/source_access_register.md")
+    # The evidence record is complete (2026-10-17): the five step-6 detail ingests have their
+    # revision ids, and the ids-only evidence file carries no URL or listing text.
+    evidence = _text("docs/evidence/autoscout24_it_live_smoke_2026-10-17.json")
+    for revision in ("faf012b2-325d-4f22-9dfc-f638cecc273c", "4cde316a-040a-4c72-8be9-b3a05e4722a2"):
+        assert revision in evidence and revision in _text("docs/source_access_register.md")
+    assert "://" not in evidence and "/annunci/" not in evidence
     assert "evidence log" in gates_row
     register = _text("docs/source_access_register.md")
     record = register[register.index("### Live smoke evidence") : register.index("### Synthetic fixture")]

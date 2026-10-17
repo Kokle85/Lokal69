@@ -51,8 +51,8 @@ come from: the server-normalised ``pageQuery`` of the owner's captures carries `
 and ``D`` (.de), but those requests sent no ``cy`` (their own query has none), so the value is the
 server's default for those requests, not proof that an explicit ``cy`` narrows the results. The
 crawler's requests without ``cy`` were answered differently: in the owner's 12-model live smoke of
-autoscout24.it on 2026-10-17, three of the five ingested listings came from other countries (two
-Dutch dealers, rejected by screening as ``COUNTRY_NOT_IN_PROFILE``, and a German listing, which
+autoscout24.it on 2026-10-17, three of the five ingested listings came from other countries (a
+Dutch and a Belgian one, rejected by screening as ``COUNTRY_NOT_IN_PROFILE``, and a German one, which
 the country rule accepts and screening left at ``needs_facts``). Both shipped configurations
 therefore set ``cy``; whether it narrows the results stays UNVERIFIED on both sites until a live
 12-model walk shows every ingested listing's seller country equal to the source's own. Keeping it

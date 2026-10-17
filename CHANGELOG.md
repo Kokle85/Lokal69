@@ -16,9 +16,12 @@ ingested, no block; the source was switched off again. `config/sources/autoscout
 decision). The same walk strongly indicates that the seller-country filter `cy=I` works (15 cards
 instead of the unfiltered walk's 49; its three foreign listings gone, its two Italian ones kept;
 the seller countries of the other cards confirm it once their detail pages are read) and
-requested all twelve model slugs (every one HTTP 200). The evidence record still lacks the five
-ingests' revision ids and the crawler gate evidence; `sources smoke-evidence` now prints each
-revision's seller country. Evidence: docs/source_access_register.md "Live smoke
+requested all twelve model slugs (every one HTTP 200). `sources smoke-evidence` now prints each
+revision's seller country. The record was completed the same day: the five step-6 detail ingests
+(BE, AT, BE, FR rejected; one HTTP 410 recorded as removed), the status in the database and the
+crawler gate (`existing_crawler` `live_verified` on the owner's workstation: firewall rules
+present, isolation verified, `doctor --crawler` passed, image digest recorded); the ids are in
+docs/evidence/autoscout24_it_live_smoke_2026-10-17.json. Evidence: docs/source_access_register.md "Live smoke
 evidence" and the ACTIVATION_GATES.md evidence log; runbook 9.1 now says how the owner writes the
 status into the database with its time (`sources set-technical-status`, before the next sync).
 
@@ -85,7 +88,8 @@ AutoScout24 seller-country filter (live finding of 2026-10-17). The owner's 12-m
 `autoscout24_it` (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards,
 5 detail pages ingested) sent a search URL (`pricefrom`, `priceto`, `kmto`, `sort`, `desc`,
 `ustate`) with no country filter, and three of the five ingested listings came from other
-countries: two were Dutch dealers, rejected by screening (primary profile `source_countries` DE,
+countries: a Dutch and a Belgian one (seller countries NL and BE, read back on 2026-10-17 from the
+revisions; first reported as two Dutch dealers), rejected by screening (primary profile `source_countries` DE,
 IT, CH -> `COUNTRY_NOT_IN_PROFILE`), and one was a German listing, which the country rule accepts
 (screened `needs_facts`). With one page of 20 newest cards per model, foreign listings spend the
 request budget and can hide every Italian or German one.

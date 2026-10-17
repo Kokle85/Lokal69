@@ -3,12 +3,12 @@
 What must happen before each capability of the SUV deal system may run against real services,
 who does it, how it is done, how it is verified and what evidence is kept. Contract: spec section
 32 (activation gates and honest completion states), section 31 (exact-build evidence) and section
-37.10 (activation evidence for the seller-email route). Status as of **2026-10-10** (wave D3); `source_access` updated 2026-10-17.
+37.10 (activation evidence for the seller-email route). Status as of **2026-10-10** (wave D3); `existing_crawler` and `source_access` updated 2026-10-17.
 
-**Nothing is active and nothing is `live_verified`.** The furthest live step is `source_access`
-step 6 for `autoscout24_it`: the owner's hand-run live smoke of 2026-10-17 on the owner's
-workstation and Crawl4AI passed (evidence log below; the record still lacks two items); the source
-stays disabled until the owner enables it. Apart from the owner's
+**Nothing is active.** Two things are `live_verified`, both on the owner's workstation on
+2026-10-17 (evidence log below): the crawler (`existing_crawler`) and the AutoScout24 Italy source
+(`source_access` step 6 for `autoscout24_it`, the owner's hand-run live smoke); the source stays
+disabled until the owner enables it. Apart from the owner's
 AutoScout24 Italy smokes that day, no live crawl, no real e-mail sent or read, no Slack, no dot,
 no Outlook on a real PC and no deployed service has been used. Every source is disabled and every external effect is off by default (README "Safety
 defaults"). The work these gates protect is complete and tested offline
@@ -90,10 +90,11 @@ Each step only needs the steps above it; any step can stop without affecting the
 
 ## 2. `existing_crawler` (Crawl4AI service)
 
-- **State:** `implemented` (client, URL policy, SSRF guards, fixture pipeline). The owner's
-  Crawl4AI on the workstation served the AutoScout24 Italy smokes of 2026-10-17 (the worker's
-  crawler contract check reported `ready: true`); this gate's own evidence (doctor output, image
-  digest, firewall listings, reachability check) is not recorded yet.
+- **State:** `live_verified` on the owner's workstation (2026-10-17, evidence log): the owner's
+  Crawl4AI (host-local loopback `127.0.0.1:11235`) served the AutoScout24 Italy smokes that day;
+  afterwards `scripts/crawler_firewall.sh --check` found all eight rules already present and
+  verified the isolation from inside the crawler, and `doctor --process worker --crawler` passed.
+  The VPS (gate `hosting`) is not set up.
 - **Prerequisites:** an approved host (gate `hosting` or the owner's workstation); the pinned
   image `unclecode/crawl4ai:0.9.4` with its tested digest; an API token; the host firewall rules.
 - **Who:** operator provisions; owner approves the host.
@@ -559,4 +560,5 @@ Append one row per completed activation step (newest last). Ids, versions, hashe
 | Date (UTC) | Gate / step | Commit | Evidence (ids, codes) | Recorded by |
 |---|---|---|---|---|
 | 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 37 pages, DE 23 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |
-| 2026-10-17 | `source_access` step 6 (live smoke): `autoscout24_it` -> `live_smoke_passed`; the owner's hand-run smoke (docs/runbook.md 9.1: `crawl once --max-pages 12`, `worker --drain --queues detail --max-jobs 5`); the source stays `enabled: false` | `25f43f8a1451f534cb49e1b93659f904f263742a` | config revision 1 `360d0a9d-b46d-4442-bb8b-309751cde88e`; `autoscout24@1.0.0`; job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, run `46f4bdec-1a91-4702-8ecb-1dff3f5a7255` (`complete`, `access_state: ok`, 12 pages, 15 cards); robots fetch `03976780-d703-4d0c-bcb3-c6838b10e05d` (HTTP 200) and revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (SHA-256 `7c78475c...`); 12 search fetches HTTP 200; 5 detail jobs succeeded (queued by the morning walk; their revision ids not yet recorded); the run created no revision (no new or changed card); still missing: those revision ids and the crawler gate evidence; full record: docs/source_access_register.md "Live smoke evidence" | owner (smoke), operator (record) |
+| 2026-10-17 | `source_access` step 6 (live smoke): `autoscout24_it` -> `live_smoke_passed`; the owner's hand-run smoke (docs/runbook.md 9.1: `crawl once --max-pages 12`, `worker --drain --queues detail --max-jobs 5`); the source stays `enabled: false` | `25f43f8a1451f534cb49e1b93659f904f263742a` | config revision 1 `360d0a9d-b46d-4442-bb8b-309751cde88e`; `autoscout24@1.0.0`; job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, run `46f4bdec-1a91-4702-8ecb-1dff3f5a7255` (`complete`, `access_state: ok`, 12 pages, 15 cards); robots fetch `03976780-d703-4d0c-bcb3-c6838b10e05d` (HTTP 200) and revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (SHA-256 `7c78475c...`); 12 search fetches HTTP 200; 5 detail jobs succeeded (queued by the morning walk): revisions `faf012b2-325d-4f22-9dfc-f638cecc273c`, `d0f0ca62-27a5-4d5f-9991-b1bf11bff2a4`, `7ce1c9bb-f233-40ad-895f-afe861d2ef43`, `4cde316a-040a-4c72-8be9-b3a05e4722a2` and one HTTP 410 (removed, no revision); the run created no revision (no new or changed card); status recorded in the database with `last_live_smoke_at`; full record: docs/source_access_register.md "Live smoke evidence" and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json | owner (smoke), operator (record) |
+| 2026-10-17 | `existing_crawler` -> `live_verified` on the owner's workstation (host-local loopback `127.0.0.1:11235`) | `80e1f96` | `scripts/crawler_firewall.sh --check`: 8 rules present (DOCKER-USER: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, tcp 5432:6543; INPUT: `br-suv-crawl`, `br-suv-crawlint` NEW), none added; "crawler isolation verified: 9 target(s) blocked", no `REACHABLE` line; `doctor --process worker --crawler`: health OK version 0.9.4 (matches the pin), unauthenticated requests refused (401), read-only contract inspection passed; image `unclecode/crawl4ai@sha256:9021b3cb5c6f12570bbcd5395638495e0a06969b3148e377b953d174af2ebc9b`. Recorded after the same day's AutoScout24 Italy smokes (the rules were already in place) | owner (checks), operator (record) |

@@ -444,8 +444,8 @@ state of every gate, its missing dependency and the smallest owner action are in
 - **Crawler**: `doctor --crawler` against the real runtime, plus the host firewall rules of
   section 3.2 (DOCKER-USER **and** INPUT) with the in-container verification showing every host
   address unreachable. No live crawl before both are recorded. (The owner's AutoScout24 Italy
-  smokes of 2026-10-17 ran without this evidence recorded in the repository: record it before
-  enabling any source.)
+  smokes of 2026-10-17 ran before this evidence was recorded; the check the same day found every
+  rule already present and the isolation verified: ACTIVATION_GATES.md evidence log.)
 - **Each source**, in this order (`docs/source_access_register.md` steps 1-7): a terms decision
   and robots handling; an **adapter implementation with a real `adapter_version`, verified routes
   and saved fixtures** (10 of the 14 registered sources are `adapter_version: unimplemented`
@@ -474,7 +474,7 @@ stay `enabled: false`; `sources inspect <key>` and `doctor --verbose` show exact
 
 State on 2026-10-17: `autoscout24_it` passed step 6, the owner's live smoke below run as a
 12-model walk at commit `25f43f8` (evidence: docs/source_access_register.md, "Live smoke
-evidence", two items still missing there), and is `technical_status: live_smoke_passed`, still
+evidence"), and is `technical_status: live_smoke_passed`, still
 disabled until the owner enables it (step 7). `autoscout24_de` is next: the same commands with
 its key. `sources smoke-evidence` prints each revision's seller country (since the commit after
 `87fee45`), the check of the `cy` filter.
@@ -578,17 +578,17 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   own code, `I` or `D`): the owner's 12-model smoke of `autoscout24_it` that day
   (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages
   ingested) ran without a country filter, and three of the five ingested listings came from other
-  countries: two Dutch dealers, rejected by screening as `COUNTRY_NOT_IN_PROFILE`, and a German
-  listing, which the country rule accepts (screened `needs_facts`). With one page of 20 newest
+  countries: a Dutch and a Belgian one, rejected by screening as `COUNTRY_NOT_IN_PROFILE`, and a
+  German one, which the country rule accepts (screened `needs_facts`). With one page of 20 newest
   cards per model, foreign listings spend the request budget and hide Italian (or German) ones.
   `I` / `D` is what the sites' normalised query (`pageQuery`) carried on the owner's captures,
   but those requests sent no `cy`: it was the server's default for them, and the crawler's
   requests without `cy` evidently got a different one. Whether an explicit `cy` narrows the
   results was therefore unverified. On .it it is strongly indicated, not yet confirmed: the
   owner's second 12-model walk of 2026-10-17, with `cy=I`, returned 15 cards instead of the
-  unfiltered walk's 49, and of the five listings ingested from that walk the two with an Italian
-  seller were among them while the three foreign ones were not; the seller countries of the other
-  13 cards (their detail pages) confirm it. On .de it stays **unverified** until a live walk of
+  unfiltered walk's 49; of the listings whose seller country is known, the 2 it returned are
+  Italian and the 7 it no longer returned are foreign (NL, BE, DE, BE, AT, BE, FR); the seller
+  countries of the other 13 cards (their detail pages) confirm it. On .de it stays **unverified** until a live walk of
   `autoscout24_de` shows it.
   robots.txt disallows a query on the bare `/lst?` and `/lst/?` paths (and, on autoscout24.de, any
   URL with `cat=`), not on `/lst/<make>/<model>`, so the filtered `/lst/<make>/<model>?...` URL
