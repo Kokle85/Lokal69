@@ -65,40 +65,40 @@ files:
     while 3 results are reported; no card is Organic/Main, which is drift, never an empty healthy page.'
   server_error.html: 503 maintenance body.
 routes:
-  https://www.autoscout24.de/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_normal.html
     description: 'primary-profile search of model 1 (renault/captur): normal search page'
-  https://www.autoscout24.de/lst/nissan/qashqai?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/nissan/qashqai?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_model2.html
     description: 'primary-profile search of model 2 (nissan/qashqai): the walk''s next page'
-  https://www.autoscout24.de/lst/nissan/juke?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/nissan/juke?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 3: explicit empty result'
-  https://www.autoscout24.de/lst/kia/sportage?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/kia/sportage?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 4: explicit empty result'
-  https://www.autoscout24.de/lst/opel/mokka?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/opel/mokka?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 5: explicit empty result'
-  https://www.autoscout24.de/lst/opel/mokka-x?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/opel/mokka-x?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 6: explicit empty result'
-  https://www.autoscout24.de/lst/dacia/duster?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/dacia/duster?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 7: explicit empty result'
-  https://www.autoscout24.de/lst/peugeot/2008?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/peugeot/2008?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 8: explicit empty result'
-  https://www.autoscout24.de/lst/hyundai/ix35?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/hyundai/ix35?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 9: explicit empty result'
-  https://www.autoscout24.de/lst/opel/antara?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/opel/antara?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 10: explicit empty result'
-  https://www.autoscout24.de/lst/skoda/yeti?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/skoda/yeti?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 11: explicit empty result'
-  https://www.autoscout24.de/lst/suzuki/sx4-s-cross?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1:
+  https://www.autoscout24.de/lst/suzuki/sx4-s-cross?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_empty.html
     description: 'primary-profile search of model 12: explicit empty result'
   https://www.autoscout24.de/lst/renault/captur?fixture=price-missing:

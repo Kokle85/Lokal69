@@ -517,7 +517,9 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `--workspace <id>` to `sources sync`, `sources inspect --from-db` and `crawl once`.
 - `crawl once` takes no URL: the adapter builds the search for the first configured model
   (`/lst/renault/captur`, the slug verified on the owner's captures) with the primary profile's
-  price band, `kmto` and `sort=age&desc=1&ustate=U`; `--max-pages 1` means ONE search request,
+  price band, `kmto`, `sort=age&desc=1&ustate=U` and the seller-country filter `cy=I`
+  (`https://www.autoscout24.it/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&ustate=U&cy=I`;
+  on .de `...&sort=age&desc=1&cy=D`, no `ustate`); `--max-pages 1` means ONE search request,
   through the URL policy, robots.txt and the persistent budget gate (20 s spacing; daily budget
   600 requests for .it, 350 for .de). Expected: `Job state: succeeded`, `pages: 1`, `completeness: budget_limited` (12 models,
   capped at one page).
@@ -526,6 +528,18 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   its own run, so a drain without `--max-jobs` fetches every queued `/annunci/` page, 20 s apart.
   `--max-jobs 5` is the bound here: at most 5 detail jobs, one `/annunci/` page each (use
   `--max-jobs 1` for one); the jobs left waiting are never fetched (see the report-back item).
+- `cy` since 2026-10-17 (`search.cy` in the source YAML; the adapter accepts only the source's
+  own code, `I` or `D`): the owner's 12-model smoke of `autoscout24_it` that day
+  (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages
+  ingested) ran without a country filter, and the site answered with sellers from all of Europe:
+  two of the five ingested listings were Dutch dealers, rejected by screening as
+  `COUNTRY_NOT_IN_PROFILE`, and another card was a German listing. With one page of 20 newest cards
+  per model, foreign listings spend the request budget and hide Italian (or German) ones. `cy=I` /
+  `cy=D` is the value the sites' own normalised query (`pageQuery`) carried on the owner's
+  captures. robots.txt disallows a query only on the bare `/lst?` and `/lst/?` paths, so the
+  filtered `/lst/<make>/<model>?...` URL still passes the URL policy and robots.txt. After the
+  change, a listing of either source screened out as `COUNTRY_NOT_IN_PROFILE` means the filter was
+  not applied: report it.
 - This one-page smoke requests ONLY `/lst/renault/captur`, the slug already verified on the
   captures: it checks the live page structure, not the model slugs marked UNVERIFIED in the
   configuration notes. Those are first requested by a full 12-model walk, either a separate

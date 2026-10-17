@@ -6,6 +6,7 @@ See ``tests/adapters/autoscout24_synthetic.py``: structure from the owner's capt
 
 from __future__ import annotations
 
+import hashlib
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -27,6 +28,7 @@ from tests.adapters.conftest import NOW, raw_document
 
 from suv_deals.adapters.autoscout24 import (
     ADAPTER_VERSION,
+    COUNTRY_FILTER_CODES,
     AutoScout24DeAdapter,
     AutoScout24ItAdapter,
     ModelSearch,
@@ -36,6 +38,7 @@ from suv_deals.adapters.autoscout24 import (
 )
 from suv_deals.adapters.base import FetchPurpose, RawDocument, SearchRequest, SourceAdapter
 from suv_deals.adapters.registry import ADAPTERS, gate_status, load_registry
+from suv_deals.crawling.robots import RobotsAvailability, RobotsRevision, evaluate, parse_robots_txt
 from suv_deals.domain.enums import (
     AccessState,
     BodyType,
@@ -200,6 +203,7 @@ def test_query_is_built_from_the_profile_bounds_newest_first_used_only() -> None
         ("sort", "age"),
         ("desc", "1"),
         ("ustate", "U"),
+        ("cy", "I"),
     ]
     assert request.page_number == 1 and request.cursor is None and request.params["ustate"] == "U"
     assert adapter.policy.is_search_url(request.url)
@@ -209,8 +213,141 @@ def test_german_query_sends_no_offer_state_and_no_cat_parameter() -> None:
     request = _de().build_search(_profile(), None)
     query = dict(parse_qsl(urlsplit(request.url).query))
     assert urlsplit(request.url).hostname == DE_HOST
-    assert query == {"pricefrom": "2500", "priceto": "3000", "kmto": "200000", "sort": "age", "desc": "1"}
+    assert query == {
+        "pricefrom": "2500",
+        "priceto": "3000",
+        "kmto": "200000",
+        "sort": "age",
+        "desc": "1",
+        "cy": "D",
+    }
     assert "cat" not in query
+
+
+#: The search-relevant robots.txt rules named in each source's ``robots_summary`` (re-checked
+#: 2026-10-14), rebuilt as a robots.txt for the evaluator. A RECONSTRUCTION of the recorded facts,
+#: not the sites' file (dealer and API paths are left out: the summary names no path for them).
+_RECORDED_ROBOTS = {
+    "autoscout24_it": (
+        IT_HOST,
+        "User-agent: *\nDisallow: /lst?\nDisallow: /lst/?\nDisallow: /ricerca-avanzata\n",
+    ),
+    "autoscout24_de": (
+        DE_HOST,
+        "User-agent: *\nDisallow: /angebote/\nDisallow: /lst?\nDisallow: /lst/?\nDisallow: /*cat=\n"
+        "Disallow: /detailsuche\n",
+    ),
+}
+_ROBOTS_UA = "SUVDealResearch/0.1 (+private research; contact owner)"
+
+
+def _recorded_robots(key: str) -> RobotsRevision:
+    host, text = _RECORDED_ROBOTS[key]
+    body = text.encode("utf-8")
+    return RobotsRevision(
+        host=host,
+        robots_url=f"https://{host}/robots.txt",
+        fetched_at=NOW,
+        http_status=200,
+        availability=RobotsAvailability.AVAILABLE,
+        content_hash=hashlib.sha256(body).hexdigest(),
+        parse_ok=True,
+        groups=parse_robots_txt(body).groups,
+    )
+
+
+@pytest.mark.parametrize(("key", "code"), [("autoscout24_it", "I"), ("autoscout24_de", "D")])
+def test_each_source_filters_on_its_own_seller_country(key: str, code: str) -> None:
+    """Live finding 2026-10-17: without ``cy`` the sites answer with sellers from all of Europe."""
+    adapter = _it() if key == "autoscout24_it" else _de()
+    assert adapter.config.search["cy"] == code == COUNTRY_FILTER_CODES[adapter.config.country]
+    robots = _recorded_robots(key)
+    for index in range(len(adapter.models)):
+        request = adapter.build_search(_profile(), None if index == 0 else f"model:{index}")
+        query = parse_qsl(urlsplit(request.url).query)
+        assert query[-1] == ("cy", code) and [k for k, _ in query].count("cy") == 1
+        assert request.params["cy"] == code
+        # The filtered URL stays inside the source's search path policy and robots.txt: a query
+        # is disallowed only on the bare /lst? and /lst/? paths, never on /lst/<make>/<model>.
+        assert adapter.policy.is_search_url(request.url)
+        verdict = evaluate(robots, request.url, _ROBOTS_UA, now=NOW)
+        assert verdict.allowed, (request.url, verdict)
+    # The reconstruction does refuse what robots.txt disallows (it is not an allow-all).
+    assert not evaluate(robots, f"https://{robots.host}/lst?cy={code}", _ROBOTS_UA, now=NOW).allowed
+    assert not evaluate(robots, f"https://{robots.host}/lst/?cy={code}", _ROBOTS_UA, now=NOW).allowed
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("autoscout24_it", "D"),
+        ("autoscout24_it", "NL"),
+        ("autoscout24_it", "i"),
+        ("autoscout24_it", "I,D"),
+        ("autoscout24_it", " I"),
+        ("autoscout24_it", "I&cat=x"),
+        ("autoscout24_de", "I"),
+        ("autoscout24_de", "A"),
+        ("autoscout24_de", "D,I"),
+    ],
+)
+def test_an_unsupported_country_filter_is_refused(key: str, value: str) -> None:
+    build = _it if key == "autoscout24_it" else _de
+    search = {**REGISTRY.config(key).search, "cy": value}
+    with pytest.raises(ValidationFailed, match="unsupported cy search setting") as refused:
+        build(search=search)
+    assert refused.value.details == {"allowed": [COUNTRY_FILTER_CODES[REGISTRY.config(key).country]]}
+
+
+@pytest.mark.parametrize("key", ["autoscout24_it", "autoscout24_de"])
+def test_a_source_without_a_country_filter_sends_no_cy(key: str) -> None:
+    """The filter is opt-in: a source without ``cy`` (or an empty one) builds the URLs it built before."""
+    build = _it if key == "autoscout24_it" else _de
+    without = {k: v for k, v in REGISTRY.config(key).search.items() if k != "cy"}
+    host, ustate = (IT_HOST, "&ustate=U") if key == "autoscout24_it" else (DE_HOST, "")
+    expected = (
+        f"https://{host}/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1{ustate}"
+    )
+    for search in (without, {**without, "cy": ""}):
+        adapter = build(search=search)
+        request = adapter.build_search(_profile(), None)
+        assert request.url == expected and "cy" not in request.params
+        assert "cy" not in dict(adapter.query(_profile()))
+    with_filter = build().build_search(_profile(), None).url
+    assert with_filter == f"{expected}&cy={'I' if key == 'autoscout24_it' else 'D'}"
+
+
+@pytest.mark.parametrize(("key", "code"), [("autoscout24_it", "I"), ("autoscout24_de", "D")])
+def test_the_cards_of_a_country_filtered_page_are_still_parsed(key: str, code: str) -> None:
+    """The filter changes the request only: the page the site serves for it parses as before."""
+    adapter = _it() if key == "autoscout24_it" else _de()
+    request = _request(adapter)
+    assert request.params["cy"] == code
+    country = adapter.config.country
+    wording: dict[str, Any] = (
+        {}
+        if country == "IT"
+        else {"transmission": "Schaltgetriebe", "fuel_text": "Diesel", "power": "81 kW (110 PS)"}
+    )
+    listings = [
+        card(1, country=country, price=2900, **wording),
+        card(2, country=country, price=2800, km=151000, **wording),
+        card(3, country=country, result_type="Sponsored", section="Top", **wording),
+    ]
+    html = search_page(
+        listings,
+        number_of_results=2,
+        lang="it-IT" if country == "IT" else "de-DE",
+        page_query={"sort": "age", "desc": "1", "kmto": "200000", "cy": code},
+    )
+    parsed = adapter.parse_search(request, raw_document(request.url, html))
+    page = parsed.page
+    assert page.access_state == AccessState.OK and page.next_cursor == "model:1"
+    assert parsed.dropped == {"not_organic": 1}
+    assert [o.source_listing_id for o in page.observations] == [uuid_for(1), uuid_for(2)]
+    assert [o.card_price_minor for o in page.observations] == [290000, 280000]
+    assert [c.listing.vehicle.gearbox for c in parsed.cards] == [Gearbox.MANUAL, Gearbox.MANUAL]
+    assert all(c.listing.location.country == country for c in parsed.cards)
 
 
 def test_open_lower_bound_and_exclusive_upper_bound_profiles() -> None:

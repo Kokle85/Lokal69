@@ -42,6 +42,19 @@ Search config keys (``SourceConfig.search``):
   or commas, searched in that order.
 - ``sort`` (default ``age``) and ``desc`` (default ``1``): the site's sort key and direction.
 - ``ustate`` (optional): the site's offer-state filter (``U`` = used), sent only when configured.
+- ``cy`` (optional): the site's seller-country filter, sent only when configured. The only accepted
+  value is the source's own country code in the site's vocabulary (`COUNTRY_FILTER_CODES`: ``I``
+  for Italy, ``D`` for Germany, read from the server-normalised ``pageQuery`` of the owner's
+  captures); any other value is refused when the adapter is built.
+
+The country filter is NOT implied by the source country: it must be configured. Without ``cy`` the
+sites answer with sellers from all of Europe (owner's 12-model live smoke of autoscout24.it,
+2026-10-17: two of the five ingested listings were Dutch dealers, rejected by screening as
+``COUNTRY_NOT_IN_PROFILE``, and another card was a German listing), so both shipped configurations
+set it. Keeping it explicit means every query key the adapter sends is written in the source's
+YAML, where it is reviewed against robots.txt and the access register, and a source without ``cy``
+sends exactly the URLs it sent before. robots.txt disallows a query only on the bare ``/lst?`` and
+``/lst/?`` paths, so a ``cy`` query on ``/lst/<make>/<model>`` stays allowed.
 """
 
 from __future__ import annotations
@@ -136,7 +149,11 @@ from suv_deals.errors import ValidationFailed
 
 ADAPTER_VERSION: Final = "autoscout24@1.0.0"
 
-_SEARCH_KEYS: Final = frozenset({"models", "sort", "desc", "ustate"})
+_SEARCH_KEYS: Final = frozenset({"models", "sort", "desc", "ustate", "cy"})
+#: The sites' seller-country filter codes (query key ``cy``) by source country, from the
+#: server-normalised ``pageQuery`` of the owner's captures (``I`` on autoscout24.it, ``D`` on
+#: autoscout24.de). A source may only filter on its own country.
+COUNTRY_FILTER_CODES: Final = {"IT": "I", "DE": "D"}
 #: Sort keys of the sites' own vocabulary (``taxonomy.sortingKeys`` on the captured pages).
 _SORT_KEYS: Final = frozenset({"standard", "age", "price", "year", "mileage", "power"})
 _SLUG: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -523,6 +540,14 @@ class AutoScout24Adapter:
             raise ValidationFailed(f"source {config.source_key}: unsupported sort/desc search setting")
         if self._ustate is not None and not _USTATE.fullmatch(self._ustate):
             raise ValidationFailed(f"source {config.source_key}: unsupported ustate search setting")
+        self._cy = config.search.get("cy") or None
+        own_code = COUNTRY_FILTER_CODES[self.COUNTRY]
+        if self._cy is not None and self._cy != own_code:
+            raise ValidationFailed(
+                f"source {config.source_key}: unsupported cy search setting"
+                f" (only {own_code!r}, the {self.COUNTRY} seller-country filter, is accepted)",
+                details={"allowed": [own_code]},
+            )
 
     # ------------------------------------------------------------------ contract
 
@@ -547,6 +572,9 @@ class AutoScout24Adapter:
 
         The price band is widened to whole euros (floor/ceil) and ``kmto`` carries the mileage
         ceiling itself (the strict ``< 200,000 km`` rule is enforced by eligibility screening).
+        ``ustate`` and ``cy`` are sent only when the source configures them; ``cy`` narrows the
+        results to sellers in the source's own country (screening still checks every listing's
+        country against the profile).
         """
         params: list[tuple[str, str]] = []
         if profile.min_price_eur is not None:
@@ -557,6 +585,8 @@ class AutoScout24Adapter:
         params.append(("desc", self._desc))
         if self._ustate is not None:
             params.append(("ustate", self._ustate))
+        if self._cy is not None:
+            params.append(("cy", self._cy))
         return params
 
     def build_search(self, profile: SearchProfile, cursor: str | None) -> SearchRequest:
@@ -1853,6 +1883,7 @@ AUTOSCOUT24_ADAPTERS: tuple[type[AutoScout24Adapter], ...] = (AutoScout24ItAdapt
 __all__ = [
     "ADAPTER_VERSION",
     "AUTOSCOUT24_ADAPTERS",
+    "COUNTRY_FILTER_CODES",
     "FUEL_CODES",
     "AutoScout24Adapter",
     "AutoScout24DeAdapter",

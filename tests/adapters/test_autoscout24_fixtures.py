@@ -14,7 +14,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 from tests.adapters.autoscout24_fixture_set import (
@@ -243,6 +243,19 @@ def test_manifest_records_source_date_parser_and_designation(key: str) -> None:
     assert manifest.parser_version == config.adapter_version == ADAPTER_VERSION
     assert manifest.created.isoformat() == "2026-10-16"
     assert all(len(description) > 10 for description in manifest.files.values())
+
+
+@pytest.mark.parametrize(("key", "code"), [("autoscout24_it", "I"), ("autoscout24_de", "D")])
+def test_the_saved_model_search_routes_carry_the_country_filter(key: str, code: str) -> None:
+    """The routes of the adapter-built model searches are the URLs a live run requests (with ``cy``)."""
+    manifest = load_manifest(FIXTURES / key)
+    adapter = _adapter(key)
+    urls = model_search_urls(key)
+    assert len(urls) == len(adapter.models) == 12
+    for url in urls:
+        assert url in manifest.routes
+        assert parse_qsl(urlsplit(url).query)[-1] == ("cy", code)
+        assert adapter.policy.is_search_url(url)
 
 
 # --------------------------------------------------------------------------- search pages
