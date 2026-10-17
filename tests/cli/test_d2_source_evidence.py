@@ -54,7 +54,8 @@ def test_doctor_names_unimplemented_sources_not_activatable(run_cli: Cli) -> Non
         assert findings[key]["detail"].startswith("not activatable (no adapter"), findings[key]
     assert findings["example_dealer_template_de"]["detail"].startswith("not active:")
     # AutoScout24 Italy and Germany have an adapter (2026-10-16) that passed its saved synthetic
-    # fixture set (step 5, fixture_tested): activatable, and the disabled switch is the only gate.
+    # fixture set (step 5, fixture_tested; .it also its live smoke, step 6, live_smoke_passed):
+    # activatable, and the disabled switch is the only gate.
     for key in ("autoscout24_de", "autoscout24_it"):
         assert findings[key]["detail"] == "not active: 1 gate problem(s)", findings[key]
 

@@ -470,8 +470,13 @@ fixture_tested`. That is **not a live verification**: nothing was fetched from e
 stay `enabled: false`; `sources inspect <key>` and `doctor --verbose` show exactly one gate problem,
 "source is disabled in configuration", and `crawl once` refuses them.
 
-The next step is the owner's live smoke, ONE source at a time, `autoscout24_it` first, from the
-repository root on the WSL machine, with the crawler running on the host
+State on 2026-10-17: `autoscout24_it` passed step 6, the owner's live smoke below run as a
+12-model walk at commit `25f43f8` (evidence: docs/source_access_register.md, "Live smoke
+evidence"), and is `technical_status: live_smoke_passed`, still disabled until the owner enables
+it (step 7). `autoscout24_de` is next: the same commands with its key.
+
+The owner's live smoke runs ONE source at a time (`autoscout24_it` first, done; `autoscout24_de`
+next), from the repository root on the WSL machine, with the crawler running on the host
 (`http://127.0.0.1:11235`, section 3.1), `CRAWL4AI_API_TOKEN` and `DATABASE_URL` in `.env` (never
 on the command line) and the business configuration recorded (`suv-deals config apply`). The
 enable switch in step 1 is a LOCAL edit for the smoke only: never commit it. No `suv-deals
@@ -575,7 +580,11 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `I` / `D` is what the sites' normalised query (`pageQuery`) carried on the owner's captures,
   but those requests sent no `cy`: it was the server's default for them, and the crawler's
   requests without `cy` evidently got a different one. Whether an explicit `cy` narrows the
-  results is therefore **unverified on both sites** until a live 12-model walk shows it.
+  results was therefore unverified. On .it it does: the owner's second 12-model walk of
+  2026-10-17, with `cy=I`, returned 15 cards instead of the unfiltered walk's 49, and of the five
+  listings ingested from that walk the two Italian sellers' were among them while the three
+  foreign ones were not. On .de it stays **unverified** until a live walk of `autoscout24_de`
+  shows it.
   robots.txt disallows a query on the bare `/lst?` and `/lst/?` paths (and, on autoscout24.de, any
   URL with `cat=`), not on `/lst/<make>/<model>`, so the filtered `/lst/<make>/<model>?...` URL
   still passes the URL policy and robots.txt.
@@ -612,7 +621,11 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   the run observed (canonical URL, card price and mileage) with the persisted revision and
   field-evidence ids, and the workspace's current configuration revision. From these the operator
   records step 6 (`technical_status: live_smoke_passed`, committed with the evidence) or fixes
-  the parser first. Enabling for real (step 7) is a separate, committed configuration revision;
+  the parser first. On the owner's machine, after pulling that commit and BEFORE the next
+  `sources sync`, `uv run suv-deals sources set-technical-status <key> live_smoke_passed --reason
+  "<evidence>" --yes` writes the status into the database with its time (`last_live_smoke_at`,
+  audited); a sync alone writes the status without the time, and the command is then a no-op.
+  Enabling for real (step 7) is a separate, committed configuration revision;
   until then step 4 keeps the source off, and a detail job still queued is blocked as
   `source_paused` when a worker reaches it (nothing is fetched).
 - `doctor` reads the YAML: between steps 1 and 4 it reports `autoscout24_it` as `active
@@ -627,8 +640,8 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   stored price and mileage in `sources smoke-evidence` (`card_price_minor`, `card_mileage_km`): a
   card outside the primary profile's price band or above its mileage ceiling means that filter
   was ignored; and, for `cy`, the ingested listings' seller countries (previous bullet). Every
-  value inside is consistent with the filters, never proof of them. These filters (`cy` on both
-  sites) stay unverified until such evidence is recorded.
+  value inside is consistent with the filters, never proof of them. These filters stay unverified
+  until such evidence is recorded; for `cy` on .it it was, on 2026-10-17 (the `cy` bullet above).
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

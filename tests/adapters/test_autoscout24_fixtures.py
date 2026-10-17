@@ -757,15 +757,22 @@ async def test_no_seller_data_or_markup_reaches_any_model(key: str, client: Fixt
     assert "<script" not in text.lower() and "Synthetic description" not in text
 
 
-# --------------------------------------------------------------------------- gates after step 5
+# --------------------------------------------------------------------------- gates after steps 5-6
+
+#: Step 6 (the owner's live smoke) passed for autoscout24_it on 2026-10-17; autoscout24_de is still
+#: at step 5 (``fixture_tested``).
+STATUS_AFTER_STEPS = {
+    "autoscout24_it": TechnicalStatus.LIVE_SMOKE_PASSED,
+    "autoscout24_de": TechnicalStatus.FIXTURE_TESTED,
+}
 
 
 @pytest.mark.parametrize("key", SOURCE_KEYS)
-def test_fixture_tested_sources_stay_inactive_while_disabled(key: str) -> None:
-    """Step 5 records ``fixture_tested``; the only gate left is the owner's enable switch, which
-    stays off until the live smoke (step 6) and the enabling revision (step 7)."""
+def test_tested_sources_stay_inactive_while_disabled(key: str) -> None:
+    """Step 5 records ``fixture_tested`` and step 6 ``live_smoke_passed``; either way the only gate
+    left is the owner's enable switch, which stays off until the enabling revision (step 7)."""
     config = REGISTRY.config(key)
-    assert config.technical_status == TechnicalStatus.FIXTURE_TESTED and config.enabled is False
+    assert config.technical_status == STATUS_AFTER_STEPS[key] and config.enabled is False
     assert activation_problems(config) == []
     gate = gate_status(config)
     assert not gate.active and gate.activatable

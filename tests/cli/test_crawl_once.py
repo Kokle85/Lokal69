@@ -44,9 +44,9 @@ def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli, key: str) -> N
     assert result.exit_code == 3
     assert f"refused: source {key} is not active" in result.output
     # The owner recorded a terms decision on 2026-10-10 (proceed_acknowledged), the adapter exists
-    # (2026-10-16) and passed its saved synthetic fixture set (step 5, fixture_tested); the source
-    # stays disabled until the owner's live smoke run and enabling (register steps 6-7), and the
-    # disabled switch is the only refusal left.
+    # (2026-10-16) and passed its saved synthetic fixture set (step 5, fixture_tested; .it also
+    # its live smoke, step 6, on 2026-10-17); the source stays disabled until enabling (register
+    # step 7), and the disabled switch is the only refusal left.
     assert "adapter has not passed fixture tests" not in result.output
     assert f"refused: source {key} is not active: source is disabled in configuration" in result.output
 

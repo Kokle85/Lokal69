@@ -127,9 +127,13 @@ def test_real_configs_build_the_adapter_but_stay_disabled_and_gated(key: str) ->
     assert isinstance(adapter, AutoScout24ItAdapter | AutoScout24DeAdapter)
     assert isinstance(adapter, SourceAdapter)
     assert cfg.adapter_version == ADAPTER_VERSION == adapter.adapter_version
-    # Activation step 5 (2026-10-16): fixture_tested on the saved SYNTHETIC fixture set; still
-    # disabled, so not active (the owner's live smoke and enabling are steps 6-7).
-    assert cfg.enabled is False and cfg.technical_status == TechnicalStatus.FIXTURE_TESTED
+    # Activation step 5 (2026-10-16): fixture_tested on the saved SYNTHETIC fixture set. Step 6
+    # (the owner's live smoke) passed for autoscout24_it on 2026-10-17; autoscout24_de's is still
+    # to come. Both stay disabled, so not active (enabling is step 7).
+    expected = (
+        TechnicalStatus.LIVE_SMOKE_PASSED if key == "autoscout24_it" else TechnicalStatus.FIXTURE_TESTED
+    )
+    assert cfg.enabled is False and cfg.technical_status == expected
     gate = gate_status(cfg)
     assert gate.adapter_implemented and gate.activatable and not gate.active
     assert gate.problems == ("source is disabled in configuration",)

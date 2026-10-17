@@ -119,21 +119,23 @@ def test_source_register_live_smoke_is_the_gated_crawl_once_procedure() -> None:
     assert "insufficient_comparables" in register  # F2: no MK evidence -> no valuation
 
 
-def test_autoscout24_rows_record_step_5_and_name_the_live_smoke_next() -> None:
-    """Step 5 (saved spec-31 fixtures) is done for both AutoScout24 sources on SYNTHETIC pages, so
-    they are ``fixture_tested``; the rows must say so, never claim a live verification, and name
-    the owner's live smoke (step 6) as the next step (earlier regression: the live smoke was named
-    while ``crawl once`` still refused the ``untested`` sources)."""
+def _source_rows(key: str) -> list[str]:
+    """The register row and the ACTIVATION_GATES row of one source."""
     register = _text("docs/source_access_register.md").splitlines()
     gates = _text("ACTIVATION_GATES.md").splitlines()
-    rows = [
-        next(line for line in register if line.startswith(f"| `{key}` |"))
-        for key in ("autoscout24_de", "autoscout24_it")
+    return [
+        next(line for line in register if line.startswith(f"| `{key}` |")),
+        next(line for line in gates if line.startswith(f"| `{key}` |")),
     ]
-    rows.append(next(line for line in gates if line.startswith("| `autoscout24_de`, `autoscout24_it` |")))
-    for row in rows:
-        # The one-page smoke never confirms the unverified slugs or the .de filters (it requests
-        # only renault/captur and nothing records pageQuery).
+
+
+def test_autoscout24_de_rows_record_step_5_and_name_the_live_smoke_next() -> None:
+    """Step 5 (saved spec-31 fixtures) is done on SYNTHETIC pages, so ``autoscout24_de`` is
+    ``fixture_tested``; its rows must say so, never claim a live verification, and name the owner's
+    live smoke (step 6) as the next step (earlier regression: the live smoke was named while
+    ``crawl once`` still refused the ``untested`` sources)."""
+    for row in _source_rows("autoscout24_de"):
+        # The smoke never confirms the .de filters (nothing records pageQuery).
         assert "to confirm the unverified model slugs" not in row
         assert "to confirm the search filters" not in row
         assert "fixture_tested" in row and "step 5" in row and "2026-10-16" in row
@@ -141,6 +143,37 @@ def test_autoscout24_rows_record_step_5_and_name_the_live_smoke_next() -> None:
         assert row.index("fixture_tested") < row.index("live smoke")
         assert "live_smoke_passed" not in row and "live-verified" not in row
         assert "docs/runbook.md section 9.1" in row
+
+
+def test_autoscout24_it_rows_record_step_6_and_name_enabling_next() -> None:
+    """Step 6 (the owner's live smoke) passed for ``autoscout24_it`` on 2026-10-17: its rows record
+    both steps (5 on SYNTHETIC fixtures, 6 live) and name enabling (step 7) as the owner's next
+    decision, never claim the source is enabled or active, and point to the evidence record."""
+    register_row, gates_row = _source_rows("autoscout24_it")
+    for row in (register_row, gates_row):
+        assert "fixture_tested" in row and "2026-10-16" in row and "SYNTHETIC" in row.upper()
+        assert "live_smoke_passed" in row and "2026-10-17" in row
+        assert "step 7" in row and "the owner's decision" in row
+        assert "`enabled: false`" in row
+        assert "docs/runbook.md section 9.1" in row
+        assert "`cy=I`" in row and "verified" in row
+    assert "Live smoke evidence" in register_row
+    assert "evidence log" in gates_row
+    register = _text("docs/source_access_register.md")
+    record = register[register.index("### Live smoke evidence") : register.index("### Synthetic fixture")]
+    for evidence in (
+        "25f43f8a1451f534cb49e1b93659f904f263742a",  # commit
+        "46f4bdec-1a91-4702-8ecb-1dff3f5a7255",  # crawl run
+        "d3c60927-9dc7-426b-8a5a-20cab1087c32",  # discovery job
+        "dad6209a-1e23-4f87-a88f-e140e6da7633",  # robots revision
+        "7c78475c525adef6bf88187d53e75e9eb7b4ae9fdbe4f05215fb5ddafb396478",  # robots SHA-256
+        "360d0a9d-b46d-4442-bb8b-309751cde88e",  # configuration revision
+        "autoscout24@1.0.0",
+    ):
+        assert evidence in record, evidence
+    gates = _text("ACTIVATION_GATES.md")
+    log = gates[gates.index("## Evidence log") :]
+    assert "`autoscout24_it` -> `live_smoke_passed`" in log and "46f4bdec-1a91-4702-8ecb-1dff3f5a7255" in log
 
 
 def _shell_commands(block: str) -> list[str]:

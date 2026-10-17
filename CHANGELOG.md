@@ -7,6 +7,18 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (on top of `7f7e187`)
 
+**Activation step 6 for `autoscout24_it` (2026-10-17).** The owner's live smoke at `25f43f8`
+(docs/runbook.md 9.1: a 12-model `crawl once --max-pages 12`, then `worker --drain --queues detail
+--max-jobs 5`) passed: the worker fetched and stored robots.txt itself (HTTP 200, unchanged since
+2026-10-06), 12 search pages HTTP 200, `complete`, `access_state: ok`, 15 cards, 5 detail pages
+ingested, no block; the source was switched off again. `config/sources/autoscout24_it.yaml` is now
+`technical_status: live_smoke_passed` and stays `enabled: false` (enabling is step 7, the owner's
+decision). The same walk verified the seller-country filter `cy=I` (15 cards instead of the
+unfiltered walk's 49; its three foreign listings gone, its two Italian ones kept) and requested all
+twelve model slugs (every one HTTP 200). Evidence: docs/source_access_register.md "Live smoke
+evidence" and the ACTIVATION_GATES.md evidence log; runbook 9.1 now says how the owner writes the
+status into the database with its time (`sources set-technical-status`, before the next sync).
+
 Finding of the owner's first live smoke (2026-10-17, `autoscout24_it`, `crawl once --max-pages 1`;
 the search page answered 200, access ok): the live worker path never recorded robots.txt
 (`sources inspect --from-db` showed the robots view empty, `sources smoke-evidence` listed only the

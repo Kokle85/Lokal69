@@ -29,10 +29,12 @@ and 17 with migration `20261013000100_import_values`, applied to the hosted Supa
 States are those of spec 32: `implemented`, `fixture_verified`, `integration_verified`,
 `live_verified`, `active`, `blocked`, `not_requested`. Here `fixture_verified` means proven on
 saved or synthetic fixtures, and `integration_verified` means proven against a real PostgreSQL
-(16 and 17.11) with every external service replaced by a fake. **Nothing is `live_verified` or
-`active`.** No marketplace was crawled, no Crawl4AI service was reached, no e-mail was sent or
-read, and no Slack, dot or Outlook on a real PC was used. Every source is disabled and every
-external effect is off by default.
+(16 and 17.11) with every external service replaced by a fake. **Nothing is `active`; the only `live_verified`
+item is the AutoScout24 Italy source** (`autoscout24_it`: the owner's live smoke, activation step 6,
+passed on 2026-10-17; still disabled). Apart from the owner's AutoScout24 Italy smokes that day (on
+the owner's workstation and Crawl4AI), no marketplace was crawled, no e-mail was sent or read, and
+no Slack, dot or Outlook on a real PC was used. Every source is disabled and every external effect
+is off by default.
 
 - The activation steps for each gate: [ACTIVATION_GATES.md](ACTIVATION_GATES.md)
 - The spec 31 test matrix with results: [docs/acceptance_matrix.md](docs/acceptance_matrix.md)
@@ -46,7 +48,7 @@ external effect is off by default.
 | M1 Domain contracts and deterministic tests | done | `src/suv_deals/domain/`; `tests/unit`, `tests/property` (price EUR 2,500-3,000 inclusive, mileage strictly under 200,000 km, unknown is never zero) | - |
 | M2 Database and reliability foundation | done | 17 forward-only migrations (all applied to the hosted project, the newest `20261013000100_import_values` on 2026-10-14), RLS on every `app`/`ops` table, durable jobs with leases, idempotency, outbox, audit; `tests/integration/db`, `tests/integration/persistence_core` on PostgreSQL 16 and 17.11 | - |
 | M3 Crawl4AI integration and first source | code done, exit **blocked** | Crawl4AI 0.9.4 REST client, URL policy, robots, rate limits, parser health, scheduler; generic dealer adapter `fixture_verified` (`tests/adapters`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`) | a permitted live search/detail smoke on one real source (gates `existing_crawler`, `source_access`) |
-| M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 10 of 14 sources have no adapter (AutoScout24 IT/DE got one on 2026-10-16, built from owner captures, disabled until a live smoke run); mobile.de and AutoScout24 (2026-10-10) and every other marketplace and MK source (2026-10-14) are included by owner decision, but their adapters still need real page captures; no MK evidence in any real workspace |
+| M4 Additional sources and MK comparables | partial, **blocked** | source registry with 14 disabled sources and their gates; MK evidence import (`suv-deals market import`) and `mk_comparable` detail routing (`tests/integration/pipeline/test_d2_mk_comparable_routing.py`) | 10 of 14 sources have no adapter (AutoScout24 IT/DE got one on 2026-10-16, built from owner captures; IT passed the owner's live smoke on 2026-10-17; both disabled until the owner enables them); mobile.de and AutoScout24 (2026-10-10) and every other marketplace and MK source (2026-10-14) are included by owner decision, but their adapters still need real page captures; no MK evidence in any real workspace |
 | M5 Costs and tax framework | done for the framework; real tax readiness **blocked** | versioned tax engine 1.1, approvals, cost evidence, FX, scenarios (`tests/unit/test_tax_engine.py`, `test_tax_engine_extensions.py`, `test_costs.py`, `test_valuation.py`, `test_fx.py`); the North Macedonian DRAFT rule set golden-tested (`tests/unit/test_mk_rule_draft.py`) and the import-cost calculator (`tests/unit/test_import_estimate.py`, `tests/integration/import_costs`, `tests/mcp/test_calc_tools.py`, `tests/api/test_import_cost_routes.py`, `tests/cli/test_import_cost_db_commands.py`); the owner's recorded purchase price and estimated customs value per listing (`tests/integration/import_costs/test_import_values.py`, `tests/api/test_import_values_routes.py`, `tests/integration/pipeline/test_import_tax_valuation.py`); transport fixed at EUR 700 | the owner's review, approval and activation of a rule set (gate `tax_rules`), approval of the cost profile and the other cost assumptions (gate `cost_assumptions`) |
 | M6 Dashboard and MCP | done offline; real client **blocked** | 12 + 3 + 1 MCP tools (the +1 is the calculator `deals_estimate_import_costs`), scopes, schemas (`tests/mcp`, `tests/contracts`); dashboard screens and browser flows (`dashboard/src/test`, `dashboard/e2e`) | a real dot client connection (gate `mcp_authentication`); a deployed dashboard (gate `hosting`) |
 | M7 Notifications and optional activation bridge | done offline; activation **blocked** | MCP Events provider and subscriptions, Slack fallback and the selected Slack seller-reply route, destination bindings, dedup, uncertainty handling (`tests/integration/pipeline/test_dispatcher.py`, `tests/integration/v11_runtime`, `tests/mcp/test_events.py`) | delivery receipts and dot's processing evidence; an operator command for destination bindings (ACTIVATION_GATES.md section 19) |
@@ -61,7 +63,7 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 | Item | Status | Category | Evidence | What is missing |
 |---|---|---|---|---|
 | U1 | `implemented` | done, tested offline | Audit and additive adoption plan: docs/decisions/0002-spec-v1.1-adoption.md; v1.0 components and data kept; forward-only migrations (`tests/unit/test_migrations_ascii.py`, `tests/integration/db/test_schema_catalogue.py`) | - |
-| U2 | `fixture_verified` (dealer search/detail slice on synthetic sources); live `blocked` | tested offline; activation-pending (live source) | `tests/adapters/test_dealer_search.py`, `tests/adapters/test_dealer_detail.py`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`; first/last-seen and availability evidence `tests/integration/repos_sources_listings/test_availability_events.py`, `tests/unit/test_lifecycle.py`; lags and coverage gaps `tests/integration/read_queries/test_views.py`, `tests/integration/repos_sources_listings/test_schedules.py` | an actually working live source (gate `source_access`); 10 of 14 sources have no adapter (AutoScout24 IT/DE are implemented but untested live and disabled) |
+| U2 | `fixture_verified` (dealer search/detail slice on synthetic sources); live `blocked` | tested offline; activation-pending (live source) | `tests/adapters/test_dealer_search.py`, `tests/adapters/test_dealer_detail.py`, `tests/integration/pipeline/test_e2e_fixture_pipeline.py`; first/last-seen and availability evidence `tests/integration/repos_sources_listings/test_availability_events.py`, `tests/unit/test_lifecycle.py`; lags and coverage gaps `tests/integration/read_queries/test_views.py`, `tests/integration/repos_sources_listings/test_schedules.py` | an actually working live source (gate `source_access`); 10 of 14 sources have no adapter (AutoScout24 IT/DE are implemented and disabled; IT passed the owner's live smoke on 2026-10-17, DE not yet) |
 | U3 | `integration_verified` | tested offline | inquiry readiness separate from profit readiness; CoC/document unknowns resolvable by the inquiry; hard price/mileage rules kept (`tests/unit/test_inquiries.py`, `tests/integration/v11_inquiries/test_qualification_and_reservation.py`, `tests/integration/v11_runtime/test_plan_and_send.py`) | real readiness needs MK evidence, FX rates and an active source (gate `seller_inquiry`) |
 | U4 | `integration_verified` (code); activation `blocked` | tested offline; activation-pending (real account, canary) | sender binding, technical verification from the desktop worker's evidence, standing authorization, no-approval automatic mode, process gate, reservation gate `activation_canary_incomplete` (`tests/integration/v11_inquiries/test_senders_and_contacts.py`, `test_d2_activation_canary_gate.py`, `tests/cli/test_inquiry_commands.py`, `tests/integration/v11_runtime/test_operator_and_policy.py`) | no real account bound or verified; `gmail_api` cannot be activated with this build (OPS-09) |
 | U5 | `integration_verified` (synthetic dealer pages) | tested offline; activation-pending (real permitted source) | exact-ad seller, recipient and language evidence produced by detail ingest (`tests/integration/v11_runtime/test_d2_seller_evidence_pipeline.py`, `tests/adapters/test_d2_seller_contact_evidence.py`); Swiss DE/FR/IT from text evidence (`tests/unit/test_language.py`); deterministic DE/IT/FR/verified-EN templates and the informational Macedonian preview (`tests/unit/test_seller_templates.py`, `tests/unit/test_mime_builder.py`) | evidence from a real permitted source; only adapters declaring `seller_contact_evidence` (today the dealer adapter) produce it |
@@ -75,11 +77,13 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 
 ## What is NOT done or NOT verified
 
-- **Live crawling.** No source was fetched live; no live smoke ever ran. 10 of the 14 registered
-  sources have no adapter; `autoscout24_it` and `autoscout24_de` have one (built from owner
-  captures 2026-10-16) and passed activation step 5 on SYNTHETIC saved fixtures the same day
-  (`fixture_tested`, not a live verification), but stay disabled and untested live: the next step
-  is the owner's live smoke (docs/runbook.md section 9.1). No permitted dealer has been selected.
+- **Live crawling.** Nothing runs on a schedule yet. 10 of the 14 registered sources have no
+  adapter; `autoscout24_it` and `autoscout24_de` have one (built from owner captures 2026-10-16)
+  and passed activation step 5 on SYNTHETIC saved fixtures the same day (`fixture_tested`).
+  `autoscout24_it` also passed step 6, the owner's live smoke, on 2026-10-17 (`live_smoke_passed`,
+  docs/source_access_register.md "Live smoke evidence") and waits for enabling (step 7, the owner's
+  decision); `autoscout24_de` is untested live, its smoke is next (docs/runbook.md section 9.1).
+  No permitted dealer has been selected.
 - **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
   path** (ADR 0002 addendum). `mobile_de_public`, `autoscout24_de`, `autoscout24_it` and
   `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
@@ -266,14 +270,17 @@ reviewing `doctor`, coverage gaps and blocked jobs.
   VPS (gate `hosting`). The hosted Supabase project has the schema through `20261013000100`
   (docs/schema.md section 9; `20261013000100_import_values` applied 2026-10-14) and serves nothing
   yet.
-- **Which sources are truly working?** None live. The generic dealer adapter is `fixture_verified`
-  on synthetic pages; the AutoScout24 IT/DE adapter is built from owner captures (2026-10-16) and
-  passed its saved SYNTHETIC fixture sets (register step 5, 2026-10-16: `autoscout24_it` and
-  `autoscout24_de` are `fixture_tested`), but both sources stay disabled until the owner's live
-  smoke run (step 6, docs/runbook.md section 9.1) and enabling (step 7);
+- **Which sources are truly working?** None runs yet. The generic dealer adapter is
+  `fixture_verified` on synthetic pages; the AutoScout24 IT/DE adapter is built from owner captures
+  (2026-10-16) and passed its saved SYNTHETIC fixture sets (register step 5, 2026-10-16:
+  `fixture_tested`). `autoscout24_it` also passed the owner's live smoke on 2026-10-17 (step 6,
+  `live_smoke_passed`: robots.txt, 12 search pages and 5 detail pages, no block) and waits for
+  enabling (step 7, the owner's decision); `autoscout24_de`'s live smoke (docs/runbook.md section
+  9.1) is next;
   10 of 14 registered sources have no adapter; mobile.de is included by owner decision
   (2026-10-10) but stays disabled until its adapter is built from real page captures.
-- **When was each last checked?** No source has ever been checked live. The source register
+- **When was each last checked?** Live only `autoscout24_it`, on 2026-10-17 (the owner's smoke; the
+  worker fetched and stored robots.txt, unchanged since 2026-10-06). The source register
   (docs/source_access_register.md) is dated 2026-10-06: terms were reviewed that day for
   `mobile_de_public`, `autoscout24_de` and `autoscout24_it` only (all restrictive) and every other
   source is "not reviewed"; the only recorded robots.txt reading is `autoscout24_ch` (2026-10-06,

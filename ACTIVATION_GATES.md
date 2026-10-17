@@ -5,9 +5,11 @@ who does it, how it is done, how it is verified and what evidence is kept. Contr
 32 (activation gates and honest completion states), section 31 (exact-build evidence) and section
 37.10 (activation evidence for the seller-email route). Status as of **2026-10-10** (wave D3).
 
-**Nothing is active and nothing is `live_verified`.** No live crawl, no Crawl4AI service, no real
-e-mail sent or read, no Slack, no dot, no Outlook on a real PC and no deployed service has been
-used. Every source is disabled and every external effect is off by default (README "Safety
+**Nothing is active.** The only live verification is `source_access` step 6 for `autoscout24_it`:
+the owner's hand-run live smoke of 2026-10-17 on the owner's workstation and Crawl4AI (evidence
+log below); the source stays disabled until the owner enables it. Apart from the owner's
+AutoScout24 Italy smokes that day, no live crawl, no real e-mail sent or read, no Slack, no dot,
+no Outlook on a real PC and no deployed service has been used. Every source is disabled and every external effect is off by default (README "Safety
 defaults"). The work these gates protect is complete and tested offline
 ([IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md), [docs/acceptance_matrix.md](docs/acceptance_matrix.md)).
 
@@ -87,8 +89,10 @@ Each step only needs the steps above it; any step can stop without affecting the
 
 ## 2. `existing_crawler` (Crawl4AI service)
 
-- **State:** `implemented` (client, URL policy, SSRF guards, fixture pipeline). No Crawl4AI
-  service has been reached; `doctor --crawler` has never run against a real one.
+- **State:** `implemented` (client, URL policy, SSRF guards, fixture pipeline). The owner's
+  Crawl4AI on the workstation served the AutoScout24 Italy smokes of 2026-10-17 (the worker's
+  crawler contract check reported `ready: true`); this gate's own evidence (doctor output, image
+  digest, firewall listings, reachability check) is not recorded yet.
 - **Prerequisites:** an approved host (gate `hosting` or the owner's workstation); the pinned
   image `unclecode/crawl4ai:0.9.4` with its tested digest; an API token; the host firewall rules.
 - **Who:** operator provisions; owner approves the host.
@@ -155,15 +159,17 @@ Each step only needs the steps above it; any step can stop without affecting the
 ## 4. `source_access` (per source)
 
 - **State:** `blocked`. 14 sources are registered in `config/sources/*.yaml`; all are
-  `enabled: false` and none was ever fetched live. Two adapters are implemented: the generic
-  dealer adapter (`schemaorg_dealer@1.1.0`, used by the two dealer templates), `fixture_verified`
-  on synthetic pages, and the AutoScout24 adapter (`autoscout24@1.0.0`, used by `autoscout24_it`
-  and `autoscout24_de`), built from owner-captured pages and never run live. Step 5 below is done
-  for both (2026-10-16): SYNTHETIC saved fixtures with `MANIFEST.yaml` covering the spec 31 set
-  (`tests/adapters/fixtures/autoscout24_it/`, `autoscout24_de/`), so both are `technical_status:
-  fixture_tested` - not a live verification. Both stay disabled: `doctor` lists them as "not
-  active" with one gate problem ("source is disabled in configuration") until steps 6-7 (the
-  owner's live smoke, docs/runbook.md section 9.1, then enabling). The other 10
+  `enabled: false`; only `autoscout24_it` was ever fetched live (the owner's smokes of
+  2026-10-17). Two adapters are implemented: the generic dealer adapter (`schemaorg_dealer@1.1.0`,
+  used by the two dealer templates), `fixture_verified` on synthetic pages, and the AutoScout24
+  adapter (`autoscout24@1.0.0`, used by `autoscout24_it` and `autoscout24_de`), built from
+  owner-captured pages. Step 5 below is done for both (2026-10-16): SYNTHETIC saved fixtures with
+  `MANIFEST.yaml` covering the spec 31 set (`tests/adapters/fixtures/autoscout24_it/`,
+  `autoscout24_de/`), `technical_status: fixture_tested`. Step 6 is done for `autoscout24_it`
+  (2026-10-17, the owner's live smoke: `live_smoke_passed`, evidence log); `autoscout24_de`'s live
+  smoke is next. Both stay disabled: `doctor` lists them as "not active" with one gate problem
+  ("source is disabled in configuration") until step 7 (enabling, the owner's decision; for
+  `autoscout24_de` after its live smoke, docs/runbook.md section 9.1). The other 10
   sources have no adapter
   (`adapter_version: unimplemented`; `sources inspect` and `doctor` say "not activatable (no
   adapter)"), so configuration alone can never activate them.
@@ -221,8 +227,9 @@ Each step only needs the steps above it; any step can stop without affecting the
      (the robots.txt request of the run, `purpose: robots`, and `robots_revisions` included). Then
      `technical_status: live_smoke_passed`. For AutoScout24 the exact owner commands (local
      uncommitted `enabled: true`, sync, smoke, switch-off) are in docs/runbook.md section 9.1. The
-     first `autoscout24_it` smoke (2026-10-17) predates the worker's robots check (empty robots
-     view, no robots fetch in the evidence), so it does not count for step 6; repeat it.
+     first `autoscout24_it` smokes (2026-10-17) predate the worker's robots check (empty robots
+     view, no robots fetch in the evidence) and do not count for step 6; the repeat that day at
+     commit `25f43f8` passed (evidence log).
   7. Enable through an auditable configuration revision (`sources sync --yes`).
 - **Verified when:** `access_state: ok`, healthy parser outcomes, and the persisted listing,
   revision and evidence ids of the smoke.
@@ -236,7 +243,8 @@ Each step only needs the steps above it; any step can stop without affecting the
 |---|---|---|---|
 | `example_dealer_template_de`, `example_dealer_template_ch` | `schemaorg_dealer@1.1.0` (fixture_verified) | none (templates) | a real permitted dealer: copy, steps 1-7 |
 | `mobile_de_public`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; CH terms not identified |
-| `autoscout24_de`, `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures); `fixture_tested` (step 5 done 2026-10-16 on SYNTHETIC saved fixtures), never run live | proceed_acknowledged (owner, 2026-10-10) | `enabled: false` only (the one remaining gate problem; `crawl once` refuses a disabled source): step 5 is done (saved spec-31 fixtures with `MANIFEST.yaml`, `fixture_tested`, synthetic, not a live verification); next the owner's live smoke (step 6, `autoscout24_it` first, exact commands in docs/runbook.md section 9.1), then enabling (step 7); per-model searches (12 models, one page each per run, every 30 min from 08:00 to 22:00 Europe/Skopje (owner decision 2026-10-16; 28 runs x 12 pages = 336 search requests a day; daily budget 350 DE, 600 IT: 336 search + 264 detail pages, the remaining runs' search pages reserved against detail requests); `autoscout24_de` card_only (robots) |
+| `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures); `fixture_tested` (step 5 done 2026-10-16 on SYNTHETIC saved fixtures); `live_smoke_passed` (step 6 done 2026-10-17, the owner's live smoke at commit `25f43f8`, evidence log) | proceed_acknowledged (owner, 2026-10-10) | `enabled: false` only (the one remaining gate problem; `crawl once` refuses a disabled source): next enabling (step 7, a committed configuration revision, the owner's decision); per-model searches (12 models, one page each per run, seller-country filter `cy=I` verified live 2026-10-17), every 30 min from 08:00 to 22:00 Europe/Skopje (owner decision 2026-10-16; 28 runs x 12 pages = 336 search requests a day; daily budget 600: 336 search + 264 detail pages, the remaining runs' search pages reserved against detail requests); smoke commands in docs/runbook.md section 9.1 |
+| `autoscout24_de` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures); `fixture_tested` (step 5 done 2026-10-16 on SYNTHETIC saved fixtures), never run live | proceed_acknowledged (owner, 2026-10-10) | `enabled: false` only (the one remaining gate problem; `crawl once` refuses a disabled source): step 5 is done (saved spec-31 fixtures with `MANIFEST.yaml`, `fixture_tested`, synthetic, not a live verification); next the owner's live smoke (step 6, exact commands in docs/runbook.md section 9.1 with this key), then enabling (step 7); per-model searches (12 models, one page each per run, every 30 min from 08:00 to 22:00 Europe/Skopje (owner decision 2026-10-16; 28 runs x 12 pages = 336 search requests a day; daily budget 350); card_only (robots) |
 | `subito_it`, `automobile_it`, `carforyou_ch`, `tutti_ch`, `comparis_ch` | placeholder | pending | domain, terms, routes unverified; an adapter |
 | `pazar3_mk`, `reklama5_mk` (MK comparables) | placeholder | pending | terms and an adapter; until then MK evidence comes from `suv-deals market import` |
 | `mobile_de_api` | skeleton (raises until entitlement) | pending | gate 5 |
@@ -549,3 +557,4 @@ Append one row per completed activation step (newest last). Ids, versions, hashe
 | Date (UTC) | Gate / step | Commit | Evidence (ids, codes) | Recorded by |
 |---|---|---|---|---|
 | 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 37 pages, DE 23 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |
+| 2026-10-17 | `source_access` step 6 (live smoke): `autoscout24_it` -> `live_smoke_passed`; the owner's hand-run smoke (docs/runbook.md 9.1: `crawl once --max-pages 12`, `worker --drain --queues detail --max-jobs 5`); the source stays `enabled: false` | `25f43f8a1451f534cb49e1b93659f904f263742a` | config revision 1 `360d0a9d-b46d-4442-bb8b-309751cde88e`; `autoscout24@1.0.0`; job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, run `46f4bdec-1a91-4702-8ecb-1dff3f5a7255` (`complete`, `access_state: ok`, 12 pages, 15 cards); robots fetch `03976780-d703-4d0c-bcb3-c6838b10e05d` (HTTP 200) and revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (SHA-256 `7c78475c...`); 12 search fetches HTTP 200; 5 detail jobs succeeded; revisions `3170f0e5-c12c-4d61-8a1a-149f891bbe7c`, `2c03793a-2d66-46cc-b8d5-e5af9675de72`; full record: docs/source_access_register.md "Live smoke evidence" | owner (smoke), operator (record) |

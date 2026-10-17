@@ -69,10 +69,12 @@ OWNER_DECIDED_SOURCES = frozenset(
 )
 
 
-#: Marketplace sources with a real adapter (built from owner captures, not yet smoke-tested live).
-#: Activation step 5 (2026-10-16): their SYNTHETIC saved-fixture sets pass, so they are
-#: ``fixture_tested``; they stay disabled until the owner's live smoke (step 6) and enabling (step 7).
+#: Marketplace sources with a real adapter (built from owner captures). Activation step 5
+#: (2026-10-16): their SYNTHETIC saved-fixture sets pass (``fixture_tested``); step 6, the owner's
+#: live smoke, passed for autoscout24_it on 2026-10-17 (``live_smoke_passed``). Both stay disabled
+#: until enabling (step 7).
 IMPLEMENTED_MARKETPLACES = frozenset({"autoscout24_de", "autoscout24_it"})
+LIVE_SMOKE_PASSED = frozenset({"autoscout24_it"})
 
 
 @pytest.mark.parametrize("path", CONFIG_FILES, ids=lambda p: p.name)
@@ -81,7 +83,9 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
     assert path.stem == config.source_key
     assert config.enabled is False
     expected_status = (
-        TechnicalStatus.FIXTURE_TESTED
+        TechnicalStatus.LIVE_SMOKE_PASSED
+        if config.source_key in LIVE_SMOKE_PASSED
+        else TechnicalStatus.FIXTURE_TESTED
         if config.source_key in IMPLEMENTED_MARKETPLACES
         else TechnicalStatus.UNTESTED
     )
@@ -93,8 +97,8 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
         assert config.terms_decision_actor and "owner" in config.terms_decision_actor
         assert config.robots_checked_at is not None and config.robots_summary
         if config.source_key in IMPLEMENTED_MARKETPLACES:
-            # Real adapter (2026-10-16), fixture_tested (step 5): the only gate left closed is the
-            # owner's enable switch, which stays off until the live smoke (step 6).
+            # Real adapter (2026-10-16), fixture_tested (step 5) or live_smoke_passed (step 6): the
+            # only gate left closed is the owner's enable switch (step 7).
             assert activation_problems(config) == []
             assert gate_status(config).problems == ("source is disabled in configuration",)
         else:
