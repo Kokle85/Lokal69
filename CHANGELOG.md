@@ -41,7 +41,14 @@ timer, `jobs unblock` one by one) while `--max-jobs` was spent on the wrong sour
   KEY.`
 - **Docs.** Runbook 9.1 drains with `--source autoscout24_it` (`--source autoscout24_de` for the
   .de smoke) and says why; the register and ACTIVATION_GATES step 6 name `--source <key>`;
-  schema.md section 7.
+  schema.md section 7. Runbook 9.1 also says what `--source` does not do: the source's OWN older
+  queued detail jobs still come first (the drain after the 2026-10-17 `cy=I` walk requested 5 of
+  the earlier walk's pages; such fetches are not in that run's `smoke-evidence`), and on the
+  `card_only` `autoscout24_de` a card job left queued is not blocked after the switch-off but
+  ingested by the next worker, so the .de drain runs without `--max-jobs`.
+- **Tests.** A database CLI test runs `worker --drain --source KEY` itself: only that source's
+  jobs are claimed, the other source's and a source-less job stay queued, and an empty drain
+  prints `No due jobs of source KEY.`
 
 Finding of the owner's first live smoke (2026-10-17, `autoscout24_it`, `crawl once --max-pages 1`;
 the search page answered 200, access ok): the live worker path never recorded robots.txt

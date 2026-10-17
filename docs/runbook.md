@@ -515,8 +515,9 @@ git diff config/sources/autoscout24_it.yaml
 uv run suv-deals sources sync --dry-run
 uv run suv-deals sources sync --yes
 
-# 2. One bounded discovery (one model page: renault/captur), then at most 5 of the detail pages
-#    it queued (--max-jobs is the bound; --source keeps other sources' jobs queued; see below).
+# 2. One bounded discovery (one model page: renault/captur), then at most 5 detail pages of this
+#    source, its oldest queued jobs first (--max-jobs is the bound; --source keeps other sources'
+#    jobs queued, not this source's own older ones; see below).
 SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
   uv run suv-deals crawl once --source autoscout24_it --max-pages 1
 SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
@@ -574,13 +575,27 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   card, up to about 20. `max_detail_jobs_per_run` (10) does NOT bound that: each detail job is
   its own run, so a drain without `--max-jobs` fetches every queued `/annunci/` page, 20 s apart.
   `--max-jobs 5` is the bound here: at most 5 detail jobs, one `/annunci/` page each (use
-  `--max-jobs 1` for one); the jobs left waiting are never fetched (see the report-back item).
+  `--max-jobs 1` for one); the jobs left waiting are not fetched while the source is off (see the
+  report-back item), but they stay queued and come first in the next drain of this source (below).
 - `--source autoscout24_it` limits the drain to this source's jobs: without it the worker claims
   the due detail jobs of EVERY source (highest priority, then oldest), so detail jobs another
-  source left queued (e.g. the 39 left from the 2026-10-17 `autoscout24_it` walks, during the
-  `autoscout24_de` smoke) would be claimed first and, their source being disabled, blocked as
+  source left queued would be claimed first and, their source being disabled, blocked as
   `source_paused` (each then needing `jobs unblock`) while using up `--max-jobs`. With it they
-  stay queued, untouched (an empty drain prints `No due jobs of source autoscout24_it.`).
+  stay queued, untouched (an empty drain prints `No due jobs of source autoscout24_it.`). That is
+  what keeps the 39 `autoscout24_it` detail jobs left from the 2026-10-17 walks out of the
+  `autoscout24_de` smoke's drain.
+- `--source` does NOT separate this source's own older queued detail jobs from the ones this
+  run's search queued: detail jobs share one priority, so the drain claims the source's oldest
+  first. `autoscout24_it` still has 39 queued from that day's 12-model walk without `cy` (09:28
+  UTC), so a repeat of this block spends `--max-jobs 5` on 5 of those, not on the pages its own
+  search queued. That already happened on 2026-10-17: the second walk (`cy=I`, 11:50 UTC) queued no
+  detail job, and its drain requested 5 of the 09:28 walk's pages. Such fetches are counted in
+  `rate_budget.requests_today` but are not in this run's `sources smoke-evidence` (it lists only
+  the latest run's own detail jobs and their fetches), and the listings they ingest come from the
+  walk without `cy` (possibly foreign sellers), so they say nothing about the `cy` country check
+  below. No `suv-deals` command drops queued jobs: before repeating a smoke of a source that
+  still has queued detail jobs, accept that the drain works through them first, oldest first, one
+  `/annunci/` request each within `--max-jobs`.
 - `cy` since 2026-10-17 (`search.cy` in the source YAML; the adapter accepts only the source's
   own code, `I` or `D`): the owner's 12-model smoke of `autoscout24_it` that day
   (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages
@@ -638,16 +653,21 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   "<evidence>" --yes` writes the status into the database with its time (`last_live_smoke_at`,
   audited); a sync alone writes the status without the time, and the command is then a no-op.
   Enabling for real (step 7) is a separate, committed configuration revision;
-  until then step 4 keeps the source off, and a detail job still queued is blocked as
-  `source_paused` when a worker without `--source` (or with this key) reaches it (nothing is
-  fetched).
+  until then step 4 keeps the source off, and a detail job of a fetching source such as
+  `autoscout24_it` still queued is blocked as `source_paused` when a worker without `--source`
+  (or with this key) reaches it (nothing is fetched). A `card_only` source's job is not blocked
+  (see `autoscout24_de` below).
 - `doctor` reads the YAML: between steps 1 and 4 it reports `autoscout24_it` as `active
   (public_html)`, after step 4 again `not active: 1 gate problem(s)`.
 - `autoscout24_de` follows later the same way (replace the key in every command, the drain's
   `--source` too: `worker --drain --queues detail --source autoscout24_de`, so the `autoscout24_it`
   jobs still queued are not claimed and blocked). It is `card_only`: that drain only ingests the
-  search cards' own facts and makes no request (robots.txt disallows `/angebote/`), so there
-  `--max-jobs 5` may be left out (with it, only 5 of the cards are ingested).
+  search cards' own facts and makes no request (robots.txt disallows `/angebote/`). Leave
+  `--max-jobs 5` out there, so that no card job is left queued: unlike a fetching source's detail
+  job, a `card_only` job is NOT blocked once step 4 has switched the source off (a disabled or
+  paused source stops only network work, and these facts came with the search page), so any later
+  worker, without `--source` or with `--source autoscout24_de`, ingests a card left queued (new
+  revision, screening, valuation job) although the source is disabled.
 - The smoke does NOT show whether .de applies `pricefrom`/`priceto`/`kmto`, nor whether either
   site applies `cy`: the adapter does not record the page's server-normalised `pageQuery` and raw
   pages are not kept (`SNAPSHOT_STORAGE=disabled`). The only indirect checks are the cards'

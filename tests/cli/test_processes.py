@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 import uvicorn
+import yaml
 from tests.cli.conftest import Cli
+from tests.integration.db.helpers import Seed
 
 from suv_deals.cli_commands import processes
 from suv_deals.cli_commands.processes import DEFAULT_APP_FACTORY, DEFAULT_REGISTRY, load_factory
-from suv_deals.errors import ValidationFailed
+from suv_deals.domain.enums import JobType
+from suv_deals.errors import SourcePaused, ValidationFailed
+from suv_deals.persistence.transactions import job_unit_of_work
+from suv_deals.workers.handlers import HandlerRegistry
+from suv_deals.workers.runtime import Disposition, JobExecution, JobOutcome, RuntimeContext, apply_disposition
 
+REPO = Path(__file__).resolve().parents[2]
+FIXTURE_SOURCE = REPO / "tests" / "adapters" / "fixtures" / "fixture_dealer_de" / "source.yaml"
 DEV = {"APP_ENV": "development", "DATABASE_URL": "postgresql://fake:FAKE-pw@127.0.0.1:1/none"}
 
 
@@ -117,6 +128,97 @@ def test_worker_help_lists_the_source_option(run_cli: Cli) -> None:
         "With --drain: claim only jobs of this source (an owner smoke); jobs of other sources stay queued."
         in text
     )
+
+
+@pytest.mark.db
+def test_worker_drain_with_source_claims_only_that_sources_jobs(
+    run_cli: Cli,
+    db_env: dict[str, str],
+    workspace: UUID,
+    seed: Seed,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner's smoke drain through the real command (runbook 9.1, ``worker --drain --source``).
+
+    The other source stands for ``autoscout24_it`` after its smokes: switched off with older detail
+    jobs still queued, which its handler would block ``source_paused``. Only the named source's jobs
+    are claimed (in claim order, within ``--max-jobs``); the other source's job and a source-less
+    job stay queued, untouched; an empty drain names the source. The handlers are SYNTHETIC (no
+    network): ``--registry`` accepts only ``suv_deals.*`` factories, so the factory is replaced.
+    """
+    smoke_key = f"synthetic_smoke_{uuid4().hex[:8]}"  # unique: the session database is shared
+    config = tmp_path / "config"
+    shutil.copytree(REPO / "config", config)
+    source_yaml = yaml.safe_load(FIXTURE_SOURCE.read_text(encoding="utf-8"))
+    source_yaml["source_key"] = smoke_key
+    (config / "sources" / f"{smoke_key}.yaml").write_text(yaml.safe_dump(source_yaml), encoding="utf-8")
+    env = {**db_env, "CONFIG_DIR": str(config), "LOG_LEVEL": "WARNING"}
+
+    smoke = seed.source(workspace, source_key=smoke_key)
+    left = seed.source(workspace)  # disabled again, detail jobs still queued
+
+    def detail_job(source_id: UUID, **cols: Any) -> UUID:
+        listing = seed.listing(workspace, source_id)
+        return seed.job(
+            workspace, job_type="detail", source_id=source_id, listing_id=listing, generation=1, **cols
+        )
+
+    day_ago = seed.scalar("select now() - interval '1 day'")
+    leftover = detail_job(left, priority=100, available_at=day_ago)  # older AND higher priority
+    sourceless = seed.job(workspace, job_type="valuation", priority=1000)  # no source_id
+    smoke_first = detail_job(smoke, priority=50)
+    smoke_second = detail_job(smoke)
+
+    handled: list[UUID] = []
+
+    async def handler(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
+        handled.append(execution.job.id)
+        if execution.job.source_id not in (None, smoke):
+            raise SourcePaused("synthetic: the left-over source is disabled")
+        async with job_unit_of_work(ctx.db, execution.job) as (conn, _locked):
+            state = await apply_disposition(conn, execution.job, Disposition.complete({"synthetic": True}))
+        return JobOutcome(state=state)
+
+    registry = HandlerRegistry()
+    for job_type in (JobType.DETAIL, JobType.VALUATION):
+        registry.register(job_type, handler, description="synthetic test handler")
+    real_load_factory = processes.load_factory
+
+    def load(spec: str, *, option: str) -> Any:
+        return (lambda: registry) if option == "--registry" else real_load_factory(spec, option=option)
+
+    monkeypatch.setattr(processes, "load_factory", load)
+
+    def state(job_id: UUID) -> str:
+        return str(seed.scalar("select state from ops.jobs where id = %s", (job_id,)))
+
+    def assert_untouched() -> None:
+        for job_id in (leftover, sourceless):
+            row = seed.conn.execute(
+                "select state, attempts, blocker_code, lease_token from ops.jobs where id = %s", (job_id,)
+            ).fetchone()
+            assert row == ("queued", 0, None, None), (job_id, row)
+
+    drain = ("worker", "--drain", "--queues", "detail,valuation", "--source", smoke_key)
+    first = run_cli(*drain, "--max-jobs", "1", env=env)
+    assert first.exit_code == 0, first.output
+    assert str(smoke_first) in first.stdout
+    assert all(str(j) not in first.stdout for j in (smoke_second, leftover, sourceless))
+    assert (state(smoke_first), state(smoke_second)) == ("succeeded", "queued")
+    assert_untouched()
+
+    rest = run_cli(*drain, env=env)
+    assert rest.exit_code == 0, rest.output
+    assert str(smoke_second) in rest.stdout and str(leftover) not in rest.stdout
+    assert state(smoke_second) == "succeeded"
+    assert_untouched()
+
+    idle = run_cli(*drain, env=env)
+    assert idle.exit_code == 0, idle.output
+    assert idle.stdout.strip() == f"No due jobs of source {smoke_key}."
+    assert handled == [smoke_first, smoke_second]
+    assert_untouched()
 
 
 def test_api_serve_needs_a_database_url(run_cli: Cli, captured_uvicorn: dict[str, Any]) -> None:

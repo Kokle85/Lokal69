@@ -224,6 +224,14 @@ def test_runbook_autoscout24_smoke_commands_match_the_real_cli() -> None:
     # the drain on the smoke source: other sources' queued detail jobs are never claimed.
     assert "worker --drain --queues detail --source autoscout24_it --max-jobs 5" in block
     assert "worker --drain --queues detail --source autoscout24_de" in section
+    # --source does not hold back the source's OWN older queued detail jobs (same priority, so
+    # the oldest come first), and a card_only source's left-over card jobs are ingested after the
+    # switch-off, not blocked: the runbook must say both and not offer --max-jobs on .de.
+    prose = " ".join(section.split())
+    assert "`--source` does NOT separate this source's own older queued detail jobs" in prose
+    assert "A `card_only` source's job is not blocked" in prose
+    assert "Leave `--max-jobs 5` out there, so that no card job is left queued" in prose
+    assert "may be left out" not in prose and "the jobs left waiting are never fetched" not in prose
     assert "at most `max_detail_jobs_per_run`" not in section
     # The spec-31 evidence ids come from a documented read-only command.
     assert "sources smoke-evidence autoscout24_it" in block and "`sources smoke-evidence` JSON" in section
