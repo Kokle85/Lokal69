@@ -220,8 +220,10 @@ def test_runbook_autoscout24_smoke_commands_match_the_real_cli() -> None:
     )
     assert "crawl once --source autoscout24_it --max-pages 1" in block
     # The detail drain is bounded by --max-jobs: max_detail_jobs_per_run never bounds a drain
-    # (each detail job is its own run), so the runbook must not claim it does.
-    assert "worker --drain --queues detail --max-jobs 5" in block
+    # (each detail job is its own run), so the runbook must not claim it does. --source keeps
+    # the drain on the smoke source: other sources' queued detail jobs are never claimed.
+    assert "worker --drain --queues detail --source autoscout24_it --max-jobs 5" in block
+    assert "worker --drain --queues detail --source autoscout24_de" in section
     assert "at most `max_detail_jobs_per_run`" not in section
     # The spec-31 evidence ids come from a documented read-only command.
     assert "sources smoke-evidence autoscout24_it" in block and "`sources smoke-evidence` JSON" in section

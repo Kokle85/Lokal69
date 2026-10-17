@@ -14,7 +14,10 @@ Contracts (docs/schema.md section 7):
 - `claim` is the spec section 13 statement (``FOR UPDATE SKIP LOCKED LIMIT 1``, ``attempts + 1``,
   fresh UUID token, ``priority desc, available_at, id``, ``attempts < max_attempts``) plus an
   explicit workspace predicate and a job-type filter, always with bound parameters, in its own
-  short transaction. Two concurrent workers never receive the same job.
+  short transaction. Two concurrent workers never receive the same job. An owner's smoke drain
+  may narrow it to one source (``source_key``: only jobs whose ``source_id`` is the workspace's
+  source with that key; source-less jobs are never picked then); without it the statement is
+  the unfiltered one.
 - Every lease-holder update (`heartbeat`, `complete`, `fail_retry`, `release`, `fail_blocked`,
   `dead_letter`) is fenced: ``id``, ``state = 'running'``, current ``lease_token``, current
   ``lease_owner`` and ``lease_expires_at > clock_timestamp()`` (database time, not the
@@ -67,6 +70,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import JobState, JobType, Scope
+from suv_deals.domain.sources import SOURCE_KEY_PATTERN
 from suv_deals.errors import (
     EmailDeliveryUncertain,
     Forbidden,
@@ -99,6 +103,7 @@ DEFAULT_SLOT_INTERVAL: Final = timedelta(minutes=15)
 
 _CODE_RE: Final = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _PARTITION_RE: Final = re.compile(r"^[A-Za-z0-9_:.-]{1,80}$")
+_SOURCE_KEY_RE: Final = re.compile(SOURCE_KEY_PATTERN)
 _ENQUEUE_RETRIES: Final = 3
 _MAX_INCOMPATIBLE_PER_CLAIM: Final = 20
 
@@ -419,8 +424,7 @@ async def current_slot(conn: Conn, interval: timedelta = DEFAULT_SLOT_INTERVAL) 
 # Claim / heartbeat
 # --------------------------------------------------------------------------------------------
 
-_CLAIM_SQL: Final = sql.SQL(
-    """
+_CLAIM_TEMPLATE: Final = """
 with picked as (
   select id
   from ops.jobs
@@ -428,7 +432,7 @@ with picked as (
     and state in ('queued', 'retry_wait')
     and job_type = any(%(job_types)s::text[])
     and attempts < max_attempts
-    and available_at <= now()
+    and available_at <= now(){source_filter}
   order by priority desc, available_at, id
   for update skip locked
   limit 1
@@ -445,7 +449,19 @@ where j.id = picked.id
   and j.workspace_id = %(workspace_id)s
 returning {columns}
 """
-).format(columns=job_columns("j"))
+
+_CLAIM_SQL: Final = sql.SQL(_CLAIM_TEMPLATE).format(columns=job_columns("j"), source_filter=sql.SQL(""))
+
+# The same statement narrowed to one source of the workspace (an owner's smoke drain). The key
+# is resolved in the statement itself: an unknown key yields NULL and claims nothing, and a job
+# without a source (``source_id`` null) never compares equal.
+_CLAIM_SOURCE_SQL: Final = sql.SQL(_CLAIM_TEMPLATE).format(
+    columns=job_columns("j"),
+    source_filter=sql.SQL(
+        "\n    and source_id = (select s.id from app.sources s"
+        " where s.workspace_id = %(workspace_id)s and s.source_key = %(source_key)s)"
+    ),
+)
 
 _BLOCK_INCOMPATIBLE_SQL: Final = (
     "update ops.jobs"
@@ -480,6 +496,13 @@ def _worker(worker_id: str) -> str:
     return worker_id
 
 
+def check_source_key(source_key: str) -> str:
+    """A well-formed source key (the ``app.sources.source_key`` pattern) or `ValidationFailed`."""
+    if not isinstance(source_key, str) or not _SOURCE_KEY_RE.fullmatch(source_key):
+        raise ValidationFailed("source_key must be 3-60 characters of lowercase letters, digits and _")
+    return source_key
+
+
 def _fence(job: ClaimedJob) -> dict[str, Any]:
     return {
         "workspace_id": job.workspace_id,
@@ -497,14 +520,23 @@ async def claim(
     lease_seconds: float,
     *,
     payload_versions: Mapping[JobType, Collection[int]] | None = None,
+    source_key: str | None = None,
 ) -> ClaimedJob | None:
     """Lease the next due job of ``job_types`` in one workspace (spec 13 claim, one short transaction).
 
     ``payload_versions`` declares the payload versions this worker understands per job type
     (every requested type must be listed when it is given). A claimed job with another
     version is blocked with ``incompatible_payload_version`` and the next job is tried.
+
+    ``source_key`` (an owner's smoke drain) narrows the claim to the jobs of this workspace's
+    source with that key, in the same order; jobs of other sources and jobs without a source
+    stay untouched. An unknown key claims nothing; a malformed one is `ValidationFailed`.
     """
     worker = _worker(worker_id)
+    statement = _CLAIM_SQL if source_key is None else _CLAIM_SOURCE_SQL
+    params: dict[str, Any] = {}
+    if source_key is not None:
+        params["source_key"] = check_source_key(source_key)
     lease = _lease_duration(lease_seconds)
     types = sorted({JobType(t).value for t in job_types})
     if not types:
@@ -517,8 +549,9 @@ async def claim(
         for _ in range(_MAX_INCOMPATIBLE_PER_CLAIM):
             row = await fetch_one(
                 conn,
-                _CLAIM_SQL,
+                statement,
                 {
+                    **params,
                     "workspace_id": workspace_id,
                     "job_types": types,
                     "worker_id": worker,

@@ -496,7 +496,10 @@ The persistence layer must use these shapes, always with bound parameters, as
 **Claim.** Use the spec §13 statement verbatim: `... for update skip locked limit 1`, then
 set `state='running'`, a fresh `lease_token`, `lease_owner`, `lease_expires_at = now() +
 :lease`, `last_heartbeat_at` and `attempts = attempts + 1`. Two concurrent workers never
-receive the same job.
+receive the same job. An owner's smoke drain (`worker --drain --source KEY`) adds one predicate
+to the picking subquery, `source_id = (select id from app.sources where workspace_id = :ws and
+source_key = :key)` (`jobs.claim(source_key=...)`): only that source's jobs, never a source-less
+one, and an unknown key claims nothing; without it the statement is unchanged.
 
 **Heartbeat and completion.** Both update with `WHERE id = :id AND state = 'running' AND
 lease_token = :token AND lease_owner = :worker AND lease_expires_at > clock_timestamp()`.

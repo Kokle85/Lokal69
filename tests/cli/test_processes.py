@@ -84,6 +84,41 @@ def test_worker_queue_validation(run_cli: Cli) -> None:
     assert "no handler is registered" in unregistered.output
 
 
+def test_worker_source_requires_drain(run_cli: Cli) -> None:
+    result = run_cli("worker", "--source", "autoscout24_it", env=DEV)
+    assert result.exit_code == 2
+    assert "--source requires --drain" in result.output
+
+
+@pytest.mark.parametrize("key", ["not_a_configured_source", "AutoScout24-IT", "https://example.com/x"])
+def test_worker_source_must_be_in_the_yaml_registry(run_cli: Cli, key: str) -> None:
+    # The fake DATABASE_URL is never reached: the key is checked against config/sources first.
+    result = run_cli("worker", "--drain", "--queues", "detail", "--source", key, env=DEV)
+    assert result.exit_code == 2
+    assert "not a source of the YAML registry" in result.output
+    assert "autoscout24_it" in result.output  # the configured keys are listed
+    assert "database" not in result.output.lower()
+
+
+def test_worker_source_of_the_registry_passes_the_check(run_cli: Cli) -> None:
+    # A configured (even disabled) source passes; the drain then needs its database.
+    result = run_cli("worker", "--drain", "--queues", "detail", "--source", "autoscout24_de")
+    assert result.exit_code != 0
+    assert "not a source of the YAML registry" not in result.output
+    assert "DATABASE_URL" in result.output
+
+
+def test_worker_help_lists_the_source_option(run_cli: Cli) -> None:
+    result = run_cli("worker", "--help")
+    assert result.exit_code == 0
+    text = " ".join(result.output.split())
+    assert "--source KEY" in text
+    assert (
+        "With --drain: claim only jobs of this source (an owner smoke); jobs of other sources stay queued."
+        in text
+    )
+
+
 def test_api_serve_needs_a_database_url(run_cli: Cli, captured_uvicorn: dict[str, Any]) -> None:
     result = run_cli("api", "serve")
     assert result.exit_code == 2

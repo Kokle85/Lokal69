@@ -311,3 +311,39 @@ async def test_stop_event_ends_the_loop_without_claiming(env: PipelineEnv) -> No
     with anyio.fail_after(5):
         await worker(env, registry_with(succeed)).run(stop)
     assert job_row(env, job_id)["state"] == "queued"
+
+
+async def test_a_source_drain_leaves_other_sources_jobs_queued(env: PipelineEnv) -> None:
+    """``worker --drain --source KEY`` (an owner smoke, runbook 9.1): only that source's jobs run.
+
+    The other source stands for a smoke source switched off again with detail jobs still queued:
+    an unfiltered drain claims them first (higher priority or older) and its handler blocks them
+    ``source_paused``; the filtered drain never claims them, so they stay queued, unblocked.
+    """
+    left = env.seed.source(env.workspace_id, source_key=f"synthetic_left_{uuid.uuid4().hex[:8]}")
+    smoke_key = env.scalar("select source_key from app.sources where id = %s", env.source_id)
+
+    async def paused_unless_smoke(ctx: RuntimeContext, execution: JobExecution) -> JobOutcome:
+        if execution.job.source_id not in (None, env.source_id):
+            raise SourcePaused("synthetic: the left-over source is disabled")
+        return await succeed(ctx, execution)
+
+    leftover = await enqueue(env, source_id=left, priority=100)
+    sourceless = await enqueue(env, priority=1000)
+    mine = await enqueue(env, source_id=env.source_id)
+    with pytest.raises(ValidationFailed):
+        worker(env, registry_with(paused_unless_smoke), source_key="Not-A-Key")
+
+    reports = await worker(env, registry_with(paused_unless_smoke), source_key=smoke_key).run_until_idle()
+    assert [(r.job_id, r.state) for r in reports] == [(mine, JobState.SUCCEEDED)]
+    for job_id in (leftover, sourceless):
+        row = job_row(env, job_id)
+        assert row["state"] == "queued" and row["attempts"] == 0 and row["blocker_code"] is None
+    assert await worker(env, registry_with(paused_unless_smoke), source_key=smoke_key).run_until_idle() == []
+
+    # Without --source the same drain reaches the left-over job and blocks it (no retry timer).
+    rest = await worker(env, registry_with(paused_unless_smoke)).run_until_idle()
+    assert [(r.job_id, r.state, r.code) for r in rest] == [
+        (sourceless, JobState.SUCCEEDED, None),
+        (leftover, JobState.BLOCKED, "source_paused"),
+    ]

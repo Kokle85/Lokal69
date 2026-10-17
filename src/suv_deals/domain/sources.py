@@ -27,6 +27,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from suv_deals.domain.enums import SourceMode, TechnicalStatus, TermsDecision, TermsStatus
 
+#: A source key (the YAML file name and ``app.sources.source_key``; the database checks the same
+#: pattern in ``sources_key_ck``).
+SOURCE_KEY_PATTERN: Final = r"^[a-z0-9_]{3,60}$"
+
 
 class RateBudget(BaseModel):
     """Engineering defaults, not provider-approved quotas."""
@@ -290,7 +294,7 @@ def _aware(value: datetime) -> datetime:
 class SourceConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_key: str = Field(pattern=r"^[a-z0-9_]{3,60}$")
+    source_key: str = Field(pattern=SOURCE_KEY_PATTERN)
     display_name: str = Field(min_length=2, max_length=120)
     country: str = Field(pattern=r"^[A-Z]{2}$")
     role: str = Field(pattern=r"^(acquisition|mk_comparable)$")

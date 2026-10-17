@@ -4,6 +4,8 @@
   the next due job of its job types with `jobs.claim` (``FOR UPDATE SKIP LOCKED``, fresh token,
   ``attempts + 1``). The payload versions every handler understands are passed along, so an
   incompatible job is moved to ``blocked`` (``incompatible_payload_version``) by the claim itself.
+  An optional ``source_key`` (``worker --drain --source KEY``, an owner's smoke) narrows every
+  claim to that source's jobs; other sources' jobs and source-less jobs stay queued.
 - **Heartbeats** extend the lease every ``heartbeat_seconds`` while the handler works. A failed
   heartbeat means the lease is lost: the handler is cancelled (its network work stops) and nothing it
   would still commit can pass the fenced updates (`LeaseLost` rolls its transaction back).
@@ -89,10 +91,13 @@ class Worker:
         worker_id: str | None = None,
         job_types: Collection[JobType] | None = None,
         workspace_ids: Collection[UUID] | None = None,
+        source_key: str | None = None,
     ) -> None:
         self.ctx = ctx
         #: Optional restriction to some workspaces (still only ACTIVE ones are visited).
         self.workspace_ids = None if workspace_ids is None else frozenset(workspace_ids)
+        #: Optional restriction to the jobs of one source (by key, in every visited workspace).
+        self.source_key = None if source_key is None else jobs.check_source_key(source_key)
         self.registry = registry or default_registry()
         self.worker_id = worker_id or default_worker_id()
         wanted = tuple(self.registry.job_types() if job_types is None else job_types)
@@ -122,6 +127,7 @@ class Worker:
                 self.job_types,
                 self.ctx.options.job_lease_seconds,
                 payload_versions=self._versions,
+                source_key=self.source_key,
             )
             if job is not None:
                 self._cursor = start + offset + 1

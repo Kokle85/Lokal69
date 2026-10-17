@@ -247,9 +247,11 @@ raises `SourcePaused` unless every gate passes. Placeholders raise `AdapterUnimp
    crawler reachable, `suv-deals crawl once --source <key> --max-pages 1` runs ONE bounded
    discovery through every source and runtime gate (it refuses while any gate is closed), within
    the source's rate budget; then let the worker fetch some of the detail pages that one search
-   page queued (`suv-deals worker --drain --queues detail --max-jobs N`). The search page queues
-   one detail job per new or changed card and `max_detail_jobs_per_run` does not bound a drain
-   (each detail job is its own run), so `--max-jobs N` is what limits the detail requests.
+   page queued (`suv-deals worker --drain --queues detail --source <key> --max-jobs N`). The
+   search page queues one detail job per new or changed card and `max_detail_jobs_per_run` does
+   not bound a drain (each detail job is its own run), so `--max-jobs N` is what limits the
+   detail requests; `--source <key>` keeps the drain on this source, so detail jobs another
+   (disabled) source left queued are not claimed and blocked as `source_paused`.
    Confirm `access_state: ok` and healthy parser outcomes (`suv-deals sources inspect <key>
    --from-db`, `doctor`). For AutoScout24 the exact owner commands, including the local
    uncommitted `enabled: true` and switching the source off again, are in docs/runbook.md

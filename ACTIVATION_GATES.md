@@ -223,11 +223,13 @@ Each step only needs the steps above it; any step can stop without affecting the
   6. Live smoke by hand: with `SOURCE_NETWORK_ENABLED=true` (Compose:
      `SUV_DEALS_ENABLE_SOURCE_NETWORK=true` exported for that run only),
      `uv run suv-deals crawl once --source <key> --max-pages 1`, then
-     `uv run suv-deals worker --drain --queues detail --max-jobs N` (`--max-jobs` bounds the
-     detail requests; `max_detail_jobs_per_run` does not bound a drain); check `suv-deals sources
-     inspect <key> --from-db` (its `robots` view must show the run's robots revision: status, time,
-     hash) and `doctor`, and collect the evidence ids with `suv-deals sources smoke-evidence <key>`
-     (the robots.txt request of the run, `purpose: robots`, and `robots_revisions` included). Then
+     `uv run suv-deals worker --drain --queues detail --source <key> --max-jobs N` (`--max-jobs`
+     bounds the detail requests; `max_detail_jobs_per_run` does not bound a drain; `--source`
+     keeps other sources' queued detail jobs out of the drain, so they are not blocked as
+     `source_paused`); check `suv-deals sources inspect <key> --from-db` (its `robots` view must
+     show the run's robots revision: status, time, hash) and `doctor`, and collect the evidence
+     ids with `suv-deals sources smoke-evidence <key>` (the robots.txt request of the run,
+     `purpose: robots`, and `robots_revisions` included). Then
      `technical_status: live_smoke_passed`. For AutoScout24 the exact owner commands (local
      uncommitted `enabled: true`, sync, smoke, switch-off) are in docs/runbook.md section 9.1. The
      first `autoscout24_it` smokes (2026-10-17) predate the worker's robots check (empty robots

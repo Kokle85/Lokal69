@@ -25,6 +25,24 @@ docs/evidence/autoscout24_it_live_smoke_2026-10-17.json. Evidence: docs/source_a
 evidence" and the ACTIVATION_GATES.md evidence log; runbook 9.1 now says how the owner writes the
 status into the database with its time (`sources set-technical-status`, before the next sync).
 
+A smoke drain claims only its own source (2026-10-17). After the `autoscout24_it` smokes, 39 of
+its detail jobs are still queued (the source is disabled again); the `autoscout24_de` smoke's
+`worker --drain` would have claimed them first and blocked each one `source_paused` (no retry
+timer, `jobs unblock` one by one) while `--max-jobs` was spent on the wrong source.
+
+- **`suv-deals worker --drain --source KEY`.** `jobs.claim(source_key=...)` adds `source_id =
+  (select id from app.sources where workspace_id = ... and source_key = ...)` to the same claim
+  statement (`for update skip locked`, priority order, the incompatible-payload loop stays within
+  the source); jobs of other sources and source-less jobs (valuation, seller inquiries) stay
+  queued, untouched, and an unknown key claims nothing. Without `--source` the statement is
+  unchanged. `Worker(source_key=...)` passes it to every claim. The key must be a source of the
+  YAML registry (checked before the database is opened) and `--source` needs `--drain` (exit 2
+  otherwise); a malformed key is `ValidationFailed`. An empty drain prints `No due jobs of source
+  KEY.`
+- **Docs.** Runbook 9.1 drains with `--source autoscout24_it` (`--source autoscout24_de` for the
+  .de smoke) and says why; the register and ACTIVATION_GATES step 6 name `--source <key>`;
+  schema.md section 7.
+
 Finding of the owner's first live smoke (2026-10-17, `autoscout24_it`, `crawl once --max-pages 1`;
 the search page answered 200, access ok): the live worker path never recorded robots.txt
 (`sources inspect --from-db` showed the robots view empty, `sources smoke-evidence` listed only the

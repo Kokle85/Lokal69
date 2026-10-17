@@ -30,6 +30,7 @@ from uuid import UUID, uuid4
 import click
 
 if TYPE_CHECKING:
+    from suv_deals.adapters.registry import SourceRegistry
     from suv_deals.domain.actor import ActorContext
     from suv_deals.persistence.database import Database
     from suv_deals.settings import Settings
@@ -220,6 +221,17 @@ def database_url(settings: Settings) -> str:
     if settings.database_url is None or not settings.database_url.get_secret_value():
         fail("DATABASE_URL is not configured (server-side secret; set it in the environment)", EXIT_USAGE)
     return settings.database_url.get_secret_value()
+
+
+def load_source_registry(settings: Settings) -> SourceRegistry:
+    """The YAML source registry of ``CONFIG_DIR`` (no database); an invalid one fails the command."""
+    from suv_deals.adapters.registry import load_registry
+    from suv_deals.errors import AppError
+
+    try:
+        return load_registry(settings.config_dir)
+    except AppError as exc:
+        fail(exc.message)
 
 
 _LOOPBACK_ADDRESSES: Final = frozenset({"127.0.0.1", "::1"})

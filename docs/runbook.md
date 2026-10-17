@@ -307,6 +307,7 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `sources set-technical-status KEY STATUS --reason ... --yes`, `sources resume KEY --reason ... --yes` | audited owner recovery actions; neither one enables a source |
 | `crawl once --source KEY [--profile primary] [--max-pages 1]` | one bounded discovery through every gate; if this command does not get its own job (another due discovery job first, or a running worker claimed it), the job is cancelled while it still waits, so the page cap can never be skipped silently |
 | `worker`, `scheduler`, `dispatcher`, `reconcile [--dry-run / --loop]` | runtime processes |
+| `worker --drain [--queues detail] [--max-jobs N] [--source KEY]` | process the due jobs once, then exit; `--source` (a configured source key, only with `--drain`) claims only that source's jobs, so an owner smoke never claims (and blocks) the jobs another source left queued (section 9.1) |
 | `outbox inspect`, `reviews list --status pending`, `evidence verify` | read-only checks |
 | `tax-rules validate PATH` | validates; never approves |
 | `tax-rules list [--jurisdiction MK] [--json]` | read-only: the workspace's stored rule-set versions and the repository drafts (`config/tax_rules/drafts`) with status, content hash (recorded, or computed for an unsealed draft), effective dates and whether a draft file is stored (same or DIFFERENT content), plus which rule set `import-costs estimate` would use today |
@@ -515,11 +516,11 @@ uv run suv-deals sources sync --dry-run
 uv run suv-deals sources sync --yes
 
 # 2. One bounded discovery (one model page: renault/captur), then at most 5 of the detail pages
-#    it queued (--max-jobs is the bound; see below).
+#    it queued (--max-jobs is the bound; --source keeps other sources' jobs queued; see below).
 SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
   uv run suv-deals crawl once --source autoscout24_it --max-pages 1
 SOURCE_NETWORK_ENABLED=true CRAWL4AI_BASE_URL=http://127.0.0.1:11235 \
-  uv run suv-deals worker --drain --queues detail --max-jobs 5
+  uv run suv-deals worker --drain --queues detail --source autoscout24_it --max-jobs 5
 
 # 3. Look at the result (read-only) and collect the spec-31 evidence ids.
 uv run suv-deals sources inspect autoscout24_it --from-db
@@ -574,6 +575,12 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   its own run, so a drain without `--max-jobs` fetches every queued `/annunci/` page, 20 s apart.
   `--max-jobs 5` is the bound here: at most 5 detail jobs, one `/annunci/` page each (use
   `--max-jobs 1` for one); the jobs left waiting are never fetched (see the report-back item).
+- `--source autoscout24_it` limits the drain to this source's jobs: without it the worker claims
+  the due detail jobs of EVERY source (highest priority, then oldest), so detail jobs another
+  source left queued (e.g. the 39 left from the 2026-10-17 `autoscout24_it` walks, during the
+  `autoscout24_de` smoke) would be claimed first and, their source being disabled, blocked as
+  `source_paused` (each then needing `jobs unblock`) while using up `--max-jobs`. With it they
+  stay queued, untouched (an empty drain prints `No due jobs of source autoscout24_it.`).
 - `cy` since 2026-10-17 (`search.cy` in the source YAML; the adapter accepts only the source's
   own code, `I` or `D`): the owner's 12-model smoke of `autoscout24_it` that day
   (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages
@@ -632,13 +639,15 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   audited); a sync alone writes the status without the time, and the command is then a no-op.
   Enabling for real (step 7) is a separate, committed configuration revision;
   until then step 4 keeps the source off, and a detail job still queued is blocked as
-  `source_paused` when a worker reaches it (nothing is fetched).
+  `source_paused` when a worker without `--source` (or with this key) reaches it (nothing is
+  fetched).
 - `doctor` reads the YAML: between steps 1 and 4 it reports `autoscout24_it` as `active
   (public_html)`, after step 4 again `not active: 1 gate problem(s)`.
-- `autoscout24_de` follows later the same way (replace the key in every command). It is
-  `card_only`: `worker --drain --queues detail` then only ingests the search cards' own facts and
-  makes no request (robots.txt disallows `/angebote/`), so there `--max-jobs 5` may be left out
-  (with it, only 5 of the cards are ingested).
+- `autoscout24_de` follows later the same way (replace the key in every command, the drain's
+  `--source` too: `worker --drain --queues detail --source autoscout24_de`, so the `autoscout24_it`
+  jobs still queued are not claimed and blocked). It is `card_only`: that drain only ingests the
+  search cards' own facts and makes no request (robots.txt disallows `/angebote/`), so there
+  `--max-jobs 5` may be left out (with it, only 5 of the cards are ingested).
 - The smoke does NOT show whether .de applies `pricefrom`/`priceto`/`kmto`, nor whether either
   site applies `cy`: the adapter does not record the page's server-normalised `pageQuery` and raw
   pages are not kept (`SNAPSHOT_STORAGE=disabled`). The only indirect checks are the cards'

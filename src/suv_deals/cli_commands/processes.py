@@ -36,6 +36,7 @@ from suv_deals.cli_commands._common import (
     emit_json,
     fail,
     load_settings,
+    load_source_registry,
     parse_csv,
     pass_cli,
     refuse,
@@ -100,6 +101,13 @@ def parse_queues(value: str) -> list[Any]:
     "--max-jobs", type=click.IntRange(1, 100_000), default=1000, show_default=True, help="With --drain."
 )
 @click.option(
+    "--source",
+    "source_key",
+    metavar="KEY",
+    default=None,
+    help="With --drain: claim only jobs of this source (an owner smoke); jobs of other sources stay queued.",
+)
+@click.option(
     "--registry",
     "registry_spec",
     default=DEFAULT_REGISTRY,
@@ -107,14 +115,27 @@ def parse_queues(value: str) -> list[Any]:
     help="Handler registry factory (extension point; suv_deals.* only).",
 )
 @pass_cli
-def worker(cli: CliContext, queues: str, drain: bool, max_jobs: int, registry_spec: str) -> None:
+def worker(
+    cli: CliContext, *, queues: str, drain: bool, max_jobs: int, source_key: str | None, registry_spec: str
+) -> None:
     """Claim and process durable jobs (leases, heartbeats, fenced commits; SIGTERM finishes the job)."""
+    if source_key is not None and not drain:
+        fail("--source requires --drain (a long-running worker always claims every source)", EXIT_USAGE)
     settings = load_settings(cli)
     job_types = parse_queues(queues)
     registry = load_factory(registry_spec, option="--registry")()
     missing = [t.value for t in job_types if t not in registry]
     if missing:
         fail(f"no handler is registered for: {', '.join(missing)}", EXIT_USAGE)
+    if source_key is not None:
+        # Only a source of the YAML registry (checked before the database is touched).
+        configured = sorted(c.source_key for c in load_source_registry(settings).configs)
+        if source_key not in configured:
+            fail(
+                f"--source {source_key[:80]}: not a source of the YAML registry (CONFIG_DIR/sources); "
+                f"configured: {', '.join(configured) or '-'}",
+                EXIT_USAGE,
+            )
 
     async def body() -> int:
         from suv_deals.workers.runner import Worker, run_worker
@@ -125,7 +146,8 @@ def worker(cli: CliContext, queues: str, drain: bool, max_jobs: int, registry_sp
             return 0
         ctx = await build_runtime(settings, application_name="suv-deals-worker", configure_logs=True)
         try:
-            reports = await Worker(ctx, registry, job_types=job_types).run_until_idle(max_jobs=max_jobs)
+            drainer = Worker(ctx, registry, job_types=job_types, source_key=source_key)
+            reports = await drainer.run_until_idle(max_jobs=max_jobs)
         finally:
             await ctx.aclose()
         rows = [
@@ -138,7 +160,8 @@ def worker(cli: CliContext, queues: str, drain: bool, max_jobs: int, registry_sp
             }
             for r in reports
         ]
-        echo(table(rows, ["job_id", "type", "attempt", "state", "code"]) if rows else "No due jobs.")
+        idle = "No due jobs." if source_key is None else f"No due jobs of source {source_key}."
+        echo(table(rows, ["job_id", "type", "attempt", "state", "code"]) if rows else idle)
         return 0
 
     run_async(body)

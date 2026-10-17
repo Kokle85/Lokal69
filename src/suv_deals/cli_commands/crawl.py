@@ -35,6 +35,7 @@ from suv_deals.cli_commands._common import (
     echo,
     fail,
     load_settings,
+    load_source_registry,
     pass_cli,
     refuse,
     run_async,
@@ -99,15 +100,12 @@ def runtime_refusals(record: SourceRecord, *, network_enabled: bool, fixture_dat
 @pass_cli
 def once(cli: CliContext, source_key: str, profile: str, max_pages: int, workspace: UUID | None) -> None:
     """Run one bounded discovery for SOURCE through every source and runtime gate."""
-    from suv_deals.adapters.registry import gate_status, load_registry
+    from suv_deals.adapters.registry import gate_status
     from suv_deals.domain.enums import SourceMode
-    from suv_deals.errors import AppError, NotFound
+    from suv_deals.errors import NotFound
 
     settings = load_settings(cli)
-    try:
-        registry = load_registry(settings.config_dir)
-    except AppError as exc:
-        fail(exc.message)
+    registry = load_source_registry(settings)
     yaml_config = next((c for c in registry.configs if c.source_key == source_key), None)
     if yaml_config is not None:
         gate = gate_status(yaml_config)
