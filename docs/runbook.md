@@ -531,15 +531,27 @@ uv run suv-deals sources inspect autoscout24_it --from-db
 - `cy` since 2026-10-17 (`search.cy` in the source YAML; the adapter accepts only the source's
   own code, `I` or `D`): the owner's 12-model smoke of `autoscout24_it` that day
   (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards, 5 detail pages
-  ingested) ran without a country filter, and the site answered with sellers from all of Europe:
-  two of the five ingested listings were Dutch dealers, rejected by screening as
-  `COUNTRY_NOT_IN_PROFILE`, and another card was a German listing. With one page of 20 newest cards
-  per model, foreign listings spend the request budget and hide Italian (or German) ones. `cy=I` /
-  `cy=D` is the value the sites' own normalised query (`pageQuery`) carried on the owner's
-  captures. robots.txt disallows a query only on the bare `/lst?` and `/lst/?` paths, so the
-  filtered `/lst/<make>/<model>?...` URL still passes the URL policy and robots.txt. After the
-  change, a listing of either source screened out as `COUNTRY_NOT_IN_PROFILE` means the filter was
-  not applied: report it.
+  ingested) ran without a country filter, and three of the five ingested listings came from other
+  countries: two Dutch dealers, rejected by screening as `COUNTRY_NOT_IN_PROFILE`, and a German
+  listing, which the country rule accepts (screened `needs_facts`). With one page of 20 newest
+  cards per model, foreign listings spend the request budget and hide Italian (or German) ones.
+  `I` / `D` is what the sites' normalised query (`pageQuery`) carried on the owner's captures,
+  but those requests sent no `cy`: it was the server's default for them, and the crawler's
+  requests without `cy` evidently got a different one. Whether an explicit `cy` narrows the
+  results is therefore **unverified on both sites** until a live 12-model walk shows it.
+  robots.txt disallows a query on the bare `/lst?` and `/lst/?` paths (and, on autoscout24.de, any
+  URL with `cat=`), not on `/lst/<make>/<model>`, so the filtered `/lst/<make>/<model>?...` URL
+  still passes the URL policy and robots.txt.
+- The check after the change: every ingested listing's seller country must be the source's own
+  (`IT` for `autoscout24_it`, `DE` for `autoscout24_de`). Any other country means the filter was
+  not applied: report it. That includes a `DE` or `CH` listing on .it (or an `IT` or `CH` listing
+  on .de), which screening ACCEPTS because the profiles' `source_countries` are DE, IT and CH;
+  `COUNTRY_NOT_IN_PROFILE` is only the visible case of a country outside the profile. The seller
+  country of each ingested listing is the Country column of the dashboard's Candidates list with
+  "include screening-rejected (audit)" ticked (a country other than the source's is marked
+  `source IT` / `source DE` under it). If `cy` works, German sellers come in only through
+  `autoscout24_de` (card_only: card facts, no detail page) and Swiss sellers through neither
+  AutoScout24 source while `autoscout24_ch` is blocked.
 - This one-page smoke requests ONLY `/lst/renault/captur`, the slug already verified on the
   captures: it checks the live page structure, not the model slugs marked UNVERIFIED in the
   configuration notes. Those are first requested by a full 12-model walk, either a separate
@@ -571,13 +583,14 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `card_only`: `worker --drain --queues detail` then only ingests the search cards' own facts and
   makes no request (robots.txt disallows `/angebote/`), so there `--max-jobs 5` may be left out
   (with it, only 5 of the cards are ingested).
-- The smoke does NOT show whether .de applies `pricefrom`/`priceto`/`kmto`: the adapter does not
-  record the page's server-normalised `pageQuery` and raw pages are not kept
-  (`SNAPSHOT_STORAGE=disabled`). The only indirect check is the cards' stored price and mileage in
-  `sources smoke-evidence` (`card_price_minor`, `card_mileage_km`): a card outside the primary
-  profile's price band or above its mileage ceiling means that filter was ignored; every card
-  inside is consistent with the filters, never proof of them. The filters stay unverified on .de
-  until such evidence is recorded.
+- The smoke does NOT show whether .de applies `pricefrom`/`priceto`/`kmto`, nor whether either
+  site applies `cy`: the adapter does not record the page's server-normalised `pageQuery` and raw
+  pages are not kept (`SNAPSHOT_STORAGE=disabled`). The only indirect checks are the cards'
+  stored price and mileage in `sources smoke-evidence` (`card_price_minor`, `card_mileage_km`): a
+  card outside the primary profile's price band or above its mileage ceiling means that filter
+  was ignored; and, for `cy`, the ingested listings' seller countries (previous bullet). Every
+  value inside is consistent with the filters, never proof of them. These filters (`cy` on both
+  sites) stay unverified until such evidence is recorded.
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

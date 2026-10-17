@@ -9,19 +9,30 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 AutoScout24 seller-country filter (live finding of 2026-10-17). The owner's 12-model smoke of
 `autoscout24_it` (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards,
-5 detail pages ingested) showed that the search URL (`pricefrom`, `priceto`, `kmto`, `sort`,
-`desc`, `ustate`) carried no country filter, so the site answered with sellers from all of
-Europe: two of the five ingested Italian-site listings were Dutch dealers, rejected by screening
-(primary profile `source_countries` DE, IT, CH -> `COUNTRY_NOT_IN_PROFILE`), and another card
-was a German listing. With one page of 20 newest cards per model, foreign listings spend the
+5 detail pages ingested) sent a search URL (`pricefrom`, `priceto`, `kmto`, `sort`, `desc`,
+`ustate`) with no country filter, and three of the five ingested listings came from other
+countries: two were Dutch dealers, rejected by screening (primary profile `source_countries` DE,
+IT, CH -> `COUNTRY_NOT_IN_PROFILE`), and one was a German listing, which the country rule accepts
+(screened `needs_facts`). With one page of 20 newest cards per model, foreign listings spend the
 request budget and can hide every Italian or German one.
 
 - **`search.cy` for AutoScout24** (`autoscout24.COUNTRY_FILTER_CODES`): the sites' own
-  seller-country filter, the value their server-normalised `pageQuery` carried on the owner's
-  captures (`I` on autoscout24.it, `D` on autoscout24.de). Validated when the adapter is built:
-  only the source's own code is accepted (`I` for IT, `D` for DE); any other value (another
-  country, lower case, a list, extra text) is refused. It is not implied by the source country:
-  a source without `cy` sends exactly the URLs it sent before (documented in the adapter module).
+  seller-country filter key. The codes (`I` on autoscout24.it, `D` on autoscout24.de) are the
+  values the server-normalised `pageQuery` carried on the owner's captures, but those requests
+  sent no `cy` (their own query has none): there the value was the server's default. The
+  crawler's requests without `cy` were evidently answered with a different default (the foreign
+  listings above), so whether an explicit `cy` narrows the results is **unverified on both
+  sites** until the next live 12-model walk shows it: every ingested listing's seller country is
+  the source's own (IT on `autoscout24_it`, DE on `autoscout24_de`). Validated when the adapter
+  is built: only the source's own code is accepted (`I` for IT, `D` for DE); any other value
+  (another country, lower case, a list, extra text) is refused. It is not implied by the source
+  country: a source without `cy` sends exactly the URLs it sent before (documented in the adapter
+  module).
+- **Trade-off, if `cy` works as intended**: German sellers no longer come in through
+  `autoscout24_it` (which fetches `/annunci/` detail pages); they are reached only through
+  `autoscout24_de`, which is `card_only` (robots.txt disallows `/angebote/`), so with card facts
+  and no detail page. Swiss sellers (CH is in the profiles' `source_countries`) are reached
+  through neither AutoScout24 source while `autoscout24_ch` stays blocked.
 - **Configuration.** `autoscout24_it` sets `cy: I` and `autoscout24_de` `cy: D`, each with a
   comment recording the finding; the search URLs now end in `&cy=I` / `&cy=D`. robots.txt
   disallows a query only on the bare `/lst?` and `/lst/?` paths (and, on .de, any `cat=` URL),
@@ -31,11 +42,14 @@ request budget and can hide every Italian or German one.
   routes of the 12 adapter-built model searches of each source (and the Italian
   redirect-to-list target) carry `cy`; no page changed.
 - Tests: the built URL of every model carries the source's `cy` and passes the URL policy and the
-  robots evaluator, an unsupported `cy` is refused, a source without `cy` builds the old URL, and
-  the cards of a filtered page are still parsed; the saved model-search routes carry `cy`.
-- Docs: runbook 9.1 (the smoke URL now includes `cy`; a listing screened out as
-  `COUNTRY_NOT_IN_PROFILE` after the change means the filter was not applied), the source access
-  register rows and the source configuration notes.
+  robots evaluator (which still refuses a `cat=` query on a .de model page), an unsupported `cy`
+  is refused, a source without `cy` builds the old URL, and the cards of a filtered page are
+  still parsed; the saved model-search routes carry `cy`.
+- Docs: runbook 9.1 (the smoke URL now includes `cy`; after the change, any ingested listing
+  whose seller country is not the source's own, including a DE or CH listing that screening
+  accepts, means the filter was not applied; `cy` joins the filters that stay unverified until
+  live evidence is recorded), the source access register rows and the source configuration
+  notes.
 
 Owner decision of 2026-10-16 („сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00"):
 discovery of AutoScout24 Italy and Germany every 30 minutes, only from 08:00 to 22:00 (the

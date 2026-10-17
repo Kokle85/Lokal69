@@ -258,7 +258,7 @@ def _recorded_robots(key: str) -> RobotsRevision:
 
 @pytest.mark.parametrize(("key", "code"), [("autoscout24_it", "I"), ("autoscout24_de", "D")])
 def test_each_source_filters_on_its_own_seller_country(key: str, code: str) -> None:
-    """Live finding 2026-10-17: without ``cy`` the sites answer with sellers from all of Europe."""
+    """Live finding 2026-10-17: without ``cy`` autoscout24.it answered the crawler with foreign sellers."""
     adapter = _it() if key == "autoscout24_it" else _de()
     assert adapter.config.search["cy"] == code == COUNTRY_FILTER_CODES[adapter.config.country]
     robots = _recorded_robots(key)
@@ -268,13 +268,18 @@ def test_each_source_filters_on_its_own_seller_country(key: str, code: str) -> N
         assert query[-1] == ("cy", code) and [k for k, _ in query].count("cy") == 1
         assert request.params["cy"] == code
         # The filtered URL stays inside the source's search path policy and robots.txt: a query
-        # is disallowed only on the bare /lst? and /lst/? paths, never on /lst/<make>/<model>.
+        # is disallowed on the bare /lst? and /lst/? paths (and, on .de, any URL with cat=), not
+        # on /lst/<make>/<model>.
         assert adapter.policy.is_search_url(request.url)
         verdict = evaluate(robots, request.url, _ROBOTS_UA, now=NOW)
         assert verdict.allowed, (request.url, verdict)
     # The reconstruction does refuse what robots.txt disallows (it is not an allow-all).
     assert not evaluate(robots, f"https://{robots.host}/lst?cy={code}", _ROBOTS_UA, now=NOW).allowed
     assert not evaluate(robots, f"https://{robots.host}/lst/?cy={code}", _ROBOTS_UA, now=NOW).allowed
+    # On .de the query rule is not limited to the bare paths: cat= is refused on a model page too.
+    model_url = adapter.build_search(_profile(), None).url
+    with_cat = evaluate(robots, f"{model_url}&cat=x", _ROBOTS_UA, now=NOW)
+    assert with_cat.allowed is (key != "autoscout24_de"), (model_url, with_cat)
 
 
 @pytest.mark.parametrize(

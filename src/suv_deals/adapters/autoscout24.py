@@ -44,17 +44,23 @@ Search config keys (``SourceConfig.search``):
 - ``ustate`` (optional): the site's offer-state filter (``U`` = used), sent only when configured.
 - ``cy`` (optional): the site's seller-country filter, sent only when configured. The only accepted
   value is the source's own country code in the site's vocabulary (`COUNTRY_FILTER_CODES`: ``I``
-  for Italy, ``D`` for Germany, read from the server-normalised ``pageQuery`` of the owner's
-  captures); any other value is refused when the adapter is built.
+  for Italy, ``D`` for Germany); any other value is refused when the adapter is built.
 
-The country filter is NOT implied by the source country: it must be configured. Without ``cy`` the
-sites answer with sellers from all of Europe (owner's 12-model live smoke of autoscout24.it,
-2026-10-17: two of the five ingested listings were Dutch dealers, rejected by screening as
-``COUNTRY_NOT_IN_PROFILE``, and another card was a German listing), so both shipped configurations
-set it. Keeping it explicit means every query key the adapter sends is written in the source's
-YAML, where it is reviewed against robots.txt and the access register, and a source without ``cy``
-sends exactly the URLs it sent before. robots.txt disallows a query only on the bare ``/lst?`` and
-``/lst/?`` paths, so a ``cy`` query on ``/lst/<make>/<model>`` stays allowed.
+The country filter is NOT implied by the source country: it must be configured. Where the codes
+come from: the server-normalised ``pageQuery`` of the owner's captures carries ``cy`` ``I`` (.it)
+and ``D`` (.de), but those requests sent no ``cy`` (their own query has none), so the value is the
+server's default for those requests, not proof that an explicit ``cy`` narrows the results. The
+crawler's requests without ``cy`` were answered differently: in the owner's 12-model live smoke of
+autoscout24.it on 2026-10-17, three of the five ingested listings came from other countries (two
+Dutch dealers, rejected by screening as ``COUNTRY_NOT_IN_PROFILE``, and a German listing, which
+the country rule accepts and screening left at ``needs_facts``). Both shipped configurations
+therefore set ``cy``; whether it narrows the results stays UNVERIFIED on both sites until a live
+12-model walk shows every ingested listing's seller country equal to the source's own. Keeping it
+explicit means every query key the adapter sends is written in the source's YAML, where it is
+reviewed against robots.txt and the access register, and a source without ``cy`` sends exactly
+the URLs it sent before. robots.txt disallows a query on the bare ``/lst?`` and ``/lst/?`` paths
+(and, on autoscout24.de, any URL with ``cat=``), not on ``/lst/<make>/<model>``, so a ``cy``
+query there stays allowed.
 """
 
 from __future__ import annotations
@@ -150,9 +156,11 @@ from suv_deals.errors import ValidationFailed
 ADAPTER_VERSION: Final = "autoscout24@1.0.0"
 
 _SEARCH_KEYS: Final = frozenset({"models", "sort", "desc", "ustate", "cy"})
-#: The sites' seller-country filter codes (query key ``cy``) by source country, from the
-#: server-normalised ``pageQuery`` of the owner's captures (``I`` on autoscout24.it, ``D`` on
-#: autoscout24.de). A source may only filter on its own country.
+#: The sites' seller-country filter codes (query key ``cy``) by source country, as the
+#: server-normalised ``pageQuery`` of the owner's captures carried them (``I`` on autoscout24.it,
+#: ``D`` on autoscout24.de; a server default there, since those requests sent no ``cy``; the
+#: effect of sending it is unverified, see the module docstring). A source may only filter on its
+#: own country.
 COUNTRY_FILTER_CODES: Final = {"IT": "I", "DE": "D"}
 #: Sort keys of the sites' own vocabulary (``taxonomy.sortingKeys`` on the captured pages).
 _SORT_KEYS: Final = frozenset({"standard", "age", "price", "year", "mileage", "power"})
@@ -572,9 +580,9 @@ class AutoScout24Adapter:
 
         The price band is widened to whole euros (floor/ceil) and ``kmto`` carries the mileage
         ceiling itself (the strict ``< 200,000 km`` rule is enforced by eligibility screening).
-        ``ustate`` and ``cy`` are sent only when the source configures them; ``cy`` narrows the
-        results to sellers in the source's own country (screening still checks every listing's
-        country against the profile).
+        ``ustate`` and ``cy`` are sent only when the source configures them; ``cy`` asks for
+        sellers in the source's own country (unverified until a live walk shows it; screening
+        still checks every listing's country against the profile).
         """
         params: list[tuple[str, str]] = []
         if profile.min_price_eur is not None:
