@@ -13,6 +13,17 @@ Hard rules (spec 3):
   prices, missing mileage, mileage ranges, conflicting odometer statements and missing FX are
   ``needs_facts``; parts/damaged and auction prices are ``rejected``. A price or mileage of exactly
   0 is a site placeholder and is treated as missing (unknown is never 0, spec 2).
+- Implausibly low mileage is ``needs_facts`` (``MILEAGE_IMPLAUSIBLY_LOW``), never a pass: sellers
+  leave out the thousands ("16 km" for 16,000 or 160,000 km), so the real reading is unknown.
+  Any positive reading below ``MIN_PLAUSIBLE_USED_MILEAGE_KM`` (1,000 km) qualifies, and so does a
+  reading below ``MIN_PLAUSIBLE_KM_PER_YEAR`` (2,000 km) times the full years since first
+  registration once the car is at least ``MIN_AGE_YEARS_FOR_KM_FLOOR`` (3) full years old on the
+  screening date. The age counts conservatively: a month-only registration from the last day of
+  that month, a year-only one from 31 December, so a missing day or month never makes a car look
+  older than it can be. Estimated readings are checked too; the rule never applies at or above the
+  profile's mileage ceiling, so it never replaces ``MILEAGE_TOO_HIGH``. There is no exemption for
+  new, "km 0" or demo offers: ``NormalizedListing`` has no offer-condition field (the AutoScout24
+  adapter keeps a non-used ``offerType`` only as a parser warning, which screening does not read).
 - SUV identity: the taxonomy decides when it knows the model (``is_suv`` True passes, False
   rejects even against a seller "SUV" body type). A body type in ``profile.body_types`` alone
   passes only when ``profile.require_taxonomy_match`` is False; with the shipped default (True)
@@ -37,6 +48,7 @@ profile needs facts, else ``rejected``.
 
 from __future__ import annotations
 
+import calendar
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
@@ -52,6 +64,7 @@ from suv_deals.domain.enums import (
     EligibilityState,
     FxPurpose,
     OdometerClaim,
+    Precision,
     PriceBasis,
     PriceType,
     ProfileKey,
@@ -59,7 +72,7 @@ from suv_deals.domain.enums import (
     Tristate,
     VatTreatment,
 )
-from suv_deals.domain.listings import NormalizedListing
+from suv_deals.domain.listings import NormalizedListing, PartialDate, VehicleSpec
 from suv_deals.domain.money import FxRate, Money
 from suv_deals.domain.parsing import MILES_TO_KM
 from suv_deals.domain.profiles import BusinessConfig, SearchProfile
@@ -75,6 +88,12 @@ PROFILE_ORDER: tuple[ProfileKey, ...] = (
 # An estimated odometer reading ("ca. 150.000 km") passes only below 180,000 km (= ceiling minus
 # this margin); at or above ceiling plus the margin it fails; in between it needs facts.
 ESTIMATE_UNCERTAINTY_KM = Decimal("20000")
+# A positive odometer reading below this is implausible for a used car (thousands left out).
+MIN_PLAUSIBLE_USED_MILEAGE_KM = Decimal("1000")
+# From this many full years after first registration, a reading below MIN_PLAUSIBLE_KM_PER_YEAR
+# times those full years is implausible too.
+MIN_AGE_YEARS_FOR_KM_FLOOR = 3
+MIN_PLAUSIBLE_KM_PER_YEAR = Decimal("2000")
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
 
@@ -122,6 +141,7 @@ class ReasonCode(StrEnum):
     PRICE_ABOVE_BAND = "PRICE_ABOVE_BAND"
     MILEAGE_MISSING = "MILEAGE_MISSING"
     MILEAGE_ZERO_PLACEHOLDER = "MILEAGE_ZERO_PLACEHOLDER"
+    MILEAGE_IMPLAUSIBLY_LOW = "MILEAGE_IMPLAUSIBLY_LOW"
     MILEAGE_TOO_HIGH = "MILEAGE_TOO_HIGH"
     MILEAGE_RANGE_ONLY = "MILEAGE_RANGE_ONLY"
     MILEAGE_CONFLICT = "MILEAGE_CONFLICT"
@@ -554,7 +574,51 @@ def _decimal_or_none(value: str) -> Decimal | None:
     return number if number.is_finite() else None
 
 
-def _mileage_rule(listing: NormalizedListing, profile: SearchProfile) -> _Rule:
+def _full_years_since(first_registration: PartialDate, as_of: date) -> int | None:
+    """Fewest full years from first registration to ``as_of`` that the date's precision allows.
+
+    A month-only date counts from the last day of that month and a year-only date from
+    31 December, so a missing day or month never makes the car look older than it can be.
+    ``None`` when the date is unknown or not a calendar date (e.g. year 0000).
+    """
+    value = first_registration.value
+    if value is None:
+        return None
+    try:
+        year = int(value[:4])
+        if first_registration.precision == Precision.DAY:
+            latest = date.fromisoformat(value)
+        elif first_registration.precision == Precision.MONTH:
+            month = int(value[5:7])
+            latest = date(year, month, calendar.monthrange(year, month)[1])
+        else:
+            latest = date(year, 12, 31)
+    except ValueError:
+        return None
+    return as_of.year - latest.year - ((as_of.month, as_of.day) < (latest.month, latest.day))
+
+
+def _implausibly_low_mileage(vehicle: VehicleSpec, km: Decimal, as_of: date) -> str | None:
+    """Why a positive odometer reading is too low to be true for this used car, or ``None``."""
+    if km < MIN_PLAUSIBLE_USED_MILEAGE_KM:
+        return (
+            f"mileage {km} km is implausibly low for a used car, probably a typing error "
+            "(thousands left out); confirm the odometer reading"
+        )
+    years = _full_years_since(vehicle.first_registration, as_of)
+    if years is None or years < MIN_AGE_YEARS_FOR_KM_FLOOR:
+        return None
+    floor = MIN_PLAUSIBLE_KM_PER_YEAR * years
+    if km >= floor:
+        return None
+    return (
+        f"mileage {km} km is implausibly low for a car first registered "
+        f"{vehicle.first_registration.value} ({years} full years: at least {floor} km at "
+        f"{MIN_PLAUSIBLE_KM_PER_YEAR} km/year), probably a typing error; confirm the odometer reading"
+    )
+
+
+def _mileage_rule(listing: NormalizedListing, profile: SearchProfile, as_of: date) -> _Rule:
     rule = _Rule()
     key = profile.key
     vehicle = listing.vehicle
@@ -613,6 +677,14 @@ def _mileage_rule(listing: NormalizedListing, profile: SearchProfile) -> _Rule:
             ReasonSeverity.NEEDS_FACTS,
             "mileage 0 km is a placeholder, not an odometer reading",
             "vehicle.mileage_km",
+        )
+        return rule
+    # Below the ceiling only, so MILEAGE_TOO_HIGH always wins; before the estimate branch because
+    # an estimated 150 km is just as implausible as a stated one.
+    implausible = _implausibly_low_mileage(vehicle, km, as_of) if km < ceiling else None
+    if implausible is not None:
+        rule.add(
+            ReasonCode.MILEAGE_IMPLAUSIBLY_LOW, ReasonSeverity.NEEDS_FACTS, implausible, "vehicle.mileage_km"
         )
         return rule
     if vehicle.mileage_claim == OdometerClaim.ESTIMATED or vehicle.mileage_original.is_estimate:
@@ -847,7 +919,7 @@ def screen(
                 facts.common,
                 taxonomy_rule,
                 _band_rule(facts, profile, as_of),
-                _mileage_rule(listing, profile),
+                _mileage_rule(listing, profile, as_of),
                 _suv_rule(listing, match, profile),
                 _country_rule(listing, profile),
             ]

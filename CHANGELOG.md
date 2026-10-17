@@ -7,6 +7,27 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (on top of `7f7e187`)
 
+Implausibly low mileage (live finding of 2026-10-17). The owner's `autoscout24_it` smoke stored a
+search card "Nissan Qashqai 2.0 dCi DPF Tekna" (a 2007-2013 model) at EUR 3,000 with a card
+mileage of 16 km: the seller almost certainly left out the thousands, so the real reading is
+unknown. Screening treated only exactly 0 km as a placeholder, so the card would have screened
+`eligible_primary`.
+
+- **`MILEAGE_IMPLAUSIBLY_LOW`** (`domain.filters`, `needs_facts`, field `vehicle.mileage_km`): a
+  positive reading below 1,000 km (`MIN_PLAUSIBLE_USED_MILEAGE_KM`), or below 2,000 km
+  (`MIN_PLAUSIBLE_KM_PER_YEAR`) per full year since first registration once the car is at least
+  3 full years old (`MIN_AGE_YEARS_FOR_KM_FLOOR`) on the screening date. Full years count from the
+  last day of a month-only registration (31 December of a year-only one), so a missing month never
+  makes a car look older. Checked after the 0 km placeholder and before the estimate branch (an
+  estimated 150 km is just as implausible); never at or above the mileage ceiling, so
+  `MILEAGE_TOO_HIGH` still rejects, and a reject from any other rule still wins. No exemption for
+  new, "km 0" or demo offers: `NormalizedListing` carries no offer-condition field.
+- `schemas/tools/deals_get_candidate.json` regenerated (new reason code). No fixture, pipeline
+  test or migration changed.
+- Tests: `tests/unit/test_filters.py` (the live card's shape, both floors and their boundaries with
+  and without a registration month, estimates, reject precedence, `MILEAGE_TOO_HIGH`, 0 km),
+  `tests/property/test_filters_properties.py` (below either floor is never eligible).
+
 **Activation step 6 for `autoscout24_it` (2026-10-17).** The owner's live smoke at `25f43f8`
 (docs/runbook.md 9.1: a 12-model `crawl once --max-pages 12`, then `worker --drain --queues detail
 --max-jobs 5`) passed: the worker fetched and stored robots.txt itself (HTTP 200, unchanged since

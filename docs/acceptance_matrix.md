@@ -29,7 +29,7 @@ Dashboard: `cd dashboard && npm test` (Vitest) and `npx playwright test` (browse
 | Area | Result | Class | Evidence (tests) | Not covered |
 |---|---|---|---|---|
 | Locale parsing | **passed** | offline-verified | `tests/unit/test_parsing.py`, `tests/property/test_parsing_properties.py`, `tests/unit/test_switzerland_market.py`, `tests/unit/test_parsing_inspection.py` (DE/IT/CH separators, apostrophes, currencies, ambiguity) | - |
-| Mileage | **passed** | offline-verified | `tests/unit/test_filters.py` (199,999 passes, 200,000 fails), `tests/property/test_filters_properties.py`, `tests/unit/test_parsing.py` (miles, ranges, conflicts) | - |
+| Mileage | **passed** | offline-verified | `tests/unit/test_filters.py` (199,999 passes, 200,000 fails; implausibly low mileage, below 1,000 km or below 2,000 km per full year once a car is 3 full years old, needs facts), `tests/property/test_filters_properties.py`, `tests/unit/test_parsing.py` (miles, ranges, conflicts) | - |
 | Prices | **passed** | offline-verified | `tests/unit/test_parsing.py` (instalment, net/export, negotiable), `tests/adapters/test_dealer_detail.py` (margin scheme, instalment, gross/net ambiguity), `tests/unit/test_parsing_inspection.py` | - |
 | Dates | **passed** | offline-verified | `tests/unit/test_parsing.py` (source zones, DST gap, date-only precision, future/invalid) | - |
 | Identity | **passed** | offline-verified | `tests/unit/test_identity.py` (tracking parameters, aliases), `tests/integration/repos_sources_listings/test_search_ingest.py` (hash collision quarantined), `tests/integration/repos_sources_listings/test_evidence_clusters.py` | - |

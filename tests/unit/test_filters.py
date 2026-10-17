@@ -19,6 +19,7 @@ from suv_deals.domain.enums import (
     EligibilityState,
     FxPurpose,
     OdometerClaim,
+    Precision,
     PriceBasis,
     PriceType,
     ProfileKey,
@@ -27,6 +28,9 @@ from suv_deals.domain.enums import (
     VatTreatment,
 )
 from suv_deals.domain.filters import (
+    MIN_AGE_YEARS_FOR_KM_FLOOR,
+    MIN_PLAUSIBLE_KM_PER_YEAR,
+    MIN_PLAUSIBLE_USED_MILEAGE_KM,
     SCREENING_VERSION,
     ReasonCode,
     ReasonSeverity,
@@ -34,7 +38,14 @@ from suv_deals.domain.filters import (
     screen,
     select_reference_rate,
 )
-from suv_deals.domain.listings import LocationInfo, MileageOriginal, NormalizedListing, PriceInfo, VehicleSpec
+from suv_deals.domain.listings import (
+    LocationInfo,
+    MileageOriginal,
+    NormalizedListing,
+    PartialDate,
+    PriceInfo,
+    VehicleSpec,
+)
 from suv_deals.domain.money import FxRate
 from suv_deals.domain.parsing import parse_mileage, parse_price
 from suv_deals.domain.profiles import BusinessConfig, load_business_config
@@ -113,9 +124,10 @@ def run(
     rates: list[FxRate] | None = None,
     taxonomy: VehicleTaxonomy | None = None,
     use_taxonomy: bool = True,
+    as_of: date = AS_OF,
 ) -> ScreeningResult:
     return screen(
-        item, config, rates or [], AS_OF, (taxonomy or default_taxonomy()) if use_taxonomy else None
+        item, config, rates or [], as_of, (taxonomy or default_taxonomy()) if use_taxonomy else None
     )
 
 
@@ -305,6 +317,187 @@ def test_unknown_claim_status_is_warning() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# Implausibly low mileage (thousands left out by the seller)
+# ---------------------------------------------------------------------------------------------
+
+
+def registered(value: str | None) -> PartialDate:
+    if value is None:
+        return PartialDate()
+    precision = {4: Precision.YEAR, 7: Precision.MONTH, 10: Precision.DAY}[len(value)]
+    return PartialDate(value=value, precision=precision)
+
+
+def low_km(km: str, first_registration: str | None = None, **vehicle: Any) -> NormalizedListing:
+    return listing(
+        vehicle={"mileage_km": Decimal(km), "first_registration": registered(first_registration), **vehicle}
+    )
+
+
+def implausible_reason(result: ScreeningResult) -> str:
+    reason = next(r for r in result.reasons if r.code == ReasonCode.MILEAGE_IMPLAUSIBLY_LOW)
+    assert reason.severity == ReasonSeverity.NEEDS_FACTS
+    assert reason.field == "vehicle.mileage_km"
+    assert reason.profile is None
+    return reason.message
+
+
+def test_floor_constants() -> None:
+    assert Decimal("1000") == MIN_PLAUSIBLE_USED_MILEAGE_KM
+    assert MIN_AGE_YEARS_FOR_KM_FLOOR == 3
+    assert Decimal("2000") == MIN_PLAUSIBLE_KM_PER_YEAR
+
+
+def test_live_card_qashqai_16_km_needs_facts() -> None:
+    # Modelled on the 2026-10-17 AutoScout24 Italy smoke card "Nissan Qashqai 2.0 dCi DPF Tekna",
+    # EUR 3,000, card mileage 16 km (the seller left out the thousands). The listing is synthetic.
+    def qashqai(km: str) -> NormalizedListing:
+        return listing(
+            price={"amount_minor": 300000},
+            vehicle={
+                "make": "Nissan",
+                "model": "Qashqai",
+                "body_type": BodyType.UNKNOWN,
+                "mileage_km": Decimal(km),
+                "first_registration": registered("2010"),
+            },
+            location=LocationInfo(country="IT"),
+            availability=Availability.UNKNOWN,
+        )
+
+    assert run(qashqai("160000")).state == EligibilityState.ELIGIBLE_PRIMARY  # otherwise eligible
+    result = run(qashqai("16"))
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert result.profile == ProfileKey.PRIMARY
+    assert result.missing_facts == ("vehicle.mileage_km",)
+    message = implausible_reason(result)
+    assert message.startswith("mileage 16 km is implausibly low for a used car")
+    assert "thousands left out" in message and "confirm the odometer reading" in message
+    for config in (DEFAULT_CONFIG, business_config(manual=True, below=True)):
+        assert run(qashqai("16"), config=config).state == EligibilityState.NEEDS_FACTS
+
+
+@pytest.mark.parametrize("first_registration", [None, "2025-09"])
+@pytest.mark.parametrize(
+    ("km", "implausible"),
+    [("0.5", True), ("1", True), ("16", True), ("999", True), ("999.999", True), ("1000", False)],
+)
+def test_absolute_floor(km: str, implausible: bool, first_registration: str | None) -> None:
+    # 2025-09 is one full year old on AS_OF: below the age floor's three years, so only the
+    # absolute 1,000 km floor can apply.
+    result = run(low_km(km, first_registration))
+    if implausible:
+        assert result.state == EligibilityState.NEEDS_FACTS
+        assert implausible_reason(result).startswith(f"mileage {km} km is implausibly low")
+        assert "vehicle.mileage_km" in result.missing_facts
+    else:
+        assert result.state == EligibilityState.ELIGIBLE_PRIMARY
+        assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW not in result.codes()
+
+
+@pytest.mark.parametrize(
+    ("first_registration", "as_of", "km", "implausible"),
+    [
+        # Month known: a full year counts from the last day of the registration month.
+        ("2023-10", date(2026, 10, 31), "5999", True),  # exactly 3 full years, floor 6,000
+        ("2023-10", date(2026, 10, 31), "6000", False),  # floor exactly met
+        ("2023-10", date(2026, 10, 30), "5999", False),  # 2 full years: no age floor yet
+        # Month unknown: counted from 31 December, so the car never looks older than it can be.
+        ("2023", date(2026, 12, 31), "5999", True),
+        ("2023", date(2026, 12, 31), "6000", False),
+        ("2023", date(2026, 12, 30), "5999", False),
+        ("2023", date(2026, 10, 31), "5999", False),  # "2023-10" would already be 3 years here
+        # Day known.
+        ("2023-10-15", date(2026, 10, 15), "5999", True),
+        ("2023-10-15", date(2026, 10, 14), "5999", False),
+        # Older car: 2010 on AS_OF (2026-10-06) is 15 full years, floor 30,000 km.
+        ("2010", AS_OF, "29999", True),
+        ("2010", AS_OF, "29999.999", True),
+        ("2010", AS_OF, "30000", False),
+    ],
+)
+def test_age_floor_boundaries(first_registration: str, as_of: date, km: str, implausible: bool) -> None:
+    result = run(low_km(km, first_registration), as_of=as_of)
+    if implausible:
+        assert result.state == EligibilityState.NEEDS_FACTS
+        assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW in result.codes()
+    else:
+        assert result.state == EligibilityState.ELIGIBLE_PRIMARY
+        assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW not in result.codes()
+
+
+def test_age_floor_message_names_km_registration_and_floor() -> None:
+    message = implausible_reason(run(low_km("29999", "2010")))
+    assert "mileage 29999 km" in message
+    assert "first registered 2010" in message
+    assert "15 full years" in message and "at least 30000 km" in message
+    assert "confirm the odometer reading" in message
+
+
+@pytest.mark.parametrize("first_registration", [None, "0000", "2030", "2026-10"])
+def test_unknown_impossible_or_future_registration_has_no_age_floor(first_registration: str | None) -> None:
+    result = run(low_km("1500", first_registration))
+    assert result.state == EligibilityState.ELIGIBLE_PRIMARY
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW not in result.codes()
+
+
+@pytest.mark.parametrize(("text", "registration"), [("ca. 150 km", None), ("ca. 20.000 km", "2010")])
+def test_estimated_low_mileage_is_implausible_too(text: str, registration: str | None) -> None:
+    parsed = parse_mileage(text, "de")
+    assert parsed.claim == OdometerClaim.ESTIMATED
+    item = low_km(
+        str(parsed.km),
+        registration,
+        mileage_original=parsed.original,
+        mileage_claim=parsed.claim,
+    )
+    result = run(item)
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW in result.codes()
+    assert ReasonCode.MILEAGE_ESTIMATE not in result.codes()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"price": {"amount_minor": 350000}},  # PRICE_ABOVE_BAND
+        {"vehicle": {"model": "Golf", "body_type": BodyType.HATCHBACK}},  # NOT_SUV
+        {"availability": Availability.SOLD_CLAIMED},
+        {"location": LocationInfo(country="FR")},
+    ],
+)
+def test_reject_from_another_rule_beats_implausible_mileage(overrides: dict[str, Any]) -> None:
+    rest = {k: v for k, v in overrides.items() if k != "vehicle"}
+    result = run(listing(vehicle={"mileage_km": Decimal("16"), **overrides.get("vehicle", {})}, **rest))
+    assert result.state == EligibilityState.REJECTED
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW in result.codes()
+
+
+@pytest.mark.parametrize(
+    ("km", "claim"),
+    [
+        ("200000", OdometerClaim.SELLER_REPORTED),
+        ("250000", OdometerClaim.SELLER_REPORTED),
+        ("250000", OdometerClaim.ESTIMATED),
+    ],
+)
+def test_implausibly_low_never_replaces_too_high(km: str, claim: OdometerClaim) -> None:
+    # A registration year of 1900 puts the age floor above the ceiling (126 years x 2,000 km).
+    result = run(low_km(km, "1900", mileage_claim=claim))
+    assert result.state == EligibilityState.REJECTED
+    assert ReasonCode.MILEAGE_TOO_HIGH in result.codes()
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW not in result.codes()
+
+
+def test_new_or_demo_offer_wording_does_not_exempt_low_mileage() -> None:
+    # NormalizedListing has no new/"km 0"/demo condition field; the AutoScout24 adapter keeps a
+    # non-used offerType only as a parser warning, which screening does not read.
+    result = run(listing(vehicle={"mileage_km": Decimal("16")}, warnings=("OFFER_TYPE_N",)))
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW in result.codes()
+
+
+# ---------------------------------------------------------------------------------------------
 # Price types and basis
 # ---------------------------------------------------------------------------------------------
 
@@ -443,6 +636,7 @@ def test_zero_mileage_is_a_placeholder() -> None:
     result = run(listing(vehicle={"mileage_km": Decimal("0")}))
     assert result.state == EligibilityState.NEEDS_FACTS
     assert ReasonCode.MILEAGE_ZERO_PLACEHOLDER in result.codes()
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW not in result.codes()  # 0 keeps its own code
     assert "vehicle.mileage_km" in result.missing_facts
 
 

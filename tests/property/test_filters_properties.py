@@ -18,12 +18,26 @@ from suv_deals.domain.enums import (
     BodyType,
     EligibilityState,
     OdometerClaim,
+    Precision,
     PriceBasis,
     PriceType,
     Tristate,
 )
-from suv_deals.domain.filters import screen
-from suv_deals.domain.listings import LocationInfo, MileageOriginal, NormalizedListing, PriceInfo, VehicleSpec
+from suv_deals.domain.filters import (
+    MIN_AGE_YEARS_FOR_KM_FLOOR,
+    MIN_PLAUSIBLE_KM_PER_YEAR,
+    MIN_PLAUSIBLE_USED_MILEAGE_KM,
+    ReasonCode,
+    screen,
+)
+from suv_deals.domain.listings import (
+    LocationInfo,
+    MileageOriginal,
+    NormalizedListing,
+    PartialDate,
+    PriceInfo,
+    VehicleSpec,
+)
 from suv_deals.domain.money import FxRate
 from suv_deals.domain.parsing import parse_mileage
 from suv_deals.domain.profiles import BusinessConfig, load_business_config
@@ -47,6 +61,7 @@ def synthetic(
     *,
     original: MileageOriginal | None = None,
     claim: OdometerClaim = OdometerClaim.SELLER_REPORTED,
+    first_registration: PartialDate | None = None,
 ) -> NormalizedListing:
     return NormalizedListing(
         source_key="fixture_dealer_de",
@@ -62,6 +77,7 @@ def synthetic(
             mileage_km=mileage_km,
             mileage_original=original or MileageOriginal(),
             mileage_claim=claim,
+            first_registration=first_registration or PartialDate(),
         ),
         price=PriceInfo(
             amount_minor=price_minor,
@@ -138,11 +154,68 @@ def test_parsed_mileage_at_or_above_200000_never_eligible(
 
 @settings(max_examples=150)
 @given(
-    mileage=st.decimals(min_value=Decimal("1"), max_value=Decimal("199999.999"), places=3, allow_nan=False)
+    mileage=st.decimals(
+        min_value=MIN_PLAUSIBLE_USED_MILEAGE_KM, max_value=Decimal("199999.999"), places=3, allow_nan=False
+    )
 )
-def test_mileage_below_limit_does_not_block(mileage: Decimal) -> None:
+def test_plausible_mileage_below_limit_does_not_block(mileage: Decimal) -> None:
+    # No first registration on the synthetic listing, so only the absolute 1,000 km floor applies.
     result = screen(synthetic(275_000, mileage), DEFAULT, [], AS_OF, default_taxonomy())
     assert result.state == EligibilityState.ELIGIBLE_PRIMARY
+
+
+@settings(max_examples=200)
+@given(
+    price=st.integers(min_value=0, max_value=500_000),
+    mileage=st.decimals(
+        min_value=Decimal("0.001"),
+        max_value=MIN_PLAUSIBLE_USED_MILEAGE_KM - Decimal("0.001"),
+        places=3,
+        allow_nan=False,
+    ),
+    estimate=st.booleans(),
+)
+def test_mileage_below_plausible_floor_never_eligible(price: int, mileage: Decimal, estimate: bool) -> None:
+    claim = OdometerClaim.ESTIMATED if estimate else OdometerClaim.SELLER_REPORTED
+    result = screen(synthetic(price, mileage, claim=claim), ALL_ENABLED, [], AS_OF, default_taxonomy())
+    assert result.state not in ELIGIBLE
+    if result.state == EligibilityState.NEEDS_FACTS:
+        assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW in result.codes()
+
+
+@settings(max_examples=200)
+@given(
+    year=st.integers(min_value=1990, max_value=AS_OF.year - MIN_AGE_YEARS_FOR_KM_FLOOR - 1),
+    month=st.one_of(st.none(), st.integers(min_value=1, max_value=12)),
+    data=st.data(),
+)
+def test_mileage_below_age_floor_never_eligible(year: int, month: int | None, data: st.DataObject) -> None:
+    # Full years count from the last day of the registration month (31 December without a month);
+    # on AS_OF (2026-10-06) an October-or-later month, or none, is therefore one year fewer.
+    years = AS_OF.year - year - (1 if month is None or month >= AS_OF.month else 0)
+    assert years >= MIN_AGE_YEARS_FOR_KM_FLOOR
+    floor = MIN_PLAUSIBLE_KM_PER_YEAR * years
+    mileage = data.draw(
+        st.decimals(
+            min_value=MIN_PLAUSIBLE_USED_MILEAGE_KM,
+            max_value=floor - Decimal("0.001"),
+            places=3,
+            allow_nan=False,
+        )
+    )
+    registration = (
+        PartialDate(value=str(year), precision=Precision.YEAR)
+        if month is None
+        else PartialDate(value=f"{year}-{month:02d}", precision=Precision.MONTH)
+    )
+    listing = synthetic(275_000, mileage, first_registration=registration)
+    result = screen(listing, ALL_ENABLED, [], AS_OF, default_taxonomy())
+    assert result.state == EligibilityState.NEEDS_FACTS
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW in result.codes()
+    at_floor = screen(
+        synthetic(275_000, floor, first_registration=registration), ALL_ENABLED, [], AS_OF, default_taxonomy()
+    )
+    assert at_floor.state == EligibilityState.ELIGIBLE_PRIMARY
 
 
 @settings(max_examples=150)
