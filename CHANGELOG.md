@@ -22,11 +22,16 @@ unknown. Screening treated only exactly 0 km as a placeholder, so the card would
   estimated 150 km is just as implausible); never at or above the mileage ceiling, so
   `MILEAGE_TOO_HIGH` still rejects, and a reject from any other rule still wins. No exemption for
   new, "km 0" or demo offers: `NormalizedListing` carries no offer-condition field.
+- **`SCREENING_VERSION` `screening@1.0.0` -> `screening@1.1.0`**: the same listing can now screen
+  differently (a positive reading under either floor used to pass), so results stored in
+  `app.listings.screening_version`, shown by `deals_get_candidate` and snapshotted in the inquiry
+  evidence name the rules that produced them.
 - `schemas/tools/deals_get_candidate.json` regenerated (new reason code). No fixture, pipeline
   test or migration changed.
 - Tests: `tests/unit/test_filters.py` (the live card's shape, both floors and their boundaries with
   and without a registration month, estimates, reject precedence, `MILEAGE_TOO_HIGH`, 0 km),
-  `tests/property/test_filters_properties.py` (below either floor is never eligible).
+  `tests/property/test_filters_properties.py` (below either floor is never eligible; under 3 full
+  years a reading from 1,000 km up stays eligible).
 
 **Activation step 6 for `autoscout24_it` (2026-10-17).** The owner's live smoke at `25f43f8`
 (docs/runbook.md 9.1: a 12-model `crawl once --max-pages 12`, then `worker --drain --queues detail

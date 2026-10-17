@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from suv_deals.domain.enums import (
@@ -216,6 +216,33 @@ def test_mileage_below_age_floor_never_eligible(year: int, month: int | None, da
         synthetic(275_000, floor, first_registration=registration), ALL_ENABLED, [], AS_OF, default_taxonomy()
     )
     assert at_floor.state == EligibilityState.ELIGIBLE_PRIMARY
+
+
+@settings(max_examples=200)
+@given(
+    year=st.integers(min_value=AS_OF.year - MIN_AGE_YEARS_FOR_KM_FLOOR, max_value=AS_OF.year),
+    month=st.one_of(st.none(), st.integers(min_value=1, max_value=12)),
+    mileage=st.decimals(
+        min_value=MIN_PLAUSIBLE_USED_MILEAGE_KM,
+        max_value=MIN_PLAUSIBLE_KM_PER_YEAR * MIN_AGE_YEARS_FOR_KM_FLOOR - Decimal("0.001"),
+        places=3,
+        allow_nan=False,
+    ),
+)
+def test_age_floor_off_before_min_age(year: int, month: int | None, mileage: Decimal) -> None:
+    # Under MIN_AGE_YEARS_FOR_KM_FLOOR full years only the absolute floor applies, so any reading
+    # from 1,000 km up (here: up to the first age floor) stays eligible.
+    years = AS_OF.year - year - (1 if month is None or month >= AS_OF.month else 0)
+    assume(0 <= years < MIN_AGE_YEARS_FOR_KM_FLOOR)
+    registration = (
+        PartialDate(value=str(year), precision=Precision.YEAR)
+        if month is None
+        else PartialDate(value=f"{year}-{month:02d}", precision=Precision.MONTH)
+    )
+    listing = synthetic(275_000, mileage, first_registration=registration)
+    result = screen(listing, ALL_ENABLED, [], AS_OF, default_taxonomy())
+    assert result.state == EligibilityState.ELIGIBLE_PRIMARY
+    assert ReasonCode.MILEAGE_IMPLAUSIBLY_LOW not in result.codes()
 
 
 @settings(max_examples=150)

@@ -398,18 +398,22 @@ def test_absolute_floor(km: str, implausible: bool, first_registration: str | No
 @pytest.mark.parametrize(
     ("first_registration", "as_of", "km", "implausible"),
     [
+        # The "2 full years" rows use 3,999 km (or 1,000 km): below what a floor starting at
+        # 2 years would demand (2 x 2,000 = 4,000 km), so they show the age floor is still off,
+        # not only that the year count stops short of 3.
         # Month known: a full year counts from the last day of the registration month.
         ("2023-10", date(2026, 10, 31), "5999", True),  # exactly 3 full years, floor 6,000
         ("2023-10", date(2026, 10, 31), "6000", False),  # floor exactly met
-        ("2023-10", date(2026, 10, 30), "5999", False),  # 2 full years: no age floor yet
+        ("2023-10", date(2026, 10, 30), "3999", False),  # 2 full years: no age floor yet
         # Month unknown: counted from 31 December, so the car never looks older than it can be.
         ("2023", date(2026, 12, 31), "5999", True),
         ("2023", date(2026, 12, 31), "6000", False),
-        ("2023", date(2026, 12, 30), "5999", False),
-        ("2023", date(2026, 10, 31), "5999", False),  # "2023-10" would already be 3 years here
+        ("2023", date(2026, 12, 30), "3999", False),
+        ("2023", date(2026, 10, 31), "3999", False),  # "2023-10" would already be 3 years here
         # Day known.
         ("2023-10-15", date(2026, 10, 15), "5999", True),
-        ("2023-10-15", date(2026, 10, 14), "5999", False),
+        ("2023-10-15", date(2026, 10, 14), "3999", False),
+        ("2023-10-15", date(2026, 10, 14), "1000", False),  # only the absolute floor applies
         # Older car: 2010 on AS_OF (2026-10-06) is 15 full years, floor 30,000 km.
         ("2010", AS_OF, "29999", True),
         ("2010", AS_OF, "29999.999", True),

@@ -78,7 +78,9 @@ from suv_deals.domain.parsing import MILES_TO_KM
 from suv_deals.domain.profiles import BusinessConfig, SearchProfile
 from suv_deals.domain.taxonomy import CLASS_BODY_TYPES, TaxonomyMatch, VehicleTaxonomy
 
-SCREENING_VERSION = "screening@1.0.0"
+# Bumped whenever screen() can return a different result for the same input, so a stored or
+# snapshotted result names the rules that produced it. 1.1.0: MILEAGE_IMPLAUSIBLY_LOW.
+SCREENING_VERSION = "screening@1.1.0"
 
 PROFILE_ORDER: tuple[ProfileKey, ...] = (
     ProfileKey.PRIMARY,
