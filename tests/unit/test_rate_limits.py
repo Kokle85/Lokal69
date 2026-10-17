@@ -514,7 +514,9 @@ def _client(gate: InMemoryBudgetGate, inner: _FakeInner, clock: FrozenClock) -> 
     policy = SourceUrlPolicy(
         "dealer_example", allowed_hosts=(HOST,), search_paths=(r"/search",), detail_paths=(r"/fahrzeug/\d+",)
     )
-    return PolicyEnforcingCrawlClient(inner, {"dealer_example": policy}, gate, resolver=_public, clock=clock)
+    return PolicyEnforcingCrawlClient(
+        inner, {"dealer_example": policy}, gate, robots=None, resolver=_public, clock=clock
+    )
 
 
 class TestBudgetGateIntegration:

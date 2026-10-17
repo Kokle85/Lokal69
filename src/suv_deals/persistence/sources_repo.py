@@ -1114,10 +1114,29 @@ _SMOKE_REVISIONS_SQL: Final = (
     " where j.workspace_id = %(ws)s and j.id = any(%(job_ids)s::uuid[])"
     " order by r.listing_id, r.revision_number"
 )
+_SMOKE_ROBOTS_SQL: Final = (
+    "select distinct on (host) id, host, fetched_at, http_status, content_hash, parse_ok, body_truncated,"
+    " body is not null as has_body, user_agent from ops.robots_revisions"
+    " where workspace_id = %(ws)s and host = any(%(hosts)s::text[])"
+    " and fetched_at <= coalesce(%(until)s::timestamptz, clock_timestamp())"
+    " order by host, fetched_at desc, id desc"
+)
 _SMOKE_CONFIG_SQL: Final = (
     "select id, revision, config_hash, effective_at from app.config_revisions"
     " where workspace_id = %(ws)s order by revision desc limit 1"
 )
+
+
+def _robots_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One stored robots revision for the smoke evidence (no body; availability as the worker's
+    robots guard reads it: a body = available, no body but parsed = unavailable (no robots.txt:
+    no restriction), neither = unreachable (complete disallow))."""
+    evidence = {k: v for k, v in row.items() if k != "has_body"}
+    if row["has_body"]:
+        evidence["availability"] = "available"
+    else:
+        evidence["availability"] = "unavailable" if row["parse_ok"] else "unreachable"
+    return evidence
 
 
 async def smoke_evidence(
@@ -1129,7 +1148,10 @@ async def smoke_evidence(
     revision, the source's adapter version, the run (job, outcome, access state, versions, timing),
     the detail jobs the run queued, the redacted fetch outcomes of the run and of those jobs (no URL
     and no body is stored), and every listing the run observed (canonical URL, card price and
-    mileage) with the revisions those detail jobs wrote and their field-evidence ids.
+    mileage) with the revisions those detail jobs wrote and their field-evidence ids. The fetch
+    outcomes include the run's robots.txt request (``purpose: robots``) when the run had to fetch
+    it; ``robots_revisions`` names, per host of the source, the robots revision in effect when the
+    run ended (time, HTTP status, SHA-256, availability; no body).
     """
     actor.require(Scope.DEALS_READ)
     source = await get_source_by_key(conn, actor, source_key)
@@ -1150,6 +1172,11 @@ async def smoke_evidence(
             conn, _SMOKE_REVISIONS_SQL, {"ws": actor.workspace_id, "job_ids": job_ids}
         )
         config = await fetch_one(conn, _SMOKE_CONFIG_SQL, {"ws": actor.workspace_id})
+        robots = await fetch_all(
+            conn,
+            _SMOKE_ROBOTS_SQL,
+            {"ws": actor.workspace_id, "hosts": list(source.budget_hosts()), "until": run["finished_at"]},
+        )
     by_listing: dict[UUID, list[dict[str, Any]]] = {}
     for revision in revisions:
         by_listing.setdefault(revision["listing_id"], []).append(
@@ -1168,6 +1195,7 @@ async def smoke_evidence(
             "version": source.version,
         },
         "config_revision": None if config is None else dict(config),
+        "robots_revisions": [_robots_evidence(row) for row in robots],
         "crawl_run": dict(run),
         "detail_jobs": [dict(job) for job in detail_jobs],
         "fetches": [dict(fetch) for fetch in fetches],
@@ -1560,6 +1588,12 @@ async def record_robots_revision(
 
     A changed robots revision invalidates stale activation evidence (spec 5): the affected
     sources get a ``source.robots_changed`` audit event for review; nothing is auto-enabled.
+
+    A fetch that could not read robots.txt at all (no body and ``parse_ok`` false: 5xx, 429,
+    network failure; `crawling.robots.RobotsAvailability.UNREACHABLE`) is stored but says nothing
+    about the directives: it is never compared, and later fetches are compared with the last
+    revision that was read (a body, or a 4xx "no robots.txt"). An outage therefore raises no
+    review item, while a disappeared or changed robots.txt does.
     """
     _require_system_or_admin(actor)
     name = _clean_host(host)
@@ -1567,11 +1601,13 @@ async def record_robots_revision(
         raise ValidationFailed("http_status must be an HTTP status code")
     content_hash = None if body is None else hashlib.sha256(body.encode("utf-8")).hexdigest()
     stored, truncated = _bounded_body(body)
+    read = body is not None or parse_ok
     async with mapped_errors():
         previous = await fetch_one(
             conn,
             "select content_hash from ops.robots_revisions where workspace_id = %(workspace_id)s"
-            " and host = %(host)s order by fetched_at desc, id desc limit 1",
+            " and host = %(host)s and (body is not null or parse_ok)"
+            " order by fetched_at desc, id desc limit 1",
             {"workspace_id": actor.workspace_id, "host": name},
         )
         row = await fetch_one(
@@ -1594,7 +1630,7 @@ async def record_robots_revision(
         )
         assert row is not None
         previous_hash = None if previous is None else previous["content_hash"]
-        changed = previous is not None and previous_hash != content_hash
+        changed = read and previous is not None and previous_hash != content_hash
         affected: list[UUID] = []
         if changed:
             sources = await fetch_all(

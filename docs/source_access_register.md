@@ -32,6 +32,16 @@ and this page must be corrected.
 - **Robots directives are obeyed by default** (`robots_policy: obey`). Each fetched robots
   revision is stored with its time. Any change to the terms or to robots invalidates earlier
   activation evidence and triggers a new review.
+  In the worker this is enforced before every page request (`crawling.robots_guard`, since
+  2026-10-17): the host's robots.txt is read first through the robots module (reused within its
+  UTC day, so at most 24 hours and fetched again by the first request of each day; an
+  unreachable robots.txt is asked again after 30 minutes), stored with its time and hash, logged
+  as a `robots` fetch attempt and counted in the host's budget. Every search and detail URL is
+  checked against it for our product token; a disallowed URL is never requested, an unreachable
+  robots.txt means no request at all (complete disallow), a 401/403 answer to robots.txt is an
+  access block, and a robots `Crawl-delay` widens the host's spacing. A changed robots.txt is
+  audited (`source.robots_changed`) for this review; nothing is switched on or off by it.
+  Crawl4AI's own robots check stays on as a second line.
 
 ## Register
 
@@ -121,6 +131,9 @@ raises `SourcePaused` unless every gate passes. Placeholders raise `AdapterUnimp
    `search.detail_id_regex`. Never guess them.
 3. **Robots check.** Fetch robots.txt through the robots module, store the revision hash and
    time, and confirm that the configured paths are allowed. Re-check whenever robots changes.
+   Before activation this is the owner's `capture-samples` reading; once a source runs, the worker
+   records a revision per host each UTC day itself (`ops.robots_revisions`; `sources inspect
+   --from-db` shows status, time and hash), and the live smoke of step 6 must show it.
 4. **Adapter implementation.** For marketplaces, replace the placeholder with an implementation
    built on the verified routes, set a real `adapter_version` and bump it on every parser
    change. For dealers, confirm that the permitted pages publish schema.org JSON-LD:
@@ -148,9 +161,10 @@ raises `SourcePaused` unless every gate passes. Placeholders raise `AdapterUnimp
    uncommitted `enabled: true` and switching the source off again, are in docs/runbook.md
    section 9.1. Record the spec 31 evidence fields: commit SHA and image digest, configuration
    revision and `adapter_version`, source URL, actual observation timestamp, crawl run and job
-   ids with the redacted fetch outcome, and the persisted listing/revision/evidence ids
-   (`suv-deals sources smoke-evidence <key>` prints all of them except the commit SHA and image
-   digest). Then set `technical_status: live_smoke_passed`.
+   ids with the redacted fetch outcome, the robots.txt request of the run (`purpose: robots`) and
+   the robots revision in effect (time, HTTP status, hash), and the persisted
+   listing/revision/evidence ids (`suv-deals sources smoke-evidence <key>` prints all of them
+   except the commit SHA and image digest). Then set `technical_status: live_smoke_passed`.
 7. **Enable.** Set `enabled: true` through an auditable configuration revision.
 
 After activation:

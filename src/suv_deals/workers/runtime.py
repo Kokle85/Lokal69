@@ -5,9 +5,15 @@
 - ``Database`` with ``DATABASE_SET_ROLE`` (normally ``suv_backend``; ADR 0001) and a bounded pool;
 - the crawl clients: `Crawl4AIClient.from_settings` only when ``SOURCE_NETWORK_ENABLED=true``, and an
   offline `FixtureCrawlClient` over saved fixture directories for ``mode: fixture`` sources. Every
-  fetch of a job goes through a fresh `PolicyEnforcingCrawlClient` (URL policy, budget gate, DNS
-  check, redirect validation) backed by a `DbBudgetGate` (persistent token bucket, Retry-After,
-  circuit, access blocks shared by all workers);
+  fetch of a job goes through a fresh `PolicyEnforcingCrawlClient` (URL policy, robots.txt, budget
+  gate, DNS check, redirect validation) backed by a `DbBudgetGate` (persistent token bucket,
+  Retry-After, circuit, access blocks shared by all workers);
+- robots.txt (`crawling.robots_guard`): each crawl session's `RobotsGuard` makes sure the host has a
+  current robots revision before any page request and evaluates every URL against it. Real sources
+  read robots.txt directly through the netguard `SafeHttpClient` (``robots_transport``, built only
+  when ``SOURCE_NETWORK_ENABLED=true``; honest User-Agent, no proxy); fixture sources read the
+  ``/robots.txt`` route of their saved fixture set. Revisions and robots fetch attempts are stored
+  (`persistence.robots_store.DbRobotsStore`);
 - the snapshot store (``SNAPSHOT_STORAGE``, disabled by default), metrics, the cost profile, the
   optional vehicle taxonomy override and the injectable clock/sleep used by tests.
 
@@ -33,18 +39,26 @@ from uuid import UUID, uuid4
 import anyio
 
 from suv_deals.adapters.base import CrawlClient, SourceAdapter
-from suv_deals.adapters.crawl4ai_client import Crawl4AIClient
+from suv_deals.adapters.crawl4ai_client import DEFAULT_USER_AGENT, Crawl4AIClient
 from suv_deals.adapters.fixture_client import FixtureCrawlClient
 from suv_deals.adapters.registry import build_adapter, registry_problems
 from suv_deals.clock import Clock, SystemClock, ensure_utc
 from suv_deals.crawling.policy_client import BudgetRefused, PolicyEnforcingCrawlClient
 from suv_deals.crawling.rate_limits import DEFAULT_BACKOFF, BackoffPolicy, Deny, DenyReason, Wait, WaitReason
+from suv_deals.crawling.robots import DEFAULT_FETCH_TIMEOUT_S, ROBOTS_MAX_BYTES
+from suv_deals.crawling.robots_guard import (
+    CrawlClientRobotsTransport,
+    RobotsGuard,
+    RobotsTransport,
+    SafeHttpRobotsTransport,
+)
 from suv_deals.crawling.url_policy import SourceUrlPolicy
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.costs import CostProfile, load_cost_profile
 from suv_deals.domain.enums import JobState, SourceMode
 from suv_deals.domain.taxonomy import VehicleTaxonomy
 from suv_deals.errors import AppError, DependencyUnavailable, ErrorCode, SourcePaused, ValidationFailed
+from suv_deals.integrations.safe_http import HttpLimits, SafeHttpClient
 from suv_deals.netguard import Resolver, system_resolver
 from suv_deals.observability.logging import configure_logging
 from suv_deals.observability.metrics import AppMetrics
@@ -53,6 +67,7 @@ from suv_deals.persistence.budgets import DbBudgetGate
 from suv_deals.persistence.database import Conn, Database, fetch_all
 from suv_deals.persistence.errors_map import LeaseLost, mapped_errors
 from suv_deals.persistence.jobs import ClaimedJob
+from suv_deals.persistence.robots_store import DbRobotsStore
 from suv_deals.persistence.sources_repo import SourceRecord
 from suv_deals.persistence.storage import SnapshotStore, snapshot_store_from_settings
 from suv_deals.settings import REPO_ROOT, Settings
@@ -136,12 +151,19 @@ class RuntimeOptions:
 
 @dataclass(slots=True)
 class CrawlSession:
-    """The crawl client of ONE job and its budget gate (per-run page/detail caps live in the gate)."""
+    """The crawl client of ONE job, its budget gate (per-run page/detail caps live in the gate) and
+    its robots.txt guard (the guard's store links robots fetches to the job and run)."""
 
     client: PolicyEnforcingCrawlClient
     gate: DbBudgetGate
     adapter: SourceAdapter
     policy: SourceUrlPolicy
+    robots: RobotsGuard
+    robots_store: DbRobotsStore
+
+    def bind_run(self, run_id: UUID) -> None:
+        """Link robots.txt fetches made from now on to the job's crawl run (smoke evidence)."""
+        self.robots_store.run_id = run_id
 
 
 @dataclass(slots=True)
@@ -155,6 +177,9 @@ class RuntimeContext:
     metrics: AppMetrics = field(default_factory=lambda: AppMetrics(process_metrics=False))
     network_client: CrawlClient | None = None
     fixture_client: FixtureCrawlClient | None = None
+    #: How real (non-fixture) sources read robots.txt; built with the crawler client when
+    #: ``SOURCE_NETWORK_ENABLED=true`` (`SafeHttpRobotsTransport`). No transport: no real fetch.
+    robots_transport: RobotsTransport | None = None
     resolver: Resolver = system_resolver
     snapshot_store: SnapshotStore | None = None
     cost_profile: CostProfile | None = None
@@ -204,18 +229,35 @@ class RuntimeContext:
         if not self.crawler_ready:
             raise DependencyUnavailable("The crawler failed its health/contract check")
 
-    async def open_crawl_session(self, workspace_id: UUID, source: SourceRecord) -> CrawlSession:
+    async def open_crawl_session(
+        self,
+        workspace_id: UUID,
+        source: SourceRecord,
+        *,
+        actor: ActorContext | None = None,
+        job_id: UUID | None = None,
+    ) -> CrawlSession:
         """`crawl_session` plus the crawler readiness check for real (non-fixture) sources."""
-        session = self.crawl_session(workspace_id, source)
+        session = self.crawl_session(workspace_id, source, actor=actor, job_id=job_id)
         if source.mode != SourceMode.FIXTURE:
             await self.ensure_crawler_ready()
         return session
 
-    def crawl_session(self, workspace_id: UUID, source: SourceRecord) -> CrawlSession:
-        """A fresh policy-enforcing client + budget gate for one job of ``source``.
+    def crawl_session(
+        self,
+        workspace_id: UUID,
+        source: SourceRecord,
+        *,
+        actor: ActorContext | None = None,
+        job_id: UUID | None = None,
+    ) -> CrawlSession:
+        """A fresh policy-enforcing client + budget gate + robots guard for one job of ``source``.
 
-        Raises `SourceNetworkDisabled` (non-fixture source while ``SOURCE_NETWORK_ENABLED=false``),
-        `FixtureDataUnavailable`, or `SourcePaused` when the registry refuses the adapter.
+        ``actor`` (default: the workspace's system actor) records robots revisions and robots
+        fetch attempts, linked to ``job_id``. Raises `SourceNetworkDisabled` (non-fixture source
+        while ``SOURCE_NETWORK_ENABLED=false``), `FixtureDataUnavailable`, `DependencyUnavailable`
+        (no crawler client or no robots transport for a real source), or `SourcePaused` when the
+        registry refuses the adapter.
         """
         config = source.source_config()
         problems = registry_problems(config)
@@ -223,17 +265,24 @@ class RuntimeContext:
             raise SourcePaused(f"source {source.source_key} is gated: {'; '.join(problems)}")
         adapter = build_adapter(config)
         inner: CrawlClient
+        transport: RobotsTransport
         if source.mode == SourceMode.FIXTURE:
             if self.fixture_client is None:
                 raise FixtureDataUnavailable()
             inner = self.fixture_client
+            # The saved fixture set's /robots.txt route (offline; a missing route answers 404).
+            transport = CrawlClientRobotsTransport(self.fixture_client, label="fixture-client")
             resolver: Resolver = offline_fixture_resolver
         else:
             if not self.settings.source_network_enabled:
                 raise SourceNetworkDisabled()
             if self.network_client is None:
                 raise DependencyUnavailable("The crawler client is not configured")
+            if self.robots_transport is None:
+                # Never a page request without robots.txt: refuse instead of skipping the check.
+                raise DependencyUnavailable("The robots.txt transport is not configured")
             inner = self.network_client
+            transport = self.robots_transport
             resolver = self.resolver
         policy = SourceUrlPolicy.from_source(config)
         gate = DbBudgetGate(
@@ -245,10 +294,22 @@ class RuntimeContext:
             # A discovery window's remaining runs keep their search requests (detail pages wait).
             schedules=None if config.schedule is None else {source.source_key: config.schedule},
         )
-        client = PolicyEnforcingCrawlClient(
-            inner, {source.source_key: policy}, gate, resolver=resolver, clock=self.clock
+        robots_store = DbRobotsStore(
+            self.db,
+            actor or system_actor(workspace_id, "robots"),
+            source_id=source.id,
+            user_agent=DEFAULT_USER_AGENT,
+            job_id=job_id,
         )
-        return CrawlSession(client=client, gate=gate, adapter=adapter, policy=policy)
+        robots = RobotsGuard(
+            robots_store, transport, resolver=resolver, clock=self.clock, user_agent=DEFAULT_USER_AGENT
+        )
+        client = PolicyEnforcingCrawlClient(
+            inner, {source.source_key: policy}, gate, robots=robots, resolver=resolver, clock=self.clock
+        )
+        return CrawlSession(
+            client=client, gate=gate, adapter=adapter, policy=policy, robots=robots, robots_store=robots_store
+        )
 
     def add_closer(self, closer: Callable[[], Awaitable[None]]) -> None:
         self._closers.append(closer)
@@ -262,6 +323,20 @@ class RuntimeContext:
         self._closers.clear()
         if self.owns_db:
             await self.db.close()
+
+
+def robots_transport(resolver: Resolver = system_resolver) -> SafeHttpRobotsTransport:
+    """The live robots.txt fetcher: `SafeHttpClient` (public IP pinned, TLS verified, no proxy, no
+    redirect followed by itself) with the crawler's honest User-Agent; bodies capped at
+    `robots.ROBOTS_MAX_BYTES`, one request at most `robots.DEFAULT_FETCH_TIMEOUT_S` long."""
+    limits = HttpLimits(
+        connect_timeout_s=10.0,
+        read_timeout_s=DEFAULT_FETCH_TIMEOUT_S,
+        total_timeout_s=DEFAULT_FETCH_TIMEOUT_S,
+        max_response_bytes=ROBOTS_MAX_BYTES,
+    )
+    http = SafeHttpClient(resolver=resolver, limits=limits, user_agent=DEFAULT_USER_AGENT)
+    return SafeHttpRobotsTransport(http, timeout_s=DEFAULT_FETCH_TIMEOUT_S, closer=http.aclose)
 
 
 def discover_fixture_dirs(root: Path = FIXTURE_ROOT) -> tuple[Path, ...]:
@@ -320,6 +395,9 @@ async def build_runtime(
             crawler = Crawl4AIClient.from_settings(settings)
             ctx.network_client = crawler
             ctx.add_closer(crawler.aclose)
+            robots_http = robots_transport(ctx.resolver)
+            ctx.robots_transport = robots_http
+            ctx.add_closer(robots_http.aclose)
         dirs = (
             tuple(fixture_dirs)
             if fixture_dirs is not None
@@ -511,6 +589,9 @@ def refusal_disposition(exc: BudgetRefused, attempt: int) -> Disposition:
             return Disposition.retry("DAILY_BUDGET_EXHAUSTED", decision.until or backoff_delay(attempt))
         if decision.reason == DenyReason.CIRCUIT_OPEN:
             return Disposition.retry("CIRCUIT_OPEN", decision.until or backoff_delay(attempt))
+        if decision.reason == DenyReason.ROBOTS_UNREACHABLE:
+            # Complete disallow until robots.txt may be asked again (`crawling.robots_guard`).
+            return Disposition.retry("ROBOTS_UNREACHABLE", decision.until or backoff_delay(attempt))
         return Disposition.retry("RUN_CAP_REACHED", timedelta(minutes=15))
     if isinstance(decision, Wait):
         return Disposition.retry(f"BUDGET_WAIT_{decision.reason.value}".upper(), decision.until)
@@ -573,5 +654,6 @@ __all__ = [
     "fixture_runs_allowed",
     "offline_fixture_resolver",
     "refusal_disposition",
+    "robots_transport",
     "system_actor",
 ]

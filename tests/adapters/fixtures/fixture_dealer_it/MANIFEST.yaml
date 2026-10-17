@@ -12,7 +12,12 @@ files:
   detail_200000.html: "Mileage exactly 200000 km (parsed; eligibility rejects later), 'IVA inclusa', 'prezzo fisso'."
   detail_removed.html: "Explicit removed listing ('non è più disponibile')."
   detail_injection_microdata.html: "Italian/English prompt injection and entity-encoded script in a microdata description; labelled odometer contradicting JSON-LD."
+  robots.txt: "SYNTHETIC robots.txt: allows the reviewed search and detail paths."
 routes:
+  "https://concessionario.example/robots.txt":
+    file: robots.txt
+    content_type: "text/plain; charset=utf-8"
+    description: "robots.txt (synthetic)"
   "https://concessionario.example/usato/ricerca?categoria=suv":
     file: search_page.html
     description: "search"

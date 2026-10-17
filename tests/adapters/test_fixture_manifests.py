@@ -11,6 +11,7 @@ strict (marker, no other real host, e-mail addresses only on ``.example``, no ph
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -22,6 +23,8 @@ from suv_deals.adapters._policy import UrlPolicy
 from suv_deals.adapters.dealer_inventory import ADAPTER_VERSION
 from suv_deals.adapters.fixture_client import load_manifest
 from suv_deals.adapters.registry import load_registry
+from suv_deals.crawling.robots import parse_robots_txt
+from suv_deals.crawling.url_policy import ROBOTS_PATH
 from suv_deals.domain.enums import SourceMode, TechnicalStatus
 
 REAL_MARKETPLACE_HOSTS = ("mobile.de", "autoscout24", "subito.it", "automobile.it", "pazar3", "reklama5")
@@ -67,14 +70,15 @@ def test_manifest_is_complete_and_synthetic(source_key: str) -> None:
     assert manifest.created == date(2026, 10, 6)
     assert manifest.parser_version == ADAPTER_VERSION
     html_files = {p.name for p in directory.glob("*.html")}
-    assert html_files == set(manifest.files), (
+    assert html_files | {ROBOTS_FILE} == set(manifest.files), (
         "every fixture file is described and every described file exists"
     )
     used = {r.file for r in manifest.routes.values() if r.file}
-    assert used == html_files, "every fixture file is reachable through a route"
+    assert used == html_files | {ROBOTS_FILE}, "every fixture file is reachable through a route"
     config = fixture_config(source_key)
     for url in manifest.routes:
         assert urlsplit(url).hostname in config.allowed_hosts
+    _check_robots_route(directory, config.allowed_hosts)
 
 
 def test_every_fixture_directory_is_a_known_kind() -> None:
@@ -108,6 +112,27 @@ def _check_marketplace_page(source_key: str, text: str) -> None:
         assert match.group(1).lower().endswith(".example"), match.group(0)
     for pattern in _PHONES:
         assert not pattern.search(text), pattern.pattern
+
+
+ROBOTS_FILE = "robots.txt"
+ROBOTS_MARKER = "# SYNTHETIC FIXTURE:"
+
+
+def _check_robots_route(directory: Path, hosts: Sequence[str]) -> None:
+    """Every fixture set serves a SYNTHETIC robots.txt (the worker's robots guard reads it first):
+    one route per host at exactly /robots.txt, plain text, marked synthetic, naming no real host."""
+    manifest = load_manifest(directory)
+    robots = {url: r for url, r in manifest.routes.items() if r.file == ROBOTS_FILE}
+    assert {urlsplit(url).hostname for url in robots} == set(hosts)
+    for url, route in robots.items():
+        assert urlsplit(url).path == ROBOTS_PATH and not urlsplit(url).query, url
+        assert route.content_type.startswith("text/plain") and route.status == 200
+    text = (directory / ROBOTS_FILE).read_text(encoding="utf-8")
+    assert text.startswith(ROBOTS_MARKER)
+    assert parse_robots_txt(text.encode("utf-8")).recognized_lines > 0
+    lowered = text.lower()
+    found = {h.rstrip(".") for h in re.findall(r"https?://([a-z0-9.-]+)", lowered)}
+    assert found <= {h.lower() for h in hosts}, found
 
 
 @pytest.mark.parametrize(
@@ -156,11 +181,14 @@ def test_marketplace_manifest_is_complete_and_synthetic(source_key: str) -> None
     assert manifest.parser_version == config.adapter_version
     assert "SYNTHETIC" in manifest.description and "invented" in manifest.description
     html_files = {p.name for p in directory.glob("*.html")}
-    assert html_files == set(manifest.files)
-    assert {r.file for r in manifest.routes.values() if r.file} == html_files
+    assert html_files | {ROBOTS_FILE} == set(manifest.files)
+    assert {r.file for r in manifest.routes.values() if r.file} == html_files | {ROBOTS_FILE}
+    _check_robots_route(directory, config.allowed_hosts)
     policy = UrlPolicy(config)
     for url, route in manifest.routes.items():
         assert urlsplit(url).hostname in config.allowed_hosts, url
+        if urlsplit(url).path == ROBOTS_PATH:
+            continue
         assert policy.is_search_url(url) or policy.is_detail_url(url), url
         if route.final_url is not None:
             final_host = urlsplit(route.final_url).hostname or ""

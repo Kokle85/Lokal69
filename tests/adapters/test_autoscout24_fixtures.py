@@ -61,9 +61,17 @@ from suv_deals.adapters.autoscout24 import (
     SearchParse,
 )
 from suv_deals.adapters.base import ParsedListing, SearchRequest
+from suv_deals.adapters.crawl4ai_client import DEFAULT_USER_AGENT
 from suv_deals.adapters.fixture_client import FixtureCrawlClient, load_manifest
 from suv_deals.adapters.registry import build_active_adapter, gate_status, load_registry
 from suv_deals.clock import FrozenClock
+from suv_deals.crawling.robots import (
+    RobotsAvailability,
+    RobotsRevision,
+    crawl_delay,
+    evaluate,
+    parse_robots_txt,
+)
 from suv_deals.domain.enums import (
     AccessState,
     Availability,
@@ -228,11 +236,46 @@ def test_required_autoscout24_de_fixture_coverage() -> None:
         assert any(r.file == filename for r in manifest.routes.values()), category
     # card_only: no detail page and no detail route exists; the manifest says why.
     assert not [f for f in manifest.files if f.startswith("detail_")]
-    assert all("/lst/" in urlsplit(url).path for url in manifest.routes)
+    assert all("/lst/" in urlsplit(url).path for url in manifest.routes if not url.endswith("/robots.txt"))
     assert "card_only" in manifest.description
     for category, stand_in in DE_NOT_APPLICABLE.items():
         assert f"{category} -> {stand_in}" in manifest.description, category
         assert stand_in in manifest.files, category
+
+
+def _saved_robots(key: str) -> RobotsRevision:
+    """The saved SYNTHETIC robots.txt as the worker's robots guard reads it (available, parsed)."""
+    body = (FIXTURES / key / "robots.txt").read_bytes()
+    parsed = parse_robots_txt(body)
+    return RobotsRevision(
+        host=HOSTS[key],
+        robots_url=f"https://{HOSTS[key]}/robots.txt",
+        fetched_at=NOW,
+        http_status=200,
+        availability=RobotsAvailability.AVAILABLE,
+        parse_ok=True,
+        groups=parsed.groups,
+    )
+
+
+@pytest.mark.parametrize("key", SOURCE_KEYS)
+def test_saved_robots_txt_allows_every_fixture_route(key: str) -> None:
+    """The worker reads robots.txt before any page: the saved one must let every saved search and
+    detail route through for our product token (the real file's recorded rules, synthetic copy)."""
+    revision = _saved_robots(key)
+    manifest = load_manifest(FIXTURES / key)
+    routes = [url for url in manifest.routes if not url.endswith("/robots.txt")]
+    assert routes
+    for url in routes:
+        assert evaluate(revision, url, DEFAULT_USER_AGENT, now=NOW).allowed, url
+    for url in model_search_urls(key):
+        assert evaluate(revision, url, DEFAULT_USER_AGENT, now=NOW).allowed, url
+    # The recorded disallow rules hold in the synthetic copy too.
+    assert not evaluate(revision, f"https://{HOSTS[key]}/lst?atype=C", DEFAULT_USER_AGENT, now=NOW).allowed
+    if key == "autoscout24_de":  # card_only because detail pages are disallowed
+        detail = f"https://{DE_HOST}/angebote/{DE_PLUS_SLUG}-{uuid_for(501)}"
+        assert not evaluate(revision, detail, DEFAULT_USER_AGENT, now=NOW).allowed
+        assert crawl_delay(revision, DEFAULT_USER_AGENT) is None
 
 
 @pytest.mark.parametrize("key", SOURCE_KEYS)

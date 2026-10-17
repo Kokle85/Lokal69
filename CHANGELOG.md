@@ -7,6 +7,59 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (on top of `7f7e187`)
 
+Finding of the owner's first live smoke (2026-10-17, `autoscout24_it`, `crawl once --max-pages 1`;
+the search page answered 200, access ok): the live worker path never recorded robots.txt
+(`sources inspect --from-db` showed the robots view empty, `sources smoke-evidence` listed only the
+search fetch, `requests_today` was 1). robots.txt was obeyed only inside Crawl4AI
+(`check_robots_txt: true`); the application's own robots module ran only in `capture-samples`.
+
+- **robots.txt before every page request of the worker** (`crawling.robots_guard`, wired into
+  `PolicyEnforcingCrawlClient` by `workers.runtime.crawl_session` for discovery, detail and recheck
+  jobs alike). Before the first page request to a host the worker holds a current robots revision:
+  reused while fresh, otherwise fetched through `robots.fetch_robots` (URL policy `robots` purpose:
+  exactly `/robots.txt`; same-host redirects only, at most five hops, public DNS before every hop,
+  fail closed) as a request of its own through the persistent budget gate (`purpose: robots`,
+  counted in `requests_today`, spaced like any request), stored with
+  `sources_repo.record_robots_revision` and logged as a fetch attempt (`purpose: robots`, linked to
+  the job and the crawl run) before the gate is released. Every search and detail URL (and a
+  same-host redirect target) is evaluated with `robots.evaluate` for our product token
+  (`SUVDealResearch`).
+- **Outcomes.** A disallowed URL is never requested: a POLICY_DENIED page `robots_disallowed`
+  (discovery: failed/partial traversal with the gap, job completed; detail: a visible
+  `policy_denied` dead letter; never retried). An unreachable robots.txt (5xx, 429, network, an
+  answer not read completely) is a complete disallow: no page request, `RobotsUnavailable`
+  (`DenyReason.ROBOTS_UNREACHABLE`), the job released like a budget refusal without consuming an
+  attempt, robots.txt asked again after 30 minutes. A 401/403/407 answer to the robots request is
+  an access denial: the page is reported `access_blocked` without being requested (source route
+  paused, job blocked). A robots `Crawl-delay` travels with every page request
+  (`BudgetRequest.crawl_delay`) into the gate's effective spacing (capped at one day).
+- **Freshness.** A revision is reused only within the UTC day it was fetched in (so at most
+  24 hours, and always fetched again by the first request of a UTC day: one robots request per host
+  and day in normal operation); an unreachable one for 30 minutes; an access denial never.
+- **How robots.txt is fetched.** Directly by the worker through the netguard `SafeHttpClient`
+  (`SafeHttpRobotsTransport`: the validated public IP pinned per connection, TLS verified,
+  environment proxies ignored, no redirect followed by the client, 500 KiB cap, identity encoding
+  only, the crawler's honest User-Agent; no stealth, proxy or CAPTCHA handling), built only with
+  `SOURCE_NETWORK_ENABLED=true`; a real source without it fetches nothing
+  (`DependencyUnavailable`). `SafeHttpError` carries the refused `Location` of a 3xx for the
+  robots module. Crawl4AI's own `check_robots_txt` stays on as a second line.
+- **Changes are audited, nothing switches.** A changed revision raises the existing
+  `source.robots_changed` audit for every source on the host; nothing is enabled or disabled. A
+  robots outage (no body, not parsed) is stored but compared with nothing, so neither the outage
+  nor the recovery raises a review item, while a robots.txt that disappears does.
+- **Evidence.** `sources smoke-evidence` prints the robots fetch among the fetches and
+  `robots_revisions` (per host: time, HTTP status, SHA-256, availability; no body);
+  `sources inspect --from-db` shows the stored revision. A robots refusal is not counted as a
+  parser failure.
+- **Fixtures.** Every saved fixture set serves a SYNTHETIC `robots.txt` route (dealer sets;
+  AutoScout24 IT/DE from the rules recorded in their `robots_summary`, regenerated); a missing
+  route answers 404 (no robots.txt). No migration: `ops.robots_revisions` and the `robots` purpose
+  of `ops.fetch_attempts` already existed.
+- Tests: `tests/unit/test_robots_guard.py` (freshness, order, reuse, disallow, unreachable, access
+  denial, crawl-delay, transports), `tests/integration/pipeline/test_robots_live_path.py` (real
+  discovery/detail handlers on PostgreSQL), the AutoScout24 fixture pipeline and smoke-evidence
+  checks, and the repository's change rule (`test_sources_repo.py`).
+
 AutoScout24 seller-country filter (live finding of 2026-10-17). The owner's 12-model smoke of
 `autoscout24_it` (`crawl once --max-pages 12`: 12 search pages HTTP 200, `complete`, 49 cards,
 5 detail pages ingested) sent a search URL (`pricefrom`, `priceto`, `kmto`, `sort`, `desc`,

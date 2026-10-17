@@ -203,7 +203,10 @@ Each step only needs the steps above it; any step can stop without affecting the
      `terms_decision`, actor and note).
   2. Permitted routes: exact `allowed_hosts`, anchored search/detail path regexes, dealer
      `search.search_url`.
-  3. Robots check through the robots module (revision hash and time stored).
+  3. Robots check through the robots module (revision hash and time stored): before activation
+     the owner's `capture-samples` reading; once the source runs, the worker itself records a
+     revision per host each UTC day before any page request (`crawling.robots_guard`, since
+     2026-10-17; `sources inspect --from-db` shows status, time and hash).
   4. Adapter: for a dealer, copy `config/sources/example_dealer_template_de.yaml` (or `_ch`) and
      confirm schema.org JSON-LD on the permitted pages; for a marketplace, a real adapter.
   5. Saved fixtures with `MANIFEST.yaml` covering the spec 31 set; `uv run pytest tests/adapters -q`;
@@ -213,16 +216,20 @@ Each step only needs the steps above it; any step can stop without affecting the
      `uv run suv-deals crawl once --source <key> --max-pages 1`, then
      `uv run suv-deals worker --drain --queues detail --max-jobs N` (`--max-jobs` bounds the
      detail requests; `max_detail_jobs_per_run` does not bound a drain); check `suv-deals sources
-     inspect <key> --from-db` and `doctor`, and collect the evidence ids with `suv-deals sources
-     smoke-evidence <key>`. Then `technical_status: live_smoke_passed`. For AutoScout24 the
-     exact owner commands (local uncommitted `enabled: true`, sync, smoke, switch-off) are in
-     docs/runbook.md section 9.1.
+     inspect <key> --from-db` (its `robots` view must show the run's robots revision: status, time,
+     hash) and `doctor`, and collect the evidence ids with `suv-deals sources smoke-evidence <key>`
+     (the robots.txt request of the run, `purpose: robots`, and `robots_revisions` included). Then
+     `technical_status: live_smoke_passed`. For AutoScout24 the exact owner commands (local
+     uncommitted `enabled: true`, sync, smoke, switch-off) are in docs/runbook.md section 9.1. The
+     first `autoscout24_it` smoke (2026-10-17) predates the worker's robots check (empty robots
+     view, no robots fetch in the evidence), so it does not count for step 6; repeat it.
   7. Enable through an auditable configuration revision (`sources sync --yes`).
 - **Verified when:** `access_state: ok`, healthy parser outcomes, and the persisted listing,
   revision and evidence ids of the smoke.
 - **Evidence (spec 31 exact-build list):** commit SHA and image digest, configuration revision and
   `adapter_version`, source URL, actual observation timestamp, crawl run and job ids with the
-  redacted fetch outcome, persisted listing/revision/evidence ids. Record each source separately;
+  redacted fetch outcome (the robots.txt request included), the robots revision in effect (time,
+  HTTP status, SHA-256), persisted listing/revision/evidence ids. Record each source separately;
   one source never proves another.
 
 | Source | Adapter | Terms decision | What blocks it |

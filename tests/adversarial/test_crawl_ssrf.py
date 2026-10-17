@@ -115,7 +115,12 @@ def build(
     inner = Crawl4AIClient(CRAWLER, SecretStr("token"), http=http, clock=FrozenClock(NOW))
     gate = gate or RecordingGate()
     client = PolicyEnforcingCrawlClient(
-        inner, {SOURCE: source_policy or policy()}, gate, resolver=resolver, clock=FrozenClock(NOW)
+        inner,
+        {SOURCE: source_policy or policy()},
+        gate,
+        robots=None,
+        resolver=resolver,
+        clock=FrozenClock(NOW),
     )
     return client, gate
 
@@ -371,7 +376,9 @@ class _FakeInner:
 )
 async def test_inner_final_url_is_never_trusted(final: str) -> None:
     inner: CrawlClient = _FakeInner(final)
-    client = PolicyEnforcingCrawlClient(inner, {SOURCE: policy()}, RecordingGate(), resolver=public_dns)
+    client = PolicyEnforcingCrawlClient(
+        inner, {SOURCE: policy()}, RecordingGate(), robots=None, resolver=public_dns
+    )
     doc = await client.fetch(DETAIL, purpose="detail", source_key=SOURCE)
     assert doc.fetch.access_state == AccessState.POLICY_DENIED
     assert doc.html is None
@@ -379,7 +386,7 @@ async def test_inner_final_url_is_never_trusted(final: str) -> None:
 
 
 def test_wrapper_satisfies_protocol() -> None:
-    client = PolicyEnforcingCrawlClient(_FakeInner(DETAIL), {SOURCE: policy()}, RecordingGate())
+    client = PolicyEnforcingCrawlClient(_FakeInner(DETAIL), {SOURCE: policy()}, RecordingGate(), robots=None)
     assert isinstance(client, CrawlClient)
 
 
@@ -418,7 +425,7 @@ async def test_refused_redirect_keeps_target_failure_classification(state: Acces
     """A block/throttle/failure behind an off-policy redirect must still pause/back off the route."""
     gate = RecordingGate()
     inner: CrawlClient = _ClassifiedInner(state, final, retry_after=600)
-    client = PolicyEnforcingCrawlClient(inner, {SOURCE: policy()}, gate, resolver=public_dns)
+    client = PolicyEnforcingCrawlClient(inner, {SOURCE: policy()}, gate, robots=None, resolver=public_dns)
     doc = await client.fetch(DETAIL, purpose="detail", source_key=SOURCE)
     assert doc.fetch.access_state == state
     assert doc.fetch.error_code == "target_failure"
@@ -437,7 +444,9 @@ async def test_refused_redirect_keeps_target_failure_classification(state: Acces
 async def test_refused_redirect_never_reports_removal(state: AccessState) -> None:
     """A 404/410 reached through an off-policy redirect is not evidence that our listing was removed."""
     inner: CrawlClient = _ClassifiedInner(state, f"https://{HOST}/suche?removed=1")
-    client = PolicyEnforcingCrawlClient(inner, {SOURCE: policy()}, RecordingGate(), resolver=public_dns)
+    client = PolicyEnforcingCrawlClient(
+        inner, {SOURCE: policy()}, RecordingGate(), robots=None, resolver=public_dns
+    )
     doc = await client.fetch(DETAIL, purpose="detail", source_key=SOURCE)
     assert doc.fetch.access_state == AccessState.POLICY_DENIED
     assert doc.fetch.error_code == "policy_path_not_allowed"
@@ -459,7 +468,9 @@ async def test_anti_bot_redirect_to_captcha_host_pauses_route(
     clock = FrozenClock(NOW)
     gate = InMemoryBudgetGate({SOURCE: RateBudget(min_delay_seconds=5)}, clock=clock)
     inner = Crawl4AIClient(CRAWLER, SecretStr("token"), http=http, clock=clock)
-    client = PolicyEnforcingCrawlClient(inner, {SOURCE: policy()}, gate, resolver=public_dns, clock=clock)
+    client = PolicyEnforcingCrawlClient(
+        inner, {SOURCE: policy()}, gate, robots=None, resolver=public_dns, clock=clock
+    )
 
     doc = await client.fetch(DETAIL, purpose="detail", source_key=SOURCE)
     assert doc.fetch.access_state == AccessState.ACCESS_BLOCKED

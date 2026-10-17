@@ -58,6 +58,9 @@ files:
   not_found.html: Generic 404 page without removal wording (an unknown model slug, or a drifted search
     route).
   rate_limited.html: 429 body (too many requests).
+  robots.txt: 'SYNTHETIC robots.txt with the rules recorded for AutoScout24 Italy: the ''*'' group disallows
+    a query on the bare search path (/lst? and /lst/?) and /ricerca-avanzata; /lst/<make>/<model> search
+    pages and /annunci/ detail pages are not disallowed; no Crawl-delay.'
   search_empty.html: 'Empty result: numberOfResults 0 and an empty listings array (an explicit empty result).'
   search_injection.html: 'Prompt injection and XSS in seller-written card text, next to one clean card:
     a <script> block, an <img onerror> payload and ''Ignore all previous instructions'' in one version
@@ -90,6 +93,10 @@ files:
     result of the model).'
   server_error.html: 503 maintenance body.
 routes:
+  https://www.autoscout24.it/robots.txt:
+    file: robots.txt
+    content_type: text/plain; charset=utf-8
+    description: robots.txt (synthetic)
   https://www.autoscout24.it/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&ustate=U&cy=I:
     file: search_normal.html
     description: 'primary-profile search of model 1 (renault/captur): normal search page'

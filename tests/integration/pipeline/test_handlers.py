@@ -32,6 +32,7 @@ from suv_deals.adapters.fixture_client import FixtureCrawlClient
 from suv_deals.clock import SystemClock
 from suv_deals.crawling import discovery
 from suv_deals.crawling.detail import CARD_FACTS, CARD_ONLY_SKIP
+from suv_deals.crawling.robots_guard import CrawlClientRobotsTransport
 from suv_deals.crawling.scheduler import run_scheduler_tick
 from suv_deals.domain.enums import (
     AccessState,
@@ -281,13 +282,15 @@ async def test_real_sources_need_network_enabled_and_a_ready_crawler(
     try:
         stub = _ContractStub(ok=ready)
         env.ctx.network_client = stub
+        env.ctx.robots_transport = CrawlClientRobotsTransport(stub)  # robots.txt from the same pages
         env.ctx.resolver = offline_fixture_resolver
         await tick(env)
         [report] = await worker(env, "worker-real", JobType.DISCOVERY).run_until_idle()
         assert stub.inspections == 1
         if ready:
             assert report.state == JobState.SUCCEEDED and report.details["completeness"] == "complete"
-            assert len(stub.requests) == 2  # two search pages, through the policy client
+            # robots.txt first, then two search pages, all through the policy client
+            assert [r.purpose for r in stub.requests] == ["robots", "search", "search"]
         else:
             assert report.state == JobState.RETRY_WAIT and report.code == "DEPENDENCY_UNAVAILABLE"
             assert stub.requests == []  # nothing is fetched through an unready crawler
@@ -437,8 +440,8 @@ async def test_a_pagination_cycle_is_never_refetched(
     set_source_config(env, "rate_budget", '{"max_search_pages_per_run": 6}')
     original = RuntimeContext.open_crawl_session
 
-    async def looping(self: RuntimeContext, workspace_id: Any, source: Any) -> Any:
-        session = await original(self, workspace_id, source)
+    async def looping(self: RuntimeContext, workspace_id: Any, source: Any, **kwargs: Any) -> Any:
+        session = await original(self, workspace_id, source, **kwargs)
         session.adapter = _LoopingAdapter(session.adapter)  # type: ignore[assignment]
         return session
 

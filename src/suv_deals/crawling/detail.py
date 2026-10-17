@@ -14,8 +14,10 @@ Phases (no transaction is open during network I/O):
    must allow network work
    (`lock_source(for_network=True)`, activation gate) and ``SOURCE_NETWORK_ENABLED`` must be true for
    a real source (`RuntimeContext.crawl_session`).
-2. **Network**: ``adapter.fetch_detail`` through the policy-enforcing client and the persistent budget
-   gate, then ``adapter.parse_detail``. The optional raw snapshot is written to the snapshot store
+2. **Network**: ``adapter.fetch_detail`` through the policy-enforcing client (robots.txt first: a
+   detail URL robots.txt disallows is never requested and ends as a visible ``policy_denied`` dead
+   letter; an unreachable robots.txt releases the job like a budget refusal) and the persistent
+   budget gate, then ``adapter.parse_detail``. The optional raw snapshot is written to the snapshot store
    (disabled by default) before the commit.
 3. **Commit** (job locked first; `LeaseLost` rolls everything back): the redacted fetch outcome and the
    snapshot metadata are recorded, then
@@ -127,14 +129,16 @@ def _retry_at(
 
 def lifts_on_its_own(refusal: BudgetRefused) -> bool:
     """Whether the gate's refusal ends by itself at a known time (``Wait`` always has ``until``; a
-    ``Deny`` only for an open circuit or an exhausted daily budget, never for an access block)."""
+    ``Deny`` only for an open circuit, an exhausted daily budget or an unreachable robots.txt (asked
+    again at ``until``), never for an access block)."""
     decision = refusal.decision
     if isinstance(decision, Wait):
         return True
     return (
         isinstance(decision, Deny)
         and decision.until is not None
-        and decision.reason in (DenyReason.CIRCUIT_OPEN, DenyReason.BUDGET_EXHAUSTED)
+        and decision.reason
+        in (DenyReason.CIRCUIT_OPEN, DenyReason.BUDGET_EXHAUSTED, DenyReason.ROBOTS_UNREACHABLE)
     )
 
 
@@ -194,7 +198,7 @@ async def handle_detail(ctx: RuntimeContext, execution: JobExecution) -> JobOutc
         return await _ingest_card_facts(ctx, execution, listing, source, payload.card_listing)
     if source.activation_problems():
         raise SourcePaused(f"source {source.source_key} is gated")
-    session = await ctx.open_crawl_session(job.workspace_id, source)
+    session = await ctx.open_crawl_session(job.workspace_id, source, actor=actor, job_id=job.id)
     adapter = session.adapter
     with log_context(source_key=source.source_key, adapter_version=adapter.adapter_version):
         identity = adapter.canonicalize(listing.canonical_url)

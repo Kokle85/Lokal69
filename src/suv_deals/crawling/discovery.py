@@ -10,7 +10,8 @@ Three phases, never holding a transaction across network I/O:
    job lease (`job_unit_of_work` locks and revalidates the job first), so the in-progress run id is
    persisted.
 2. **Network** (no transaction): the adapter fetches page after page through the policy-enforcing
-   client (URL policy, `DbBudgetGate`, DNS check, redirect validation), within the source's per-run
+   client (URL policy, robots.txt, `DbBudgetGate`, DNS check, redirect validation; the host's robots
+   revision is fetched first when none is fresh, `crawling.robots_guard`), within the source's per-run
    page budget -- or the job payload's optional ``max_pages`` (``suv-deals crawl once``), which can
    only LOWER it; the cap travels with the job, so it holds for whichever worker claims it. A short
    minimum-delay wait is waited out (`call_with_budget`); any other budget refusal stops the
@@ -26,7 +27,11 @@ Three phases, never holding a transaction across network I/O:
    runs back the schedule off); and the job outcome is written by the fenced update. A late worker
    whose lease was lost cannot commit any of it (`LeaseLost` rolls everything back).
 
-Outcomes: access blocked -> job ``blocked`` (``access_blocked``, never retried); a budget-gate or
+Outcomes: access blocked -> job ``blocked`` (``access_blocked``, never retried; a 401/403 answer to the
+robots.txt request counts too); a search URL robots.txt disallows is never requested: the page is a
+policy refusal (``robots_disallowed``), the run records the gap and the job completes (not retried);
+an unreachable robots.txt (complete disallow) is a refusal before the first page like the budget
+gate's (released until robots.txt may be asked again); a budget-gate or
 host-budget refusal before the first page (nothing fetched) that lifts on its own -> the job is
 released to ``queued`` at the gate's time WITHOUT consuming an attempt (`detail.apply_budget_refusal`
 -> `jobs.release`; an access-blocked host blocks it, a refusal without a known end consumes the
@@ -64,7 +69,7 @@ from suv_deals.adapters.base import DiscoveryPage, ParseOutcome, ParserHealth, S
 from suv_deals.adapters.registry import build_adapter
 from suv_deals.clock import ensure_utc
 from suv_deals.crawling.detail import apply_budget_refusal
-from suv_deals.crawling.policy_client import BudgetRefused
+from suv_deals.crawling.policy_client import BudgetRefused, RobotsUnavailable
 from suv_deals.crawling.rate_limits import Deny, DenyReason
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.enums import AccessState, Completeness, CoverageMode, JobState, TechnicalStatus
@@ -166,7 +171,7 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
             reason=expired,
         )
     deadline = None if window is None or slot is None else window.run_window_end(slot)
-    session = await ctx.open_crawl_session(job.workspace_id, source)
+    session = await ctx.open_crawl_session(job.workspace_id, source, actor=actor, job_id=job.id)
     adapter = session.adapter
     coverage = payload.coverage_mode or adapter.capabilities().coverage_mode
     watermark_from = (
@@ -193,6 +198,7 @@ async def handle_discovery(ctx: RuntimeContext, execution: JobExecution) -> JobO
             )
 
     run = await retry_transient(open_run)
+    session.bind_run(run.id)  # robots.txt fetched by this run is evidence of this run
     with log_context(run_id=run.id, source_key=source.source_key, adapter_version=adapter.adapter_version):
         traversal = await traverse(
             ctx,
@@ -388,7 +394,12 @@ async def traverse(
             if not result.ok_pages:
                 result.refusal = exc
                 result.completeness = Completeness.FAILED
-                result.gap_reasons.append(f"budget refused before the first page ({exc.reason})")
+                result.gap_reasons.append(
+                    "robots.txt unreachable before the first page: complete disallow, nothing requested"
+                    f" ({exc.detail or exc.reason})"
+                    if isinstance(exc, RobotsUnavailable)
+                    else f"budget refused before the first page ({exc.reason})"
+                )
                 return result
             budget_stop = isinstance(exc.decision, Deny) and exc.decision.reason in (
                 DenyReason.RUN_CAP_REACHED,
@@ -666,9 +677,11 @@ def _record_metrics(
         for _ in range(report.detail_jobs_deduplicated):
             metrics.record_detail_job(source.source_key, deduplicated=True)
     failure = traversal.failure
-    if failure is not None and failure.access_state in (
-        AccessState.UNEXPECTED_CONTENT,
-        AccessState.POLICY_DENIED,
+    robots_refusal = failure is not None and (failure.fetch.error_code or "").startswith("robots_")
+    if (
+        failure is not None
+        and failure.access_state in (AccessState.UNEXPECTED_CONTENT, AccessState.POLICY_DENIED)
+        and not robots_refusal  # robots.txt said no: nothing was parsed, nothing drifted
     ):
         metrics.record_parser_failure(source.source_key, page_type="search")
 

@@ -177,6 +177,10 @@ def classify_status_only(document: RawDocument) -> AccessClassification | None:
     fetch = document.fetch
     status = fetch.http_status
     if fetch.access_state == AccessState.POLICY_DENIED:
+        if (fetch.error_code or "").startswith("robots_"):
+            return AccessClassification(
+                AccessState.POLICY_DENIED, "unknown", f"request refused by robots.txt ({fetch.error_code})"
+            )
         return AccessClassification(AccessState.POLICY_DENIED, "unknown", "request refused by URL policy")
     if status is None:
         if fetch.success and document.html is not None:

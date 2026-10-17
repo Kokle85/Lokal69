@@ -4,17 +4,27 @@ Every fetch passes, in order:
 
 1. Source lookup: an unknown `source_key` is denied.
 2. `SourceUrlPolicy.check()` for the purpose (structural SSRF + host/path allow-lists).
-3. The budget gate (`rate_limits` decision): no request is made without budget.
+3. robots.txt (`RobotsChecker`, the worker's `crawling.robots_guard.RobotsGuard`): the host's
+   current robots revision (reused within its freshness window, otherwise fetched first as a
+   request of its own through the same budget gate) and `robots.evaluate()` of the URL for our
+   product token. A disallowed URL is never requested: it becomes a POLICY_DENIED document
+   (``robots_disallowed``; reported, not retried). An unreachable robots.txt is a complete
+   disallow: `RobotsUnavailable` (a `BudgetRefused`, nothing fetched; the job waits until the
+   revision may be fetched again). A 401/403/407 answer to the robots request itself is an
+   access denial: the page becomes an ACCESS_BLOCKED document without being requested. The
+   robots crawl-delay travels with the page's budget request (`BudgetRequest.crawl_delay`).
+4. The budget gate (`rate_limits` decision): no request is made without budget.
    A `Wait`/`Deny` raises a typed `BudgetRefused`; nothing is fetched.
-4. Fetch-time DNS check (`resolve_check`): every answer must be a public address.
-5. The inner client fetch.
-6. `validate_redirect()` on the final URL: cross-host redirects, scheme downgrades and
-   off-policy final paths are converted to POLICY_DENIED and the body is discarded.
+5. Fetch-time DNS check (`resolve_check`): every answer must be a public address.
+6. The inner client fetch.
+7. `validate_redirect()` on the final URL: cross-host redirects, scheme downgrades and
+   off-policy final paths are converted to POLICY_DENIED and the body is discarded; a
+   same-host final URL that robots.txt disallows is discarded the same way.
    Exception: when the target itself blocked, throttled or failed the request
    (ACCESS_BLOCKED, RATE_LIMITED, TRANSIENT_ERROR, e.g. a redirect to a CAPTCHA host),
    that classification is kept (body still discarded) so the budget gate pauses the
    route, honours Retry-After or backs off instead of seeing "our own policy refusal".
-7. The budget gate is released with the outcome, even on cancellation (shielded).
+8. The budget gate is released with the outcome, even on cancellation (shielded).
 
 Policy violations become a `RawDocument` whose `FetchOutcome.access_state` is
 POLICY_DENIED (no HTML, no exception). Typed `AppError`s from the inner client
@@ -31,7 +41,7 @@ from decimal import Decimal
 from typing import Final, Protocol, runtime_checkable
 
 import anyio
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from suv_deals.adapters.base import CrawlClient, FetchOutcome, FetchPurpose, RawDocument
 from suv_deals.clock import Clock, SystemClock, ensure_utc
@@ -51,6 +61,7 @@ from suv_deals.crawling.rate_limits import (
     record_outcome,
     start_request,
 )
+from suv_deals.crawling.robots import RobotsAvailability, RobotsBasis, RobotsRevision, RobotsVerdict, evaluate
 from suv_deals.crawling.url_policy import (
     DEFAULT_DNS_TIMEOUT_SECONDS,
     DenialReason,
@@ -71,6 +82,9 @@ class BudgetRequest(BaseModel):
     host: str
     purpose: FetchPurpose
     url: str
+    # The host's robots.txt Crawl-delay (untrusted, capped by `rate_limits`): the gate spaces
+    # this request by the larger of it and the source's ``min_delay_seconds``.
+    crawl_delay: Decimal | None = Field(default=None, ge=0)
 
 
 @runtime_checkable
@@ -114,6 +128,159 @@ class BudgetRefused(AppError):
         self.until = until
 
 
+class RobotsUnavailable(BudgetRefused):
+    """The host's robots.txt could not be read (5xx, 429, network, unusable answer): a complete
+    disallow (RFC 9309 2.3.1.3, `robots.RobotsAvailability.UNREACHABLE`). Nothing was fetched for
+    the page; ``until`` is when the revision may be fetched again. Handled like any budget
+    refusal: the job waits until then without consuming an attempt."""
+
+    def __init__(self, *, host: str, until: datetime, now: datetime, detail: str | None = None) -> None:
+        super().__init__(Deny(reason=DenyReason.ROBOTS_UNREACHABLE, until=ensure_utc(until)), now=now)
+        self.message = "robots.txt could not be read; nothing is requested from the host until it can"
+        self.host = host
+        self.detail = detail
+
+
+class RobotsCheck(BaseModel):
+    """What the robots guard decided for one URL (see `RobotsChecker`)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    revision: RobotsRevision
+    verdict: RobotsVerdict
+    #: The User-Agent whose product token was evaluated (redirect targets are evaluated for it too).
+    user_agent: str
+    #: The robots.txt request made for this check (None: a stored or cached revision was reused).
+    fetched: FetchOutcome | None = None
+    crawl_delay: Decimal | None = None
+    #: Until when the revision may be reused (the guard's freshness window).
+    reusable_until: datetime
+
+
+@runtime_checkable
+class RobotsChecker(Protocol):
+    """The worker's robots.txt guard (`crawling.robots_guard.RobotsGuard`).
+
+    `check` returns the host's current revision (reused within its freshness window, otherwise
+    fetched through ``gate`` as a ``robots`` request of its own and recorded) and the
+    `robots.evaluate` verdict for ``url``. A budget refusal of the robots request propagates as
+    `BudgetRefused`; a robots URL outside the policy raises `PolicyDenied`.
+    """
+
+    async def check(
+        self, *, source_key: str, policy: SourceUrlPolicy, host: str, url: str, gate: BudgetGate
+    ) -> RobotsCheck: ...
+
+
+_ROBOTS_CODES: Final[dict[RobotsBasis, str]] = {
+    RobotsBasis.DISALLOWED_BY_ROBOTS: "robots_disallowed",
+    RobotsBasis.ROBOTS_STALE: "robots_stale",
+    RobotsBasis.HOST_MISMATCH: "robots_host_mismatch",
+}
+
+
+def robots_refused_document(
+    url: str,
+    *,
+    code: str,
+    message: str,
+    fetched_at: datetime,
+    access_state: AccessState = AccessState.POLICY_DENIED,
+    base: FetchOutcome | None = None,
+) -> RawDocument:
+    """A RawDocument for a URL robots.txt refused: no body; the page itself was not requested
+    (``base`` only for a redirect target the crawler had already reached, whose body is dropped)."""
+    safe_url = redact_url(url)
+    outcome = FetchOutcome(
+        requested_url=safe_url,
+        final_url=redact_url(base.final_url) if base is not None and base.final_url else None,
+        http_status=base.http_status if base is not None else None,
+        success=False,
+        access_state=access_state,
+        error_code=code[:80],
+        error_message=message[:500],
+        elapsed_ms=base.elapsed_ms if base is not None else None,
+        bytes=base.bytes if base is not None else 0,
+        redirect_count=base.redirect_count if base is not None else 0,
+        crawler_version=base.crawler_version if base is not None else None,
+        fetched_at=base.fetched_at if base is not None else ensure_utc(fetched_at),
+    )
+    return RawDocument(
+        url=safe_url, final_url=outcome.final_url, fetched_at=outcome.fetched_at, fetch=outcome
+    )
+
+
+def robots_refusal(url: str, check: RobotsCheck, *, now: datetime) -> RawDocument | None:
+    """The document for a URL robots.txt does not let us request (None: request it).
+
+    Raises `RobotsUnavailable` for an unreachable robots.txt (complete disallow, retried later).
+    """
+    revision = check.revision
+    fetched = check.fetched
+    if fetched is not None and fetched.access_state == AccessState.ACCESS_BLOCKED:
+        status = revision.http_status
+        return robots_refused_document(
+            url,
+            code=f"robots_http_{status}" if status is not None else "robots_access_blocked",
+            message=f"robots.txt answered HTTP {status} (access denied); the page was not requested",
+            fetched_at=now,
+            access_state=AccessState.ACCESS_BLOCKED,
+        )
+    verdict = check.verdict
+    if verdict.allowed:
+        return None
+    if (
+        verdict.basis == RobotsBasis.ROBOTS_UNREACHABLE
+        or revision.availability == RobotsAvailability.UNREACHABLE
+    ):
+        raise RobotsUnavailable(
+            host=revision.host, until=check.reusable_until, now=now, detail=revision.error_kind
+        )
+    rule = f" ({verdict.matched_rule})" if verdict.matched_rule else ""
+    return robots_refused_document(
+        url,
+        code=_ROBOTS_CODES.get(verdict.basis, "robots_disallowed"),
+        message=f"robots.txt disallows this URL for our user agent{rule}; it was not requested",
+        fetched_at=now,
+    )
+
+
+def robots_refused_redirect(
+    url: str, final_url: str, check: RobotsCheck, document: RawDocument, *, now: datetime
+) -> RawDocument | None:
+    """A redirect target that robots.txt disallows (None: it may be kept). The body is dropped.
+
+    The crawler followed the redirect itself, so this can only discard what it brought back. As
+    for a refused URL-policy redirect, a block, throttle or failure reported by the target is
+    kept so the budget gate still pauses, honours Retry-After or backs off.
+    """
+    verdict = evaluate(check.revision, final_url, check.user_agent, now=now)
+    if verdict.allowed:
+        return None
+    inner = document.fetch
+    note = "final URL disallowed by robots.txt"
+    if inner.access_state in _KEEP_ON_REFUSED_REDIRECT:
+        message = f"{inner.error_message}; {note}" if inner.error_message else note
+        outcome = inner.model_copy(
+            update={
+                "requested_url": redact_url(inner.requested_url),
+                "final_url": redact_url(inner.final_url) if inner.final_url else None,
+                "success": False,
+                "error_message": message[:500],
+            }
+        )
+        return RawDocument(
+            url=redact_url(url), final_url=outcome.final_url, fetched_at=outcome.fetched_at, fetch=outcome
+        )
+    return robots_refused_document(
+        url,
+        code=_ROBOTS_CODES.get(verdict.basis, "robots_disallowed"),
+        message=f"the request was redirected to a URL robots.txt disallows ({note}); the body was dropped",
+        fetched_at=now,
+        base=inner,
+    )
+
+
 def policy_denied_document(
     url: str,
     reason: DenialReason,
@@ -141,6 +308,15 @@ def policy_denied_document(
     return RawDocument(
         url=safe_url, final_url=outcome.final_url, fetched_at=outcome.fetched_at, fetch=outcome
     )
+
+
+def larger_delay(configured: Decimal | None, robots: Decimal | None) -> Decimal | None:
+    """The larger of a configured per-host crawl delay and the request's robots crawl-delay."""
+    if configured is None:
+        return robots
+    if robots is None:
+        return configured
+    return max(configured, robots)
 
 
 # Target-side failures that must survive a refused final URL: replacing them with
@@ -182,16 +358,24 @@ class PolicyEnforcingCrawlClient:
         policies: Mapping[str, SourceUrlPolicy],
         budget_gate: BudgetGate,
         *,
+        robots: RobotsChecker | None,
         resolver: Resolver = system_resolver,
         clock: Clock | None = None,
         dns_timeout_s: float = DEFAULT_DNS_TIMEOUT_SECONDS,
     ) -> None:
+        """``robots`` is required by keyword: the worker runtime always passes its robots guard;
+        ``None`` (no application-level robots check) is an explicit choice of a test or tool."""
         self._inner = inner
         self._policies = dict(policies)
         self._gate = budget_gate
+        self._robots = robots
         self._resolver = resolver
         self._clock: Clock = clock or SystemClock()
         self._dns_timeout_s = dns_timeout_s
+
+    @property
+    def robots(self) -> RobotsChecker | None:
+        return self._robots
 
     async def fetch(self, url: str, *, purpose: FetchPurpose, source_key: str) -> RawDocument:
         now = ensure_utc(self._clock.now())
@@ -203,7 +387,31 @@ class PolicyEnforcingCrawlClient:
         except PolicyDenied as exc:
             return policy_denied_document(url, exc.reason, fetched_at=now)
 
-        request = BudgetRequest(source_key=source_key, host=decision.host, purpose=purpose, url=decision.url)
+        robots: RobotsCheck | None = None
+        if self._robots is not None and purpose != "robots":
+            # Before any page request to the host: its current robots revision, then this URL's
+            # verdict for our product token (see the module docstring, step 3).
+            try:
+                robots = await self._robots.check(
+                    source_key=source_key,
+                    policy=policy,
+                    host=decision.host,
+                    url=decision.url,
+                    gate=self._gate,
+                )
+            except PolicyDenied as exc:
+                return policy_denied_document(url, exc.reason, fetched_at=now)
+            refused = robots_refusal(url, robots, now=ensure_utc(self._clock.now()))
+            if refused is not None:
+                return refused
+
+        request = BudgetRequest(
+            source_key=source_key,
+            host=decision.host,
+            purpose=purpose,
+            url=decision.url,
+            crawl_delay=None if robots is None else robots.crawl_delay,
+        )
         budget = await self._gate.acquire(request)
         if not isinstance(budget, Allow):
             raise BudgetRefused(budget, now=now)
@@ -225,6 +433,12 @@ class PolicyEnforcingCrawlClient:
                     policy.validate_redirect(url, final_url, purpose)
                 except PolicyDenied as exc:
                     document = refused_redirect_document(url, exc.reason, document, fetched_at=now)
+                else:
+                    if robots is not None:
+                        refused = robots_refused_redirect(
+                            url, final_url, robots, document, now=ensure_utc(self._clock.now())
+                        )
+                        document = document if refused is None else refused
             outcome = document.fetch
             return document
         finally:
@@ -296,7 +510,7 @@ class InMemoryBudgetGate:
             usage = self.run_usage(request.source_key)
             # The daily request/byte budget belongs to the source, not to each of its hosts.
             source_usage = self.daily_usage(request.source_key, now)
-            delay = self._crawl_delays.get(request.host)
+            delay = larger_delay(self._crawl_delays.get(request.host), request.crawl_delay)
             decision = decide(
                 state,
                 now,

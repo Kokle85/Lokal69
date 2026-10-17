@@ -55,7 +55,10 @@ from suv_deals.netguard import (
 )
 
 DEFAULT_USER_AGENT: Final = "suv-deals/0.1 (private deal research; callback delivery)"
-_RESPONSE_HEADER_ALLOWLIST: Final = frozenset({"content-type", "content-length", "retry-after", "date"})
+_RESPONSE_HEADER_ALLOWLIST: Final = frozenset(
+    {"content-type", "content-length", "content-encoding", "retry-after", "date"}
+)
+_MAX_LOCATION: Final = 2048
 _FORBIDDEN_REQUEST_HEADERS: Final = frozenset(
     {"host", "connection", "transfer-encoding", "upgrade", "proxy-authorization", "te", "keep-alive"}
 )
@@ -84,12 +87,16 @@ class SafeHttpError(Exception):
         possibly_delivered: bool = False,
         status_code: int | None = None,
         detail: str | None = None,
+        location: str | None = None,
     ) -> None:
         super().__init__(f"outbound request failed: {failure.value}")
         self.failure = failure
         self.possibly_delivered = possibly_delivered
         self.status_code = status_code
         self.detail = detail  # short internal classification only; never a URL or body
+        # REDIRECT_REFUSED only: the refused Location (bounded). Never part of the message or repr;
+        # a caller that follows redirects itself (robots.txt) validates it like any other URL.
+        self.location = location
 
     def __repr__(self) -> str:
         return (
@@ -413,10 +420,12 @@ class SafeHttpClient:
             ) as response:
                 tracer.status = response.status_code
                 if 300 <= response.status_code < 400:
+                    location = response.headers.get("location")
                     raise SafeHttpError(
                         SafeHttpFailure.REDIRECT_REFUSED,
                         possibly_delivered=True,
                         status_code=response.status_code,
+                        location=location[:_MAX_LOCATION] if location else None,
                     )
                 body, truncated = await _read_bounded(response, limit)
                 kept = {

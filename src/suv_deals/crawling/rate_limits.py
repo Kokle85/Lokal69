@@ -75,6 +75,9 @@ class DenyReason(StrEnum):
     RUN_CAP_REACHED = "run_cap_reached"
     CIRCUIT_OPEN = "circuit_open"
     ACCESS_BLOCKED = "access_blocked"
+    # robots.txt could not be read (5xx, 429, network): complete disallow until a later fetch
+    # (RFC 9309 2.3.1.3). Raised by the worker's robots guard, never by `decide()`.
+    ROBOTS_UNREACHABLE = "robots_unreachable"
 
 
 class WaitReason(StrEnum):

@@ -54,6 +54,7 @@ from tests.integration.pipeline.support import (
 from tests.integration.v11_inquiries.support import complete_activation_canary
 
 from suv_deals.clock import SystemClock
+from suv_deals.crawling.robots_guard import CrawlClientRobotsTransport
 from suv_deals.domain.comparables import MarketObservation
 from suv_deals.domain.enums import (
     Confidence,
@@ -246,6 +247,9 @@ async def build_live_env(
     if ctx.inquiry_runtime is not None:
         ctx.inquiry_runtime.settings = ctx.settings
     ctx.network_client = ctx.fixture_client
+    # robots.txt of the live-mode source comes from the same in-memory pages (a 404 without a route).
+    assert ctx.fixture_client is not None
+    ctx.robots_transport = CrawlClientRobotsTransport(ctx.fixture_client, label="in-memory")
     ctx.resolver = public_resolver
     env = PipelineEnv(
         ctx=ctx,

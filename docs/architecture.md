@@ -16,7 +16,8 @@ browser/crawler process is never the authoritative queue.
 ```text
 config/sources/*.yaml  ->  scheduler (15 min slots, ops.source_schedules)
   -> ops.jobs discovery job (idempotent slot key)
-  -> worker: adapter.discover() via CrawlClient (Crawl4AI REST) under URL policy + budgets
+  -> worker: adapter.discover() via CrawlClient (Crawl4AI REST) under URL policy, robots.txt
+     (host revision fetched first and stored, every URL evaluated) + budgets
   -> app.listing_observations (+ detail jobs for new/changed cards)
   -> worker: adapter.fetch_detail()/parse_detail() -> NormalizedListing
   -> app.listing_revisions (only on semantic change) + field evidence
@@ -85,7 +86,9 @@ seller reply in the owner's mailbox
 | `adapters/base.py` | `SourceAdapter`/`CrawlClient` protocols and DTOs | listings, profiles |
 | `adapters/*.py` | Concrete adapters; unverified sites are explicit placeholders | base |
 | `crawling/url_policy.py` | SSRF + per-source host/path policy, redirect validation | sources |
-| `crawling/robots.py` | robots.txt fetch/parse/obey with stored revision hash | url_policy |
+| `crawling/robots.py` | robots.txt fetch/parse/obey with stored revision hash (RFC 9309) | url_policy |
+| `crawling/robots_guard.py` | Worker robots guard: current revision per host before any page request (reused within its UTC day; unreachable retried after 30 min), fetched directly (`SafeHttpClient`) or from fixtures, budgeted, recorded; URL evaluation, crawl-delay | robots, policy_client |
+| `crawling/policy_client.py` | The only `CrawlClient` adapters get: URL policy, robots guard, budget gate, DNS check, redirect validation | url_policy, rate_limits, robots |
 | `crawling/rate_limits.py` | Token bucket / circuit breaker / backoff decisions (pure) | sources |
 | `crawling/parser_health.py` | Tripwires on parse outcomes | adapters.base |
 | `crawling/scheduler.py`, `discovery.py`, `detail.py` | Job orchestration (DB-backed) | persistence |

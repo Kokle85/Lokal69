@@ -54,7 +54,7 @@ from psycopg import sql
 
 from suv_deals.adapters.base import FetchOutcome
 from suv_deals.clock import ensure_utc
-from suv_deals.crawling.policy_client import BudgetRequest
+from suv_deals.crawling.policy_client import BudgetRequest, larger_delay
 from suv_deals.crawling.rate_limits import (
     DEFAULT_BACKOFF,
     TOKEN_CAPACITY,
@@ -334,7 +334,8 @@ class DbBudgetGate:
         if budget is None:
             return Deny(reason=DenyReason.BUDGET_EXHAUSTED)
         host = _host(request.host)
-        delay = self._crawl_delays.get(host)
+        # A robots.txt Crawl-delay travels with the request (`BudgetRequest.crawl_delay`).
+        delay = larger_delay(self._crawl_delays.get(host), request.crawl_delay)
         usage = self.run_usage(request.source_key)
         refill = (Decimal(1) / effective_delay_seconds(budget, delay)).quantize(Decimal("0.00000001"))
         async with self._transaction() as conn:
@@ -407,7 +408,7 @@ class DbBudgetGate:
         own_token = entry[1] if entry is not None and entry[0] is request else None
         budget = self._budgets.get(request.source_key)
         host = _host(request.host)
-        delay = self._crawl_delays.get(host)
+        delay = larger_delay(self._crawl_delays.get(host), request.crawl_delay)
 
         async def once() -> OutcomeResult | None:
             result: OutcomeResult | None = None

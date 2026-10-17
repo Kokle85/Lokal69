@@ -124,6 +124,8 @@ class RobotsFetchResponse(NamedTuple):
     body: bytes | None
     error_kind: str | None
     location: str | None = None
+    # Raw Retry-After header of a 429/503 answer (recorded with the fetch outcome; not parsed here).
+    retry_after: str | None = None
 
 
 RobotsFetchResult = RobotsFetchResponse | tuple[int | None, bytes | None, str | None]

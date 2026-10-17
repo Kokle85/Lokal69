@@ -23,6 +23,10 @@ files:
   not_found.html: Generic 404 page without removal wording (an unknown model slug, or a drifted search
     route).
   rate_limited.html: 429 body (too many requests).
+  robots.txt: 'SYNTHETIC robots.txt with the rules recorded for AutoScout24 Germany: the ''*'' group disallows
+    detail pages (/angebote/), a query on the bare search path (/lst? and /lst/?), any URL with a ''cat=''
+    parameter and /detailsuche; /lst/<make>/<model> search pages are not disallowed (the reason the source
+    is card_only).'
   search_after_removal.html: 'Removed card (card-level equivalent of a removed listing): the normal page
     after listing 502 was removed. A card_only source sees a removal only as absence from a COMPLETE walk.'
   search_damaged.html: 'Damaged vehicle on the card: vehicle.isCurrentlyDamaged true (no full asking price)
@@ -65,6 +69,10 @@ files:
     while 3 results are reported; no card is Organic/Main, which is drift, never an empty healthy page.'
   server_error.html: 503 maintenance body.
 routes:
+  https://www.autoscout24.de/robots.txt:
+    file: robots.txt
+    content_type: text/plain; charset=utf-8
+    description: robots.txt (synthetic)
   https://www.autoscout24.de/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&cy=D:
     file: search_normal.html
     description: 'primary-profile search of model 1 (renault/captur): normal search page'

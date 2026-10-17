@@ -12,6 +12,7 @@ from tests.integration.persistence_core.support import member
 from tests.integration.repos_sources_listings.support import HOST, T0, Env, source_config
 
 from suv_deals.adapters.base import FetchOutcome, ParserHealth
+from suv_deals.crawling.robots import RobotsAvailability, evaluate
 from suv_deals.domain.enums import (
     AccessState,
     GateStatus,
@@ -22,7 +23,7 @@ from suv_deals.domain.enums import (
     TermsStatus,
 )
 from suv_deals.errors import Forbidden, IdempotencyConflict, NotFound, SourcePaused, VersionConflict
-from suv_deals.persistence import sources_repo
+from suv_deals.persistence import robots_store, sources_repo
 from suv_deals.persistence.database import Database
 from suv_deals.persistence.sources_repo import SourceRoute
 from suv_deals.persistence.transactions import lock_source, unit_of_work
@@ -355,6 +356,60 @@ async def test_robots_revision_change_flags_sources(db: Database, env: Env, seed
         )
         == 1
     )
+
+
+async def test_an_unreachable_robots_fetch_is_stored_but_never_a_change(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """A robots.txt outage (no body, not parsed) is stored as a fetch but compared with nothing:
+    no review item for the outage nor for the recovery; a robots.txt that disappears is a change."""
+    rules = "User-agent: *\nDisallow: /vehicles/private/\n"
+
+    async def record(hours: int, status: int | None, body: str | None, parse_ok: bool) -> Any:
+        async with unit_of_work(db, env.system) as conn:
+            return await sources_repo.record_robots_revision(
+                conn,
+                env.system,
+                host=HOST,
+                fetched_at=T0 + timedelta(hours=hours),
+                http_status=status,
+                body=body,
+                parse_ok=parse_ok,
+                user_agent="SUVDealResearch/0.1 (+test)",
+            )
+
+    first = await record(0, 200, rules, True)
+    outage = await record(1, 503, None, False)
+    network = await record(2, None, None, False)
+    back = await record(3, 200, rules, True)
+    assert not first.changed and not outage.changed and not network.changed
+    assert not back.changed and back.previous_hash == sha(rules)
+    gone = await record(4, 404, None, True)  # robots.txt removed: no restriction any more
+    assert gone.changed and gone.previous_hash == sha(rules) and gone.content_hash is None
+    count = seed.scalar(
+        "select count(*) from ops.audit_events where target_id = %s and action = 'source.robots_changed'",
+        (env.source_id,),
+    )
+    assert count == 1
+    stored = seed.scalar(
+        "select count(*) from ops.robots_revisions where workspace_id = %s and host = %s",
+        (env.workspace_id, HOST),
+    )
+    assert stored == 5
+    # The worker's robots store reads the newest row back as the robots module's revision.
+    async with unit_of_work(db, env.system) as conn:
+        latest = await robots_store.latest_revision(conn, env.system, HOST)
+        await record(5, 200, rules, True)
+        available = await robots_store.latest_revision(conn, env.system, HOST)
+        await record(6, 503, None, False)
+        down = await robots_store.latest_revision(conn, env.system, HOST)
+    assert latest is not None and latest.availability == RobotsAvailability.UNAVAILABLE
+    assert latest.http_status == 404 and latest.fetched_at == T0 + timedelta(hours=4)
+    assert available is not None and available.availability == RobotsAvailability.AVAILABLE
+    assert available.content_hash == sha(rules)
+    assert not evaluate(available, f"https://{HOST}/vehicles/private/1", "SUVDealResearch/0.1").allowed
+    assert evaluate(available, f"https://{HOST}/vehicles/1", "SUVDealResearch/0.1").allowed
+    assert down is not None and down.availability == RobotsAvailability.UNREACHABLE
 
 
 async def test_fetch_attempt_is_redacted(db: Database, env: Env, seed: Seed) -> None:

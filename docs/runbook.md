@@ -479,6 +479,18 @@ scheduler` process (and no Compose service running it) may run during the smoke:
 switched on, it would queue a full 12-model run at the next half-hour slot between 08:00 and 22:00
 Europe/Skopje (section 2.2).
 
+robots.txt (since 2026-10-17; the first smoke that day found the robots view empty and only the
+search fetch in the evidence, because only Crawl4AI read robots.txt): before the first page request
+to a host the worker reads the host's robots.txt ITSELF, directly from the machine that runs
+`suv-deals` (not through Crawl4AI; the netguard HTTPS client with the crawler's honest User-Agent,
+no proxy), stores the revision (`ops.robots_revisions`) and logs the request as a fetch attempt with
+`purpose: robots`. The request counts in the host's daily budget and is spaced like a page (20 s,
+or the robots `Crawl-delay` when larger). A revision is reused for the rest of its UTC day, so the
+first request of each UTC day fetches robots.txt again and the detail jobs of the same day reuse it.
+Every search and detail URL is checked against it for `SUVDealResearch`; Crawl4AI's own robots
+check stays on as well. The machine therefore needs direct outbound HTTPS to the source host (the
+same network the owner's captures used).
+
 ```bash
 # 0. Preconditions: crawler firewall (3.2), crawler health/contract, the source's gate view.
 sudo scripts/crawler_firewall.sh --check
@@ -521,8 +533,27 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   (`https://www.autoscout24.it/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&ustate=U&cy=I`;
   on .de `...&sort=age&desc=1&cy=D`, no `ustate`); `--max-pages 1` means ONE search request,
   through the URL policy, robots.txt and the persistent budget gate (20 s spacing; daily budget
-  600 requests for .it, 350 for .de). Expected: `Job state: succeeded`, `pages: 1`, `completeness: budget_limited` (12 models,
-  capped at one page).
+  600 requests for .it, 350 for .de). On the first run of a UTC day it is preceded by ONE
+  robots.txt request (`https://www.autoscout24.it/robots.txt`), then the search page follows
+  20 s later (the command waits). Expected: `Job state: succeeded`, `pages: 1`, `completeness:
+  budget_limited` (12 models, capped at one page).
+- Expected in step 3 (robots): `sources inspect autoscout24_it --from-db` shows `robots.fetch_status:
+  200`, `robots.revision_hash` (the SHA-256 of the stored robots.txt) and `robots.last_checked_at`
+  (the time of the `crawl once`); `rate_budget.requests_today` counts the robots request too (2
+  after `crawl once`, plus one per detail page). `sources smoke-evidence` lists the robots request
+  first among `fetches` (`purpose: robots`, `http_status: 200`, `access_state: ok`, the discovery
+  job and run ids), then the search fetch and the detail fetches, and `robots_revisions` names the
+  revision in effect (`host`, `fetched_at`, `http_status`, `content_hash`, `availability:
+  available`; no body). The detail jobs of the same UTC day reuse that revision (no further robots
+  request). Any later change of the file raises a `source.robots_changed` audit event for review
+  (`sources inspect` / the audit log); nothing is switched on or off by it.
+- robots.txt outcomes that stop the smoke (do not retry, run step 4, report the printed lines and
+  the `smoke-evidence` JSON): robots.txt unreachable (5xx, 429, no answer) is a complete disallow:
+  `Job state: queued (ROBOTS_UNREACHABLE)` and nothing else is requested (the job would wait 30
+  minutes); a 401/403 to robots.txt is an access block like a 403 page (`blocked
+  (access_blocked)`); a search URL robots.txt disallows is never requested (`completeness: failed`,
+  gap `robots.txt (robots_disallowed)` in the run, a `search` fetch with `error_code:
+  robots_disallowed` and no `http_status`).
 - The search page queues one detail job per new or changed organic card: on a first run every
   card, up to about 20. `max_detail_jobs_per_run` (10) does NOT bound that: each detail job is
   its own run, so a drain without `--max-jobs` fetches every queued `/annunci/` page, 20 s apart.
@@ -570,7 +601,8 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `sources smoke-evidence` JSON and the `git rev-parse HEAD` output. `sources smoke-evidence`
   (read-only) prints the source's latest crawl run (run and job ids, outcome, access state,
   adapter/parser versions, timing), the detail jobs it queued, the redacted fetch outcomes of
-  both (purpose, host, HTTP status, access state, time; no URL or body is stored), every listing
+  both (purpose, host, HTTP status, access state, time; no URL or body is stored; the robots.txt
+  request included), the robots revision in effect (`robots_revisions`), every listing
   the run observed (canonical URL, card price and mileage) with the persisted revision and
   field-evidence ids, and the workspace's current configuration revision. From these the operator
   records step 6 (`technical_status: live_smoke_passed`, committed with the evidence) or fixes

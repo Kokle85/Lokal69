@@ -12,7 +12,12 @@ files:
   detail_miles.html: "Mileage 124274 SMI (= 199999.616256 km, exact factor 1.609344), CHF 2750.50."
   detail_export_ab_mfk.html: "CHF 2750 with Swiss wording 'Export ohne MWST' (export net price) and 'Occasion', 'Frisch ab MFK' (fresh-inspection seller claim)."
   detail_ohne_mfk.html: "CHF 1950 'inkl. MWST' sold 'ab Platz ohne MFK' (not freshly inspected: never a positive roadworthy claim)."
+  robots.txt: "SYNTHETIC robots.txt: allows the reviewed search and detail paths."
 routes:
+  "https://garage.example/robots.txt":
+    file: robots.txt
+    content_type: "text/plain; charset=utf-8"
+    description: "robots.txt (synthetic)"
   "https://garage.example/occasionen?kategorie=suv":
     file: search_page.html
     description: "search"

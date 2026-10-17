@@ -32,7 +32,15 @@ files:
   not_found.html: "Generic 404 page without removal wording."
   rate_limited.html: "429 body."
   server_error.html: "503 maintenance body."
+  robots.txt: "SYNTHETIC robots.txt: allows the reviewed search and detail paths; disallows the search variant typ=robots-gesperrt and the listing TEST-230 (robots guard tests)."
 routes:
+  "https://dealer.example/robots.txt":
+    file: robots.txt
+    content_type: "text/plain; charset=utf-8"
+    description: "robots.txt (synthetic)"
+  "https://dealer.example/suche?typ=robots-gesperrt":
+    file: search_page1.html
+    description: "search variant robots.txt disallows (a request would be served; none may happen)"
   "https://dealer.example/suche?typ=suv":
     file: search_page1.html
     description: "search page 1"
@@ -164,3 +172,6 @@ routes:
   "https://dealer.example/fahrzeug/TEST-224":
     file: detail_seller_email.html
     description: "seller e-mail shown on the advertisement (wave D2)"
+  "https://dealer.example/fahrzeug/TEST-230":
+    file: detail_normal.html
+    description: "listing robots.txt disallows (a request would be served; none may happen)"
