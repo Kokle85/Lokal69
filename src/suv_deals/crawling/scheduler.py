@@ -12,8 +12,9 @@ slots and due times):
    - Without a ``schedule`` block in its YAML: every ``SCHEDULER_INTERVAL_SECONDS`` on the UTC
      slot grid, stretched for a source whose search pages per run would not fit its daily request
      budget at that cadence (`domain.sources.discovery_interval_seconds`).
-   - With one (`domain.sources.DiscoverySchedule`, an owner decision; AutoScout24 IT/DE: every 30
-     minutes from 08:00 to 22:00 Europe/Skopje, slots 08:00 ... 21:30): fixed wall-clock slots
+   - With one (`domain.sources.DiscoverySchedule`, an owner decision; AutoScout24 DE every 30
+     minutes from 08:00 to 22:00 Europe/Skopje, slots 08:00 ... 21:30; AutoScout24 IT every 15
+     minutes in the same window since 2026-10-18, slots 08:00 ... 21:45): fixed wall-clock slots
      inside the daily window in the schedule's time zone, DST-correct (zoneinfo). Outside the
      window the schedule is due at the next day's window start. An explicit schedule is never
      stretched: if a day of its runs x search pages x enabled profiles does not fit the budget
@@ -41,7 +42,7 @@ slots and due times):
 
 The process wakes on the ``SCHEDULER_INTERVAL_SECONDS`` UTC grid (15 minutes by default) and
 never in between, so a window slot runs only if a tick falls inside its run window (refused
-otherwise, see step 2): Europe/Skopje's :00/:30 slots fall on the 15-minute grid exactly.
+otherwise, see step 2): Europe/Skopje's :00/:15/:30/:45 slots fall on the 15-minute grid exactly.
 
 Real sources are not scheduled at all while ``SOURCE_NETWORK_ENABLED=false`` (their schedules stay
 due and visibly unscanned); fixture sources run offline, and never in production, whose processes

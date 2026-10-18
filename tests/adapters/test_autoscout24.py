@@ -120,29 +120,44 @@ class FakeClient:
 # --------------------------------------------------------------------------- configuration
 
 
-@pytest.mark.parametrize("key", ["autoscout24_it", "autoscout24_de"])
-def test_real_configs_build_the_adapter_but_stay_disabled_and_gated(key: str) -> None:
+def _check_real_config(key: str) -> SourceConfig:
+    """What both real AutoScout24 configurations share, whatever their activation step."""
     cfg = REGISTRY.config(key)
     adapter = REGISTRY.adapter(key)
     assert isinstance(adapter, AutoScout24ItAdapter | AutoScout24DeAdapter)
     assert isinstance(adapter, SourceAdapter)
     assert cfg.adapter_version == ADAPTER_VERSION == adapter.adapter_version
-    # Activation step 5 (2026-10-16): fixture_tested on the saved SYNTHETIC fixture set. Step 6
-    # (the owner's live smoke) passed for autoscout24_it on 2026-10-17; autoscout24_de's is still
-    # to come. Both stay disabled, so not active (enabling is step 7).
-    expected = (
-        TechnicalStatus.LIVE_SMOKE_PASSED if key == "autoscout24_it" else TechnicalStatus.FIXTURE_TESTED
-    )
-    assert cfg.enabled is False and cfg.technical_status == expected
-    gate = gate_status(cfg)
-    assert gate.adapter_implemented and gate.activatable and not gate.active
-    assert gate.problems == ("source is disabled in configuration",)
     # Every owner model is searched, once per run, within the per-run page budget and spacing.
     assert tuple(m.label for m in adapter.models) == OWNER_MODELS
     assert cfg.rate_budget.max_search_pages_per_run >= len(adapter.models)
     assert cfg.rate_budget.min_delay_seconds >= 20
     assert "UNVERIFIED" in (cfg.notes or "")
     assert not adapter.capabilities().seller_contact_evidence
+    return cfg
+
+
+def test_the_german_config_builds_the_adapter_but_stays_disabled_and_gated() -> None:
+    # Activation step 5 (2026-10-16): fixture_tested on the saved SYNTHETIC fixture set; the
+    # owner's live smoke (step 6) is still to come, so the source stays disabled, not active.
+    cfg = _check_real_config("autoscout24_de")
+    assert cfg.enabled is False and cfg.technical_status == TechnicalStatus.FIXTURE_TESTED
+    gate = gate_status(cfg)
+    assert gate.adapter_implemented and gate.activatable and not gate.active
+    assert gate.problems == ("source is disabled in configuration",)
+
+
+def test_the_italian_config_is_enabled_and_active_after_step_7() -> None:
+    # Step 5 (2026-10-16, synthetic fixtures), step 6 (2026-10-17, the owner's live smoke:
+    # live_smoke_passed) and step 7 (2026-10-18, the owner's decision to switch it on permanently,
+    # every 15 minutes): enabled, every gate satisfied.
+    cfg = _check_real_config("autoscout24_it")
+    assert cfg.enabled is True and cfg.technical_status == TechnicalStatus.LIVE_SMOKE_PASSED
+    gate = gate_status(cfg)
+    assert gate.adapter_implemented and gate.activatable and gate.active
+    assert gate.problems == ()
+    # The enable switch is still a gate of its own: switched off, the source is gated again.
+    off = gate_status(cfg.model_copy(update={"enabled": False}))
+    assert not off.active and off.problems == ("source is disabled in configuration",)
 
 
 def test_registry_maps_the_country_keys_to_the_real_adapter() -> None:

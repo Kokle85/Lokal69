@@ -10,9 +10,12 @@ vehicle/seller pair (availability, documents, lowest/final price) and route the 
 through the owner's own classic Outlook. The contract is
 [docs/spec/suv-deal-system-build-spec.md](docs/spec/suv-deal-system-build-spec.md) (version 1.1).
 
-> **Nothing is active.** Every source is disabled and every external effect is off by default. No
-> live crawl, Crawl4AI service, real mailbox, Outlook on a real PC, Slack, dot or deployed service
-> has been used. What is built and tested, and what is still blocked:
+> **Nothing runs by itself.** Every source is disabled except AutoScout24 Italy (`autoscout24_it`,
+> enabled 2026-10-18; it runs only while the owner's scheduler and worker run on his workstation,
+> docs/runbook.md section 9.2), and every external effect is off by default. Apart from the owner's
+> AutoScout24 Italy smokes through his workstation's Crawl4AI (2026-10-17), no live crawl, real
+> mailbox, Outlook on a real PC, Slack, dot or deployed service has been used. What is built and
+> tested, and what is still blocked:
 > [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) and [ACTIVATION_GATES.md](ACTIVATION_GATES.md).
 
 ## Architecture in brief

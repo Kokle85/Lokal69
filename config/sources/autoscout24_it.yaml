@@ -1,4 +1,4 @@
-# AutoScout24 Italy public listings (IT). Candidate acquisition source - DISABLED.
+# AutoScout24 Italy public listings (IT). Candidate acquisition source - ENABLED (step 7, 2026-10-18).
 # Each AutoScout24 country is registered and gated separately.
 # A stored owner acknowledgement audits a decision; it is NOT legal permission,
 # and public accessibility is NOT permission.
@@ -9,7 +9,14 @@ role: acquisition
 mode: public_html
 adapter: autoscout24_public_it
 adapter_version: "autoscout24@1.0.0"   # built from owner captures 2026-10-15/16; live smoke passed 2026-10-17
-enabled: false
+# Activation step 7 done 2026-10-18 (enabling), owner decision of 2026-10-18 (verbatim):
+# "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes"). Step 6
+# passed 2026-10-17 (below). An auditable configuration revision: it takes effect on a machine
+# with `suv-deals sources sync --yes` (audited source.sync_update); the source runs only while
+# the owner's scheduler and worker run (docs/runbook.md 9.2). Switching it off again is a
+# committed `enabled: false` plus `sources sync --yes` (for a while: a pause from the dashboard's
+# Sources screen or the MCP tool `sources_pause`).
+enabled: true
 # Activation step 5 done 2026-10-16: the SYNTHETIC saved-fixture set
 # tests/adapters/fixtures/autoscout24_it/ (MANIFEST.yaml, spec-31 coverage) passes
 # tests/adapters/test_autoscout24_fixtures.py.
@@ -18,8 +25,8 @@ enabled: false
 # the worker fetched robots.txt itself (HTTP 200, available, sha256 7c78475c..., unchanged), 12
 # search pages HTTP 200, access ok, complete, 15 cards, 5 detail pages ingested, no block; the
 # source was switched off again. Run ids and the evidence record: docs/source_access_register.md
-# ("Live smoke evidence") and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json. Still
-# disabled: enabling is step 7, a separate owner decision.
+# ("Live smoke evidence") and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json. Enabling
+# (step 7) was the separate owner decision of 2026-10-18 above.
 technical_status: live_smoke_passed
 terms_status: restricted
 terms_url: https://www.autoscout24.com/company/agb/
@@ -40,18 +47,23 @@ allowed_search_paths:
 allowed_detail_paths:
   # '+' occurs in real listing slugs (2026-10-16 captures); the URL must still end in the listing UUID.
   - '^/annunci/[A-Za-z0-9][A-Za-z0-9._~%+-]{0,300}/?$'
-# Discovery schedule, owner decision 2026-10-16 (verbatim): "сакам на секои 30 минуту да го
-# наместиш само од 08:00 до 22:00" (every 30 minutes, only from 08:00 to 22:00, owner's local time).
-# Slots 08:00, 08:30, ..., 21:30 Europe/Skopje (22:00 is the exclusive end; CET/CEST handled):
-# 28 runs a day x 12 search pages = 336 search requests a day, all inside one UTC budget day.
-# Budget 600 (owner, 2026-10-16): 336 search + 264 for detail pages. Nothing caps the detail pages
-# per run (one per new or changed card, plus stale refreshes); the budget gate keeps them from
-# using what the day's remaining runs still need (crawling.rate_limits.SearchReserve), so on a
-# busy day the extra detail pages wait (end of the 21:30 run window or next UTC day) and the runs
-# up to 21:30 keep their 336. Load check (domain.sources.schedule_budget_problem): 336 + 10
-# (one run's max_detail_jobs_per_run) <= 600.
+# Discovery schedule: every 15 minutes, owner decision 2026-10-18 (verbatim above: "вклучи ја
+# трајно на секои 15 мин"), inside the 08:00-22:00 window of the owner's decision of 2026-10-16
+# ("сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00": every 30 minutes, only from
+# 08:00 to 22:00, owner's local time; budget 600 then). Only the interval changed.
+# Slots 08:00, 08:15, ..., 21:45 Europe/Skopje (22:00 is the exclusive end; CET/CEST handled):
+# 56 runs a day x 12 search pages = 672 search requests a day, all inside one UTC budget day
+# (06:00-20:00 UTC in summer time, 07:00-21:00 in winter time). The slots lie on the scheduler's
+# 15-minute UTC tick grid (SCHEDULER_INTERVAL_SECONDS=900).
+# Budget 800 (2026-10-18): 672 search + 128 for detail pages and the daily robots.txt request.
+# Nothing caps the detail pages per run (one per new or changed card, plus stale refreshes); the
+# budget gate keeps them from using what the day's remaining runs still need
+# (crawling.rate_limits.SearchReserve), so on a busy day the extra detail pages wait (end of the
+# 21:45 run window or next UTC day) and the runs up to 21:45 keep their 672. Load check
+# (domain.sources.schedule_budget_problem, one profile): 672 + 10 (one run's
+# max_detail_jobs_per_run) <= 800.
 schedule:
-  interval_minutes: 30
+  interval_minutes: 15
   window_start: "08:00"
   window_end: "22:00"
   timezone: Europe/Skopje
@@ -59,7 +71,7 @@ rate_budget:
   min_delay_seconds: 20            # per-host spacing (shared rate limiter)
   max_search_pages_per_run: 12     # one search page for each of the 12 configured models
   max_detail_jobs_per_run: 10
-  daily_request_budget: 600        # 336 search + 264 for detail pages (see schedule above)
+  daily_request_budget: 800        # 672 search + 128 for detail pages and robots.txt (see schedule above)
 search:
   # One search page per model per run (newest first), in this order. Slug verification
   # (2026-10-16, from the owner-captured pages' links and taxonomy): see notes.

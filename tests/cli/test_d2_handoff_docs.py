@@ -145,17 +145,24 @@ def test_autoscout24_de_rows_record_step_5_and_name_the_live_smoke_next() -> Non
         assert "docs/runbook.md section 9.1" in row
 
 
-def test_autoscout24_it_rows_record_step_6_and_name_enabling_next() -> None:
-    """Step 6 (the owner's live smoke) passed for ``autoscout24_it`` on 2026-10-17: its rows record
-    both steps (5 on SYNTHETIC fixtures, 6 live) and name enabling (step 7) as the owner's next
-    decision, never claim the source is enabled or active, and point to the evidence record."""
+def test_autoscout24_it_rows_record_steps_6_and_7() -> None:
+    """Step 6 (the owner's live smoke) passed for ``autoscout24_it`` on 2026-10-17 and step 7
+    (enabling) followed on 2026-10-18 by the owner's decision: its rows record steps 5 (SYNTHETIC
+    fixtures), 6 (live) and 7 (enabled, every 15 minutes), the decision verbatim, how it runs
+    (runbook 9.2) and the evidence record; they never call it disabled any more."""
     register_row, gates_row = _source_rows("autoscout24_it")
     for row in (register_row, gates_row):
         assert "fixture_tested" in row and "2026-10-16" in row and "SYNTHETIC" in row.upper()
         assert "live_smoke_passed" in row and "2026-10-17" in row
-        assert "step 7" in row and "the owner's decision" in row
-        assert "`enabled: false`" in row
-        assert "docs/runbook.md section 9.1" in row
+        assert "step 7" in row and "2026-10-18" in row and "the owner's decision" in row
+        assert "вклучи ја трајно на секои 15 мин" in row  # noqa: RUF001 - the owner's words, verbatim
+        assert "`enabled: true`" in row and "sources sync --yes" in row
+        assert "`enabled: false` only" not in row and "The only gate left closed" not in row
+        # The cadence: every 15 minutes in the unchanged window, 56 x 12 = 672 of 800.
+        assert "every 15 min" in row and "08:00 to 22:00 Europe/Skopje" in row
+        assert "56 runs x 12 pages = 672 search requests a day" in row and "800" in row
+        assert "every 30 min" not in row.replace("which set every 30 minutes", "").replace("set 30 min", "")
+        assert "docs/runbook.md section 9.1" in row and "docs/runbook.md section 9.2" in row
         # The 49 -> 15 cards drop strongly indicates the seller-country filter; the seller
         # countries of the cards confirm it, so no row may call it verified yet.
         assert "`cy=I` strongly indicated" in row and "`cy=I` verified" not in row
@@ -182,6 +189,12 @@ def test_autoscout24_it_rows_record_step_6_and_name_enabling_next() -> None:
     gates = _text("ACTIVATION_GATES.md")
     log = gates[gates.index("## Evidence log") :]
     assert "`autoscout24_it` -> `live_smoke_passed`" in log and "46f4bdec-1a91-4702-8ecb-1dff3f5a7255" in log
+    step_7 = next(line for line in log.splitlines() if "`source_access` step 7" in line)
+    assert step_7.startswith("| 2026-10-18 |") and "`autoscout24_it` -> `enabled: true`" in step_7
+    assert "вклучи ја трајно на секои 15 мин" in step_7  # noqa: RUF001 - verbatim
+    assert "sources sync --yes" in step_7 and "the commit that sets `enabled: true`" in step_7
+    # The register's vocabulary: autoscout24_it is the only source that can be active.
+    assert "No source is active." not in register and "No other source is active." in register
 
 
 def _shell_commands(block: str) -> list[str]:
@@ -240,6 +253,64 @@ def test_runbook_autoscout24_smoke_commands_match_the_real_cli() -> None:
     assert "sources sync --yes" in block and "sources inspect autoscout24_it --from-db" in block
     assert "git checkout -- config/sources/autoscout24_it.yaml" in block
     assert block.index("enabled: true") < block.index("crawl once") < block.index("git checkout --")
+
+
+def _assert_real_cli_command(line: str) -> str:
+    """A ``suv-deals ...`` command line uses only commands and options the CLI really has."""
+    tokens = shlex.split(line.split("suv-deals ", 1)[1], comments=True)
+    command: click.Command = cli
+    path: list[str] = []
+    while isinstance(command, click.Group) and tokens and tokens[0] in command.commands:
+        path.append(tokens[0])
+        command = command.commands[tokens.pop(0)]
+    assert not isinstance(command, click.Group), line
+    options = {opt for param in command.params for opt in (*param.opts, *param.secondary_opts)}
+    for token in tokens:
+        if token.startswith("-"):
+            assert token.split("=", 1)[0] in options, (line, token)
+    return " ".join(path)
+
+
+def test_runbook_9_2_runs_the_enabled_source_with_real_commands() -> None:
+    """Runbook 9.2 (2026-10-18): how the owner runs the enabled ``autoscout24_it``. Its block uses
+    only ``scripts/local_crawl.sh`` subcommands the script has, every ``suv-deals`` command it
+    names exists with those options, and it states the cadence, the left-over detail jobs, the
+    WSL caveat, the restart procedure, how to switch the source off and the access-block rule."""
+    runbook = _text("docs/runbook.md")
+    section = runbook[runbook.index("### 9.2 Running the enabled source") : runbook.index("## 10.")]
+    block = section[
+        section.index("```bash") + len("```bash") : section.index("```", section.index("```bash") + 7)
+    ]
+    script = (REPO / "scripts" / "local_crawl.sh").read_text(encoding="utf-8")
+    subcommands = re.search(r"^  start \| stop \| status \| logs\) ;;$", script, re.M)
+    assert subcommands is not None
+    used = {line.split()[1] for line in _shell_commands(block)}
+    assert all(line.split()[0] == "scripts/local_crawl.sh" for line in _shell_commands(block))
+    assert used == {"start", "status", "logs", "stop"}
+    prose = " ".join(section.split())
+    named = re.findall(r"`(?:uv run )?(suv-deals [^`]+)`", prose)
+    paths = {_assert_real_cli_command(command.replace('"..."', "x")) for command in named}
+    assert {"doctor", "sources sync", "reconcile", "scheduler", "worker", "jobs unblock"} <= paths
+    assert {"sources resume", "sources inspect"} <= paths
+    for fact in (
+        "вклучи ја трајно на секои 15 мин",  # noqa: RUF001 - the owner's words, verbatim
+        "every 15 minutes from 08:00 to 22:00 Europe/Skopje",
+        "56 runs x 12 search pages = 672 search requests a day, daily budget 800",
+        "both with `SOURCE_NETWORK_ENABLED=true`",
+        "the 39 `autoscout24_it` detail jobs left queued from 2026-10-17",
+        "about 13 minutes at the 20 s spacing",
+        "Keep a WSL window open",
+        "closing every WSL window can shut WSL down",
+        "`docker compose up -d crawl4ai`), then `scripts/local_crawl.sh start`",
+        "a committed `enabled: false`",
+        "`sources_pause`",
+        "There is no CLI pause command.",
+        "`access_blocked`",
+        "`technical_denial_policy: stop_and_report`",
+        "never work around it",
+    ):
+        assert fact in prose, fact
+    assert (REPO / "scripts" / "crawler_firewall.sh").exists()
 
 
 @pytest.mark.parametrize("relative", ["docs/seller_email_activation.md", "docs/runbook.md"])

@@ -71,17 +71,20 @@ OWNER_DECIDED_SOURCES = frozenset(
 
 #: Marketplace sources with a real adapter (built from owner captures). Activation step 5
 #: (2026-10-16): their SYNTHETIC saved-fixture sets pass (``fixture_tested``); step 6, the owner's
-#: live smoke, passed for autoscout24_it on 2026-10-17 (``live_smoke_passed``). Both stay disabled
-#: until enabling (step 7).
+#: live smoke, passed for autoscout24_it on 2026-10-17 (``live_smoke_passed``); step 7, enabling,
+#: followed for autoscout24_it on 2026-10-18 (the owner's decision). autoscout24_de stays disabled.
 IMPLEMENTED_MARKETPLACES = frozenset({"autoscout24_de", "autoscout24_it"})
 LIVE_SMOKE_PASSED = frozenset({"autoscout24_it"})
+#: The only sources with ``enabled: true`` (activation step 7 done).
+ENABLED_SOURCES = frozenset({"autoscout24_it"})
 
 
 @pytest.mark.parametrize("path", CONFIG_FILES, ids=lambda p: p.name)
-def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
+def test_every_source_file_validates_and_only_step_7_sources_are_enabled(path: Path) -> None:
     config = SourceConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert path.stem == config.source_key
-    assert config.enabled is False
+    assert config.enabled is (config.source_key in ENABLED_SOURCES)
+    assert ENABLED_SOURCES <= LIVE_SMOKE_PASSED  # nothing is enabled before its live smoke (step 6)
     expected_status = (
         TechnicalStatus.LIVE_SMOKE_PASSED
         if config.source_key in LIVE_SMOKE_PASSED
@@ -92,11 +95,15 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
     assert config.technical_status == expected_status
     if config.source_key in OWNER_DECIDED_SOURCES:
         # Owner decision 2026-10-10 (ADR 0002 addendum): an audited acknowledgement with an actor,
-        # never legal permission; the source stays disabled and gated (unimplemented adapter).
+        # never legal permission; it opens no gate by itself (activation steps 2-7 still apply).
         assert config.terms_decision == TermsDecision.PROCEED_ACKNOWLEDGED
         assert config.terms_decision_actor and "owner" in config.terms_decision_actor
         assert config.robots_checked_at is not None and config.robots_summary
-        if config.source_key in IMPLEMENTED_MARKETPLACES:
+        if config.source_key in ENABLED_SOURCES:
+            # Steps 5-7 done: every gate passes.
+            assert activation_problems(config) == []
+            assert gate_status(config).problems == ()
+        elif config.source_key in IMPLEMENTED_MARKETPLACES:
             # Real adapter (2026-10-16), fixture_tested (step 5) or live_smoke_passed (step 6): the
             # only gate left closed is the owner's enable switch (step 7).
             assert activation_problems(config) == []
@@ -113,7 +120,9 @@ def test_every_source_file_validates_and_is_disabled(path: Path) -> None:
         )
     assert config.robots_policy == "obey" and config.technical_denial_policy == "stop_and_report"
     assert config.adapter in ADAPTERS
-    assert not gate_status(config).active, "every candidate source must still be gated"
+    assert gate_status(config).active is (config.source_key in ENABLED_SOURCES), (
+        "every candidate source except the enabled ones must still be gated"
+    )
     if config.source_key not in IMPLEMENTED_MARKETPLACES:
         assert activation_problems(config), "an untested source fails a gate besides the switch"
 
@@ -290,19 +299,26 @@ def test_roles_and_modes() -> None:
     assert template.adapter == "schemaorg_dealer" and template.adapter_version == "schemaorg_dealer@1.1.0"
 
 
-def test_registry_builds_every_adapter_and_nothing_is_active() -> None:
+def test_registry_builds_every_adapter_and_only_autoscout24_it_is_active() -> None:
     registry = load_registry(REPO / "config")
     assert {c.source_key for c in registry.configs} == EXPECTED_SOURCES
     for cfg in registry.configs:
         adapter = registry.adapter(cfg.source_key)
         assert isinstance(adapter, SourceAdapter)
         assert adapter.source_key == cfg.source_key
-        with pytest.raises(SourcePaused):
-            registry.active_adapter(cfg.source_key)
-    assert registry.active_source_keys() == []
+        if cfg.source_key in ENABLED_SOURCES:
+            assert registry.active_adapter(cfg.source_key).source_key == cfg.source_key
+        else:
+            with pytest.raises(SourcePaused):
+                registry.active_adapter(cfg.source_key)
+    assert registry.active_source_keys() == ["autoscout24_it"]
     gates = registry.gates()
-    assert all(not g.active and g.problems for g in gates)
-    assert all("source is disabled in configuration" in g.problems for g in gates)
+    assert [g.source_key for g in gates if g.active] == ["autoscout24_it"]
+    assert all(not g.problems for g in gates if g.active)
+    inactive = [g for g in gates if g.source_key not in ENABLED_SOURCES]
+    assert len(inactive) == len(EXPECTED_SOURCES) - 1
+    assert all(not g.active and g.problems for g in inactive)
+    assert all("source is disabled in configuration" in g.problems for g in inactive)
     implemented = {g.source_key for g in gates if g.adapter_implemented}
     assert (
         implemented == {"example_dealer_template_de", "example_dealer_template_ch"} | IMPLEMENTED_MARKETPLACES

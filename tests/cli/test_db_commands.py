@@ -68,9 +68,16 @@ def test_sources_sync_requires_yes_and_never_enables_gated_sources(
     done = run_cli("sources", "sync", "--workspace", str(workspace), "--yes", env=db_env)
     assert done.exit_code == 0, done.output
     assert _source_count(seed, workspace) >= 14
-    assert (
-        seed.scalar("select count(*) from app.sources where workspace_id = %s and enabled", (workspace,)) == 0
+    # Only the committed `enabled: true` of a source that passes every gate is synced as enabled:
+    # autoscout24_it since activation step 7 (2026-10-18). Every gated source stays disabled, and
+    # the sync reports no source it refused to enable.
+    enabled = seed.scalar(
+        "select string_agg(source_key, ',' order by source_key) from app.sources"
+        " where workspace_id = %s and enabled",
+        (workspace,),
     )
+    assert enabled == "autoscout24_it"
+    assert "not enabled" not in done.output
     again = run_cli("sources", "sync", "--workspace", str(workspace), "--yes", env=db_env)
     assert "created                       : -" in again.output
     audits = seed.scalar(

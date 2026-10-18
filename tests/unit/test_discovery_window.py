@@ -1,12 +1,15 @@
 # ruff: noqa: RUF002
 # (RUF002: the owner's decision is quoted verbatim in Macedonian, Cyrillic by design.)
-"""Explicit discovery windows (owner decision of 2026-10-16; no database, no network).
+"""Explicit discovery windows (owner decisions of 2026-10-16 and 2026-10-18; no database, no network).
 
-"сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00": AutoScout24 Italy and Germany
-run every 30 minutes, slots 08:00, 08:30, ..., 21:30 Europe/Skopje (28 a day; 22:00 is the
-exclusive end), 12 search pages each, so 336 search requests a day. These tests pin the slot
-math (window edges, both 2026/2027 DST changes of Europe/Skopje, downtime), the configuration
-rules (budget fit, window, zone) and the reconciliation of an existing schedule row.
+"сакам на секои 30 минуту да го наместиш само од 08:00 до 22:00" (2026-10-16): AutoScout24 Italy
+and Germany run every 30 minutes, slots 08:00, 08:30, ..., 21:30 Europe/Skopje (28 a day; 22:00 is
+the exclusive end), 12 search pages each, so 336 search requests a day. Germany still does.
+"вклучи ја трајно на секои 15 мин" (2026-10-18, activation step 7 of AutoScout24 Italy): Italy is
+enabled and runs every 15 minutes in the same window, slots 08:00, 08:15, ..., 21:45 (56 a day),
+so 672 search requests a day of its 800-request budget. These tests pin the slot math (window
+edges, both 2026/2027 DST changes of Europe/Skopje, downtime), the configuration rules (budget
+fit, window, zone) and the reconciliation of an existing schedule row.
 """
 
 from __future__ import annotations
@@ -56,9 +59,12 @@ from suv_deals.persistence.sources_repo import ScheduleRecord
 REPO = Path(__file__).resolve().parents[2]
 CONFIGS = {c.source_key: c for c in load_source_configs(REPO / "config" / "sources")}
 SKOPJE = ZoneInfo("Europe/Skopje")
+#: The owner's window of 2026-10-16 (autoscout24_de; autoscout24_it until 2026-10-18).
 OWNER = DiscoverySchedule(
     interval_minutes=30, window_start="08:00", window_end="22:00", timezone="Europe/Skopje"
 )
+#: autoscout24_it since the owner's decision of 2026-10-18: every 15 minutes, same window.
+IT_WINDOW = OWNER.model_copy(update={"interval_minutes": 15})
 
 
 def local(year: int, month: int, day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
@@ -75,34 +81,77 @@ def wall(instant: datetime) -> str:
 # --------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("key", ["autoscout24_it", "autoscout24_de"])
-def test_autoscout24_follow_the_owner_window(key: str) -> None:
-    cfg = CONFIGS[key]
+def _unchanged_safety_settings(cfg: SourceConfig) -> None:
+    """20 s spacing, one connection per host, robots obeyed, stop and report on any denial."""
+    assert cfg.rate_budget.min_delay_seconds == 20 and cfg.rate_budget.max_concurrency_per_host == 1
+    assert cfg.robots_policy == "obey" and cfg.technical_denial_policy == "stop_and_report"
+
+
+def test_autoscout24_de_follows_the_owner_window() -> None:
+    cfg = CONFIGS["autoscout24_de"]
     assert cfg.schedule == OWNER
     assert cfg.schedule.runs_per_day == 28 and cfg.schedule.max_runs_per_budget_day() == 28
     assert cfg.rate_budget.max_search_pages_per_run == 12
     assert 28 * 12 == 336
     assert discovery_interval_seconds(cfg, 900) == 1800  # never stretched
-    # Unchanged safety settings: 20 s spacing, one connection per host, robots obeyed.
-    assert cfg.rate_budget.min_delay_seconds == 20 and cfg.rate_budget.max_concurrency_per_host == 1
-    assert cfg.robots_policy == "obey" and cfg.technical_denial_policy == "stop_and_report"
+    _unchanged_safety_settings(cfg)
     assert not cfg.enabled
 
 
-def test_autoscout24_budgets_fit_336_search_requests_a_day() -> None:
-    de, it = CONFIGS["autoscout24_de"], CONFIGS["autoscout24_it"]
+def test_autoscout24_it_is_enabled_every_15_minutes_in_the_owner_window() -> None:
+    """Activation step 7 (owner decision 2026-10-18, "вклучи ја трајно на секои 15 мин"): enabled,
+    every 15 minutes inside the unchanged 08:00-22:00 Europe/Skopje window."""
+    cfg = CONFIGS["autoscout24_it"]
+    assert cfg.schedule == IT_WINDOW
+    assert cfg.schedule.runs_per_day == 56 and cfg.schedule.max_runs_per_budget_day() == 56
+    assert cfg.rate_budget.max_search_pages_per_run == 12
+    assert 56 * 12 == 672
+    assert discovery_interval_seconds(cfg, 900) == 900  # never stretched
+    # Every slot lies on the scheduler's 15-minute UTC tick grid (the default 900 s).
+    assert cfg.schedule.tick_problem(900) is None
+    _unchanged_safety_settings(cfg)
+    assert cfg.enabled
+
+
+def test_autoscout24_de_budget_fits_336_search_requests_a_day() -> None:
+    de = CONFIGS["autoscout24_de"]
     # Germany is card_only (search pages only): 336 of 350.
     assert de.detail_mode == "card_only" and de.rate_budget.daily_request_budget == 350
-    # Italy fetches detail pages: the owner's 600 = 336 search + 264 for detail pages; the load
-    # check leaves at least one run's detail allowance, the gate keeps the 336 at runtime.
-    assert it.detail_mode == "fetch" and it.rate_budget.daily_request_budget == 600
-    assert window_search_share(it.rate_budget, it.detail_mode) == 590 >= 336
-    for cfg in (de, it):
-        assert cfg.schedule is not None
-        assert schedule_budget_problem(cfg.schedule, cfg.rate_budget, cfg.detail_mode) is None
-        # A second enabled search profile would double the search pages: refused, never stretched.
-        problem = schedule_budget_problem(cfg.schedule, cfg.rate_budget, cfg.detail_mode, profiles=2)
-        assert problem is not None and "672 requests a day" in problem
+    assert de.schedule is not None
+    assert schedule_budget_problem(de.schedule, de.rate_budget, de.detail_mode) is None
+    # A second enabled search profile would double the search pages: refused, never stretched.
+    problem = schedule_budget_problem(de.schedule, de.rate_budget, de.detail_mode, profiles=2)
+    assert problem is not None and "672 requests a day" in problem
+
+
+@pytest.mark.parametrize(
+    "day",
+    [
+        date(2026, 7, 1),  # CEST: 08:00-21:45 Skopje = 06:00-19:45 UTC
+        date(2026, 12, 1),  # CET: 07:00-20:45 UTC
+        date(2026, 3, 29),  # CET -> CEST (02:00 -> 03:00, outside the window)
+        date(2026, 10, 25),  # CEST -> CET (03:00 -> 02:00, outside the window)
+    ],
+)
+def test_autoscout24_it_budget_fits_672_search_requests_a_day(day: date) -> None:
+    it = CONFIGS["autoscout24_it"]
+    assert it.schedule is not None
+    # Italy fetches detail pages: 800 = 672 search + 128 for detail pages and the daily robots.txt
+    # request; the load check leaves one run's detail allowance (10) beyond the 672, the gate keeps
+    # the 672 at runtime.
+    assert it.detail_mode == "fetch" and it.rate_budget.daily_request_budget == 800
+    assert it.rate_budget.max_detail_jobs_per_run == 10
+    assert window_search_share(it.rate_budget, it.detail_mode) == 790 >= 672 + 10
+    # The whole window lies inside one UTC day (the budget day), in summer and winter time alike.
+    slots = it.schedule.slots_on(day)
+    assert len(slots) == 56 and {slot.date() for slot in slots} == {day}
+    assert [wall(s)[11:16] for s in slots] == [
+        f"{h:02d}:{m:02d}" for h in range(8, 22) for m in (0, 15, 30, 45)
+    ]
+    assert schedule_budget_problem(it.schedule, it.rate_budget, it.detail_mode) is None
+    # A second enabled search profile would double the search pages: refused, never stretched.
+    problem = schedule_budget_problem(it.schedule, it.rate_budget, it.detail_mode, profiles=2)
+    assert problem is not None and "1344 requests a day" in problem
 
 
 def test_sources_without_a_window_are_unchanged() -> None:
@@ -118,6 +167,13 @@ def test_sources_without_a_window_are_unchanged() -> None:
         # (no registry version bump for sources that did not change).
         assert "schedule" not in sources_repo._sync_values(cfg)["config"]
     stored = sources_repo._sync_values(CONFIGS["autoscout24_it"])["config"]
+    assert stored["schedule"] == {
+        "interval_minutes": 15,
+        "window_start": "08:00",
+        "window_end": "22:00",
+        "timezone": "Europe/Skopje",
+    }
+    stored = sources_repo._sync_values(CONFIGS["autoscout24_de"])["config"]
     assert stored["schedule"] == {
         "interval_minutes": 30,
         "window_start": "08:00",
@@ -350,10 +406,15 @@ def test_a_schedule_must_fit_the_budget_at_config_load() -> None:
     assert _with(de, rate_budget={"daily_request_budget": 336}).schedule == OWNER  # exactly fits
     with pytest.raises(ValidationError, match=r"autoscout24_de: the discovery schedule .* 336 requests"):
         _with(de, rate_budget={"daily_request_budget": 335})
-    # Italy fetches detail pages: one run's detail allowance (10) must be left beyond the 336.
-    assert _with(it, rate_budget={"daily_request_budget": 346}).rate_budget.daily_request_budget == 346
+    # Italy fetches detail pages: one run's detail allowance (10) must be left beyond the 672 of
+    # its 15-minute window (beyond the 336 of the 30-minute one).
+    assert _with(it, rate_budget={"daily_request_budget": 682}).rate_budget.daily_request_budget == 682
+    with pytest.raises(ValidationError, match=r"more than the 671 .*max_detail_jobs_per_run 10"):
+        _with(it, rate_budget={"daily_request_budget": 681})
+    half_hourly = {"schedule": OWNER}
+    assert _with(it, rate_budget={"daily_request_budget": 346}, **half_hourly).schedule == OWNER
     with pytest.raises(ValidationError, match=r"more than the 335 .*max_detail_jobs_per_run 10"):
-        _with(it, rate_budget={"daily_request_budget": 345})
+        _with(it, rate_budget={"daily_request_budget": 345}, **half_hourly)
     # An explicit schedule is never stretched to fit: the cure is the budget, pages or window.
     hourly = OWNER.model_copy(update={"interval_minutes": 60})
     assert _with(it, rate_budget={"daily_request_budget": 345}, schedule=hourly).schedule == hourly
@@ -470,8 +531,9 @@ async def _ensure_with_profiles(
 
 
 async def test_ensure_schedules_refuses_a_window_over_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two enabled profiles would double AutoScout24's 336 search requests: both windows are
-    refused (reported, no row created or changed); the plain source is ensured as before."""
+    """Two enabled profiles would double AutoScout24's search requests (Germany 336 -> 672 of
+    350, Italy 672 -> 1344 of 790): both windows are refused (reported, no row created or
+    changed); the plain source is ensured as before."""
     result, created = await _ensure_with_profiles(monkeypatch, enabled=2)
     assert result == scheduler.EnsuredSchedules(ensured=2, over_budget=("autoscout24_de", "autoscout24_it"))
     assert created == ["example_dealer_template_de", "example_dealer_template_de"]
@@ -483,11 +545,24 @@ async def test_ensure_schedules_refuses_a_window_over_budget(monkeypatch: pytest
 async def test_ensure_schedules_refuses_a_window_its_ticks_cannot_reach(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SCHEDULER_INTERVAL_SECONDS=3600 would silently drop every :30 slot (14 of 28 runs a day):
-    both windows are refused (reported, no row created or changed); the plain source is ensured."""
+    """SCHEDULER_INTERVAL_SECONDS=3600 would silently drop every :30 slot of Germany (14 of 28
+    runs a day) and every :15, :30 and :45 slot of Italy (42 of 56): both windows are refused
+    (reported, no row created or changed); the plain source is ensured."""
     result, created = await _ensure_with_profiles(monkeypatch, enabled=1, tick=3600)
     assert result == scheduler.EnsuredSchedules(ensured=1, off_tick=("autoscout24_de", "autoscout24_it"))
     assert created == ["example_dealer_template_de"]
+
+
+async def test_the_15_minute_window_needs_the_15_minute_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SCHEDULER_INTERVAL_SECONDS=1800 still reaches Germany's :00/:30 slots but never Italy's
+    :15/:45 ones (their 15-minute run windows hold no tick): only Italy is refused."""
+    result, created = await _ensure_with_profiles(monkeypatch, enabled=1, tick=1800)
+    assert result == scheduler.EnsuredSchedules(ensured=2, off_tick=("autoscout24_it",))
+    assert created == ["autoscout24_de", "example_dealer_template_de"]
+    assert CONFIGS["autoscout24_de"].schedule == OWNER and OWNER.tick_problem(1800) is None
+    problem = IT_WINDOW.tick_problem(1800)
+    # 28 of the 56 slots of every day of 2026 (365 x 28 = 10220), the first one at 08:15.
+    assert problem is not None and "10220 slots in 2026, e.g. 08:15" in problem
 
 
 # --------------------------------------------------------------------------------------------
@@ -507,21 +582,21 @@ def _reserve(cfg: SourceConfig, now: datetime) -> SearchReserve | None:
 def test_a_detail_request_may_not_use_the_remaining_runs_search_pages() -> None:
     it = CONFIGS["autoscout24_it"]
     budget = it.rate_budget
-    now = local(2026, 10, 20, 12, 5)  # 12:00 has run; 12:00 ... 21:30 = 20 runs x 12 = 240 reserved
+    now = local(2026, 10, 20, 12, 5)  # 12:00 has run; 12:00 ... 21:45 = 40 runs x 12 = 480 reserved
     reserve = _reserve(it, now)
-    assert reserve == SearchReserve(requests=240, until=local(2026, 10, 20, 22))
+    assert reserve == SearchReserve(requests=480, until=local(2026, 10, 20, 22))
     state = HostBudgetState(
-        source_key=it.source_key, host="www.autoscout24.it", budget_day=now.date(), requests_today=359
+        source_key=it.source_key, host="www.autoscout24.it", budget_day=now.date(), requests_today=319
     )
-    assert isinstance(decide(state, now, budget, purpose="detail", search_reserve=reserve), Allow)  # 599
-    full = state.model_copy(update={"requests_today": 360})  # 360 + 240 = 600
+    assert isinstance(decide(state, now, budget, purpose="detail", search_reserve=reserve), Allow)  # 799
+    full = state.model_copy(update={"requests_today": 320})  # 320 + 480 = 800
     denied = decide(full, now, budget, purpose="detail", search_reserve=reserve)
     assert denied == Deny(reason=DenyReason.BUDGET_EXHAUSTED, until=local(2026, 10, 20, 22))
     assert isinstance(decide(full, now, budget, purpose="search", search_reserve=reserve), Allow)
     assert isinstance(decide(full, now, budget, purpose="detail"), Allow)  # no window: no reserve
     # After the window the reserve is gone; the daily budget still ends at the next UTC midnight.
     assert _reserve(it, local(2026, 10, 20, 22, 1)) is None
-    spent = full.model_copy(update={"requests_today": 600})
+    spent = full.model_copy(update={"requests_today": 800})
     assert decide(spent, now, budget, purpose="detail", search_reserve=reserve) == Deny(
         reason=DenyReason.BUDGET_EXHAUSTED, until=next_utc_midnight(now)
     )
@@ -582,7 +657,8 @@ def _simulate_day(*, backlog: int, first_run: int, per_run: int, reserve: bool) 
     ("backlog", "first_run", "per_run"),
     [
         (0, 240, 20),  # activation day: every card is new, then 20 new or changed cards a run
-        (0, 20, 14),  # 14 a run already starved the 21:30 run before
+        (0, 20, 14),  # 14 a run starved the 21:30 run at the 30-minute cadence (budget 600)
+        (0, 20, 3),  # at 15 minutes (budget 800) 3 a run already starve the evening runs
         (400, 20, 20),  # yesterday's refused detail jobs come back at 00:00 UTC (02:00 Skopje)
     ],
 )
@@ -590,11 +666,11 @@ def test_busy_detail_days_never_starve_the_window(backlog: int, first_run: int, 
     search, detail, full_runs = _simulate_day(
         backlog=backlog, first_run=first_run, per_run=per_run, reserve=True
     )
-    assert full_runs == 28 and search == 336  # every slot up to 21:30 ran all 12 pages
-    assert detail <= 600 - 336 and search + detail <= 600
+    assert full_runs == 56 and search == 672  # every slot up to 21:45 ran all 12 pages
+    assert detail <= 800 - 672 and search + detail <= 800
     # Without the reserve (the defect): detail pages used the budget and evening slots starved.
     unreserved = _simulate_day(backlog=backlog, first_run=first_run, per_run=per_run, reserve=False)
-    assert unreserved[2] < 28
+    assert unreserved[2] < 56
 
 
 # --------------------------------------------------------------------------------------------

@@ -4,11 +4,14 @@
 - Dockerfile / compose files parse, contain no secret values, bind ports to 127.0.0.1 only, give
   the crawler no database/Supabase credentials and never mount the Docker socket or a home dir;
 - scripts: help/syntax, the restore check refuses a non-local target, and (marker ``db``) a real
-  backup -> isolated restore -> verification round trip on SYNTHETIC data.
+  backup -> isolated restore -> verification round trip on SYNTHETIC data;
+- ``scripts/local_crawl.sh`` (the owner's start/stop/status of the enabled source on WSL) against
+  stub ``uv``/``sudo`` executables on a fake PATH: no network, no database, no real crawler.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -332,6 +335,7 @@ def test_dockerfile_and_dockerignore() -> None:
         "rollback.sh",
         "crawler_firewall.sh",
         "readiness_check.sh",
+        "local_crawl.sh",
     ],
 )
 def test_shell_scripts_parse(script: str) -> None:
@@ -342,7 +346,14 @@ def test_shell_scripts_parse(script: str) -> None:
 
 @pytest.mark.parametrize(
     "script",
-    ["backup.sh", "restore_check.sh", "verify_release.sh", "crawler_firewall.sh", "readiness_check.sh"],
+    [
+        "backup.sh",
+        "restore_check.sh",
+        "verify_release.sh",
+        "crawler_firewall.sh",
+        "readiness_check.sh",
+        "local_crawl.sh",
+    ],
 )
 def test_scripts_have_help(script: str) -> None:
     result = subprocess.run(
@@ -617,3 +628,216 @@ def test_readiness_check_probes_only_through_capture_samples() -> None:
     assert "curl" not in text.replace('curl -sS -m 10 "$crawler_url/health"', "")  # no direct site fetch
     assert text.count("capture-samples") >= 2 and "--via crawl4ai" in text
     assert "enable_stealth" not in text and "proxy" not in text.lower()
+
+
+# --------------------------------------------------------------------------------------------
+# scripts/local_crawl.sh (docs/runbook.md 9.2): stub uv/sudo on a fake PATH, a copy of the script
+# in a temporary "repository" (its var/ and .env), so nothing touches this checkout, a database,
+# the crawler or the network.
+# --------------------------------------------------------------------------------------------
+
+LOCAL_CRAWL = SCRIPTS / "local_crawl.sh"
+DOTENV_SECRET = "FAKE-dotenv-secret-7f3a"
+ENV_SECRET = "FAKE-env-secret-91c2"
+needs_setsid = pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid (util-linux) is missing")
+
+_STUB_UV = r"""#!/usr/bin/env bash
+# Records argv and the two NON-secret switches, never any other variable.
+printf '%s|net=%s|crawler=%s\n' "$*" "${SOURCE_NETWORK_ENABLED:-}" "${CRAWL4AI_BASE_URL:-}" >> "$CALLS"
+case " $* " in
+  *" suv-deals scheduler "* | *" suv-deals worker "*)
+    trap 'echo "stub: TERM" >> "$CALLS.term"; sleep "${STUB_TERM_DELAY:-0}"; exit 0' TERM
+    echo "stub $* started"
+    while :; do sleep 0.1; done ;;
+  *" suv-deals doctor "*) exit "${STUB_DOCTOR_EXIT:-0}" ;;
+  *" sources inspect "*)
+    printf '%s\n' '{' '  "enabled": true,' '  "paused": false,' '  "rate_budget": {' \
+      '    "requests_today": 12' '  },' '  "state": "active"' '}' ;;
+  *) echo "stub ok" ;;
+esac
+"""
+
+_STUB_SUDO = r"""#!/usr/bin/env bash
+printf 'sudo %s\n' "$*" >> "$CALLS"
+exit "${STUB_SUDO_EXIT:-0}"
+"""
+
+
+def _local_crawl_world(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy2(LOCAL_CRAWL, repo / "scripts" / "local_crawl.sh")
+    (repo / ".env").write_text(
+        f"DATABASE_URL=postgresql://owner:{DOTENV_SECRET}@db.example.invalid/x\n"
+        f"CRAWL4AI_API_TOKEN={DOTENV_SECRET}\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("uv", _STUB_UV), ("sudo", _STUB_SUDO)):
+        (bin_dir / name).write_text(body, encoding="utf-8")
+        (bin_dir / name).chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k not in ("CRAWL4AI_BASE_URL", "SOURCE_NETWORK_ENABLED")}
+    env.update(
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        CALLS=str(tmp_path / "calls.log"),
+        LOCAL_CRAWL_SETTLE_SECONDS="1",
+        DATABASE_URL=f"postgresql://owner:{ENV_SECRET}@db.example.invalid/x",
+        CRAWL4AI_API_TOKEN=ENV_SECRET,
+    )
+    return repo, env
+
+
+def _local_crawl(
+    repo: Path, env: dict[str, str], *args: str, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(repo / "scripts" / "local_crawl.sh"), *args],
+        cwd=repo.parent,  # any directory: the script works in its repository root
+        env={**env, **extra},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _calls(env: dict[str, str]) -> list[str]:
+    path = Path(env["CALLS"])
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def _kill_leftovers(repo: Path) -> None:
+    for pid_file in (repo / "var" / "local_crawl").glob("*.pid"):
+        with contextlib.suppress(ProcessLookupError, ValueError, PermissionError):
+            os.kill(int(pid_file.read_text(encoding="utf-8").strip()), 9)
+
+
+@pytest.mark.parametrize("args", [("bogus",), (), ("start", "now"), ("--yes",)])
+def test_local_crawl_refuses_unknown_subcommands(args: tuple[str, ...]) -> None:
+    result = subprocess.run(
+        ["bash", str(LOCAL_CRAWL), *args], capture_output=True, text=True, check=False, timeout=30
+    )
+    assert result.returncode == 2
+    assert "Usage" in result.stderr and result.stdout == ""
+
+
+def test_local_crawl_help_names_every_subcommand_and_the_state_paths() -> None:
+    result = subprocess.run(
+        ["bash", str(LOCAL_CRAWL), "--help"], capture_output=True, text=True, check=True, timeout=30
+    )
+    for word in ("start", "stop", "status", "logs", "var/local_crawl/", "SOURCE_NETWORK_ENABLED=true"):
+        assert word in result.stdout, word
+    assert "never reads, prints or passes them" in result.stdout
+
+
+def test_local_crawl_never_reads_or_prints_the_env_file_or_secrets() -> None:
+    text = LOCAL_CRAWL.read_text(encoding="utf-8")
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert ".env" not in code  # neither sourced, read, grepped nor echoed
+    for forbidden in ("set -a", "printenv", "declare -x", "export ", "DATABASE_URL", "CRAWL4AI_API_TOKEN"):
+        assert forbidden not in code, forbidden
+    assert re.search(r"\benv\s*\|", code) is None and re.search(r"\benv\s*$", code, re.M) is None
+    assert "set -euo pipefail" in text
+    # The state lives under var/ (git-ignored), and the network switch is per process, never global.
+    assert "STATE_DIR=var/local_crawl" in code and "LOG_DIR=$STATE_DIR/logs" in code
+    assert re.search(r"^/?var/$", (REPO / ".gitignore").read_text(encoding="utf-8"), re.M)
+
+
+@needs_setsid
+def test_local_crawl_start_status_stop_with_stub_tools(tmp_path: Path) -> None:
+    repo, env = _local_crawl_world(tmp_path)
+    state = repo / "var" / "local_crawl"
+    try:
+        started = _local_crawl(repo, env, "start")
+        assert started.returncode == 0, started.stderr
+        calls = _calls(env)
+        # Order: firewall (sudo, adds missing rules), doctor, sync, one reconcile pass, processes.
+        assert calls[0] == "sudo scripts/crawler_firewall.sh"
+        assert (
+            calls[1]
+            == "run suv-deals doctor --process worker --crawler|net=true|crawler=http://127.0.0.1:11235"
+        )
+        assert calls[2] == "run suv-deals sources sync --yes|net=|crawler="
+        assert calls[3] == "run suv-deals reconcile|net=|crawler="
+        launched = sorted(calls[4:6])
+        # Both long-running processes get the network switch (the scheduler skips every real
+        # source without it); only the worker talks to the crawler.
+        assert launched == [
+            "run suv-deals scheduler|net=true|crawler=",
+            "run suv-deals worker|net=true|crawler=http://127.0.0.1:11235",
+        ]
+        for proc in ("scheduler", "worker"):
+            pid = int((state / f"{proc}.pid").read_text(encoding="utf-8"))
+            os.kill(pid, 0)  # alive
+            log = (state / f"{proc}.logfile").read_text(encoding="utf-8").strip()
+            assert re.fullmatch(rf"var/local_crawl/logs/{proc}-\d{{8}}T\d{{6}}Z\.log", log), log
+            assert (repo / log).is_file()
+        # Refused while running: nothing is checked or launched again.
+        again = _local_crawl(repo, env, "start")
+        assert again.returncode == 1 and "already running" in again.stderr
+        assert len(_calls(env)) == 6
+
+        status = _local_crawl(repo, env, "status")
+        assert status.returncode == 0, status.stdout + status.stderr
+        assert "scheduler: running (pid " in status.stdout and "worker: running (pid " in status.stdout
+        assert "log: var/local_crawl/logs/worker-" in status.stdout
+        assert "stub run suv-deals worker started" in status.stdout
+        assert re.search(r"enabled=true .*requests_today=12", status.stdout), status.stdout
+        assert "state=active" in status.stdout
+        inspect = "run --quiet suv-deals sources inspect autoscout24_it --from-db|net=|crawler="
+        assert _calls(env)[-1] == inspect
+
+        stopped = _local_crawl(repo, env, "stop")
+        assert stopped.returncode == 0, stopped.stderr
+        assert "scheduler: stopped" in stopped.stdout and "worker: stopped" in stopped.stdout
+        assert not list(state.glob("*.pid")) and not list(state.glob("*.stopping"))
+        after = _local_crawl(repo, env, "status")
+        assert after.returncode == 1 and "worker: not running" in after.stdout
+        # No secret ever reaches an argument, the output or a log.
+        everything = "\n".join(
+            [started.stdout, started.stderr, status.stdout, stopped.stdout, *_calls(env)]
+            + [p.read_text(encoding="utf-8") for p in (state / "logs").glob("*.log")]
+        )
+        assert DOTENV_SECRET not in everything and ENV_SECRET not in everything
+        assert not (repo / ".git").exists()  # the copy is not a checkout: nothing was committed
+    finally:
+        _kill_leftovers(repo)
+
+
+@needs_setsid
+@pytest.mark.parametrize(
+    ("failing", "calls_made"),
+    [({"STUB_SUDO_EXIT": "1"}, 1), ({"STUB_DOCTOR_EXIT": "1"}, 2)],
+)
+def test_local_crawl_start_aborts_on_a_failed_check(
+    tmp_path: Path, failing: dict[str, str], calls_made: int
+) -> None:
+    repo, env = _local_crawl_world(tmp_path)
+    try:
+        result = _local_crawl(repo, env, "start", **failing)
+        assert result.returncode == 1
+        assert "nothing was started" in result.stderr
+        assert len(_calls(env)) == calls_made  # stopped at the failed step
+        assert not list((repo / "var" / "local_crawl").glob("*.pid"))
+    finally:
+        _kill_leftovers(repo)
+
+
+@needs_setsid
+def test_local_crawl_stop_signals_once_and_waits_again(tmp_path: Path) -> None:
+    """A second SIGTERM would end the worker at once, mid-job: a repeated ``stop`` only waits."""
+    repo, env = _local_crawl_world(tmp_path)
+    try:
+        # The stub processes take 4 s to finish after SIGTERM (their "current job").
+        assert _local_crawl(repo, env, "start", STUB_TERM_DELAY="4").returncode == 0
+        slow = _local_crawl(repo, env, "stop", LOCAL_CRAWL_STOP_TIMEOUT="1")
+        assert slow.returncode == 1 and "still running after 1s" in slow.stderr
+        assert "SIGTERM sent" in slow.stdout
+        again = _local_crawl(repo, env, "stop", LOCAL_CRAWL_STOP_TIMEOUT="30")
+        assert again.returncode == 0, again.stderr
+        assert again.stdout.count("SIGTERM already sent, waiting") == 2
+        terms = Path(env["CALLS"] + ".term").read_text(encoding="utf-8").splitlines()
+        assert terms == ["stub: TERM", "stub: TERM"]  # one per process, never a second one
+    finally:
+        _kill_leftovers(repo)

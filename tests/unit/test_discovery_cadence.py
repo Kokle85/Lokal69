@@ -3,9 +3,10 @@
 Regression: AutoScout24 Italy/Germany walk twelve model pages per run but kept the global
 15-minute schedule, so their 200-request daily budget ran out after about four hours of each UTC
 day and every later slot was skipped (``daily_budget_exhausted``). Since the owner decision of
-2026-10-16 both run on an explicit window instead (every 30 minutes from 08:00 to 22:00
-Europe/Skopje; `tests/unit/test_discovery_window.py`); a source without a ``schedule`` block keeps
-the budget-stretched global interval tested here.
+2026-10-16 both run on an explicit window instead (from 08:00 to 22:00 Europe/Skopje: Germany
+every 30 minutes, Italy every 15 minutes since the owner decision of 2026-10-18;
+`tests/unit/test_discovery_window.py`); a source without a ``schedule`` block keeps the
+budget-stretched global interval tested here.
 """
 
 from __future__ import annotations
@@ -123,8 +124,9 @@ async def test_new_schedules_are_created_with_the_budget_interval(monkeypatch: p
     db: Any = object()
     ensured = await scheduler.ensure_schedules(db, db, [record(CONFIGS[k]) for k in keys], BASE)
     assert ensured == scheduler.EnsuredSchedules(ensured=3)
-    # AutoScout24: the owner's 30-minute window; the template keeps the global interval.
-    assert created == {"autoscout24_de": 1800, "autoscout24_it": 1800, "example_dealer_template_de": BASE}
+    # AutoScout24: the owner's windows (Germany every 30 minutes, Italy every 15 minutes since
+    # 2026-10-18); the template keeps the global interval.
+    assert created == {"autoscout24_de": 1800, "autoscout24_it": 900, "example_dealer_template_de": BASE}
     assert CONFIGS["autoscout24_de"].schedule is not None
     assert windows["autoscout24_de"] == CONFIGS["autoscout24_de"].schedule
     assert windows["autoscout24_it"] == CONFIGS["autoscout24_it"].schedule

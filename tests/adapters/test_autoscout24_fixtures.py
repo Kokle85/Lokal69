@@ -90,7 +90,7 @@ from suv_deals.domain.enums import (
 from suv_deals.domain.filters import ReasonCode, screen
 from suv_deals.domain.listings import NormalizedListing
 from suv_deals.domain.profiles import load_business_config
-from suv_deals.domain.sources import activation_problems
+from suv_deals.domain.sources import SourceConfig, activation_problems
 from suv_deals.domain.taxonomy import load_taxonomy
 from suv_deals.errors import SourcePaused
 
@@ -757,22 +757,23 @@ async def test_no_seller_data_or_markup_reaches_any_model(key: str, client: Fixt
     assert "<script" not in text.lower() and "Synthetic description" not in text
 
 
-# --------------------------------------------------------------------------- gates after steps 5-6
+# --------------------------------------------------------------------------- gates after steps 5-7
 
-#: Step 6 (the owner's live smoke) passed for autoscout24_it on 2026-10-17; autoscout24_de is still
-#: at step 5 (``fixture_tested``).
+#: Step 6 (the owner's live smoke) passed for autoscout24_it on 2026-10-17 and step 7 (enabling,
+#: the owner's decision of 2026-10-18) followed; autoscout24_de is still at step 5
+#: (``fixture_tested``).
 STATUS_AFTER_STEPS = {
     "autoscout24_it": TechnicalStatus.LIVE_SMOKE_PASSED,
     "autoscout24_de": TechnicalStatus.FIXTURE_TESTED,
 }
+assert set(STATUS_AFTER_STEPS) == set(SOURCE_KEYS)
 
 
-@pytest.mark.parametrize("key", SOURCE_KEYS)
-def test_tested_sources_stay_inactive_while_disabled(key: str) -> None:
-    """Step 5 records ``fixture_tested`` and step 6 ``live_smoke_passed``; either way the only gate
-    left is the owner's enable switch, which stays off until the enabling revision (step 7)."""
-    config = REGISTRY.config(key)
-    assert config.technical_status == STATUS_AFTER_STEPS[key] and config.enabled is False
+def test_the_tested_german_source_stays_inactive_while_disabled() -> None:
+    """Step 5 records ``fixture_tested``; the only gate left is the owner's enable switch, which
+    stays off until its live smoke (step 6) and the enabling revision (step 7)."""
+    config = REGISTRY.config("autoscout24_de")
+    assert config.technical_status == STATUS_AFTER_STEPS["autoscout24_de"] and config.enabled is False
     assert activation_problems(config) == []
     gate = gate_status(config)
     assert not gate.active and gate.activatable
@@ -781,3 +782,25 @@ def test_tested_sources_stay_inactive_while_disabled(key: str) -> None:
         build_active_adapter(config)
     untested = config.model_copy(update={"technical_status": TechnicalStatus.UNTESTED})
     assert "adapter has not passed fixture tests" in gate_status(untested).problems
+
+
+def test_the_enabled_italian_source_is_active_after_step_7() -> None:
+    """Steps 5 and 6 recorded ``fixture_tested`` then ``live_smoke_passed``; step 7 (2026-10-18)
+    switched it on, so every gate passes and the worker may build the active adapter. Without the
+    switch, or with a status before step 5, it would be refused again."""
+    config = REGISTRY.config("autoscout24_it")
+    assert config.technical_status == STATUS_AFTER_STEPS["autoscout24_it"] and config.enabled is True
+    assert activation_problems(config) == []
+    gate = gate_status(config)
+    assert gate.active and gate.activatable and gate.problems == ()
+    assert build_active_adapter(config).source_key == "autoscout24_it"
+    # The same configuration, switched off in memory only (the YAML is not touched).
+    disabled = config.model_copy(update={"enabled": False})
+    assert gate_status(disabled).problems == ("source is disabled in configuration",)
+    with pytest.raises(SourcePaused, match="not enabled"):
+        build_active_adapter(disabled)
+    # A source that has not passed its fixture tests can never be enabled (load-time refusal).
+    untested = config.model_copy(update={"technical_status": TechnicalStatus.UNTESTED})
+    assert "adapter has not passed fixture tests" in gate_status(untested).problems
+    with pytest.raises(ValueError, match="cannot be enabled: adapter has not passed fixture tests"):
+        SourceConfig.model_validate({**config.model_dump(), "technical_status": "untested"})

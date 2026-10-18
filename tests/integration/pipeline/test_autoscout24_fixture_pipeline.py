@@ -56,10 +56,16 @@ pytestmark = pytest.mark.db
 REPO = Path(__file__).resolve().parents[3]
 
 
+#: The enable switch in each real YAML: autoscout24_it since activation step 7 (2026-10-18);
+#: autoscout24_de stays disabled (enabled in memory only below).
+YAML_ENABLED = {"autoscout24_it": True, "autoscout24_de": False}
+
+
 def _fixture_mode(key: str) -> SourceConfig:
-    """The real configuration, served from saved fixtures and enabled in memory only."""
+    """The real configuration, served from saved fixtures and enabled in memory (the YAML is never
+    changed)."""
     config = load_registry(REPO / "config").config(key)
-    assert config.enabled is False  # the YAML itself stays disabled
+    assert config.enabled is YAML_ENABLED[key]
     return SourceConfig.model_validate({**config.model_dump(), "mode": "fixture", "enabled": True})
 
 

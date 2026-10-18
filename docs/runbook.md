@@ -90,7 +90,8 @@ source's YAML (`config/sources/<key>.yaml`):
   `SCHEDULER_INTERVAL_SECONDS` (15 minutes) on the UTC grid, slowed down automatically when a day
   of runs would not fit the source's `daily_request_budget` (`discovery_interval_seconds`).
 - **A `schedule` block** (an owner decision; AutoScout24 IT and DE since 2026-10-16, "сакам на
-  секои 30 минуту да го наместиш само од 08:00 до 22:00"):
+  секои 30 минуту да го наместиш само од 08:00 до 22:00"; AutoScout24 IT every 15 minutes in the
+  same window since 2026-10-18, "вклучи ја трајно на секои 15 мин"):
 
   ```yaml
   schedule:
@@ -101,11 +102,15 @@ source's YAML (`config/sources/<key>.yaml`):
   ```
 
   Slots are wall-clock times in that zone: 08:00, 08:30, ..., 21:30 (28 runs a day, in summer and
-  winter time alike; 22:00 itself is not a slot). A slot's run may start until the next slot or
-  the window end; outside the window the schedule is due at the next day's 08:00. After downtime
-  only the slot that is live now runs once (the missed slots are a recorded gap,
+  winter time alike; 22:00 itself is not a slot). That is AutoScout24 DE: 28 runs x 12 search
+  pages = 336 search requests a day of its 350. AutoScout24 IT (`interval_minutes: 15` since
+  2026-10-18): 08:00, 08:15, ..., 21:45, 56 runs x 12 = 672 search requests a day of its 800 (the
+  other 128 for detail pages and the daily robots.txt request); the window lies inside one UTC day
+  in summer and winter time (06:00-20:00 / 07:00-21:00 UTC). A slot's run may start until the next
+  slot or the window end; outside the window the schedule is due at the next day's 08:00. After
+  downtime only the slot that is live now runs once (the missed slots are a recorded gap,
   `scheduler_missed_slots`, never a burst). The scheduler ticks on the 15-minute UTC grid, so a
-  :00/:30 Skopje slot starts within a second of its time.
+  :00/:15/:30/:45 Skopje slot starts within a second of its time.
 
   The window is checked again when the worker STARTS a slot's job (database time): a job claimed
   after its slot's run window (released by the budget gate to 00:00 UTC, retried after a 429 or
@@ -116,11 +121,11 @@ source's YAML (`config/sources/<key>.yaml`):
 
   The scheduler only wakes on its `SCHEDULER_INTERVAL_SECONDS` grid, so every slot's run window
   must contain a tick: `interval_minutes` a multiple of the scheduler interval with
-  `window_start` on its grid (30-minute slots from 08:00 with the default 900 s work; 10-minute
-  slots, or `SCHEDULER_INTERVAL_SECONDS=3600` with 30-minute slots, do not). Otherwise the
-  scheduler refuses the source (log line "discovery schedule refused: the scheduler interval
-  cannot reach its slots", `schedules_off_tick` in the tick report, its schedules not advanced)
-  and `sources inspect` prints a "discovery problem" line.
+  `window_start` on its grid (15- and 30-minute slots from 08:00 with the default 900 s work;
+  10-minute slots, `SCHEDULER_INTERVAL_SECONDS=1800` with 15-minute slots, or 3600 with 30-minute
+  slots, do not). Otherwise the scheduler refuses the source (log line "discovery schedule
+  refused: the scheduler interval cannot reach its slots", `schedules_off_tick` in the tick
+  report, its schedules not advanced) and `sources inspect` prints a "discovery problem" line.
 
   An explicit window is never stretched to fit the budget. Loading the YAML checks that one day
   of runs (the most slots in any UTC day, the budget day) x `max_search_pages_per_run` fits the
@@ -129,12 +134,13 @@ source's YAML (`config/sources/<key>.yaml`):
   configuration error naming the numbers. Detail pages are not capped per run (one job per new or
   changed card, plus stale refreshes), so the budget gate reserves the search pages of the day's
   remaining runs: a detail request that would leave less than they need is refused until the
-  last run window of the day ends (or the next UTC day), and the runs up to 21:30 keep their
-  pages even on a busy day (e.g. the first day after enabling). The YAML does
-  not know how many search profiles are enabled, so that check counts one; the scheduler
-  re-checks with the workspace's enabled profiles. If they would overspend (e.g. a second profile
-  doubles 336 search requests a day), `ensure_schedules` refuses the source (log line
-  "discovery schedule refused", `schedules_over_budget` in the tick report) and every run of an
+  last run window of the day ends (or the next UTC day), and the runs up to the last slot (21:30;
+  21:45 for AutoScout24 IT) keep their pages even on a busy day (e.g. the first day after
+  enabling). The YAML does not know how many search profiles are enabled, so that check counts
+  one; the scheduler re-checks with the workspace's enabled profiles. If they would overspend
+  (e.g. a second profile doubles AutoScout24 IT's 672 search requests a day to 1,344, beyond its
+  790), `ensure_schedules` refuses the source (log line "discovery schedule refused",
+  `schedules_over_budget` in the tick report) and every run of an
   existing schedule is skipped as `slot_skipped: schedule_over_budget` until the budget, window
   or profiles change. Today's request budget is still enforced per request as before.
 
@@ -453,8 +459,9 @@ state of every gate, its missing dependency and the smallest owner action are in
   today, both MK comparable sources included: `sources inspect <key>` and `doctor` report them as
   "not activatable (no adapter)"; configuration alone can never activate them; `autoscout24_it`
   and `autoscout24_de` have an adapter that passed step 5 on SYNTHETIC saved fixtures on 2026-10-16
-  (`fixture_tested`, not a live verification) and stay disabled); then the gated
-  live smoke `suv-deals crawl once --source <key> --max-pages 1` with `SOURCE_NETWORK_ENABLED=true`
+  (`fixture_tested`, not a live verification); `autoscout24_it` also passed step 6 on 2026-10-17
+  and was enabled on 2026-10-18 (step 7, section 9.2), `autoscout24_de` stays disabled); then the
+  gated live smoke `suv-deals crawl once --source <key> --max-pages 1` with `SOURCE_NETWORK_ENABLED=true`
   and its evidence record (register step 6; for AutoScout24 the exact commands are in 9.1).
 - **Supabase**: migrations + `doctor` + restore drill (section 7).
 - **MCP auth**: a real client (`docs/connect_mcp.md`).
@@ -479,6 +486,16 @@ evidence"), and is `technical_status: live_smoke_passed`, still
 disabled until the owner enables it (step 7). `autoscout24_de` is next: the same commands with
 its key. `sources smoke-evidence` prints each revision's seller country (since the commit after
 `87fee45`), the check of the `cy` filter.
+
+State on 2026-10-18: `autoscout24_it` passed step 7. The owner enabled it ("вклучи ја трајно на
+секои 15 мин", "switch it on permanently, every 15 minutes"): `enabled: true` is committed, every 15
+minutes from 08:00 to 22:00 Europe/Skopje (section 2.2); running it: section 9.2. Steps 1 and 4 of
+the block below therefore no longer apply to `autoscout24_it`; the block stays the procedure for
+`autoscout24_de` (its key in every command). Before that smoke, stop the running processes
+(`scripts/local_crawl.sh stop`): a running worker would claim the smoke's jobs, and the scheduler
+would queue the source's 12-model runs once it is switched on locally. Start them again
+(`scripts/local_crawl.sh start`) after step 4; `autoscout24_it` stays enabled through the smoke's
+`sources sync` runs.
 
 The owner's live smoke runs ONE source at a time (`autoscout24_it` first, done; `autoscout24_de`
 next), from the repository root on the WSL machine, with the crawler running on the host
@@ -545,9 +562,9 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   (`https://www.autoscout24.it/lst/renault/captur?pricefrom=2500&priceto=3000&kmto=200000&sort=age&desc=1&ustate=U&cy=I`;
   on .de `...&sort=age&desc=1&cy=D`, no `ustate`); `--max-pages 1` means ONE search request,
   through the URL policy, robots.txt and the persistent budget gate (20 s spacing; daily budget
-  600 requests for .it, 350 for .de). On the first run of a UTC day it is preceded by ONE
-  robots.txt request (`https://www.autoscout24.it/robots.txt`), then the search page follows
-  20 s later (the command waits). Expected: `Job state: succeeded`, `pages: 1`, `completeness:
+  600 requests for .it at its step-6 smoke, 800 since 2026-10-18; 350 for .de). On the first run
+  of a UTC day it is preceded by ONE robots.txt request (`https://www.autoscout24.it/robots.txt`),
+  then the search page follows 20 s later (the command waits). Expected: `Job state: succeeded`, `pages: 1`, `completeness:
   budget_limited` (12 models, capped at one page).
 - Expected in step 3 (robots): `sources inspect autoscout24_it --from-db` shows `robots.fetch_status:
   200`, `robots.revision_hash` (the SHA-256 of robots.txt as fetched: the same value
@@ -657,8 +674,9 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `autoscout24_it` still queued is blocked as `source_paused` when a worker without `--source`
   (or with this key) reaches it (nothing is fetched). A `card_only` source's job is not blocked
   (see `autoscout24_de` below).
-- `doctor` reads the YAML: between steps 1 and 4 it reports `autoscout24_it` as `active
-  (public_html)`, after step 4 again `not active: 1 gate problem(s)`.
+- `doctor` reads the YAML: between steps 1 and 4 it reports the smoke's source as `active
+  (public_html)`, after step 4 again `not active: 1 gate problem(s)` (`autoscout24_it` reports
+  `active (public_html)` throughout since step 7).
 - `autoscout24_de` follows later the same way (replace the key in every command, the drain's
   `--source` too: `worker --drain --queues detail --source autoscout24_de`, so the `autoscout24_it`
   jobs still queued are not claimed and blocked). It is `card_only`: that drain only ingests the
@@ -676,6 +694,70 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   was ignored; and, for `cy`, the ingested listings' seller countries (previous bullet). Every
   value inside is consistent with the filters, never proof of them. These filters stay unverified
   until such evidence is recorded (for `cy` on .it see the `cy` bullet above).
+
+### 9.2 Running the enabled source on the owner's workstation
+
+Since 2026-10-18 `autoscout24_it` is `enabled: true` (activation step 7, the owner's decision "вклучи
+ја трајно на секои 15 мин", "switch it on permanently, every 15 minutes"): every 15 minutes from
+08:00 to 22:00 Europe/Skopje, 56 runs x 12 search pages = 672 search requests a day, daily budget
+800 (section 2.2). The configuration alone fetches nothing. The source runs only while a
+`suv-deals scheduler` (one discovery job per slot) and a `suv-deals worker` (the requests) run,
+both with `SOURCE_NETWORK_ENABLED=true`: the scheduler queues no run of a real source without it.
+On the owner's WSL machine `scripts/local_crawl.sh` starts, checks and stops the two, from the
+repository root, with `DATABASE_URL` and `CRAWL4AI_API_TOKEN` in `.env` (the script never reads,
+prints or passes them) and the crawler on the host (`http://127.0.0.1:11235`, section 3.1):
+
+```bash
+scripts/local_crawl.sh start    # firewall (sudo), doctor, sources sync --yes, one reconcile pass,
+                                # then the scheduler and the worker in the background
+scripts/local_crawl.sh status   # both running? their last log lines; enabled, paused, state, requests_today
+scripts/local_crawl.sh logs     # follow both logs (Ctrl+C stops following, not the processes)
+scripts/local_crawl.sh stop     # SIGTERM; the worker finishes its current job first
+```
+
+- `start` refuses while either process runs. In order, stopping at the first failure: `sudo
+  scripts/crawler_firewall.sh` (adds the rules of section 3.2 that are missing, as after every
+  restart, and verifies the isolation), `suv-deals doctor --process worker --crawler` with the
+  network switch, `suv-deals sources sync --yes` (the committed configuration, `enabled: true`
+  included, into the runtime registry; audited) and one `suv-deals reconcile` pass (no network;
+  it returns a job whose lease ended while nothing ran to the queue). Then it starts `suv-deals
+  scheduler` and `suv-deals worker` (default queues; only the worker gets `CRAWL4AI_BASE_URL`)
+  detached (`setsid nohup`), each with a pid file under `var/local_crawl/` and its own log,
+  `var/local_crawl/logs/<process>-<UTC time>.log` (`var/` is git-ignored).
+- First requests: the 39 `autoscout24_it` detail jobs left queued from 2026-10-17 are the oldest
+  due jobs, so the worker fetches them first: 39 `/annunci/` pages, about 13 minutes at the 20 s
+  spacing, 39 of the day's 128 detail requests (the first request of each UTC day is robots.txt).
+  Meanwhile the slot that is live at `start` and the next one can end as coverage gaps
+  (`slot_expired`, `backlog`); the slots after that run normally. A detail job that a worker
+  blocked as `source_paused` while the source was disabled stays blocked until `suv-deals jobs
+  unblock` puts it back.
+- `status` exits 0 only when both run and the database answers. For a process that is not
+  running it still shows the last log lines; `stop`, then `start` again.
+- Keep a WSL window open. The processes survive closing the terminal that started them, but closing
+  every WSL window can shut WSL down, and both processes with it. A sleeping or switched-off PC is
+  a coverage gap (section 3); missed slots are recorded, never replayed.
+- After a restart of the PC, WSL or Docker: start Docker and the crawler (`docker compose up -d
+  crawl4ai`), then `scripts/local_crawl.sh start` (the firewall rules are not persistent; `start`
+  adds them again). A job the worker was running when WSL stopped keeps its lease for 5 minutes; a
+  discovery job blocks the source's slots (`backlog`) until it is back in the queue. `start`'s
+  reconcile pass puts it back once the lease has ended (after a quicker restart, `stop` and
+  `start` again 5 minutes later).
+- `stop` sends one SIGTERM to each process and waits up to 10 minutes
+  (`LOCAL_CRAWL_STOP_TIMEOUT`): the scheduler stops after its current tick, the worker after its
+  current job (a 12-page discovery run takes about 5 minutes). Running `stop` again only waits
+  again: a second SIGTERM would end the worker at once, in the middle of its job.
+- Switching the source off: permanently, a committed `enabled: false` in
+  `config/sources/autoscout24_it.yaml` (an auditable configuration revision, like the step-7 one)
+  and `uv run suv-deals sources sync --yes`; for a while, pause it (the dashboard's Sources screen,
+  "Pause this source", or the MCP tool `sources_pause`; `uv run suv-deals sources resume
+  autoscout24_it --reason "..." --yes` ends the pause). There is no CLI pause command.
+  `scripts/local_crawl.sh stop` stops all crawling on the machine at once.
+- An access block stops the source by itself: a 401/403, a challenge page or a login wall makes it
+  `access_blocked` (`technical_denial_policy: stop_and_report`; disabled in the runtime registry,
+  one operational review item), and a 429 backs off and honours `Retry-After`. Report it with
+  `status` and `uv run suv-deals sources inspect autoscout24_it --from-db`; never work around it
+  (no other network, proxy, browser setting or retry by hand). Whether and how it runs again is the
+  owner's decision after that review.
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

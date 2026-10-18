@@ -31,6 +31,8 @@ REAL_MARKETPLACE_HOSTS = ("mobile.de", "autoscout24", "subito.it", "automobile.i
 REGISTRY = load_registry(Path(__file__).resolve().parents[2] / "config")
 #: Synthetic fixture sets of real (configured, non-fixture) marketplace sources.
 MARKETPLACE_FIXTURE_SOURCES = ("autoscout24_it", "autoscout24_de")
+#: The enable switch of each real source in config/sources (step 7 done for autoscout24_it only).
+MARKETPLACE_ENABLED = {"autoscout24_it": True, "autoscout24_de": False}
 VOCABULARY = {"schema.org", "purl.org"}  # schema.org/GoodRelations vocabulary identifiers, not fetched
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+)")
 _PHONE_SEP = r"[ \t\u00a0./()\-]{0,3}"
@@ -174,7 +176,9 @@ def test_marketplace_manifest_is_complete_and_synthetic(source_key: str) -> None
     directory = FIXTURES / source_key
     manifest = load_manifest(directory)
     config = REGISTRY.config(source_key)  # a REAL configured source, never a fixture source
-    assert config.mode != SourceMode.FIXTURE and config.enabled is False
+    assert config.mode != SourceMode.FIXTURE
+    # autoscout24_it was enabled by the owner on 2026-10-18 (activation step 7); autoscout24_de stays off.
+    assert config.enabled is MARKETPLACE_ENABLED[source_key]
     assert not (directory / "source.yaml").exists(), "a real source is configured only in config/sources"
     assert (manifest.source_key, manifest.designation) == (source_key, "synthetic")
     assert manifest.created == date(2026, 10, 16)

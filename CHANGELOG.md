@@ -7,6 +7,36 @@ a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a r
 
 ## Unreleased (on top of `7f7e187`)
 
+**Activation step 7 for `autoscout24_it` (2026-10-18): enabled, every 15 minutes.** The owner's
+decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes"), after
+the step-6 live smoke of 2026-10-17.
+
+- `config/sources/autoscout24_it.yaml`: `enabled: true` (an auditable configuration revision that
+  takes effect with `sources sync --yes`); `schedule.interval_minutes` 30 -> 15 in the unchanged
+  08:00-22:00 Europe/Skopje window (slots 08:00 ... 21:45: 56 runs x 12 search pages = 672 search
+  requests a day, every slot on the scheduler's 900 s UTC tick grid); `daily_request_budget`
+  600 -> 800 (672 + 128 for detail pages and the daily robots.txt request; the load check needs
+  672 + 10 <= 800, and the window lies inside one UTC day in CEST and CET alike).
+  `autoscout24_de` is unchanged (disabled, `fixture_tested`, every 30 minutes, budget 350).
+- `scripts/local_crawl.sh` (`start`, `stop`, `status`, `logs`): the owner's WSL start and stop of
+  the scheduler and the worker. `start` runs the crawler firewall (sudo), `doctor --process worker
+  --crawler`, `sources sync --yes` and one `reconcile` pass, then starts both detached with pid
+  files and logs under `var/local_crawl/`. Both get `SOURCE_NETWORK_ENABLED=true` (the scheduler
+  queues no run of a real source without it); only the worker gets `CRAWL4AI_BASE_URL`. `.env` is
+  never read or printed and no secret is an argument. `stop` sends one SIGTERM per process (the
+  worker finishes its current job; a second signal would end it at once).
+- Docs: runbook 9.2 (running the enabled source, first requests, the WSL window, restarts,
+  switching it off, access blocks), 2.2 and 9.1; the source register (row, vocabulary, step 7);
+  ACTIVATION_GATES.md (gate 4, the row, an evidence-log row for step 7); IMPLEMENTATION_STATUS.md,
+  the acceptance matrix, the README and the scheduler's module docstring.
+- Tests: every test that pinned `autoscout24_it` as disabled, inactive, refused by `crawl once`,
+  "not active" in `doctor`, unsynced as enabled, or at 30 minutes / 28 runs / 336 / 600 now pins it
+  enabled and active at 15 minutes / 56 runs / 672 / 800, split from `autoscout24_de`, which keeps
+  its own facts. New: the 15-minute window needs the 15-minute tick
+  (`tests/unit/test_discovery_window.py`), `scripts/local_crawl.sh` against stub `uv`/`sudo`
+  executables (`tests/cli/test_ops_files.py`) and runbook 9.2 against the real CLI
+  (`tests/cli/test_d2_handoff_docs.py`).
+
 Implausibly low mileage (live finding of 2026-10-17). The owner's `autoscout24_it` smoke stored a
 search card "Nissan Qashqai 2.0 dCi DPF Tekna" (a 2007-2013 model) at EUR 3,000 with a card
 mileage of 16 km: the seller almost certainly left out the thousands, so the real reading is

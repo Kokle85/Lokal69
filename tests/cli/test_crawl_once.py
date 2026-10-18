@@ -38,17 +38,28 @@ def _config_with(tmp_path: Path, **source: object) -> Path:
     return target
 
 
-@pytest.mark.parametrize("key", ["autoscout24_de", "autoscout24_it"])
-def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli, key: str) -> None:
+def test_crawl_once_refuses_a_disabled_gated_source(run_cli: Cli) -> None:
+    key = "autoscout24_de"
     result = run_cli("crawl", "once", "--source", key, "--profile", "primary", "--max-pages", "1")
     assert result.exit_code == 3
     assert f"refused: source {key} is not active" in result.output
     # The owner recorded a terms decision on 2026-10-10 (proceed_acknowledged), the adapter exists
-    # (2026-10-16) and passed its saved synthetic fixture set (step 5, fixture_tested; .it also
-    # its live smoke, step 6, on 2026-10-17); the source stays disabled until enabling (register
-    # step 7), and the disabled switch is the only refusal left.
+    # (2026-10-16) and passed its saved synthetic fixture set (step 5, fixture_tested); the source
+    # stays disabled until its live smoke (step 6) and enabling (register step 7), and the
+    # disabled switch is the only refusal left.
     assert "adapter has not passed fixture tests" not in result.output
     assert f"refused: source {key} is not active: source is disabled in configuration" in result.output
+
+
+def test_crawl_once_passes_the_gate_of_the_enabled_source_but_not_the_network_switch(run_cli: Cli) -> None:
+    """``autoscout24_it`` is enabled since activation step 7 (2026-10-18): the source gate passes,
+    and the process switch still refuses every real fetch while ``SOURCE_NETWORK_ENABLED=false``
+    (the default), before anything touches the database or the network."""
+    key = "autoscout24_it"
+    result = run_cli("crawl", "once", "--source", key, "--profile", "primary", "--max-pages", "1")
+    assert result.exit_code == 3
+    assert "is not active" not in result.output
+    assert "refused: SOURCE_NETWORK_ENABLED=false blocks every real fetch" in result.output
 
 
 def test_crawl_once_refuses_a_source_without_an_adapter(run_cli: Cli) -> None:
