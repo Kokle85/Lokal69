@@ -4,7 +4,9 @@ Spec §28. This page separates what the code and tests verify from what only a r
 the owner's actual ChatGPT/dot account can verify. Nothing here has been connected to a real
 client yet: **no deployed URL exists, no real client was tested, no subscription was created.**
 Replace the placeholders below with the actual values when that happens and record the evidence
-listed in step 8.
+listed in step 8. The first route is decided (owner, 2026-10-18): dot reads through OpenAI's
+Secure MCP Tunnel from a local API on the owner's WSL machine, read-only (section 8,
+`scripts/local_mcp.sh`); its live test with the owner's ChatGPT account is still to be done.
 
 ## 1. What the server provides (verified in tests)
 
@@ -26,7 +28,7 @@ effective on MCP).
 | Mode | Use | Notes |
 |---|---|---|
 | `oauth` (preferred production) | OAuth access tokens (JWT, ES256/RS256) from the configured authorization server | Needs `MCP_PUBLIC_URL` (ending in `/mcp`), `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL` (optional `MCP_OAUTH_AUDIENCE`). The server publishes RFC 9728 protected-resource metadata at `/.well-known/oauth-protected-resource/mcp` and validates issuer, audience/resource, signature, expiry and scopes. A user `sub` maps to an active workspace membership; machine clients need an explicit principal mapping. **Not verified:** which authorization server the owner uses and whether the actual dot client completes this flow (Supabase Auth alone is not assumed to provide MCP OAuth discovery/registration). |
-| `static_bearer` | a scoped private credential for a private compatible client | Not OAuth compliance; ChatGPT itself cannot send it (section 3.1). Created with the CLI (section 3); only the SHA-256 hash is stored. On the proposed Secure MCP Tunnel route (pending the owner's decision) OpenAI's `tunnel-client` would add it as a static header read from a file (section 3.1). |
+| `static_bearer` | a scoped private credential for a private compatible client | Not OAuth compliance; ChatGPT itself cannot send it (section 3.1). Created with the CLI (section 3); only the SHA-256 hash is stored. On the Secure MCP Tunnel route (phase 1, owner decision 2026-10-18, section 8) OpenAI's `tunnel-client` adds it as a static header read from a file (section 3.1). |
 | `dev_local` | local tests only | Allowed only with `APP_ENV=development/test`, a loopback URL and loopback clients. |
 
 `suv-deals doctor --process api` checks the configured URLs offline (scheme, `/mcp` path, no
@@ -54,12 +56,14 @@ uv run suv-deals credentials create-mcp --workspace <workspace-id> \
 
 ChatGPT's custom MCP servers offer only "OAuth", "No authentication" or a mix of both; ChatGPT itself
 cannot send a custom API key or bearer header (research of 2026-10-18, official OpenAI
-documentation; not checked against the owner's account). The **proposed** first route, still
-pending the owner's decision, is OpenAI's Secure MCP Tunnel: OpenAI's `tunnel-client` runs in the
-owner's WSL, makes outbound HTTPS connections only and forwards MCP requests to
-`http://127.0.0.1:8000/mcp`, and it can add a static header to every forwarded request from a file
-(`mcp.extra_headers: {Authorization: "file:/path"}`). For a client like that the token can go into
-a file instead of the terminal:
+documentation; the owner confirmed on 2026-10-18 that the account offers "Add custom MCP server"
+with Connection: Tunnel). The first route, approved by the owner on 2026-10-18 (section 8), is
+OpenAI's Secure MCP Tunnel: OpenAI's `tunnel-client` runs in the owner's WSL, makes outbound HTTPS
+connections only and forwards MCP requests to a separate local API at `http://127.0.0.1:8010/mcp`,
+and it adds a static header to every forwarded request from a file (`mcp.extra_headers:
+{Authorization: "file:/path"}`). `scripts/local_mcp.sh setup` runs the command for that route
+(label `dot read-only (tunnel)`, file `~/.config/suv-deals/tunnel/mcp-authorization`). For a
+client like that the token can go into a file instead of the terminal:
 
 ```bash
 install -d -m 700 ~/.config/suv-deals
@@ -96,9 +100,9 @@ uv run suv-deals credentials create-mcp --workspace <workspace-id> \
 | # | Step | How | Status |
 |---|---|---|---|
 | 1 | Local contract tests with an MCP client | `uv run pytest tests/mcp tests/contracts -q` (in-process official SDK client); optionally the official MCP Inspector against `http://127.0.0.1:8000/mcp` with a `dev_local` credential | verified in tests (fixture data) |
-| 2 | Deploy only after the owner authorizes destination and cost; HTTPS and correct auth | docs/runbook.md sections 3 and 8 | **blocked**: no approved host/domain |
-| 3 | Unauthenticated private calls fail; authorized reads succeed | `curl -i https://<domain>/mcp` must be `401`; then a read with the credential. `suv-deals mcp probe --url <url> --authorization-file <file>` runs both (section 4.1) | not run (no deployment) |
-| 4 | Add the private custom MCP connection in the product | OpenAI documentation checked 2026-10-06 describes the web flow: open ChatGPT Plugins, select the plus button, choose *Add custom MCP server*, enter the server URL, configure authentication, review the risk warning, create and install the plugin. Availability depends on the account/workspace. No other menu or hidden setting is assumed. | not run |
+| 2 | Deploy only after the owner authorizes destination and cost; HTTPS and correct auth | docs/runbook.md sections 3 and 8 | **blocked**: no approved host/domain. Phase 1 needs no deployment: a local API behind the Secure MCP Tunnel (section 8) |
+| 3 | Unauthenticated private calls fail; authorized reads succeed | `curl -i https://<domain>/mcp` must be `401`; then a read with the credential. `suv-deals mcp probe --url <url> --authorization-file <file>` runs both (section 4.1) | phase 1: `scripts/local_mcp.sh start` runs the probe against the local API before the tunnel starts (section 8.6: passed in the build container on 2026-10-18); not run on the owner's machine yet |
+| 4 | Add the private custom MCP connection in the product | OpenAI documentation checked 2026-10-06 describes the web flow: open ChatGPT Plugins, select the plus button, choose *Add custom MCP server*, enter the server URL, configure authentication, review the risk warning, create and install the plugin. Availability depends on the account/workspace. No other menu or hidden setting is assumed. Phase 1: Connection: Tunnel, the tunnel `lokal69-mcp`, Authentication: No authentication (section 8.3, step 4) | not run |
 | 5 | Read scopes first; verify `deals_health`, `reviews_list_pending`, one specific candidate and `deals_estimate_import_costs` for it in the intended dot conversation | ask dot to call those tools; check that dot relays the preview banner (section 7) | not run |
 | 6 | Review writes only after approval; test claim/submit on a clearly labelled canary case | a SYNTHETIC canary review case in a non-production workspace | not run |
 | 7 | Source and dashboard links open for the owner | open the links returned by `deals_get_candidate` | not run |
@@ -398,3 +402,230 @@ owner has recorded EUR 2,800 (actual) and EUR 4,200 (SchwackeNet catalogue) for 
 | The two values (real purchase price vs estimated customs value), whole-unit amounts, the owner's recorded listing values used automatically, a dot-supplied value replacing one for a single call, no tool that records them | verified in tests (same files; the owner's EUR 2,800 / EUR 4,200 example, synthetic listing) |
 | The MK draft rule set's legal content | **not approved**: every `UNCERTAIN - confirm` marker of the draft must be resolved and the owner must approve and activate it first (docs/tax_rule_approval.md) |
 | dot calling the tool and relaying the banner in the real conversation | **not verified** (no deployment, section 4 step 5) |
+
+## 8. Connecting dot through the OpenAI Secure MCP Tunnel (phase 1)
+
+### 8.1 The owner's decision
+
+On **2026-10-18** the owner approved phase 1, verbatim: **"ChatGPT-план е dot: Pro, да има и постои
+Tunnel, одобрувам"**. Meaning: the ChatGPT plan behind dot is Pro, the account offers "Add custom
+MCP server" with Connection: Tunnel, and the owner approves this route. Phase 1 is read-only: one
+viewer credential with `deals:read` and `reviews:read`, valid 30 days, used by dot only while a
+window on the owner's WSL machine runs `scripts/local_mcp.sh start`. Write scopes
+(`reviews:write`, `inquiries:*`) and Events need a new owner decision.
+
+### 8.2 Data flow
+
+```text
+dot (ChatGPT, OpenAI)
+  -> OpenAI tunnel service (/v1/mcp/{tunnel_id}; only the owner may use the tunnel, S1)
+  <- tunnel-client on the owner's WSL machine, OUTBOUND HTTPS only to api.openai.com:443
+     (long-poll with the restricted runtime API key, S2; no inbound port, no public URL)
+  -> http://127.0.0.1:8010/mcp, with "Authorization: Bearer suvmcp_..." added by tunnel-client
+     from ~/.config/suv-deals/tunnel/mcp-authorization (ChatGPT itself sends no Authorization)
+  -> suv-deals api serve (127.0.0.1 only; MCP_AUTH_MODE=static_bearer) -> PostgreSQL (.env)
+```
+
+- The API of this route is a separate process (default port 8010, `LOCAL_MCP_PORT`); the dashboard
+  API on port 8000 may run next to it. It gets `MCP_AUTH_MODE=static_bearer`,
+  `MCP_PUBLIC_URL=http://127.0.0.1:<port>/mcp`, `MCP_EVENTS_ENABLED=false` and
+  `SOURCE_NETWORK_ENABLED=false` as process environment (it never fetches from a source), runs
+  without proxy headers (`--no-proxy-headers`: only tunnel-client connects, from 127.0.0.1) and
+  reads `DATABASE_URL` and every other setting from `.env` itself; the script never reads, prints
+  or passes `.env`. `APP_BASE_URL` is not set by the script: `doctor --process api` and the Host
+  check accept the `.env` value or the default (loopback hosts are accepted on any port), so the
+  links tools return keep the owner's dashboard address.
+- tunnel-client forwards MCP requests to the configured URL (`/mcp`); the dashboard routes
+  (`/api/...`) are not its target. Its health and admin endpoints are served on a Unix socket in
+  the 0700 tunnel directory (`--health.unix-socket`), not on TCP, so no other local user reaches
+  its `/ui`.
+- **What leaves the machine:** every tool result dot reads (candidates, prices, valuations,
+  comparables, import-cost estimates, the review queue, `deals_health` status) goes to OpenAI as
+  part of dot's conversation. No seller e-mail address (never returned on MCP) and no secret.
+
+### 8.3 The owner's steps
+
+1. **Platform** (signed in as the owner):
+   1. Tunnels management, <https://platform.openai.com/settings/organization/tunnels>: create a
+      tunnel named `lokal69-mcp` and note its id (`tunnel_` + 32 lowercase letters or digits, or
+      `tunnel_` + a 4-character namespace + `_` + 32).
+   2. **S1:** restrict who may *use* the tunnel to the owner only (roles and groups:
+      <https://platform.openai.com/settings/organization/people/roles>,
+      <https://platform.openai.com/settings/organization/people/groups>; Tunnels **Read + Use**
+      for the owner only, **Manage** only for whoever administers the tunnel).
+   3. **S2:** create a **restricted runtime API key**
+      (<https://platform.openai.com/settings/organization/api-keys>) with only the Tunnels
+      permission **Read + Use** (for this tunnel only, if the page offers that choice) and set a
+      usage limit for its project. Never an admin key: `setup` refuses a key starting with
+      `sk-admin-`.
+   4. Download `tunnel-client` for **Linux x86-64** from the Tunnels page (the download is gated;
+      there is no public pinned release this repository could fetch), unpack it and install the
+      full `tunnel-client` binary (not `tunnel-client-runtime`, which has no `doctor`):
+      `mkdir -p ~/.local/bin && cp /mnt/c/Users/<you>/Downloads/<unpacked>/tunnel-client ~/.local/bin/
+      && chmod +x ~/.local/bin/tunnel-client`, then `tunnel-client --version` (open a new WSL
+      window if `~/.local/bin` was just created, or set `TUNNEL_CLIENT_BIN`).
+2. **`scripts/local_mcp.sh setup`** in `~/Lokal69` (once; running it again changes nothing that
+   exists). It checks `tunnel-client` and records its version, creates
+   `~/.config/suv-deals/tunnel` (0700; refused inside the repository or a git working tree, under
+   `/mnt`, as a symlink, owned by someone else or open to group/others), asks for the tunnel id
+   and the runtime API key without echo (the key is checked and written by the shell builtin
+   `printf` into a new 0600 file: it never appears on a command line, in another process's
+   environment or in any output), creates the viewer credential with
+   `uv run suv-deals credentials create-mcp --label "dot read-only (tunnel)" --role viewer --scopes
+   deals:read,reviews:read --expires 30d --authorization-file ~/.config/suv-deals/tunnel/mcp-authorization --yes`
+   (the token is never shown; the credential id, workspace and expiry go to `credential.json`),
+   writes `tunnel-client.yaml` and runs `tunnel-client doctor --config <yaml> --explain`:
+
+   | File in `~/.config/suv-deals/tunnel/` | Content |
+   |---|---|
+   | `control-plane-api-key` (0600) | the runtime API key, exactly as entered (secret) |
+   | `tunnel-id` (0600) | the tunnel id (not secret) |
+   | `mcp-authorization` (0600) | exactly `Bearer suvmcp_...` (secret) |
+   | `credential.json` (0600) | credential id, workspace id, label, role, scopes, `expires_at` (from the `create-mcp` output), no secret |
+   | `tunnel-client.yaml` (0600) | see below; rewritten when `LOCAL_MCP_PORT` changes |
+   | `tunnel-client.version`, `health.sock` | the binary's `--version` output; the health socket while the tunnel runs |
+
+   ```yaml
+   config_version: 1
+   control_plane:
+     tunnel_id: "tunnel_..."
+     api_key: "file:/home/<you>/.config/suv-deals/tunnel/control-plane-api-key"
+   mcp:
+     server_urls:
+       - channel: main
+         url: "http://127.0.0.1:8010/mcp"
+     extra_headers:
+       Authorization: "file:/home/<you>/.config/suv-deals/tunnel/mcp-authorization"
+   log:
+     level: info
+   ```
+
+   If `doctor` reports only the MCP server as unreachable, that is expected before `start` (the
+   API is not running yet; UNVERIFIED whether `doctor` checks it at all).
+3. **`scripts/local_mcp.sh start`** and keep that window open. It refuses while a previous run is
+   still running, when port 8010 is taken (choose another with `LOCAL_MCP_PORT=<port>`), when setup
+   is incomplete and when the credential has expired (it warns 5 days before). Then: `suv-deals
+   doctor --process api` with the route's environment; the API in the background
+   (`var/local_mcp/logs/api-<UTC>.log`); `/readyz` (up to 60 s, `LOCAL_MCP_READY_TIMEOUT`);
+   `suv-deals mcp probe --url http://127.0.0.1:8010/mcp --authorization-file <file> --json`
+   (`401` without the header; `initialize`, `tools/list` and `deals_health` with it; it prints
+   the protocol, the tool count and the tools/list SHA-256 and keeps the report as
+   `var/local_mcp/logs/probe-<UTC>.json`); finally `tunnel-client run --config <yaml>
+   --health.unix-socket ~/.config/suv-deals/tunnel/health.sock` in the foreground of the window
+   (the vendor's advice for a manual daemon; its output also goes to
+   `var/local_mcp/logs/tunnel-<UTC>.log`). The window says "Keep this window open while dot uses
+   the system; Ctrl+C stops the tunnel and the API" and, once the tunnel's `/readyz` answers 200,
+   "tunnel ready". When the tunnel ends for any reason (Ctrl+C, `stop`, a crash, the window
+   closed), the API is stopped too.
+4. **ChatGPT**, only while the window says "tunnel ready": open ChatGPT Plugins (the vendor's
+   connector settings page is <https://chatgpt.com/#settings/Connectors>), select the plus
+   button, *Add custom MCP server*, **Connection: Tunnel**, select the tunnel `lokal69-mcp`,
+   **Authentication: No authentication**, review the risk warning, create and install. dot should
+   discover **7 tools** (the viewer scopes; counted by the probe and the end-to-end run of 8.6):
+   `deals_health`, `deals_list_candidates`, `deals_get_candidate`, `deals_get_comparables`,
+   `deals_get_valuation`, `deals_estimate_import_costs` (`deals:read`) and `reviews_list_pending`
+   (`reviews:read`). Any other number means another credential or build: stop and compare with
+   the probe report.
+5. **Test with dot** (in the intended conversation), one prompt each:
+   - "Call deals_health and tell me whether the system is ready."
+   - "List the pending reviews (reviews_list_pending)."
+   - "Get candidate <listing id from the list> (deals_get_candidate)."
+   - "Estimate the import costs for that candidate (deals_estimate_import_costs)", and check that
+     dot relays the preview banner (section 7).
+
+   Record in the evidence log of ACTIVATION_GATES.md (gate 13), without any secret: the date, the
+   tunnel-client version (`tunnel-client.version`), the negotiated protocol and the tools/list
+   SHA-256 from the probe report, what dot shows (the tool list, or a screenshot without the
+   token), and the request ids of dot's calls from `var/local_mcp/logs/api-<UTC>.log` (one
+   `request served` line per call with `request_id`, route and status).
+
+### 8.4 Every day: status, logs, stop, rotate, turning it off
+
+```bash
+scripts/local_mcp.sh status   # another window: API /readyz, tunnel /readyz, days left, last log lines
+scripts/local_mcp.sh logs     # follow the API and tunnel logs (Ctrl+C stops following only)
+scripts/local_mcp.sh stop     # SIGTERM to the tunnel, then the API (or Ctrl+C in the start window)
+scripts/local_mcp.sh rotate   # new credential file (atomic rename), revokes the old one; then stop + start
+```
+
+- The credential expires after 30 days (S7): `start` and `status` warn 5 days before; `start`
+  refuses an expired one. `rotate` creates the new credential into a new file, renames it over
+  `mcp-authorization` only after it succeeded, updates `credential.json` and revokes the old
+  credential (`credentials revoke <old id> --workspace <id> --reason ... --yes`); if the
+  revocation fails it says so loudly, keeps the new file and prints the command to run. A running
+  tunnel keeps sending the old (now revoked) header until it is restarted.
+- **Turning it off**, from the quickest to the most complete: Ctrl+C in the start window or
+  `scripts/local_mcp.sh stop` (nothing listens any more); revoke the credential, `uv run suv-deals
+  credentials revoke <credential id from status> --reason "..." --yes` (the next request is
+  `401`); disable or delete the tunnel on the Platform, or remove the plugin in ChatGPT; revoke the
+  runtime API key on the Platform and delete `control-plane-api-key`.
+- The scripts write only `var/local_mcp/` (git-ignored) and the tunnel directory; they are
+  separate from `scripts/local_crawl.sh` (its own state, lock and processes).
+
+### 8.5 Security rules of this route
+
+- **S1** only the owner may use the tunnel; **S2** the runtime key is restricted to Tunnels Read +
+  Use for this tunnel and has a usage limit (8.3 step 1).
+- **S3** never `--log.http-raw-unsafe` (or `LOG_HTTP_RAW_UNSAFE`): it logs request and response
+  bodies and headers, including the injected `Authorization`. The script never passes it, the
+  YAML has no such setting, and tunnel-client runs with a cleaned environment (only `PATH`,
+  `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `TZ`, locale, terminal, proxy and `SSL_CERT_*`
+  variables), so no `CONTROL_PLANE_*`,
+  `OPENAI_*`, `MCP_*`, `LOG_*` or `TUNNEL_CLIENT_*` variable of the shell can change its key, its
+  target, its headers or its logging.
+- **S4** every tunneled request reaches the API from 127.0.0.1, so the failed-authentication
+  limiter in front of the token check (20 failures, then one more per 3 s, per client address) is
+  per process here, not per client: a wrong or revoked token makes the next calls `429` for a
+  while. `start`'s probe uses one unit of that budget for its unauthenticated check.
+- **S7** 30 days; warning 5 days before; refused when expired (8.4).
+- **Never connect the owner's PC as dot's "computer"** (remote computer use): that would expose
+  `.env` with `DATABASE_URL` and the other secrets, the Outlook mailbox and everything else on the
+  PC. dot gets this read-only MCP tunnel only.
+- The data dot reads goes to OpenAI (8.2).
+
+### 8.6 What is verified and what is not
+
+| Item | Status |
+|---|---|
+| `scripts/local_mcp.sh`: help and exit codes, the tunnel directory and file modes, refusals (inside the repository, symlink, group/other access, foreign owner, `/mnt`), tunnel-id and key validation, idempotent setup, the YAML, the step order of `start` with the exact environment, the foreground tunnel with `--health.unix-socket` and never raw logging, the API stopped when the tunnel exits, the refusals of `start`, the expiry warning, `stop` order, `status`, `rotate` (revoke with the old id; the new file replaces the old one only after success); the API key and the token never in any output, argument or stub environment | verified in tests (tests/cli/test_local_mcp_script.py, stub executables) |
+| The chain local API + real credential + `mcp probe` + YAML-driven header injection | verified on 2026-10-18 in the build container with a **fake** `tunnel-client` (below) |
+| The real `tunnel-client` with this YAML (`doctor`, `run`, `file:` references, `--health.unix-socket`) | **UNVERIFIED** (the vendor binary is not available here; flags and keys from its documentation) |
+| The injected header survives with ChatGPT's "No authentication" (connector-forwarded headers are applied last and override static ones case-insensitively; with No authentication ChatGPT sends no `Authorization`) | **UNVERIFIED** until the owner's live test |
+| dot discovering the 7 tools and calling them | **not run** |
+
+End-to-end run of 2026-10-18 (build container; scratch database, SYNTHETIC workspace; the real
+script, `uv`, `suv-deals api serve` and credential; a fake `tunnel-client` that parsed the
+generated YAML, read `mcp.extra_headers.Authorization` from its `file:` reference and sent MCP
+requests to `mcp.server_urls[main]`, as the vendor's client would after the control plane):
+`setup` exit 0 (second run: everything kept, YAML unchanged); `doctor --process api` 0 errors
+without `APP_BASE_URL`; `/readyz` 200; the probe passed all 4 checks (unauthenticated `initialize`
+401 with `WWW-Authenticate: Bearer error="invalid_token"`; protocol `2025-11-25`; server
+`suv-deals 0.1.0`; **7 tools**; tools/list SHA-256
+`bcb1df66242b775812f9623bcde1dc3774e65fad313e661741118fb2fe9d266a`; `deals_health` ready=true,
+`source_network_enabled=false`); through the fake tunnel: `initialize` 401 without the header and
+200 with it, `notifications/initialized` 202, `tools/list` 200 with the same 7 tools and the
+same SHA-256, `tools/call deals_health` 200; the tunnel's `/readyz` on the socket 200 after 1 s;
+the API stopped when the tunnel exited; `rotate` created a new credential and revoked the old one
+(`revoked_at` set); the environment tunnel-client saw held only `HOME`, `PATH`, `TERM`,
+`LC_CTYPE`, `SSL_CERT_FILE` and the proxy variables (no `OPENAI_API_KEY`, no `DATABASE_URL`); the
+API key, the token and a planted shell secret were in no output, log, YAML or `credential.json`;
+modes 0700/0600; no process left; the scratch database dropped. The SHA-256 belongs to this
+build's tool schemas: record the one the owner's own probe prints.
+
+Points not confirmed in the vendor documentation (re-check them in the live test):
+
+- that the header injected from `mcp.extra_headers` reaches the API unchanged when ChatGPT uses
+  "No authentication" (above);
+- that `--health.unix-socket` replaces the TCP health listener (default `127.0.0.1:8080`) rather
+  than adding to it, and serves `/readyz` there;
+- whether `tunnel-client doctor` contacts the control plane or the MCP server (setup runs it
+  before the API is up);
+- whether `file:` values are used byte for byte (both files have no trailing newline either way);
+- the Platform pages: restricting a runtime key to one tunnel, the usage limit and whether tunnel
+  traffic counts against it, restricting a tunnel's Use to one person, the download's archive
+  and binary name; the ChatGPT labels (Plugins or Settings -> Connectors, "Connection: Tunnel");
+- that admin keys start with `sk-admin-` (setup's refusal is a heuristic);
+- that the forwarded requests carry no browser `Origin` and a loopback `Host` (otherwise the API
+  answers 403 or 421; `status`, the API log and the tunnel log show it);
+- how tunnel-client treats this server's 401 challenge without OAuth metadata during its startup
+  discovery (the vendor says non-timeout discovery failures settle readiness).

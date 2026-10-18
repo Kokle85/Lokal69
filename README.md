@@ -58,7 +58,7 @@ with row-level security). Details: [docs/architecture.md](docs/architecture.md).
 | `dashboard/` | Private React dashboard (Vite, Supabase Auth, Vitest, Playwright) |
 | `desktop/outlook-bridge/` | Windows desktop mail worker for classic Outlook (Linux-testable with fakes) |
 | `tests/` | Unit, property, adapter, adversarial, contract, API, MCP, CLI, integration (real PostgreSQL) and E2E-harness tests |
-| `scripts/` | Migrate, rollback policy, backup, restore check, release verification, schema export, log redaction |
+| `scripts/` | Migrate, rollback policy, backup, restore check, release verification, schema export, log redaction; the owner's WSL helpers `local_crawl.sh` (the enabled source) and `local_mcp.sh` (dot through the OpenAI Secure MCP Tunnel, docs/connect_mcp.md section 8) |
 | `docs/` | Specification, architecture, schema, API contract, runbook, activation guides, decisions, research |
 
 ## Quickstart (local development)

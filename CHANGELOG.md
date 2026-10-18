@@ -10,6 +10,55 @@ scheduler and worker run.
 
 ## Unreleased (on top of `7f7e187`)
 
+dot through the OpenAI Secure MCP Tunnel, phase 1 (read-only). Owner decision of 2026-10-18:
+"ChatGPT-план е dot: Pro, да има и постои Tunnel, одобрувам" (the ChatGPT plan is Pro, the account
+offers "Add custom MCP server" with Connection: Tunnel, approved). The vendor's `tunnel-client`
+on the owner's WSL machine connects outbound only and forwards dot's MCP requests to a separate
+local API on `127.0.0.1:8010`, adding a viewer `suvmcp_` credential from a 0600 file; the ChatGPT
+plugin uses "No authentication". Nothing was connected to the real ChatGPT account yet: gate 13
+(`mcp_authentication`) stays `blocked` until the owner's live test.
+
+- **`scripts/local_mcp.sh setup|start|stop|status|logs|rotate`** (in the style of
+  `scripts/local_crawl.sh`, separate state `var/local_mcp/` and lock). `setup` (idempotent)
+  checks `tunnel-client` and records its version; creates `~/.config/suv-deals/tunnel`
+  (`LOCAL_MCP_TUNNEL_DIR`; 0700; refused inside the repository or a git working tree around it,
+  under `/mnt`, as a symlink, owned by someone else or open to group/others); reads the tunnel id
+  (validated, `tunnel_<32>` or `tunnel_<4>_<32>`) and the runtime API key with `read -rs` and
+  writes them with the shell builtin `printf` into new 0600 files (refuses an empty key, an admin
+  key `sk-admin-...`, a tunnel id or an MCP token in the key prompt); creates the credential with
+  `credentials create-mcp --label "dot read-only (tunnel)" --role viewer --scopes
+  deals:read,reviews:read --expires 30d --authorization-file ... --yes` and records only its id,
+  workspace and expiry in `credential.json`; writes `tunnel-client.yaml` (0600, `config_version:
+  1`, `file:` references for the key and the `Authorization` header, `log.level: info`, the MCP
+  URL; rewritten when the port changes) and runs `tunnel-client doctor --config ... --explain`.
+  `start` refuses while a run is active, when the port is taken, when setup is incomplete and when
+  the credential has expired (warning 5 days before); then `doctor --process api` with
+  `MCP_AUTH_MODE=static_bearer`, `MCP_PUBLIC_URL=http://127.0.0.1:<port>/mcp`,
+  `MCP_EVENTS_ENABLED=false`, `SOURCE_NETWORK_ENABLED=false`; `api serve --host 127.0.0.1 --port
+  <port> --no-proxy-headers` in the background; `/readyz`; `mcp probe --json` (report kept);
+  then `tunnel-client run --config ... --health.unix-socket <tunnel dir>/health.sock` in the
+  foreground with a cleaned environment (no `CONTROL_PLANE_*`/`OPENAI_*`/`MCP_*`/`LOG_*` variable
+  of the shell reaches it; never raw HTTP logging); the API is stopped whenever the tunnel ends.
+  `stop` signals the tunnel, then the API (one SIGTERM each); `status` shows both, the `/readyz`
+  answers (the tunnel's over its health socket), the days left and the last log lines; `rotate`
+  creates a new credential into a new file, renames it into place only after success, updates
+  `credential.json` and revokes the old credential (a failed revocation is reported loudly, the
+  new file kept). `APP_BASE_URL` is not set: verified unnecessary for `doctor` and the Host check.
+- Tests: `tests/cli/test_local_mcp_script.py` (57; stub `uv`, `tunnel-client` and `curl` that
+  record argv and environment: the key and the token never appear in any output, argument,
+  environment or the YAML; modes, refusals, validation, idempotency, step order and environment,
+  refusals of `start`, expiry warning, the API stopped when the tunnel exits, `stop` and `status`
+  from another window, `rotate` success and both failure paths, the lock); the script is in the
+  syntax and help lists of `tests/cli/test_ops_files.py`. One real end-to-end run in the build
+  container (scratch database, the real API and credential, a fake `tunnel-client` driven by the
+  generated YAML): probe 4/4, 7 tools, tools/list SHA-256 `bcb1df66...`, 401 without and 200 with
+  the injected header, rotation revoked the old credential (docs/connect_mcp.md 8.6).
+- Docs: docs/connect_mcp.md section 8 (decision, data flow, the owner's steps on the Platform, in
+  WSL and in ChatGPT, test prompts and evidence, turning it off, rules S1-S7, what is unverified),
+  sections 2, 3.1 and 4 updated; docs/runbook.md 9.3; ACTIVATION_GATES.md gate 13 and its
+  evidence row; SECURITY.md (where the tunnel's secrets live, rotation, residual risks); README
+  scripts row.
+
 MCP connection groundwork for dot: an authorization-header file and `mcp probe`. Research of
 2026-10-18 (official OpenAI documentation): ChatGPT's custom MCP servers offer only "OAuth", "No
 authentication" or both, and ChatGPT cannot send a custom bearer header itself. The proposed first

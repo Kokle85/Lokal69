@@ -8,6 +8,8 @@
 - ``scripts/local_crawl.sh`` (the owner's start/stop/status of the enabled source on WSL: the
   scheduler, the worker and the reconciler loop, one ``start``/``stop`` at a time) against stub
   ``uv``/``sudo`` executables on a fake PATH: no network, no database, no real crawler.
+  ``scripts/local_mcp.sh`` (dot through the OpenAI Secure MCP Tunnel) has its own module,
+  tests/cli/test_local_mcp_script.py; both are in the syntax and help lists below.
 """
 
 from __future__ import annotations
@@ -338,6 +340,7 @@ def test_dockerfile_and_dockerignore() -> None:
         "crawler_firewall.sh",
         "readiness_check.sh",
         "local_crawl.sh",
+        "local_mcp.sh",
     ],
 )
 def test_shell_scripts_parse(script: str) -> None:
@@ -355,6 +358,7 @@ def test_shell_scripts_parse(script: str) -> None:
         "crawler_firewall.sh",
         "readiness_check.sh",
         "local_crawl.sh",
+        "local_mcp.sh",
     ],
 )
 def test_scripts_have_help(script: str) -> None:

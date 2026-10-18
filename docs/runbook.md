@@ -512,7 +512,8 @@ state of every gate, its missing dependency and the smallest owner action are in
   gated live smoke `suv-deals crawl once --source <key> --max-pages 1` with `SOURCE_NETWORK_ENABLED=true`
   and its evidence record (register step 6; for AutoScout24 the exact commands are in 9.1).
 - **Supabase**: migrations + `doctor` + restore drill (section 7).
-- **MCP auth**: a real client (`docs/connect_mcp.md`).
+- **MCP auth**: a real client (`docs/connect_mcp.md`); phase 1, dot through the OpenAI Secure
+  MCP Tunnel from the owner's WSL machine, is section 9.3.
 - **MCP Events / Slack**: the docs/notification_bridge.md canary; the Slack seller-reply route has
   its own gate (`seller_reply_slack_route`).
 - **Tax rules**: docs/tax_rule_approval.md.
@@ -829,6 +830,41 @@ scripts/local_crawl.sh stop     # SIGTERM; the worker finishes its current job f
   `status` and `uv run suv-deals sources inspect autoscout24_it --from-db`; never work around it
   (no other network, proxy, browser setting or retry by hand). Whether and how it runs again is the
   owner's decision after that review.
+
+### 9.3 Connecting dot (local MCP tunnel)
+
+Owner decision of 2026-10-18 ("ChatGPT-план е dot: Pro, да има и постои Tunnel, одобрувам": the
+ChatGPT plan is Pro, the account offers "Add custom MCP server" with Connection: Tunnel, approved).
+Phase 1 is read-only: dot reads through OpenAI's `tunnel-client`, which connects outbound only and
+adds a viewer `suvmcp_` credential (`deals:read`, `reviews:read`, 30 days) to every request it
+forwards to a separate local API on `127.0.0.1:8010`. The full procedure, the security rules
+(S1-S7) and what is still unverified are in docs/connect_mcp.md section 8.
+
+```bash
+scripts/local_mcp.sh setup    # once: tunnel-client check, tunnel id + runtime API key (hidden input),
+                              # the credential file, tunnel-client.yaml, `tunnel-client doctor --explain`
+scripts/local_mcp.sh start    # doctor, API on 127.0.0.1:8010, /readyz, `mcp probe`, then the tunnel
+                              # in this window: keep it open; Ctrl+C stops the tunnel and the API
+scripts/local_mcp.sh status   # another window: both processes, /readyz, credential days left, logs
+scripts/local_mcp.sh stop     # another window: the tunnel first, then the API
+scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart afterwards
+```
+
+- Before `setup`, on the Platform: the tunnel `lokal69-mcp` with Use restricted to the owner, a
+  restricted runtime API key (Tunnels Read + Use, usage limit) and the Linux x86-64 `tunnel-client`
+  in `~/.local/bin` (docs/connect_mcp.md 8.3 step 1). Then in ChatGPT: Add custom MCP server,
+  Connection: Tunnel, `lokal69-mcp`, No authentication, only while `start` says "tunnel ready".
+- Secrets stay in `~/.config/suv-deals/tunnel/` (0700, files 0600) and in `.env`; the script never
+  prints them, never puts them on a command line and never reads, prints or passes `.env`. Never
+  run tunnel-client with `--log.http-raw-unsafe`, and never connect the PC as dot's "computer".
+- The API of this route can run next to the dashboard API (port 8000) and next to
+  `scripts/local_crawl.sh` (separate state in `var/local_mcp/`, separate lock). A different port:
+  `LOCAL_MCP_PORT=<port> scripts/local_mcp.sh start`.
+- `start` and `status` warn 5 days before the credential expires; `start` refuses an expired one
+  (`rotate`). Turning it off: Ctrl+C or `stop`; revoke the credential (`uv run suv-deals credentials
+  revoke <id> --reason "..." --yes`); disable the tunnel or remove the plugin.
+- Gate 13 (`mcp_authentication`) stays `blocked` until the owner's live test is recorded
+  (ACTIVATION_GATES.md).
 
 ## 10. Seller inquiries and the desktop mail worker (spec §37)
 

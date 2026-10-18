@@ -3,7 +3,7 @@
 What must happen before each capability of the SUV deal system may run against real services,
 who does it, how it is done, how it is verified and what evidence is kept. Contract: spec section
 32 (activation gates and honest completion states), section 31 (exact-build evidence) and section
-37.10 (activation evidence for the seller-email route). Status as of **2026-10-10** (wave D3); `existing_crawler` and `source_access` updated 2026-10-17, `source_access` again on 2026-10-18 (step 7 for `autoscout24_it`).
+37.10 (activation evidence for the seller-email route). Status as of **2026-10-10** (wave D3); `existing_crawler` and `source_access` updated 2026-10-17, `source_access` again on 2026-10-18 (step 7 for `autoscout24_it`), `mcp_authentication` on 2026-10-18 (phase-1 route decided, still `blocked`).
 
 **Nothing runs by itself.** Two things are `live_verified`, both on the owner's workstation on
 2026-10-17 (evidence log below): the crawler (`existing_crawler`) and the AutoScout24 Italy source
@@ -477,8 +477,27 @@ Each step only needs the steps above it; any step can stop without affecting the
 
 - **State:** `blocked`. The MCP server (12 + 3 tools, scopes, OAuth protected-resource metadata,
   static bearer credentials) is tested with the official SDK client in process. No deployed URL,
-  no real client.
-- **Steps:** docs/connect_mcp.md section 4. In short: deploy (12); choose `MCP_AUTH_MODE`
+  no real client. The state stays `blocked` until the evidence of the owner's live test below is
+  recorded; the decision and the local checks of 2026-10-18 do not pass the gate.
+- **Phase-1 route (owner decision 2026-10-18, verbatim: "ChatGPT-план е dot: Pro, да има и постои
+  Tunnel, одобрувам": the ChatGPT plan is Pro, the account offers "Add custom MCP server" with
+  Connection: Tunnel, approved):** dot reads, read-only, through OpenAI's Secure MCP Tunnel. The
+  vendor's `tunnel-client` on the owner's WSL machine connects outbound only (api.openai.com:443)
+  and forwards dot's MCP requests to a separate local API on `127.0.0.1:8010` (`MCP_AUTH_MODE=
+  static_bearer`), adding a viewer `suvmcp_` credential (`deals:read`, `reviews:read`, 30 days)
+  from a 0600 file (`mcp.extra_headers`); the ChatGPT plugin uses "No authentication". No
+  deployment, no inbound port, no public URL. `scripts/local_mcp.sh setup|start|status|stop|rotate`
+  (docs/connect_mcp.md section 8, docs/runbook.md 9.3). Rules: only the owner may use the tunnel
+  (S1); a restricted runtime key, Tunnels Read + Use with a usage limit (S2); never
+  `--log.http-raw-unsafe` (S3); the failed-authentication limiter is per process on this route
+  (S4); the credential expires after 30 days (S7); never connect the owner's PC as dot's
+  "computer"; the data dot reads goes to OpenAI.
+- **Phase-1 evidence (owner's live test):** the date, the `tunnel-client` version, the negotiated
+  protocol and the tools/list SHA-256 from `start`'s probe report (`var/local_mcp/logs/probe-*.json`),
+  the 7 tools dot discovers, and the request ids of dot's `deals_health`, `reviews_list_pending`,
+  `deals_get_candidate` and `deals_estimate_import_costs` calls from the API log. UNVERIFIED until
+  then: that the injected header survives with "No authentication" (docs/connect_mcp.md 8.6).
+- **Steps (other routes):** docs/connect_mcp.md section 4. In short: deploy (12); choose `MCP_AUTH_MODE`
   (`oauth` preferred; `static_bearer` only for a client that supports it); for a static credential
   `uv run suv-deals credentials create-mcp --label "dot read-only" --scopes
   deals:read,reviews:read --role viewer --expires 30d --yes` (token printed once; into dot's
@@ -572,3 +591,4 @@ Append one row per completed activation step (newest last). Ids, versions, hashe
 | 2026-10-17 | `source_access` step 6 (live smoke): `autoscout24_it` -> `live_smoke_passed`; the owner's hand-run smoke (docs/runbook.md 9.1: `crawl once --max-pages 12`, `worker --drain --queues detail --max-jobs 5`); the source stays `enabled: false` | `25f43f8a1451f534cb49e1b93659f904f263742a` | config revision 1 `360d0a9d-b46d-4442-bb8b-309751cde88e`; `autoscout24@1.0.0`; job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, run `46f4bdec-1a91-4702-8ecb-1dff3f5a7255` (`complete`, `access_state: ok`, 12 pages, 15 cards); robots fetch `03976780-d703-4d0c-bcb3-c6838b10e05d` (HTTP 200) and revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (SHA-256 `7c78475c...`); 12 search fetches HTTP 200; 5 detail jobs succeeded (queued by the morning walk): revisions `faf012b2-325d-4f22-9dfc-f638cecc273c`, `d0f0ca62-27a5-4d5f-9991-b1bf11bff2a4`, `7ce1c9bb-f233-40ad-895f-afe861d2ef43`, `4cde316a-040a-4c72-8be9-b3a05e4722a2` and one HTTP 410 (removed, no revision); the run created no revision (no new or changed card); status recorded in the database with `last_live_smoke_at`; full record: docs/source_access_register.md "Live smoke evidence" and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json | owner (smoke), operator (record) |
 | 2026-10-17 | `existing_crawler` -> `live_verified` on the owner's workstation (host-local loopback `127.0.0.1:11235`) | `80e1f96` | `scripts/crawler_firewall.sh --check`: 8 rules present (DOCKER-USER: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, tcp 5432:6543; INPUT: `br-suv-crawl`, `br-suv-crawlint` NEW), none added; "crawler isolation verified: 9 target(s) blocked", no `REACHABLE` line; `doctor --process worker --crawler`: health OK version 0.9.4 (matches the pin), unauthenticated requests refused (401), read-only contract inspection passed; image `unclecode/crawl4ai@sha256:9021b3cb5c6f12570bbcd5395638495e0a06969b3148e377b953d174af2ebc9b`. Recorded after the same day's AutoScout24 Italy smokes (the rules were already in place) | owner (checks), operator (record) |
 | 2026-10-18 | `source_access` step 7 (enable): `autoscout24_it` -> `enabled: true`, every 15 minutes from 08:00 to 22:00 Europe/Skopje (56 runs x 12 search pages = 672 a day; daily budget 800 = 672 + 128); the owner's decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes") | the commit that sets `enabled: true` in `config/sources/autoscout24_it.yaml` (`git log -- config/sources/autoscout24_it.yaml`) | the committed configuration change (`enabled: true`, `interval_minutes: 15`, `daily_request_budget: 800`); not yet applied on the owner's machine: the owner's `suv-deals sources sync --yes` writes the audited `source.sync_update` event (run by `scripts/local_crawl.sh start`, docs/runbook.md section 9.2), and that audit event's id and the first scheduled runs' ids are added here when the owner reports them | owner (decision), operator (configuration) |
+| 2026-10-18 | `mcp_authentication` phase-1 route decided (state stays `blocked`): dot through the OpenAI Secure MCP Tunnel, read-only; the owner's decision "ChatGPT-план е dot: Pro, да има и постои Tunnel, одобрувам" (the ChatGPT plan is Pro, "Add custom MCP server" with Connection: Tunnel exists, approved) | the commit that adds `scripts/local_mcp.sh` (`git log -- scripts/local_mcp.sh`) | no live test yet. Local check in the build container (scratch database, SYNTHETIC workspace, the real script, API and credential, a FAKE `tunnel-client` driven by the generated YAML): `mcp probe` passed 4/4 (unauthenticated `initialize` 401 with `WWW-Authenticate: Bearer`, protocol `2025-11-25`, 7 tools, tools/list SHA-256 `bcb1df66242b775812f9623bcde1dc3774e65fad313e661741118fb2fe9d266a`, `deals_health` ready); through the fake tunnel 401 without and 200 with the injected header; `rotate` revoked the old credential (docs/connect_mcp.md 8.6). The owner's live test adds its own evidence row | owner (decision), operator (script, local check) |
