@@ -4,8 +4,8 @@ The build waves in order, derived from `git log --oneline` and the wave document
 (docs/schema.md sections 9 to 11, docs/decisions/). Dates are commit dates. "WIP checkpoint"
 commits are omitted; they only preserved interrupted work. **No build wave activated anything
 against a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC. The
-owner's activation steps are listed under Unreleased: his live smokes of `autoscout24_it` on
-2026-10-17 (step 6) and its enabling on 2026-10-18 (step 7), after which it fetches only while his
+owner's activation steps are listed under Unreleased: the owner's live smokes of `autoscout24_it` on
+2026-10-17 (step 6) and its enabling on 2026-10-18 (step 7), after which it fetches only while the owner's
 scheduler and worker run.
 
 ## Unreleased (on top of `7f7e187`)

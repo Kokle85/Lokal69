@@ -1,8 +1,8 @@
 """Owner import of MK market evidence (spec 15; F2, wave D2): parse and validate, nothing else.
 
 Until an MK comparable adapter is implemented and its terms are reviewed (both MK sources are
-placeholders), the owner can record MK evidence by hand: ASKING prices he saw on MK classifieds
-(``asking_price``, each with the ad URL) and his own estimates (``owner_estimate``). Without
+placeholders), the owner can record MK evidence by hand: ASKING prices the owner saw on MK classifieds
+(``asking_price``, each with the ad URL) and the owner's own estimates (``owner_estimate``). Without
 any such evidence every valuation is ``insufficient_comparables`` and no listing can become
 ``inquiry_ready`` (spec 37.2 check 2).
 

@@ -10,7 +10,7 @@ who does it, how it is done, how it is verified and what evidence is kept. Contr
 (`source_access` step 6 for `autoscout24_it`, the owner's hand-run live smoke). On 2026-10-18 the
 owner enabled that source (step 7, "вклучи ја трајно на секои 15 мин", "switch it on permanently,
 every 15 minutes": every 15 minutes from 08:00 to 22:00 Europe/Skopje); it runs on schedule only
-while his scheduler and worker run on his workstation (docs/runbook.md section 9.2). Apart from the
+while the owner's scheduler and worker run on the owner's workstation (docs/runbook.md section 9.2). Apart from the
 owner's AutoScout24 Italy smokes of 2026-10-17, no live crawl is recorded here, and no real e-mail
 sent or read, no Slack, no dot, no Outlook on a real PC and no deployed service has been used.
 Every other source is disabled and every external effect is off by default (README "Safety
@@ -32,7 +32,7 @@ defaults"). The work these gates protect is complete and tested offline
   exists, the seeded status in the database stays as listed below, and the evidence log at the
   end of this file is the authoritative record of activation progress. Adding that command is
   an open item ([IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md), "Review findings and open items").
-- **Who.** *Owner*: Vasko. He makes the decisions, owns the accounts and the Windows PC, approves
+- **Who.** *Owner*: Vasko. The owner makes the decisions, owns the accounts and the Windows PC, approves
   destinations and rules, and personally runs the activation canary send. *Operator*: whoever
   runs the deployment and the `suv-deals` CLI on the owner's behalf. An agent never runs an
   owner step.
@@ -343,7 +343,7 @@ Each step only needs the steps above it; any step can stop without affecting the
   `outlook_local` and the reservation gate `activation_canary_incomplete` are implemented and
   tested with fakes. No account is bound, no Windows PC was used, no canary was sent.
 - **Owner decisions in force:** `outlook_local` is THE path (owner decision 2026-10-10, ADR 0002
-  addendum): classic Outlook on the owner's PC with his Gmail account sends the inquiries and reads
+  addendum): classic Outlook on the owner's PC with the owner's Gmail account sends the inquiries and reads
   the correlated replies. `gmail_api` / `microsoft_graph` stay in the code but are not part of the
   activation plan.
 - **Prerequisites:** Supabase and hosting (the desktop worker needs an HTTPS backend URL), a
@@ -381,7 +381,7 @@ Each step only needs the steps above it; any step can stop without affecting the
      `canary_target_address` and `send_intents_enabled = true` into the worker's `config.toml`;
      set `SELLER_EMAIL_CANARY_SEND_ENABLED=true`, `SELLER_INQUIRY_MODE=automatic` and workspace
      mode automatic (`suv-deals inquiries set-mode automatic --reason ... --expected-version N
-     --yes`). Then **the owner himself** runs `suv-deals canary send <id>
+     --yes`). Then **the owner personally** runs `suv-deals canary send <id>
      --i-confirm-owner-controlled-address --yes`. The worker sends it once; the owner replies from
      the test mailbox. Afterwards set `SELLER_EMAIL_CANARY_SEND_ENABLED=false` and decide on the
      caps (section 10).
@@ -571,4 +571,4 @@ Append one row per completed activation step (newest last). Ids, versions, hashe
 | 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 37 pages, DE 23 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |
 | 2026-10-17 | `source_access` step 6 (live smoke): `autoscout24_it` -> `live_smoke_passed`; the owner's hand-run smoke (docs/runbook.md 9.1: `crawl once --max-pages 12`, `worker --drain --queues detail --max-jobs 5`); the source stays `enabled: false` | `25f43f8a1451f534cb49e1b93659f904f263742a` | config revision 1 `360d0a9d-b46d-4442-bb8b-309751cde88e`; `autoscout24@1.0.0`; job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, run `46f4bdec-1a91-4702-8ecb-1dff3f5a7255` (`complete`, `access_state: ok`, 12 pages, 15 cards); robots fetch `03976780-d703-4d0c-bcb3-c6838b10e05d` (HTTP 200) and revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (SHA-256 `7c78475c...`); 12 search fetches HTTP 200; 5 detail jobs succeeded (queued by the morning walk): revisions `faf012b2-325d-4f22-9dfc-f638cecc273c`, `d0f0ca62-27a5-4d5f-9991-b1bf11bff2a4`, `7ce1c9bb-f233-40ad-895f-afe861d2ef43`, `4cde316a-040a-4c72-8be9-b3a05e4722a2` and one HTTP 410 (removed, no revision); the run created no revision (no new or changed card); status recorded in the database with `last_live_smoke_at`; full record: docs/source_access_register.md "Live smoke evidence" and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json | owner (smoke), operator (record) |
 | 2026-10-17 | `existing_crawler` -> `live_verified` on the owner's workstation (host-local loopback `127.0.0.1:11235`) | `80e1f96` | `scripts/crawler_firewall.sh --check`: 8 rules present (DOCKER-USER: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, tcp 5432:6543; INPUT: `br-suv-crawl`, `br-suv-crawlint` NEW), none added; "crawler isolation verified: 9 target(s) blocked", no `REACHABLE` line; `doctor --process worker --crawler`: health OK version 0.9.4 (matches the pin), unauthenticated requests refused (401), read-only contract inspection passed; image `unclecode/crawl4ai@sha256:9021b3cb5c6f12570bbcd5395638495e0a06969b3148e377b953d174af2ebc9b`. Recorded after the same day's AutoScout24 Italy smokes (the rules were already in place) | owner (checks), operator (record) |
-| 2026-10-18 | `source_access` step 7 (enable): `autoscout24_it` -> `enabled: true`, every 15 minutes from 08:00 to 22:00 Europe/Skopje (56 runs x 12 search pages = 672 a day; daily budget 800 = 672 + 128); the owner's decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes") | the commit that sets `enabled: true` in `config/sources/autoscout24_it.yaml` (`git log -- config/sources/autoscout24_it.yaml`) | the committed configuration change (`enabled: true`, `interval_minutes: 15`, `daily_request_budget: 800`); not yet applied on the owner's machine: his `suv-deals sources sync --yes` writes the audited `source.sync_update` event (run by `scripts/local_crawl.sh start`, docs/runbook.md section 9.2), and that audit event's id and the first scheduled runs' ids are added here when the owner reports them | owner (decision), operator (configuration) |
+| 2026-10-18 | `source_access` step 7 (enable): `autoscout24_it` -> `enabled: true`, every 15 minutes from 08:00 to 22:00 Europe/Skopje (56 runs x 12 search pages = 672 a day; daily budget 800 = 672 + 128); the owner's decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes") | the commit that sets `enabled: true` in `config/sources/autoscout24_it.yaml` (`git log -- config/sources/autoscout24_it.yaml`) | the committed configuration change (`enabled: true`, `interval_minutes: 15`, `daily_request_budget: 800`); not yet applied on the owner's machine: the owner's `suv-deals sources sync --yes` writes the audited `source.sync_update` event (run by `scripts/local_crawl.sh start`, docs/runbook.md section 9.2), and that audit event's id and the first scheduled runs' ids are added here when the owner reports them | owner (decision), operator (configuration) |

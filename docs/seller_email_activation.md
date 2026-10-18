@@ -163,7 +163,7 @@ Use only if sending must work while the laptop is off.
    `SELLER_EMAIL_OAUTH_SECRET_REFERENCE=secretbox:ops.email_sender_bindings/<binding id>`
    (`sender-binding create --vault-ref` records an external reference the runtime does NOT read).
    Tokens are never logged or shown. No consent flow is built into the backend: the owner obtains
-   the refresh token with Google's own tooling on his machine (UNVERIFIED, an owner step).
+   the refresh token with Google's own tooling on the owner's machine (UNVERIFIED, an owner step).
 4. Set `SELLER_EMAIL_ACCOUNT_ID` to the Gmail account address. The adapter always calls
    `users/<that address>/...` (never `me`) and pre-checks `getProfile` with the same token
    before every send, so a token for another account cannot send.
@@ -279,7 +279,7 @@ a seller inquiry.
    nobody); unset the variable afterwards. `suv-deals canary status` / `suv-deals doctor`
    (`seller_inquiry/activation_canary`) show the evidence state (`prepared`, `accepted`,
    `uncertain`, `failed`, `complete`; `stale` after a sender-binding change).
-2. Send - THE OWNER runs this himself, once; an operator script, a test or an agent never does
+2. Send - THE OWNER runs this personally, once; an operator script, a test or an agent never does
    (on `outlook_local` the desktop worker must first have the same owner test address as
    `canary_target_address` in its local `config.toml`, desktop/outlook-bridge/README.md):
    `suv-deals canary send <id> --i-confirm-owner-controlled-address --yes`. It refuses (exit 3,

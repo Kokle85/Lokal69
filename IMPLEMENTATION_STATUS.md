@@ -33,7 +33,7 @@ saved or synthetic fixtures, and `integration_verified` means proven against a r
 2026-10-17 (owner's workstation): the crawler gate and the AutoScout24 Italy source** (`autoscout24_it`,
 the owner's live smoke, activation step 6). **Since 2026-10-18 `autoscout24_it` is enabled**
 (step 7, the owner's decision: every 15 minutes from 08:00 to 22:00 Europe/Skopje); it is `active`
-only while the owner's scheduler and worker run on his workstation (`scripts/local_crawl.sh`,
+only while the owner's scheduler and worker run on the owner's workstation (`scripts/local_crawl.sh`,
 docs/runbook.md section 9.2), and no scheduled run is recorded here yet. Apart from the owner's
 AutoScout24 Italy smokes of 2026-10-17 (on the owner's workstation and Crawl4AI), no marketplace
 was crawled, no e-mail was sent or read, and no Slack, dot or Outlook on a real PC was used. Every
@@ -82,7 +82,7 @@ Category: *tested offline* (implemented and proven by automated tests here), *ac
 
 - **Live crawling.** No scheduled run is recorded yet: `autoscout24_it` is enabled since 2026-10-18
   (step 7, every 15 minutes from 08:00 to 22:00 Europe/Skopje) and runs only while the owner's
-  scheduler and worker run on his workstation (docs/runbook.md section 9.2). 10 of the 14 registered sources have no
+  scheduler and worker run on the owner's workstation (docs/runbook.md section 9.2). 10 of the 14 registered sources have no
   adapter; `autoscout24_it` and `autoscout24_de` have one (built from owner captures 2026-10-16)
   and passed activation step 5 on SYNTHETIC saved fixtures the same day (`fixture_tested`).
   `autoscout24_it` also passed step 6, the owner's live smoke, on 2026-10-17 (`live_smoke_passed`,

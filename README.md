@@ -4,16 +4,16 @@ A private, auditable deal-discovery system for one owner. It watches permitted E
 sources for SUVs that can be bought in Germany, Italy or Switzerland for EUR 2,500 to 3,000
 (inclusive) with strictly less than 200,000 km, compares them with North Macedonian resale
 evidence (research band EUR 8,000 to 10,000), computes landed cost and contribution with explicit
-unknowns, and puts the candidates in a review queue for the owner and his assistant dot (MCP).
+unknowns, and puts the candidates in a review queue for the owner and the owner's assistant dot (MCP).
 Under the owner's standing authorization it can send ONE automatic initial inquiry per verified
 vehicle/seller pair (availability, documents, lowest/final price) and route the seller's reply back
 through the owner's own classic Outlook. The contract is
 [docs/spec/suv-deal-system-build-spec.md](docs/spec/suv-deal-system-build-spec.md) (version 1.1).
 
 > **Nothing runs by itself.** Every source is disabled except AutoScout24 Italy (`autoscout24_it`,
-> enabled 2026-10-18; it runs only while the owner's scheduler and worker run on his workstation,
+> enabled 2026-10-18; it runs only while the owner's scheduler and worker run on the owner's workstation,
 > docs/runbook.md section 9.2), and every external effect is off by default. Apart from the owner's
-> AutoScout24 Italy smokes through his workstation's Crawl4AI (2026-10-17), no live crawl, real
+> AutoScout24 Italy smokes through the owner's workstation's Crawl4AI (2026-10-17), no live crawl, real
 > mailbox, Outlook on a real PC, Slack, dot or deployed service has been used. What is built and
 > tested, and what is still blocked:
 > [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) and [ACTIVATION_GATES.md](ACTIVATION_GATES.md).

@@ -45,7 +45,7 @@ and this page must be corrected.
 
 ## Register
 
-Every source below is `enabled: false` except `autoscout24_it`, enabled on 2026-10-18 (activation step 7, the owner's decision "вклучи ја трајно на секои 15 мин", "switch it on permanently, every 15 minutes"). It is the only live-verified source (the owner's live smoke, step 6, 2026-10-17: "Live smoke evidence" below), and it runs only while the owner's scheduler and worker run on his workstation (docs/runbook.md section 9.2); no other source is active. On 2026-10-14 the owner decided to include every marketplace and MK comparable source ("сакам сите да го вклучиш"); each carries `terms_decision: proceed_acknowledged` with the owner as actor, which is an audit record and opens no gate by itself.
+Every source below is `enabled: false` except `autoscout24_it`, enabled on 2026-10-18 (activation step 7, the owner's decision "вклучи ја трајно на секои 15 мин", "switch it on permanently, every 15 minutes"). It is the only live-verified source (the owner's live smoke, step 6, 2026-10-17: "Live smoke evidence" below), and it runs only while the owner's scheduler and worker run on the owner's workstation (docs/runbook.md section 9.2); no other source is active. On 2026-10-14 the owner decided to include every marketplace and MK comparable source ("сакам сите да го вклучиш"); each carries `terms_decision: proceed_acknowledged` with the owner as actor, which is an audit record and opens no gate by itself.
 
 **Consequence for valuations (F2, wave D2).** Both MK comparable sources are placeholders, so no
 MK market evidence is crawled. Until the owner records some (`suv-deals market import FILE
