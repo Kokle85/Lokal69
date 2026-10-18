@@ -15,11 +15,17 @@ no database are read:
     headers and the tool envelope's ``request_id``).
 
 The token and the ``Authorization`` header are never printed or logged: the header lives only in
-the authenticated HTTP client (the unauthenticated check uses a separate client without it);
-redirects are not followed, so the header never reaches another location; the file is sent only
-over https or to a loopback address; while the probe runs, the ``httpx``/``httpcore``/``mcp``
-loggers stay at WARNING with `observability.logging.RedactionFilter` attached (it masks ``Bearer``
-values and ``suvmcp_`` tokens); every error text passes through ``redact``.
+the authenticated HTTP client (the unauthenticated check uses a separate client without it, which
+follows no redirect and reports a ``3xx`` with its ``Location``); the SDK transport follows a
+redirect only within the endpoint's origin (a ``307``/``308`` to the same scheme, host and port, or
+from http to https on the same host) and refuses every other one, so the header never leaves the
+endpoint's origin; the file is sent only over https or to a loopback address; while the probe runs,
+the ``httpx``/``httpcore``/``mcp`` loggers stay at WARNING with
+`observability.logging.RedactionFilter` attached (it masks ``Bearer`` values and ``suvmcp_``
+tokens); every error text passes through ``redact``.
+
+``--timeout`` bounds every request (no answer in time: ``no answer within N s``, whichever timer
+fires); the authenticated checks together get ``OVERALL_TIMEOUT_FACTOR`` times as long.
 
 Exit codes: ``0`` every check passed; ``1`` a check failed (the output names it); ``2`` usage
 (``--url``, ``--timeout`` or the authorization file).
@@ -39,7 +45,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import click
 
@@ -55,6 +61,8 @@ DEFAULT_TIMEOUT_S: Final = 10.0
 PROBE_CLIENT_NAME: Final = "suv-deals-mcp-probe"
 HEALTH_TOOL: Final = "deals_health"
 MAX_TOOL_PAGES: Final = 20
+#: The authenticated checks together may take this many times ``--timeout``.
+OVERALL_TIMEOUT_FACTOR: Final = 4
 #: Library loggers held at WARNING (and redacted) while the probe runs; their children inherit it.
 LIBRARY_LOGGERS: Final = (
     "httpx",
@@ -75,6 +83,9 @@ CHECK_HEALTH: Final = f"tools/call {HEALTH_TOOL}"
 AUTHENTICATED_CHECKS: Final = (CHECK_INITIALIZE, CHECK_TOOLS, CHECK_HEALTH)
 
 _STATUS_MEANING: Final[Mapping[int, str]] = {
+    400: "bad request; from `suv-deals api serve` this means the URL's host is not in its Host"
+    " allow-list: the hosts of MCP_PUBLIC_URL and APP_BASE_URL, 127.0.0.1, localhost and"
+    " API_ALLOWED_HOSTS",
     401: "the server refused the credential (unknown, revoked or expired token, or the server runs"
     " another MCP_AUTH_MODE)",
     403: "forbidden (insufficient scope, an Origin that is not allowed, or loopback-only access)",
@@ -291,17 +302,61 @@ def _first_leaf(error: BaseException) -> BaseException:
     return error
 
 
+def _causes(error: BaseException) -> Iterator[BaseException]:
+    """``error`` and its ``__cause__``/``__context__`` chain (each exception once)."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_timeout(error: BaseException) -> bool:
+    """No answer in time, whichever timer fired: ``anyio.fail_after`` (``TimeoutError``), the HTTP
+    client (``httpx2.TimeoutException``: read, write, pool) or the SDK's request timeout."""
+    import httpx2
+    from mcp import MCPError
+    from mcp_types import REQUEST_TIMEOUT
+
+    if isinstance(error, (TimeoutError, httpx2.TimeoutException)):
+        return True
+    return isinstance(error, MCPError) and error.code == REQUEST_TIMEOUT
+
+
+def _connect_failure(error: BaseException) -> str:
+    """Why the connection failed: TLS, name resolution or (by default) nobody listening."""
+    import socket
+    import ssl
+
+    message = " ".join(str(error).split())[:200] or "no details"
+    cause = f"{type(error).__name__}: {message}"
+    chain = list(_causes(error))
+    if any(isinstance(item, ssl.SSLError) for item in chain):
+        return (
+            f"TLS failed ({cause}): check the server's certificate and that the URL's scheme"
+            " (http or https) matches the server"
+        )
+    if any(isinstance(item, socket.gaierror) for item in chain):
+        return f"the host name cannot be resolved ({cause}): check the URL's host"
+    return f"cannot connect ({cause}): is the server running at this URL?"
+
+
 def _failure_text(error: BaseException, last_status: int | None, timeout: float) -> str:
     """A clear, redacted reason for a failed step (the HTTP status the server sent wins)."""
+    import httpx2
+
     leaf = _first_leaf(error)
     if last_status is not None and last_status >= 400:
         meaning = _STATUS_MEANING.get(last_status, "the server answered with an error")
         return f"HTTP {last_status}: {meaning}"
-    if isinstance(leaf, TimeoutError):
+    if isinstance(leaf, httpx2.ConnectTimeout):
+        return f"cannot connect within {timeout:g} s (ConnectTimeout): is the host reachable at this URL?"
+    if _is_timeout(leaf):
         return f"no answer within {timeout:g} s"
+    if isinstance(leaf, httpx2.ConnectError):
+        return _connect_failure(leaf)
     name = type(leaf).__name__
-    if name in ("ConnectError", "ConnectTimeout"):
-        return f"cannot connect ({name}): is the server running at this URL?"
     message = str(leaf).strip()
     return f"{name}: {message[:300]}" if message else name
 
@@ -367,26 +422,50 @@ async def _check_unauthenticated(
             f"no answer from {target.url}: {_failure_text(exc, None, request_timeout_s)}",
         )
         return
+    status = response.status_code
     challenge = response.headers.get("www-authenticate")
     scheme = challenge.strip().split(" ", 1)[0].lower() if challenge else ""
-    if response.status_code == 401 and scheme == "bearer":
+    if status == 401 and scheme == "bearer":
         report.challenge = parse_challenge(challenge or "")
         report.add(CHECK_UNAUTHENTICATED, True, "HTTP 401 with WWW-Authenticate: Bearer")
         return
-    if response.status_code < 400:
-        detail = f"HTTP {response.status_code} WITHOUT authentication: the endpoint is open"
-    elif response.status_code == 401:
-        detail = "HTTP 401 but without a WWW-Authenticate: Bearer challenge"
+    if 300 <= status < 400:
+        # Not followed (and not an open endpoint): the URL is not the endpoint itself.
+        location = (response.headers.get("location") or "").strip()
+        if location:
+            where = urljoin(target.url, location)[:300]
+            detail = f"HTTP {status} redirect to {where} (not followed; use that URL as --url)"
+        else:
+            detail = f"HTTP {status} redirect without a Location (not followed)"
+        report.add(CHECK_UNAUTHENTICATED, False, detail)
+        return
+    if status < 300:
+        detail = f"HTTP {status} WITHOUT authentication: the endpoint is open"
+    elif status == 401:
+        # Quoted so that the redaction of `Bearer <value>` leaves the text readable.
+        detail = 'HTTP 401 but without a "WWW-Authenticate: Bearer" challenge'
     else:
-        meaning = _STATUS_MEANING.get(response.status_code, "unexpected answer")
-        detail = f"HTTP {response.status_code}, expected 401 ({meaning})"
+        meaning = _STATUS_MEANING.get(status, "unexpected answer")
+        detail = f"HTTP {status}, expected 401 ({meaning})"
+    detail += _server_says(response)
+    report.add(CHECK_UNAUTHENTICATED, False, detail)
+
+
+def _server_says(response: httpx2.Response) -> str:
+    """A short reason from the body: a JSON ``error_description`` or a plain-text body."""
+    if response.status_code < 400:
+        return ""
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type == "text/plain":
+        text = " ".join(response.text.split())[:200]
+        return f"; server says: {text}" if text else ""
     try:
         payload = response.json()
     except ValueError:
-        payload = None
+        return ""
     if isinstance(payload, Mapping) and isinstance(payload.get("error_description"), str):
-        detail += f"; server says: {str(payload['error_description'])[:200]}"
-    report.add(CHECK_UNAUTHENTICATED, False, detail)
+        return f"; server says: {str(payload['error_description'])[:200]}"
+    return ""
 
 
 async def _list_all_tools(client: Client) -> list[dict[str, Any]]:
@@ -418,6 +497,8 @@ async def _check_authenticated(
 
     step = CHECK_INITIALIZE
     done: set[str] = set()
+    overall_s = request_timeout_s * OVERALL_TIMEOUT_FACTOR
+    overall: anyio.CancelScope | None = None
     try:
         async with httpx2.AsyncClient(
             headers={"Authorization": authorization},
@@ -426,7 +507,7 @@ async def _check_authenticated(
             trust_env=trust_env,
             event_hooks={"response": [remember]},
         ) as http:
-            with anyio.fail_after(request_timeout_s * 4):
+            with anyio.fail_after(overall_s) as overall:
                 async with Client(
                     streamable_http_client(target.url, http_client=http, terminate_on_close=False),
                     mode="legacy",
@@ -485,8 +566,14 @@ async def _check_authenticated(
                     done.add(CHECK_HEALTH)
     except Exception as exc:
         if step not in done:
-            last = statuses[-1] if statuses else None
-            report.add(step, False, _failure_text(exc, last, request_timeout_s))
+            if overall is not None and overall.cancel_called:
+                detail = (
+                    f"the checks did not finish within {overall_s:g} s (all authenticated checks"
+                    f" together get {OVERALL_TIMEOUT_FACTOR} x --timeout)"
+                )
+            else:
+                detail = _failure_text(exc, statuses[-1] if statuses else None, request_timeout_s)
+            report.add(step, False, detail)
 
 
 async def run_probe(
@@ -579,7 +666,7 @@ def mcp_group() -> None:
     type=click.FloatRange(min=0.5, max=120.0),
     default=DEFAULT_TIMEOUT_S,
     show_default=True,
-    help="Seconds per request.",
+    help=f"Seconds per request (all authenticated checks together: {OVERALL_TIMEOUT_FACTOR} x this).",
 )
 def probe(url: str, authorization_file: Path | None, as_json: bool, timeout: float) -> None:
     """Probe the MCP endpoint: 401 without a token, then initialize, tools/list and deals_health.

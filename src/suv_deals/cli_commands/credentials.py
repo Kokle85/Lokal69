@@ -13,7 +13,8 @@ usage error before anything is created). It is meant only for a client that cann
 secret-store entry itself but reads a static header from a file (docs/connect_mcp.md section 3).
 The credential is inserted and the file written in ONE transaction: a failed write rolls the
 credential back, and when the COMMIT fails after the write (its outcome unknown) the credential is
-revoked if it exists, so no live token remains that nobody holds.
+revoked if it exists, so no live token remains that nobody holds. An interrupt (Ctrl-C) after the
+write keeps the file and names the credential that may be live, with its revoke command.
 """
 
 # ruff: noqa: PLC0415 - application modules are imported lazily so `--help` stays fast
@@ -49,6 +50,7 @@ from suv_deals.cli_commands._common import (
     require_yes,
     run_async,
     table,
+    warn,
     workspace_option,
 )
 
@@ -245,9 +247,18 @@ async def _issue_into_file(
         await _settle_uncertain_commit(db, actor, issued, reserved, exc)
     except BaseException:
         # Interrupted: before the write nothing was committed; after it the token may be live,
-        # so the file that holds it is kept.
-        if written:
+        # so the file that holds it is kept and the credential named (no database work after an
+        # interrupt: the owner asked to stop, and the COMMIT itself may be what hangs).
+        if written and issued is not None:
             reserved.close()
+            warn(
+                f"interrupted after the token was written, so the commit outcome is unknown and"
+                f" credential {issued.credential_id} may be live. The authorization file"
+                f" {target.path} was KEPT because its token may be live: check it with `suv-deals"
+                f" mcp probe --authorization-file {target.path}` or `suv-deals credentials list`;"
+                f" if it is not wanted, run `suv-deals credentials revoke {issued.credential_id}"
+                " --reason '...' --yes`, then delete the file."
+            )
         else:
             reserved.discard()
         raise

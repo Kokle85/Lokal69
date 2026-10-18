@@ -56,7 +56,7 @@ template `.env.example` holds placeholders only.
 | `SUPABASE_SECRET_KEY` | API/worker env, only with `SNAPSHOT_STORAGE=supabase` | never in the dashboard; the dashboard build refuses `sb_secret_` and `service_role` values |
 | `SUPABASE_PUBLISHABLE_KEY` (`VITE_SUPABASE_PUBLISHABLE_KEY`) | dashboard bundle | browser-safe by design |
 | `MCP_CURSOR_SIGNING_SECRET` | API env | signs pagination cursors |
-| MCP static bearer tokens (`suvmcp_`) | the client's secret store | printed once by `credentials create-mcp`; only the SHA-256 is stored |
+| MCP static bearer tokens (`suvmcp_`) | the client's secret store; only on the owner-approved file route, a NEW 0600 file outside the repository holding `Bearer <token>` that the client reads (e.g. `tunnel-client`'s `mcp.extra_headers`; docs/connect_mcp.md 3.1) | printed once by `credentials create-mcp`, or with `--authorization-file` written to that file and not printed; only the SHA-256 is stored |
 | Mail-worker tokens (`suvmail_`) | Windows Credential Manager of the owner's user on the PC | printed once by `mail-worker credential issue`; only the SHA-256 is stored; the desktop refuses Supabase keys, JWTs and database URLs (`outlook_bridge/credentials.py`) |
 | `MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY` | API and dispatcher env | AES-256-GCM key ring of the secret box (`integrations/secret_box.py`), context-bound associated data; seals MCP Events callback secrets and sender OAuth grants |
 | Gmail OAuth client secret and refresh token (optional `gmail_api`) | sealed into `ops.email_sender_bindings` by `sender-binding store-secret` | input from `SUV_OAUTH_CLIENT_SECRET` / `SUV_OAUTH_REFRESH_TOKEN` for that one command (then unset) or hidden prompts; the runtime reads only `SELLER_EMAIL_OAUTH_SECRET_REFERENCE=secretbox:...`; token-like values in that setting are refused |
@@ -104,7 +104,7 @@ template `.env.example` holds placeholders only.
 
 | Credential | Revoke | Replace |
 |---|---|---|
-| MCP token | `uv run suv-deals credentials revoke <id> --reason "..." --yes` (next request `401`) | `credentials create-mcp ...` with the same or narrower scopes; store it in the client's secret store |
+| MCP token | `uv run suv-deals credentials revoke <id> --reason "..." --yes` (next request `401`); on the file route, then delete its file | `credentials create-mcp ...` with the same or narrower scopes; store it in the client's secret store, or on the file route create it into a NEW file (`--authorization-file`), switch the client to it, then revoke the old credential and delete its file |
 | Mail-worker token | `uv run suv-deals mail-worker credential revoke <mailbox id> --reason "..." --yes` (the worker stops, keeps its backlog) | `mail-worker credential issue --sender-binding <id> ...`, then `python -m outlook_bridge credential set` on the PC |
 | Gmail OAuth grant | remove the grant in the Google account (health turns `credentials_revoked`; sending stops) | new consent, then `sender-binding store-secret <id> ... --expected-version N` |
 | Secret-box key | - | prepend a new key to `MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY`, re-wrap stored rows, remove the old key (`integrations/secret_box.py`) |

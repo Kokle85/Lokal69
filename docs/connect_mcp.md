@@ -84,6 +84,9 @@ uv run suv-deals credentials create-mcp --workspace <workspace-id> \
   committed and no credential exists. If the commit outcome is unknown after the write (for example
   a dropped connection), the command revokes the credential and removes the file; if even that
   fails, it keeps the file (the token may be live) and prints the `credentials revoke` command.
+  An interrupt (Ctrl-C) after the write does no further database work: it keeps the file, names
+  the credential that may be live and prints the `credentials revoke` command (check the file with
+  `mcp probe --authorization-file`; an interrupt before the write leaves no file).
 - Treat the file like the token: do not copy, sync or commit it. To rotate, create a new credential
   into a new file, switch the client to it, then revoke the old credential and delete its file.
 - Check the result with `suv-deals mcp probe --authorization-file <file>` (section 4.1).
@@ -126,11 +129,29 @@ calls `deals_health`. Without `--authorization-file` only (a) runs. It prints:
 
 Exit `0` when every check passed, `1` when one failed (the line names the check and the reason,
 e.g. `HTTP 401: the server refused the credential ...` for `initialize`), `2` for usage errors.
+Reasons it names for a failed check:
+
+- `HTTP 3xx redirect to <Location> (not followed; use that URL as --url)`: the URL is not the
+  endpoint itself (a trailing slash, or a proxy upgrading http to https); only a `2xx` answer
+  without a token is reported as `the endpoint is open`.
+- `HTTP 400 ... Host allow-list` (with the server's plain-text reason): `suv-deals api serve`
+  refused the URL's host; it accepts the hosts of `MCP_PUBLIC_URL` and `APP_BASE_URL`,
+  `127.0.0.1`, `localhost` and `API_ALLOWED_HOSTS`. `HTTP 421` for `initialize`: the host passed
+  that list but does not match `MCP_PUBLIC_URL` (for example `localhost` when it names
+  `127.0.0.1`).
+- `no answer within N s`: one request took longer than `--timeout` (default 10 s);
+  `the checks did not finish within M s`: the authenticated checks together took longer than
+  4 x `--timeout`.
+- `cannot connect (...): is the server running at this URL?` (nothing listens), `TLS failed (...)`
+  (certificate, or https against a plain-http server) or `the host name cannot be resolved (...)`.
+
 The token and the `Authorization` header are never printed or logged. The file is refused when it
 is a symlink, accessible to group or others or not exactly `Bearer suvmcp_...` / `Bearer <JWT>`; it
-is sent only over https or to a loopback address, and redirects are not followed. The probe shows
-what this server offers this credential; what dot itself negotiates still has to be recorded from
-the client.
+is sent only over https or to a loopback address. The unauthenticated check follows no redirect;
+the SDK follows one only within the endpoint's origin (a `307`/`308` to the same scheme, host and
+port, or from http to https on the same host), so the header never leaves that origin, and it
+refuses any other redirect. The probe shows what this server offers this credential; what dot
+itself negotiates still has to be recorded from the client.
 
 ## 5. Native MCP Events subscription (preferred activation route)
 

@@ -28,17 +28,24 @@ decided.
   missing, not owned by the current user or readable/writable by group or others. The insert and
   the write share one transaction: a failed write rolls the credential back; an unknown commit
   outcome after the write revokes the credential and removes the file (if the revocation fails too,
-  the file is kept and the revoke command printed). Without the option nothing changed.
+  the file is kept and the revoke command printed); an interrupt (Ctrl-C) after the write keeps the
+  file and names the credential that may be live with its revoke command. Without the option
+  nothing changed.
 - **`suv-deals mcp probe [--url] [--authorization-file] [--json] [--timeout]`**
   (`cli_commands/mcp_probe.py`; no settings, no database): an unauthenticated `initialize` must be
   `401` with `WWW-Authenticate: Bearer` (its parameters are reported); with the file (exactly
   `Bearer suvmcp_...` or `Bearer <JWT>`, no group/other access, not a symlink, sent only over https
-  or to loopback, no redirects) the official `mcp` SDK client runs the `initialize` handshake,
+  or to loopback; the SDK follows redirects only within the endpoint's origin, so the header never
+  leaves it) the official `mcp` SDK client runs the `initialize` handshake,
   `tools/list` and `deals_health`. It prints the negotiated protocol version, server name and
   version, tool names, the SHA-256 of the canonical `tools/list` result (tools sorted by name,
   `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`), the `deals_health`
   status fields and every request id; never the token (the HTTP and SDK loggers are held at WARNING
-  with the redaction filter while it runs). Exit 0 / 1 (the failing check named) / 2.
+  with the redaction filter while it runs). Exit 0 / 1 (the failing check named) / 2. A failed
+  check names its reason: a `3xx` as a redirect to its `Location` (never as an open endpoint), a
+  `400` from the backend's Host allow-list with the server's plain-text reason, every request
+  timeout as `no answer within N s` and the 4 x `--timeout` overall limit as such, and TLS and
+  name-resolution failures apart from a server that is not running.
 - Tests: `tests/cli/test_credentials_authorization_file.py` (content, 0600 under any umask, no token
   on stdout/stderr or in logs, every refusal before the database, rollback on a failed write,
   revocation on an unknown commit outcome, the kept file when revoking fails) and
@@ -46,7 +53,12 @@ decided.
   7 read tools, the same hash on two runs and the same as the raw `tools/list` wire result,
   `deals_health` really called, the token absent from all output; unauthenticated-only run; bad
   file permissions, symlinks and contents refused; unknown, revoked and wrong tokens exit 1; open,
-  unreachable and unconfigured endpoints fail the first check).
+  unreachable and unconfigured endpoints fail the first check). Review follow-up: the probe also
+  runs against the `create_app` stack that `api serve` runs (end to end, a foreign Host, a
+  loopback alias), a trailing-slash URL, a cross-origin redirect that never sees the header, a
+  `401` without a Bearer challenge, slow endpoints, TLS and DNS failures, JWT files, https and
+  `localhost` URLs and `--timeout`; the opened parent directory is re-checked and an interrupt
+  after the write keeps the file and names the credential.
 - Docs: docs/connect_mcp.md 3.1 (when a file is acceptable) and 4.1 (the probe's evidence for steps
   3 and 8), docs/runbook.md CLI reference.
 

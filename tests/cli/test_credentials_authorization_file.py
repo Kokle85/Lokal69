@@ -3,8 +3,8 @@
 The token goes into a NEW 0600 file as exactly ``Bearer <token>`` and is never printed or logged.
 Every refusal is a usage error raised before the database is touched: the refusal tests run with
 an unreachable ``DATABASE_URL``, so a command that reached the database would end with exit 4
-instead of 2. The ``db`` tests cover the written file, the rollback when writing fails and the
-revocation when the commit outcome is unknown.
+instead of 2. The ``db`` tests cover the written file, the rollback when writing fails, the
+revocation when the commit outcome is unknown and the notice when the owner interrupts the COMMIT.
 """
 
 from __future__ import annotations
@@ -17,15 +17,18 @@ import stat
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
+import anyio
 import pytest
 from click.testing import Result
+from pydantic import SecretStr
 from tests.cli.conftest import Cli
 from tests.integration.db.helpers import Seed
 
-from suv_deals.cli_commands import _authorization_file
+from suv_deals.cli_commands import _authorization_file, credentials
 from suv_deals.cli_commands._common import CliAbort
 from suv_deals.errors import DependencyUnavailable
 from suv_deals.persistence import transactions
@@ -177,6 +180,74 @@ def test_a_path_that_appears_after_the_check_is_refused(tmp_path: Path) -> None:
         _authorization_file.ReservedFile(target)
     assert raised.value.code == 2 and "already exists" in raised.value.message
     assert (directory / "late").read_text(encoding="ascii") == "someone else"
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o707], ids=lambda mode: f"{mode:04o}")
+def test_a_directory_opened_up_after_the_check_is_refused(tmp_path: Path, mode: int) -> None:
+    directory = secret_dir(tmp_path)
+    target = _authorization_file.prepare_target(directory / "late")
+    directory.chmod(mode)  # between the check and the creation: the opened directory is checked again
+    with pytest.raises(CliAbort) as raised:
+        _authorization_file.ReservedFile(target)
+    assert raised.value.code == 2
+    assert f"readable or writable by group or others (mode {mode:04o})" in raised.value.message
+    assert not (directory / "late").exists()
+
+
+def test_an_interrupt_after_the_write_keeps_the_file_and_names_the_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ctrl-C makes asyncio cancel the main task; the cancellation lands in the COMMIT, after the
+    token is on disk, so the outcome is unknown: the file is kept and the credential named."""
+    path = secret_dir(tmp_path) / "dot.authorization"
+    target = _authorization_file.prepare_target(path)
+    token = "suvmcp_" + "9e" * 32
+    issued = SimpleNamespace(credential_id=uuid4(), token=SecretStr(token))
+
+    async def issue(conn: Any) -> Any:
+        return issued
+
+    async def main() -> bool:
+        with anyio.CancelScope() as scope:
+
+            @asynccontextmanager
+            async def interrupted_commit(db: Any, actor: Any) -> AsyncIterator[Any]:
+                yield object()
+                scope.cancel()  # Ctrl-C ...
+                await anyio.sleep(30)  # ... while the COMMIT round-trip is in flight
+
+            monkeypatch.setattr(transactions, "unit_of_work", interrupted_commit)
+            await credentials._issue_into_file(cast(Any, None), cast(Any, None), target, issue)
+        return scope.cancelled_caught
+
+    assert anyio.run(main) is True  # the interrupt propagated (the command then reports it)
+    err = capsys.readouterr().err
+    assert f"credential {issued.credential_id} may be live" in err
+    assert f"The authorization file {path} was KEPT because its token may be live" in err
+    assert f"suv-deals credentials revoke {issued.credential_id} --reason" in err
+    assert f"mcp probe --authorization-file {path}" in err
+    assert path.read_text(encoding="ascii") == f"Bearer {token}" and token not in err
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_an_interrupt_before_the_write_removes_the_file_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = secret_dir(tmp_path) / "dot.authorization"
+    target = _authorization_file.prepare_target(path)
+
+    async def interrupted_insert(conn: Any) -> Any:
+        raise KeyboardInterrupt  # before the token exists: nothing was committed
+
+    @asynccontextmanager
+    async def plain(db: Any, actor: Any) -> AsyncIterator[Any]:
+        yield object()
+
+    monkeypatch.setattr(transactions, "unit_of_work", plain)
+    with pytest.raises(KeyboardInterrupt):
+        anyio.run(credentials._issue_into_file, cast(Any, None), cast(Any, None), target, interrupted_insert)
+    assert not path.exists()
+    assert capsys.readouterr().err == ""
 
 
 def test_reserved_file_is_0600_whatever_the_umask(tmp_path: Path) -> None:
@@ -392,6 +463,40 @@ def test_a_live_token_that_cannot_be_revoked_keeps_its_file(
     assert path.exists() and stat.S_IMODE(path.stat().st_mode) == 0o600
     token = path.read_text(encoding="ascii").removeprefix("Bearer ")
     assert hashlib.sha256(token.encode()).hexdigest() == rows[0][1]
+    assert token not in result.output
+
+
+@pytest.mark.db
+def test_an_interrupt_after_the_commit_keeps_the_file_and_prints_the_revoke_command(
+    run_cli: Cli,
+    db_env: dict[str, str],
+    workspace: UUID,
+    seed: Seed,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = transactions.unit_of_work
+
+    @asynccontextmanager
+    async def committed_then_interrupted(db: Any, actor: Any) -> AsyncIterator[Any]:
+        async with real(db, actor) as conn:
+            yield conn
+        raise KeyboardInterrupt  # Ctrl-C while the COMMIT acknowledgement is awaited
+
+    monkeypatch.setattr(transactions, "unit_of_work", committed_then_interrupted)
+    path = secret_dir(tmp_path) / "dot.authorization"
+    result = run_cli(*create_args(workspace, path, "--yes"), env=db_env)
+    assert result.exit_code == 1, result.output
+    assert "error: interrupted" in result.stderr
+    rows = _credentials(seed, workspace)
+    assert len(rows) == 1 and rows[0][5] is None  # committed and live
+    credential_id = rows[0][0]
+    assert f"credential {credential_id} may be live" in result.stderr
+    assert f"The authorization file {path} was KEPT because its token may be live" in result.stderr
+    assert f"suv-deals credentials revoke {credential_id} --reason" in result.stderr
+    token = path.read_text(encoding="ascii").removeprefix("Bearer ")
+    assert hashlib.sha256(token.encode()).hexdigest() == rows[0][1]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert token not in result.output
 
 
