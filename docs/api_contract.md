@@ -204,14 +204,15 @@ presented); every invalid token gets the same message.
   the original result; with a different request it is `409 IDEMPOTENCY_CONFLICT`. A replayed
   claim returns `claim_token: null, claim_token_redacted: true` (the token is shown only once).
 - `expected_version` is the case `case_version` (review routes) or the source `version`
-  (pause). A stale value is `409 VERSION_CONFLICT`. Decisions also cite `listing_revision` and,
+  (source pause and resume). A stale value is `409 VERSION_CONFLICT`. Decisions also cite `listing_revision` and,
   when relevant, `valuation_id`; anything newer than the citation is a conflict.
 - Request bodies never contain actor fields; the actor is the authenticated principal.
 
 ## 6. Routes
 
 Mutation bodies are the MCP tool input models without the id that the path supplies
-(`<Body>.to_tool_input(path_id)` produces the exact tool input). Query models are the
+(`<Body>.to_tool_input(path_id)` produces the exact tool input); the one exception is the owner's
+source resume, which has no MCP tool (`ResumeSourceRequest`, see the route notes). Query models are the
 string-parsing counterparts of the MCP list inputs and convert with `to_tool_input()`.
 Path ids must be canonical UUID strings (`422` otherwise). Every authenticated route can also
 return `UNAUTHENTICATED`, `FORBIDDEN`, `VALIDATION_ERROR`, `RATE_LIMITED`,
@@ -236,6 +237,7 @@ return `UNAUTHENTICATED`, `FORBIDDEN`, `VALIDATION_ERROR`, `RATE_LIMITED`,
 | `POST /api/listings/{listing_id}/recheck` | `rechecks:request` | body `RecheckRequest` | `RecheckRequestResult` | 202 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `SOURCE_PAUSED`, `ACCESS_BLOCKED` | `deals_request_recheck` |
 | `GET /api/sources` | `deals:read` | - | `SourceListView` | 200 | - | - |
 | `POST /api/sources/{source_id}/pause` | `sources:pause` | body `PauseSourceRequest` | `SourcePauseResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | `sources_pause` |
+| `POST /api/sources/{source_id}/resume` | `config:admin` | body `ResumeSourceRequest` | `SourceResumeResult` | 200 | `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`, `VERSION_CONFLICT` | - (owner only, never an MCP tool) |
 | `GET /api/settings` | `deals:read` | - | `SettingsView` | 200 | - | - |
 | `GET /api/outbox` | `reviews:read` | query `OutboxQuery` | `OutboxPage` | 200 | - | - |
 
@@ -296,7 +298,28 @@ Route notes:
   URL) and returns `202` with the job id.
 - **Sources** show the terms status/decision separately from the technical status (a terms
   decision is an audit record, not permission), parser health, robots handling, the rate budget,
-  recent runs, pause state and `version`. **Pause** never resumes or enables a source.
+  recent runs, pause state and `version`. `enabled` is the configuration's switch (the source YAML
+  and `sources sync`; while a gate is open it stays off and `activation_problems` says why),
+  `paused` the operator pause, and `network_allowed` the server's verdict on both plus the
+  technical status (`true` only when enabled, not paused and neither `access_blocked`,
+  `parser_unhealthy` nor `untested`), so the dashboard's per-source on/off switch is drawn from
+  these fields without re-deriving any rule. **Pause** never resumes or enables a source.
+- **Resume** (`POST /api/sources/{source_id}/resume`) follows the inquiry-control resume's rules:
+  owner only (`config:admin`, which is never effective on MCP), dashboard only (there is no MCP
+  resume tool; the route is listed in `V11_DASHBOARD_ROUTES` with the other owner-only routes and
+  exported as `schemas/api/sources.source_id.resume.post.json`, but served by `api.routes` next to
+  the pause route), body `expected_version` (the source `version`), `reason` (3-2000 characters,
+  audited) and `idempotency_key` (operation `source_resume`, bound to the source; an optional
+  `Idempotency-Key` header must equal it). In ONE transaction it clears the pause and moves this
+  source's jobs that are `blocked` with `blocker_code = source_paused` back to `queued` (the guards
+  of `suv-deals jobs unblock`: due now, at least one attempt left, blocker and lease cleared, one
+  `job.unblock` audit each; other blockers and other sources' jobs are never touched), and reports
+  `requeued_jobs` (also in the `source.resume` audit). A source that is not paused answers the same
+  shape with `was_paused: false`, `requeued_jobs: 0` and changes nothing. A resume never sets
+  `enabled` and never changes the technical status: `enabled`, `technical_status` and
+  `network_allowed` in the result are the state after it, and a warning (`ACTIVATION_BLOCKED` for
+  a source its configuration does not enable, `SOURCE_BLOCKED` for `access_blocked` /
+  `parser_unhealthy`) says when the source still runs no network work.
 - **Settings** are read-only here: profiles (the optional EUR 4,000 manual profile is labelled
   `DISABLED - optional manual-review profile ...` while disabled), the MK band, the contribution
   threshold (`PROPOSED` until approved), the re-alert policy, destination bindings (external ids
@@ -381,7 +404,8 @@ text from `ResponseEnvelope.to_text()`.
 `schemas/tools/<tool>.json` (MCP `Tool` object with `inputSchema`, `outputSchema`,
 `annotations`, `requiredScope`, `paginated`, `idempotencyOperation` and `errorSchema`; the twelve
 `TOOLS`, the three served `V11_TOOLS` and the `CALC_TOOLS` calculator) and `schemas/api/<route>.json` (one file per spec 37
-route of section 10: `method`, `path`, `auth`, `requiredScope`, `requestLocation`, the `request`
+route of section 10, and per owner-only route without an MCP tool listed with them, such as the
+source resume of section 6: `method`, `path`, `auth`, `requiredScope`, `requestLocation`, the `request`
 validation schema, the `response` serialization schema, `successStatus`, `errors`, `paginated`,
 `mcpTool`, `summary` and `idempotencyKeyHeader` (`required`, `optional` or `null`); the file
 name is the path without `/v1`/`/api`, dots for slashes, plus
@@ -581,7 +605,9 @@ the spec 37.8 prose differ, the wire contract wins:
 ### 10.2 Dashboard inquiry routes
 
 User-JWT routes like section 6, enveloped, with the same error conventions. Table:
-`api.schemas.V11_DASHBOARD_ROUTES`; handlers: `api.inquiry_routes`.
+`api.schemas.V11_DASHBOARD_ROUTES`; handlers: `api.inquiry_routes`. The owner's source resume
+(`POST /api/sources/{source_id}/resume`, section 6) is listed in that table too because it has no
+MCP tool; it is served by `api.routes` next to the pause route.
 
 | Route | Scope | Request | Response `data` | Success | Extra errors | MCP tool |
 |---|---|---|---|---|---|---|

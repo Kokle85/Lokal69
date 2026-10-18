@@ -46,7 +46,9 @@ Contracts (docs/schema.md section 7):
 
 `resolve_blocked` closes a blocked ``EMAIL_DELIVERY_UNCERTAIN`` send job whose inquiry has been
 reconciled (``succeeded``/``cancelled``, audited, reason required; refused while the inquiry is
-still uncertain); it never re-queues and can never transmit.
+still uncertain); it never re-queues and can never transmit. `requeue_source_paused` is the
+set-based `unblock` of one source's ``source_paused`` jobs that the owner's source resume runs
+(same guards and column changes, one audited ``job.unblock`` per job).
 
 Scopes: recheck jobs need ``rechecks:request``; every other job type is system work (a
 ``system`` principal or ``config:admin``). Reads (`get_job`, `queue_stats`) need ``deals:read``.
@@ -834,6 +836,83 @@ async def cancel(conn: Conn, actor: ActorContext, job_id: UUID, *, reason: str |
     return JobRecord.model_validate(updated)
 
 
+#: The column changes of an unblock (`unblock` and `requeue_source_paused`): due now, at least one
+#: attempt left (``attempts`` lowered to ``max_attempts - 1`` when used up), blocker, lease and
+#: completion cleared. Unqualified columns: the statement's target is ``ops.jobs``.
+_UNBLOCK_SET: Final = sql.SQL(
+    "state = 'queued', available_at = clock_timestamp(),"
+    " attempts = least(attempts, max_attempts - 1),"
+    " blocker_code = null, blocker_detail = null, lease_owner = null,"
+    " lease_token = null, lease_expires_at = null, completed_at = null"
+)
+
+#: Blocker of a job whose source was paused, disabled or gated when a worker claimed it
+#: (``workers.runtime.disposition_for_error``); `requeue_source_paused` lifts it on a resume.
+SOURCE_PAUSED_BLOCKER: Final = "source_paused"
+
+_REQUEUE_SOURCE_PAUSED_SQL: Final = sql.SQL(
+    "with target as ("
+    " select id, attempts as attempts_before from ops.jobs"
+    " where workspace_id = %(workspace_id)s and source_id = %(source_id)s"
+    " and state = 'blocked' and blocker_code = %(blocker)s"
+    " order by id for update)"
+    " update ops.jobs set {changes} from target"
+    " where ops.jobs.workspace_id = %(workspace_id)s and ops.jobs.id = target.id"
+    " and ops.jobs.state = 'blocked' and ops.jobs.blocker_code = %(blocker)s"
+    " returning ops.jobs.id, ops.jobs.job_type, target.attempts_before, ops.jobs.attempts"
+).format(changes=_UNBLOCK_SET)
+
+
+async def requeue_source_paused(
+    conn: Conn,
+    actor: ActorContext,
+    source_id: UUID,
+    *,
+    reason: str,
+    source_key: str,
+) -> tuple[UUID, ...]:
+    """Set-based `unblock` of ONE source's ``source_paused`` jobs (the owner's source resume).
+
+    The guards of `unblock`: ``config:admin`` (or a system principal); only ``blocked`` jobs, each
+    locked first (in id order); the same column changes (`_UNBLOCK_SET`: due now, at least one
+    attempt left, blocker and lease cleared); one audited ``job.unblock`` per job (metadata ``via:
+    source.resume``, the attempts before/after). Only jobs of ``source_id`` in the actor's
+    workspace whose blocker is exactly ``source_paused`` move: every other blocker (an uncertain
+    e-mail delivery, an incompatible payload version, a host access block, ...) and every other
+    source's job stays as it is. Called by `sources_repo.resume_source` in the transaction that
+    clears the pause, while it holds the source row lock. Returns the requeued job ids (id order).
+    """
+    if actor.principal_kind != "system":
+        actor.require(Scope.CONFIG_ADMIN)
+    params = {"workspace_id": actor.workspace_id, "source_id": source_id, "blocker": SOURCE_PAUSED_BLOCKER}
+    async with mapped_errors():
+        rows = await fetch_all(conn, _REQUEUE_SOURCE_PAUSED_SQL, params)
+        rows = sorted(rows, key=lambda row: str(row["id"]))
+        for row in rows:
+            await audit.record(
+                conn,
+                actor,
+                "job.unblock",
+                "job",
+                row["id"],
+                reason=reason,
+                metadata={
+                    "job_type": str(row["job_type"]),
+                    "blocker_code": SOURCE_PAUSED_BLOCKER,
+                    "attempts_before": int(row["attempts_before"]),
+                    "attempts_after": int(row["attempts"]),
+                    "via": "source.resume",
+                    "source_key": source_key,
+                },
+            )
+    if rows:
+        logger.info(
+            "source_paused jobs requeued by a source resume",
+            extra={"source_key": source_key, "jobs": len(rows)},
+        )
+    return tuple(row["id"] for row in rows)
+
+
 async def unblock(
     conn: Conn,
     actor: ActorContext,
@@ -875,13 +954,9 @@ async def unblock(
         updated = await fetch_one(
             conn,
             sql.SQL(
-                "update ops.jobs set state = 'queued', available_at = clock_timestamp(),"
-                " attempts = least(attempts, max_attempts - 1),"
-                " blocker_code = null, blocker_detail = null, lease_owner = null,"
-                " lease_token = null, lease_expires_at = null, completed_at = null"
-                " where workspace_id = %(workspace_id)s and id = %(id)s and state = 'blocked'"
-                " returning {columns}"
-            ).format(columns=job_columns()),
+                "update ops.jobs set {changes} where workspace_id = %(workspace_id)s"
+                " and id = %(id)s and state = 'blocked' returning {columns}"
+            ).format(changes=_UNBLOCK_SET, columns=job_columns()),
             {"workspace_id": actor.workspace_id, "id": job_id},
         )
         if updated is None:  # pragma: no cover - the row is locked above

@@ -61,6 +61,7 @@ import {
   type ReplyListView,
   type ReplyView,
   type ResponseEnvelope,
+  type ResumeSourceRequest,
   type ReviewCaseView,
   type ReviewDecisionView,
   type ReviewQueuePage,
@@ -68,6 +69,7 @@ import {
   type SettingsView,
   type SourceListView,
   type SourcePauseResult,
+  type SourceResumeResult,
   type SubmitReviewRequest,
   type TaxRuleChangeResult,
   type TaxRuleSetsView,
@@ -230,6 +232,13 @@ export class ApiClient {
   }
   async pauseSource(sourceId: string, body: PauseSourceRequest, options: RequestOptions = {}) {
     return this.post<SourcePauseResult>(`/api/sources/${pathId(sourceId, 'source_id')}/pause`, body, options)
+  }
+  /**
+   * Owner only (`config:admin`): clear a source's pause and requeue its `source_paused` jobs. Never
+   * enables a source and never changes its technical status (contract section 6).
+   */
+  async resumeSource(sourceId: string, body: ResumeSourceRequest, options: RequestOptions = {}) {
+    return this.post<SourceResumeResult>(`/api/sources/${pathId(sourceId, 'source_id')}/resume`, body, options)
   }
   async settings(options: RequestOptions = {}) {
     return this.get<SettingsView>('/api/settings', undefined, options)

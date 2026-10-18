@@ -38,7 +38,9 @@ which ``api.app.create_app`` includes by default; kept apart from ``ROUTES``, th
   served by ``api.owner_config_routes``; never an MCP tool), and a listing's recorded import values
   (``/api/listings/{listing_id}/import-values``: the real purchase price and the estimated customs
   value, owner decision 2026-10-13; recording is ``config:admin`` only, reading ``deals:read``;
-  served by ``api.import_values_routes``; never an MCP tool).
+  served by ``api.import_values_routes``; never an MCP tool), and the owner's resume of a paused
+  source (``POST /api/sources/{source_id}/resume``, ``config:admin`` only, served by ``api.routes``
+  next to the pause route; never an MCP tool).
 """
 
 from __future__ import annotations
@@ -171,6 +173,7 @@ from suv_deals.views.operations import (
     SettingsView,
     SourceListView,
     SourcePauseResult,
+    SourceResumeResult,
 )
 from suv_deals.views.owner_config import (
     CostProfileApproveResult,
@@ -345,6 +348,20 @@ class PauseSourceRequest(ToolInput):
 
     def to_tool_input(self, source_id: UUID) -> SourcesPauseInput:
         return _to_input(SourcesPauseInput, {"source_id": source_id, **self.model_dump()}, "pause")
+
+
+class ResumeSourceRequest(ToolInput):
+    """Body of ``POST /api/sources/{source_id}/resume`` (owner only, ``config:admin``; never an MCP
+    tool, so there is no tool input to convert to).
+
+    The same fields as the pause body: ``expected_version`` is the source ``version`` the owner saw
+    (a changed source is ``409 VERSION_CONFLICT``), ``reason`` is audited, ``idempotency_key`` is
+    bound to the source (same key + same request replays the original result).
+    """
+
+    expected_version: SourceVersion
+    reason: Reason
+    idempotency_key: IdempotencyKey
 
 
 # --------------------------------------------------------------------------- spec 37 dashboard
@@ -1748,6 +1765,22 @@ V11_DASHBOARD_ROUTES: Final[tuple[ApiRoute, ...]] = (
         errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
         idempotency_header="optional",
     ),
+    # Served by ``api.routes`` next to the pause route. Not in ``ROUTES``: every mutation there is
+    # an MCP tool's input, and there is deliberately no resume tool (owner-only, dashboard-only).
+    _r(
+        "POST",
+        "/api/sources/{source_id}/resume",
+        SourceResumeResult,
+        scope=Scope.CONFIG_ADMIN,
+        summary=(
+            "Owner-only: clear a source's pause against the expected source version and requeue its"
+            " source_paused jobs; never enables the source or changes its technical status."
+        ),
+        request=ResumeSourceRequest,
+        location="body",
+        errors=(ErrorCode.NOT_FOUND, ErrorCode.IDEMPOTENCY_CONFLICT, ErrorCode.VERSION_CONFLICT),
+        idempotency_header="optional",
+    ),
 )
 V11_ROUTE_INDEX: Final[Mapping[str, ApiRoute]] = MappingProxyType(
     {route.key: route for route in (*MAIL_WORKER_ROUTES, *V11_DASHBOARD_ROUTES)}
@@ -1860,6 +1893,7 @@ __all__ = [
     "ReleaseRequest",
     "ReplyListQuery",
     "ResponseEnvelope",
+    "ResumeSourceRequest",
     "ReviewQueueQuery",
     "ReviewRecordInput",
     "SubmitReviewRequest",

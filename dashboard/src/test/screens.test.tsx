@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
-import type { Role, SettingsView, SourceStatusView } from '../api/types'
+import type { Role, SettingsView } from '../api/types'
 import { fakeApi, ok } from './fakeApi'
 import {
   candidateDetail,
@@ -10,6 +10,7 @@ import {
   LISTING_ID,
   me,
   SOURCE_ID,
+  sourceStatus,
   VALUATION_ID,
   XSS_DESCRIPTION,
   XSS_TITLE,
@@ -282,57 +283,11 @@ describe('settings', () => {
   })
 })
 
-function source(): SourceStatusView {
-  return {
-    source_id: SOURCE_ID,
-    source_key: 'synthetic_source',
-    display_name: 'SYNTHETIC running source',
-    country: 'DE',
-    role: 'acquisition',
-    state: 'running',
-    enabled: true,
-    paused: false,
-    pause_reason: null,
-    paused_at: null,
-    version: 4,
-    terms: {
-      status: 'no_restriction_found',
-      decision: 'proceed_acknowledged',
-      decision_actor: 'SYNTHETIC owner',
-      decision_note: null,
-      reviewed_at: null,
-      terms_url: null,
-      meaning: 'A recorded terms decision audits the owner choice; it is not legal permission.',
-    },
-    technical: {
-      status: 'live_smoke_passed',
-      mode: 'public_html',
-      adapter: 'synthetic_adapter',
-      adapter_version: 'synthetic@1.0.0',
-      detail_mode: 'fetch',
-      last_live_smoke_at: null,
-      parser_health: { status: 'healthy', sample_size: 20, reasons: [], recommended_actions: [], checked_at: null },
-    },
-    robots: { policy: 'obey', last_checked_at: null, revision_hash: null, fetch_status: null, summary: null },
-    rate_budget: {
-      budget: { daily_request_budget: 500, min_delay_seconds: 5 },
-      budget_label: 'engineering_default',
-      requests_today: 12,
-      bytes_today: null,
-      circuit_state: 'closed',
-      next_request_not_before: null,
-      retry_after_until: null,
-    },
-    last_runs: [],
-    activation_problems: [],
-  }
-}
-
 describe('sources', () => {
-  it('shows terms and technical status separately and lets an owner pause with a reason and expected version', async () => {
+  it('shows terms and technical status separately and lets an owner switch a source off with a reason and expected version', async () => {
     const api = fakeApi({
       'GET /api/me': () => ok(me('owner')),
-      'GET /api/sources': () => ok({ items: [source()] }),
+      'GET /api/sources': () => ok({ items: [sourceStatus()] }),
       'POST /api/sources/:id/pause': () =>
         ok({ source_id: SOURCE_ID, source_key: 'synthetic_source', paused: true, already_paused: false, version: 5, paused_at: '2026-10-07T10:00:00Z', reason: 'x', notice: 'Paused.' }),
     })
@@ -341,6 +296,7 @@ describe('sources', () => {
     expect(await screen.findByRole('heading', { name: 'Terms (audit record)' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Technical status (separate from terms)' })).toBeInTheDocument()
     expect(screen.getByText('12 of 500')).toBeInTheDocument()
+    await user.click(screen.getByRole('switch', { name: 'Collect from SYNTHETIC running source' }))
     const button = screen.getByRole('button', { name: 'Pause this source' })
     expect(button).toBeDisabled()
     await user.type(screen.getByLabelText(/Pause reason/), 'SYNTHETIC parser drift')
@@ -351,10 +307,11 @@ describe('sources', () => {
     expect(String(body.idempotency_key)).toMatch(/^source-pause:/)
   })
 
-  it('hides the pause control from a reviewer', async () => {
-    const api = fakeApi({ 'GET /api/me': () => ok(me('reviewer')), 'GET /api/sources': () => ok({ items: [source()] }) })
+  it('shows a reviewer the switch read-only', async () => {
+    const api = fakeApi({ 'GET /api/me': () => ok(me('reviewer')), 'GET /api/sources': () => ok({ items: [sourceStatus()] }) })
     renderApp('/sources', { api })
     await screen.findByRole('heading', { name: 'Terms (audit record)' })
+    expect(screen.getByRole('switch', { name: 'Collect from SYNTHETIC running source' })).toHaveAttribute('aria-disabled', 'true')
     expect(screen.queryByRole('button', { name: 'Pause this source' })).toBeNull()
   })
 })

@@ -32,6 +32,15 @@ with the MCP ``deals_request_recheck`` tool): a budget-controlled ``recheck`` jo
 listing only (the stored canonical URL; the request carries no URL). A paused, disabled or
 parser-unhealthy source is ``SOURCE_PAUSED``; an access-blocked source is ``ACCESS_BLOCKED``; a
 detail job already waiting for the listing is returned as ``deduplicated: true``.
+
+Pause and resume of a source: pause (``POST /api/sources/{source_id}/pause``) is the
+``sources_pause`` tool's rule set (``sources:pause``). Resume (``POST /api/sources/{source_id}/resume``)
+follows the inquiry-control resume's rules: owner-only (``config:admin``), dashboard-only (no MCP
+tool; its route entry is in ``V11_DASHBOARD_ROUTES``), expected version, reason, idempotency key and
+an optional matching ``Idempotency-Key`` header. It clears the pause and requeues the source's
+``source_paused`` jobs; it never enables a source and never changes its technical status (the
+response warns when either still keeps the source off). These two are the dashboard's per-source
+on/off switch.
 """
 
 from __future__ import annotations
@@ -68,6 +77,7 @@ from suv_deals.api.deps import (
 from suv_deals.api.errors import JSON_MEDIA_TYPE, method_not_allowed
 from suv_deals.api.schemas import (
     ROUTE_INDEX,
+    V11_ROUTE_INDEX,
     AddNoteRequest,
     ApiRoute,
     CandidateDetailQuery,
@@ -78,13 +88,14 @@ from suv_deals.api.schemas import (
     PauseSourceRequest,
     RecheckRequest,
     ReleaseRequest,
+    ResumeSourceRequest,
     ReviewQueueQuery,
     SubmitReviewRequest,
 )
 from suv_deals.clock import ensure_utc
 from suv_deals.domain.actor import ActorContext
 from suv_deals.domain.due_diligence import DashboardAction
-from suv_deals.domain.enums import ReviewOutcome, Scope
+from suv_deals.domain.enums import ReviewOutcome, Scope, TechnicalStatus
 from suv_deals.domain.reviews import DASHBOARD_ACTION_CODES, check_dashboard_action_outcome
 from suv_deals.errors import AppError, ErrorCode
 from suv_deals.mcp.schemas import ReviewsSubmitInput
@@ -100,6 +111,7 @@ from suv_deals.views.operations import (
     MeView,
     ReadinessCheck,
     ReadinessView,
+    SourceResumeResult,
     WorkspaceView,
 )
 
@@ -143,6 +155,8 @@ NOTES: Final = _route("POST /api/listings/{listing_id}/notes")
 RECHECK: Final = _route("POST /api/listings/{listing_id}/recheck")
 SOURCES: Final = _route("GET /api/sources")
 PAUSE: Final = _route("POST /api/sources/{source_id}/pause")
+#: Owner-only resume: listed in ``V11_DASHBOARD_ROUTES`` (no MCP tool), served here next to pause.
+RESUME: Final = V11_ROUTE_INDEX["POST /api/sources/{source_id}/resume"]
 SETTINGS: Final = _route("GET /api/settings")
 OUTBOX: Final = _route("GET /api/outbox")
 
@@ -604,6 +618,57 @@ async def post_pause(request: Request, source_id: str, auth: Authenticated) -> R
     return _respond(PAUSE, _mutation_envelope(view, auth, as_of, warnings))
 
 
+def resume_warnings(result: SourceResumeResult) -> list[ResponseWarning]:
+    """Why a resumed source may still run no new network work: the resume never enables a source
+    and never changes its technical status, so either one keeps it off (and its requeued jobs are
+    blocked again by the worker before any request)."""
+    if result.technical_status in (TechnicalStatus.ACCESS_BLOCKED, TechnicalStatus.PARSER_UNHEALTHY):
+        return [
+            warning(
+                WarningCode.SOURCE_BLOCKED,
+                f"The source's technical status is {result.technical_status.value}: no new network work"
+                " runs until the owner clears it with the explicit technical-status action (the block"
+                " must be reported); the resume did not change it.",
+            )
+        ]
+    if not result.enabled:
+        return [
+            warning(
+                WarningCode.ACTIVATION_BLOCKED,
+                "The source is not enabled by its configuration: the resume did not enable it (enabling"
+                " is a source YAML revision and `sources sync`). No new network work runs for it.",
+            )
+        ]
+    return []
+
+
+@router.post("/api/sources/{source_id}/resume")
+async def post_resume(request: Request, source_id: str, auth: Authenticated) -> Response:
+    """The owner's resume (``config:admin``; dashboard only, never an MCP tool): clears the pause
+    against ``expected_version`` and requeues the source's ``source_paused`` jobs in the same
+    transaction (``sources_repo.resume_source``). A source that is not paused answers the same
+    shape with ``was_paused: false`` and ``requeued_jobs: 0``."""
+    require_scope(request, auth, RESUME.scope)
+    no_query(request)
+    target = path_id(source_id, "source_id")
+    body = await body_model(request, ResumeSourceRequest)
+    check_idempotency_header(request, body.idempotency_key)
+
+    async def work(conn: Conn, actor: ActorContext) -> tuple[SourceResumeResult, datetime]:
+        result = await sources_repo.resume_source(
+            conn,
+            actor,
+            target,
+            body.expected_version,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+        return result, await _now(conn)
+
+    view, as_of = await _read(request, auth, work)
+    return _respond(RESUME, _mutation_envelope(view, auth, as_of, resume_warnings(view)))
+
+
 @router.get("/api/settings")
 async def get_settings_view(request: Request, auth: Authenticated) -> Response:
     require_scope(request, auth, SETTINGS.scope)
@@ -703,5 +768,6 @@ __all__ = [
     "install_api_fallback",
     "json_response",
     "readiness_view",
+    "resume_warnings",
     "router",
 ]

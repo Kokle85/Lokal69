@@ -61,7 +61,10 @@ def test_the_app_serves_exactly_the_contract_routes() -> None:
         for method in getattr(route, "methods", ()) or ()
         if method != "HEAD"
     }
-    assert served == {route.key for route in ROUTES}
+    # ``ROUTES`` plus the owner's source resume, which ``api.routes`` serves next to the pause route
+    # but which is listed with the owner-only, non-MCP routes (``V11_DASHBOARD_ROUTES``).
+    assert served == {route.key for route in ROUTES} | {routes.RESUME.key}
+    assert routes.RESUME.key == "POST /api/sources/{source_id}/resume"
 
 
 async def test_every_read_route_returns_its_published_schema(data_api: DataHarness) -> None:

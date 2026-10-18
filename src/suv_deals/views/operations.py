@@ -309,8 +309,29 @@ class CrawlRunView(ViewModel):
         return self
 
 
+#: Technical statuses under which no new network work starts, whatever ``enabled`` and ``paused``
+#: say (``transactions.lock_source``, the scheduler's skip reasons). ``untested`` never goes with
+#: an enabled source (activation gate); it is listed so the rule needs no such assumption.
+NETWORK_BLOCKING_TECHNICAL_STATUSES: Final = frozenset(
+    {TechnicalStatus.ACCESS_BLOCKED, TechnicalStatus.PARSER_UNHEALTHY, TechnicalStatus.UNTESTED}
+)
+
+
+def network_work_allowed(*, enabled: bool, paused: bool, technical_status: TechnicalStatus) -> bool:
+    """Whether new network work may start for a source: enabled by its configuration, not paused,
+    and a technical status that does not stop it."""
+    return enabled and not paused and technical_status not in NETWORK_BLOCKING_TECHNICAL_STATUSES
+
+
 class SourceStatusView(ViewModel):
-    """One registered source (spec 23 screen 6). ``version`` is the ``sources_pause`` expected version."""
+    """One registered source (spec 23 screen 6). ``version`` is the ``sources_pause`` (and owner
+    resume) expected version.
+
+    ``enabled`` is the configuration's switch (source YAML + ``sources sync``; the activation CHECK
+    keeps it off while a gate is open, ``activation_problems`` then lists why); ``paused`` is the
+    operator pause. ``network_allowed`` is the server's verdict on both plus the technical status
+    (`network_work_allowed`), so a client never has to re-derive which statuses stop new work.
+    """
 
     source_id: UUID
     source_key: str = Field(max_length=80)
@@ -323,6 +344,7 @@ class SourceStatusView(ViewModel):
     pause_reason: str | None = Field(max_length=2000)
     paused_at: UtcDatetime | None
     version: int = Field(ge=1)
+    network_allowed: bool
     terms: TermsView
     technical: TechnicalView
     robots: RobotsView
@@ -338,6 +360,11 @@ class SourceStatusView(ViewModel):
             raise ValueError("a paused source reads as paused")
         if self.enabled and self.activation_problems:
             raise ValueError("an enabled source has no activation problems")
+        expected = network_work_allowed(
+            enabled=self.enabled, paused=self.paused, technical_status=self.technical.status
+        )
+        if self.network_allowed != expected:
+            raise ValueError("network_allowed follows enabled, paused and the technical status")
         return self
 
 
@@ -356,6 +383,47 @@ class SourcePauseResult(ViewModel):
     paused_at: UtcDatetime
     reason: str = Field(min_length=3, max_length=2000)
     notice: str = "Paused. Resuming or enabling requires a separate owner action."
+
+
+RESUME_NOTICE: Final = (
+    "A resume only clears the operator pause. It never enables a source (enabling is a configuration"
+    " revision: the source YAML and `sources sync`) and never changes its technical status"
+    " (access_blocked / parser_unhealthy are cleared only by the owner's explicit technical-status action)."
+)
+
+
+class SourceResumeResult(ViewModel):
+    """The owner's resume of a paused source (``POST /api/sources/{source_id}/resume`` and
+    ``suv-deals sources resume``; ``config:admin``, never an MCP tool).
+
+    ``was_paused=False`` is the no-op of a source that was not paused (nothing changed, no job
+    requeued). Otherwise the pause is cleared and, in the same transaction, this source's jobs that
+    were ``blocked`` with ``source_paused`` are back in ``queued`` (``requeued_jobs``). ``enabled``,
+    ``technical_status`` and ``network_allowed`` are the source's state after the resume: they are
+    never changed by it, so a source the configuration does not enable stays off.
+    """
+
+    source_id: UUID
+    source_key: str = Field(max_length=80)
+    paused: Literal[False] = False
+    was_paused: bool
+    version: int = Field(ge=1)
+    enabled: bool
+    technical_status: TechnicalStatus
+    network_allowed: bool
+    requeued_jobs: int = Field(ge=0)
+    notice: str = RESUME_NOTICE
+
+    @model_validator(mode="after")
+    def _consistent(self) -> SourceResumeResult:
+        if not self.was_paused and self.requeued_jobs:
+            raise ValueError("a resume of a source that was not paused requeues nothing")
+        expected = network_work_allowed(
+            enabled=self.enabled, paused=False, technical_status=self.technical_status
+        )
+        if self.network_allowed != expected:
+            raise ValueError("network_allowed follows enabled and the technical status")
+        return self
 
 
 # --------------------------------------------------------------------------- overview

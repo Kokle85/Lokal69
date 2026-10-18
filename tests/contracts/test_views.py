@@ -153,6 +153,7 @@ from suv_deals.views import (
     SourceLink,
     SourceListView,
     SourcePauseResult,
+    SourceResumeResult,
     SourceRunState,
     SourceStatusView,
     ValuationRef,
@@ -1280,6 +1281,7 @@ def source_status(**overrides: Any) -> SourceStatusView:
         "pause_reason": None,
         "paused_at": None,
         "version": 4,
+        "network_allowed": False,
         "terms": TermsView(
             status=TermsStatus.RESTRICTED,
             decision=TermsDecision.PENDING,
@@ -1349,6 +1351,71 @@ def test_source_status_separates_terms_and_technical() -> None:
         source_status(enabled=True, state=SourceRunState.RUNNING)
     with pytest.raises(ValidationError):  # running runs have no finish time
         CrawlRunView.model_validate({**source_status().last_runs[0].model_dump(), "outcome": "running"})
+    # network_allowed is the server's verdict on enabled + paused + technical status, never a guess.
+    assert dumped["network_allowed"] is False
+    with pytest.raises(ValidationError):  # a disabled source never allows network work
+        source_status(network_allowed=True)
+
+
+def _technical(status: TechnicalStatus) -> TechnicalView:
+    return source_status().technical.model_copy(update={"status": status})
+
+
+@pytest.mark.parametrize(
+    ("enabled", "paused", "status", "allowed"),
+    [
+        (True, False, TechnicalStatus.LIVE_SMOKE_PASSED, True),
+        (True, False, TechnicalStatus.FIXTURE_TESTED, True),
+        (True, False, TechnicalStatus.DEGRADED, True),
+        (True, True, TechnicalStatus.LIVE_SMOKE_PASSED, False),
+        (False, False, TechnicalStatus.LIVE_SMOKE_PASSED, False),
+        (False, False, TechnicalStatus.ACCESS_BLOCKED, False),
+        (False, False, TechnicalStatus.PARSER_UNHEALTHY, False),
+    ],
+)
+def test_network_allowed_follows_enabled_pause_and_technical_status(
+    enabled: bool, paused: bool, status: TechnicalStatus, allowed: bool
+) -> None:
+    state = (
+        SourceRunState.PAUSED if paused else (SourceRunState.RUNNING if enabled else SourceRunState.DISABLED)
+    )
+    view = source_status(
+        enabled=enabled,
+        paused=paused,
+        pause_reason="SYNTHETIC pause" if paused else None,
+        paused_at=NOW if paused else None,
+        state=state,
+        technical=_technical(status),
+        activation_problems=() if enabled else ("source is disabled in configuration",),
+        network_allowed=allowed,
+    )
+    assert view.network_allowed is allowed
+    with pytest.raises(ValidationError):
+        SourceStatusView.model_validate({**view.model_dump(), "network_allowed": not allowed})
+
+
+def test_resume_result_never_claims_more_than_the_resume_did() -> None:
+    result = SourceResumeResult(
+        source_id=SOURCE_ID,
+        source_key="mobile_de_public",
+        was_paused=True,
+        version=5,
+        enabled=True,
+        technical_status=TechnicalStatus.LIVE_SMOKE_PASSED,
+        network_allowed=True,
+        requeued_jobs=3,
+    )
+    dumped = result.model_dump(mode="json")
+    assert dumped["paused"] is False and dumped["requeued_jobs"] == 3
+    assert "never enables a source" in dumped["notice"] and "technical status" in dumped["notice"]
+    with pytest.raises(ValidationError):  # a no-op resume requeues nothing
+        SourceResumeResult.model_validate({**result.model_dump(), "was_paused": False})
+    with pytest.raises(ValidationError):  # a disabled source is never reported as running
+        SourceResumeResult.model_validate({**result.model_dump(), "enabled": False})
+    blocked = {**result.model_dump(), "technical_status": TechnicalStatus.ACCESS_BLOCKED, "enabled": False}
+    assert SourceResumeResult.model_validate({**blocked, "network_allowed": False}).network_allowed is False
+    with pytest.raises(ValidationError):
+        SourceResumeResult.model_validate({**result.model_dump(), "paused": True})
 
 
 def test_overview_counts_must_match() -> None:
@@ -1520,6 +1587,7 @@ OUTPUT_VIEWS: tuple[type[BaseModel], ...] = (
     OverviewView,
     SettingsView,
     SourceStatusView,
+    SourceResumeResult,
     MeView,
     OutboxItemView,
     ReadinessView,

@@ -15,6 +15,8 @@ export interface Manifest {
   comparable_set_id: string
   titles: Record<string, string>
   sources: Record<string, string>
+  /** Jobs of the paused source that a worker blocked as `source_paused` (requeued by a resume). */
+  paused_source_waiting_jobs: number
   /** The SYNTHETIC spec v1.1 world (tests/e2e/seed_v11.py). */
   v11: {
     inquiries: Record<V11InquiryKey, string>

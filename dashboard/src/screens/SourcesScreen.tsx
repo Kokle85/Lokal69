@@ -1,5 +1,4 @@
-import { useState } from 'react'
-import { LIMITS, type PauseSourceRequest, type SourcePauseResult, type SourceStatusView } from '../api/types'
+import type { SourceStatusView } from '../api/types'
 import {
   Badge,
   EmptyState,
@@ -7,7 +6,6 @@ import {
   ExternalLink,
   KeyValues,
   LoadingState,
-  Notice,
   Section,
   Timestamp,
   ViewMeta,
@@ -15,9 +13,8 @@ import {
 } from '../components/ui'
 import { label, yesNo } from '../format'
 import { useApiQuery } from '../hooks/useApiQuery'
-import { MutationStatus } from '../review/MutationStatus'
-import { useIdempotentMutation } from '../review/useIdempotentMutation'
 import { useWorkspace } from '../workspace/WorkspaceProvider'
+import { SourceSwitch } from './SourceSwitch'
 
 export function SourcesScreen() {
   const { timezone } = useWorkspace()
@@ -50,19 +47,10 @@ function SourceCard({ source, timeZone, onChanged }: { source: SourceStatusView;
       actions={<Badge value={source.state} />}
     >
       <p className="muted">
-        {source.source_key} · {source.country} · {label(source.role)} · enabled {yesNo(source.enabled)} · version {source.version}
+        {source.source_key} · {source.country} · {label(source.role)} · enabled in the configuration {yesNo(source.enabled)} ·
+        version {source.version}
       </p>
-      {source.paused ? (
-        <Notice tone="warn">
-          Paused{source.paused_at ? (
-            <>
-              {' '}
-              since <Timestamp value={source.paused_at} timeZone={timeZone} />
-            </>
-          ) : null}
-          : {source.pause_reason ?? 'no reason recorded'}. No new network work runs for this source.
-        </Notice>
-      ) : null}
+      <SourceSwitch source={source} timeZone={timeZone} onChanged={onChanged} />
       <div className="two-columns">
         <div>
           <h3>Terms (audit record)</h3>
@@ -162,81 +150,6 @@ function SourceCard({ source, timeZone, onChanged }: { source: SourceStatusView;
           </tbody>
         </table>
       )}
-      <PauseControl source={source} onChanged={onChanged} />
     </Section>
-  )
-}
-
-function PauseControl({ source, onChanged }: { source: SourceStatusView; onChanged: () => void }) {
-  const { client, can } = useWorkspace()
-  const [reason, setReason] = useState('')
-  const mutation = useIdempotentMutation<PauseSourceRequest, SourcePauseResult>(
-    'source-pause',
-    (body) => client.pauseSource(source.source_id, body),
-    {
-      settled: (_attempt, outcome) => {
-        if ('envelope' in outcome) {
-          setReason('')
-          onChanged()
-        }
-      },
-    },
-  )
-  if (!can('sources:pause')) return null
-  const status = (
-    <MutationStatus
-      phase={mutation.phase}
-      onRetry={() => void mutation.retry()}
-      onDiscard={() => {
-        mutation.reset()
-        onChanged()
-      }}
-      pendingText="Pausing…"
-      confirmed={(result) => (result.already_paused ? 'The source was already paused.' : 'Source paused.')}
-      extraOnRejected={
-        mutation.phase.kind === 'rejected' && mutation.phase.error.code === 'VERSION_CONFLICT' ? (
-          <button type="button" className="button secondary" onClick={onChanged}>
-            Reload sources
-          </button>
-        ) : null
-      }
-    />
-  )
-  if (source.paused) {
-    // The confirmation stays visible after the reload that shows the source as paused.
-    return (
-      <div className="pause-form">
-        {status}
-        <p className="muted">Resuming is not available from the dashboard (the owner resumes sources deliberately elsewhere).</p>
-      </div>
-    )
-  }
-  const locked = mutation.phase.kind === 'pending' || mutation.phase.kind === 'unconfirmed'
-  const valid = reason.trim().length >= LIMITS.reasonMin
-  const inputId = `pause-reason-${source.source_id}`
-  return (
-    <form
-      className="form pause-form"
-      onSubmit={(event) => {
-        event.preventDefault()
-        if (valid) void mutation.submit({ expected_version: source.version, reason: reason.trim() })
-      }}
-    >
-      <label htmlFor={inputId}>Pause reason (required; recorded in the audit trail)</label>
-      <input
-        id={inputId}
-        value={reason}
-        minLength={LIMITS.reasonMin}
-        maxLength={LIMITS.reasonMax}
-        onChange={(event) => setReason(event.target.value)}
-        disabled={locked}
-      />
-      <div className="form-actions">
-        <button type="submit" className="button danger" disabled={locked || !valid}>
-          Pause this source
-        </button>
-      </div>
-      {status}
-    </form>
   )
 }

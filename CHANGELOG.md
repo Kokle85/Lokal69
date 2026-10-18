@@ -10,6 +10,49 @@ scheduler and worker run.
 
 ## Unreleased (on top of `7f7e187`)
 
+Per-source on/off switch on the dashboard. Owner request 2026-10-18:
+"направи и toogle на фронт енд за палење и гасење". The Sources screen's pause form is replaced by
+one switch per source, built on pause and resume only, so the existing rules stay as they are:
+enabling a source is still a committed YAML revision plus `sources sync`, and `access_blocked` /
+`parser_unhealthy` are still cleared only by the owner's explicit technical-status action.
+
+- **`POST /api/sources/{source_id}/resume`** (`api.routes`, next to the pause route; owner only,
+  `config:admin`; never an MCP tool, so it is listed in `V11_DASHBOARD_ROUTES` and exported as
+  `schemas/api/sources.source_id.resume.post.json`): body `ResumeSourceRequest` (`expected_version`,
+  `reason` 3-2000, `idempotency_key`; optional matching `Idempotency-Key` header), result
+  `SourceResumeResult` (`was_paused`, `requeued_jobs`, and the unchanged `enabled`,
+  `technical_status`, `network_allowed`), warnings `ACTIVATION_BLOCKED` / `SOURCE_BLOCKED` when the
+  source still runs no network work. Same owner-only, dashboard-only rules as the inquiry-control
+  resume.
+- **`sources_repo.resume_source`** clears the pause and, in the same transaction, requeues this
+  source's jobs that are `blocked` with `source_paused` (`jobs.requeue_source_paused`: the guards
+  and column changes of `jobs.unblock`, shared as `_UNBLOCK_SET`; one `job.unblock` audit per job;
+  the `source.resume` audit records the count). A source that is not paused is a no-op with the
+  same result shape. It never sets `enabled` and never changes the technical status. Optional
+  idempotency key (operation `source_resume`, bound to the source). `suv-deals sources resume`
+  prints `requeued_jobs=N` and the requeued count.
+- **`SourceStatusView.network_allowed`** (`GET /api/sources`): the server's verdict (enabled, not
+  paused, technical status not `access_blocked` / `parser_unhealthy` / `untested`;
+  `views.operations.network_work_allowed`), so the dashboard draws the switch without re-deriving
+  a rule.
+- **Dashboard** (`dashboard/src/screens/SourceSwitch.tsx`): a `<button role="switch"
+  aria-checked>` per source. On: "Running"; switching off opens the pause form (reason required).
+  Off because paused: "Paused" with reason and time; switching on opens the resume confirmation
+  (owner only; otherwise disabled with a short explanation) and reports how many waiting jobs were
+  requeued. Off because the configuration does not enable it, or blocked by the technical status:
+  disabled, with the reason (YAML + `sources sync`; report the block). Keyboard operable, focusable
+  while disabled (`aria-disabled`), state and help as its description, idempotent mutations through
+  `useIdempotentMutation`, conflicts through the shared conflict UI, phone width without
+  horizontal scroll. `resumeSource` in the API client.
+- Tests: `tests/api/test_source_resume_route.py` (happy path, no-op, version conflict, `sources:pause`
+  alone refused, idempotent replay and key reuse, requeue of this source's `source_paused` jobs
+  only, never enables a disabled source, never clears `access_blocked`, not found across
+  workspaces), `tests/integration/repos_sources_listings/test_source_resume.py` (requeue guards,
+  attempts, audits, scope, idempotency), the CLI count (`tests/cli/test_db_commands.py`), view
+  contracts, `dashboard/src/test/sourceSwitch.test.tsx` (every switch state and both flows) and
+  `dashboard/e2e/sources.spec.ts` (the seeded paused source's two `source_paused` jobs requeued by
+  a keyboard resume, then paused again). Docs: docs/runbook.md 2.3, docs/api_contract.md section 6.
+
 **Activation step 7 for `autoscout24_it` (2026-10-18): enabled, every 15 minutes.** The owner's
 decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes"), after
 the step-6 live smoke of 2026-10-17.

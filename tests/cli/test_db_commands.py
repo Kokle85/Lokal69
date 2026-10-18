@@ -578,6 +578,54 @@ def test_owner_recovery_actions_never_enable_a_source(
     )
     assert resumed.exit_code == 0, resumed.output
     assert "paused=false, enabled=false" in resumed.output
+    assert "technical_status=fixture_tested, requeued_jobs=0" in resumed.output
+    assert "No new network work runs for this source yet" in resumed.output
+
+
+def test_sources_resume_requeues_and_prints_the_waiting_jobs(
+    run_cli: Cli, db_env: dict[str, str], workspace: UUID, seed: Seed
+) -> None:
+    ws = str(workspace)
+    assert (
+        run_cli("sources", "sync", "--workspace", ws, "--fixture-sources", "--yes", env=db_env).exit_code == 0
+    )
+    source_id = seed.scalar(
+        "select id from app.sources where workspace_id = %s and source_key = 'fixture_dealer_de'",
+        (workspace,),
+    )
+    seed.conn.execute(
+        "update app.sources set paused = true, pause_reason = 'synthetic pause', paused_at = now(),"
+        " version = version + 1 where id = %s",
+        (source_id,),
+    )
+
+    def blocked(blocker: str) -> UUID:
+        return seed.job(
+            workspace,
+            job_type="discovery",
+            state="blocked",
+            blocker_code=blocker,
+            attempts=1,
+            source_id=source_id,
+        )
+
+    waiting = [blocked("source_paused"), blocked("source_paused")]
+    other = blocked("incompatible_payload_version")
+    args = ("sources", "resume", "fixture_dealer_de", "--workspace", ws, "--reason", "synthetic resume")
+    refused = run_cli(*args, env=db_env)
+    assert refused.exit_code == 3  # --yes is required; nothing changed
+    assert seed.scalar("select paused from app.sources where id = %s", (source_id,)) is True
+    resumed = run_cli(*args, "--yes", env=db_env)
+    assert resumed.exit_code == 0, resumed.output
+    assert "fixture_dealer_de: paused=false" in resumed.output and "requeued_jobs=2" in resumed.output
+    assert "Requeued 2 waiting job(s) of fixture_dealer_de (source_paused -> queued)." in resumed.output
+    states = {
+        job: seed.scalar("select state from ops.jobs where id = %s", (job,)) for job in (*waiting, other)
+    }
+    assert states == {waiting[0]: "queued", waiting[1]: "queued", other: "blocked"}
+    again = run_cli(*args, "--yes", env=db_env)
+    assert again.exit_code == 0, again.output
+    assert "requeued_jobs=0 (was not paused; nothing changed)" in again.output
 
 
 def test_reviews_list_reads_cases_through_the_repository(

@@ -17,7 +17,11 @@ Source registry (``app.sources``)
 Pause and access blocks
     `pause_source` implements the ``sources_pause`` tool: ``sources:pause`` scope, optimistic
     ``expected_version``, an idempotency record (``ops.idempotency_records``, taken first), never an
-    implicit resume or enable. `resume_source` is a separate owner action (``config:admin``).
+    implicit resume or enable. `resume_source` is a separate owner action (``config:admin``; the
+    dashboard's Sources switch and ``suv-deals sources resume``, never an MCP tool): it clears the
+    pause and, in the same transaction, puts this source's ``source_paused`` blocked jobs back in
+    ``queued`` (`jobs.requeue_source_paused`); it never enables a source and never changes its
+    technical status.
     `record_access_block` (spec 5, 9: 401/403/CAPTCHA/login/paywall) stops all network work of the
     source (technical status ``access_blocked``) and opens exactly ONE deduplicated operational
     review item: the per-source activation gate ``source_access.<source_key>`` in status
@@ -126,13 +130,19 @@ from suv_deals.views.operations import (
     RobotsView,
     SourceListView,
     SourcePauseResult,
+    SourceResumeResult,
     SourceRunState,
     SourceStatusView,
     TechnicalView,
     TermsView,
+    network_work_allowed,
 )
 
 PAUSE_OPERATION: Final = "sources_pause"
+#: Idempotency operation of the owner's resume (dashboard route); never an MCP tool name.
+RESUME_OPERATION: Final = "source_resume"
+#: Requeued job ids listed in the ``source.resume`` audit metadata (the count is always complete).
+MAX_AUDITED_JOB_IDS: Final = 50
 ACCESS_GATE_PREFIX: Final = "source_access."
 RUNTIME_BLOCKING_STATUSES: Final = frozenset(
     {TechnicalStatus.ACCESS_BLOCKED, TechnicalStatus.PARSER_UNHEALTHY}
@@ -1046,6 +1056,9 @@ async def _status_view(conn: Conn, record: SourceRecord) -> SourceStatusView:
         pause_reason=record.pause_reason,
         paused_at=record.paused_at,
         version=record.version,
+        network_allowed=network_work_allowed(
+            enabled=record.enabled, paused=record.paused, technical_status=record.technical_status
+        ),
         terms=TermsView(
             status=record.terms_status,
             decision=record.terms_decision,
@@ -1325,41 +1338,109 @@ async def pause_source(  # noqa: PLR0917 - mirrors the sources_pause tool input
     return result
 
 
+def _resume_result(record: SourceRecord, *, was_paused: bool, requeued_jobs: int) -> SourceResumeResult:
+    return SourceResumeResult(
+        source_id=record.id,
+        source_key=record.source_key,
+        was_paused=was_paused,
+        version=record.version,
+        enabled=record.enabled,
+        technical_status=record.technical_status,
+        network_allowed=network_work_allowed(
+            enabled=record.enabled, paused=record.paused, technical_status=record.technical_status
+        ),
+        requeued_jobs=requeued_jobs,
+    )
+
+
 async def resume_source(
-    conn: Conn, actor: ActorContext, source_id: UUID, expected_version: int, *, reason: str
-) -> SourceRecord:
-    """Explicit owner action (``config:admin``): clear a pause. Never enables a disabled source."""
+    conn: Conn,
+    actor: ActorContext,
+    source_id: UUID,
+    expected_version: int,
+    *,
+    reason: str,
+    idempotency_key: str | None = None,
+) -> SourceResumeResult:
+    """Explicit owner action (``config:admin``): clear a pause, then requeue what it blocked.
+
+    One transaction: lock the source, check ``expected_version`` (`VersionConflict` otherwise),
+    clear the pause fields (``version + 1``) and move this source's jobs that are ``blocked`` with
+    ``source_paused`` back to ``queued`` (`jobs.requeue_source_paused`: the guards of `jobs.unblock`,
+    one ``job.unblock`` audit per job). The ``source.resume`` audit records the requeued count. A
+    source that is not paused is a no-op with the same result shape (``was_paused=False``,
+    ``requeued_jobs=0``; nothing written, no job touched). Never sets ``enabled`` and never changes
+    the technical status: a source its configuration does not enable stays off (enabling is a
+    YAML revision + ``sources sync``), and ``access_blocked`` / ``parser_unhealthy`` stay until the
+    owner's `set_technical_status` (its requeued jobs are blocked again by the worker before any
+    request). Never an MCP tool.
+
+    ``idempotency_key`` (the dashboard route; the CLI sends none): same key + same request
+    (source, expected version, reason) replays the original result, a different request with the
+    key is `IdempotencyConflict`; the key is bound to the source, so it never resumes another one.
+    """
     actor.require(Scope.CONFIG_ADMIN)
     clean_reason = _text(reason, 2000, minimum=3, name="reason")
+    assert clean_reason is not None
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+        raise ValidationFailed("expected_version must be a positive integer")
+    request_hash = idempotency.request_hash_for(
+        RESUME_OPERATION,
+        {"source_id": str(source_id), "expected_version": expected_version, "reason": clean_reason},
+    )
     async with mapped_errors():
+        if idempotency_key is not None:
+            started = await idempotency.begin(conn, actor, RESUME_OPERATION, idempotency_key, request_hash)
+            if isinstance(started, idempotency.Replay):
+                return SourceResumeResult.model_validate(started.result)
+            if isinstance(started, idempotency.ReplayError):
+                raise _replay_error(started.error_code)
+            if isinstance(started, idempotency.InProgress):
+                raise TransientConflict.in_progress()
         source = await _load_source(conn, actor.workspace_id, source_id, lock=" for update")
         if source.version != expected_version:
             raise VersionConflict("The source changed; reload and retry", current_version=source.version)
         if not source.paused:
-            return source
-        row = await fetch_one(
-            conn,
-            sql.SQL(
-                "update app.sources set paused = false, pause_reason = null, paused_by = null,"
-                " paused_at = null, version = version + 1"
-                " where workspace_id = %(workspace_id)s and id = %(id)s returning {returning}"
-            ).format(returning=_cols(_SOURCE_COLUMNS)),
-            {"workspace_id": actor.workspace_id, "id": source.id},
-        )
-        assert row is not None
-        record = SourceRecord.model_validate(row)
-        await audit.record(
-            conn,
-            actor,
-            "source.resume",
-            "source",
-            source.id,
-            prior_version=source.version,
-            new_version=record.version,
-            reason=clean_reason,
-            metadata={"source_key": source.source_key, "prior_pause_reason": source.pause_reason},
-        )
-    return record
+            result = _resume_result(source, was_paused=False, requeued_jobs=0)
+        else:
+            row = await fetch_one(
+                conn,
+                sql.SQL(
+                    "update app.sources set paused = false, pause_reason = null, paused_by = null,"
+                    " paused_at = null, version = version + 1"
+                    " where workspace_id = %(workspace_id)s and id = %(id)s returning {returning}"
+                ).format(returning=_cols(_SOURCE_COLUMNS)),
+                {"workspace_id": actor.workspace_id, "id": source.id},
+            )
+            assert row is not None
+            record = SourceRecord.model_validate(row)
+            requeued = await jobs.requeue_source_paused(
+                conn, actor, source.id, reason=f"source resumed: {clean_reason}", source_key=source.source_key
+            )
+            result = _resume_result(record, was_paused=True, requeued_jobs=len(requeued))
+            await audit.record(
+                conn,
+                actor,
+                "source.resume",
+                "source",
+                source.id,
+                prior_version=source.version,
+                new_version=record.version,
+                reason=clean_reason,
+                metadata={
+                    "source_key": source.source_key,
+                    "prior_pause_reason": source.pause_reason,
+                    "requeued_jobs": len(requeued),
+                    "requeued_job_ids": [str(job_id) for job_id in requeued[:MAX_AUDITED_JOB_IDS]],
+                    "enabled": record.enabled,
+                    "technical_status": record.technical_status.value,
+                },
+            )
+        if idempotency_key is not None:
+            await idempotency.complete(
+                conn, actor, RESUME_OPERATION, idempotency_key, result.model_dump(mode="json")
+            )
+    return result
 
 
 def access_gate_capability(source_key: str) -> str:
@@ -2409,6 +2490,8 @@ async def _apply_run_to_schedule(
 
 __all__ = [
     "ACCESS_GATE_PREFIX",
+    "MAX_AUDITED_JOB_IDS",
+    "RESUME_OPERATION",
     "AccessBlockResult",
     "CrawlRunRecord",
     "RobotsRevisionResult",

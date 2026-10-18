@@ -157,6 +157,41 @@ source's YAML (`config/sources/<key>.yaml`):
    (audited `schedule.reconfigure` with the before/after interval and due time); no migration,
    no restart, no new rows. A slot already run is never run again.
 
+### 2.3 Switching a source on and off (dashboard Sources switch)
+
+A source has two separate switches, and only one of them is on the dashboard:
+
+- **Enabled, by the configuration.** A source runs only while its committed YAML
+  (`config/sources/<key>.yaml`) says `enabled: true` and `suv-deals sources sync --yes` has recorded
+  that revision (activation step 7; `SourceConfig`, the sync and the database CHECK refuse enabling
+  while any gate is open). This stays an auditable configuration revision: the dashboard never
+  changes it. A source the configuration does not enable shows its switch off and disabled ("Off
+  (configuration)") with the activation problems below it.
+- **Paused, by an operator.** The Sources screen has one on/off switch per source
+  (`<button role="switch">`, keyboard operable):
+  - **Off** = pause (`POST /api/sources/{id}/pause`, `sources:pause`, the rule set of the MCP tool
+    `sources_pause`; reason required, audited `source.pause`). The scheduler skips the source and a
+    worker blocks a claimed job of it that needs the network as `source_paused` before any request
+    (a blocked job has no retry timer; a pause stops only network work, so work on facts already
+    captured, such as a `card_only` card job, still runs). Nothing already captured is removed.
+  - **On** = resume (`POST /api/sources/{id}/resume`, owner only, `config:admin`; reason required;
+    never an MCP tool). In ONE transaction the pause is cleared and this source's jobs that are
+    `blocked` with `source_paused` go back to `queued` (due now, at least one attempt left, one
+    `job.unblock` audit each with `via: source.resume`; other blockers and other sources' jobs are
+    untouched); the `source.resume` audit and the screen give the count. `suv-deals sources resume
+    KEY --reason "..." --yes` is the same action and prints `requeued_jobs=N`. Resuming a source
+    that is not paused changes nothing.
+  - The switch is disabled, with the reason next to it, for a role without the permission, for a
+    source the configuration does not enable, and for `access_blocked` / `parser_unhealthy`: such a
+    block must be reported (section 6) and is cleared only by the owner's explicit
+    `suv-deals sources set-technical-status KEY STATUS --reason "..." --yes` (which never re-enables
+    the source either), never by the switch.
+- A resume never enables a source and never changes its technical status. It requeues only what is
+  blocked `source_paused` at that moment: a job a worker was processing while the resume committed
+  can still end up blocked `source_paused` a moment later, and a job blocked because its source was
+  disabled or gated (not paused) is not touched by a resume of a source that is not paused. Those go
+  back with `suv-deals jobs unblock JOB_ID --reason "..." --yes`, one by one, as before.
+
 ## 3. Local versus VPS
 
 | | Local (laptop / workstation) | VPS (optional, owner-approved) |
@@ -310,7 +345,7 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 | `sources list / inspect KEY [--from-db]` | gates with separate terms and technical status |
 | `sources smoke-evidence KEY [--run-id ID]` | read-only JSON: the persisted spec-31 evidence of the source's latest (or the given) crawl run: run and job ids, redacted fetch outcomes, observed listings with revision and field-evidence ids, the configuration revision (section 9.1) |
 | `sources sync [--fixture-sources] [--dry-run] --yes` | YAML -> `app.sources`; never enables a gated source |
-| `sources set-technical-status KEY STATUS --reason ... --yes`, `sources resume KEY --reason ... --yes` | audited owner recovery actions; neither one enables a source |
+| `sources set-technical-status KEY STATUS --reason ... --yes`, `sources resume KEY --reason ... --yes` | audited owner recovery actions; neither one enables a source. `sources resume` is the dashboard switch's "on" (section 2.3): it clears the pause, requeues the source's `source_paused` jobs and prints `requeued_jobs=N` |
 | `crawl once --source KEY [--profile primary] [--max-pages 1]` | one bounded discovery through every gate; if this command does not get its own job (another due discovery job first, or a running worker claimed it), the job is cancelled while it still waits, so the page cap can never be skipped silently |
 | `worker`, `scheduler`, `dispatcher`, `reconcile [--dry-run / --loop]` | runtime processes |
 | `worker --drain [--queues detail] [--max-jobs N] [--source KEY]` | process the due jobs once, then exit; `--source` (a configured source key, only with `--drain`) claims only that source's jobs, so an owner smoke never claims (and blocks) the jobs another source left queued (section 9.1) |
@@ -353,7 +388,7 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 
 | Incident | Immediate safe action (commands) | Recovery evidence |
 |---|---|---|
-| CAPTCHA / 401 / 403 on a source | The worker already records `access_blocked` and stops that source (one operational review item). Confirm: `suv-deals sources inspect KEY --from-db`. Pause the route explicitly if needed through the MCP/dashboard `sources_pause` action. Preserve evidence: do not delete fetch records. | Permitted access restored and recorded (terms/technical decision); the blocking technical status is cleared only by the explicit, audited owner action `suv-deals sources set-technical-status KEY fixture_tested --reason "..." --yes` (it never re-enables the source), then `suv-deals sources sync --yes` and a low-rate `suv-deals crawl once --source KEY --max-pages 1` smoke pass. |
+| CAPTCHA / 401 / 403 on a source | The worker already records `access_blocked` and stops that source (one operational review item). Confirm: `suv-deals sources inspect KEY --from-db`. Pause the route explicitly if needed through the MCP `sources_pause` action or the dashboard Sources switch (section 2.3). Preserve evidence: do not delete fetch records. | Permitted access restored and recorded (terms/technical decision); the blocking technical status is cleared only by the explicit, audited owner action `suv-deals sources set-technical-status KEY fixture_tested --reason "..." --yes` (it never re-enables the source), then `suv-deals sources sync --yes` and a low-rate `suv-deals crawl once --source KEY --max-pages 1` smoke pass. |
 | Parser drift | Source becomes `parser_unhealthy` automatically (new revisions quarantined, opportunity alerts paused). Check `suv-deals sources inspect KEY --from-db` (parser health section). | Fixtures repaired, `uv run pytest tests/adapters -q` green, then a live low-volume `crawl once` smoke. |
 | Database outage | Processes back off on their own; stop schedulers if the outage is long: `docker compose stop scheduler dispatcher`. Do not delete leases or jobs. | After reconnect: `suv-deals reconcile --dry-run` then `suv-deals reconcile` (expired leases requeued, exhausted jobs dead-lettered visibly), `suv-deals outbox inspect`, `suv-deals doctor`. |
 | Worker crash | Nothing manual: the reaper requeues expired leases (`suv-deals reconcile`). | The same job completes once logically: `suv-deals worker --drain` then `outbox inspect`; no duplicate revisions (`evidence verify`). |

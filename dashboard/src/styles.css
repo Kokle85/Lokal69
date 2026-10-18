@@ -1052,3 +1052,113 @@ blockquote.untrusted {
 .import-values-form fieldset {
   min-width: 0;
 }
+
+/* ------------------------------------------------------------------ source on/off switch */
+
+/* A real <button role="switch">: the track keeps its size in every state (no layout jump), the
+   thumb moves without changing the row's width, and the state label has a fixed minimum width. */
+.source-switch {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 0.6rem 0.75rem;
+  margin: 0.5rem 0 0.75rem;
+}
+
+.switch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.switch {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  width: 3.25rem;
+  height: 1.9rem;
+  min-height: 1.9rem;
+  padding: 0.15rem;
+  border: 2px solid var(--muted);
+  border-radius: 999px;
+  background: var(--muted-bg);
+  cursor: pointer;
+}
+
+.switch-thumb {
+  display: block;
+  width: 1.3rem;
+  height: 1.3rem;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.switch[aria-checked='true'] {
+  border-color: var(--ok-text);
+  background: var(--ok-text);
+}
+
+.switch[aria-checked='true'] .switch-thumb {
+  background: var(--surface);
+  transform: translateX(1.35rem);
+}
+
+.switch[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.switch-name {
+  font-weight: 600;
+  min-width: 0;
+}
+
+.switch-state {
+  min-width: 6.5rem;
+  text-align: center;
+}
+
+.switch-state-running {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+}
+
+.switch-state-paused {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.switch-state-technical_block {
+  background: var(--bad-bg);
+  color: var(--bad-text);
+}
+
+.switch-help p {
+  margin: 0.4rem 0 0;
+}
+
+.switch-panel {
+  margin-top: 0.5rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch-thumb {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .switch {
+    border-color: ButtonText;
+  }
+
+  .switch-thumb {
+    background: ButtonText;
+  }
+
+  .switch[aria-checked='true'] {
+    background: Highlight;
+  }
+}

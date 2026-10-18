@@ -14,6 +14,16 @@ static single-page app (Vite 8 + React 19.3 + React Router 8 + TypeScript 6) tha
   seller replies (original text, Macedonian summary, unaccepted quotes, escalations), inquiry
   control (pause/resume), mail-worker health and coverage gaps, coverage and lags (per source and
   per listing) and the 15-day evaluation;
+- has an **on/off switch per source** on the Sources screen (`src/screens/SourceSwitch.tsx`), built
+  on pause and resume only: a real `<button role="switch" aria-checked>`, "on" exactly when the
+  server's `network_allowed` is true. Switching a running source off opens the pause form (reason
+  required; `POST /api/sources/{id}/pause`, `sources:pause`); switching a paused source on opens the
+  resume confirmation (reason required; `POST /api/sources/{id}/resume`, owner only,
+  `config:admin`), which also requeues the jobs that waited for the source and reports how many.
+  A source its configuration does not enable, or one that is `access_blocked` / `parser_unhealthy`,
+  has its switch disabled with the reason: enabling stays a YAML revision + `sources sync`, and a
+  block is cleared only by the owner's explicit technical-status action. A disabled switch stays
+  focusable (`aria-disabled`) so the explanation is reachable by keyboard and screen reader;
 - has a read-only **Customs calculator** (`/import-costs`, and `/candidates/<id>/import-costs`
   starting from that listing's facts; `GET /api/import-costs/estimate`, the same calculation dot
   gets through MCP): North Macedonian customs duty, motor-vehicle tax (ДМВ), import VAT and the
@@ -136,7 +146,7 @@ the API same-origin, exactly as in production; no CORS configuration is needed i
 | Command | What it does |
 |---|---|
 | `npm run build` | `tsc -b` (app, tests, configs, E2E specs), `vite build` into `dist/` (fails without the two `VITE_` variables), then `scripts/check-security.mjs --dist` (CSP meta present, no inline scripts/handlers/styles, no secret key in the bundle). Screens are code-split: the entry chunk keeps React, the router and supabase-js (needed at once to restore the session), each screen is its own chunk |
-| `npm test` | Vitest 5 + Testing Library (jsdom 29.1.1): API client (incl. every v1.1 route), auth gating, review idempotency/conflicts and `decided_by_caller`, unknown-money rendering, XSS escaping, mobile nav, static security grep, and the v1.1 screens (no approve/send control, informational preview label, withheld addresses and quarantined text, escalations, unaccepted quotes, unknown lags never zero, powered-off worker as a coverage gap, zero deals as zero, pause/resume incl. outcome-unknown retry and reload marker) |
+| `npm test` | Vitest 5 + Testing Library (jsdom 29.1.1): API client (incl. every v1.1 route), auth gating, review idempotency/conflicts and `decided_by_caller`, unknown-money rendering, XSS escaping, mobile nav, static security grep, and the v1.1 screens (no approve/send control, informational preview label, withheld addresses and quarantined text, escalations, unaccepted quotes, unknown lags never zero, powered-off worker as a coverage gap, zero deals as zero, pause/resume incl. outcome-unknown retry and reload marker), and the source on/off switch in every state (running, paused, off in the configuration, access-blocked / parser-unhealthy, read-only roles) with its pause and resume flows, keyboard operation, conflicts and same-key retry |
 | `npm run lint` | oxlint (correctness + React/a11y rules, `react/no-danger`, `jsx-no-target-blank`, no `eval`) and the source security grep |
 | `npm run e2e` | Playwright 1.56.1 (chromium) against real local services (see below) |
 | `npm audit --omit=dev` | production dependency audit (also `make dashboard-audit`) |
@@ -197,8 +207,11 @@ and `stranger@e2e.invalid` (no membership); the shared test password is in `test
 Covered: password and magic-link sign-in, cancelled/expired magic link, sign-out, deep-link
 redirect, workspace selection, no membership; overview; candidate queue filters + detail +
 back/forward; unknown costs shown as `unknown`; malicious seller text rendered inert (no dialogs,
-no injected elements, no CSP violations); viewer without mutation controls; owner pause with a
-reason; claim + `watch` decision with a second reviewer seeing `ALREADY_CLAIMED` and then
+no injected elements, no CSP violations); viewer without mutation controls (every source switch
+read-only); owner pause with a reason through the source switch; the source switch states from the
+real server, the owner's keyboard resume of the paused source with its two seeded `source_paused`
+jobs requeued (then paused again), a reviewer's read-only switches and the open switch form at
+375 px (`e2e/sources.spec.ts`); claim + `watch` decision with a second reviewer seeing `ALREADY_CLAIMED` and then
 `VERSION_CONFLICT`; token expiry mid-review (401 -> refresh -> identical retry with the same
 idempotency key); network loss after the write (not confirmed -> same-key retry -> exactly one
 decision); page reload while a decision is in flight (server state reported, nothing resent);
@@ -292,7 +305,8 @@ Recommended response headers from the static host (the build already contains a 
   inline scripts or styles). The E2E suite fails on any CSP violation.
 - **Roles.** Mutation controls are shown only for the scopes returned by `/api/me` (viewer:
   read-only, no seller-inquiry area; reviewer: claim/decide/notes/recheck and the inquiry screens
-  read-only; owner: also source pause, inquiry pause/resume, the owner-only administration
+  read-only; owner: also the source on/off switch (pause with `sources:pause`, resume with
+  `config:admin`), inquiry pause/resume, the owner-only administration
   details and the tax-rule and cost-profile acts in Settings). The backend enforces every scope
   regardless.
 - **Seller inquiries (spec 37).** No approve, send or reply control exists. The Macedonian preview

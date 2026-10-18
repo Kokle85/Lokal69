@@ -1381,11 +1381,19 @@ export interface SourceStatusView {
   country: CountryCode
   role: 'acquisition' | 'mk_comparable'
   state: SourceRunState
+  /** The configuration's switch (source YAML + `sources sync`); never changed from the dashboard. */
   enabled: boolean
+  /** The operator pause (the dashboard switch's off position). */
   paused: boolean
   pause_reason: string | null
   paused_at: DateTimeString | null
+  /** Expected version of a pause or resume. */
   version: number
+  /**
+   * The server's verdict: new network work may start (enabled, not paused, and a technical status
+   * that does not stop it). The switch is "on" exactly when this is true.
+   */
+  network_allowed: boolean
   terms: TermsView
   technical: TechnicalView
   robots: RobotsView
@@ -1406,6 +1414,25 @@ export interface SourcePauseResult {
   version: number
   paused_at: DateTimeString
   reason: string
+  notice: string
+}
+
+/**
+ * `POST /api/sources/{source_id}/resume` (owner only, `config:admin`; never an MCP tool). The pause
+ * is cleared and the source's `source_paused` jobs are requeued (`requeued_jobs`); `enabled`,
+ * `technical_status` and `network_allowed` are the state AFTER the resume, which never changes
+ * them. `was_paused: false` is the no-op of a source that was not paused.
+ */
+export interface SourceResumeResult {
+  source_id: Uuid
+  source_key: string
+  paused: false
+  was_paused: boolean
+  version: number
+  enabled: boolean
+  technical_status: TechnicalStatus
+  network_allowed: boolean
+  requeued_jobs: number
   notice: string
 }
 
@@ -2811,6 +2838,13 @@ export interface RecheckRequest {
 }
 
 export interface PauseSourceRequest {
+  expected_version: number
+  reason: string
+  idempotency_key: IdempotencyKey
+}
+
+/** Body of the owner's resume (`ResumeSourceRequest`): the same fields as the pause body. */
+export interface ResumeSourceRequest {
   expected_version: number
   reason: string
   idempotency_key: IdempotencyKey

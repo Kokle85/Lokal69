@@ -419,7 +419,13 @@ def set_technical_status(
 @click.option("--yes", is_flag=True, help="Confirm clearing the pause.")
 @pass_cli
 def resume(cli: CliContext, *, source_key: str, workspace: UUID | None, reason: str, yes: bool) -> None:
-    """Clear an operator pause (owner action). Never enables a disabled or gated source."""
+    """Clear an operator pause (owner action) and requeue the source's ``source_paused`` jobs.
+
+    The same repository action as the dashboard's Sources switch (`sources_repo.resume_source`):
+    in one transaction the pause is cleared and the jobs a worker blocked as ``source_paused``
+    for this source go back to ``queued`` (the count is printed). Never enables a disabled or
+    gated source and never changes its technical status.
+    """
     settings = load_settings(cli)
     require_yes(yes, "sources resume")
 
@@ -433,13 +439,23 @@ def resume(cli: CliContext, *, source_key: str, workspace: UUID | None, reason: 
             actor = operator_actor(workspace_id, "sources-resume", admin=True)
             async with unit_of_work(db, actor) as conn:
                 current = await sources_repo.get_source_by_key(conn, actor, source_key)
-                record = await sources_repo.resume_source(
+                result = await sources_repo.resume_source(
                     conn, actor, current.id, current.version, reason=reason
                 )
         echo(
-            f"{source_key}: paused={str(record.paused).lower()}, enabled={str(record.enabled).lower()}"
-            + (" (was not paused)" if not current.paused else "")
+            f"{source_key}: paused=false, enabled={str(result.enabled).lower()},"
+            f" technical_status={result.technical_status.value},"
+            f" requeued_jobs={result.requeued_jobs}"
+            + ("" if result.was_paused else " (was not paused; nothing changed)")
         )
+        if result.requeued_jobs:
+            echo(f"Requeued {result.requeued_jobs} waiting job(s) of {source_key} (source_paused -> queued).")
+        if not result.network_allowed:
+            echo(
+                "No new network work runs for this source yet: a resume never enables a source"
+                " (YAML + `sources sync`) and never clears access_blocked / parser_unhealthy"
+                " (`sources set-technical-status`)."
+            )
         return 0
 
     run_async(body)

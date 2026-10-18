@@ -80,7 +80,28 @@ describe('ApiClient headers', () => {
     const api = fakeApi({})
     const client = new ApiClient({ tokens: tokens(), getWorkspaceId: () => null, fetchImpl: api.fetch })
     await expect(client.reviewCase('../../admin')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(
+      client.resumeSource('../pause', { expected_version: 1, reason: 'SYNTHETIC', idempotency_key: newIdempotencyKey('source-resume') }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
     expect(api.calls).toHaveLength(0)
+  })
+
+  it('pauses and resumes a source on the contract paths with the key in the body and header', async () => {
+    const sourceId = 'eeeeeeee-0000-4000-8000-000000000001'
+    const api = fakeApi({
+      'POST /api/sources/:id/pause': () => ok({}),
+      'POST /api/sources/:id/resume': () => ok({}),
+    })
+    const client = new ApiClient({ tokens: tokens(), getWorkspaceId: () => 'ws-1', fetchImpl: api.fetch })
+    const pauseKey = newIdempotencyKey('source-pause')
+    const resumeKey = newIdempotencyKey('source-resume')
+    await client.pauseSource(sourceId, { expected_version: 4, reason: 'SYNTHETIC pause', idempotency_key: pauseKey })
+    await client.resumeSource(sourceId, { expected_version: 5, reason: 'SYNTHETIC resume', idempotency_key: resumeKey })
+    const [pause, resume] = api.calls
+    expect(`${pause?.method} ${pause?.path}`).toBe(`POST /api/sources/${sourceId}/pause`)
+    expect(`${resume?.method} ${resume?.path}`).toBe(`POST /api/sources/${sourceId}/resume`)
+    expect(resume?.headers.get('Idempotency-Key')).toBe(resumeKey)
+    expect(resume?.body).toEqual({ expected_version: 5, reason: 'SYNTHETIC resume', idempotency_key: resumeKey })
   })
 
   it('does not call the API when signed out', async () => {

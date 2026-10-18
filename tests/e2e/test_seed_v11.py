@@ -293,3 +293,22 @@ def test_the_loopback_guards_refuse_a_url_that_connects_elsewhere(
 def test_the_loopback_guards_accept_a_loopback_cluster(url: str) -> None:
     assert v11_actions.loopback_url(url)
     assert run_backend._loopback(url)
+
+
+async def test_the_paused_source_has_the_waiting_jobs_the_sources_spec_resumes(
+    seeded: tuple[str, dict[str, Any]],
+) -> None:
+    url, manifest = seeded
+    paused = manifest["sources"]["paused"]
+    with psycopg.connect(url, autocommit=True) as conn:
+        source = conn.execute("select enabled, paused from app.sources where id = %s", (paused,)).fetchone()
+        jobs = conn.execute(
+            "select state, blocker_code from ops.jobs where source_id = %s order by dedup_key", (paused,)
+        ).fetchall()
+        others = conn.execute(
+            "select count(*) from ops.jobs where blocker_code = 'source_paused' and source_id <> %s",
+            (paused,),
+        ).fetchone()
+    assert source == (True, True)  # enabled by its configuration, paused by the owner
+    assert jobs == [("blocked", "source_paused")] * manifest["paused_source_waiting_jobs"]
+    assert others == (0,)

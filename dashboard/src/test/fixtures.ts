@@ -9,6 +9,8 @@ import type {
   ReviewDecisionView,
   Role,
   Scope,
+  SourceResumeResult,
+  SourceStatusView,
   ValuationView,
 } from '../api/types'
 
@@ -423,6 +425,84 @@ export function incompleteValuation(overrides: Partial<ValuationView> = {}): Val
       cost_profile: null,
       config_revision_id: '12345678-0000-4000-8000-000000000001',
     },
+    ...overrides,
+  }
+}
+
+/** A SYNTHETIC source status (running by default: enabled, not paused, network allowed). */
+export function sourceStatus(overrides: Partial<SourceStatusView> = {}): SourceStatusView {
+  return {
+    source_id: SOURCE_ID,
+    source_key: 'synthetic_source',
+    display_name: 'SYNTHETIC running source',
+    country: 'DE',
+    role: 'acquisition',
+    state: 'running',
+    enabled: true,
+    paused: false,
+    pause_reason: null,
+    paused_at: null,
+    version: 4,
+    network_allowed: true,
+    terms: {
+      status: 'no_restriction_found',
+      decision: 'proceed_acknowledged',
+      decision_actor: 'SYNTHETIC owner',
+      decision_note: null,
+      reviewed_at: null,
+      terms_url: null,
+      meaning: 'A recorded terms decision audits the owner choice; it is not legal permission.',
+    },
+    technical: {
+      status: 'live_smoke_passed',
+      mode: 'public_html',
+      adapter: 'synthetic_adapter',
+      adapter_version: 'synthetic@1.0.0',
+      detail_mode: 'fetch',
+      last_live_smoke_at: null,
+      parser_health: { status: 'healthy', sample_size: 20, reasons: [], recommended_actions: [], checked_at: null },
+    },
+    robots: { policy: 'obey', last_checked_at: null, revision_hash: null, fetch_status: null, summary: null },
+    rate_budget: {
+      budget: { daily_request_budget: 500, min_delay_seconds: 5 },
+      budget_label: 'engineering_default',
+      requests_today: 12,
+      bytes_today: null,
+      circuit_state: 'closed',
+      next_request_not_before: null,
+      retry_after_until: null,
+    },
+    last_runs: [],
+    activation_problems: [],
+    ...overrides,
+  }
+}
+
+/** A paused (otherwise runnable) SYNTHETIC source. */
+export function pausedSource(overrides: Partial<SourceStatusView> = {}): SourceStatusView {
+  return sourceStatus({
+    display_name: 'SYNTHETIC paused source',
+    state: 'paused',
+    paused: true,
+    pause_reason: 'SYNTHETIC owner pause for maintenance',
+    paused_at: '2026-10-07T08:00:00Z',
+    network_allowed: false,
+    ...overrides,
+  })
+}
+
+export function resumeResult(overrides: Partial<SourceResumeResult> = {}): SourceResumeResult {
+  return {
+    source_id: SOURCE_ID,
+    source_key: 'synthetic_source',
+    paused: false,
+    was_paused: true,
+    version: 5,
+    enabled: true,
+    technical_status: 'live_smoke_passed',
+    network_allowed: true,
+    requeued_jobs: 2,
+    notice: 'A resume only clears the operator pause.',
     ...overrides,
   }
 }

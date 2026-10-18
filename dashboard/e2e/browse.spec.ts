@@ -167,6 +167,11 @@ test.describe('read-only screens', () => {
     await page.goto('/sources')
     await expect(page.getByRole('heading', { name: 'Technical status (separate from terms)' }).first()).toBeVisible()
     await expect(page.getByRole('button', { name: 'Pause this source' })).toHaveCount(0)
+    // The on/off switches show the state but are read-only for a viewer.
+    await expect(page.getByRole('switch', { name: 'Collect from SYNTHETIC running source' })).toBeVisible()
+    const switches = await page.getByRole('switch').all()
+    expect(switches.length).toBeGreaterThanOrEqual(5) // one per registered source
+    for (const toggle of switches) await expect(toggle).toHaveAttribute('aria-disabled', 'true')
     await page.goto('/settings')
     await expect(page.getByTestId('profile-manual_4000')).toContainText('DISABLED')
     await expect(page.getByTestId('owner-admin')).toHaveCount(0)
@@ -192,6 +197,10 @@ test.describe('read-only screens', () => {
     await expect(never.getByRole('heading', { name: 'Technical status (separate from terms)' })).toBeVisible()
     await expect(page.locator('section', { hasText: 'SYNTHETIC running source' }).getByRole('heading', { name: 'Recent runs' })).toBeVisible()
     await expect(page.locator('section', { hasText: 'SYNTHETIC paused source' })).toContainText('SYNTHETIC owner pause for maintenance')
+    // Switching the running source off opens the pause form (reason required).
+    const toggle = never.getByRole('switch', { name: 'Collect from SYNTHETIC never source' })
+    await expect(toggle).toHaveAttribute('aria-checked', 'true')
+    await toggle.click()
     const pause = never.getByRole('button', { name: 'Pause this source' })
     await expect(pause).toBeDisabled()
     await never.getByLabel(/Pause reason/).fill('SYNTHETIC E2E pause: parser drift suspected')
@@ -200,8 +209,8 @@ test.describe('read-only screens', () => {
     expect((await response).status()).toBe(200)
     // After the reload shows the source as paused, the server confirmation is still on screen.
     await expect(never.getByText(/No new network work runs for this source/)).toBeVisible()
-    await expect(never.getByText(/Resuming is not available from the dashboard/)).toBeVisible()
     await expect(never.getByText('Source paused.')).toBeVisible()
+    await expect(toggle).toHaveAttribute('aria-checked', 'false')
     await expect(never.getByRole('button', { name: 'Pause this source' })).toHaveCount(0)
     expect(problems).toEqual([])
   })
