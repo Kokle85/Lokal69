@@ -10,6 +10,46 @@ scheduler and worker run.
 
 ## Unreleased (on top of `7f7e187`)
 
+MCP connection groundwork for dot: an authorization-header file and `mcp probe`. Research of
+2026-10-18 (official OpenAI documentation): ChatGPT's custom MCP servers offer only "OAuth", "No
+authentication" or both, and ChatGPT cannot send a custom bearer header itself. The proposed first
+route, pending the owner's decision, is OpenAI's Secure MCP Tunnel, whose `tunnel-client` (in the
+owner's WSL, outbound HTTPS only) forwards to `http://127.0.0.1:8000/mcp` and can add a static
+`Authorization` header read from a file. Nothing was connected to a real client; no route is
+decided.
+
+- **`suv-deals credentials create-mcp ... --authorization-file PATH`**
+  (`cli_commands/credentials.py`, `cli_commands/_authorization_file.py`): the token is written as
+  exactly `Bearer <token>` (no newline) into a NEW file (`O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`
+  relative to the opened, re-checked parent directory, mode 0600 by `fchmod`, so the umask cannot
+  change it, `fsync`-ed) and is not printed; the output names the file. Refused with a usage error
+  before anything is created: an existing path or symlink, a path inside the repository or a git
+  working tree containing the current directory (symlinks resolved), a parent directory that is
+  missing, not owned by the current user or readable/writable by group or others. The insert and
+  the write share one transaction: a failed write rolls the credential back; an unknown commit
+  outcome after the write revokes the credential and removes the file (if the revocation fails too,
+  the file is kept and the revoke command printed). Without the option nothing changed.
+- **`suv-deals mcp probe [--url] [--authorization-file] [--json] [--timeout]`**
+  (`cli_commands/mcp_probe.py`; no settings, no database): an unauthenticated `initialize` must be
+  `401` with `WWW-Authenticate: Bearer` (its parameters are reported); with the file (exactly
+  `Bearer suvmcp_...` or `Bearer <JWT>`, no group/other access, not a symlink, sent only over https
+  or to loopback, no redirects) the official `mcp` SDK client runs the `initialize` handshake,
+  `tools/list` and `deals_health`. It prints the negotiated protocol version, server name and
+  version, tool names, the SHA-256 of the canonical `tools/list` result (tools sorted by name,
+  `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`), the `deals_health`
+  status fields and every request id; never the token (the HTTP and SDK loggers are held at WARNING
+  with the redaction filter while it runs). Exit 0 / 1 (the failing check named) / 2.
+- Tests: `tests/cli/test_credentials_authorization_file.py` (content, 0600 under any umask, no token
+  on stdout/stderr or in logs, every refusal before the database, rollback on a failed write,
+  revocation on an unknown commit outcome, the kept file when revoking fails) and
+  `tests/cli/test_mcp_probe.py` (uvicorn-served in-process app: a viewer credential sees exactly the
+  7 read tools, the same hash on two runs and the same as the raw `tools/list` wire result,
+  `deals_health` really called, the token absent from all output; unauthenticated-only run; bad
+  file permissions, symlinks and contents refused; unknown, revoked and wrong tokens exit 1; open,
+  unreachable and unconfigured endpoints fail the first check).
+- Docs: docs/connect_mcp.md 3.1 (when a file is acceptable) and 4.1 (the probe's evidence for steps
+  3 and 8), docs/runbook.md CLI reference.
+
 Per-source on/off switch on the dashboard. Owner request 2026-10-18:
 "направи и toogle на фронт енд за палење и гасење". The Sources screen's pause form is replaced by
 one switch per source, built on pause and resume only, so the existing rules stay as they are:

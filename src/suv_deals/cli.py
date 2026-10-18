@@ -26,7 +26,11 @@ Commands (``suv-deals <command> --help`` for details)::
                                    (--local-only: exit 3 unless it stays on this machine)
     api serve                      uvicorn for /api, /healthz, /readyz and /mcp (127.0.0.1 default)
     credentials create-mcp | revoke | list
-                                   scoped MCP credentials (token shown once; --yes)
+                                   scoped MCP credentials (token shown once, or written to a new
+                                   0600 --authorization-file outside the repository; --yes)
+    mcp probe [--url] [--authorization-file]
+                                   check a running MCP endpoint: 401 without a token, then
+                                   initialize, tools/list (+ SHA-256) and deals_health (no database)
     bootstrap owner                link an existing Supabase Auth user as workspace owner (--yes)
     mail-worker credential issue | revoke | list
                                    the desktop mail worker's mailbox binding and credential
@@ -80,6 +84,7 @@ from suv_deals.cli_commands import (
     inquiries,
     jobs,
     market,
+    mcp_probe,
     ops,
     processes,
     sources,
@@ -132,6 +137,7 @@ cli.add_command(tax.tax_rules_group)
 cli.add_command(import_costs.import_costs_group)
 cli.add_command(db.db_group)
 cli.add_command(credentials.credentials_group)
+cli.add_command(mcp_probe.mcp_group)
 cli.add_command(bootstrap.bootstrap_group)
 cli.add_command(inquiries.mail_worker_group)
 cli.add_command(inquiries.sender_binding_group)

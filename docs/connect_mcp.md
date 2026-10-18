@@ -26,7 +26,7 @@ effective on MCP).
 | Mode | Use | Notes |
 |---|---|---|
 | `oauth` (preferred production) | OAuth access tokens (JWT, ES256/RS256) from the configured authorization server | Needs `MCP_PUBLIC_URL` (ending in `/mcp`), `MCP_OAUTH_ISSUER`, `MCP_OAUTH_JWKS_URL` (optional `MCP_OAUTH_AUDIENCE`). The server publishes RFC 9728 protected-resource metadata at `/.well-known/oauth-protected-resource/mcp` and validates issuer, audience/resource, signature, expiry and scopes. A user `sub` maps to an active workspace membership; machine clients need an explicit principal mapping. **Not verified:** which authorization server the owner uses and whether the actual dot client completes this flow (Supabase Auth alone is not assumed to provide MCP OAuth discovery/registration). |
-| `static_bearer` | a scoped private credential for a private compatible client | Not OAuth compliance and not assumed to be supported by the actual dot connection. Created with the CLI (section 3); only the SHA-256 hash is stored. |
+| `static_bearer` | a scoped private credential for a private compatible client | Not OAuth compliance; ChatGPT itself cannot send it (section 3.1). Created with the CLI (section 3); only the SHA-256 hash is stored. On the proposed Secure MCP Tunnel route (pending the owner's decision) OpenAI's `tunnel-client` would add it as a static header read from a file (section 3.1). |
 | `dev_local` | local tests only | Allowed only with `APP_ENV=development/test`, a loopback URL and loopback clients. |
 
 `suv-deals doctor --process api` checks the configured URLs offline (scheme, `/mcp` path, no
@@ -50,19 +50,87 @@ uv run suv-deals credentials create-mcp --workspace <workspace-id> \
   `uv run suv-deals credentials revoke <credential-id> --reason "..." --yes` revokes immediately
   (the next request is `401`).
 
+### 3.1 The token in an authorization file (`--authorization-file`)
+
+ChatGPT's custom MCP servers offer only "OAuth", "No authentication" or a mix of both; ChatGPT itself
+cannot send a custom API key or bearer header (research of 2026-10-18, official OpenAI
+documentation; not checked against the owner's account). The **proposed** first route, still
+pending the owner's decision, is OpenAI's Secure MCP Tunnel: OpenAI's `tunnel-client` runs in the
+owner's WSL, makes outbound HTTPS connections only and forwards MCP requests to
+`http://127.0.0.1:8000/mcp`, and it can add a static header to every forwarded request from a file
+(`mcp.extra_headers: {Authorization: "file:/path"}`). For a client like that the token can go into
+a file instead of the terminal:
+
+```bash
+install -d -m 700 ~/.config/suv-deals
+uv run suv-deals credentials create-mcp --workspace <workspace-id> \
+    --label "dot via tunnel-client (read-only)" --scopes deals:read,reviews:read --role viewer \
+    --expires 30d --authorization-file ~/.config/suv-deals/dot.authorization --yes
+```
+
+- The file holds exactly `Bearer <token>` (no trailing newline). It is always a NEW file (created
+  with `O_EXCL`, never overwritten, never through a symlink), mode 0600 whatever the umask, and the
+  token is **not printed**; the output shows the credential metadata and the file path only.
+- A file is acceptable only when **all** of these hold: the client cannot hold a secret-store entry
+  itself and reads a static header from a file (such as `tunnel-client`'s `mcp.extra_headers`); the
+  file is 0600 and outside the repository, on the Linux filesystem of the machine that runs the
+  client (not under `/mnt/c`); and the owner approved this route. Otherwise keep the printed token in
+  the client's secret store as above.
+- Refused with a usage error (exit 2) before anything is created: a path that exists or is a
+  symlink; a path inside the repository or inside a git working tree that contains the current
+  directory (symlinks resolved); a parent directory that is missing, not owned by the current user,
+  or readable or writable by group or others (create it with `install -d -m 700`).
+- The credential is inserted and the file written in one transaction: if writing fails, nothing is
+  committed and no credential exists. If the commit outcome is unknown after the write (for example
+  a dropped connection), the command revokes the credential and removes the file; if even that
+  fails, it keeps the file (the token may be live) and prints the `credentials revoke` command.
+- Treat the file like the token: do not copy, sync or commit it. To rotate, create a new credential
+  into a new file, switch the client to it, then revoke the old credential and delete its file.
+- Check the result with `suv-deals mcp probe --authorization-file <file>` (section 4.1).
+
 ## 4. Connection steps (spec §28)
 
 | # | Step | How | Status |
 |---|---|---|---|
 | 1 | Local contract tests with an MCP client | `uv run pytest tests/mcp tests/contracts -q` (in-process official SDK client); optionally the official MCP Inspector against `http://127.0.0.1:8000/mcp` with a `dev_local` credential | verified in tests (fixture data) |
 | 2 | Deploy only after the owner authorizes destination and cost; HTTPS and correct auth | docs/runbook.md sections 3 and 8 | **blocked**: no approved host/domain |
-| 3 | Unauthenticated private calls fail; authorized reads succeed | `curl -i https://<domain>/mcp` must be `401`; then a read with the credential | not run (no deployment) |
+| 3 | Unauthenticated private calls fail; authorized reads succeed | `curl -i https://<domain>/mcp` must be `401`; then a read with the credential. `suv-deals mcp probe --url <url> --authorization-file <file>` runs both (section 4.1) | not run (no deployment) |
 | 4 | Add the private custom MCP connection in the product | OpenAI documentation checked 2026-10-06 describes the web flow: open ChatGPT Plugins, select the plus button, choose *Add custom MCP server*, enter the server URL, configure authentication, review the risk warning, create and install the plugin. Availability depends on the account/workspace. No other menu or hidden setting is assumed. | not run |
 | 5 | Read scopes first; verify `deals_health`, `reviews_list_pending`, one specific candidate and `deals_estimate_import_costs` for it in the intended dot conversation | ask dot to call those tools; check that dot relays the preview banner (section 7) | not run |
 | 6 | Review writes only after approval; test claim/submit on a clearly labelled canary case | a SYNTHETIC canary review case in a non-production workspace | not run |
 | 7 | Source and dashboard links open for the owner | open the links returned by `deals_get_candidate` | not run |
-| 8 | Record evidence | client version/surface, negotiated protocol, SDK version (2.3.0), tool-list hash (`sha256` of the `tools/list` result), exact successful test IDs/request ids | not run |
+| 8 | Record evidence | client version/surface, negotiated protocol, SDK version (2.3.0), tool-list hash (`sha256` of the `tools/list` result), exact successful test IDs/request ids; `suv-deals mcp probe` prints the server side of it (section 4.1) | not run |
 | 9 | Native MCP Events first, Slack fallback only if needed | section 5 | **blocked** |
+
+### 4.1 `suv-deals mcp probe`: the server-side evidence for steps 3 and 8
+
+```bash
+uv run suv-deals mcp probe --url http://127.0.0.1:8000/mcp \
+    --authorization-file ~/.config/suv-deals/dot.authorization          # add --json for a record
+```
+
+It reads no settings and no database and checks, in order: (a) an unauthenticated `initialize`
+POST answers `401` with a `WWW-Authenticate: Bearer` challenge; (b) with the file, the official
+`mcp` SDK client (Streamable HTTP, `initialize` handshake) runs `initialize` and `tools/list` and
+calls `deals_health`. Without `--authorization-file` only (a) runs. It prints:
+
+| Evidence | What it is |
+|---|---|
+| challenge | the parameters of the `401` challenge (`error`, `error_description`, `scope`; `resource_metadata` in `oauth` mode) |
+| protocol version | the version negotiated by the `initialize` handshake (`2025-11-25` with SDK 2.3.0) |
+| server | name, version and title from `initialize` (`suv-deals <version>`) |
+| tools | the tool names the credential discovers (7 for `deals:read,reviews:read`) |
+| tools/list SHA-256 | over `{"tools": [...]}` with the tools sorted by name, `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`, UTF-8; equal to the hash of the server's raw `tools/list` result for the same credential |
+| `deals_health` | status fields only: `ready` and each readiness status, `source_network_enabled`, `bridge_status`, `notification_route`, sources by state, the number of activation blockers, warning codes |
+| request ids | every `X-Request-Id` the server returned, plus the tool envelope's `request_id` |
+
+Exit `0` when every check passed, `1` when one failed (the line names the check and the reason,
+e.g. `HTTP 401: the server refused the credential ...` for `initialize`), `2` for usage errors.
+The token and the `Authorization` header are never printed or logged. The file is refused when it
+is a symlink, accessible to group or others or not exactly `Bearer suvmcp_...` / `Bearer <JWT>`; it
+is sent only over https or to a loopback address, and redirects are not followed. The probe shows
+what this server offers this credential; what dot itself negotiates still has to be recorded from
+the client.
 
 ## 5. Native MCP Events subscription (preferred activation route)
 
