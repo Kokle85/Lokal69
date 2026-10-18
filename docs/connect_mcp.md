@@ -437,19 +437,22 @@ dot (ChatGPT, OpenAI)
   links tools return keep the owner's dashboard address.
 - tunnel-client forwards MCP requests to the configured URL (`/mcp`); the dashboard routes
   (`/api/...`) are not its target. Its health and admin endpoints (`/healthz`, `/readyz`,
-  `/metrics` and the embedded UI with the live logs, the runtime log-level switch and the log
-  export) are served on a Unix socket in the 0700 tunnel directory (`--health.unix-socket`), which
-  only the owner's user can reach. Whether the socket **replaces** the default TCP listener
-  (`127.0.0.1:8080`) is **UNVERIFIED** for the binary the owner installs: the flag help in the
-  vendor's public source (github.com/openai/tunnel-client, the `run` flags at commit `3e52fa04` of
-  2026-10-17) says the socket is served "instead of binding TCP" and that `--health.listen-addr` is
-  "Ignored when health.unix-socket is set", but the vendor's configuration.md (embedded-stub
-  section) adds "Existing TCP defaults remain available". `start` therefore also passes the
-  documented `--health.listen-addr 127.0.0.1:0`: if a build keeps a TCP listener, it gets an
-  ephemeral loopback port instead of 8080 and cannot collide with another program there. Such a
-  listener would still answer every local process (and possibly Windows programs through WSL's
-  localhost forwarding), so the live test records which listeners exist (8.3 step 5: `ss -ltnp |
-  grep tunnel-client` must print nothing).
+  `/health`, `/metrics` and the embedded UI with the live logs, the runtime log-level switch and
+  the log export) are served on a Unix socket in the 0700 tunnel directory
+  (`--health.unix-socket`), which only the owner's user can reach. **VERIFIED for v0.0.16**
+  (2026-10-18, the owner's downloaded linux-amd64 binary, 8.6): with the socket, tunnel-client
+  binds **no TCP port**. Its `run --help` says the socket is served "instead of binding TCP", the
+  variable `HEALTH_UNIX_SOCKET` "when set, tunnel-client does not bind TCP for health/admin", and
+  `--health.listen-addr` is "Ignored when health.unix-socket is set"; a real `start` showed no
+  listening TCP socket owned by tunnel-client (read from `/proc/net/tcp`). Without the socket,
+  `doctor` reports "will bind http://127.0.0.1:8080". `start` still passes `--health.listen-addr
+  127.0.0.1:0` (ignored by v0.0.16; a build that kept a TCP listener would get an ephemeral
+  loopback port instead of 8080). For another version, check again in the live test (8.3 step 5:
+  `ss -ltnp | grep tunnel-client` must print nothing).
+- `/readyz` on that socket is **not** a sign that OpenAI accepted the tunnel: with a rejected
+  runtime key, v0.0.16 keeps answering `/readyz` 200 "ready" while every poll of the control plane
+  fails with 401. `start` therefore reads the control-plane component of `GET
+  /health?details=true` (8.3 step 3).
 - While the tunnel runs, the start window stops it as soon as the API process is gone (a crash, an
   out-of-memory kill): tunnel-client would otherwise add the credential to requests for whatever
   program binds `127.0.0.1:8010` next. Before its probe sends the credential, `start` checks that
@@ -476,26 +479,37 @@ dot (ChatGPT, OpenAI)
       `sk-admin-`.
    4. Download `tunnel-client` for **Linux x86-64** from the Tunnels page. The vendor's readme
       says its download button points at the supported public release on
-      <https://github.com/openai/tunnel-client/releases> (file
-      `tunnel-client-vX.Y.Z-linux-amd64.zip`; this repository pins no version). This binary reads
-      both secrets and every tool result, so **check the ZIP before unpacking it**, in WSL, with
-      `vX.Y.Z` the version in its name:
+      <https://github.com/openai/tunnel-client/releases>. The release the owner downloaded on
+      2026-10-18 is **v0.0.16**; take these two assets of it:
+      - `tunnel-client-v0.0.16-linux-amd64.zip` (the full client, with `doctor`), verified ZIP
+        SHA-256 `d60cdba019bce451bcc3a15478cc5b9cb11270b049f5b56ea39a80b517f8b117`;
+      - `SHA256SUMS.txt` (the release's checksum list; the copy checked on 2026-10-18 has the
+        SHA-256 `fcce864a5935655534cc3d981257509579dbb5c71dbaec64c17a157ca9d65e56`).
+
+      Not `tunnel-client-runtime-...` or `tunnel-client-runtime-cloudflared-...` (no `doctor`),
+      and not the darwin, windows or arm64 builds. This binary reads both secrets and every tool
+      result, so **check the ZIP before unpacking it**, in WSL (for a later version, replace
+      `v0.0.16` in both names):
 
       ```bash
       cd /mnt/c/Users/<you>/Downloads
-      curl -fLO https://github.com/openai/tunnel-client/releases/download/vX.Y.Z/SHA256SUMS.txt
-      sha256sum --check --ignore-missing SHA256SUMS.txt  # must print: tunnel-client-vX.Y.Z-linux-amd64.zip: OK
+      curl -fLO https://github.com/openai/tunnel-client/releases/download/v0.0.16/SHA256SUMS.txt
+      sha256sum --check --ignore-missing SHA256SUMS.txt  # must print: tunnel-client-v0.0.16-linux-amd64.zip: OK
       ```
 
       No line or `FAILED` means another or a damaged file: do not install it (if the name differs,
       compare `sha256sum <file>.zip` with the line in `SHA256SUMS.txt` by hand). The vendor's full
       provenance check (`gh attestation verify ... --repo openai/tunnel-client` with the release's
-      Sigstore bundle) is in its readme, section "Validate a downloaded release". Then unpack it
-      and install the full `tunnel-client` binary (not `tunnel-client-runtime`, which has no
-      `doctor`): `mkdir -p ~/.local/bin && cp <unpacked>/tunnel-client ~/.local/bin/ && chmod +x
-      ~/.local/bin/tunnel-client`, then `tunnel-client --version` (open a new WSL window if
-      `~/.local/bin` was just created, or set `TUNNEL_CLIENT_BIN`). `setup` prints and records the
-      version and the binary's SHA-256 (`tunnel-client.version`).
+      Sigstore bundle) is in its readme, section "Validate a downloaded release". The ZIP holds
+      `tunnel-client`, `cloudflared` (the bundled Cloudflare Tunnel companion; this route does not
+      use it, its health component stays "disabled"), licences and an SPDX bill of materials.
+      Install the `tunnel-client` binary only: `mkdir -p ~/.local/bin && cp <unpacked>/tunnel-client
+      ~/.local/bin/ && chmod +x ~/.local/bin/tunnel-client`, then `tunnel-client --version`
+      (v0.0.16 prints `0.0.16+5f99daabd4aa4a77049e6d81d54a0d8c18335397 (git sha: 5f99daab...)`;
+      open a new WSL window if `~/.local/bin` was just created, or set `TUNNEL_CLIENT_BIN`).
+      `setup` prints and records the version and the binary's SHA-256 (`tunnel-client.version`;
+      the v0.0.16 linux-amd64 binary unpacked from the verified ZIP:
+      `01260ee973d5510861bc32979739561edd33869f99f9f8cd324f6d0da5b2e692`).
 2. **`scripts/local_mcp.sh setup`** in `~/Lokal69` (once; running it again changes nothing that
    exists). It checks `tunnel-client` and records its version, creates
    `~/.config/suv-deals/tunnel` (0700; refused inside the repository, inside a git working tree
@@ -509,7 +523,8 @@ dot (ChatGPT, OpenAI)
    `uv run suv-deals credentials create-mcp --label "dot read-only (tunnel)" --role viewer --scopes
    deals:read,reviews:read --expires 30d --authorization-file ~/.config/suv-deals/tunnel/mcp-authorization --yes`
    (the token is never shown; the credential id, workspace and expiry go to `credential.json`),
-   writes `tunnel-client.yaml` and runs `tunnel-client doctor --config <yaml> --explain`:
+   writes `tunnel-client.yaml` and runs `tunnel-client doctor --config <yaml> --health.unix-socket
+   <tunnel dir>/health.sock --explain` (what doctor shows is explained after the table):
 
    | File in `~/.config/suv-deals/tunnel/` | Content |
    |---|---|
@@ -535,28 +550,75 @@ dot (ChatGPT, OpenAI)
      level: info
    ```
 
-   If `doctor` reports only the MCP server as unreachable, that is expected before `start` (the
-   API is not running yet; UNVERIFIED whether `doctor` checks it at all).
+   `doctor` runs with the cleaned environment and the same health socket `start` gives the
+   tunnel, and `setup` shows its whole output (check names, URLs and errors; no secret). Its lines
+   look like `CHECK <name> PASS|FAIL|SKIP <detail>`, then `RESULT ok|fail`, `FAILED_CHECKS a,b` and
+   `EXIT_CODE n`, then the `--explain` text. Before `start` nothing answers the MCP URL, so v0.0.16
+   fails exactly two checks: **`mcp_server_reachable`** (connection refused) and
+   **`oauth_metadata`** (its OAuth discovery request is refused too): `RESULT fail`,
+   `FAILED_CHECKS mcp_server_reachable,oauth_metadata`, exit 2. That is expected: `setup` says so
+   and succeeds (exit 0), and `start` runs `doctor` again with the API up. Any other failed check,
+   or output without one `FAILED_CHECKS` line, makes `setup` exit 1. Every other check passes,
+   including `control_plane_api_key` "configured": `doctor` checks only that the key is
+   referenced, **not** that OpenAI accepts it (a wrong key shows in step 3). `health_listener`
+   reports "will bind unix socket <tunnel dir>/health.sock"; while a tunnel of this directory
+   runs, `setup` skips `doctor` (the socket is in use), and a socket left by a killed tunnel is
+   removed first.
 3. **`scripts/local_mcp.sh start`** and keep that window open. It refuses while a previous run is
    still running, when port 8010 is taken (choose another with `LOCAL_MCP_PORT=<port>`), when setup
-   is incomplete and when the credential has expired (it warns 5 days before). Then: `suv-deals
-   doctor --process api` with the route's environment; the API in the background
-   (`var/local_mcp/logs/api-<UTC>.log`); `/readyz` (up to 60 s, `LOCAL_MCP_READY_TIMEOUT`);
-   `suv-deals mcp probe --url http://127.0.0.1:8010/mcp --authorization-file <file> --json`
-   (`401` without the header; `initialize`, `tools/list` and `deals_health` with it; it prints
-   the protocol, the tool count and the tools/list SHA-256 and keeps the report as
-   `var/local_mcp/logs/probe-<UTC>.json`), sent only after the check that the socket on the port is
-   the API's own (8.2); finally `tunnel-client run --config <yaml> --health.unix-socket
-   ~/.config/suv-deals/tunnel/health.sock --health.listen-addr 127.0.0.1:0` in the foreground of
-   the window (the vendor's advice for a manual daemon; its output also goes to
-   `var/local_mcp/logs/tunnel-<UTC>.log`). The window says "Keep this window open while dot uses
-   the system; Ctrl+C stops the tunnel and the API" and, once the tunnel's `/readyz` answers 200,
-   "tunnel ready". When the tunnel ends for any reason (Ctrl+C, `stop`, a crash, the window
-   closed), the API is stopped too; when the API ends first, the tunnel is stopped within a second
-   and `start` prints the API log's last lines. Exit status: 0 after Ctrl+C or `stop`, 1 for any
-   other end, 130 (Ctrl+C), 143 (SIGTERM) or 129 (window closed) when it is interrupted before the
-   tunnel runs; the API it launched is stopped in every case.
-4. **ChatGPT**, only while the window says "tunnel ready": open ChatGPT Plugins (the vendor's
+   is incomplete and when the credential has expired (it warns 5 days before). Then, numbered 1/6
+   to 6/6 in the window: `suv-deals doctor --process api` with the route's environment; the API in
+   the background (`var/local_mcp/logs/api-<UTC>.log`); `/readyz` (up to 60 s,
+   `LOCAL_MCP_READY_TIMEOUT`); `suv-deals mcp probe --url http://127.0.0.1:8010/mcp
+   --authorization-file <file> --json` (`401` without the header; `initialize`, `tools/list` and
+   `deals_health` with it; it prints the protocol, the tool count and the tools/list SHA-256 and
+   keeps the report as `var/local_mcp/logs/probe-<UTC>.json`), sent only after the check that the
+   socket on the port is the API's own (8.2); **`tunnel-client doctor`** again, now with the API
+   up, which must pass (`RESULT ok`, exit 0; the window shows its `mcp_server_reachable`,
+   `oauth_metadata` and `health_listener` lines, the whole output is kept as
+   `var/local_mcp/logs/doctor-<UTC>.txt`; on a failure the window shows the output, the tunnel is
+   not started and the API is stopped); finally `tunnel-client run --config <yaml>
+   --health.unix-socket ~/.config/suv-deals/tunnel/health.sock --health.listen-addr 127.0.0.1:0`
+   in the foreground of the window (the vendor's advice for a manual daemon; Ctrl+C reaches it
+   directly).
+
+   **The window stays short.** tunnel-client's own output (about 150 start-up lines of its
+   dependency injection, then one warning per failed poll) goes only to
+   `var/local_mcp/logs/tunnel-<UTC>.log`; the window shows the script's lines. Follow the details
+   with `scripts/local_mcp.sh logs` in another window. If the tunnel exits with an unexpected
+   status, the window prints the last 20 lines of the tunnel log.
+
+   **Readiness.** The window does not trust `/readyz` alone (8.2). Every second (every 5 s once
+   connected) it reads `GET /health?details=true` on the health socket and looks at the
+   control-plane component (parsed with `python3 -I`, else `jq`, else a conservative fallback that
+   recognises only status ok and HTTP 401/403/404; nothing from the socket is ever evaluated):
+   - status `ok` (state `polling`): it prints **"[local_mcp] connected to OpenAI (control plane
+     polling); dot can use the plugin now"**, once;
+   - HTTP **401, 403 or 404** on 3 polls in a row (v0.0.16 retries within a second, so this takes
+     about a second; it would retry for ever): the window names the cause and the fix, records it
+     in `var/local_mcp/tunnel.rejected` (`status` shows it), stops the tunnel and `start` exits 1
+     with the API stopped:
+     - 401: "OpenAI rejected the runtime API key ...: a wrong or revoked key. Delete
+       `~/.config/suv-deals/tunnel/control-plane-api-key` and run `scripts/local_mcp.sh setup` with
+       a new restricted key (Tunnels Read + Use)";
+     - 403: "OpenAI refused the tunnel ...: the runtime API key lacks Tunnels Read + Use for
+       `tunnel_...`, or the tunnel belongs to another organization or project" (fix the key's
+       permission or create one in the tunnel's project, delete `control-plane-api-key` and run
+       setup; for a wrong tunnel id delete `tunnel-id` instead);
+     - 404: "OpenAI does not know the tunnel `tunnel_...`: delete
+       `~/.config/suv-deals/tunnel/tunnel-id` and run setup with the id from the Tunnels page";
+   - any other failure (no network, a proxy, HTTP 5xx, backoff without an authentication status):
+     one warning naming the state and the failure category; tunnel-client keeps retrying and the
+     window keeps running;
+   - nothing decided within `LOCAL_MCP_READY_TIMEOUT` (60 s): "the tunnel has not connected to
+     OpenAI within 60s (control plane: status ..., state ...); dot cannot use the plugin yet".
+
+   When the tunnel ends for any reason (Ctrl+C, `stop`, a rejection, a crash, the window closed),
+   the API is stopped too; when the API ends first, the tunnel is stopped within a second and
+   `start` prints the API log's last lines. Exit status: 0 after Ctrl+C or `stop`, 1 for any other
+   end (a rejection by OpenAI included), 130 (Ctrl+C), 143 (SIGTERM) or 129 (window closed) when it
+   is interrupted before the tunnel runs; the API it launched is stopped in every case.
+4. **ChatGPT**, only while the window says "connected to OpenAI": open ChatGPT Plugins (the vendor's
    connector settings page is <https://chatgpt.com/#settings/Connectors>), select the plus
    button, *Add custom MCP server*, **Connection: Tunnel**, select the tunnel `lokal69-mcp`,
    **Authentication: No authentication**, review the risk warning, create and install. dot should
@@ -580,17 +642,27 @@ dot (ChatGPT, OpenAI)
    with `tool`, `status` and `request_id` (the same id is in the tool result's envelope and in the
    response's `X-Request-Id` header; `initialize` and `tools/list` leave no log line, and the
    `request served` lines of that log are only `start`'s and `status`'s own `/readyz` checks); and,
-   while the tunnel runs, the output of `ss -ltnp | grep tunnel-client` (expected: nothing; a line
-   means a TCP health/admin listener, 8.2).
+   while the tunnel runs, the output of `ss -ltnp | grep tunnel-client` (expected: nothing, as
+   verified for v0.0.16 in the build container; a line means a TCP health/admin listener, 8.2)
+   and the window's "connected to OpenAI" line (with the time).
 
 ### 8.4 Every day: status, logs, stop, rotate, turning it off
 
 ```bash
-scripts/local_mcp.sh status   # another window: API /readyz, tunnel /readyz, days left, last log lines
+scripts/local_mcp.sh status   # another window: API /readyz, tunnel /readyz and control plane, days left, last log lines
 scripts/local_mcp.sh logs     # follow the API and tunnel logs (Ctrl+C stops following only)
 scripts/local_mcp.sh stop     # SIGTERM to the tunnel, then the API (or Ctrl+C in the start window)
 scripts/local_mcp.sh rotate   # new credential file (atomic rename), revokes the old one; then stop + start
 ```
+
+- `status` shows, while the tunnel runs, a line `control plane: status ok, state polling,
+  http_status -, consecutive_failures 0, failure_category -` (from the health socket); anything
+  but status `ok` makes `status` exit 1. When the tunnel is not running and the last `start`
+  stopped it because OpenAI refused it, `status` repeats the cause and the fix
+  (`var/local_mcp/tunnel.rejected`, cleared by the next `start`).
+- tunnel-client's own output is in `var/local_mcp/logs/tunnel-<UTC>.log` only (`logs` follows it
+  next to the API log). After a 401 that log contains OpenAI's error message with the key masked
+  by OpenAI (`sk-proj-`, asterisks, the key's last 4 characters), never the whole key (8.6).
 
 - The credential expires after 30 days (S7): `start` and `status` warn 5 days before; `start`
   refuses an expired one. `rotate` creates the new credential into a new file, renames it over
@@ -643,10 +715,11 @@ scripts/local_mcp.sh rotate   # new credential file (atomic rename), revokes the
 
 | Item | Status |
 |---|---|
-| `scripts/local_mcp.sh`: help and exit codes (0 after Ctrl+C with the tunnel running, 130 after Ctrl+C before it), the tunnel directory and file modes, refusals (inside the repository, inside a git working tree around the tunnel directory such as `~/.config` or `~`, symlink, group/other access, foreign owner, `/mnt`), tunnel-id and key validation, both prompts without echo on a real terminal (pty), idempotent setup, the recorded credential revoked before `setup` creates another, the YAML, the step order of `start` with the exact environment, the credential sent only to the API's own socket, the foreground tunnel with `--health.unix-socket` and `--health.listen-addr 127.0.0.1:0` and never raw logging, the API stopped when the tunnel exits and the tunnel stopped when the API dies, a reused API pid never signalled, the refusals of `start`, the expiry warning, `stop` order, `status` and `stop` with a narrow `COLUMNS` or another tunnel directory, `rotate` (revoke with the old id; the new file replaces the old one only after success; a `credential.json` that cannot be written takes the new credential back); the API key and the token never in the output, in the argv of any command the script runs (every external command is wrapped and records its argv; a static test forbids an external `printf` and commands by absolute path), in the stubs' environment or in the YAML | verified in tests (tests/cli/test_local_mcp_script.py, stub executables) |
+| `scripts/local_mcp.sh`: help and exit codes (0 after Ctrl+C with the tunnel running, 130 after Ctrl+C before it), the tunnel directory and file modes, refusals (inside the repository, inside a git working tree around the tunnel directory such as `~/.config` or `~`, symlink, group/other access, foreign owner, `/mnt`), tunnel-id and key validation, both prompts without echo on a real terminal (pty), idempotent setup, the recorded credential revoked before `setup` creates another, the YAML, the step order of `start` with the exact environment, the credential sent only to the API's own socket, the foreground tunnel with `--health.unix-socket` and `--health.listen-addr 127.0.0.1:0` and never raw logging, the API stopped when the tunnel exits and the tunnel stopped when the API dies, a reused API pid never signalled, the refusals of `start`, the expiry warning, `stop` order, `status` and `stop` with a narrow `COLUMNS` or another tunnel directory, `rotate` (revoke with the old id; the new file replaces the old one only after success; a `credential.json` that cannot be written takes the new credential back); the API key and the token never in the output, in the argv of any command the script runs (every external command is wrapped and records its argv; a static test forbids an external `printf` and commands by absolute path), in the stubs' environment or in the YAML; `setup`'s `tunnel-client doctor` (with `--health.unix-socket`) accepted when only `mcp_server_reachable` and/or `oauth_metadata` fail and refused for any other failed check or output without a `FAILED_CHECKS` line, skipped while the tunnel runs, a stale socket removed; `start`'s second `doctor` after the probe with the API up (a failure: no tunnel, the API stopped); readiness from the control-plane component of `GET /health?details=true`, not `/readyz` ("connected" once, only when it is ok; HTTP 401, 403 or 404 on 3 polls in a row stop the tunnel with the cause and the fix, `start` exits 1 with the API stopped and `status` repeats the cause; fewer than 3 do not; network or 5xx failures: one warning and the tunnel keeps running; the `python3`, `jq` and fallback parsers; hostile values never evaluated); tunnel-client's output only in its log, its last 20 lines on an unexpected exit; `status`'s control-plane line | verified in tests (tests/cli/test_local_mcp_script.py, stub executables; the stub `doctor` and health JSON in the real v0.0.16 formats) |
 | The chain local API + real credential + `mcp probe` + YAML-driven header injection | verified on 2026-10-18 in the build container with a **fake** `tunnel-client` (below) |
-| The real `tunnel-client` with this YAML (`doctor`, `run`, `file:` references, `--health.unix-socket`) | **UNVERIFIED** (the vendor binary is not available here; flags and keys from its documentation) |
-| The injected header survives with ChatGPT's "No authentication" (connector-forwarded headers are applied last and override static ones case-insensitively; with No authentication ChatGPT sends no `Authorization`) | **UNVERIFIED** until the owner's live test |
+| The real `tunnel-client` v0.0.16 (linux-amd64, the owner's verified download) with this YAML: `doctor` before and with the API, `run` with `--health.unix-socket` (no TCP listener), the `file:` references (the key reaches OpenAI, the header reaches the API), the health JSON, the rejection path through `start` | verified on 2026-10-18 in the build container with a **fake** runtime key and a SYNTHETIC tunnel id (below); a connection that OpenAI's real control plane **accepts** is not verified (it needs the owner's key) |
+| The header injection through the vendor's runtime (its local `dev proxy` control plane): no `Authorization` from the client: ours from the file, 200; a client-sent `Authorization`: it overrides ours, 401 | verified on 2026-10-18 (below) |
+| ChatGPT with "No authentication" sends no `Authorization` of its own (one would override ours, and the API would answer 401) | **UNVERIFIED** until the owner's live test |
 | dot discovering the 7 tools and calling them | **not run** |
 
 End-to-end run of 2026-10-18 (build container; scratch database, SYNTHETIC workspace; the real
@@ -675,26 +748,90 @@ tunnel gave the same results as above (4/4 checks, 7 tools, the same SHA-256, 40
 with the injected header); the secret scan found nothing; modes 0700/0600. The API dying while the
 tunnel runs is covered by the stub tests only.
 
-Points not confirmed in the vendor documentation (re-check them in the live test):
+Real `tunnel-client` v0.0.16 on 2026-10-18 (build container). The owner's download:
+`tunnel-client-v0.0.16-linux-amd64.zip`, SHA-256
+`d60cdba019bce451bcc3a15478cc5b9cb11270b049f5b56ea39a80b517f8b117`, matching its line in the
+release's `SHA256SUMS.txt` (that file's SHA-256
+`fcce864a5935655534cc3d981257509579dbb5c71dbaec64c17a157ca9d65e56`, identical to the owner's
+copy); the unpacked binary's SHA-256
+`01260ee973d5510861bc32979739561edd33869f99f9f8cd324f6d0da5b2e692`; `--version`
+`0.0.16+5f99daabd4aa4a77049e6d81d54a0d8c18335397 (git sha: ...)`. Always run with a cleaned
+environment, a FAKE runtime key and a SYNTHETIC tunnel id (no real OpenAI account):
 
-- that the header injected from `mcp.extra_headers` reaches the API unchanged when ChatGPT uses
-  "No authentication" (above);
-- that `--health.unix-socket` replaces the TCP health and admin listener (default `127.0.0.1:8080`)
-  rather than adding to it (the vendor's flag help says it does, its configuration.md says
-  "Existing TCP defaults remain available"; 8.2), that it serves `/readyz` there, and that
-  `--health.listen-addr 127.0.0.1:0` is accepted next to it (flag help: "Ignored when
-  health.unix-socket is set"); the live test records `ss -ltnp | grep tunnel-client`;
-- that the Tunnels page's download is the public GitHub release asset
-  `tunnel-client-vX.Y.Z-linux-amd64.zip` listed in that release's `SHA256SUMS.txt` (the vendor's
-  readme says the button points at the public release; asset name from its validation example);
-- whether `tunnel-client doctor` contacts the control plane or the MCP server (setup runs it
-  before the API is up);
-- whether `file:` values are used byte for byte (both files have no trailing newline either way);
+1. `run --help`: `--health.unix-socket` "When set, tunnel-client serves health over the socket
+   instead of binding TCP"; `HEALTH_UNIX_SOCKET` "when set, tunnel-client does not bind TCP for
+   health/admin"; `--health.listen-addr` "Ignored when health.unix-socket is set". While the real
+   tunnel ran under `start`, no listening TCP socket belonged to it (`/proc/net/tcp`; the container
+   has no IPv6).
+2. `doctor --config <yaml> --health.unix-socket <sock> --explain` before the API runs: `RESULT
+   fail`, exit 2, `FAILED_CHECKS mcp_server_reachable,oauth_metadata` (connection refused), every
+   other check `PASS` (`config_source`, `profile_load`, `tunnel_id`, `control_plane_api_key`
+   "configured", which does not validate the key with OpenAI, `mcp_target`, `health_listener`,
+   `ui`; `codex_plugin` `SKIP`). Without `--health.unix-socket` it reports "health_listener PASS will
+   bind http://127.0.0.1:8080". With the API up: `RESULT ok`, exit 0, no `FAILED_CHECKS` line
+   (`mcp_server_reachable` "PASS HTTP 405 from .../mcp", `oauth_metadata` "PASS OAuth metadata not
+   advertised; all candidates returned HTTP 404", `health_listener` "PASS will bind unix socket
+   <sock>"). A leftover socket file makes `health_listener` fail ("bind: address already in use").
+   No secret in its output.
+3. `run` with the fake key against api.openai.com: tunnel-client keeps retrying (backoff from
+   200 ms, about 4 failed polls in 2 s); `/readyz` on the socket stays 200 "ready", while `GET
+   /health?details=true` (one JSON line: `schema_version`, `live`, `ready`, `snapshot_at`,
+   `runtime{version, flavor "full", ...}`, `components{...}`) shows `components["control-plane"] =
+   {"status":"degraded","state":"backoff","reason_code":"http_error",...,"details":{...,
+   "consecutive_failures":4,...,"failure_category":"http_error","http_status":401}}`; right after
+   the start it is status `unknown`, state `polling`. In the vendor's local control plane (`dev
+   proxy`) it is `{"status":"ok","state":"polling",...,"details":{"consecutive_failures":0,...}}`;
+   the other components then: oauth ok/not_advertised, dispatcher ok/accepting, mcp
+   unknown/not_observed (normal for HTTP). The log of a 401: `WARN poll failed; backing off ...
+   error="controlplane client: unexpected status 401: invalid_api_key: Incorrect API key provided:
+   sk-proj-****...<last 4>. ..."` and one `WARN tunnel metadata fetch failed ... 401`: OpenAI masks
+   the key (`sk-proj-`, one asterisk per hidden character, the last 4 characters); the whole key is
+   never logged. SIGTERM and SIGINT: exit 0, the socket removed.
+4. At log level info, `run` writes about 150 dependency-injection lines (`INFO provided ...`, `INFO
+   supplied ...`, OnStart/OnStop hooks) before anything useful, and one warning per failed poll:
+   in a window this floods everything else (why `start` writes it to the tunnel log only).
+5. `dev proxy --profile-file <our tunnel-client.yaml> --url-file <json>` (an in-memory control plane
+   with the real runtime; the JSON names `mcp_url` `http://127.0.0.1:<port>/v1/mcp/tunnel_2222...`)
+   with the API up: `initialize` without any `Authorization` 200 (tunnel-client added ours from
+   the `file:` reference), `notifications/initialized` 202, `tools/list` 200 with the 7 viewer
+   tools, `tools/call deals_health` 200 (one `mcp tool call` line with its `request_id` in the API
+   log); `initialize` with a client-sent `Authorization: Bearer junk` 401 (client headers override
+   ours, as the vendor documents). tunnel-client's own start-up probe logged "mcp session
+   initialized ... protocol_version=2026-07-28 server_name=suv-deals" (our `mcp probe` negotiates
+   `2025-11-25`); its OAuth discovery logs a harmless "WARN OAuth discovery failed ... decode
+   protected resource metadata" (our 404 is plain text) and health shows oauth ok/not_advertised.
+6. The build container reaches api.openai.com (the 401 above).
+
+End-to-end run of the reviewed script with the real binary, the same day (scratch database,
+SYNTHETIC workspace, tunnel id `tunnel_` + 32 hex, a FAKE key piped on stdin): `setup` exit 0,
+showing doctor's output with exactly `mcp_server_reachable,oauth_metadata` failed and the
+"expected before start" note; `start` (stdin `/dev/null`): `doctor --process api` 0 errors,
+`/readyz` 200, "the API's own socket", the probe 4/4 (7 tools, tools/list SHA-256 `bcb1df66...`),
+`tunnel-client doctor` with the API up `RESULT ok`, then the real tunnel; `status` during the run:
+`control plane: status unknown, state polling, ...` (exit 1), no TCP listener of tunnel-client;
+about 2 s after the tunnel started the window printed "[local_mcp] error: OpenAI's control plane
+answers HTTP 401; stopping the tunnel" and "error: OpenAI rejected the runtime API key (control
+plane HTTP 401 on 4 polls in a row): a wrong or revoked key. Delete .../control-plane-api-key and
+run scripts/local_mcp.sh setup with a new restricted key ...", `start` exit 1, the API stopped (its
+port closed), no process left; `status` afterwards exit 1 with "the last start stopped it: OpenAI
+rejected the runtime API key ...". None of tunnel-client's own lines reached the window. The dev
+proxy chain of item 5 ran with this run's YAML and credential. Secret scan of 48 files (every
+output, the logs, the probe and doctor reports, the YAML, `credential.json`,
+`tunnel-client.version`): neither the fake key, nor the token (with or without its prefix), nor a
+planted shell variable; the tunnel log holds the masked key 10 times (`sk-proj-`, asterisks, the
+fake key's last 4 characters). Modes 0700/0600; the scratch database dropped.
+
+Points not confirmed (re-check them in the live test):
+
+- whether ChatGPT with "No authentication" sends no `Authorization` header of its own (a
+  client-sent one overrides ours: verified with the vendor's `dev proxy`; the API then answers
+  401);
+- a control plane that accepts the tunnel: status `ok`, state `polling` was seen only in the
+  vendor's local `dev proxy`; against OpenAI's real service only the 401 path is verified (403
+  and 404 were not observed there; their messages follow the HTTP meaning);
 - the Platform pages: restricting a runtime key to one tunnel, the usage limit and whether tunnel
-  traffic counts against it, restricting a tunnel's Use to one person, the download's archive
-  and binary name; the ChatGPT labels (Plugins or Settings -> Connectors, "Connection: Tunnel");
+  traffic counts against it, restricting a tunnel's Use to one person; the ChatGPT labels
+  (Plugins or Settings -> Connectors, "Connection: Tunnel");
 - that admin keys start with `sk-admin-` (setup's refusal is a heuristic);
-- that the forwarded requests carry no browser `Origin` and a loopback `Host` (otherwise the API
-  answers 403 or 421; `status`, the API log and the tunnel log show it);
-- how tunnel-client treats this server's 401 challenge without OAuth metadata during its startup
-  discovery (the vendor says non-timeout discovery failures settle readiness).
+- that the requests the real service forwards carry no browser `Origin` and a loopback `Host`
+  (otherwise the API answers 403 or 421; `status`, the API log and the tunnel log show it).

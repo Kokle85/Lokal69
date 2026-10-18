@@ -72,6 +72,33 @@ plugin uses "No authentication". Nothing was connected to the real ChatGPT accou
   release exists is gone) and `setup` records the binary's SHA-256; the gate-13 evidence names
   the `mcp tool call` log lines (the `request served` lines are only `/readyz`); the exit codes
   129/130/143 of an interrupted `start` are documented.
+- **The real `tunnel-client` v0.0.16** (the owner's download `tunnel-client-v0.0.16-linux-amd64.zip`,
+  SHA-256 `d60cdba0...b117`, matching the release's `SHA256SUMS.txt`) checked in the build
+  container, and `scripts/local_mcp.sh` adapted to what it does. `setup` runs `tunnel-client
+  doctor --config ... --health.unix-socket <tunnel dir>/health.sock --explain`, shows its output
+  and succeeds when only `mcp_server_reachable` and/or `oauth_metadata` fail (nothing answers the
+  MCP URL before `start`; any other failed check, or no `FAILED_CHECKS` line: exit 1). `start` runs
+  the same doctor after the probe with the API up and requires it to pass (steps 1/6 to 6/6). The
+  start window no longer says "dot can use the plugin" on `/readyz` 200 (v0.0.16 answers 200 even
+  while OpenAI rejects the key): it reads the control-plane component of `GET
+  /health?details=true` on the health socket (`python3 -I`, else `jq`, else a conservative
+  fallback; nothing read is evaluated) and says "connected to OpenAI (control plane polling)" once
+  it is ok; HTTP 401, 403 or 404 on 3 polls in a row stop the tunnel with the cause and the fix
+  (recorded in `var/local_mcp/tunnel.rejected`, shown by `status`), and `start` exits 1 with the
+  API stopped; other failures (network, 5xx) give one warning while tunnel-client keeps retrying.
+  `status` shows the control-plane line. tunnel-client's own output (about 150 start-up lines,
+  one warning per failed poll) goes only to `var/local_mcp/logs/tunnel-<UTC>.log` (no `tee` into
+  the window; its last 20 lines are printed on an unexpected exit). Verified for v0.0.16: with
+  the health socket it binds no TCP port. Tests: 98 in `tests/cli/test_local_mcp_script.py`
+  (stub `doctor` and health JSON in the real formats; every new test fails against the previous
+  script). End-to-end with the real binary (FAKE key, SYNTHETIC tunnel id): `setup` exit 0 with
+  the expected note; `start`: doctor ok with the API up, OpenAI answered 401, the tunnel stopped,
+  exit 1, the API stopped, no TCP listener; the vendor's `dev proxy` with the generated YAML:
+  `initialize`, `tools/list` (7 tools) and `deals_health` 200 without a client `Authorization`, a
+  client-sent one 401; secret scan clean, the tunnel log holds only OpenAI's masked key (last 4
+  characters; SECURITY.md). Docs: docs/connect_mcp.md 8.2, 8.3, 8.4, 8.6, docs/runbook.md 9.3,
+  ACTIVATION_GATES.md gate 13 (an evidence row; the state stays `blocked`). The live ChatGPT test
+  is still to be done.
 - Docs: docs/connect_mcp.md section 8 (decision, data flow, the owner's steps on the Platform, in
   WSL and in ChatGPT, test prompts and evidence, turning it off, rules S1-S7, what is unverified),
   sections 2, 3.1 and 4 updated; docs/runbook.md 9.3; ACTIVATION_GATES.md gate 13 and its

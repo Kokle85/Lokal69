@@ -6,13 +6,20 @@
 #   scripts/local_mcp.sh setup    once; idempotent, creates only what is missing: checks
 #                                 tunnel-client, asks for the tunnel id and the OpenAI runtime API
 #                                 key (hidden input), creates the viewer MCP credential file, writes
-#                                 tunnel-client.yaml and runs `tunnel-client doctor --explain`
+#                                 tunnel-client.yaml and runs `tunnel-client doctor --explain` (its
+#                                 checks mcp_server_reachable and oauth_metadata fail until `start`
+#                                 runs the API: expected, setup still succeeds)
 #   scripts/local_mcp.sh start    doctor, the API on 127.0.0.1:LOCAL_MCP_PORT (background), its
-#                                 /readyz, `suv-deals mcp probe`, then `tunnel-client run` in THIS
-#                                 window (foreground); Ctrl+C stops the tunnel and the API
+#                                 /readyz, `suv-deals mcp probe`, `tunnel-client doctor` with the
+#                                 API up, then `tunnel-client run` in THIS window (foreground; its own
+#                                 output goes to its log file only). The window says when OpenAI's
+#                                 control plane accepts the tunnel, and stops it when OpenAI rejects
+#                                 the runtime API key or the tunnel id; Ctrl+C stops the tunnel and
+#                                 the API
 #   scripts/local_mcp.sh stop     from another window: SIGTERM to the tunnel, then to the API
-#   scripts/local_mcp.sh status   which of the two run, the API's /readyz, the tunnel's /readyz (its
-#                                 health socket), the credential's expiry, log files and last lines
+#   scripts/local_mcp.sh status   which of the two run, the API's /readyz, the tunnel's /readyz and
+#                                 control-plane state (its health socket), the credential's expiry,
+#                                 log files and last lines
 #   scripts/local_mcp.sh logs     follow the current API and tunnel logs (Ctrl+C stops following)
 #   scripts/local_mcp.sh rotate   a new credential file (atomic rename), then revokes the old
 #                                 credential; restart afterwards
@@ -45,18 +52,24 @@
 # control-plane-api-key (0600), tunnel-id, mcp-authorization (0600, exactly "Bearer <token>"),
 # credential.json (credential id, workspace, expiry; no secret), tunnel-client.yaml (0600),
 # tunnel-client.version (its --version output and sha256) and, while the tunnel runs, health.sock
-# (its health and admin endpoints: /healthz, /readyz, the UI).
+# (its health and admin endpoints: /healthz, /readyz, /health, the UI; tunnel-client v0.0.16 binds
+# no TCP port when it has this socket).
 #
 # State (var/ is git-ignored): var/local_mcp/<process>.pid, <process>.starttime (the API's start
 # time, so a reused pid is never signalled), <process>.logfile (its current log), <process>.stopping
-# (SIGTERM sent), api.port, api.lost (the API ended while the tunnel ran), var/local_mcp/lock (one
-# setup, start, stop or rotate at a time; `start` releases it once the tunnel runs) and
-# var/local_mcp/logs/<process>-<UTC time>.log (process: api, tunnel), probe-<UTC time>.json.
-# Separate from scripts/local_crawl.sh (var/local_crawl, its own lock).
+# (SIGTERM sent), api.port, api.lost (the API ended while the tunnel ran), tunnel.rejected (why the
+# last start stopped the tunnel: OpenAI answered 401, 403 or 404), var/local_mcp/lock (one setup,
+# start, stop or rotate at a time; `start` releases it once the tunnel runs) and
+# var/local_mcp/logs/<process>-<UTC time>.log (process: api, tunnel), probe-<UTC time>.json,
+# doctor-<UTC time>.txt. Separate from scripts/local_crawl.sh (var/local_crawl, its own lock).
 #
 # While the tunnel runs, the start window stops it as soon as the API is gone (tunnel-client would
 # otherwise send the credential to whatever binds 127.0.0.1:LOCAL_MCP_PORT next), and `start` sends
 # the credential (probe) only after checking that the API it launched owns the listening socket.
+# The window reads the control-plane component of the tunnel's GET /health?details=true (/readyz
+# answers 200 even while OpenAI refuses the key): "connected" only once it is ok; 401, 403 or 404
+# on 3 polls in a row stop the tunnel with the cause and the fix (exit 1); other failures (network,
+# 5xx) print one warning and the tunnel keeps retrying. Nothing read from the socket is evaluated.
 #
 # Environment (optional): LOCAL_MCP_PORT API port (default 8010); LOCAL_MCP_TUNNEL_DIR;
 # TUNNEL_CLIENT_BIN the tunnel-client binary (default: from PATH); LOCAL_MCP_WORKSPACE workspace id
@@ -66,8 +79,9 @@
 # `status` shows (default 5).
 #
 # Exit codes: 0 ok (for `start`: the tunnel was stopped with Ctrl+C or `stop`); 1 a step failed,
-# setup is incomplete, the credential expired, a process is not running or not ready (`status`),
-# did not stop in time, another command holds the lock, or the tunnel ended any other way (the API
+# setup is incomplete, the credential expired, a process is not running or not ready (`status`:
+# also a control plane that is not ok), did not stop in time, another command holds the lock,
+# OpenAI rejected the runtime API key or the tunnel id, or the tunnel ended any other way (the API
 # died, a closed window); 2 usage; 129, 130 or 143 when `start` is interrupted (closed window,
 # Ctrl+C, SIGTERM) before the tunnel runs. The API that `start` launched is stopped in every case.
 set -euo pipefail
@@ -85,6 +99,11 @@ STOP_TIMEOUT=${LOCAL_MCP_STOP_TIMEOUT:-30}
 PROBE_TIMEOUT=${LOCAL_MCP_PROBE_TIMEOUT:-10}
 TAIL_LINES=${LOCAL_MCP_TAIL:-5}
 EXPIRY_WARN_DAYS=5
+# OpenAI's 401/403/404 on this many control-plane polls in a row stop the tunnel (retrying cannot
+# help; tunnel-client v0.0.16 reaches 3 within about a second).
+REJECT_AFTER=3
+# The checks of `tunnel-client doctor` that fail while the API is not running (setup, before start).
+DOCTOR_EXPECTED_BEFORE_START=" mcp_server_reachable oauth_metadata "
 CREDENTIAL_LABEL="dot read-only (tunnel)"
 CREDENTIAL_ROLE=viewer
 CREDENTIAL_SCOPES=deals:read,reviews:read
@@ -474,6 +493,40 @@ scrub_tunnel_env() {
 # tunnel_client ARGS...: tunnel-client with the cleaned environment (header comment).
 tunnel_client() { (scrub_tunnel_env && exec "$TC" "$@"); }
 
+# tunnel_doctor: `tunnel-client doctor --explain` for tunnel-client.yaml with the health socket that
+# `start` gives the tunnel (cleaned environment, no stdin). Sets DOCTOR_OUT (its whole output: check
+# names, URLs and errors, no secret value), DOCTOR_STATUS (its exit status) and DOCTOR_FAILED (the
+# comma-separated names of its one `FAILED_CHECKS` line; empty without exactly one such line).
+tunnel_doctor() {
+  DOCTOR_OUT=$(tunnel_client doctor --config "$CONFIG_FILE" --health.unix-socket "$HEALTH_SOCKET" \
+    --explain </dev/null 2>&1) && DOCTOR_STATUS=0 || DOCTOR_STATUS=$?
+  DOCTOR_FAILED=$(printf '%s\n' "$DOCTOR_OUT" |
+    awk '/^FAILED_CHECKS / { n++; v = substr($0, 15) } END { if (n == 1) print v }')
+  [[ $DOCTOR_FAILED =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] || DOCTOR_FAILED=""
+}
+
+# doctor_unexpected: the names in DOCTOR_FAILED that are not expected before `start` (empty: only
+# mcp_server_reachable and/or oauth_metadata failed).
+doctor_unexpected() {
+  local name names=()
+  IFS=, read -r -a names <<<"$DOCTOR_FAILED"
+  for name in "${names[@]}"; do
+    if [[ $DOCTOR_EXPECTED_BEFORE_START != *" $name "* ]]; then printf '%s ' "$name"; fi
+  done
+}
+
+# remove_stale_socket: delete health.sock left by an earlier run (the caller made sure that no tunnel
+# of this directory runs); tunnel-client would fail to bind it ("address already in use").
+remove_stale_socket() {
+  if [[ -e $HEALTH_SOCKET || -L $HEALTH_SOCKET ]]; then
+    if [[ -S $HEALTH_SOCKET && ! -L $HEALTH_SOCKET ]]; then
+      rm -f -- "$HEALTH_SOCKET"
+    else
+      fail "$HEALTH_SOCKET exists and is not a socket; remove it"
+    fi
+  fi
+}
+
 render_config() {
   cat <<EOF
 # tunnel-client configuration for dot (docs/connect_mcp.md section 8), written by
@@ -710,10 +763,27 @@ setup() {
 
   echo "6/6 tunnel-client.yaml and \`tunnel-client doctor --explain\`"
   ensure_config
-  if ! tunnel_client doctor --config "$CONFIG_FILE" --explain; then
-    echo "error: tunnel-client doctor reported a problem (above). If it names only the MCP server at" \
-      "$MCP_URL as unreachable, that is expected before scripts/local_mcp.sh start runs the API." >&2
-    exit 1
+  if running tunnel; then
+    echo "  doctor skipped: the tunnel is running (pid $(read_pid tunnel)) and holds its health socket;" \
+      "stop it and run setup again to check the configuration"
+    echo "setup complete."
+    return 0
+  fi
+  remove_stale_socket
+  tunnel_doctor
+  printf '%s\n' "$DOCTOR_OUT" | sed 's/^/    /'
+  if ((DOCTOR_STATUS == 0)); then
+    echo "  doctor: RESULT ok"
+  elif [[ -z $DOCTOR_FAILED ]]; then
+    fail "tunnel-client doctor failed (exit $DOCTOR_STATUS) and its output (above) has no FAILED_CHECKS" \
+      "line naming the failed checks; fix what it reports, then run scripts/local_mcp.sh setup again"
+  elif [[ -n $(doctor_unexpected) ]]; then
+    fail "tunnel-client doctor failed (exit $DOCTOR_STATUS): failed checks other than" \
+      "mcp_server_reachable and oauth_metadata: $(doctor_unexpected)(all: $DOCTOR_FAILED); the" \
+      "explanation is above. Fix them, then run scripts/local_mcp.sh setup again"
+  else
+    echo "  doctor: only ${DOCTOR_FAILED//,/ and } failed. That is expected before scripts/local_mcp.sh" \
+      "start: the API is not running yet (nothing answers $MCP_URL); start runs doctor again with the API up."
   fi
   echo "setup complete. Next: scripts/local_mcp.sh start (and keep that window open)."
 }
@@ -732,6 +802,84 @@ tunnel_ready_code() {
     return 0
   fi
   curl -s -o /dev/null -m 3 -w '%{http_code}' --unix-socket "$HEALTH_SOCKET" http://localhost/readyz 2>/dev/null || true
+}
+
+# The control-plane component of the health JSON as five words (see control_plane), for python3 in
+# isolated mode and for jq. Every value that is not a plain word becomes "-".
+CP_PY='import json, re, sys
+def word(value):
+    text = str(value) if isinstance(value, (str, int, float)) else ""
+    return text if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", text) else "-"
+try:
+    cp = json.load(sys.stdin)["components"]["control-plane"]
+    details = cp.get("details") or {}
+    values = (cp.get("status"), cp.get("state"), details.get("http_status"),
+              details.get("consecutive_failures"), details.get("failure_category") or cp.get("reason_code"))
+    print(" ".join(word(v) for v in values))
+except Exception:
+    print("- - - - -")'
+# shellcheck disable=SC2016 # a jq program: $c is jq's variable, not the shell's
+CP_JQ='.components["control-plane"] as $c
+  | [$c.status, $c.state, $c.details.http_status, $c.details.consecutive_failures,
+     ($c.details.failure_category // $c.reason_code)]
+  | map(if type == "string" or type == "number" then tostring else "" end
+        | if test("^[A-Za-z0-9_.:-]{1,64}$") then . else "-" end)
+  | join(" ")'
+CP_WORDS_RE='^[A-Za-z0-9_.:-]+( [A-Za-z0-9_.:-]+){4}$'
+
+# cp_sed JSON: the conservative fallback without python3 and jq. It looks only at the control-plane
+# object up to its first closing brace (its details) and recognises only "status":"ok" as its first
+# key, http_status 401, 403 or 404 and consecutive_failures; everything else is "-".
+cp_sed() {
+  local segment status=- http=- failures=-
+  segment=$(printf '%s' "$1" | sed -n 's/.*"control-plane":{\([^}]*\)}.*/\1/p' | head -n 1)
+  if [[ $segment == '"status":"ok",'* || $segment == '"status":"ok"' ]]; then status=ok; fi
+  if [[ $segment =~ \"http_status\":(401|403|404)(,|$) ]]; then http=${BASH_REMATCH[1]}; fi
+  if [[ $segment =~ \"consecutive_failures\":([0-9]{1,6})(,|$) ]]; then failures=${BASH_REMATCH[1]}; fi
+  printf '%s - %s %s -' "$status" "$http" "$failures"
+}
+
+# control_plane: the tunnel's GET /health?details=true on its health socket, reduced to the
+# control-plane component's "status state http_status consecutive_failures failure_category" ("-"
+# for a missing or unusual value); 1 without an answer. python3 -I if present, else jq, else cp_sed.
+# The JSON is only parsed, never evaluated.
+control_plane() {
+  local json line=""
+  [[ -S $HEALTH_SOCKET ]] || return 1
+  json=$(curl -s -m 3 --unix-socket "$HEALTH_SOCKET" 'http://localhost/health?details=true' 2>/dev/null |
+    head -c 262144) || true
+  [[ -n $json ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    line=$(printf '%s' "$json" | python3 -I -c "$CP_PY" 2>/dev/null) || line=""
+  fi
+  if [[ ! $line =~ $CP_WORDS_RE ]] && command -v jq >/dev/null 2>&1; then
+    line=$(printf '%s' "$json" | jq -r "$CP_JQ" 2>/dev/null) || line=""
+  fi
+  if [[ ! $line =~ $CP_WORDS_RE ]]; then line=$(cp_sed "$json"); fi
+  printf '%s' "$line"
+}
+
+# rejected_message HTTP FAILURES: the cause and the fix when OpenAI's control plane keeps answering
+# HTTP 401, 403 or 404 (tunnel-client would retry for ever).
+rejected_message() {
+  case $1 in
+    401)
+      printf '%s' "OpenAI rejected the runtime API key (control plane HTTP 401 on $2 polls in a row): a" \
+        " wrong or revoked key. Delete $API_KEY_FILE and run scripts/local_mcp.sh setup with a new" \
+        " restricted key (Tunnels Read + Use; $API_KEYS_PAGE)"
+      ;;
+    403)
+      printf '%s' "OpenAI refused the tunnel (control plane HTTP 403 on $2 polls in a row): the runtime" \
+        " API key lacks Tunnels Read + Use for $TUNNEL_ID, or the tunnel belongs to another organization" \
+        " or project. Give the key that permission or create one in the tunnel's project ($API_KEYS_PAGE)," \
+        " delete $API_KEY_FILE and run scripts/local_mcp.sh setup; for a wrong tunnel id delete" \
+        " $TUNNEL_ID_FILE instead"
+      ;;
+    *)
+      printf '%s' "OpenAI does not know the tunnel $TUNNEL_ID (control plane HTTP 404 on $2 polls in a" \
+        " row): delete $TUNNEL_ID_FILE and run scripts/local_mcp.sh setup with the id from $TUNNELS_PAGE"
+      ;;
+  esac
 }
 
 # launch PROCESS LOGFILE COMMAND...: detached (own session, SIGHUP ignored), pid, start time and
@@ -849,13 +997,17 @@ EOF
   sed 's/^/  /' "$1"
 }
 
-# watch_tunnel (background job of the start window, ended by the EXIT trap): says when the tunnel's
-# /readyz first answers 200, and stops the tunnel as soon as the API this run launched is gone, so
-# that tunnel-client never sends the credential to whatever binds 127.0.0.1:PORT next. The API is
-# checked before the tunnel: `stop` ends the API only after the tunnel, so "API gone, tunnel
-# running" means the API died by itself.
+# watch_tunnel (background job of the start window, ended by the EXIT trap):
+# - stops the tunnel as soon as the API this run launched is gone, so that tunnel-client never sends
+#   the credential to whatever binds 127.0.0.1:PORT next. The API is checked before the tunnel:
+#   `stop` ends the API only after the tunnel, so "API gone, tunnel running" means it died;
+# - reads the control-plane component of the tunnel's health (every second until it is ok, then
+#   every 5 s; /readyz answers 200 even while OpenAI refuses the key): says "connected" once it is
+#   ok; on HTTP 401, 403 or 404 for REJECT_AFTER polls in a row records the cause in tunnel.rejected
+#   and stops the tunnel (the window then exits 1); any other failure (network, 5xx, backoff) gets
+#   one warning per kind and the tunnel keeps retrying; nothing decided within READY_TIMEOUT: a hint.
 watch_tunnel() {
-  local ticks=0 ready=0 tunnel_pid=""
+  local ticks=0 connected=0 hinted=0 warned="" tunnel_pid="" words status state http failures category
   while :; do
     sleep 0.5
     ticks=$((ticks + 1))
@@ -873,20 +1025,43 @@ watch_tunnel() {
       return 0
     fi
     if [[ -n $tunnel_pid ]] && ! pid_alive "$tunnel_pid"; then return 0; fi
-    if ((!ready)); then
-      if [[ $(tunnel_ready_code) == 200 ]]; then
-        ready=1
-        echo "[local_mcp] tunnel ready (health socket /readyz: HTTP 200 after $(((ticks + 1) / 2))s); dot can use the plugin now"
-      elif ((ticks >= READY_TIMEOUT * 2)); then
-        ready=1
-        echo "[local_mcp] the tunnel did not report ready within ${READY_TIMEOUT}s; check the lines above or scripts/local_mcp.sh status"
+    if ((ticks % (connected ? 10 : 2) != 0)); then continue; fi
+    status=- state=- http=- failures=- category=-
+    if words=$(control_plane); then
+      read -r status state http failures category <<<"$words"
+    fi
+    if [[ $http =~ ^(401|403|404)$ && $failures =~ ^[0-9]+$ ]] && ((failures >= REJECT_AFTER)); then
+      rejected_message "$http" "$failures" >"$STATE_DIR/tunnel.rejected"
+      echo "[local_mcp] error: OpenAI's control plane answers HTTP $http; stopping the tunnel (cause and fix below)" >&2
+      signal_once tunnel
+      return 0
+    fi
+    if [[ $status == ok ]]; then
+      if [[ $state == - ]]; then state=ok; fi # the sed fallback reads the status only
+      if ((!connected)); then
+        echo "[local_mcp] connected to OpenAI (control plane $state); dot can use the plugin now"
+      elif [[ -n $warned ]]; then
+        echo "[local_mcp] control plane ok again ($state)"
       fi
+      connected=1 warned=""
+    elif [[ $status != - && ($failures =~ ^[1-9] || $category != -) && ! $http =~ ^(401|403|404)$ ]]; then
+      if [[ $warned != "$category $http" ]]; then
+        warned="$category $http"
+        echo "[local_mcp] warning: OpenAI's control plane is not reachable yet (status $status, state" \
+          "$state, failure $category, HTTP $http, $failures failure(s) in a row); tunnel-client keeps" \
+          "retrying. Details: scripts/local_mcp.sh status, logs" >&2
+      fi
+    fi
+    if ((!connected && !hinted && ticks >= READY_TIMEOUT * 2)); then
+      hinted=1
+      echo "[local_mcp] the tunnel has not connected to OpenAI within ${READY_TIMEOUT}s (control plane: status" \
+        "$status, state $state); dot cannot use the plugin yet. Check scripts/local_mcp.sh status and logs"
     fi
   done
 }
 
 start() {
-  local proc stamp api_log tunnel_log probe_file status other
+  local proc stamp api_log tunnel_log probe_file doctor_file status other
   if other=$(other_tunnel); then
     fail "a tunnel started with another LOCAL_MCP_TUNNEL_DIR is running (pid $(read_pid tunnel): $other);" \
       "stop it first: LOCAL_MCP_TUNNEL_DIR=<that directory> scripts/local_mcp.sh stop"
@@ -902,37 +1077,32 @@ start() {
     fail "port $PORT on 127.0.0.1 is already in use; choose a free one with LOCAL_MCP_PORT=<port>" \
       "(start rewrites tunnel-client.yaml for it; the dashboard API uses 8000 by default)"
   fi
-  if [[ -e $HEALTH_SOCKET || -L $HEALTH_SOCKET ]]; then
-    if [[ -S $HEALTH_SOCKET && ! -L $HEALTH_SOCKET ]]; then
-      rm -f -- "$HEALTH_SOCKET" # left by an earlier run (the tunnel is not running)
-    else
-      fail "$HEALTH_SOCKET exists and is not a socket; remove it"
-    fi
-  fi
+  remove_stale_socket # left by an earlier run (the tunnel is not running)
   ensure_config
   mkdir -p "$LOG_DIR"
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   api_log=$LOG_DIR/api-$stamp.log
   tunnel_log=$LOG_DIR/tunnel-$stamp.log
   probe_file=$LOG_DIR/probe-$stamp.json
+  doctor_file=$LOG_DIR/doctor-$stamp.txt
 
   trap on_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
 
-  echo "1/5 doctor (the API's configuration with this route's MCP environment; names only)"
+  echo "1/6 doctor (the API's configuration with this route's MCP environment; names only)"
   env "${API_ENV[@]}" uv run suv-deals doctor --process api || fail "doctor reported an error; nothing was started"
 
-  echo "2/5 API on 127.0.0.1:$PORT (background; log $api_log)"
+  echo "2/6 API on 127.0.0.1:$PORT (background; log $api_log)"
   forget api # a stale pid file must never name another process to the EXIT trap
-  rm -f "$STATE_DIR/api.lost"
+  rm -f "$STATE_DIR/api.lost" "$STATE_DIR/tunnel.rejected"
   API_STARTED=1
   launch api "$api_log" env "${API_ENV[@]}" \
     uv run suv-deals api serve --host 127.0.0.1 --port "$PORT" --no-proxy-headers
   printf '%s\n' "$PORT" >"$STATE_DIR/api.port"
 
-  echo "3/5 waiting for http://127.0.0.1:$PORT/readyz (up to ${READY_TIMEOUT}s)"
+  echo "3/6 waiting for http://127.0.0.1:$PORT/readyz (up to ${READY_TIMEOUT}s)"
   local waited=0 code
   while :; do
     if ! alive api; then
@@ -962,7 +1132,7 @@ start() {
   fi
   echo "  127.0.0.1:$PORT is the API's own socket"
 
-  echo "4/5 suv-deals mcp probe (401 without the header; initialize, tools/list, deals_health with it)"
+  echo "4/6 suv-deals mcp probe (401 without the header; initialize, tools/list, deals_health with it)"
   uv run suv-deals mcp probe --url "$MCP_URL" --authorization-file "$AUTH_FILE" --json \
     --timeout "$PROBE_TIMEOUT" >"$probe_file" 2>"$probe_file.err" && status=0 || status=$?
   if [[ -s $probe_file ]]; then probe_summary "$probe_file"; fi
@@ -973,11 +1143,23 @@ start() {
   rm -f -- "$probe_file.err"
   echo "  report: $probe_file"
 
-  echo "5/5 tunnel-client run (this window; log $tunnel_log)"
+  echo "5/6 tunnel-client doctor with the API up (output $doctor_file)"
+  tunnel_doctor
+  printf '%s\n' "$DOCTOR_OUT" >"$doctor_file"
+  if ((DOCTOR_STATUS != 0)); then
+    printf '%s\n' "$DOCTOR_OUT" | sed 's/^/  /' >&2
+    fail "tunnel-client doctor failed with the API up (exit $DOCTOR_STATUS; failed checks:" \
+      "${DOCTOR_FAILED:-none named}); the explanation is above; the tunnel was not started"
+  fi
+  printf '%s\n' "$DOCTOR_OUT" | sed -n -E 's/^CHECK (mcp_server_reachable|oauth_metadata|health_listener) +/  \1: /p'
+  echo "  RESULT ok"
+
+  echo "6/6 tunnel-client run (this window; its own output goes to $tunnel_log)"
   echo "======================================================================================"
   echo "Keep this window open while dot uses the system; Ctrl+C stops the tunnel and the API."
   echo "  tunnel $TUNNEL_ID -> $MCP_URL (local only; the API log: $api_log)"
-  echo "  In ChatGPT: Add custom MCP server, Connection: Tunnel, this tunnel, No authentication."
+  echo "  In ChatGPT, once this window says \"connected to OpenAI\": Add custom MCP server,"
+  echo "  Connection: Tunnel, this tunnel, No authentication."
   echo "  Another window: scripts/local_mcp.sh status | logs | stop"
   echo "======================================================================================"
   release_lock
@@ -987,19 +1169,21 @@ start() {
   WATCHER_PID=$!
   # The tunnel runs in the foreground of this window: Ctrl+C reaches it directly; the traps only
   # note the signal (bash runs them once the tunnel has exited), then the EXIT trap stops the API.
+  # Its own output (some 150 start-up lines, one warning per failed poll) goes to its log only;
+  # this window shows the watcher's lines (`logs` follows both logs).
   trap ':' INT TERM HUP
   set +e
   (
     trap - INT TERM HUP
     printf '%s\n' "$BASHPID" >"$(pid_file tunnel)" # this subshell becomes tunnel-client (exec)
     scrub_tunnel_env
-    # Health and admin endpoints on the socket in the 0700 directory; the vendor's flag help says
-    # this replaces the TCP listener. If a build keeps one anyway, 127.0.0.1:0 gives it an
-    # ephemeral loopback port instead of a fixed 8080 that could collide (docs/connect_mcp.md 8.2).
+    # Health and admin endpoints on the socket in the 0700 directory: tunnel-client v0.0.16 then
+    # binds no TCP port (flag help and a real run, docs/connect_mcp.md 8.2). If another build kept
+    # one anyway, 127.0.0.1:0 gives it an ephemeral loopback port instead of a fixed 8080.
     exec "$TC" run --config "$CONFIG_FILE" --health.unix-socket "$HEALTH_SOCKET" \
       --health.listen-addr 127.0.0.1:0
-  ) 2>&1 | tee -i -a "$tunnel_log"
-  status=${PIPESTATUS[0]}
+  ) >>"$tunnel_log" 2>&1
+  status=$?
   set -e
   forget tunnel
   if [[ -S $HEALTH_SOCKET ]]; then rm -f -- "$HEALTH_SOCKET"; fi
@@ -1010,12 +1194,19 @@ start() {
     tail -n 20 "$api_log" >&2 || true
     exit 1
   fi
+  if [[ -f $STATE_DIR/tunnel.rejected ]]; then
+    echo "error: $(<"$STATE_DIR/tunnel.rejected"). The tunnel was stopped (exit $status; its log:" \
+      "$tunnel_log); stopping the API" >&2
+    exit 1
+  fi
   case $status in
     0 | 130 | 143)
       echo "tunnel: stopped (exit $status); stopping the API"
       ;;
     *)
-      echo "error: the tunnel exited with status $status (log $tunnel_log); stopping the API" >&2
+      echo "error: the tunnel exited with status $status; last lines of $tunnel_log:" >&2
+      tail -n 20 "$tunnel_log" >&2 || true
+      echo "(stopping the API)" >&2
       exit 1
       ;;
   esac
@@ -1066,7 +1257,7 @@ show_log() {
 }
 
 status() {
-  local problem=0 port code epoch left file other
+  local problem=0 port code epoch left file other words cp_status cp_state cp_http cp_failures cp_category
   port=$PORT
   if [[ -f $STATE_DIR/api.port && $(<"$STATE_DIR/api.port") =~ ^[0-9]+$ ]]; then port=$(<"$STATE_DIR/api.port"); fi
   if running api; then
@@ -1082,11 +1273,23 @@ status() {
     code=$(tunnel_ready_code)
     echo "tunnel: running (pid $(read_pid tunnel)); health socket /readyz HTTP $code"
     if [[ $code != 200 ]]; then problem=1; fi
+    if words=$(control_plane); then
+      read -r cp_status cp_state cp_http cp_failures cp_category <<<"$words"
+      echo "  control plane: status $cp_status, state $cp_state, http_status $cp_http," \
+        "consecutive_failures $cp_failures, failure_category $cp_category"
+      if [[ $cp_status != ok ]]; then problem=1; fi
+    else
+      echo "  control plane: no answer on the health socket (GET /health?details=true)"
+      problem=1
+    fi
   elif other=$(other_tunnel); then
     echo "tunnel: one started with another LOCAL_MCP_TUNNEL_DIR runs (pid $(read_pid tunnel): $other)"
     problem=1
   else
     echo "tunnel: not running"
+    if [[ -f $STATE_DIR/tunnel.rejected ]]; then
+      echo "  the last start stopped it: $(<"$STATE_DIR/tunnel.rejected")"
+    fi
     problem=1
   fi
   show_log tunnel

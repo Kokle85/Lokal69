@@ -843,9 +843,12 @@ forwards to a separate local API on `127.0.0.1:8010`. The full procedure, the se
 ```bash
 scripts/local_mcp.sh setup    # once: tunnel-client check, tunnel id + runtime API key (hidden input),
                               # the credential file, tunnel-client.yaml, `tunnel-client doctor --explain`
-scripts/local_mcp.sh start    # doctor, API on 127.0.0.1:8010, /readyz, `mcp probe`, then the tunnel
-                              # in this window: keep it open; Ctrl+C stops the tunnel and the API
-scripts/local_mcp.sh status   # another window: both processes, /readyz, credential days left, logs
+                              # (mcp_server_reachable and oauth_metadata fail until start: expected)
+scripts/local_mcp.sh start    # doctor, API on 127.0.0.1:8010, /readyz, `mcp probe`, tunnel-client doctor,
+                              # then the tunnel in this window: keep it open; Ctrl+C stops the tunnel
+                              # and the API; tunnel-client's own output: var/local_mcp/logs/tunnel-*.log
+scripts/local_mcp.sh status   # another window: both processes, /readyz, the control plane, days left, logs
+scripts/local_mcp.sh logs     # another window: follow the API and tunnel logs
 scripts/local_mcp.sh stop     # another window: the tunnel first, then the API
 scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart afterwards
 ```
@@ -855,7 +858,11 @@ scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart aft
   its ZIP checked against the release's `SHA256SUMS.txt`, in `~/.local/bin` (docs/connect_mcp.md
   8.3 step 1). The tunnel directory must not be inside any git working tree (a dotfiles repository
   at `~/.config` or `~` is refused). Then in ChatGPT: Add custom MCP server,
-  Connection: Tunnel, `lokal69-mcp`, No authentication, only while `start` says "tunnel ready".
+  Connection: Tunnel, `lokal69-mcp`, No authentication, only while `start` says "connected to
+  OpenAI" (the control plane accepted the tunnel; `/readyz` alone does not show that). If OpenAI
+  rejects the runtime key (401), its permission or the tunnel (403) or the tunnel id (404), the
+  window names the cause and the fix, stops the tunnel and the API and exits 1
+  (docs/connect_mcp.md 8.3 step 3).
 - Secrets stay in `~/.config/suv-deals/tunnel/` (0700, files 0600) and in `.env`; the script never
   prints them, never puts them on a command line and never reads, prints or passes `.env`. Never
   run tunnel-client with `--log.http-raw-unsafe`, and never connect the PC as dot's "computer".
