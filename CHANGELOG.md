@@ -21,8 +21,8 @@ plugin uses "No authentication". Nothing was connected to the real ChatGPT accou
 - **`scripts/local_mcp.sh setup|start|stop|status|logs|rotate`** (in the style of
   `scripts/local_crawl.sh`, separate state `var/local_mcp/` and lock). `setup` (idempotent)
   checks `tunnel-client` and records its version; creates `~/.config/suv-deals/tunnel`
-  (`LOCAL_MCP_TUNNEL_DIR`; 0700; refused inside the repository or a git working tree around it,
-  under `/mnt`, as a symlink, owned by someone else or open to group/others); reads the tunnel id
+  (`LOCAL_MCP_TUNNEL_DIR`; 0700; refused inside the repository, a git working tree around it or a
+  git working tree around the tunnel directory itself such as a dotfiles repository, under `/mnt`, as a symlink, owned by someone else or open to group/others); reads the tunnel id
   (validated, `tunnel_<32>` or `tunnel_<4>_<32>`) and the runtime API key with `read -rs` and
   writes them with the shell builtin `printf` into new 0600 files (refuses an empty key, an admin
   key `sk-admin-...`, a tunnel id or an MCP token in the key prompt); creates the credential with
@@ -44,15 +44,34 @@ plugin uses "No authentication". Nothing was connected to the real ChatGPT accou
   creates a new credential into a new file, renames it into place only after success, updates
   `credential.json` and revokes the old credential (a failed revocation is reported loudly, the
   new file kept). `APP_BASE_URL` is not set: verified unnecessary for `doctor` and the Host check.
-- Tests: `tests/cli/test_local_mcp_script.py` (57; stub `uv`, `tunnel-client` and `curl` that
-  record argv and environment: the key and the token never appear in any output, argument,
-  environment or the YAML; modes, refusals, validation, idempotency, step order and environment,
-  refusals of `start`, expiry warning, the API stopped when the tunnel exits, `stop` and `status`
-  from another window, `rotate` success and both failure paths, the lock); the script is in the
+- Tests: `tests/cli/test_local_mcp_script.py` (75; stub `uv`, `tunnel-client` and `curl` that
+  record argv and environment, plus a test that wraps every other external command the script runs
+  to record its argv: the key and the token never appear in the output, in the argv of a command
+  the script runs, in the stubs' environment or in the YAML; a pty test for both hidden prompts;
+  modes, refusals, validation, idempotency, step order and environment, refusals of `start`,
+  expiry warning, the API stopped when the tunnel exits and the tunnel stopped when the API dies,
+  Ctrl+C before and after the tunnel starts, `stop` and `status` from another window, `rotate`
+  success and its failure paths, the lock); the script is in the
   syntax and help lists of `tests/cli/test_ops_files.py`. One real end-to-end run in the build
   container (scratch database, the real API and credential, a fake `tunnel-client` driven by the
   generated YAML): probe 4/4, 7 tools, tools/list SHA-256 `bcb1df66...`, 401 without and 200 with
   the injected header, rotation revoked the old credential (docs/connect_mcp.md 8.6).
+- Review fixes before the live test: the tunnel directory is also refused inside a git working
+  tree around it (a dotfiles repository at `~/.config` or `~` would have listed the key and the
+  token as untracked files); `setup` revokes a credential that `credential.json` still names when
+  its token file is gone, and `setup`/`rotate` write `credential.json` before replacing anything
+  (a failure takes the new credential back; a failed final rename still revokes the old one and
+  prints the `mv` that finishes it); the start window stops the tunnel as soon as the API is gone,
+  and `start` sends the credential only after checking that the listening socket belongs to the API
+  it launched (`/proc`); the start window never signals a reused API pid (start time recorded);
+  `running` reads `ps -ww` (an exported `COLUMNS` made `stop` miss the tunnel); `stop`/`start`
+  with another `LOCAL_MCP_TUNNEL_DIR` refuse instead of forgetting the running tunnel;
+  `tunnel-client run` also gets `--health.listen-addr 127.0.0.1:0`. Docs: 8.2 no longer states as
+  fact that the health socket replaces the TCP listener (UNVERIFIED; `ss -ltnp` in the live test);
+  8.3 checks the downloaded ZIP against the release's `SHA256SUMS.txt` (the claim that no public
+  release exists is gone) and `setup` records the binary's SHA-256; the gate-13 evidence names
+  the `mcp tool call` log lines (the `request served` lines are only `/readyz`); the exit codes
+  129/130/143 of an interrupted `start` are documented.
 - Docs: docs/connect_mcp.md section 8 (decision, data flow, the owner's steps on the Platform, in
   WSL and in ChatGPT, test prompts and evidence, turning it off, rules S1-S7, what is unverified),
   sections 2, 3.1 and 4 updated; docs/runbook.md 9.3; ACTIVATION_GATES.md gate 13 and its

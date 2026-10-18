@@ -851,8 +851,10 @@ scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart aft
 ```
 
 - Before `setup`, on the Platform: the tunnel `lokal69-mcp` with Use restricted to the owner, a
-  restricted runtime API key (Tunnels Read + Use, usage limit) and the Linux x86-64 `tunnel-client`
-  in `~/.local/bin` (docs/connect_mcp.md 8.3 step 1). Then in ChatGPT: Add custom MCP server,
+  restricted runtime API key (Tunnels Read + Use, usage limit) and the Linux x86-64 `tunnel-client`,
+  its ZIP checked against the release's `SHA256SUMS.txt`, in `~/.local/bin` (docs/connect_mcp.md
+  8.3 step 1). The tunnel directory must not be inside any git working tree (a dotfiles repository
+  at `~/.config` or `~` is refused). Then in ChatGPT: Add custom MCP server,
   Connection: Tunnel, `lokal69-mcp`, No authentication, only while `start` says "tunnel ready".
 - Secrets stay in `~/.config/suv-deals/tunnel/` (0700, files 0600) and in `.env`; the script never
   prints them, never puts them on a command line and never reads, prints or passes `.env`. Never
@@ -860,6 +862,9 @@ scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart aft
 - The API of this route can run next to the dashboard API (port 8000) and next to
   `scripts/local_crawl.sh` (separate state in `var/local_mcp/`, separate lock). A different port:
   `LOCAL_MCP_PORT=<port> scripts/local_mcp.sh start`.
+- If the API dies while the tunnel runs, the start window stops the tunnel and exits 1 (the
+  credential never goes to another program on the port); `start` sends it only to the API's own
+  socket.
 - `start` and `status` warn 5 days before the credential expires; `start` refuses an expired one
   (`rotate`). Turning it off: Ctrl+C or `stop`; revoke the credential (`uv run suv-deals credentials
   revoke <id> --reason "..." --yes`); disable the tunnel or remove the plugin.

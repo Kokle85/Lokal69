@@ -40,16 +40,23 @@
 # variable of the shell can change its configuration, and never with raw HTTP logging.
 #
 # TUNNEL_DIR (LOCAL_MCP_TUNNEL_DIR, default ~/.config/suv-deals/tunnel; mode 0700, yours, outside
-# the repository and any git working tree around it, not a symlink, not under /mnt):
+# the repository and outside every git working tree, around the repository or around TUNNEL_DIR
+# itself such as a dotfiles repository at ~/.config or ~; not a symlink, not under /mnt):
 # control-plane-api-key (0600), tunnel-id, mcp-authorization (0600, exactly "Bearer <token>"),
 # credential.json (credential id, workspace, expiry; no secret), tunnel-client.yaml (0600),
-# tunnel-client.version and, while the tunnel runs, health.sock (its /healthz and /readyz).
+# tunnel-client.version (its --version output and sha256) and, while the tunnel runs, health.sock
+# (its health and admin endpoints: /healthz, /readyz, the UI).
 #
-# State (var/ is git-ignored): var/local_mcp/<process>.pid, <process>.logfile (its current log),
-# <process>.stopping (SIGTERM sent), api.port, var/local_mcp/lock (one setup, start, stop or
-# rotate at a time; `start` releases it once the tunnel runs) and
+# State (var/ is git-ignored): var/local_mcp/<process>.pid, <process>.starttime (the API's start
+# time, so a reused pid is never signalled), <process>.logfile (its current log), <process>.stopping
+# (SIGTERM sent), api.port, api.lost (the API ended while the tunnel ran), var/local_mcp/lock (one
+# setup, start, stop or rotate at a time; `start` releases it once the tunnel runs) and
 # var/local_mcp/logs/<process>-<UTC time>.log (process: api, tunnel), probe-<UTC time>.json.
 # Separate from scripts/local_crawl.sh (var/local_crawl, its own lock).
+#
+# While the tunnel runs, the start window stops it as soon as the API is gone (tunnel-client would
+# otherwise send the credential to whatever binds 127.0.0.1:LOCAL_MCP_PORT next), and `start` sends
+# the credential (probe) only after checking that the API it launched owns the listening socket.
 #
 # Environment (optional): LOCAL_MCP_PORT API port (default 8010); LOCAL_MCP_TUNNEL_DIR;
 # TUNNEL_CLIENT_BIN the tunnel-client binary (default: from PATH); LOCAL_MCP_WORKSPACE workspace id
@@ -58,9 +65,11 @@
 # 30); LOCAL_MCP_PROBE_TIMEOUT seconds per probe request (default 10); LOCAL_MCP_TAIL log lines
 # `status` shows (default 5).
 #
-# Exit codes: 0 ok; 1 a step failed, setup is incomplete, the credential expired, a process is not
-# running or not ready (`status`), did not stop in time, or another command holds the lock;
-# 2 usage.
+# Exit codes: 0 ok (for `start`: the tunnel was stopped with Ctrl+C or `stop`); 1 a step failed,
+# setup is incomplete, the credential expired, a process is not running or not ready (`status`),
+# did not stop in time, another command holds the lock, or the tunnel ended any other way (the API
+# died, a closed window); 2 usage; 129, 130 or 143 when `start` is interrupted (closed window,
+# Ctrl+C, SIGTERM) before the tunnel runs. The API that `start` launched is stopped in every case.
 set -euo pipefail
 
 # The comment block above (from line 2 up to the first line that is not a comment).
@@ -170,23 +179,70 @@ command_words() {
   esac
 }
 
+starttime_file() { printf '%s/%s.starttime' "$STATE_DIR" "$1"; }
+
+# proc_starttime PID: the process's start time (field 22 of /proc/PID/stat, clock ticks since boot);
+# it stays the same across exec and differs for a later process that reuses the pid.
+proc_starttime() {
+  local stat rest fields
+  { IFS= read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+  rest=${stat##*) } # after the command name, which may contain spaces and parentheses
+  read -r -a fields <<<"$rest"
+  [[ ${fields[19]:-} =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${fields[19]}"
+}
+
+# same_start PROCESS PID: PID started when PROCESS was launched (true when no start time was
+# recorded, e.g. without /proc).
+same_start() {
+  local file current
+  file=$(starttime_file "$1")
+  [[ -f $file ]] || return 0
+  current=$(proc_starttime "$2") || return 1
+  [[ $current == "$(<"$file")" ]]
+}
+
+# pid_alive PID: the process exists and is no zombie.
+pid_alive() {
+  local state
+  state=$(ps -p "$1" -o stat= 2>/dev/null) || return 1
+  state=${state//[[:space:]]/}
+  [[ -n $state && $state != Z* ]]
+}
+
+# process_args PID: its whole command line (-ww: never cut to $COLUMNS).
+process_args() {
+  kill -0 "$1" 2>/dev/null || return 1
+  ps -ww -p "$1" -o args= 2>/dev/null
+}
+
 # running PROCESS: its pid is alive AND runs that command (not a reused pid).
 running() {
   local pid args
   pid=$(read_pid "$1") || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
-  [[ " $args " == *" $(command_words "$1") "* ]]
+  args=$(process_args "$pid") || return 1
+  [[ " $args " == *" $(command_words "$1") "* ]] || return 1
+  same_start "$1" "$pid"
 }
 
-# alive PROCESS: its recorded pid exists and is no zombie. For the API this run launched: right
-# after the launch `ps` may still show setsid/nohup/env instead of the final command.
+# alive PROCESS: its recorded pid exists, is no zombie and is still the process launched then (same
+# start time). For the API this run launched: right after the launch `ps` may still show
+# setsid/nohup/env instead of the final command, so the command words are not compared.
 alive() {
-  local pid state
+  local pid
   pid=$(read_pid "$1") || return 1
-  state=$(ps -p "$pid" -o stat= 2>/dev/null) || return 1
-  state=${state//[[:space:]]/}
-  [[ -n $state && $state != Z* ]]
+  pid_alive "$pid" || return 1
+  same_start "$1" "$pid"
+}
+
+# other_tunnel: tunnel.pid names a live tunnel-client run with ANOTHER configuration (started
+# with another LOCAL_MCP_TUNNEL_DIR); prints its command line.
+other_tunnel() {
+  local pid args
+  pid=$(read_pid tunnel) || return 1
+  args=$(process_args "$pid") || return 1
+  [[ " $args " == *" run --config "* && " $args " != *" $(command_words tunnel) "* ]] || return 1
+  printf '%s' "$args"
 }
 
 current_log() {
@@ -197,7 +253,7 @@ current_log() {
 }
 
 forget() {
-  rm -f "$(pid_file "$1")" "$(stopping_marker "$1")"
+  rm -f "$(pid_file "$1")" "$(stopping_marker "$1")" "$(starttime_file "$1")"
 }
 
 # One setup, start, stop or rotate at a time (fd 9 on var/local_mcp/lock). `start` releases it
@@ -225,9 +281,29 @@ protected_roots() {
   if [[ -e /.git ]]; then printf '/\n'; fi
 }
 
+# git_tree_around PATH: the nearest directory at or above PATH (already resolved) with a `.git`
+# entry, i.e. a git working tree that would list the tunnel's files as untracked (a dotfiles
+# repository at ~/.config or ~, say). A separate git directory (`--git-dir ... --work-tree ~`)
+# leaves no such entry and cannot be seen.
+git_tree_around() {
+  local dir=$1
+  while [[ -n $dir ]]; do
+    if [[ -e $dir/.git ]]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+    dir=${dir%/*}
+  done
+  if [[ -e /.git ]]; then
+    printf '/'
+    return 0
+  fi
+  return 1
+}
+
 # check_tunnel_dir create|existing
 check_tunnel_dir() {
-  local real root uid mode
+  local real root uid mode tree
   real=$(realpath -m -- "$TUNNEL_DIR")
   while IFS= read -r root; do
     if [[ $real == "$root" || $real == "${root%/}"/* ]]; then
@@ -235,6 +311,11 @@ check_tunnel_dir() {
         "use a directory outside it, e.g. the default ~/.config/suv-deals/tunnel (LOCAL_MCP_TUNNEL_DIR)"
     fi
   done < <(protected_roots)
+  if tree=$(git_tree_around "$real"); then
+    fail "the tunnel directory $TUNNEL_DIR is inside a git working tree ($tree has .git): a commit there" \
+      "could publish the runtime API key and the MCP token. Use a directory outside every git working" \
+      "tree (LOCAL_MCP_TUNNEL_DIR=/absolute/path)"
+  fi
   if [[ $real == /mnt/* ]]; then
     fail "the tunnel directory must be on the Linux filesystem, not under /mnt (Windows drives have no Unix file modes)"
   fi
@@ -310,22 +391,66 @@ json_get() {
   sed -nE "s/^  \"$1\": \"?([^\",]*)\"?,?\$/\1/p" "$CREDENTIAL_FILE" | head -n 1
 }
 
-# write_credential_json ID WORKSPACE EXPIRES_AT EPOCH SOURCE
-write_credential_json() {
+# credential_json: credential.json's content for CRED_ID, CRED_WORKSPACE, CRED_EXPIRES, CRED_EPOCH
+# and CRED_SOURCE (set by create_credential).
+credential_json() {
+  printf '{\n'
+  printf '  "credential_id": "%s",\n' "$CRED_ID"
+  printf '  "workspace_id": "%s",\n' "$CRED_WORKSPACE"
+  printf '  "label": "%s",\n' "$CREDENTIAL_LABEL"
+  printf '  "role": "%s",\n' "$CREDENTIAL_ROLE"
+  printf '  "scopes": ["deals:read", "reviews:read"],\n'
+  printf '  "expires_at": "%s",\n' "$CRED_EXPIRES"
+  printf '  "expires_at_epoch": %s,\n' "$CRED_EPOCH"
+  printf '  "expires_source": "%s",\n' "$CRED_SOURCE"
+  printf '  "created_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '  "authorization_file": "%s"\n' "$AUTH_FILE"
+  printf '}\n'
+}
+
+# stage_credential_json: the new credential.json in a temporary file of TUNNEL_DIR (STAGED); every
+# write that can fail (a full disk, say) happens here, before anything is replaced. 1 on failure.
+stage_credential_json() {
+  local content
+  STAGED=""
+  content=$(credential_json) || return 1
+  STAGED=$(mktemp -- "$TUNNEL_DIR/.new.XXXXXX" 2>/dev/null) || {
+    STAGED=""
+    return 1
+  }
+  if ! printf '%s\n' "$content" >"$STAGED" 2>/dev/null; then
+    rm -f -- "$STAGED"
+    STAGED=""
+    return 1
+  fi
+}
+
+# commit_credential_json: rename STAGED over credential.json; on failure STAGED is kept and the
+# command that finishes the job is printed (1).
+commit_credential_json() {
+  if mv -f -- "$STAGED" "$CREDENTIAL_FILE"; then
+    STAGED=""
+    return 0
+  fi
   {
-    printf '{\n'
-    printf '  "credential_id": "%s",\n' "$1"
-    printf '  "workspace_id": "%s",\n' "$2"
-    printf '  "label": "%s",\n' "$CREDENTIAL_LABEL"
-    printf '  "role": "%s",\n' "$CREDENTIAL_ROLE"
-    printf '  "scopes": ["deals:read", "reviews:read"],\n'
-    printf '  "expires_at": "%s",\n' "$3"
-    printf '  "expires_at_epoch": %s,\n' "$4"
-    printf '  "expires_source": "%s",\n' "$5"
-    printf '  "created_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '  "authorization_file": "%s"\n' "$AUTH_FILE"
-    printf '}\n'
-  } | replace_file "$CREDENTIAL_FILE"
+    echo "error: $CREDENTIAL_FILE could not be replaced; it does not name the credential in use," \
+      "$CRED_ID (workspace $CRED_WORKSPACE, expires $CRED_EXPIRES). Its new content is in $STAGED;"
+    echo "  once the problem is fixed, run: mv -f $STAGED $CREDENTIAL_FILE"
+  } >&2
+  return 1
+}
+
+# revoke_credential ID WORKSPACE REASON: `credentials revoke` (an already revoked credential is fine).
+revoke_credential() {
+  local args=(credentials revoke "$1" --reason "$3")
+  if [[ $2 =~ $UUID_RE ]]; then args+=(--workspace "$2"); fi
+  args+=(--yes)
+  uv run suv-deals "${args[@]}"
+}
+
+# revoke_command ID WORKSPACE: the command the owner runs when revoking failed.
+revoke_command() {
+  printf 'uv run suv-deals credentials revoke %s%s --reason "..." --yes' "$1" "${2:+ --workspace $2}"
 }
 
 find_tunnel_client() {
@@ -473,7 +598,7 @@ require_setup() {
 
 setup() {
   umask 077
-  local version tunnel_id_input api_key
+  local version digest tunnel_id_input api_key old_id old_workspace
   echo "1/6 tunnel-client"
   if ! TC=$(find_tunnel_client); then
     {
@@ -489,11 +614,13 @@ setup() {
     exit 1
   fi
   version=$(tunnel_client --version 2>&1) || fail "\`$TC --version\` failed: $version"
+  read -r digest _ < <(sha256sum -- "$TC") || fail "could not compute the sha256 of $TC"
   echo "  $TC: $version"
+  echo "  sha256 $digest (compare it with the release you verified, docs/connect_mcp.md 8.3 step 1)"
 
   echo "2/6 tunnel directory $TUNNEL_DIR"
   check_tunnel_dir create
-  printf '%s\n' "$version" | replace_file "$VERSION_FILE"
+  printf '%s\nsha256 %s\n' "$version" "$digest" | replace_file "$VERSION_FILE"
 
   echo "3/6 tunnel id (from $TUNNELS_PAGE)"
   if [[ -e $TUNNEL_ID_FILE || -L $TUNNEL_ID_FILE ]]; then
@@ -553,10 +680,31 @@ setup() {
     fi
     echo "  kept: credential $(json_get credential_id), expires $(json_get expires_at) ($AUTH_FILE; not shown)"
   else
+    # A credential recorded without its token file (deleted, or a symlink that was removed): revoke
+    # it first, so that no live token remains that nobody holds (a leaked copy stops working).
+    old_id=$(json_get credential_id)
+    old_workspace=$(json_get workspace_id)
+    if [[ $old_id =~ $UUID_RE ]]; then
+      echo "  $CREDENTIAL_FILE names credential $old_id, but $AUTH_FILE is gone: revoking it first"
+      if ! revoke_credential "$old_id" "$old_workspace" "replaced by scripts/local_mcp.sh setup"; then
+        fail "revoking the recorded credential $old_id failed (output above); nothing was created." \
+          "Revoke it yourself: $(revoke_command "$old_id" "$old_workspace"); if it no longer exists" \
+          "(\`uv run suv-deals credentials list --all\`), delete $CREDENTIAL_FILE. Then run setup again"
+      fi
+      rm -f -- "$CREDENTIAL_FILE"
+    fi
     if ! create_credential "$AUTH_FILE"; then
       fail "credentials create-mcp failed (output above); nothing else was changed"
     fi
-    write_credential_json "$CRED_ID" "$CRED_WORKSPACE" "$CRED_EXPIRES" "$CRED_EPOCH" "$CRED_SOURCE"
+    if ! stage_credential_json; then
+      echo "error: could not write $CREDENTIAL_FILE; taking the new credential $CRED_ID back" >&2
+      if revoke_credential "$CRED_ID" "$CRED_WORKSPACE" "setup could not record it"; then
+        rm -f -- "$AUTH_FILE"
+        fail "the new credential was revoked and $AUTH_FILE deleted; fix $TUNNEL_DIR (space, permissions) and run setup again"
+      fi
+      fail "revoking it failed too: $(revoke_command "$CRED_ID" "$CRED_WORKSPACE"), then delete $AUTH_FILE"
+    fi
+    commit_credential_json || exit 1
     echo "  created credential $CRED_ID (expires $CRED_EXPIRES; $CRED_SOURCE); token in $AUTH_FILE, not shown"
   fi
 
@@ -586,14 +734,45 @@ tunnel_ready_code() {
   curl -s -o /dev/null -m 3 -w '%{http_code}' --unix-socket "$HEALTH_SOCKET" http://localhost/readyz 2>/dev/null || true
 }
 
-# launch PROCESS LOGFILE COMMAND...: detached (own session, SIGHUP ignored), pid and log recorded.
+# launch PROCESS LOGFILE COMMAND...: detached (own session, SIGHUP ignored), pid, start time and
+# log recorded. The background child is no process group leader, so `setsid` does not fork: the
+# pid stays the same through setsid, nohup, env and uv, and it is the id of the new session.
 launch() {
-  local proc=$1 log=$2
+  local proc=$1 log=$2 pid started
   shift 2
   setsid nohup "$@" >"$log" 2>&1 </dev/null 9>&- &
-  printf '%s\n' "$!" >"$(pid_file "$proc")"
+  pid=$!
+  printf '%s\n' "$pid" >"$(pid_file "$proc")"
+  if started=$(proc_starttime "$pid"); then
+    printf '%s\n' "$started" >"$(starttime_file "$proc")"
+  else
+    rm -f "$(starttime_file "$proc")"
+  fi
   printf '%s\n' "$log" >"$(logfile_record "$proc")"
   rm -f "$(stopping_marker "$proc")"
+}
+
+# api_owns_port: every socket listening on port PORT (IPv4 or IPv6) belongs to a process of the
+# API's session (the API's pid is the session id; uv's python child, which binds the port, inherits
+# it). Read from /proc, without ss or lsof. False when nothing listens there.
+api_owns_port() {
+  local api_pid hex table st local_addr inode pid inodes=() fds=""
+  api_pid=$(read_pid api) || return 1
+  printf -v hex '%04X' "$PORT"
+  for table in /proc/net/tcp /proc/net/tcp6; do
+    [[ -r $table ]] || continue
+    # sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode ...
+    while read -r _ local_addr _ st _ _ _ _ _ inode _; do
+      if [[ $st == 0A && $local_addr == *:"$hex" ]]; then inodes+=("$inode"); fi
+    done <"$table"
+  done
+  ((${#inodes[@]})) || return 1
+  for pid in $(ps -s "$api_pid" -o pid= 2>/dev/null); do
+    fds+=$(ls -l "/proc/$pid/fd" 2>/dev/null)
+  done
+  for inode in "${inodes[@]}"; do
+    [[ $fds == *"socket:[$inode]"* ]] || return 1
+  done
 }
 
 # signal_once PROCESS: SIGTERM unless already sent to this pid (`stop` and the start window may
@@ -670,21 +849,48 @@ EOF
   sed 's/^/  /' "$1"
 }
 
-watch_tunnel_ready() {
-  local waited=0
-  while ((waited < READY_TIMEOUT)); do
-    sleep 1
-    waited=$((waited + 1))
-    if [[ $(tunnel_ready_code) == 200 ]]; then
-      echo "[local_mcp] tunnel ready (health socket /readyz: HTTP 200 after ${waited}s); dot can use the plugin now"
+# watch_tunnel (background job of the start window, ended by the EXIT trap): says when the tunnel's
+# /readyz first answers 200, and stops the tunnel as soon as the API this run launched is gone, so
+# that tunnel-client never sends the credential to whatever binds 127.0.0.1:PORT next. The API is
+# checked before the tunnel: `stop` ends the API only after the tunnel, so "API gone, tunnel
+# running" means the API died by itself.
+watch_tunnel() {
+  local ticks=0 ready=0 tunnel_pid=""
+  while :; do
+    sleep 0.5
+    ticks=$((ticks + 1))
+    if [[ -z $tunnel_pid ]]; then
+      tunnel_pid=$(read_pid tunnel) || tunnel_pid=""
+    fi
+    if ! alive api; then
+      if [[ -z $tunnel_pid ]]; then continue; fi # the tunnel is starting: stop it once it has a pid
+      if pid_alive "$tunnel_pid"; then
+        : >"$STATE_DIR/api.lost"
+        echo "[local_mcp] error: the API exited while the tunnel ran; stopping the tunnel (it would send" \
+          "the credential to whatever listens on 127.0.0.1:$PORT next)" >&2
+        signal_once tunnel
+      fi
       return 0
     fi
+    if [[ -n $tunnel_pid ]] && ! pid_alive "$tunnel_pid"; then return 0; fi
+    if ((!ready)); then
+      if [[ $(tunnel_ready_code) == 200 ]]; then
+        ready=1
+        echo "[local_mcp] tunnel ready (health socket /readyz: HTTP 200 after $(((ticks + 1) / 2))s); dot can use the plugin now"
+      elif ((ticks >= READY_TIMEOUT * 2)); then
+        ready=1
+        echo "[local_mcp] the tunnel did not report ready within ${READY_TIMEOUT}s; check the lines above or scripts/local_mcp.sh status"
+      fi
+    fi
   done
-  echo "[local_mcp] the tunnel did not report ready within ${READY_TIMEOUT}s; check the lines above or scripts/local_mcp.sh status"
 }
 
 start() {
-  local proc stamp api_log tunnel_log probe_file status
+  local proc stamp api_log tunnel_log probe_file status other
+  if other=$(other_tunnel); then
+    fail "a tunnel started with another LOCAL_MCP_TUNNEL_DIR is running (pid $(read_pid tunnel): $other);" \
+      "stop it first: LOCAL_MCP_TUNNEL_DIR=<that directory> scripts/local_mcp.sh stop"
+  fi
   for proc in tunnel api; do
     if running "$proc"; then
       fail "the $proc is already running (pid $(read_pid "$proc")); use the window where it runs, or scripts/local_mcp.sh stop"
@@ -720,6 +926,7 @@ start() {
 
   echo "2/5 API on 127.0.0.1:$PORT (background; log $api_log)"
   forget api # a stale pid file must never name another process to the EXIT trap
+  rm -f "$STATE_DIR/api.lost"
   API_STARTED=1
   launch api "$api_log" env "${API_ENV[@]}" \
     uv run suv-deals api serve --host 127.0.0.1 --port "$PORT" --no-proxy-headers
@@ -747,6 +954,13 @@ start() {
     sleep 0.5
     waited=$((waited + 1))
   done
+  # The credential goes only to the API this run launched: not to another program that won the
+  # race for the port between the check above and the API's bind.
+  if ! api_owns_port; then
+    fail "127.0.0.1:$PORT is not served by the API this start launched (pid $(read_pid api)): another" \
+      "program listens there; the credential was not sent and the tunnel was not started"
+  fi
+  echo "  127.0.0.1:$PORT is the API's own socket"
 
   echo "4/5 suv-deals mcp probe (401 without the header; initialize, tools/list, deals_health with it)"
   uv run suv-deals mcp probe --url "$MCP_URL" --authorization-file "$AUTH_FILE" --json \
@@ -768,8 +982,8 @@ start() {
   echo "======================================================================================"
   release_lock
   printf '%s\n' "$tunnel_log" >"$(logfile_record tunnel)"
-  rm -f "$(stopping_marker tunnel)"
-  watch_tunnel_ready &
+  forget tunnel # a stale pid file must never name another process to the watcher
+  watch_tunnel &
   WATCHER_PID=$!
   # The tunnel runs in the foreground of this window: Ctrl+C reaches it directly; the traps only
   # note the signal (bash runs them once the tunnel has exited), then the EXIT trap stops the API.
@@ -779,12 +993,23 @@ start() {
     trap - INT TERM HUP
     printf '%s\n' "$BASHPID" >"$(pid_file tunnel)" # this subshell becomes tunnel-client (exec)
     scrub_tunnel_env
-    exec "$TC" run --config "$CONFIG_FILE" --health.unix-socket "$HEALTH_SOCKET"
+    # Health and admin endpoints on the socket in the 0700 directory; the vendor's flag help says
+    # this replaces the TCP listener. If a build keeps one anyway, 127.0.0.1:0 gives it an
+    # ephemeral loopback port instead of a fixed 8080 that could collide (docs/connect_mcp.md 8.2).
+    exec "$TC" run --config "$CONFIG_FILE" --health.unix-socket "$HEALTH_SOCKET" \
+      --health.listen-addr 127.0.0.1:0
   ) 2>&1 | tee -i -a "$tunnel_log"
   status=${PIPESTATUS[0]}
   set -e
   forget tunnel
   if [[ -S $HEALTH_SOCKET ]]; then rm -f -- "$HEALTH_SOCKET"; fi
+  if [[ -f $STATE_DIR/api.lost ]]; then
+    rm -f "$STATE_DIR/api.lost"
+    echo "error: the API exited while the tunnel ran; the tunnel was stopped (exit $status). Last lines" \
+      "of $api_log:" >&2
+    tail -n 20 "$api_log" >&2 || true
+    exit 1
+  fi
   case $status in
     0 | 130 | 143)
       echo "tunnel: stopped (exit $status); stopping the API"
@@ -801,7 +1026,14 @@ start() {
 # --------------------------------------------------------------------------------------------
 
 stop() {
-  local proc
+  local proc pid other
+  # A tunnel of another LOCAL_MCP_TUNNEL_DIR: nothing is stopped (the API it uses neither) and its
+  # pid file is kept, so that the right `stop` still finds it.
+  if other=$(other_tunnel); then
+    fail "$(pid_file tunnel) names pid $(read_pid tunnel), a tunnel started with another" \
+      "LOCAL_MCP_TUNNEL_DIR ($other). Nothing was stopped: run" \
+      "LOCAL_MCP_TUNNEL_DIR=<that directory> scripts/local_mcp.sh stop"
+  fi
   # The tunnel first (dot loses access at once), then the API; the start window stops the API
   # too once its tunnel has exited, and only one of the two sends the SIGTERM.
   for proc in tunnel api; do
@@ -813,7 +1045,11 @@ stop() {
       fi
       echo "$proc: stopped"
     else
-      echo "$proc: not running"
+      if pid=$(read_pid "$proc") && pid_alive "$pid"; then
+        echo "$proc: not running (its pid file named pid $pid, which is another program now; not signalled, file removed)"
+      else
+        echo "$proc: not running"
+      fi
       forget "$proc"
     fi
   done
@@ -830,7 +1066,7 @@ show_log() {
 }
 
 status() {
-  local problem=0 port code epoch left file
+  local problem=0 port code epoch left file other
   port=$PORT
   if [[ -f $STATE_DIR/api.port && $(<"$STATE_DIR/api.port") =~ ^[0-9]+$ ]]; then port=$(<"$STATE_DIR/api.port"); fi
   if running api; then
@@ -846,12 +1082,17 @@ status() {
     code=$(tunnel_ready_code)
     echo "tunnel: running (pid $(read_pid tunnel)); health socket /readyz HTTP $code"
     if [[ $code != 200 ]]; then problem=1; fi
+  elif other=$(other_tunnel); then
+    echo "tunnel: one started with another LOCAL_MCP_TUNNEL_DIR runs (pid $(read_pid tunnel): $other)"
+    problem=1
   else
     echo "tunnel: not running"
     problem=1
   fi
   show_log tunnel
-  if [[ -f $VERSION_FILE ]]; then echo "tunnel-client: $(head -n 1 "$VERSION_FILE")"; fi
+  if [[ -f $VERSION_FILE ]]; then
+    echo "tunnel-client: $(head -n 1 "$VERSION_FILE") ($(sed -n '2p' "$VERSION_FILE"))"
+  fi
   epoch=$(json_get expires_at_epoch)
   if [[ $epoch =~ ^[0-9]+$ ]]; then
     left=$((epoch - $(date +%s)))
@@ -892,7 +1133,7 @@ logs() {
 
 rotate() {
   umask 077
-  local old_id old_workspace new stamp args
+  local old_id old_workspace new stamp recorded=1
   check_tunnel_dir existing
   old_id=$(json_get credential_id)
   old_workspace=$(json_get workspace_id)
@@ -904,18 +1145,29 @@ rotate() {
   if ! create_credential "$new"; then
     fail "creating the new credential failed (output above); $AUTH_FILE and credential $old_id are unchanged"
   fi
+  # credential.json is written before anything is replaced: if that fails, the new credential is
+  # taken back and nothing changed (no credential left that no file records).
+  if ! stage_credential_json; then
+    echo "error: could not write the new $CREDENTIAL_FILE; taking the new credential $CRED_ID back" >&2
+    if revoke_credential "$CRED_ID" "$CRED_WORKSPACE" "rotate could not record it"; then
+      rm -f -- "$new"
+      fail "the new credential was revoked; $AUTH_FILE and credential $old_id are unchanged"
+    fi
+    fail "revoking it failed too: $(revoke_command "$CRED_ID" "$CRED_WORKSPACE"), then delete $new;" \
+      "$AUTH_FILE and credential $old_id are unchanged"
+  fi
   echo "2/3 the new file replaces $AUTH_FILE (atomic rename)"
   if ! mv -f -- "$new" "$AUTH_FILE"; then
+    rm -f -- "$STAGED"
     fail "could not rename $new to $AUTH_FILE: the new credential $CRED_ID is in $new and the old" \
       "one ($old_id) is still in use; fix the file and revoke the credential you do not keep"
   fi
-  write_credential_json "$CRED_ID" "$CRED_WORKSPACE" "$CRED_EXPIRES" "$CRED_EPOCH" "$CRED_SOURCE"
+  # Two renames in one directory; if the second one fails, the old credential is revoked all the
+  # same (its token is no longer in use) and the staged record is kept with the command to finish.
+  commit_credential_json || recorded=0
   echo "  credential $CRED_ID, expires $CRED_EXPIRES"
   echo "3/3 revoking the old credential $old_id"
-  args=(credentials revoke "$old_id" --reason "rotated by scripts/local_mcp.sh rotate")
-  if [[ $old_workspace =~ $UUID_RE ]]; then args+=(--workspace "$old_workspace"); fi
-  args+=(--yes)
-  if ! uv run suv-deals "${args[@]}"; then
+  if ! revoke_credential "$old_id" "$old_workspace" "rotated by scripts/local_mcp.sh rotate"; then
     {
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
       echo "error: REVOKING THE OLD CREDENTIAL FAILED. $old_id may still be valid until it expires."
@@ -924,6 +1176,10 @@ rotate() {
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     } >&2
     exit 1
+  fi
+  if ((!recorded)); then
+    fail "the old credential $old_id was revoked, but $CREDENTIAL_FILE still names it (above): finish" \
+      "the rename before the next setup or rotate"
   fi
   echo "rotated. The running tunnel (if any) still sends the old, now revoked header: restart it"
   echo "(Ctrl+C in its window or scripts/local_mcp.sh stop, then scripts/local_mcp.sh start)."

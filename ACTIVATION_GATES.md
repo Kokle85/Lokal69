@@ -492,11 +492,15 @@ Each step only needs the steps above it; any step can stop without affecting the
   `--log.http-raw-unsafe` (S3); the failed-authentication limiter is per process on this route
   (S4); the credential expires after 30 days (S7); never connect the owner's PC as dot's
   "computer"; the data dot reads goes to OpenAI.
-- **Phase-1 evidence (owner's live test):** the date, the `tunnel-client` version, the negotiated
+- **Phase-1 evidence (owner's live test):** the date, the verified release (the ZIP's line in its
+  `SHA256SUMS.txt`) and `tunnel-client.version` (version and the binary's SHA-256), the negotiated
   protocol and the tools/list SHA-256 from `start`'s probe report (`var/local_mcp/logs/probe-*.json`),
-  the 7 tools dot discovers, and the request ids of dot's `deals_health`, `reviews_list_pending`,
-  `deals_get_candidate` and `deals_estimate_import_costs` calls from the API log. UNVERIFIED until
-  then: that the injected header survives with "No authentication" (docs/connect_mcp.md 8.6).
+  the 7 tools dot discovers, the request ids of dot's `deals_health`, `reviews_list_pending`,
+  `deals_get_candidate` and `deals_estimate_import_costs` calls (the `mcp tool call` lines of the
+  API log, field `request_id`), and the output of `ss -ltnp | grep tunnel-client` while the tunnel
+  runs (expected: nothing). UNVERIFIED until then: that the injected header survives with "No
+  authentication" and that the health socket replaces the TCP listener (docs/connect_mcp.md 8.2,
+  8.6).
 - **Steps (other routes):** docs/connect_mcp.md section 4. In short: deploy (12); choose `MCP_AUTH_MODE`
   (`oauth` preferred; `static_bearer` only for a client that supports it); for a static credential
   `uv run suv-deals credentials create-mcp --label "dot read-only" --scopes
