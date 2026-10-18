@@ -80,11 +80,11 @@ plugin uses "No authentication". Nothing was connected to the real ChatGPT accou
 
 MCP connection groundwork for dot: an authorization-header file and `mcp probe`. Research of
 2026-10-18 (official OpenAI documentation): ChatGPT's custom MCP servers offer only "OAuth", "No
-authentication" or both, and ChatGPT cannot send a custom bearer header itself. The proposed first
-route, pending the owner's decision, is OpenAI's Secure MCP Tunnel, whose `tunnel-client` (in the
-owner's WSL, outbound HTTPS only) forwards to `http://127.0.0.1:8000/mcp` and can add a static
-`Authorization` header read from a file. Nothing was connected to a real client; no route is
-decided.
+authentication" or both, and ChatGPT cannot send a custom bearer header itself. The route this prepared, OpenAI's Secure MCP
+Tunnel, whose `tunnel-client` (in the owner's WSL, outbound HTTPS only) forwards to a local
+`/mcp` and can add a static `Authorization` header read from a file, was approved by the owner
+later the same day (the entry above; `scripts/local_mcp.sh` serves it on `127.0.0.1:8010`).
+Nothing was connected to a real client.
 
 - **`suv-deals credentials create-mcp ... --authorization-file PATH`**
   (`cli_commands/credentials.py`, `cli_commands/_authorization_file.py`): the token is written as
