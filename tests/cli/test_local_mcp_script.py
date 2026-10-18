@@ -3,9 +3,12 @@
 The script runs from a copy in a temporary "repository" (its own ``var/`` and ``.env``) against
 stub executables on a fake PATH: ``uv`` (doctor, ``api serve``, ``mcp probe``, ``credentials
 create-mcp`` / ``revoke``), ``tunnel-client`` (``--version``; ``doctor`` in the output format of the
-real v0.0.16 binary, whose MCP checks fail while nothing listens on the API port; ``run``, which
-writes start-up noise like the real one) and ``curl`` (``/readyz``, and the tunnel's health socket:
-``/readyz`` and ``GET /health?details=true`` with knob-controlled JSON in the real shape). Every
+real v0.0.16 binary, whose MCP checks fail while nothing listens on the API port and whose
+health_listener check fails on a leftover socket file; ``run``, which writes start-up noise like the
+real one) and ``curl`` (``/readyz``, and the tunnel's health socket: ``/readyz`` and ``GET
+/health?details=true``, which answers knob-controlled JSON, one answer per request from a sequence
+if given: real answers of the v0.0.16 binary from tests/fixtures/tunnel_client_v0.0.16, or
+synthetic ones in their shape with the control-plane states the real binary reports). Every
 stub records its argv and its whole environment; one test also wraps every other external command
 the script runs (``mktemp``, ``ln``, ``env``, ``ps``, ...) to record its argv, and a static test
 forbids writing a secret with anything but the shell builtin ``printf`` or calling a command by
@@ -199,16 +202,32 @@ case "$1" in
     printf 'CHECK %-24s PASS %s\n' tunnel_id "$(sed -nE 's/^ +tunnel_id: "(.*)"$/\1/p' "$cfg")"
     printf 'CHECK %-24s PASS configured\n' control_plane_api_key
     printf 'CHECK %-24s PASS %s\n' mcp_target "$url"
-    if (exec 3<>"/dev/tcp/${hostport%%:*}/${hostport##*:}") 2>/dev/null; then
+    # Knobs: doctor_oauth=invalid (another program answers the URL: v0.0.16 passes
+    # mcp_server_reachable on any TCP connect and fails oauth_metadata unless every discovery
+    # candidate answers 404 like the API); doctor_mcp=fail (it reports the URL unreachable anyway).
+    if [[ $(cat "$knobs/doctor_mcp" 2>/dev/null) != fail ]] &&
+      (exec 3<>"/dev/tcp/${hostport%%:*}/${hostport##*:}") 2>/dev/null; then
       printf 'CHECK %-24s PASS HTTP 405 from %s\n' mcp_server_reachable "$url"
-      printf 'CHECK %-24s PASS OAuth metadata not advertised; %s\n' oauth_metadata \
-        "all candidates returned HTTP 404"
+      if [[ $(cat "$knobs/doctor_oauth" 2>/dev/null) == invalid ]]; then
+        printf 'CHECK %-24s FAIL oauth discovery empty body from http://%s (status 405)\n' oauth_metadata \
+          "$hostport"
+        failed=oauth_metadata
+      else
+        printf 'CHECK %-24s PASS OAuth metadata not advertised; %s\n' oauth_metadata \
+          "all candidates returned HTTP 404"
+      fi
     else
       printf 'CHECK %-24s FAIL dial tcp %s: connect: connection refused\n' mcp_server_reachable "$hostport"
       printf 'CHECK %-24s FAIL oauth discovery GET http://%s: connection refused\n' oauth_metadata "$hostport"
       failed=mcp_server_reachable,oauth_metadata
     fi
-    printf 'CHECK %-24s PASS will bind unix socket %s\n' health_listener "$sock"
+    # Like the real one: a socket file left at the path (by a killed tunnel) cannot be bound.
+    if [[ -e $sock || -L $sock ]]; then
+      printf 'CHECK %-24s FAIL listen unix %s: bind: address already in use\n' health_listener "$sock"
+      failed=${failed:+$failed,}health_listener
+    else
+      printf 'CHECK %-24s PASS will bind unix socket %s\n' health_listener "$sock"
+    fi
     extra=$(cat "$knobs/doctor_extra_failed" 2>/dev/null)
     if [[ -n $extra ]]; then
       printf 'CHECK %-24s FAIL stub: %s failed\n' "$extra" "$extra"
@@ -263,13 +282,23 @@ printf 'curl %s\n' "$*" >> "$calls"
 case " $* " in
   *" --unix-socket "*)
     # The tunnel's health socket: /readyz answers 200 while it runs (also while OpenAI refuses the
-    # key, like the real one); /health?details=true answers the JSON in knobs/health_json.
+    # key, like the real one); /health?details=true answers the JSON in knobs/health_json or, when
+    # knobs/health_seq exists, its next line (one JSON answer per line; the last one repeats).
     if [[ ! -e $knobs/tunnel.running ]]; then
       if [[ " $* " != *"/health?details=true "* ]]; then printf '000'; fi
       exit 7
     fi
     case " $* " in
-      *"/health?details=true "*) cat "$knobs/health_json" ;;
+      *"/health?details=true "*)
+        if [[ -s $knobs/health_seq ]]; then
+          n=$(( $(cat "$knobs/health_seq_n" 2>/dev/null || echo 0) + 1 ))
+          echo "$n" > "$knobs/health_seq_n"
+          total=$(grep -c '' "$knobs/health_seq")
+          if ((n > total)); then n=$total; fi
+          sed -n "${n}p" "$knobs/health_seq"
+        else
+          cat "$knobs/health_json"
+        fi ;;
       *) printf '200' ;;
     esac ;;
   *"/readyz "*)
@@ -299,8 +328,11 @@ def _health(
     failures: object = 0,
     category: str | None = None,
 ) -> str:
-    """``GET /health?details=true`` of tunnel-client v0.0.16 (one line; the same keys in the same
-    order as the real answers recorded in docs/connect_mcp.md 8.6), with this control-plane state."""
+    """``GET /health?details=true`` of tunnel-client v0.0.16 in its shape (one line; a subset of the
+    keys of the real answers in tests/fixtures/tunnel_client_v0.0.16, in their order), with this
+    control-plane state. The real binary reports unknown/polling right after the start, then
+    degraded with state backoff or polling (alternating between retries) while polls fail, the
+    category http_error (with http_status) or network_error, and ok/polling once accepted."""
     details: dict[str, object] = {
         "last_attempt": "2026-10-18T19:36:26.473975398Z",
         "consecutive_failures": failures,
@@ -333,13 +365,43 @@ def _health(
 
 
 HEALTHY = _health("ok", "polling")
-STARTING = _health("unknown", "starting")
-NETWORK_BACKOFF = _health("degraded", "backoff", failures=5, category="network")
+STARTING = _health("unknown", "polling")
+NETWORK_BACKOFF = _health("degraded", "backoff", failures=5, category="network_error")
 SERVER_ERROR = _health("degraded", "backoff", http_status=503, failures=10, category="http_error")
 
 
-def _rejected(http_status: int, failures: int = 10) -> str:
-    return _health("degraded", "backoff", http_status=http_status, failures=failures, category="http_error")
+def _rejected(http_status: int, failures: int = 10, state: str = "backoff") -> str:
+    return _health("degraded", state, http_status=http_status, failures=failures, category="http_error")
+
+
+def _network(failures: int) -> str:
+    return _health("degraded", "backoff", failures=failures, category="network_error")
+
+
+def _rejected_polls(http_status: int, first: int, last: int) -> list[str]:
+    """One answer per failure count from ``first`` to ``last``, the state alternating between
+    backoff and polling like the real binary's between retries."""
+    return [
+        _rejected(http_status, failures, "backoff" if failures % 2 else "polling")
+        for failures in range(first, last + 1)
+    ]
+
+
+def _rejections(http_status: int, upto: int = 10) -> list[str]:
+    """The answers the watcher reads one per sample while OpenAI keeps rejecting: the start, then
+    one more failed poll per sample."""
+    return [STARTING, *_rejected_polls(http_status, 1, upto)]
+
+
+# Real answers of tunnel-client v0.0.16 (linux-amd64, git sha 5f99daab...) on its health socket,
+# 2026-10-18, clean environment, FAKE runtime key, SYNTHETIC tunnel id; every sample whose
+# control-plane state changed: a run against api.openai.com (HTTP 401), a run whose proxy refused
+# the connection (network_error) and the vendor's local control plane (`dev proxy`: ok).
+REAL_HEALTH = REPO / "tests" / "fixtures" / "tunnel_client_v0.0.16"
+
+
+def _real_health(name: str) -> list[str]:
+    return (REAL_HEALTH / f"health_{name}.jsonl").read_text(encoding="utf-8").splitlines()
 
 
 CONNECTED = "[local_mcp] connected to OpenAI (control plane polling); dot can use the plugin now"
@@ -420,6 +482,16 @@ class World:
 
     def knob(self, name: str, value: str) -> None:
         (self.knobs / name).write_text(value, encoding="utf-8")
+
+    def health_sequence(self, *answers: str) -> None:
+        """The tunnel's health JSON: one answer per request, in this order; the last one repeats.
+        No answers: back to knobs/health_json."""
+        (self.knobs / "health_seq_n").unlink(missing_ok=True)
+        seq = self.knobs / "health_seq"
+        if answers:
+            seq.write_text("".join(f"{answer}\n" for answer in answers), encoding="utf-8")
+        else:
+            seq.unlink(missing_ok=True)
 
     def recorded(self) -> str:
         """Every argv and environment any stub saw (and every wrapped command's argv)."""
@@ -1031,6 +1103,42 @@ def test_setup_reports_doctor_ok_when_the_mcp_url_answers(world: World) -> None:
         result = world.setup()
     assert "    RESULT ok" in result.stdout and "  doctor: RESULT ok" in result.stdout
     assert "expected before" not in result.stdout
+    assert (
+        f"note: something already answers http://127.0.0.1:{world.port}/mcp; start needs port {world.port}"
+        " free" in result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    ("knob", "answering"),
+    [
+        # v0.0.16 with another program on the port (one answering 405, HTML or nothing at all):
+        # mcp_server_reachable passes on the TCP connect, oauth_metadata fails.
+        ("doctor_oauth", "mcp_server_reachable passed: a program answers http://127.0.0.1:{port}/mcp"),
+        # doctor reports the URL unreachable, but something listens on the port all the same.
+        ("doctor_mcp", "a program listens on 127.0.0.1:{port}"),
+    ],
+)
+def test_setup_refuses_when_something_else_answers_the_mcp_url(
+    world: World, knob: str, answering: str
+) -> None:
+    """Before `start` only "nothing answers the MCP URL" makes doctor's failures expected; another
+    program there would make `start` refuse the port."""
+    world.knob(knob, "invalid" if knob == "doctor_oauth" else "fail")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", world.port))
+        listener.listen(4)
+        result = world.run("setup", stdin=f"{TUNNEL_ID}\n{API_KEY}\n")
+    assert result.returncode == 1, result.stdout + result.stderr
+    failed = "oauth_metadata" if knob == "doctor_oauth" else "mcp_server_reachable,oauth_metadata"
+    assert (
+        f"error: tunnel-client doctor failed (exit 2; failed checks: {failed}) and"
+        f" {answering.format(port=world.port)}, which is not this route's API" in result.stderr
+    )
+    assert f"start would refuse port {world.port}: stop that program or choose a free port" in result.stderr
+    assert "nothing answers" not in result.stdout and "setup complete" not in result.stdout
+    assert (world.tunnel_dir / "tunnel-client.yaml").is_file()  # everything else is in place
+    _assert_no_secret(result.stdout, result.stderr)
 
 
 @pytest.mark.parametrize(
@@ -1061,7 +1169,8 @@ def test_setup_fails_on_any_other_doctor_result(world: World, knobs: dict[str, s
 
 
 def test_setup_removes_a_stale_health_socket_before_doctor(world: World) -> None:
-    """A socket left by a killed tunnel would make doctor's health_listener check fail."""
+    """A socket left by a killed tunnel would make doctor's health_listener check fail (the real
+    v0.0.16: "listen unix ...: bind: address already in use"; the stub doctor does the same)."""
     world.setup()
     stale = world.tunnel_dir / "health.sock"
     with socket.socket(socket.AF_UNIX) as sock:
@@ -1069,6 +1178,7 @@ def test_setup_removes_a_stale_health_socket_before_doctor(world: World) -> None
     result = world.run("setup")
     assert result.returncode == 0, result.stdout + result.stderr
     assert not stale.exists()
+    assert f"    CHECK health_listener          PASS will bind unix socket {stale}" in result.stdout
     assert "doctor: only mcp_server_reachable and oauth_metadata failed" in result.stdout
 
 
@@ -1587,7 +1697,8 @@ def test_connected_is_announced_once_the_control_plane_is_ok(world: World) -> No
 
 def test_readyz_200_alone_is_not_connected(world: World) -> None:
     """/readyz answers 200 while the control plane is not ok (the real binary does so even while
-    OpenAI rejects the key): no "dot can use the plugin", and the READY_TIMEOUT hint."""
+    OpenAI rejects the key) and the state is "polling" right after the start: no "dot can use the
+    plugin", and the READY_TIMEOUT hint."""
     world.setup()
     world.knob("health_json", STARTING)
     world.knob("run_mode", "exit:0:4")
@@ -1596,32 +1707,35 @@ def test_readyz_200_alone_is_not_connected(world: World) -> None:
     assert "dot can use the plugin" not in result.stdout + result.stderr
     assert (
         "[local_mcp] the tunnel has not connected to OpenAI within 2s (control plane: status unknown,"
-        " state starting); dot cannot use the plugin yet" in result.stdout
+        " state polling); dot cannot use the plugin yet" in result.stdout
     )
 
 
 _REJECTIONS = {
     401: (
-        "OpenAI rejected the runtime API key (control plane HTTP 401 on 10 polls in a row): a wrong or"
+        "OpenAI rejected the runtime API key (control plane HTTP 401 on 3 polls in a row): a wrong or"
         " revoked key. Delete {tunnel}/control-plane-api-key and run scripts/local_mcp.sh setup with a"
         " new restricted key (Tunnels Read + Use; https://platform.openai.com/settings/organization/api-keys)"
     ),
     403: (
-        "OpenAI refused the tunnel (control plane HTTP 403 on 10 polls in a row): the runtime API key"
+        "OpenAI refused the tunnel (control plane HTTP 403 on 3 polls in a row): the runtime API key"
         " lacks Tunnels Read + Use for {tunnel_id}, or the tunnel belongs to another organization or"
         " project."
     ),
     404: (
-        "OpenAI does not know the tunnel {tunnel_id} (control plane HTTP 404 on 10 polls in a row):"
+        "OpenAI does not know the tunnel {tunnel_id} (control plane HTTP 404 on 3 polls in a row):"
         " delete {tunnel}/tunnel-id and run scripts/local_mcp.sh setup"
     ),
 }
+REJECTED_401 = "error: OpenAI rejected the runtime API key (control plane HTTP 401 on 3 polls in a row)"
 
 
 @pytest.mark.parametrize("http_status", [401, 403, 404])
 def test_openai_rejecting_the_tunnel_stops_it_and_the_api(world: World, http_status: int) -> None:
+    """Three rejections in a row stop it, and the message says 3: one more failed poll per health
+    sample (STARTING, then 1, 2, 3, ... with the state alternating between backoff and polling)."""
     world.setup()
-    world.knob("health_json", _rejected(http_status))
+    world.health_sequence(*_rejections(http_status))
     world.knob("run_mode", "exit:0:20")  # would keep "running" for 20 s if nobody stopped it
     started = time.monotonic()
     result = world.run("start")
@@ -1632,7 +1746,7 @@ def test_openai_rejecting_the_tunnel_stops_it_and_the_api(world: World, http_sta
     assert stopping in result.stderr
     assert f"error: {message}" in result.stderr
     assert "The tunnel was stopped (exit 0; its log:" in result.stderr
-    assert "dot can use the plugin" not in result.stdout
+    assert "dot can use the plugin" not in result.stdout  # not at "unknown/polling" nor "degraded/polling"
     calls = world.calls_list()
     assert calls.index("tunnel: TERM") < calls.index("api: TERM")
     assert calls.count("tunnel: TERM") == 1 and calls.count("api: TERM") == 1
@@ -1646,32 +1760,146 @@ def test_openai_rejecting_the_tunnel_stops_it_and_the_api(world: World, http_sta
 
 
 def test_fewer_than_three_rejections_in_a_row_do_not_stop_the_tunnel(world: World) -> None:
+    """Two rejections (the second in state "polling", as the real binary reports between retries)
+    neither stop the tunnel nor count as connected."""
     world.setup()
-    world.knob("health_json", _rejected(401, failures=2))
-    world.knob("run_mode", "exit:0:3")
+    world.health_sequence(STARTING, _rejected(401, 1, "backoff"), _rejected(401, 2, "polling"))
+    world.knob("run_mode", "exit:0:5")
     result = world.run("start")
     assert result.returncode == 0, result.stdout + result.stderr
+    assert int((world.knobs / "health_seq_n").read_text(encoding="utf-8")) >= 3  # every answer was read
     assert "tunnel: TERM" not in world.calls_list()
     assert "OpenAI rejected" not in result.stderr and "warning" not in result.stderr
     assert "dot can use the plugin" not in result.stdout  # undecided: neither connected nor rejected
 
 
+def test_a_single_rejection_after_other_failures_does_not_stop_the_tunnel(world: World) -> None:
+    """consecutive_failures counts every kind of failure (the real binary: network errors, 5xx and
+    401s in one counter) and http_status names the latest one only: one 404 after a short outage is
+    not 3 rejections in a row."""
+    world.setup()
+    world.health_sequence(
+        _network(1),
+        _network(2),
+        _rejected(503, 3),
+        _rejected(404, 4),
+        _rejected(503, 5, "polling"),
+        _network(6),
+    )
+    world.knob("run_mode", "exit:0:9")
+    result = world.run("start")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert int((world.knobs / "health_seq_n").read_text(encoding="utf-8")) >= 6  # every answer was read
+    assert "tunnel: TERM" not in world.calls_list() and not (world.state / "tunnel.rejected").exists()
+    assert "OpenAI does not know the tunnel" not in result.stderr
+    assert "tunnel: stopped (exit 0); stopping the API" in result.stdout
+
+
 @pytest.mark.parametrize(
-    ("health", "described"),
+    "answers",
     [
-        (NETWORK_BACKOFF, "status degraded, state backoff, failure network, HTTP -, 5 failure(s) in a row"),
-        (
-            SERVER_ERROR,
-            "status degraded, state backoff, failure http_error, HTTP 503, 10 failure(s) in a row",
+        pytest.param(
+            [
+                _network(1),
+                _network(2),
+                _network(3),
+                _rejected(401, 4),
+                _network(5),
+                *_rejected_polls(401, 6, 11),
+            ],
+            id="network-errors-before-and-between",
+        ),
+        pytest.param(
+            # 2 rejections, then a poll succeeded (the counter went back to 0), then 4 in a row
+            [*_rejected_polls(401, 5, 6), *_rejected_polls(401, 1, 4)],
+            id="the-counter-went-back",
         ),
     ],
 )
+def test_rejections_are_counted_from_the_first_one_in_a_row(world: World, answers: list[str]) -> None:
+    """The tunnel stops after 3 rejections in a row, and the message says 3, not the failure count
+    (which includes the network errors before them)."""
+    world.setup()
+    world.health_sequence(*answers)
+    world.knob("run_mode", "exit:0:20")
+    result = world.run("start")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert REJECTED_401 in result.stderr
+    assert "polls in a row" not in result.stderr.replace(REJECTED_401, "")  # no other count
+    assert "tunnel: TERM" in world.calls_list()
+
+
+def test_a_rejection_after_connecting_stops_the_tunnel(world: World) -> None:
+    """A key revoked while dot uses the tunnel: connected first, then 3 rejections in a row."""
+    world.setup()
+    world.health_sequence(HEALTHY, *_rejections(401)[1:])
+    world.knob("run_mode", "exit:0:30")
+    started = time.monotonic()
+    result = world.run("start")
+    assert time.monotonic() - started < 25
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout.count(CONNECTED) == 1
+    assert REJECTED_401 in result.stderr
+    calls = world.calls_list()
+    assert calls.count("tunnel: TERM") == 1 and calls.index("tunnel: TERM") < calls.index("api: TERM")
+    assert (world.state / "tunnel.rejected").exists()
+
+
+def test_ok_again_after_a_warning_is_announced_once(world: World) -> None:
+    world.setup()
+    world.health_sequence(HEALTHY, NETWORK_BACKOFF, HEALTHY)
+    world.knob("run_mode", "exit:0:9")
+    result = world.run("start")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count(CONNECTED) == 1
+    warning = "[local_mcp] warning: OpenAI's control plane is not reachable yet (status degraded"
+    assert result.stderr.count(warning) == 1, result.stderr
+    assert result.stdout.count("[local_mcp] control plane ok again (polling)") == 1, result.stdout
+    assert result.stdout.index(CONNECTED) < result.stdout.index("control plane ok again")
+    assert "tunnel: TERM" not in world.calls_list()
+
+
+def test_the_next_start_clears_the_rejection_of_the_last_one(world: World) -> None:
+    """tunnel.rejected names why the LAST start stopped the tunnel: a start after the fix that
+    connects and ends normally is no rejection, and `status` no longer repeats it."""
+    world.setup()
+    world.health_sequence(*_rejections(401))
+    world.knob("run_mode", "exit:0:20")
+    rejected = world.run("start")
+    assert rejected.returncode == 1 and REJECTED_401 in rejected.stderr
+    assert (world.state / "tunnel.rejected").exists()
+    world.health_sequence()  # healthy from now on (knobs/health_json)
+    world.knob("run_mode", "exit:0:3")
+    again = world.run("start")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert again.stdout.count(CONNECTED) == 1
+    assert "OpenAI rejected" not in again.stdout + again.stderr
+    assert "tunnel: stopped (exit 0); stopping the API" in again.stdout
+    assert not (world.state / "tunnel.rejected").exists()
+    status = world.run("status")
+    assert "tunnel: not running" in status.stdout and "the last start stopped it" not in status.stdout
+
+
+@pytest.mark.parametrize(
+    ("health", "described"),
+    [
+        (
+            _real_health("network_error"),
+            "status degraded, state backoff, failure network_error, HTTP -, 1 failure(s) in a row",
+        ),
+        (
+            [SERVER_ERROR],
+            "status degraded, state backoff, failure http_error, HTTP 503, 10 failure(s) in a row",
+        ),
+    ],
+    ids=["real-network-error", "server-error"],
+)
 def test_other_control_plane_failures_warn_once_and_the_tunnel_keeps_running(
-    world: World, health: str, described: str
+    world: World, health: list[str], described: str
 ) -> None:
     world.setup()
-    world.knob("health_json", health)
-    world.knob("run_mode", "exit:0:4")
+    world.health_sequence(*health)
+    world.knob("run_mode", "exit:0:5")
     result = world.run("start")
     assert result.returncode == 0, result.stdout + result.stderr
     warning = (
@@ -1679,7 +1907,8 @@ def test_other_control_plane_failures_warn_once_and_the_tunnel_keeps_running(
         " tunnel-client keeps retrying"
     )
     assert result.stderr.count(warning) == 1, result.stderr
-    assert "tunnel: TERM" not in world.calls_list()  # not stopped: it ended by itself after 4 s
+    assert result.stderr.count("[local_mcp] warning") == 1, result.stderr
+    assert "tunnel: TERM" not in world.calls_list()  # not stopped: it ended by itself after 5 s
     assert "dot can use the plugin" not in result.stdout
     assert "tunnel: stopped (exit 0); stopping the API" in result.stdout
 
@@ -1694,7 +1923,7 @@ def test_status_shows_a_degraded_control_plane(world: World) -> None:
         assert status.returncode == 1, status.stdout + status.stderr  # running, but not connected
         assert (
             "  control plane: status degraded, state backoff, http_status -, consecutive_failures 5,"
-            " failure_category network" in status.stdout
+            " failure_category network_error" in status.stdout
         )
         assert world.run("stop").returncode == 0
         out, err = started.communicate(timeout=60)
@@ -1725,9 +1954,13 @@ _PARSERS = [
 
 
 @pytest.mark.parametrize("parser", _PARSERS)
-def test_every_parser_recognises_connected_and_a_rejected_key(world: World, parser: str) -> None:
+def test_every_parser_recognises_the_real_answers_connected_and_rejected(world: World, parser: str) -> None:
+    """The real v0.0.16 answers (tests/fixtures/tunnel_client_v0.0.16): accepted by the vendor's
+    local control plane, then OpenAI rejecting a FAKE key (unknown/polling, then backoff and polling
+    with 401 and 1, 1, 2, 2, 3, ... failures)."""
     world.setup()
     _parser(world, parser)
+    world.health_sequence(*_real_health("ok"))
     world.knob("run_mode", "exit:0:3")
     connected = world.run("start")
     assert connected.returncode == 0, connected.stdout + connected.stderr
@@ -1736,12 +1969,12 @@ def test_every_parser_recognises_connected_and_a_rejected_key(world: World, pars
     if parser == "sed":
         expected = CONNECTED.replace("(control plane polling)", "(control plane ok)")
     assert connected.stdout.count(expected) == 1
-    world.knob("health_json", _rejected(401))
+    world.health_sequence(*_real_health("rejected_401"))
     world.knob("run_mode", "exit:0:20")
     rejected = world.run("start")
     assert rejected.returncode == 1, rejected.stdout + rejected.stderr
-    rejection = "error: OpenAI rejected the runtime API key (control plane HTTP 401 on 10 polls in a row)"
-    assert rejection in rejected.stderr
+    assert REJECTED_401 in rejected.stderr
+    assert "dot can use the plugin" not in rejected.stdout
     assert "tunnel: TERM" in world.calls_list()
 
 

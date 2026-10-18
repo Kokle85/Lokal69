@@ -67,9 +67,10 @@
 # otherwise send the credential to whatever binds 127.0.0.1:LOCAL_MCP_PORT next), and `start` sends
 # the credential (probe) only after checking that the API it launched owns the listening socket.
 # The window reads the control-plane component of the tunnel's GET /health?details=true (/readyz
-# answers 200 even while OpenAI refuses the key): "connected" only once it is ok; 401, 403 or 404
-# on 3 polls in a row stop the tunnel with the cause and the fix (exit 1); other failures (network,
-# 5xx) print one warning and the tunnel keeps retrying. Nothing read from the socket is evaluated.
+# answers 200 even while OpenAI refuses the key): "connected" only once it is ok; the same 401, 403
+# or 404 on 3 polls in a row (other failures in between start the count again) stop the tunnel with
+# the cause and the fix (exit 1); other failures (network, 5xx) print one warning and the tunnel
+# keeps retrying. Nothing read from the socket is evaluated.
 #
 # Environment (optional): LOCAL_MCP_PORT API port (default 8010); LOCAL_MCP_TUNNEL_DIR;
 # TUNNEL_CLIENT_BIN the tunnel-client binary (default: from PATH); LOCAL_MCP_WORKSPACE workspace id
@@ -99,8 +100,9 @@ STOP_TIMEOUT=${LOCAL_MCP_STOP_TIMEOUT:-30}
 PROBE_TIMEOUT=${LOCAL_MCP_PROBE_TIMEOUT:-10}
 TAIL_LINES=${LOCAL_MCP_TAIL:-5}
 EXPIRY_WARN_DAYS=5
-# OpenAI's 401/403/404 on this many control-plane polls in a row stop the tunnel (retrying cannot
-# help; tunnel-client v0.0.16 reaches 3 within about a second).
+# The same HTTP 401, 403 or 404 from OpenAI on this many control-plane polls in a row (counted by the
+# start window from the first health sample that shows it, see watch_tunnel) stops the tunnel:
+# retrying cannot help. tunnel-client v0.0.16 retries within seconds at first, so this takes a few.
 REJECT_AFTER=3
 # The checks of `tunnel-client doctor` that fail while the API is not running (setup, before start).
 DOCTOR_EXPECTED_BEFORE_START=" mcp_server_reachable oauth_metadata "
@@ -506,7 +508,8 @@ tunnel_doctor() {
 }
 
 # doctor_unexpected: the names in DOCTOR_FAILED that are not expected before `start` (empty: only
-# mcp_server_reachable and/or oauth_metadata failed).
+# mcp_server_reachable and/or oauth_metadata failed; setup also requires mcp_server_reachable among
+# them, i.e. that nothing answers the MCP URL yet).
 doctor_unexpected() {
   local name names=()
   IFS=, read -r -a names <<<"$DOCTOR_FAILED"
@@ -774,6 +777,10 @@ setup() {
   printf '%s\n' "$DOCTOR_OUT" | sed 's/^/    /'
   if ((DOCTOR_STATUS == 0)); then
     echo "  doctor: RESULT ok"
+    if port_in_use "$PORT"; then
+      echo "  note: something already answers $MCP_URL; start needs port $PORT free (it runs its own" \
+        "API there and refuses a port in use)"
+    fi
   elif [[ -z $DOCTOR_FAILED ]]; then
     fail "tunnel-client doctor failed (exit $DOCTOR_STATUS) and its output (above) has no FAILED_CHECKS" \
       "line naming the failed checks; fix what it reports, then run scripts/local_mcp.sh setup again"
@@ -782,6 +789,21 @@ setup() {
       "mcp_server_reachable and oauth_metadata: $(doctor_unexpected)(all: $DOCTOR_FAILED); the" \
       "explanation is above. Fix them, then run scripts/local_mcp.sh setup again"
   else
+    # Expected before start only while nothing answers the MCP URL. oauth_metadata failing alone
+    # means that something answers it (mcp_server_reachable passed), and it is not this route's API,
+    # which runs only under start (v0.0.16 passes oauth_metadata on the API's 404s).
+    local answering=""
+    if [[ ,$DOCTOR_FAILED, != *,mcp_server_reachable,* ]]; then
+      answering="mcp_server_reachable passed: a program answers $MCP_URL"
+    elif port_in_use "$PORT"; then
+      answering="a program listens on 127.0.0.1:$PORT"
+    fi
+    if [[ -n $answering ]]; then
+      fail "tunnel-client doctor failed (exit $DOCTOR_STATUS; failed checks: $DOCTOR_FAILED) and" \
+        "$answering, which is not this route's API (another program, or an API started separately with" \
+        "other settings). start would refuse port $PORT: stop that program or choose a free port with" \
+        "LOCAL_MCP_PORT=<port>, then run scripts/local_mcp.sh setup again"
+    fi
     echo "  doctor: only ${DOCTOR_FAILED//,/ and } failed. That is expected before scripts/local_mcp.sh" \
       "start: the API is not running yet (nothing answers $MCP_URL); start runs doctor again with the API up."
   fi
@@ -1001,13 +1023,20 @@ EOF
 # - stops the tunnel as soon as the API this run launched is gone, so that tunnel-client never sends
 #   the credential to whatever binds 127.0.0.1:PORT next. The API is checked before the tunnel:
 #   `stop` ends the API only after the tunnel, so "API gone, tunnel running" means it died;
-# - reads the control-plane component of the tunnel's health (every second until it is ok, then
-#   every 5 s; /readyz answers 200 even while OpenAI refuses the key): says "connected" once it is
-#   ok; on HTTP 401, 403 or 404 for REJECT_AFTER polls in a row records the cause in tunnel.rejected
-#   and stops the tunnel (the window then exits 1); any other failure (network, 5xx, backoff) gets
-#   one warning per kind and the tunnel keeps retrying; nothing decided within READY_TIMEOUT: a hint.
+# - reads the control-plane component of the tunnel's health (every second while it is not ok,
+#   every 5 s while it is; /readyz answers 200 even while OpenAI refuses the key): says "connected"
+#   once it is ok; on HTTP 401, 403 or 404 for REJECT_AFTER polls in a row records the cause in
+#   tunnel.rejected and stops the tunnel (the window then exits 1); any other failure (network, 5xx,
+#   backoff) gets one warning per kind and the tunnel keeps retrying; nothing decided within
+#   READY_TIMEOUT: a hint.
+# consecutive_failures counts failures of every kind (network errors, 5xx, 401 ...) and http_status
+# names only the latest one, so a run of rejections is counted here: it starts at the first sample
+# that shows the code (failures F0) and holds while every later sample shows the same code and
+# failure category with a counter that did not go back; then failures - F0 + 1 polls in a row were
+# rejected. Any other sample (another code or kind, ok, a reset counter, no answer) ends the run.
 watch_tunnel() {
-  local ticks=0 connected=0 hinted=0 warned="" tunnel_pid="" words status state http failures category
+  local ticks=0 connected=0 healthy=0 hinted=0 warned="" tunnel_pid="" words status state http failures category
+  local run_code="" run_category="" run_first=0 run_last=0 in_a_row=0
   while :; do
     sleep 0.5
     ticks=$((ticks + 1))
@@ -1025,17 +1054,28 @@ watch_tunnel() {
       return 0
     fi
     if [[ -n $tunnel_pid ]] && ! pid_alive "$tunnel_pid"; then return 0; fi
-    if ((ticks % (connected ? 10 : 2) != 0)); then continue; fi
+    if ((ticks % (healthy ? 10 : 2) != 0)); then continue; fi
     status=- state=- http=- failures=- category=-
     if words=$(control_plane); then
       read -r status state http failures category <<<"$words"
     fi
-    if [[ $http =~ ^(401|403|404)$ && $failures =~ ^[0-9]+$ ]] && ((failures >= REJECT_AFTER)); then
-      rejected_message "$http" "$failures" >"$STATE_DIR/tunnel.rejected"
-      echo "[local_mcp] error: OpenAI's control plane answers HTTP $http; stopping the tunnel (cause and fix below)" >&2
-      signal_once tunnel
-      return 0
+    # (failures: at most 9 digits and no leading zero, so that bash arithmetic reads it as decimal)
+    if [[ $status != ok && $http =~ ^(401|403|404)$ && $failures =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
+      if [[ $http != "$run_code" || $category != "$run_category" ]] || ((failures < run_last)); then
+        run_code=$http run_category=$category run_first=$failures
+      fi
+      run_last=$failures
+      in_a_row=$((failures - run_first + 1))
+      if ((in_a_row >= REJECT_AFTER)); then
+        rejected_message "$http" "$in_a_row" >"$STATE_DIR/tunnel.rejected"
+        echo "[local_mcp] error: OpenAI's control plane answers HTTP $http; stopping the tunnel (cause and fix below)" >&2
+        signal_once tunnel
+        return 0
+      fi
+    else
+      run_code=""
     fi
+    healthy=0
     if [[ $status == ok ]]; then
       if [[ $state == - ]]; then state=ok; fi # the sed fallback reads the status only
       if ((!connected)); then
@@ -1043,7 +1083,7 @@ watch_tunnel() {
       elif [[ -n $warned ]]; then
         echo "[local_mcp] control plane ok again ($state)"
       fi
-      connected=1 warned=""
+      connected=1 healthy=1 warned=""
     elif [[ $status != - && ($failures =~ ^[1-9] || $category != -) && ! $http =~ ^(401|403|404)$ ]]; then
       if [[ $warned != "$category $http" ]]; then
         warned="$category $http"
