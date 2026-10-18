@@ -666,10 +666,14 @@ the API stopped when the tunnel exited; `rotate` created a new credential and re
 `LC_CTYPE`, `SSL_CERT_FILE` and the proxy variables (no `OPENAI_API_KEY`, no `DATABASE_URL`); the
 API key, the token and a planted shell secret were in no output, log, YAML or `credential.json`;
 modes 0700/0600; no process left; the scratch database dropped. The SHA-256 belongs to this
-build's tool schemas: record the one the owner's own probe prints. That run predates the review
-fixes of the same day (the listening-socket check before the probe, the tunnel stopped when the API
-dies, `--health.listen-addr 127.0.0.1:0`, the binary's SHA-256 in `tunnel-client.version`); those
-are covered by the stub tests in the first row only.
+build's tool schemas: record the one the owner's own probe prints. The run was repeated the same
+day on the reviewed script (with the listening-socket check before the probe, the watcher that
+stops the tunnel when the API dies, `--health.listen-addr 127.0.0.1:0` and the binary's SHA-256
+in `tunnel-client.version`): `setup`, the second `setup`, `start` and `rotate` exit 0; `start`
+reported "127.0.0.1:<port> is the API's own socket" before the probe; the probe and the fake
+tunnel gave the same results as above (4/4 checks, 7 tools, the same SHA-256, 401 without and 200
+with the injected header); the secret scan found nothing; modes 0700/0600. The API dying while the
+tunnel runs is covered by the stub tests only.
 
 Points not confirmed in the vendor documentation (re-check them in the live test):
 
