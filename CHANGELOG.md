@@ -40,18 +40,27 @@ enabling a source is still a committed YAML revision plus `sources sync`, and `a
   Off because paused: "Paused" with reason and time; switching on opens the resume confirmation
   (owner only; otherwise disabled with a short explanation) and reports how many waiting jobs were
   requeued. Off because the configuration does not enable it, or blocked by the technical status:
-  disabled, with the reason (YAML + `sources sync`; report the block). Keyboard operable, focusable
-  while disabled (`aria-disabled`), state and help as its description, idempotent mutations through
+  disabled, with the reason (YAML + `sources sync`; report the block). Such a source that is not
+  paused yet keeps the pause the old pause form offered, as a "Pause in advance" button (same
+  form, same route, `sources:pause`; the switch stays off and disabled): the pause survives a later
+  enable or a cleared block until a deliberate resume (docs/runbook.md 2.3 and the CAPTCHA / 401 /
+  403 incident row). "On" says new network work may start (the process-level
+  `SOURCE_NETWORK_ENABLED` setting still applies). Keyboard operable, focusable while disabled
+  (`aria-disabled`), state and help as its description (including why it is unavailable while a
+  pause or resume is being sent or unconfirmed), idempotent mutations through
   `useIdempotentMutation`, conflicts through the shared conflict UI, phone width without
   horizontal scroll. `resumeSource` in the API client.
-- Tests: `tests/api/test_source_resume_route.py` (happy path, no-op, version conflict, `sources:pause`
-  alone refused, idempotent replay and key reuse, requeue of this source's `source_paused` jobs
-  only, never enables a disabled source, never clears `access_blocked`, not found across
-  workspaces), `tests/integration/repos_sources_listings/test_source_resume.py` (requeue guards,
+- Tests: `tests/api/test_source_resume_route.py` (happy path, no-op and its same-key replay,
+  version conflict, `sources:pause` alone refused, idempotent replay and key reuse, requeue of this
+  source's `source_paused` jobs only, never enables a disabled source, never clears
+  `access_blocked` / `parser_unhealthy` and warns `SOURCE_BLOCKED` for both, not found across
+  workspaces), `tests/api/test_source_resume_warnings.py` (every `resume_warnings` branch), `tests/integration/repos_sources_listings/test_source_resume.py` (requeue guards,
   attempts, audits, scope, idempotency), the CLI count (`tests/cli/test_db_commands.py`), view
-  contracts, `dashboard/src/test/sourceSwitch.test.tsx` (every switch state and both flows) and
+  contracts, `dashboard/src/test/sourceSwitch.test.tsx` (every switch state, both flows, the pause
+  in advance, the explanation while locked, the other direction's result cleared) and
   `dashboard/e2e/sources.spec.ts` (the seeded paused source's two `source_paused` jobs requeued by
-  a keyboard resume, then paused again). Docs: docs/runbook.md 2.3, docs/api_contract.md section 6.
+  a keyboard resume, then paused again; the access-blocked and configuration-disabled sources
+  paused in advance). Docs: docs/runbook.md 2.3, docs/api_contract.md section 6.
 
 **Activation step 7 for `autoscout24_it` (2026-10-18): enabled, every 15 minutes.** The owner's
 decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes"), after

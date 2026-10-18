@@ -1,19 +1,24 @@
 /**
  * The per-source on/off switch of the Sources screen, built on pause and resume only.
  *
- * - On  = the server says new network work may start (`network_allowed`). Switching off opens the
- *   pause form (reason required): `POST /api/sources/{id}/pause` (`sources:pause`).
+ * - On  = the server says new network work may start (`network_allowed`; the process-level
+ *   `SOURCE_NETWORK_ENABLED` setting still applies). Switching off opens the pause form (reason
+ *   required): `POST /api/sources/{id}/pause` (`sources:pause`).
  * - Off because paused: switching on opens the resume confirmation (reason required):
  *   `POST /api/sources/{id}/resume` (owner only, `config:admin`), which also requeues the jobs
  *   that waited for the source. Without `config:admin` the switch is disabled with a short reason.
  * - Off because the configuration does not enable the source, or because its technical status is
  *   `access_blocked` / `parser_unhealthy`: the switch is disabled. Enabling stays a configuration
  *   revision (source YAML + `sources sync`) and a block is cleared only by the owner's explicit
- *   technical-status action; the switch can do neither.
+ *   technical-status action; the switch can do neither. Such a source that is not paused yet can
+ *   still be paused in advance ("Pause in advance", same pause form and route, `sources:pause`):
+ *   the pause survives a later enable by the configuration or a cleared block, so the source stays
+ *   off until a deliberate resume.
  *
  * A real `<button role="switch" aria-checked>`: keyboard operable (Enter/Space), named by the
  * visible label, described by the visible state and help text. A disabled switch stays focusable
- * (`aria-disabled`), so a keyboard or screen-reader user still reaches the explanation. Both
+ * (`aria-disabled`), so a keyboard or screen-reader user still reaches the explanation, including
+ * while a pause or resume is being sent or its outcome is not confirmed. Both
  * mutations are idempotent (one key per attempt, same-key retry when the outcome is unknown) and a
  * version conflict is shown with the shared conflict UI.
  */
@@ -59,6 +64,9 @@ const SUBJECT = 'source details'
 
 type Panel = 'pause' | 'resume' | null
 
+/** Which control opened the panel (focus goes back to it on cancel). */
+type Opener = 'switch' | 'ahead'
+
 function busy(phase: { kind: string }): boolean {
   return phase.kind === 'pending' || phase.kind === 'unconfirmed'
 }
@@ -85,8 +93,10 @@ export function SourceSwitch({
   const { client, can } = useWorkspace()
   const id = useId()
   const [panel, setPanel] = useState<Panel>(null)
+  const [opener, setOpener] = useState<Opener>('switch')
   const [reason, setReason] = useState('')
   const switchRef = useRef<HTMLButtonElement>(null)
+  const aheadRef = useRef<HTMLButtonElement>(null)
   const reasonRef = useRef<HTMLInputElement>(null)
   const settled = (_attempt: unknown, outcome: { envelope: unknown } | { error: unknown }) => {
     if ('envelope' in outcome) {
@@ -116,6 +126,10 @@ export function SourceSwitch({
   const canResume = can('config:admin')
   const permitted = (kind === 'running' && canPause) || (kind === 'paused' && canResume)
   const actionable = permitted && !locked
+  // A source that runs no network work now (off in the configuration, technically blocked, or a
+  // status that does not allow it) can still be paused: the pause survives a later enable or a
+  // cleared block, and only a deliberate resume lifts it. The switch itself stays off for it.
+  const canPauseAhead = !source.paused && kind !== 'running' && canPause
   const valid = reason.trim().length >= LIMITS.reasonMin
 
   const nameId = `${id}-name`
@@ -135,12 +149,26 @@ export function SourceSwitch({
     if (kind === 'running') resume.reset()
     else pause.reset()
     setReason('')
+    setOpener('switch')
     setPanel(kind === 'running' ? 'pause' : 'resume')
+  }
+  const pauseAhead = () => {
+    if (!canPauseAhead || locked) return
+    if (panel !== null) {
+      setPanel(null)
+      setReason('')
+      return
+    }
+    resume.reset()
+    setReason('')
+    setOpener('ahead')
+    setPanel('pause')
   }
   const cancel = () => {
     setPanel(null)
     setReason('')
-    switchRef.current?.focus()
+    const back = opener === 'ahead' && aheadRef.current ? aheadRef.current : switchRef.current
+    back?.focus()
   }
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -156,9 +184,10 @@ export function SourceSwitch({
       </button>
     ) : null
 
-  const pausedSince = source.paused ? (
+  // " since <time>: <reason>." after "Paused" (sentence start) or "It is also paused" (mid-text).
+  const pauseDetail = source.paused ? (
     <>
-      Paused{source.paused_at ? (
+      {source.paused_at ? (
         <>
           {' '}
           since <Timestamp value={source.paused_at} timeZone={timeZone} />
@@ -166,6 +195,28 @@ export function SourceSwitch({
       ) : null}
       : {source.pause_reason ?? 'no reason recorded'}.
     </>
+  ) : null
+  const alsoPaused = source.paused ? (
+    <>
+      {' '}
+      It is also paused{pauseDetail} It stays paused after the source would otherwise start again, until the owner resumes it.
+    </>
+  ) : null
+  const pauseAheadHelp = canPauseAhead ? (
+    <>
+      {' '}
+      You can still pause it in advance (a reason is required and audited): the pause stays when the source would otherwise
+      start again, until the owner resumes it.
+    </>
+  ) : null
+  const busyVerb = busy(pause.phase) ? 'pause' : 'resume'
+  const busyPhase = busy(pause.phase) ? pause.phase : resume.phase
+  const lockedHelp = locked ? (
+    <p data-testid="source-switch-locked">
+      {busyPhase.kind === 'pending'
+        ? `The switch is unavailable while the ${busyVerb} is being sent: wait for the server's answer below.`
+        : `The switch is unavailable until the unconfirmed ${busyVerb} is resolved: retry the same request or discard it below.`}
+    </p>
   ) : null
 
   return (
@@ -180,7 +231,7 @@ export function SourceSwitch({
           aria-labelledby={nameId}
           aria-describedby={`${stateId} ${helpId}`}
           aria-disabled={actionable ? undefined : true}
-          aria-controls={panel !== null ? panelId : undefined}
+          aria-controls={panel !== null && opener === 'switch' ? panelId : undefined}
           onClick={toggle}
         >
           <span className="switch-thumb" aria-hidden="true" />
@@ -193,9 +244,11 @@ export function SourceSwitch({
         </span>
       </div>
       <div id={helpId} className="switch-help small">
+        {lockedHelp}
         {kind === 'running' ? (
           <p>
-            New network work runs for this source.{' '}
+            New network work may start for this source (the process-level <code>SOURCE_NETWORK_ENABLED</code> setting still
+            applies).{' '}
             {canPause
               ? 'Switching off pauses it (a reason is required and audited); nothing already captured is removed.'
               : 'Your role cannot pause sources (it needs the sources:pause permission).'}
@@ -203,7 +256,7 @@ export function SourceSwitch({
         ) : null}
         {kind === 'paused' ? (
           <p>
-            {pausedSince} No new network work runs for this source.{' '}
+            Paused{pauseDetail} No new network work runs for this source.{' '}
             {canResume
               ? 'Switching on resumes it (owner action, reason required) and requeues the jobs that waited for it; it never enables the source or changes its technical status.'
               : 'Resuming is owner-only (it needs the config:admin permission).'}
@@ -213,7 +266,8 @@ export function SourceSwitch({
           <p>
             Off in the configuration: a source is switched on only through its YAML file (activation step 7) and{' '}
             <code>suv-deals sources sync</code>, an auditable configuration revision. This switch never enables a source.
-            {source.paused ? <> It is also {pausedSince}</> : null}
+            {alsoPaused}
+            {pauseAheadHelp}
             {source.activation_problems.length ? ' The activation problems are listed below.' : null}
           </p>
         ) : null}
@@ -221,13 +275,33 @@ export function SourceSwitch({
           <p>
             Technical status {label(source.technical.status)}: no network work runs. Report the block; it is cleared only by the
             owner&apos;s explicit technical-status action (<code>suv-deals sources set-technical-status</code>), never by this
-            switch.{source.paused ? <> It is also {pausedSince}</> : null}
+            switch.{alsoPaused}
+            {pauseAheadHelp}
           </p>
         ) : null}
         {kind === 'not_allowed' ? (
-          <p>Technical status {label(source.technical.status)}: no network work runs until it allows it. This switch cannot change it.</p>
+          <p>
+            Technical status {label(source.technical.status)}: no network work runs until it allows it. This switch cannot change
+            it.{pauseAheadHelp}
+          </p>
         ) : null}
       </div>
+      {canPauseAhead ? (
+        <div className="form-actions">
+          <button
+            ref={aheadRef}
+            type="button"
+            className="button secondary"
+            aria-expanded={panel === 'pause'}
+            aria-controls={panel === 'pause' ? panelId : undefined}
+            aria-describedby={helpId}
+            onClick={pauseAhead}
+            disabled={locked}
+          >
+            Pause in advance
+          </button>
+        </div>
+      ) : null}
       {panel !== null ? (
         <form
           className="form pause-form switch-panel"
@@ -239,6 +313,9 @@ export function SourceSwitch({
             <p className="muted small">
               Pausing stops new network work: the scheduler skips this source and a worker blocks a job of it as{' '}
               <code>source_paused</code>. Resuming is a separate owner action.
+              {kind !== 'running'
+                ? ' This source runs no network work right now; the pause keeps it off after a later enable by the configuration or a cleared technical block, until the owner resumes it.'
+                : null}
             </p>
           ) : (
             <p className="muted small">

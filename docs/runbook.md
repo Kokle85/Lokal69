@@ -186,6 +186,17 @@ A source has two separate switches, and only one of them is on the dashboard:
     block must be reported (section 6) and is cleared only by the owner's explicit
     `suv-deals sources set-technical-status KEY STATUS --reason "..." --yes` (which never re-enables
     the source either), never by the switch.
+  - **Pause in advance.** Such a source that is not paused yet (off in the configuration,
+    `access_blocked` / `parser_unhealthy`, or another technical status that allows no network
+    work) still has a "Pause in advance" button for a role with
+    `sources:pause`: the same pause form and route as switching off, while the switch itself stays
+    off and disabled. The pause is runtime state that `sources sync` never touches, so the source
+    stays paused when a later configuration revision enables it or the owner clears the block,
+    until a deliberate resume (the switch's "on" once the source is enabled again, or
+    `suv-deals sources resume`). `crawl once` refuses a paused source, so resume it before a
+    smoke pass.
+  - The "on" state means the per-source gates allow new network work (`network_allowed`); the
+    process-level `SOURCE_NETWORK_ENABLED` setting (section 1) still applies on top of it.
 - A resume never enables a source and never changes its technical status. It requeues only what is
   blocked `source_paused` at that moment: a job a worker was processing while the resume committed
   can still end up blocked `source_paused` a moment later, and a job blocked because its source was
@@ -388,7 +399,7 @@ Exit codes: `0` ok, `1` problems found, `2` usage, `3` refused for safety, `4` d
 
 | Incident | Immediate safe action (commands) | Recovery evidence |
 |---|---|---|
-| CAPTCHA / 401 / 403 on a source | The worker already records `access_blocked` and stops that source (one operational review item). Confirm: `suv-deals sources inspect KEY --from-db`. Pause the route explicitly if needed through the MCP `sources_pause` action or the dashboard Sources switch (section 2.3). Preserve evidence: do not delete fetch records. | Permitted access restored and recorded (terms/technical decision); the blocking technical status is cleared only by the explicit, audited owner action `suv-deals sources set-technical-status KEY fixture_tested --reason "..." --yes` (it never re-enables the source), then `suv-deals sources sync --yes` and a low-rate `suv-deals crawl once --source KEY --max-pages 1` smoke pass. |
+| CAPTCHA / 401 / 403 on a source | The worker already records `access_blocked` and stops that source (one operational review item). Confirm: `suv-deals sources inspect KEY --from-db`. Pause it explicitly if needed, so that it stays off after the block is cleared and the sync re-enables it, until a deliberate resume: the dashboard Sources screen's "Pause in advance" button (the switch itself stays off and disabled for a blocked source, section 2.3) or the MCP `sources_pause` action. Preserve evidence: do not delete fetch records. | Permitted access restored and recorded (terms/technical decision); the blocking technical status is cleared only by the explicit, audited owner action `suv-deals sources set-technical-status KEY fixture_tested --reason "..." --yes` (it never re-enables the source), then `suv-deals sources sync --yes` and a low-rate `suv-deals crawl once --source KEY --max-pages 1` smoke pass (a source paused during the incident stays paused through the sync; `crawl once` refuses it, so resume it first: the dashboard switch or `suv-deals sources resume KEY --reason "..." --yes`). |
 | Parser drift | Source becomes `parser_unhealthy` automatically (new revisions quarantined, opportunity alerts paused). Check `suv-deals sources inspect KEY --from-db` (parser health section). | Fixtures repaired, `uv run pytest tests/adapters -q` green, then a live low-volume `crawl once` smoke. |
 | Database outage | Processes back off on their own; stop schedulers if the outage is long: `docker compose stop scheduler dispatcher`. Do not delete leases or jobs. | After reconnect: `suv-deals reconcile --dry-run` then `suv-deals reconcile` (expired leases requeued, exhausted jobs dead-lettered visibly), `suv-deals outbox inspect`, `suv-deals doctor`. |
 | Worker crash | Nothing manual: the reaper requeues expired leases (`suv-deals reconcile`). | The same job completes once logically: `suv-deals worker --drain` then `outbox inspect`; no duplicate revisions (`evidence verify`). |

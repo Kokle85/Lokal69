@@ -2,8 +2,9 @@
  * The Sources screen's per-source on/off switch against the real backend (SYNTHETIC seed):
  * every switch state drawn from the server fields, the owner's resume of the paused source (its
  * `source_paused` jobs are requeued by the server) and the pause back, keyboard operation, the
- * read-only switch of a reviewer, and phone width. The resume never enables a source and never
- * clears a technical block, so the disabled and blocked sources stay off.
+ * read-only switch of a reviewer, the owner's pause in advance of the access-blocked and the
+ * configuration-disabled sources, and phone width. Neither a resume nor a pause ever enables a
+ * source or clears a technical block, so the disabled and blocked sources stay off.
  */
 import { expect, test, type Locator, type Page } from '@playwright/test'
 import { expectNoHorizontalScroll, guard, manifest, signIn } from './helpers.ts'
@@ -42,6 +43,14 @@ test.describe('sources on/off switch', () => {
     await expect(blocked).toHaveAttribute('aria-checked', 'false')
     await expect(blocked).toBeDisabled()
     await expect(card(page, 'SYNTHETIC blocked source')).toContainText('cleared only by the owner')
+
+    // A source that runs nothing now can still be paused in advance; a running or paused one has no such button.
+    for (const name of ['SYNTHETIC mk source', 'SYNTHETIC blocked source']) {
+      await expect(card(page, name).getByRole('button', { name: 'Pause in advance' })).toBeEnabled()
+    }
+    for (const name of ['SYNTHETIC running source', 'SYNTHETIC paused source']) {
+      await expect(card(page, name).getByRole('button', { name: 'Pause in advance' })).toHaveCount(0)
+    }
 
     // A disabled switch is reachable by keyboard but does nothing.
     await blocked.focus()
@@ -89,12 +98,15 @@ test.describe('sources on/off switch', () => {
     await expect(sourceSwitch(page, 'SYNTHETIC mk source')).toHaveAttribute('aria-checked', 'false')
     await expect(sourceSwitch(page, 'SYNTHETIC blocked source')).toHaveAttribute('aria-checked', 'false')
 
-    // Switch it off again (the seeded state: paused, with the seeded reason).
+    // Switch it off again (the seeded state: paused, with the seeded reason). The resume result
+    // leaves the screen as soon as the pause form opens, and does not come back.
     await toggle.click()
+    await expect(section.getByTestId('source-resumed')).toHaveCount(0)
     await section.getByLabel(/Pause reason/).fill(SEEDED_PAUSE_REASON)
     await section.getByRole('button', { name: 'Pause this source' }).click()
     await expect(section.getByTestId('source-paused')).toHaveText('Source paused.')
     await expect(toggle).toHaveAttribute('aria-checked', 'false')
+    await expect(section.getByTestId('source-resumed')).toHaveCount(0)
     const posts = apiRequests.filter((request) => request.method() === 'POST').map((request) => new URL(request.url()).pathname)
     expect(posts).toEqual([`/api/sources/${data.sources.paused}/resume`, `/api/sources/${data.sources.paused}/pause`])
     expect(problems).toEqual([])
@@ -109,6 +121,47 @@ test.describe('sources on/off switch', () => {
     for (const toggle of switches) await expect(toggle).toBeDisabled()
     await expect(card(page, 'SYNTHETIC paused source')).toContainText('Resuming is owner-only')
     await expect(card(page, 'SYNTHETIC running source')).toContainText('Your role cannot pause sources')
+    await expect(page.getByRole('button', { name: 'Pause in advance' })).toHaveCount(0)
+  })
+
+  // Runs after the tests above that expect the blocked and the configuration-disabled sources unpaused.
+  test('owner pauses the access-blocked and the configuration-disabled sources in advance; their switches stay off', async ({ page }) => {
+    const data = manifest()
+    const { problems, apiRequests } = guard(page)
+    await signIn(page, 'owner')
+    await page.goto('/sources')
+    const cases = [
+      { name: 'SYNTHETIC blocked source', id: data.sources.blocked, state: 'Blocked' },
+      { name: 'SYNTHETIC mk source', id: data.sources.mk, state: 'Off (configuration)' },
+    ]
+    for (const { name, id, state } of cases) {
+      const section = card(page, name)
+      const toggle = sourceSwitch(page, name)
+      await expect(toggle).toBeDisabled()
+      const ahead = section.getByRole('button', { name: 'Pause in advance' })
+      await ahead.focus()
+      await page.keyboard.press('Enter')
+      const reason = section.getByLabel(/Pause reason/)
+      await expect(reason).toBeFocused()
+      await expect(section.getByRole('form', { name: 'Pause this source' })).toContainText('keeps it off after a later enable')
+      await reason.fill(`SYNTHETIC E2E hold: ${name} stays off until the owner resumes it`)
+      const answer = page.waitForResponse((r) => r.url().endsWith(`/api/sources/${id}/pause`) && r.request().method() === 'POST')
+      await section.getByRole('button', { name: 'Pause this source' }).click()
+      const paused = await answer
+      expect(paused.status()).toBe(200)
+      expect(((await paused.json()) as { data: Record<string, unknown> }).data).toMatchObject({ paused: true, already_paused: false })
+      await expect(section.getByTestId('source-paused')).toHaveText('Source paused.')
+      await expect(section).toContainText(`It is also paused since`)
+      await expect(section).toContainText(`${name} stays off until the owner resumes it.`)
+      await expect(section.getByRole('button', { name: 'Pause in advance' })).toHaveCount(0)
+      // Still off and disabled: a pause never enables a source or clears a block.
+      await expect(toggle).toHaveAttribute('aria-checked', 'false')
+      await expect(toggle).toBeDisabled()
+      await expect(section.getByText(state, { exact: true })).toBeVisible()
+    }
+    const posts = apiRequests.filter((request) => request.method() === 'POST').map((request) => new URL(request.url()).pathname)
+    expect(posts).toEqual([`/api/sources/${data.sources.blocked}/pause`, `/api/sources/${data.sources.mk}/pause`])
+    expect(problems).toEqual([])
   })
 })
 

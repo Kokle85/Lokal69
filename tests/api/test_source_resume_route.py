@@ -151,6 +151,19 @@ async def test_resume_of_a_source_that_is_not_paused_is_a_no_op(data_api: DataHa
     assert data["version"] == view["version"]
     assert job_state(seed, gated) == ("blocked", "source_paused")
     assert source_row(seed, running)[3] == view["version"]
+    # The documented same-key retry of a no-op replays its result (the idempotency record was
+    # completed, not left in progress) and still changes nothing.
+    replay = valid(
+        await data_api.post(
+            resume_path(data_api, "running"),
+            owner,
+            body(view["version"], "resume-noop-0001"),
+            headers={"Idempotency-Key": "resume-noop-0001"},
+        )
+    )["data"]
+    assert replay == data
+    assert job_state(seed, gated) == ("blocked", "source_paused")
+    assert source_row(seed, running)[3] == view["version"]
     assert (
         seed.scalar(
             "select count(*) from ops.audit_events where workspace_id = %s and action = 'source.resume'",
@@ -271,30 +284,41 @@ async def test_resume_never_enables_a_disabled_source(data_api: DataHarness, see
     assert after["enabled"] is False and after["network_allowed"] is False and after["state"] == "disabled"
 
 
-async def test_resume_never_clears_access_blocked(data_api: DataHarness, seed: Seed) -> None:
+@pytest.mark.parametrize("status", ["access_blocked", "parser_unhealthy"])
+async def test_resume_never_clears_a_technical_block(data_api: DataHarness, seed: Seed, status: str) -> None:
     owner = data_api.users.owner
-    blocked = data_api.data.sources["blocked"]
+    blocked = data_api.data.sources["blocked"]  # seeded access_blocked (and therefore disabled)
+    if status != "access_blocked":
+        seed.conn.execute("update app.sources set technical_status = %s where id = %s", (status, blocked))
     view = await source_view(data_api, "blocked")
-    assert view["technical"]["status"] == "access_blocked" and view["network_allowed"] is False
+    assert view["technical"]["status"] == status and view["enabled"] is False
+    assert view["paused"] is False and view["network_allowed"] is False
+    # A blocked source that is not paused can still be paused (the dashboard's "Pause in advance").
     pause = await data_api.post(
         f"/api/sources/{blocked}/pause",
         owner,
         {
             "expected_version": view["version"],
             "reason": "SYNTHETIC pause",
-            "idempotency_key": "pause-blocked-01",
+            "idempotency_key": f"pause-blocked-{status[:6]}",
         },
     )
     assert pause.status_code == 200, pause.text
+    assert pause.json()["data"]["already_paused"] is False
     version = pause.json()["data"]["version"]
     envelope = valid(
-        await data_api.post(resume_path(data_api, "blocked"), owner, body(version, "resume-block-0001"))
+        await data_api.post(
+            resume_path(data_api, "blocked"), owner, body(version, f"resume-block-{status[:6]}")
+        )
     )
     data = envelope["data"]
-    assert data["technical_status"] == "access_blocked" and data["enabled"] is False
-    assert data["network_allowed"] is False
+    assert data["technical_status"] == status and data["enabled"] is False
+    assert data["network_allowed"] is False and data["was_paused"] is True
+    # SOURCE_BLOCKED (report the block; the technical-status action clears it), never the
+    # configuration's ACTIVATION_BLOCKED, although the block also left the source disabled.
     assert [w["code"] for w in envelope["warnings"]] == ["SOURCE_BLOCKED"]
-    assert source_row(seed, blocked)[:3] == (False, False, "access_blocked")
+    assert status in envelope["warnings"][0]["message"]
+    assert source_row(seed, blocked)[:3] == (False, False, status)
 
 
 async def test_unknown_and_foreign_sources_are_not_found(

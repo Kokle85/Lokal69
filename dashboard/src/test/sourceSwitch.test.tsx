@@ -1,14 +1,15 @@
 /**
  * The Sources screen's per-source on/off switch (SourceSwitch): every switch state, the pause and
- * resume flows, keyboard operation, permissions, conflicts and the unknown-outcome retry.
- * SYNTHETIC data only.
+ * resume flows, the pause in advance of a source that runs no network work now, keyboard
+ * operation, permissions, conflicts, the unknown-outcome retry and the switch's explanation while
+ * a mutation is in flight. SYNTHETIC data only.
  */
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 import type { MeView, SourceStatusView } from '../api/types'
 import { switchKind } from '../screens/SourceSwitch'
-import { apiError, fakeApi, ok } from './fakeApi'
+import { apiError, deferred, fakeApi, ok } from './fakeApi'
 import { me, pausedSource, resumeResult, SOURCE_ID, sourceStatus } from './fixtures'
 import { renderApp } from './renderApp'
 
@@ -32,6 +33,37 @@ async function findSwitch(displayName: string): Promise<HTMLElement> {
   return screen.findByRole('switch', { name: `Collect from ${displayName}` })
 }
 
+/** Off in the configuration (enabled=false), not paused. */
+function disabledInConfig(overrides: Partial<SourceStatusView> = {}): SourceStatusView {
+  return sourceStatus({
+    display_name: 'SYNTHETIC disabled source',
+    enabled: false,
+    network_allowed: false,
+    state: 'disabled',
+    activation_problems: ['source is disabled in configuration'],
+    ...overrides,
+  })
+}
+
+/** Technically blocked (which also disables it), not paused unless overridden. */
+function blockedSource(status: 'access_blocked' | 'parser_unhealthy', overrides: Partial<SourceStatusView> = {}): SourceStatusView {
+  const base = sourceStatus({ display_name: 'SYNTHETIC blocked source', enabled: false, network_allowed: false, state: 'blocked', ...overrides })
+  return { ...base, technical: { ...base.technical, status } }
+}
+
+function pauseResult(version: number, reason = 'SYNTHETIC pause'): Response {
+  return ok({
+    source_id: SOURCE_ID,
+    source_key: 'synthetic_source',
+    paused: true,
+    already_paused: false,
+    version,
+    paused_at: '2026-10-07T10:00:00Z',
+    reason,
+    notice: 'Paused.',
+  })
+}
+
 describe('switch state', () => {
   it('derives the state from the server fields, technical block first', () => {
     expect(switchKind(sourceStatus())).toBe('running')
@@ -53,7 +85,11 @@ describe('switch state', () => {
     expect(toggle).toHaveAttribute('aria-checked', 'true')
     expect(toggle).not.toHaveAttribute('aria-disabled')
     expect(toggle.tagName).toBe('BUTTON')
-    expect(toggle).toHaveAccessibleDescription(/Running New network work runs for this source/)
+    // "may start": the process-level SOURCE_NETWORK_ENABLED setting is outside this per-source switch.
+    expect(toggle).toHaveAccessibleDescription(
+      /Running New network work may start for this source \(the process-level SOURCE_NETWORK_ENABLED setting still applies\)/,
+    )
+    expect(screen.queryByRole('button', { name: 'Pause in advance' })).toBeNull() // the switch itself pauses it
     expect(within(card('SYNTHETIC running source')).getByText('Running')).toBeInTheDocument()
   })
 
@@ -66,6 +102,26 @@ describe('switch state', () => {
     expect(within(section).getByText('Paused')).toBeInTheDocument()
     expect(section).toHaveTextContent(/Paused since .*: SYNTHETIC owner pause for maintenance\./)
     expect(section).toHaveTextContent(/requeues the jobs that waited for it/)
+    expect(within(section).queryByRole('button', { name: 'Pause in advance' })).toBeNull()
+  })
+
+  it.each([
+    ['off in the configuration', pausedSource({ enabled: false, state: 'disabled' })],
+    ['access_blocked', blockedSource('access_blocked', { display_name: 'SYNTHETIC paused source', paused: true, pause_reason: 'SYNTHETIC owner pause for maintenance', paused_at: '2026-10-07T08:00:00Z' })],
+    ['parser_unhealthy', blockedSource('parser_unhealthy', { display_name: 'SYNTHETIC paused source', paused: true, pause_reason: 'SYNTHETIC owner pause for maintenance', paused_at: '2026-10-07T08:00:00Z' })],
+  ])('a paused source that is also %s reads "It is also paused" mid-sentence', async (_label, source) => {
+    renderSources(source)
+    const toggle = await findSwitch('SYNTHETIC paused source')
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    expect(toggle).toHaveAccessibleDescription(/\. It is also paused since .*: SYNTHETIC owner pause for maintenance\. It stays paused/)
+    expect(toggle).not.toHaveAccessibleDescription(/also Paused/)
+    expect(screen.queryByRole('button', { name: 'Pause in advance' })).toBeNull() // already paused
+  })
+
+  it('a paused source that is also off in the configuration, without a pause time', async () => {
+    renderSources(pausedSource({ enabled: false, state: 'disabled', paused_at: null }))
+    const toggle = await findSwitch('SYNTHETIC paused source')
+    expect(toggle).toHaveAccessibleDescription(/This switch never enables a source\. It is also paused: SYNTHETIC owner pause for maintenance\./)
   })
 
   it('OFF because paused, without config:admin: disabled with a short explanation', async () => {
@@ -99,6 +155,8 @@ describe('switch state', () => {
     await user.keyboard(' ')
     expect(screen.queryByRole('form')).toBeNull()
     expect(api.calls.filter((call) => call.method === 'POST')).toEqual([])
+    // It can still be paused in advance (a separate action; the switch stays off).
+    expect(screen.getByRole('button', { name: 'Pause in advance' })).toBeInTheDocument()
   })
 
   it.each(['access_blocked', 'parser_unhealthy'] as const)(
@@ -123,6 +181,88 @@ describe('switch state', () => {
     const toggle = await findSwitch('SYNTHETIC running source')
     expect(toggle).toHaveAttribute('aria-disabled', 'true')
     expect(toggle).toHaveAccessibleDescription(/Your role cannot pause sources/)
+  })
+})
+
+describe('pausing in advance (a source that runs no network work now)', () => {
+  const kinds: Array<[string, (overrides?: Partial<SourceStatusView>) => SourceStatusView, string]> = [
+    ['off in the configuration', disabledInConfig, 'SYNTHETIC disabled source'],
+    ['access_blocked', (overrides) => blockedSource('access_blocked', overrides), 'SYNTHETIC blocked source'],
+    ['parser_unhealthy', (overrides) => blockedSource('parser_unhealthy', overrides), 'SYNTHETIC blocked source'],
+  ]
+
+  it.each(kinds)('%s: the owner pauses it in advance; the switch stays off and disabled', async (_label, make, name) => {
+    const reason = 'SYNTHETIC hold until the source is understood'
+    let paused = false
+    const api = renderSources(() =>
+      paused ? make({ paused: true, pause_reason: reason, paused_at: '2026-10-07T10:00:00Z', version: 5 }) : make(),
+    )
+    api.on('POST /api/sources/:id/pause', () => {
+      paused = true
+      return pauseResult(5, reason)
+    })
+    const user = userEvent.setup()
+    const toggle = await findSwitch(name)
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    expect(toggle).toHaveAccessibleDescription(/You can still pause it in advance/)
+    const ahead = within(card(name)).getByRole('button', { name: 'Pause in advance' })
+    expect(ahead).toHaveAttribute('aria-expanded', 'false')
+    expect(ahead).toHaveAccessibleDescription(/the pause stays when the source would otherwise start again, until the owner resumes it/)
+    await user.click(ahead)
+    expect(ahead).toHaveAttribute('aria-expanded', 'true')
+    expect(ahead).toHaveAttribute('aria-controls', screen.getByRole('form', { name: 'Pause this source' }).id)
+    expect(toggle).not.toHaveAttribute('aria-controls') // the switch did not open it
+    expect(screen.getByRole('form', { name: 'Pause this source' })).toHaveTextContent(
+      /keeps it off after a later enable by the configuration or a cleared technical block, until the owner resumes it/,
+    )
+    const input = screen.getByLabelText(/Pause reason/)
+    expect(input).toHaveFocus()
+    await user.type(input, reason)
+    await user.click(screen.getByRole('button', { name: 'Pause this source' }))
+    expect(await screen.findByTestId('source-paused')).toHaveTextContent('Source paused.')
+    await waitFor(() => expect(within(card(name)).queryByRole('button', { name: 'Pause in advance' })).toBeNull())
+    const after = screen.getByRole('switch', { name: `Collect from ${name}` })
+    expect(after).toHaveAttribute('aria-checked', 'false')
+    expect(after).toHaveAttribute('aria-disabled', 'true') // a pause never enables or unblocks a source
+    expect(after).toHaveAccessibleDescription(new RegExp(`It is also paused since .*: ${reason}\\.`))
+    const [call] = api.callsTo('POST /api/sources/:id/pause')
+    expect(call?.body).toMatchObject({ expected_version: 4, reason })
+    const sent = call?.body as { idempotency_key: string } | undefined
+    expect(String(sent?.idempotency_key)).toMatch(/^source-pause:/)
+    expect(api.callsTo('POST /api/sources/:id/resume')).toEqual([])
+  })
+
+  it('is keyboard operable: Enter opens the form, Escape cancels back to the button', async () => {
+    const api = renderSources(disabledInConfig())
+    const user = userEvent.setup()
+    await findSwitch('SYNTHETIC disabled source')
+    const ahead = screen.getByRole('button', { name: 'Pause in advance' })
+    ahead.focus()
+    await user.keyboard('{Enter}')
+    expect(screen.getByLabelText(/Pause reason/)).toHaveFocus()
+    await user.keyboard('{Escape}')
+    expect(screen.queryByLabelText(/Pause reason/)).toBeNull()
+    expect(ahead).toHaveFocus()
+    await user.keyboard(' ')
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('form')).toBeNull()
+    expect(ahead).toHaveFocus()
+    expect(api.calls.filter((call) => call.method === 'POST')).toEqual([])
+  })
+
+  it('needs sources:pause only (not config:admin); roles without it get no pause button', async () => {
+    const pauser: MeView = { ...me('owner'), scopes: ['deals:read', 'reviews:read', 'sources:pause'] }
+    renderSources(blockedSource('access_blocked'), pauser)
+    await findSwitch('SYNTHETIC blocked source')
+    expect(screen.getByRole('button', { name: 'Pause in advance' })).toBeInTheDocument()
+  })
+
+  it.each(['reviewer', 'viewer'] as const)('a %s gets no pause button for a source that runs nothing', async (role) => {
+    renderSources(disabledInConfig(), me(role))
+    const toggle = await findSwitch('SYNTHETIC disabled source')
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    expect(toggle).not.toHaveAccessibleDescription(/pause it in advance/)
+    expect(screen.queryByRole('button', { name: 'Pause in advance' })).toBeNull()
   })
 })
 
@@ -164,6 +304,30 @@ describe('switching off (pause)', () => {
     const sent = call?.body as { idempotency_key: string } | undefined
     expect(call?.headers.get('Idempotency-Key')).toBe(sent?.idempotency_key)
     expect(api.callsTo('GET /api/sources')).toHaveLength(2)
+  })
+
+  it('while the pause is being sent or unconfirmed, the disabled switch says why', async () => {
+    const held = deferred()
+    const api = renderSources(sourceStatus())
+    api.on('POST /api/sources/:id/pause', async () => {
+      await held.promise
+      throw new TypeError('network connection lost') // the answer never arrived
+    })
+    const user = userEvent.setup()
+    const toggle = await findSwitch('SYNTHETIC running source')
+    await user.click(toggle)
+    await user.type(screen.getByLabelText(/Pause reason/), 'SYNTHETIC drift')
+    await user.click(screen.getByRole('button', { name: 'Pause this source' }))
+    expect(await screen.findByTestId('mutation-pending')).toBeInTheDocument()
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    expect(toggle).toHaveAccessibleDescription(/The switch is unavailable while the pause is being sent: wait for the server's answer below\./)
+    held.release()
+    expect(await screen.findByTestId('mutation-unconfirmed')).toBeInTheDocument()
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    expect(toggle).toHaveAccessibleDescription(
+      /The switch is unavailable until the unconfirmed pause is resolved: retry the same request or discard it below\./,
+    )
   })
 })
 
@@ -240,10 +404,56 @@ describe('switching on (resume)', () => {
     await user.click(screen.getByRole('button', { name: 'Resume this source' }))
     expect(await screen.findByTestId('mutation-unconfirmed')).toBeInTheDocument()
     expect(toggle).toHaveAttribute('aria-disabled', 'true') // nothing new while the outcome is unknown
+    expect(toggle).toHaveAccessibleDescription(
+      /The switch is unavailable until the unconfirmed resume is resolved: retry the same request or discard it below\./,
+    )
     await user.click(screen.getByRole('button', { name: 'Retry the same request' }))
     expect(await screen.findByTestId('source-resumed')).toHaveTextContent('No waiting job needed requeueing.')
+    expect(toggle).not.toHaveAccessibleDescription(/The switch is unavailable/)
     const [first, second] = api.callsTo('POST /api/sources/:id/resume')
     expect(second?.rawBody).toBe(first?.rawBody)
     expect(second?.headers.get('Idempotency-Key')).toBe(first?.headers.get('Idempotency-Key'))
+  })
+})
+
+describe('switching direction', () => {
+  it('an older result of the other direction leaves the screen when the switch is used again', async () => {
+    let paused = true
+    let version = 4
+    const api = renderSources(() =>
+      paused ? pausedSource({ version }) : sourceStatus({ display_name: 'SYNTHETIC paused source', version }),
+    )
+    api.on('POST /api/sources/:id/resume', () => {
+      paused = false
+      version += 1
+      return ok(resumeResult({ requeued_jobs: 2, version }))
+    })
+    api.on('POST /api/sources/:id/pause', () => {
+      paused = true
+      version += 1
+      return pauseResult(version, 'SYNTHETIC drift again')
+    })
+    const user = userEvent.setup()
+    const toggle = await findSwitch('SYNTHETIC paused source')
+
+    await user.click(toggle) // on
+    await user.type(screen.getByLabelText(/Resume reason/), 'SYNTHETIC maintenance done')
+    await user.click(screen.getByRole('button', { name: 'Resume this source' }))
+    expect(await screen.findByTestId('source-resumed')).toHaveTextContent('Source resumed. 2 waiting jobs were requeued.')
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
+
+    await user.click(toggle) // off: the resume result goes as soon as the pause form opens
+    expect(screen.getByLabelText(/Pause reason/)).toBeInTheDocument()
+    expect(screen.queryByTestId('source-resumed')).toBeNull()
+    await user.type(screen.getByLabelText(/Pause reason/), 'SYNTHETIC drift again')
+    await user.click(screen.getByRole('button', { name: 'Pause this source' }))
+    expect(await screen.findByTestId('source-paused')).toHaveTextContent('Source paused.')
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'))
+    expect(screen.queryByTestId('source-resumed')).toBeNull()
+
+    await user.click(toggle) // on again: the pause result goes
+    expect(screen.getByLabelText(/Resume reason/)).toBeInTheDocument()
+    expect(screen.queryByTestId('source-paused')).toBeNull()
+    expect(api.calls.filter((call) => call.method === 'POST').map((call) => call.path.split('/').pop())).toEqual(['resume', 'pause'])
   })
 })

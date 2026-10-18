@@ -22,8 +22,13 @@ static single-page app (Vite 8 + React 19.3 + React Router 8 + TypeScript 6) tha
   `config:admin`), which also requeues the jobs that waited for the source and reports how many.
   A source its configuration does not enable, or one that is `access_blocked` / `parser_unhealthy`,
   has its switch disabled with the reason: enabling stays a YAML revision + `sources sync`, and a
-  block is cleared only by the owner's explicit technical-status action. A disabled switch stays
-  focusable (`aria-disabled`) so the explanation is reachable by keyboard and screen reader;
+  block is cleared only by the owner's explicit technical-status action. Such a source that is not
+  paused yet keeps a "Pause in advance" button (same pause form and route, `sources:pause`): the
+  pause survives a later enable or a cleared block, so the source stays off until a deliberate
+  resume. "On" says new network work *may* start: the process-level `SOURCE_NETWORK_ENABLED`
+  setting still applies. A disabled switch stays focusable (`aria-disabled`) so the explanation is
+  reachable by keyboard and screen reader, including why it is unavailable while a pause or resume
+  is being sent or its outcome is not confirmed;
 - has a read-only **Customs calculator** (`/import-costs`, and `/candidates/<id>/import-costs`
   starting from that listing's facts; `GET /api/import-costs/estimate`, the same calculation dot
   gets through MCP): North Macedonian customs duty, motor-vehicle tax (ДМВ), import VAT and the
@@ -146,7 +151,7 @@ the API same-origin, exactly as in production; no CORS configuration is needed i
 | Command | What it does |
 |---|---|
 | `npm run build` | `tsc -b` (app, tests, configs, E2E specs), `vite build` into `dist/` (fails without the two `VITE_` variables), then `scripts/check-security.mjs --dist` (CSP meta present, no inline scripts/handlers/styles, no secret key in the bundle). Screens are code-split: the entry chunk keeps React, the router and supabase-js (needed at once to restore the session), each screen is its own chunk |
-| `npm test` | Vitest 5 + Testing Library (jsdom 29.1.1): API client (incl. every v1.1 route), auth gating, review idempotency/conflicts and `decided_by_caller`, unknown-money rendering, XSS escaping, mobile nav, static security grep, and the v1.1 screens (no approve/send control, informational preview label, withheld addresses and quarantined text, escalations, unaccepted quotes, unknown lags never zero, powered-off worker as a coverage gap, zero deals as zero, pause/resume incl. outcome-unknown retry and reload marker), and the source on/off switch in every state (running, paused, off in the configuration, access-blocked / parser-unhealthy, read-only roles) with its pause and resume flows, keyboard operation, conflicts and same-key retry |
+| `npm test` | Vitest 5 + Testing Library (jsdom 29.1.1): API client (incl. every v1.1 route), auth gating, review idempotency/conflicts and `decided_by_caller`, unknown-money rendering, XSS escaping, mobile nav, static security grep, and the v1.1 screens (no approve/send control, informational preview label, withheld addresses and quarantined text, escalations, unaccepted quotes, unknown lags never zero, powered-off worker as a coverage gap, zero deals as zero, pause/resume incl. outcome-unknown retry and reload marker), and the source on/off switch in every state (running, paused, off in the configuration, access-blocked / parser-unhealthy, paused and also off or blocked, read-only roles) with its pause and resume flows, the pause in advance of a source that runs nothing now, keyboard operation, conflicts, same-key retry, the switch's explanation while a mutation is pending or unconfirmed, and the other direction's old result leaving the screen |
 | `npm run lint` | oxlint (correctness + React/a11y rules, `react/no-danger`, `jsx-no-target-blank`, no `eval`) and the source security grep |
 | `npm run e2e` | Playwright 1.56.1 (chromium) against real local services (see below) |
 | `npm audit --omit=dev` | production dependency audit (also `make dashboard-audit`) |
@@ -210,8 +215,9 @@ back/forward; unknown costs shown as `unknown`; malicious seller text rendered i
 no injected elements, no CSP violations); viewer without mutation controls (every source switch
 read-only); owner pause with a reason through the source switch; the source switch states from the
 real server, the owner's keyboard resume of the paused source with its two seeded `source_paused`
-jobs requeued (then paused again), a reviewer's read-only switches and the open switch form at
-375 px (`e2e/sources.spec.ts`); claim + `watch` decision with a second reviewer seeing `ALREADY_CLAIMED` and then
+jobs requeued (then paused again, the resume result gone), the owner's pause in advance of the
+access-blocked and the configuration-disabled sources (their switches stay off and disabled), a
+reviewer's read-only switches and the open switch form at 375 px (`e2e/sources.spec.ts`); claim + `watch` decision with a second reviewer seeing `ALREADY_CLAIMED` and then
 `VERSION_CONFLICT`; token expiry mid-review (401 -> refresh -> identical retry with the same
 idempotency key); network loss after the write (not confirmed -> same-key retry -> exactly one
 decision); page reload while a decision is in flight (server state reported, nothing resent);
