@@ -5,8 +5,9 @@
   the crawler no database/Supabase credentials and never mount the Docker socket or a home dir;
 - scripts: help/syntax, the restore check refuses a non-local target, and (marker ``db``) a real
   backup -> isolated restore -> verification round trip on SYNTHETIC data;
-- ``scripts/local_crawl.sh`` (the owner's start/stop/status of the enabled source on WSL) against
-  stub ``uv``/``sudo`` executables on a fake PATH: no network, no database, no real crawler.
+- ``scripts/local_crawl.sh`` (the owner's start/stop/status of the enabled source on WSL: the
+  scheduler, the worker and the reconciler loop, one ``start``/``stop`` at a time) against stub
+  ``uv``/``sudo`` executables on a fake PATH: no network, no database, no real crawler.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -645,7 +647,7 @@ _STUB_UV = r"""#!/usr/bin/env bash
 # Records argv and the two NON-secret switches, never any other variable.
 printf '%s|net=%s|crawler=%s\n' "$*" "${SOURCE_NETWORK_ENABLED:-}" "${CRAWL4AI_BASE_URL:-}" >> "$CALLS"
 case " $* " in
-  *" suv-deals scheduler "* | *" suv-deals worker "*)
+  *" suv-deals scheduler "* | *" suv-deals worker "* | *" suv-deals reconcile --loop "*)
     trap 'echo "stub: TERM" >> "$CALLS.term"; sleep "${STUB_TERM_DELAY:-0}"; exit 0' TERM
     echo "stub $* started"
     while :; do sleep 0.1; done ;;
@@ -659,6 +661,7 @@ esac
 
 _STUB_SUDO = r"""#!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >> "$CALLS"
+sleep "${STUB_SUDO_DELAY:-0}"  # the owner typing the sudo password
 exit "${STUB_SUDO_EXIT:-0}"
 """
 
@@ -760,27 +763,32 @@ def test_local_crawl_start_status_stop_with_stub_tools(tmp_path: Path) -> None:
         )
         assert calls[2] == "run suv-deals sources sync --yes|net=|crawler="
         assert calls[3] == "run suv-deals reconcile|net=|crawler="
-        launched = sorted(calls[4:6])
-        # Both long-running processes get the network switch (the scheduler skips every real
-        # source without it); only the worker talks to the crawler.
+        launched = sorted(calls[4:7])
+        # The scheduler and the worker get the network switch (the scheduler skips every real
+        # source without it); only the worker talks to the crawler. The reconciler loop (it
+        # returns a job whose lease ran out, e.g. after the PC slept, to the queue: without it
+        # that job would block every later slot as `backlog`) gets neither switch.
         assert launched == [
+            "run suv-deals reconcile --loop|net=|crawler=",
             "run suv-deals scheduler|net=true|crawler=",
             "run suv-deals worker|net=true|crawler=http://127.0.0.1:11235",
         ]
-        for proc in ("scheduler", "worker"):
+        for proc in ("scheduler", "worker", "reconciler"):
             pid = int((state / f"{proc}.pid").read_text(encoding="utf-8"))
             os.kill(pid, 0)  # alive
             log = (state / f"{proc}.logfile").read_text(encoding="utf-8").strip()
             assert re.fullmatch(rf"var/local_crawl/logs/{proc}-\d{{8}}T\d{{6}}Z\.log", log), log
             assert (repo / log).is_file()
         # Refused while running: nothing is checked or launched again.
+        # The started processes do not hold the start/stop lock: this is the running check.
         again = _local_crawl(repo, env, "start")
         assert again.returncode == 1 and "already running" in again.stderr
-        assert len(_calls(env)) == 6
+        assert len(_calls(env)) == 7
 
         status = _local_crawl(repo, env, "status")
         assert status.returncode == 0, status.stdout + status.stderr
-        assert "scheduler: running (pid " in status.stdout and "worker: running (pid " in status.stdout
+        for proc in ("scheduler", "worker", "reconciler"):
+            assert f"{proc}: running (pid " in status.stdout, status.stdout
         assert "log: var/local_crawl/logs/worker-" in status.stdout
         assert "stub run suv-deals worker started" in status.stdout
         assert re.search(r"enabled=true .*requests_today=12", status.stdout), status.stdout
@@ -790,10 +798,12 @@ def test_local_crawl_start_status_stop_with_stub_tools(tmp_path: Path) -> None:
 
         stopped = _local_crawl(repo, env, "stop")
         assert stopped.returncode == 0, stopped.stderr
-        assert "scheduler: stopped" in stopped.stdout and "worker: stopped" in stopped.stdout
+        for proc in ("scheduler", "worker", "reconciler"):
+            assert f"{proc}: stopped" in stopped.stdout, stopped.stdout
         assert not list(state.glob("*.pid")) and not list(state.glob("*.stopping"))
         after = _local_crawl(repo, env, "status")
         assert after.returncode == 1 and "worker: not running" in after.stdout
+        assert "reconciler: not running" in after.stdout
         # No secret ever reaches an argument, the output or a log.
         everything = "\n".join(
             [started.stdout, started.stderr, status.stdout, stopped.stdout, *_calls(env)]
@@ -836,8 +846,73 @@ def test_local_crawl_stop_signals_once_and_waits_again(tmp_path: Path) -> None:
         assert "SIGTERM sent" in slow.stdout
         again = _local_crawl(repo, env, "stop", LOCAL_CRAWL_STOP_TIMEOUT="30")
         assert again.returncode == 0, again.stderr
-        assert again.stdout.count("SIGTERM already sent, waiting") == 2
+        assert again.stdout.count("SIGTERM already sent, waiting") == 3
         terms = Path(env["CALLS"] + ".term").read_text(encoding="utf-8").splitlines()
-        assert terms == ["stub: TERM", "stub: TERM"]  # one per process, never a second one
+        assert terms == ["stub: TERM"] * 3  # one per process, never a second one
     finally:
+        _kill_leftovers(repo)
+
+
+def _alive(pid: int) -> bool:
+    """A running process (not gone, not a zombie waiting for its parent)."""
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return re.search(r"^State:\s+Z", status, re.M) is None
+
+
+@needs_setsid
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock (util-linux) is missing")
+def test_local_crawl_runs_one_start_or_stop_at_a_time(tmp_path: Path) -> None:
+    """A second ``start`` while the first waits at the sudo prompt (another WSL window) is refused
+    instead of launching a second, untracked set that ``stop`` would never reach; ``stop`` is
+    refused meanwhile too. Afterwards ``stop`` stops every process the first ``start`` launched."""
+    repo, env = _local_crawl_world(tmp_path)
+    state = repo / "var" / "local_crawl"
+    first = subprocess.Popen(
+        ["bash", str(repo / "scripts" / "local_crawl.sh"), "start"],
+        cwd=repo.parent,
+        env={**env, "STUB_SUDO_DELAY": "3"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(100):  # until the first start is at its sudo step
+            if _calls(env):
+                break
+            time.sleep(0.05)
+        assert _calls(env) == ["sudo scripts/crawler_firewall.sh"]
+        second = _local_crawl(repo, env, "start")
+        assert second.returncode == 1
+        assert "another scripts/local_crawl.sh start or stop is running" in second.stderr
+        early_stop = _local_crawl(repo, env, "stop")
+        assert early_stop.returncode == 1
+        assert "another scripts/local_crawl.sh start or stop is running" in early_stop.stderr
+        out, err = first.communicate(timeout=60)
+        assert first.returncode == 0, out + err
+        calls = _calls(env)
+        assert calls.count("sudo scripts/crawler_firewall.sh") == 1  # the second start checked nothing
+        launched = [
+            c for c in calls if " --loop" in c or "suv-deals scheduler" in c or "suv-deals worker" in c
+        ]
+        assert len(launched) == 3  # one scheduler, one worker, one reconciler
+        pids = [
+            int((state / f"{p}.pid").read_text(encoding="utf-8"))
+            for p in ("scheduler", "worker", "reconciler")
+        ]
+        assert all(_alive(pid) for pid in pids)
+
+        stopped = _local_crawl(repo, env, "stop")
+        assert stopped.returncode == 0, stopped.stderr
+        deadline = time.monotonic() + 10
+        while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not any(_alive(pid) for pid in pids)  # nothing left crawling, untracked
+        assert not list(state.glob("*.pid"))
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.communicate()
         _kill_leftovers(repo)

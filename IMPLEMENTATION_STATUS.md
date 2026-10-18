@@ -270,9 +270,9 @@ reviewing `doctor`, coverage gaps and blocked jobs.
 - **What runs now?** Nothing runs in production. On the development machine the API with the MCP
   endpoint, worker, scheduler, reconciler, dispatcher, the dashboard and the desktop worker run
   against local PostgreSQL 16 or 17 and fakes, with every source, notification route and seller
-  e-mail off. Since 2026-10-18 the owner's workstation can run the scheduler and the worker for
-  the enabled `autoscout24_it` (`scripts/local_crawl.sh`, docs/runbook.md section 9.2); no such
-  run is recorded here yet.
+  e-mail off. Since 2026-10-18 the owner's workstation can run the scheduler, the worker and the
+  reconciler for the enabled `autoscout24_it` (`scripts/local_crawl.sh`, docs/runbook.md section
+  9.2); no such run is recorded here yet.
 - **Where does it run?** Only on the development machine. Compose files and a runbook exist for a
   VPS (gate `hosting`). The hosted Supabase project has the schema through `20261013000100`
   (docs/schema.md section 9; `20261013000100_import_values` applied 2026-10-14) and serves nothing

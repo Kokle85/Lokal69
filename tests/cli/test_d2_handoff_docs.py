@@ -308,9 +308,38 @@ def test_runbook_9_2_runs_the_enabled_source_with_real_commands() -> None:
         "`access_blocked`",
         "`technical_denial_policy: stop_and_report`",
         "never work around it",
+        # The reconciler loop runs next to them: a job lost while the PC slept (or the database
+        # was away) would otherwise block every later slot as `backlog` until a restart.
+        "`suv-deals reconcile --loop` (neither switch)",
+        "the reconciler returns it to the queue within 5 minutes",
+        "`status` exits 0 only when all three run",
+        "`var/local_crawl/lock`",
+        "39 of the 128 requests a day left after the search pages",
     ):
         assert fact in prose, fact
+    assert "`stop` and `start` again 5 minutes later" not in prose
+    assert "39 of the day's 128 detail requests" not in prose
+    # Runbook 9.1 no longer calls a queued `autoscout24_it` job blocked: it is enabled since step 7.
+    whole = " ".join(runbook.split())
+    assert "so the `autoscout24_it` jobs still queued are not claimed and blocked" not in whole
+    assert "`autoscout24_it` still has 39 queued" not in whole
+    assert "a detail job of a fetching source such as `autoscout24_it` still queued is blocked" not in whole
     assert (REPO / "scripts" / "crawler_firewall.sh").exists()
+
+
+def test_readme_safety_defaults_name_every_enabled_source() -> None:
+    """README "Safety defaults" never claims that every source is disabled while one is enabled:
+    it names exactly the sources whose committed configuration says ``enabled: true``."""
+    configs = sorted((REPO / "config" / "sources").glob("*.yaml"))
+    enabled = [path.stem for path in configs if re.search(r"^enabled: true$", path.read_text("utf-8"), re.M)]
+    assert enabled == ["autoscout24_it"]
+    readme = _text("README.md")
+    safety = readme[readme.index("## Safety defaults") : readme.index("## Customs calculator")]
+    prose = " ".join(safety.split())
+    assert "Every source in `config/sources/` is `enabled: false`." not in prose
+    sentence = prose[prose.index("Every source in `config/sources/`") :].split(". ", 1)[0]
+    for key in enabled:
+        assert f"except `{key}`" in sentence, sentence
 
 
 @pytest.mark.parametrize("relative", ["docs/seller_email_activation.md", "docs/runbook.md"])

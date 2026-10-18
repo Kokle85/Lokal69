@@ -596,17 +596,19 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   report-back item), but they stay queued and come first in the next drain of this source (below).
 - `--source autoscout24_it` limits the drain to this source's jobs: without it the worker claims
   the due detail jobs of EVERY source (highest priority, then oldest), so detail jobs another
-  source left queued would be claimed first and, their source being disabled, blocked as
-  `source_paused` (each then needing `jobs unblock`) while using up `--max-jobs`. With it they
-  stay queued, untouched (an empty drain prints `No due jobs of source autoscout24_it.`). That is
-  what keeps the 39 `autoscout24_it` detail jobs left from the 2026-10-17 walks out of the
-  `autoscout24_de` smoke's drain.
+  source left queued would be claimed first while using up `--max-jobs`: a disabled source's
+  are blocked as `source_paused` (each then needing `jobs unblock`), an enabled source's
+  (`autoscout24_it` since 2026-10-18) are fetched on that source's budget. With it they stay
+  queued, untouched (an empty drain prints `No due jobs of source autoscout24_it.`). That is what
+  keeps any `autoscout24_it` detail jobs still queued out of the `autoscout24_de` smoke's drain
+  (the 39 left from the 2026-10-17 walks are the first the owner's worker fetches after
+  `scripts/local_crawl.sh start`, section 9.2).
 - `--source` does NOT separate this source's own older queued detail jobs from the ones this
   run's search queued: detail jobs share one priority, so the drain claims the source's oldest
-  first. `autoscout24_it` still has 39 queued from that day's 12-model walk without `cy` (09:28
-  UTC), so a repeat of this block spends `--max-jobs 5` on 5 of those, not on the pages its own
-  search queued. That already happened on 2026-10-17: the second walk (`cy=I`, 11:50 UTC) queued no
-  detail job, and its drain requested 5 of the 09:28 walk's pages. Such fetches are counted in
+  first. Until step 7 `autoscout24_it` had 39 queued from that day's 12-model walk without `cy`
+  (09:28 UTC), so a repeat of this block then spent `--max-jobs 5` on 5 of those, not on the
+  pages its own search queued. That already happened on 2026-10-17: the second walk (`cy=I`,
+  11:50 UTC) queued no detail job, and its drain requested 5 of the 09:28 walk's pages. Such fetches are counted in
   `rate_budget.requests_today` but are not in this run's `sources smoke-evidence` (it lists only
   the latest run's own detail jobs and their fetches), and the listings they ingest come from the
   walk without `cy` (possibly foreign sellers), so they say nothing about the `cy` country check
@@ -669,17 +671,19 @@ uv run suv-deals sources inspect autoscout24_it --from-db
   `sources sync`, `uv run suv-deals sources set-technical-status <key> live_smoke_passed --reason
   "<evidence>" --yes` writes the status into the database with its time (`last_live_smoke_at`,
   audited); a sync alone writes the status without the time, and the command is then a no-op.
-  Enabling for real (step 7) is a separate, committed configuration revision;
-  until then step 4 keeps the source off, and a detail job of a fetching source such as
-  `autoscout24_it` still queued is blocked as `source_paused` when a worker without `--source`
-  (or with this key) reaches it (nothing is fetched). A `card_only` source's job is not blocked
-  (see `autoscout24_de` below).
+  Enabling for real (step 7) is a separate, committed configuration revision (`autoscout24_it`
+  since 2026-10-18); until then step 4 keeps the source off, and a detail job of a fetching source
+  still queued is blocked as `source_paused` when a worker without `--source` (or with this key)
+  reaches it (nothing is fetched). Once the source is enabled such a job is fetched, not blocked
+  (`autoscout24_it`'s since step 7). A `card_only` source's job is not blocked (see
+  `autoscout24_de` below).
 - `doctor` reads the YAML: between steps 1 and 4 it reports the smoke's source as `active
   (public_html)`, after step 4 again `not active: 1 gate problem(s)` (`autoscout24_it` reports
   `active (public_html)` throughout since step 7).
 - `autoscout24_de` follows later the same way (replace the key in every command, the drain's
-  `--source` too: `worker --drain --queues detail --source autoscout24_de`, so the `autoscout24_it`
-  jobs still queued are not claimed and blocked). It is `card_only`: that drain only ingests the
+  `--source` too: `worker --drain --queues detail --source autoscout24_de`, so the drain claims no
+  `autoscout24_it` job that may still be queued: since step 7 it would fetch it on
+  `autoscout24_it`'s budget, not block it). It is `card_only`: that drain only ingests the
   search cards' own facts and makes no request (robots.txt disallows `/angebote/`). Leave
   `--max-jobs 5` out there, so that no card job is left queued: unlike a fetching source's detail
   job, a `card_only` job is NOT blocked once step 4 has switched the source off (a disabled or
@@ -703,49 +707,68 @@ Since 2026-10-18 `autoscout24_it` is `enabled: true` (activation step 7, the own
 800 (section 2.2). The configuration alone fetches nothing. The source runs only while a
 `suv-deals scheduler` (one discovery job per slot) and a `suv-deals worker` (the requests) run,
 both with `SOURCE_NETWORK_ENABLED=true`: the scheduler queues no run of a real source without it.
-On the owner's WSL machine `scripts/local_crawl.sh` starts, checks and stops the two, from the
-repository root, with `DATABASE_URL` and `CRAWL4AI_API_TOKEN` in `.env` (the script never reads,
-prints or passes them) and the crawler on the host (`http://127.0.0.1:11235`, section 3.1):
+Next to them runs the reconciler, `suv-deals reconcile --loop` (section 2), without that switch:
+it returns a job whose lease ran out to the queue (see the sleep bullet below), closes orphaned
+crawl runs and runs the valuation and housekeeping sweeps, a pass every 5 minutes. On the owner's
+WSL machine `scripts/local_crawl.sh` starts, checks and stops the three, from the repository root,
+with `DATABASE_URL` and `CRAWL4AI_API_TOKEN` in `.env` (the script never reads, prints or passes
+them) and the crawler on the host (`http://127.0.0.1:11235`, section 3.1):
 
 ```bash
 scripts/local_crawl.sh start    # firewall (sudo), doctor, sources sync --yes, one reconcile pass,
-                                # then the scheduler and the worker in the background
-scripts/local_crawl.sh status   # both running? their last log lines; enabled, paused, state, requests_today
-scripts/local_crawl.sh logs     # follow both logs (Ctrl+C stops following, not the processes)
+                                # then the scheduler, the worker and the reconciler in the background
+scripts/local_crawl.sh status   # all three running? their last log lines; enabled, paused, state, requests_today
+scripts/local_crawl.sh logs     # follow the three logs (Ctrl+C stops following, not the processes)
 scripts/local_crawl.sh stop     # SIGTERM; the worker finishes its current job first
 ```
 
-- `start` refuses while either process runs. In order, stopping at the first failure: `sudo
-  scripts/crawler_firewall.sh` (adds the rules of section 3.2 that are missing, as after every
-  restart, and verifies the isolation), `suv-deals doctor --process worker --crawler` with the
-  network switch, `suv-deals sources sync --yes` (the committed configuration, `enabled: true`
-  included, into the runtime registry; audited) and one `suv-deals reconcile` pass (no network;
-  it returns a job whose lease ended while nothing ran to the queue). Then it starts `suv-deals
-  scheduler` and `suv-deals worker` (default queues; only the worker gets `CRAWL4AI_BASE_URL`)
-  detached (`setsid nohup`), each with a pid file under `var/local_crawl/` and its own log,
-  `var/local_crawl/logs/<process>-<UTC time>.log` (`var/` is git-ignored).
+- `start` refuses while any of the three runs, and so do `start` and `stop` while another `start`
+  or `stop` runs (a lock, `var/local_crawl/lock`: a second WSL window, or a re-run while the first
+  `start` waits at the sudo prompt, cannot launch a second set that `stop` would never reach). In
+  order, stopping at the first failure: `sudo scripts/crawler_firewall.sh` (adds the rules of
+  section 3.2 that are missing, as after every restart, and verifies the isolation), `suv-deals
+  doctor --process worker --crawler` with the network switch, `suv-deals sources sync --yes` (the
+  committed configuration, `enabled: true` included, into the runtime registry; audited) and one
+  `suv-deals reconcile` pass (no network; it returns a job whose lease ended while nothing ran to
+  the queue). Then it starts `suv-deals
+  scheduler`, `suv-deals worker` (default queues; only the worker gets `CRAWL4AI_BASE_URL`) and
+  `suv-deals reconcile --loop` (neither switch) detached (`setsid nohup`), each with a pid file
+  under `var/local_crawl/` and its own log, `var/local_crawl/logs/<process>-<UTC time>.log`
+  (`var/` is git-ignored).
+- The reconciler runs without `SOURCE_NETWORK_ENABLED`, like `start`'s reconcile pass: it makes no
+  request to the source and queues no stale-detail refresh or watch recheck of `autoscout24_it`
+  (those sweeps cover only sources this process may fetch from). `autoscout24_it`'s detail pages
+  are therefore fetched for new or changed search cards, not refreshed after 24 hours.
 - First requests: the 39 `autoscout24_it` detail jobs left queued from 2026-10-17 are the oldest
   due jobs, so the worker fetches them first: 39 `/annunci/` pages, about 13 minutes at the 20 s
-  spacing, 39 of the day's 128 detail requests (the first request of each UTC day is robots.txt).
-  Meanwhile the slot that is live at `start` and the next one can end as coverage gaps
-  (`slot_expired`, `backlog`); the slots after that run normally. A detail job that a worker
+  spacing, 39 of the 128 requests a day left after the search pages (for detail pages and the
+  daily robots.txt request, the first request of each UTC day). Meanwhile the slot that is live
+  at `start` and the next one can end as coverage gaps (`slot_expired`, `backlog`); the slots
+  after that run normally. A detail job that a worker
   blocked as `source_paused` while the source was disabled stays blocked until `suv-deals jobs
   unblock` puts it back.
-- `status` exits 0 only when both run and the database answers. For a process that is not
+- `status` exits 0 only when all three run and the database answers. For a process that is not
   running it still shows the last log lines; `stop`, then `start` again.
 - Keep a WSL window open. The processes survive closing the terminal that started them, but closing
-  every WSL window can shut WSL down, and both processes with it. A sleeping or switched-off PC is
-  a coverage gap (section 3); missed slots are recorded, never replayed.
+  every WSL window can shut WSL down, and the processes with it. A sleeping or switched-off PC is
+  a coverage gap (section 3); missed slots are recorded, never replayed. After the PC wakes the
+  source resumes by itself: a job that was running when it went to sleep has lost its 5-minute
+  lease if the sleep (or a database outage) lasted longer; the worker gives it up without a
+  commit and the reconciler returns it to the queue within 5 minutes (until then the source's
+  slots are skipped as `backlog`). The job's slot then runs if its run window is still open, or
+  ends as `slot_expired`.
 - After a restart of the PC, WSL or Docker: start Docker and the crawler (`docker compose up -d
   crawl4ai`), then `scripts/local_crawl.sh start` (the firewall rules are not persistent; `start`
   adds them again). A job the worker was running when WSL stopped keeps its lease for 5 minutes; a
   discovery job blocks the source's slots (`backlog`) until it is back in the queue. `start`'s
-  reconcile pass puts it back once the lease has ended (after a quicker restart, `stop` and
-  `start` again 5 minutes later).
+  reconcile pass puts it back once the lease has ended; after a quicker restart the reconciler
+  does, within 5 minutes of the lease's end.
 - `stop` sends one SIGTERM to each process and waits up to 10 minutes
   (`LOCAL_CRAWL_STOP_TIMEOUT`): the scheduler stops after its current tick, the worker after its
-  current job (a 12-page discovery run takes about 5 minutes). Running `stop` again only waits
-  again: a second SIGTERM would end the worker at once, in the middle of its job.
+  current job (a 12-page discovery run takes about 5 minutes), the reconciler after its current
+  pass. Running `stop` again only waits again: a second SIGTERM would end the worker at once, in
+  the middle of its job. `stop` is refused while a `start` is still running (e.g. waiting at the
+  sudo prompt): let that finish, then `stop`.
 - Switching the source off: permanently, a committed `enabled: false` in
   `config/sources/autoscout24_it.yaml` (an auditable configuration revision, like the step-7 one)
   and `uv run suv-deals sources sync --yes`; for a while, pause it (the dashboard's Sources screen,

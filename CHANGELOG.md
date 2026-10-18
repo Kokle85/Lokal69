@@ -2,8 +2,11 @@
 
 The build waves in order, derived from `git log --oneline` and the wave documentation
 (docs/schema.md sections 9 to 11, docs/decisions/). Dates are commit dates. "WIP checkpoint"
-commits are omitted; they only preserved interrupted work. **No wave activated anything against
-a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC.
+commits are omitted; they only preserved interrupted work. **No build wave activated anything
+against a real service**: no live crawl, no real e-mail, no Slack, dot or Outlook on a real PC. The
+owner's activation steps are listed under Unreleased: his live smokes of `autoscout24_it` on
+2026-10-17 (step 6) and its enabling on 2026-10-18 (step 7), after which it fetches only while his
+scheduler and worker run.
 
 ## Unreleased (on top of `7f7e187`)
 
@@ -19,10 +22,15 @@ the step-6 live smoke of 2026-10-17.
   672 + 10 <= 800, and the window lies inside one UTC day in CEST and CET alike).
   `autoscout24_de` is unchanged (disabled, `fixture_tested`, every 30 minutes, budget 350).
 - `scripts/local_crawl.sh` (`start`, `stop`, `status`, `logs`): the owner's WSL start and stop of
-  the scheduler and the worker. `start` runs the crawler firewall (sudo), `doctor --process worker
-  --crawler`, `sources sync --yes` and one `reconcile` pass, then starts both detached with pid
-  files and logs under `var/local_crawl/`. Both get `SOURCE_NETWORK_ENABLED=true` (the scheduler
-  queues no run of a real source without it); only the worker gets `CRAWL4AI_BASE_URL`. `.env` is
+  the scheduler, the worker and the reconciler. `start` runs the crawler firewall (sudo), `doctor
+  --process worker --crawler`, `sources sync --yes` and one `reconcile` pass, then starts the
+  three detached with pid files and logs under `var/local_crawl/`. The scheduler and the worker
+  get `SOURCE_NETWORK_ENABLED=true` (the scheduler queues no run of a real source without it);
+  only the worker gets `CRAWL4AI_BASE_URL`. The reconciler (`reconcile --loop`, neither switch)
+  returns a job whose lease ran out to the queue: without it a job lost while the PC slept or the
+  database was away would stay `running` and every later slot would be skipped as `backlog`.
+  One `start` or `stop` at a time (a lock under `var/local_crawl/`; the started processes do not
+  hold it), so two overlapping starts cannot leave a second, untracked set crawling. `.env` is
   never read or printed and no secret is an argument. `stop` sends one SIGTERM per process (the
   worker finishes its current job; a second signal would end it at once).
 - Docs: runbook 9.2 (running the enabled source, first requests, the WSL window, restarts,
@@ -34,7 +42,10 @@ the step-6 live smoke of 2026-10-17.
   enabled and active at 15 minutes / 56 runs / 672 / 800, split from `autoscout24_de`, which keeps
   its own facts. New: the 15-minute window needs the 15-minute tick
   (`tests/unit/test_discovery_window.py`), `scripts/local_crawl.sh` against stub `uv`/`sudo`
-  executables (`tests/cli/test_ops_files.py`) and runbook 9.2 against the real CLI
+  executables (three processes, one `start`/`stop` at a time; `tests/cli/test_ops_files.py`), a
+  slot job whose lease was lost blocks the schedule only until a reconciler pass requeues it
+  (`tests/integration/pipeline/test_scheduler.py`), runbook 9.2 against the real CLI and the
+  README's safety defaults against the source configurations
   (`tests/cli/test_d2_handoff_docs.py`).
 
 Implausibly low mileage (live finding of 2026-10-17). The owner's `autoscout24_it` smoke stored a

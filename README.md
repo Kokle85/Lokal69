@@ -123,8 +123,10 @@ the owner's activation ([desktop/outlook-bridge/README.md](desktop/outlook-bridg
 | `SELLER_EMAIL_CANARY_SEND_ENABLED` | `false` | the owner's one-time canary cannot be sent |
 | `FX_FETCH_ENABLED`, `LLM_EXTRACTION_ENABLED` | `false` | no ECB fetch; no LLM call |
 
-Every source in `config/sources/` is `enabled: false`. Fixture data never notifies. Secrets come
-only from the environment or a secret store, never from the repository; the owner's real mailbox
+Every source in `config/sources/` is `enabled: false` except `autoscout24_it` (enabled 2026-10-18,
+activation step 7; it fetches only while the owner's scheduler and worker run with
+`SOURCE_NETWORK_ENABLED=true`, docs/runbook.md section 9.2). Fixture data never notifies. Secrets
+come only from the environment or a secret store, never from the repository; the owner's real mailbox
 address never appears in it (tests use `example.invalid`). Every state-changing administrative CLI
 command (configuration, sources, credentials, sender binding, inquiry controls, canary, market and
 FX records, jobs, migrations) needs `--yes`; the process commands (`api serve`, `worker`,

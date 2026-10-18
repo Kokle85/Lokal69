@@ -157,8 +157,9 @@ ids are also in [docs/evidence/autoscout24_it_live_smoke_2026-10-17.json](eviden
   26 for listings it no longer returns, most likely foreign like the 7 known ones). They stay queued only while no worker claims them: a
   worker that reaches one while the source is disabled blocks it (`source_paused`; `suv-deals jobs
   unblock` puts it back). Since the source is enabled (step 7, 2026-10-18) the owner's worker
-  fetches them first, oldest first (39 of the day's 128 detail requests, once; about 13 minutes at
-  the 20 s spacing; docs/runbook.md section 9.2).
+  fetches them first, oldest first (once: 39 of the 128 requests a day left after the search pages
+  for detail pages and robots.txt; about 13 minutes at the 20 s spacing; docs/runbook.md section
+  9.2).
 - Completed the same day (after the smoke): the five ingests' ids and seller countries above (the
   owner's `smoke-evidence --run-id ac1a09b6-...`), the crawler gate evidence (firewall rules
   already present, none added; isolation verified, 9 host targets blocked; `doctor --process worker
@@ -252,7 +253,8 @@ raises `SourcePaused` unless every gate passes. Placeholders raise `AdapterUnimp
    search page queues one detail job per new or changed card and `max_detail_jobs_per_run` does
    not bound a drain (each detail job is its own run), so `--max-jobs N` is what limits the
    detail requests; `--source <key>` keeps the drain on this source, so detail jobs another
-   (disabled) source left queued are not claimed and blocked as `source_paused`.
+   source left queued are not claimed: a disabled source's would be blocked as `source_paused`,
+   an enabled source's (`autoscout24_it` since 2026-10-18) fetched on its budget.
    Confirm `access_state: ok` and healthy parser outcomes (`suv-deals sources inspect <key>
    --from-db`, `doctor`). For AutoScout24 the exact owner commands, including the local
    uncommitted `enabled: true` and switching the source off again, are in docs/runbook.md

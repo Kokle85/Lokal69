@@ -5,15 +5,16 @@ one tick must never do: let one failing schedule stop the others, or create jobs
 block (a fixture source in production, whose processes load no fixture data), and how a source
 with an explicit discovery window (owner decision 2026-10-16) is ensured: with the window's
 interval and due time, or refused when the enabled profiles would overspend its budget or the
-scheduler's ticks cannot reach its slots; and that a windowed slot's job never runs after its
-slot's run window (checked when the job starts and before it is deferred).
+scheduler's ticks cannot reach its slots; that a windowed slot's job never runs after its
+slot's run window (checked when the job starts and before it is deferred); and that a slot job
+whose lease was lost blocks the schedule only until a reconciler pass returns it to the queue.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -332,3 +333,54 @@ async def test_a_refusal_past_the_run_window_ends_the_job_instead_of_deferring(
     [crawl] = runs
     assert crawl["outcome"] == "cancelled"
     assert any("would start after the run window" in g for g in crawl["gap_reasons"])
+
+
+async def test_a_lost_lease_blocks_the_slots_until_a_reconciler_pass_requeues_it(
+    half_days: PipelineEnv,
+) -> None:
+    """The worker loses its slot job's lease (the PC slept, or the database was unreachable for
+    longer than the lease): it gives the job up and commits nothing, so the job stays ``running``.
+    No worker claims it again and every later slot is skipped as ``backlog``; the scheduler and
+    the worker alone never recover. Only the reconciler's reaper returns it to the queue, which is
+    why ``scripts/local_crawl.sh`` runs ``suv-deals reconcile --loop`` next to them (runbook 9.2).
+    After one pass the job runs and the schedule's next slot is enqueued again."""
+    env = half_days
+    record = await run(
+        env.ctx, env.system, lambda c: sources_repo.get_source_record(c, env.system, env.source_id)
+    )
+    await ensure_schedules(env.ctx.db, env.system, [record], 900)
+    [row] = _schedules(env)
+    first = await run(env.ctx, env.system, lambda c: sources_repo.advance_schedule(c, env.system, row["id"]))
+    assert first.outcome == "enqueued" and first.job_id is not None
+    claimed = await jobs.claim(env.ctx.db, env.workspace_id, "sleeping-worker", [JobType.DISCOVERY], 120)
+    assert claimed is not None and claimed.id == first.job_id
+    env.seed.conn.execute(
+        "update ops.jobs set lease_expires_at = clock_timestamp() - interval '1 hour' where id = %s",
+        (claimed.id,),
+    )
+    assert await jobs.heartbeat(env.ctx.db, claimed, 120) is False  # the worker marks the job lost
+    assert await jobs.claim(env.ctx.db, env.workspace_id, "other-worker", [JobType.DISCOVERY], 120) is None
+
+    async def later_slot(hours: int) -> Any:
+        env.seed.conn.execute(
+            "update ops.source_schedules set next_due_at = clock_timestamp() - interval '1 minute'"
+            " where id = %s",
+            (row["id"],),
+        )
+        slot = first.slot + timedelta(hours=hours)
+        return await run(
+            env.ctx, env.system, lambda c: sources_repo.advance_schedule(c, env.system, row["id"], slot=slot)
+        )
+
+    blocked = [await later_slot(12), await later_slot(24)]
+    assert [(a.outcome, a.skip_reason) for a in blocked] == [("skipped", "backlog")] * 2
+    assert env.rows("select state from ops.jobs where id = %s", claimed.id) == [{"state": "running"}]
+
+    report = await Reconciler(env.ctx, ReconcileOptions(job_retry_delay_seconds=0)).reconcile_workspace(
+        env.workspace_id
+    )
+    assert report.errors == [] and report.jobs_requeued == 1
+    await Worker(env.ctx, workspace_ids=[env.workspace_id], worker_id="awake-worker").run_until_idle()
+    assert env.rows("select state from ops.jobs where id = %s", claimed.id) == [{"state": "succeeded"}]
+    resumed = await later_slot(36)
+    assert resumed.outcome == "enqueued" and resumed.skip_reason is None
