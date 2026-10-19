@@ -859,10 +859,12 @@ scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart aft
   8.3 step 1). The tunnel directory must not be inside any git working tree (a dotfiles repository
   at `~/.config` or `~` is refused). Then in ChatGPT: Add custom MCP server,
   Connection: Tunnel, `lokal69-mcp`, No authentication, only while `start` says "connected to
-  OpenAI" (the control plane accepted the tunnel; `/readyz` alone does not show that). If OpenAI
-  rejects the runtime key (401), its permission or the tunnel (403) or the tunnel id (404), the
-  window names the cause and the fix, stops the tunnel and the API and exits 1
-  (docs/connect_mcp.md 8.3 step 3).
+  OpenAI" (the control plane accepted the tunnel; `/readyz` alone does not show that). If OpenAI's
+  control plane answers 401, 403 or 404 on 3 polls in a row, the window stops the tunnel and the
+  API, exits 1 and shows "OpenAI says: <code>: <text>" from the tunnel log with the cause and the
+  fix for that code (`status` repeats them): 401 `invalid_api_key` is a wrong key, 401
+  `tunnel_use_forbidden` a valid key whose principal lacks the tunnel permissions on the Platform
+  (docs/connect_mcp.md 8.3 step 3, 8.7).
 - Secrets stay in `~/.config/suv-deals/tunnel/` (0700, files 0600) and in `.env`; the script never
   prints them, never puts them on a command line and never reads, prints or passes `.env`. Never
   run tunnel-client with `--log.http-raw-unsafe`, and never connect the PC as dot's "computer".

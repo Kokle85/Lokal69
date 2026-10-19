@@ -58,7 +58,8 @@
 # State (var/ is git-ignored): var/local_mcp/<process>.pid, <process>.starttime (the API's start
 # time, so a reused pid is never signalled), <process>.logfile (its current log), <process>.stopping
 # (SIGTERM sent), api.port, api.lost (the API ended while the tunnel ran), tunnel.rejected (why the
-# last start stopped the tunnel: OpenAI answered 401, 403 or 404), var/local_mcp/lock (one setup,
+# last start stopped the tunnel: OpenAI answered 401, 403 or 404; OpenAI's error code and words from
+# the tunnel log, the cause and the fix), var/local_mcp/lock (one setup,
 # start, stop or rotate at a time; `start` releases it once the tunnel runs) and
 # var/local_mcp/logs/<process>-<UTC time>.log (process: api, tunnel), probe-<UTC time>.json,
 # doctor-<UTC time>.txt. Separate from scripts/local_crawl.sh (var/local_crawl, its own lock).
@@ -69,8 +70,11 @@
 # The window reads the control-plane component of the tunnel's GET /health?details=true (/readyz
 # answers 200 even while OpenAI refuses the key): "connected" only once it is ok; the same 401, 403
 # or 404 on 3 polls in a row (other failures in between start the count again) stop the tunnel with
-# the cause and the fix (exit 1); other failures (network, 5xx) print one warning and the tunnel
-# keeps retrying. Nothing read from the socket is evaluated.
+# "OpenAI says: <code>: <text>" (the last such error tunnel-client logged; printable characters
+# only, at most 400, any unmasked sk- key masked) and the cause and the fix for that code (one
+# status has several causes: 401 is a wrong key, invalid_api_key, or a valid key whose principal
+# may not use the tunnel, tunnel_use_forbidden) (exit 1); other failures (network, 5xx) print one
+# warning and the tunnel keeps retrying. Nothing read from the socket or the log is evaluated.
 #
 # Environment (optional): LOCAL_MCP_PORT API port (default 8010); LOCAL_MCP_TUNNEL_DIR;
 # TUNNEL_CLIENT_BIN the tunnel-client binary (default: from PATH); LOCAL_MCP_WORKSPACE workspace id
@@ -881,27 +885,186 @@ control_plane() {
   printf '%s' "$line"
 }
 
-# rejected_message HTTP FAILURES: the cause and the fix when OpenAI's control plane keeps answering
-# HTTP 401, 403 or 404 (tunnel-client would retry for ever).
+# OpenAI's own words for a rejection, from the tunnel log. tunnel-client v0.0.16 logs every failed
+# control-plane request as a struct-text line with the attribute error="..." (Go quoting), e.g.
+#   WARN poll failed; backing off ... component=controlplane error="controlplane client: unexpected
+#     status 401: invalid_api_key: Incorrect API key provided: sk-proj-****...56cc. ..." ...
+#   WARN tunnel metadata fetch failed ... error="controlplane client: unexpected metadata status
+#     404: Tunnel not found"
+# i.e. "unexpected [metadata ]status <HTTP>: [<code>: ]<text>" (the code and OpenAI's message;
+# tunnel-client appends " mitigation: ..." for the codes it knows). OpenAI masks the key itself.
+OA_LOG_BYTES=1048576 # only the end of the log is read
+OA_TEXT_MAX=400      # characters of "<code>: <text>" shown
+OA_ERROR_RE='(^| )error="(([^"\\]|\\.)*)"'
+OA_CP_RE='^controlplane client: unexpected (metadata )?status ([1-5][0-9][0-9]): (.+)$'
+OA_CODE_RE='^([a-z][a-z0-9]*(_[a-z0-9]+)+): '
+OA_KEY_RE='(^|[^A-Za-z0-9_*-])(sk-[A-Za-z0-9_*-]+)'
+ROLES_PAGE=https://platform.openai.com/settings/organization/people/roles
+
+# oa_clean TEXT: TEXT for the window and tunnel.rejected: printable ASCII only (every other byte
+# becomes "?"), every sk-... run that holds no "*" (a key OpenAI did not mask) replaced by
+# "sk-[masked]", at most OA_TEXT_MAX characters. Parameter expansion only: nothing is evaluated.
+oa_clean() {
+  local LC_ALL=C text=$1 out="" whole lead run
+  text=${text//[^ -~]/?}
+  while [[ $text =~ $OA_KEY_RE ]]; do
+    whole=${BASH_REMATCH[0]} lead=${BASH_REMATCH[1]} run=${BASH_REMATCH[2]}
+    out+=${text%%"$whole"*}$lead
+    text=${text#*"$whole"}
+    if [[ $run == *'*'* || ${#run} -lt 11 ]]; then out+=$run; else out+='sk-[masked]'; fi
+  done
+  text=$out$text
+  if ((${#text} > OA_TEXT_MAX)); then text="${text:0:OA_TEXT_MAX-3}..."; fi
+  printf '%s' "$text"
+}
+
+# openai_says HTTP LOG: OpenAI's words for HTTP in LOG (see above). Sets OA_SAYS ("<code>: <text>",
+# or the text alone; oa_clean'ed), OA_CODE (the code, or empty) and OA_META404 (1 when LOG also
+# holds a metadata 404 "Tunnel not found"). The last poll failure with status HTTP wins over a
+# metadata line with it; 1 when LOG has neither. The lines are only matched, never evaluated.
+openai_says() {
+  local http=$1 log=$2 line value metadata status rest poll="" meta=""
+  OA_SAYS="" OA_CODE="" OA_META404=0
+  [[ -f $log ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ $OA_ERROR_RE ]] || continue
+    value=${BASH_REMATCH[2]}
+    [[ $value =~ $OA_CP_RE ]] || continue
+    metadata=${BASH_REMATCH[1]} status=${BASH_REMATCH[2]} rest=${BASH_REMATCH[3]}
+    if [[ -n $metadata && $status == 404 && $rest == "Tunnel not found"* ]]; then OA_META404=1; fi
+    if [[ $status != "$http" ]]; then continue; fi
+    if [[ -n $metadata ]]; then meta=$rest; else poll=$rest; fi
+  done < <(tail -c "$OA_LOG_BYTES" -- "$log" 2>/dev/null | grep -a -F 'error="controlplane client: unexpected ')
+  rest=${poll:-$meta}
+  [[ -n $rest ]] || return 1
+  rest=${rest//\\\"/\"} # Go's quoting: \" is "
+  if [[ $rest =~ $OA_CODE_RE ]]; then OA_CODE=${BASH_REMATCH[1]}; fi
+  OA_SAYS=$(oa_clean "$rest")
+}
+
+# say WORDS...: one line (printf: no option or backslash in WORDS is interpreted).
+say() { printf '%s\n' "$*"; }
+
+# rejected_message HTTP FAILURES: why OpenAI's control plane keeps answering HTTP 401, 403 or 404
+# (tunnel-client would retry for ever), for tunnel.rejected: a first line (the summary), then
+# "OpenAI says: <code>: <text>" from the tunnel log (openai_says) and the cause and the fix, chosen
+# by OpenAI's code (one HTTP status has several causes: v0.0.16 answers 401 both for a wrong key,
+# invalid_api_key, and for a valid key whose principal may not use the tunnel, tunnel_use_forbidden),
+# else by the status. Sets OA_CODE.
 rejected_message() {
-  case $1 in
-    401)
-      printf '%s' "OpenAI rejected the runtime API key (control plane HTTP 401 on $2 polls in a row): a" \
-        " wrong or revoked key. Delete $API_KEY_FILE and run scripts/local_mcp.sh setup with a new" \
-        " restricted key (Tunnels Read + Use; $API_KEYS_PAGE)"
+  local http=$1 polls=$2 log="" said=0 new_key
+  local polled="control plane HTTP $http on $polls polls in a row"
+  log=$(current_log tunnel) || log=""
+  if openai_says "$http" "$log"; then said=1; fi
+  new_key="delete $API_KEY_FILE and run scripts/local_mcp.sh setup"
+  case $OA_CODE in
+    invalid_api_key)
+      say "OpenAI rejected the runtime API key ($polled)"
+      say "OpenAI says: $OA_SAYS"
+      say "Cause: the key in $API_KEY_FILE is wrong, truncated or revoked (invalid_api_key)."
+      say "Fix: compare the last 4 characters of the masked key above with the key list on" \
+        "$API_KEYS_PAGE; $new_key with the right restricted key (Tunnels Read + Use)."
       ;;
-    403)
-      printf '%s' "OpenAI refused the tunnel (control plane HTTP 403 on $2 polls in a row): the runtime" \
-        " API key lacks Tunnels Read + Use for $TUNNEL_ID, or the tunnel belongs to another organization" \
-        " or project. Give the key that permission or create one in the tunnel's project ($API_KEYS_PAGE)," \
-        " delete $API_KEY_FILE and run scripts/local_mcp.sh setup; for a wrong tunnel id delete" \
-        " $TUNNEL_ID_FILE instead"
+    tunnel_use_forbidden)
+      say "OpenAI denies the runtime API key's principal the use of the tunnel $TUNNEL_ID ($polled)"
+      say "OpenAI says: $OA_SAYS"
+      if ((OA_META404)); then
+        say "Cause: the key is valid, but its principal (the person or service account that owns the key)" \
+          "may not use this tunnel (tunnel_use_forbidden). The metadata 404 \"Tunnel not found\" in the" \
+          "same log has the same cause (the tunnel is hidden from that principal), not a wrong tunnel id."
+      else
+        say "Cause: the key is valid, but its principal (the person or service account that owns the key)" \
+          "may not use this tunnel (tunnel_use_forbidden)."
+      fi
+      say "Fix, on the Platform (tunnel permissions are organization-level, not per project):"
+      say "  1. the tunnel ($TUNNELS_PAGE) and the key's project are in the SAME organization" \
+        "(organization switcher);"
+      say "  2. the owner's organization role, or the tunnel's own User role, has Tunnels Read + Use" \
+        "($ROLES_PAGE; a role change can take up to 30 minutes);"
+      say "  3. the key is Owned by: You (not a service account without that role) and Restricted with" \
+        "Tunnels Read + Use ($API_KEYS_PAGE);"
+      say "  4. then create a NEW key (after a role change the vendor advises new keys), $new_key." \
+        "Keep $TUNNEL_ID_FILE: the tunnel id is not the problem."
+      ;;
+    tunnel_missing_principals)
+      say "OpenAI refused the runtime API key for the tunnel $TUNNEL_ID ($polled)"
+      say "OpenAI says: $OA_SAYS"
+      say "Cause: the key is not associated with the tunnel's organization or workspace" \
+        "(tunnel_missing_principals)."
+      say "Fix (tunnel-client's mitigation: use a runtime API key associated with the intended" \
+        "organization or workspace): create a restricted key (Tunnels Read + Use) in a project of the" \
+        "tunnel's organization ($API_KEYS_PAGE, organization switcher), $new_key."
+      ;;
+    tunnel_active_organization_required)
+      say "OpenAI needs the organization id of the tunnel $TUNNEL_ID ($polled)"
+      say "OpenAI says: $OA_SAYS"
+      say "Cause: the request does not name the tunnel's organization (tunnel_active_organization_required)."
+      say "Fix (tunnel-client's mitigation): set control_plane.organization_id to the tunnel's" \
+        "organization ID. scripts/local_mcp.sh does not set an organization id (tunnel-client.yaml has" \
+        "none, and start rewrites that file), so this needs a change to the script."
+      ;;
+    invalid_tunnel_id_format)
+      say "OpenAI does not accept the format of the tunnel id $TUNNEL_ID ($polled)"
+      say "OpenAI says: $OA_SAYS"
+      say "Fix: delete $TUNNEL_ID_FILE and run scripts/local_mcp.sh setup with the exact tunnel_... id" \
+        "from $TUNNELS_PAGE."
       ;;
     *)
-      printf '%s' "OpenAI does not know the tunnel $TUNNEL_ID (control plane HTTP 404 on $2 polls in a" \
-        " row): delete $TUNNEL_ID_FILE and run scripts/local_mcp.sh setup with the id from $TUNNELS_PAGE"
+      # No code in the log (or no log line), or a code this script does not know: the texts by
+      # HTTP status, with OpenAI's own words when the log has them.
+      case $http in
+        401) say "OpenAI rejected the runtime API key ($polled)" ;;
+        403) say "OpenAI refused the tunnel ($polled)" ;;
+        *) say "OpenAI does not know the tunnel $TUNNEL_ID ($polled)" ;;
+      esac
+      if ((said)); then
+        say "OpenAI says: $OA_SAYS"
+        if [[ -n $OA_CODE ]]; then
+          say "Note: scripts/local_mcp.sh does not know the code $OA_CODE; OpenAI's words above name the" \
+            "cause (a \"mitigation:\" part is tunnel-client's advice for it). Generic advice for HTTP $http:"
+        fi
+      else
+        say "The tunnel log${log:+ ($log)} holds no control-plane error with HTTP $http: OpenAI's own words" \
+          "are not known."
+      fi
+      case $http in
+        401)
+          say "Cause: HTTP 401 comes with a wrong, truncated or revoked key (invalid_api_key) and with a" \
+            "valid key whose principal may not use this tunnel (tunnel_use_forbidden; docs/connect_mcp.md 8.7)."
+          say "Fix: for a wrong key, $new_key with the right restricted key (Tunnels Read + Use;" \
+            "$API_KEYS_PAGE); for a valid key, give its principal Tunnels Read + Use for this tunnel" \
+            "($ROLES_PAGE), then create a new key and run setup the same way."
+          ;;
+        403)
+          say "Cause: the runtime API key lacks Tunnels Read + Use for $TUNNEL_ID, or the tunnel belongs to" \
+            "another organization or project."
+          say "Fix: give the key that permission or create one in the tunnel's project ($API_KEYS_PAGE)," \
+            "$new_key; for a wrong tunnel id delete $TUNNEL_ID_FILE instead."
+          ;;
+        *)
+          say "Cause: a wrong tunnel id, or a tunnel hidden from the key's principal (another organization," \
+            "no Tunnels Read + Use)."
+          say "Fix: delete $TUNNEL_ID_FILE and run scripts/local_mcp.sh setup with the id from $TUNNELS_PAGE." \
+            "If the id there is the same, keep it and check the organization and Tunnels Read + Use as for" \
+            "tunnel_use_forbidden (docs/connect_mcp.md 8.7)."
+          ;;
+      esac
       ;;
   esac
+}
+
+# show_rejection INDENT FIRST_PREFIX FIRST_SUFFIX: tunnel.rejected for the window or `status`: its
+# first line between the prefix and the suffix, every other line indented.
+show_rejection() {
+  local line first=1
+  while IFS= read -r line || [[ -n $line ]]; do
+    if ((first)); then
+      printf '%s%s%s\n' "$2" "$line" "$3"
+      first=0
+    else
+      printf '%s%s\n' "$1" "$line"
+    fi
+  done <"$STATE_DIR/tunnel.rejected"
 }
 
 # launch PROCESS LOGFILE COMMAND...: detached (own session, SIGHUP ignored), pid, start time and
@@ -1068,7 +1231,8 @@ watch_tunnel() {
       in_a_row=$((failures - run_first + 1))
       if ((in_a_row >= REJECT_AFTER)); then
         rejected_message "$http" "$in_a_row" >"$STATE_DIR/tunnel.rejected"
-        echo "[local_mcp] error: OpenAI's control plane answers HTTP $http; stopping the tunnel (cause and fix below)" >&2
+        echo "[local_mcp] error: OpenAI's control plane answers HTTP $http${OA_CODE:+ ($OA_CODE)};" \
+          "stopping the tunnel (cause and fix below)" >&2
         signal_once tunnel
         return 0
       fi
@@ -1235,8 +1399,7 @@ start() {
     exit 1
   fi
   if [[ -f $STATE_DIR/tunnel.rejected ]]; then
-    echo "error: $(<"$STATE_DIR/tunnel.rejected"). The tunnel was stopped (exit $status; its log:" \
-      "$tunnel_log); stopping the API" >&2
+    show_rejection "  " "error: " ". The tunnel was stopped (exit $status; its log: $tunnel_log); stopping the API" >&2
     exit 1
   fi
   case $status in
@@ -1328,7 +1491,7 @@ status() {
   else
     echo "tunnel: not running"
     if [[ -f $STATE_DIR/tunnel.rejected ]]; then
-      echo "  the last start stopped it: $(<"$STATE_DIR/tunnel.rejected")"
+      show_rejection "    " "  the last start stopped it: " ""
     fi
     problem=1
   fi
