@@ -1,0 +1,352 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/listings/{listing_id}/lifecycle",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "deals:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/listings/{listing_id}/lifecycle``: one source listing's own lifecycle evidence.",
+        "properties": {
+          "availability": {
+            "enum": [
+              "available",
+              "reserved",
+              "removed",
+              "sold_claimed",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "availability_history_source": {
+            "enum": [
+              "audit_events",
+              "availability_events"
+            ],
+            "type": "string"
+          },
+          "detail_freshness": {
+            "additionalProperties": false,
+            "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+            "properties": {
+              "configured_interval_seconds": {
+                "description": "Context only; never an observed latency guarantee.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "name": {
+                "enum": [
+                  "source_scan_lag",
+                  "detection_delay",
+                  "detail_freshness",
+                  "mail_reply_detection_lag",
+                  "notification_processing_lag",
+                  "mailbox_sync_lag",
+                  "backlog_age"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "reason": {
+                "maxLength": 500,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "measured",
+                  "unknown",
+                  "inconsistent"
+                ],
+                "type": "string"
+              },
+              "value_seconds": {
+                "description": "Only a measured lag has a value; never zero for unknown.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "value_seconds",
+              "reason",
+              "configured_interval_seconds",
+              "note"
+            ],
+            "title": "LagView",
+            "type": "object"
+          },
+          "detection_delay": {
+            "additionalProperties": false,
+            "description": "One observed lag (``domain.lifecycle.LagMeasurement``).",
+            "properties": {
+              "configured_interval_seconds": {
+                "description": "Context only; never an observed latency guarantee.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "name": {
+                "enum": [
+                  "source_scan_lag",
+                  "detection_delay",
+                  "detail_freshness",
+                  "mail_reply_detection_lag",
+                  "notification_processing_lag",
+                  "mailbox_sync_lag",
+                  "backlog_age"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "reason": {
+                "maxLength": 500,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "measured",
+                  "unknown",
+                  "inconsistent"
+                ],
+                "type": "string"
+              },
+              "value_seconds": {
+                "description": "Only a measured lag has a value; never zero for unknown.",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "value_seconds",
+              "reason",
+              "configured_interval_seconds",
+              "note"
+            ],
+            "title": "LagView",
+            "type": "object"
+          },
+          "first_seen_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "last_availability_check_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_complete_source_scan_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_detail_success_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen_on_search_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listing_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "source_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "source_key": {
+            "maxLength": 80,
+            "type": "string"
+          },
+          "source_published_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_published_trusted": {
+            "type": "boolean"
+          },
+          "source_state": {
+            "enum": [
+              "running",
+              "paused",
+              "disabled",
+              "blocked",
+              "parser_unhealthy",
+              "not_scanned"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "listing_id",
+          "source_id",
+          "source_key",
+          "source_state",
+          "first_seen_at",
+          "last_seen_on_search_at",
+          "last_detail_success_at",
+          "last_availability_check_at",
+          "last_complete_source_scan_at",
+          "source_published_at",
+          "source_published_trusted",
+          "availability",
+          "detail_freshness",
+          "detection_delay",
+          "availability_history_source",
+          "notes"
+        ],
+        "title": "ListingLifecycleView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "listings.listing_id.lifecycle.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "One source listing's first/last seen, detail freshness and detection delay."
+}

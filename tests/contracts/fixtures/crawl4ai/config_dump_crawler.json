@@ -1,0 +1,19 @@
+{
+  "label": "shape from 0.9.4 source (dump() keeps non-default params only; cache_mode BYPASS is the default); live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/config/dump"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "type": "CrawlerRunConfig",
+    "params": {
+      "page_timeout": 30000,
+      "check_robots_txt": true
+    }
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-e2e/
+test-results/
+playwright-report/
+blob-report/
+e2e/.generated/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

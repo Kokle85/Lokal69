@@ -1,0 +1,204 @@
+# SUV deal system
+
+A private, auditable deal-discovery system for one owner. It watches permitted European listing
+sources for SUVs that can be bought in Germany, Italy or Switzerland for EUR 2,500 to 3,000
+(inclusive) with strictly less than 200,000 km, compares them with North Macedonian resale
+evidence (research band EUR 8,000 to 10,000), computes landed cost and contribution with explicit
+unknowns, and puts the candidates in a review queue for the owner and the owner's assistant dot (MCP).
+Under the owner's standing authorization it can send ONE automatic initial inquiry per verified
+vehicle/seller pair (availability, documents, lowest/final price) and route the seller's reply back
+through the owner's own classic Outlook. The contract is
+[docs/spec/suv-deal-system-build-spec.md](docs/spec/suv-deal-system-build-spec.md) (version 1.1).
+
+> **Nothing runs by itself.** Every source is disabled except AutoScout24 Italy (`autoscout24_it`,
+> enabled 2026-10-18; it runs only while the owner's scheduler and worker run on the owner's workstation,
+> docs/runbook.md section 9.2), and every external effect is off by default. Apart from the owner's
+> AutoScout24 Italy smokes through the owner's workstation's Crawl4AI (2026-10-17), no live crawl, real
+> mailbox, Outlook on a real PC, Slack, dot or deployed service has been used. What is built and
+> tested, and what is still blocked:
+> [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) and [ACTIVATION_GATES.md](ACTIVATION_GATES.md).
+
+## Architecture in brief
+
+One Python codebase (`src/suv_deals`), one PostgreSQL database (Supabase in production) as the
+single source of truth for records, queues, leases, reviews and the outbox, and separately
+runnable processes:
+
+```text
+config/sources/*.yaml -> scheduler (15-min slots) -> ops.jobs
+  -> worker: adapter via Crawl4AI REST under URL policy, robots and budgets
+  -> listings, revisions, field evidence -> screening -> valuation (comparables, costs, tax)
+  -> review case + outbox event (same transaction)
+  -> dashboard API (/api) and MCP endpoint (/mcp) for review; dispatcher -> MCP Events / Slack
+     only when an activation gate passed
+
+seller inquiry (spec 37): plan -> reserve (caps, cooldown, dedup) -> send intent
+  -> desktop worker on the owner's PC -> classic Outlook .Send -> report
+seller reply: classic Outlook -> desktop worker (local correlation only) -> /v1/mail-workers
+  -> outbox -> private Slack signal -> dot -> MCP seller_replies_get
+```
+
+The browser and MCP clients never touch the database directly (ADR 0001, backend-for-frontend
+with row-level security). Details: [docs/architecture.md](docs/architecture.md).
+
+## Repository map
+
+| Path | What it is |
+|---|---|
+| `src/suv_deals/domain/` | Pure, deterministic rules: parsing, identity, screening, comparables, costs, tax engine, valuation, reviews, seller inquiries, templates, language, replies, lifecycle, evaluation |
+| `src/suv_deals/adapters/`, `crawling/` | Source adapters (generic schema.org dealer adapter; placeholders for unverified sites), Crawl4AI client, URL policy, robots, rate limits, parser health, scheduler, ingest |
+| `src/suv_deals/persistence/` | psycopg 3 repositories, jobs, outbox, idempotency, audit, activation gates, read queries |
+| `src/suv_deals/workers/` | Job runner, handlers, reconciliation, outbox dispatcher, inquiry and reply handlers |
+| `src/suv_deals/api/`, `mcp/`, `views/` | Dashboard API (FastAPI), mail-worker API, MCP server (official SDK), shared read models |
+| `src/suv_deals/integrations/` | ECB FX, MCP Events webhooks, Slack, MIME builder, e-mail providers, secret box, safe HTTP |
+| `src/suv_deals/cli.py`, `cli_commands/` | The `suv-deals` operator CLI (doctor, db, sources, crawl, inquiries, sender binding, mail worker, canary, market, fx, jobs, tax rules, import costs, ...) |
+| `supabase/migrations/` | 17 forward-only SQL migrations (all applied to the hosted project; docs/schema.md section 9) |
+| `config/` | Business configuration, search profiles, source registry, taxonomy, cost profiles, the tax-rule example and the unapproved North Macedonian draft (`config/tax_rules/drafts/`), the standing authorization record |
+| `schemas/` | Exported JSON schemas of the MCP tools and API responses (checked against the code) |
+| `dashboard/` | Private React dashboard (Vite, Supabase Auth, Vitest, Playwright) |
+| `desktop/outlook-bridge/` | Windows desktop mail worker for classic Outlook (Linux-testable with fakes) |
+| `tests/` | Unit, property, adapter, adversarial, contract, API, MCP, CLI, integration (real PostgreSQL) and E2E-harness tests |
+| `scripts/` | Migrate, rollback policy, backup, restore check, release verification, schema export, log redaction; the owner's WSL helpers `local_crawl.sh` (the enabled source) and `local_mcp.sh` (dot through the OpenAI Secure MCP Tunnel, docs/connect_mcp.md section 8) |
+| `docs/` | Specification, architecture, schema, API contract, runbook, activation guides, decisions, research |
+
+## Quickstart (local development)
+
+Requirements: [uv](https://docs.astral.sh/uv/) 0.11 (it provides Python 3.13), PostgreSQL 16
+on `127.0.0.1:5432` and 17 on `127.0.0.1:5433` with the local test superuser `suv`/`suv` (local
+test clusters only), Node 22.22+ and npm 10 for the dashboard. Nothing below needs network
+access to a listing site, a mailbox, Slack or Supabase.
+
+```bash
+uv sync --frozen                     # = make install; locked versions only
+make db-local-start                  # start the local PostgreSQL 16 and 17 clusters (or print how)
+uv run suv-deals doctor --no-db      # presence-only configuration report (never prints values)
+
+# Tests (database tests create and drop their own temporary databases)
+uv run pytest -q                     # everything under tests/, PostgreSQL 16
+TEST_DATABASE_ADMIN_URL=postgresql://suv:suv@127.0.0.1:5433/postgres \
+  TEST_DATABASE_MIGRATOR_ROLE=suv_migrator uv run pytest -q   # PostgreSQL 17, Supabase-like owner
+uv run pytest -q desktop/outlook-bridge/tests                 # desktop worker, fake Outlook
+make lint typecheck schemas-check    # ruff, mypy --strict, JSON schema snapshots
+
+# Offline smoke: CLI, configuration, tax-rule files, the fixture end-to-end pipeline
+make smoke-local
+
+# Fixture mode: a local database with the synthetic fixture sources, network and notifications OFF
+make db-migrate-local                # creates/migrates the LOCAL database suv_dev (loopback only)
+#   one synthetic local owner and workspace (the Supabase emulation provides auth.users):
+U=$(psql postgresql://suv:suv@127.0.0.1:5432/suv_dev -Atc "insert into auth.users (id, email)
+     values (gen_random_uuid(), 'dev-owner@example.invalid') returning id" | head -1)
+MAINTENANCE_DATABASE_URL=postgresql://suv:suv@127.0.0.1:5432/suv_dev \
+  uv run suv-deals --no-env-file bootstrap owner --user-id "$U" --workspace-name "Local dev" --yes
+DATABASE_URL=postgresql://suv:suv@127.0.0.1:5432/suv_dev DATABASE_SET_ROLE=suv_backend \
+  uv run suv-deals --no-env-file config apply --reason "local development" --yes
+make dev                             # syncs the fixture sources; api (127.0.0.1:8000) + worker + scheduler
+
+# Dashboard
+cd dashboard && npm ci && npm test && npm run lint && npm run typecheck
+cp .env.example .env.local && npm run dev   # http://127.0.0.1:5173, /api proxied to :8000
+cd .. && make e2e                    # Playwright vs mock Supabase Auth + real backend (PostgreSQL 16)
+```
+
+`make dev` refuses without a workspace in `suv_dev` ("no active workspace"), hence the bootstrap
+lines above (verified on 2026-10-10). It starts neither the reconciler nor the dispatcher; run
+`uv run suv-deals reconcile --loop` separately when needed. Without `SUPABASE_URL` the API answers
+`/healthz` but refuses every `/api` request, `/readyz` reports `config: not_configured`, and the
+MCP endpoint stays disabled until its settings are present (docs/runbook.md 2.1); the browser E2E
+(`make e2e`) runs the whole stack with a mock Supabase Auth instead. `suv-deals doctor` exits 1
+while required settings are missing and lists them. The exact commands and counts of the last full
+verification: [docs/qa_evidence.md](docs/qa_evidence.md).
+
+The desktop worker itself runs only on Windows with classic Outlook; its installation is part of
+the owner's activation ([desktop/outlook-bridge/README.md](desktop/outlook-bridge/README.md)).
+
+## Safety defaults
+
+| Switch | Default | While it is off |
+|---|---|---|
+| `SOURCE_NETWORK_ENABLED` | `false` | no real source is fetched; only `mode: fixture` sources run against saved files |
+| `ALLOW_EXTERNAL_NOTIFICATIONS` | `false` | nothing leaves the system; outbox events are recorded as blocked |
+| `EVENT_BRIDGE_ENABLED`, `MCP_EVENTS_ENABLED`, `NOTIFICATION_PROVIDER` | `false`, `false`, `disabled` | no activation route for dot |
+| `SELLER_INQUIRY_MODE` | `disabled_until_sender_ready` | no seller e-mail; even `automatic` also needs the workspace mode, kill switch off, the standing authorization, a verified sender and a complete activation canary |
+| `SELLER_EMAIL_CANARY_SEND_ENABLED` | `false` | the owner's one-time canary cannot be sent |
+| `FX_FETCH_ENABLED`, `LLM_EXTRACTION_ENABLED` | `false` | no ECB fetch; no LLM call |
+
+Every source in `config/sources/` is `enabled: false` except `autoscout24_it` (enabled 2026-10-18,
+activation step 7; it fetches only while the owner's scheduler and worker run with
+`SOURCE_NETWORK_ENABLED=true`, docs/runbook.md section 9.2). Fixture data never notifies. Secrets
+come only from the environment or a secret store, never from the repository; the owner's real mailbox
+address never appears in it (tests use `example.invalid`). Every state-changing administrative CLI
+command (configuration, sources, credentials, sender binding, inquiry controls, canary, market and
+FX records, jobs, migrations) needs `--yes`; the process commands (`api serve`, `worker`,
+`scheduler`, `reconcile`, `dispatcher`) and the gated, budget-bounded `crawl once` run without it.
+Compose deployments enable a switch only through a dedicated `SUV_DEALS_*` variable
+exported for that deployment (docs/runbook.md section 1). Security model: [SECURITY.md](SECURITY.md).
+
+## Customs calculator
+
+Customs duty, motor-vehicle tax (ДМВ) and import VAT for importing one used passenger car into North
+Macedonia, from a listing's facts, from facts you state, or both, with the landed cost (the REAL
+purchase price + the fixed EUR 700 transport + charges). One read-only service backs three
+surfaces; the calculator itself stores nothing:
+
+| Who | Where |
+|---|---|
+| Dashboard (scope `deals:read`) | "Customs calculator" (`/import-costs`, or from a candidate's detail page) over `GET /api/import-costs/estimate` |
+| dot (MCP) | tool `deals_estimate_import_costs`, scope `deals:read` ([docs/connect_mcp.md](docs/connect_mcp.md) section 7) |
+| Operator (CLI) | `uv run suv-deals import-costs estimate --listing-id <id>` or vehicle facts, e.g. `--price 2800 --estimated-customs-value-eur 4200 --estimated-customs-value-source "SchwackeNet catalogue" --fuel diesel --co2 nedc:189 --co2-document coc --origin-proof none` (`--json` for the shared view) |
+
+> **No tax rule set is approved yet.** The rates live only in the rule-set JSON. The North
+> Macedonian rules ship as an unapproved DRAFT
+> (`config/tax_rules/drafts/mk_passenger_car_import_2026.10-draft.3.json`), so every result is an
+> **INDICATIVE PREVIEW** (ИНДИКАТИВНА ПРОЦЕНКА): `production_ready: false`, totals named
+> `indicative_total`, never used for valuations or alerts. Valuations keep import charges
+> `unknown` until the owner approves and activates a rule set (dashboard, Settings, "Tax rules
+> and cost profile"; [docs/tax_rule_approval.md](docs/tax_rule_approval.md)). Missing facts (the
+> CO2 document, the month's customs EUR/MKD rate) make the affected charges unknown, never zero;
+> without a stated proof of origin the standard duty applies. Origin, tariff code and the VAT base
+> are never inferred, and WLTP/NEDC figures are never converted. Per the owner's decisions of
+> 2026-10-13 the VAT base includes the motor-vehicle tax (ДМВ: VAT = (customs value + duty + ДМВ +
+> other applicable costs) x 18%, ЗДДВ чл. 21), every MKD amount is rounded to whole denars and every
+> computed amount is shown without decimals (EUR in whole euros, half-up). Evidence pack:
+> [docs/tax/mk_import_fact_sheet_2026-10.md](docs/tax/mk_import_fact_sheet_2026-10.md); decisions:
+> [docs/decisions/0003-transport-and-customs-calculator.md](docs/decisions/0003-transport-and-customs-calculator.md).
+
+Two values per vehicle (owner decision of 2026-10-13): the REAL purchase price (реална набавна цена:
+profit, landed cost) and the ESTIMATED customs value (проценета царинска вредност: import charges,
+e.g. a SchwackeNet value, without transport). Customs uses the SchwackeNet catalogue for used cars,
+but Царински закон чл. 28 keeps the price actually paid as the primary method, so the result shows
+the `primary` scenario (charges on the estimate + transport to the MK border, or on the price paid
+when there is no estimate) next to the `transaction_value` scenario (charges on the price paid).
+Example: bought for EUR 2,800, catalogue EUR 4,200: `primary` 185,803 MKD on EUR 4,900, landed
+cost EUR 6,520; `transaction_value` 165,213 MKD on EUR 3,500, landed cost EUR 6,185. The owner
+records both values per listing: the candidate's "Import values" panel on the dashboard
+(`POST /api/listings/{listing_id}/import-values`, owner only; read with `GET` on the same path) or
+`suv-deals import-costs record-values ... --yes` (read: `import-costs values`); no MCP tool
+records them. The calculator's listing mode (dot's included) and the valuations then use them
+(labelled `recorded`), and recording one marks the listing's valuations stale and recomputes them. This
+needs migration `20261013000100_import_values` (docs/schema.md 11.16), applied to the hosted
+Supabase project on 2026-10-14.
+
+## Documentation
+
+| Topic | Document |
+|---|---|
+| What is done, verified, blocked; spec 34 final status | [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) |
+| Every activation gate: prerequisites, owner/operator steps, verification, evidence | [ACTIVATION_GATES.md](ACTIVATION_GATES.md) |
+| Spec 31 test matrix and the 37.10 delta tests | [docs/acceptance_matrix.md](docs/acceptance_matrix.md) |
+| QA commands and the latest measured counts | [docs/qa_evidence.md](docs/qa_evidence.md) |
+| Security, secrets, residual risks | [SECURITY.md](SECURITY.md) |
+| History of the build waves | [CHANGELOG.md](CHANGELOG.md) |
+| Architecture and module contracts | [docs/architecture.md](docs/architecture.md), [docs/decisions/](docs/decisions/0001-bff-only-data-access.md) |
+| Database schema, RLS, applied Supabase state | [docs/schema.md](docs/schema.md) |
+| Dashboard, mail-worker and MCP API contracts | [docs/api_contract.md](docs/api_contract.md) |
+| Operations: processes, setup, CLI, incidents, backup, release, activation | [docs/runbook.md](docs/runbook.md) |
+| Connecting dot over MCP | [docs/connect_mcp.md](docs/connect_mcp.md) |
+| MCP Events and the Slack routes | [docs/notification_bridge.md](docs/notification_bridge.md) |
+| Seller e-mail activation and templates | [docs/seller_email_activation.md](docs/seller_email_activation.md), [docs/seller_email_templates.md](docs/seller_email_templates.md) |
+| Source terms, robots and activation checklist | [docs/source_access_register.md](docs/source_access_register.md) |
+| Switzerland as an acquisition market | [docs/markets/switzerland.md](docs/markets/switzerland.md) |
+| Tax rule approval; the North Macedonian fact sheet; transport and calculator decisions | [docs/tax_rule_approval.md](docs/tax_rule_approval.md), [docs/tax/mk_import_fact_sheet_2026-10.md](docs/tax/mk_import_fact_sheet_2026-10.md), [ADR 0003](docs/decisions/0003-transport-and-customs-calculator.md) |
+| Tested dependency versions | [docs/dependency_inventory.md](docs/dependency_inventory.md) |
+| Dashboard | [dashboard/README.md](dashboard/README.md) |
+| Desktop mail worker | [desktop/outlook-bridge/README.md](desktop/outlook-bridge/README.md) |

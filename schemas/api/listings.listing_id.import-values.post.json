@@ -1,0 +1,679 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "IDEMPOTENCY_CONFLICT",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "optional",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/api/listings/{listing_id}/import-values",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /api/listings/{listing_id}/import-values`` (owner only): record the listing's\nreal purchase price and/or estimated customs value (at least one). Each supersedes the current\nrecorded value of its kind; the listing's valuations are recomputed with them.",
+    "properties": {
+      "estimated_customs_value": {
+        "additionalProperties": false,
+        "default": null,
+        "description": "The ESTIMATED customs value (проценета царинска вредност) of the vehicle to record: in EUR,\nWITHOUT transport, e.g. the SchwackeNet catalogue value. The import charges are computed on it.",
+        "properties": {
+          "amount_eur": {
+            "description": "Amount in EUR, more than zero, without transport, e.g. \"4200\".",
+            "maxLength": 16,
+            "minLength": 1,
+            "pattern": "^(0|[1-9][0-9]{0,12})(\\.[0-9]{1,2})?$",
+            "type": "string"
+          },
+          "document_ref": {
+            "default": null,
+            "description": "Reference of the document.",
+            "maxLength": 200,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "Where the estimate comes from, e.g. \"SchwackeNet catalogue\".",
+            "maxLength": 120,
+            "minLength": 3,
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount_eur",
+          "source"
+        ],
+        "title": "RecordCustomsValueInput",
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "idempotency_key": {
+        "description": "Client-chosen key scoped to the caller and operation; a retry with the same key and request returns the original result.",
+        "maxLength": 128,
+        "minLength": 8,
+        "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+        "type": "string"
+      },
+      "purchase_price": {
+        "additionalProperties": false,
+        "default": null,
+        "description": "The REAL purchase price (реална набавна цена) to record: what is, or will be, actually paid,\nin EUR. The profit and the landed cost use it; it never replaces the customs value.",
+        "properties": {
+          "amount": {
+            "description": "Amount in EUR, more than zero, e.g. \"2800.00\".",
+            "maxLength": 16,
+            "minLength": 1,
+            "pattern": "^(0|[1-9][0-9]{0,12})(\\.[0-9]{1,2})?$",
+            "type": "string"
+          },
+          "currency": {
+            "const": "EUR",
+            "description": "EUR only (convert at the rate actually paid).",
+            "type": "string"
+          },
+          "document_ref": {
+            "default": null,
+            "description": "Reference of the document.",
+            "maxLength": 200,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "actual: paid (invoice/contract); quote: offered or agreed, not yet paid; estimate.",
+            "enum": [
+              "actual",
+              "quote",
+              "estimate"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "description": "Where the price comes from, e.g. \"seller invoice\".",
+            "maxLength": 120,
+            "minLength": 3,
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount",
+          "currency",
+          "kind",
+          "source"
+        ],
+        "title": "RecordPurchasePriceInput",
+        "type": [
+          "object",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "idempotency_key"
+    ],
+    "title": "ImportValuesRecordRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``POST /api/listings/{listing_id}/import-values`` data: the listing's values after the\nrecording, the new and superseded row ids, the valuations marked stale and the queued\nrecomputation.",
+        "properties": {
+          "production_effect": {
+            "default": "Recorded: the listing's valuations are marked stale and recomputed with the recorded values; the calculator's listing mode uses them unless a request overrides them.",
+            "maxLength": 500,
+            "type": "string"
+          },
+          "recompute_job_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "recorded_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
+          },
+          "stale_valuation_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          },
+          "superseded_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
+          },
+          "values": {
+            "additionalProperties": false,
+            "description": "``GET /api/listings/{listing_id}/import-values`` data.",
+            "properties": {
+              "estimated_customs_value": {
+                "additionalProperties": false,
+                "description": "One recorded value: a real purchase price (``purchase``) or an estimated customs value\n(``customs_value``, always an ``estimate``, in EUR without transport).",
+                "properties": {
+                  "amount": {
+                    "additionalProperties": false,
+                    "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                    "properties": {
+                      "amount": {
+                        "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "currency": {
+                        "pattern": "^[A-Z]{3}$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "reason": {
+                        "default": null,
+                        "maxLength": 500,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "status": {
+                        "enum": [
+                          "known",
+                          "unknown",
+                          "not_applicable"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "status",
+                      "amount",
+                      "currency",
+                      "reason"
+                    ],
+                    "title": "AmountView",
+                    "type": "object"
+                  },
+                  "amount_exact": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": "string"
+                  },
+                  "category": {
+                    "enum": [
+                      "purchase",
+                      "customs_value"
+                    ],
+                    "type": "string"
+                  },
+                  "current": {
+                    "type": "boolean"
+                  },
+                  "document_ref": {
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "is_fixture": {
+                    "type": "boolean"
+                  },
+                  "kind": {
+                    "enum": [
+                      "actual",
+                      "quote",
+                      "estimate"
+                    ],
+                    "type": "string"
+                  },
+                  "recorded_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "recorded_by_principal": {
+                    "format": "uuid",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "source": {
+                    "maxLength": 120,
+                    "type": "string"
+                  },
+                  "supersedes_id": {
+                    "format": "uuid",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "category",
+                  "kind",
+                  "amount",
+                  "amount_exact",
+                  "source",
+                  "document_ref",
+                  "supersedes_id",
+                  "current",
+                  "recorded_by_principal",
+                  "recorded_at",
+                  "is_fixture"
+                ],
+                "title": "ImportValueRecordView",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "history": {
+                "items": {
+                  "additionalProperties": false,
+                  "description": "One recorded value: a real purchase price (``purchase``) or an estimated customs value\n(``customs_value``, always an ``estimate``, in EUR without transport).",
+                  "properties": {
+                    "amount": {
+                      "additionalProperties": false,
+                      "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                      "properties": {
+                        "amount": {
+                          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "currency": {
+                          "pattern": "^[A-Z]{3}$",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "reason": {
+                          "default": null,
+                          "maxLength": 500,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "enum": [
+                            "known",
+                            "unknown",
+                            "not_applicable"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "amount",
+                        "currency",
+                        "reason"
+                      ],
+                      "title": "AmountView",
+                      "type": "object"
+                    },
+                    "amount_exact": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": "string"
+                    },
+                    "category": {
+                      "enum": [
+                        "purchase",
+                        "customs_value"
+                      ],
+                      "type": "string"
+                    },
+                    "current": {
+                      "type": "boolean"
+                    },
+                    "document_ref": {
+                      "maxLength": 500,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "is_fixture": {
+                      "type": "boolean"
+                    },
+                    "kind": {
+                      "enum": [
+                        "actual",
+                        "quote",
+                        "estimate"
+                      ],
+                      "type": "string"
+                    },
+                    "recorded_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "recorded_by_principal": {
+                      "format": "uuid",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "source": {
+                      "maxLength": 120,
+                      "type": "string"
+                    },
+                    "supersedes_id": {
+                      "format": "uuid",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "category",
+                    "kind",
+                    "amount",
+                    "amount_exact",
+                    "source",
+                    "document_ref",
+                    "supersedes_id",
+                    "current",
+                    "recorded_by_principal",
+                    "recorded_at",
+                    "is_fixture"
+                  ],
+                  "title": "ImportValueRecordView",
+                  "type": "object"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              "listing_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "note": {
+                "default": "Two separate values per vehicle (owner decision 2026-10-13): the real purchase price is used for the profit and the landed cost; the estimated customs value (without transport) for the import charges. Customs first applies the price actually paid (Customs Law art. 28); the calculator shows that alternative too.",
+                "type": "string"
+              },
+              "purchase_price": {
+                "additionalProperties": false,
+                "description": "One recorded value: a real purchase price (``purchase``) or an estimated customs value\n(``customs_value``, always an ``estimate``, in EUR without transport).",
+                "properties": {
+                  "amount": {
+                    "additionalProperties": false,
+                    "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                    "properties": {
+                      "amount": {
+                        "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "currency": {
+                        "pattern": "^[A-Z]{3}$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "reason": {
+                        "default": null,
+                        "maxLength": 500,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "status": {
+                        "enum": [
+                          "known",
+                          "unknown",
+                          "not_applicable"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "status",
+                      "amount",
+                      "currency",
+                      "reason"
+                    ],
+                    "title": "AmountView",
+                    "type": "object"
+                  },
+                  "amount_exact": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": "string"
+                  },
+                  "category": {
+                    "enum": [
+                      "purchase",
+                      "customs_value"
+                    ],
+                    "type": "string"
+                  },
+                  "current": {
+                    "type": "boolean"
+                  },
+                  "document_ref": {
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "is_fixture": {
+                    "type": "boolean"
+                  },
+                  "kind": {
+                    "enum": [
+                      "actual",
+                      "quote",
+                      "estimate"
+                    ],
+                    "type": "string"
+                  },
+                  "recorded_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "recorded_by_principal": {
+                    "format": "uuid",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "source": {
+                    "maxLength": 120,
+                    "type": "string"
+                  },
+                  "supersedes_id": {
+                    "format": "uuid",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "category",
+                  "kind",
+                  "amount",
+                  "amount_exact",
+                  "source",
+                  "document_ref",
+                  "supersedes_id",
+                  "current",
+                  "recorded_by_principal",
+                  "recorded_at",
+                  "is_fixture"
+                ],
+                "title": "ImportValueRecordView",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "listing_id",
+              "purchase_price",
+              "estimated_customs_value",
+              "history",
+              "note"
+            ],
+            "title": "ImportValuesView",
+            "type": "object"
+          }
+        },
+        "required": [
+          "values",
+          "recorded_ids",
+          "superseded_ids",
+          "stale_valuation_ids",
+          "recompute_job_id",
+          "production_effect"
+        ],
+        "title": "ImportValuesRecordResult",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "listings.listing_id.import-values.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only: record the real purchase price (profit, landed cost) and/or the estimated customs value (import charges); supersedes the current value and recomputes the listing's valuations."
+}

@@ -1,0 +1,30 @@
+{
+  "format": "suv_deals.market_import/1",
+  "evidence_kind": "asking_price",
+  "observations": [
+    {"url": "https://mk-classifieds.example/ad/syn-1001", "observed_at": "2026-10-06T09:30:00+02:00",
+     "price": "8600", "currency": "EUR", "provenance": "SYNTHETIC test observation 1",
+     "source_key": "synthetic_mk_market", "seller_type": "private", "local_registration_status": "locally_registered",
+     "vehicle": {"make": "Example", "model": "Trail", "first_registration": "2011", "fuel": "diesel",
+                 "gearbox": "manual", "drive": "awd", "mileage_km": "170000",
+                 "engine_displacement_cm3": 1995, "power_kw": 103}},
+    {"url": "https://mk-classifieds.example/ad/syn-1002", "observed_at": "2026-10-06T10:00:00+02:00",
+     "price": "8900", "currency": "EUR", "provenance": "SYNTHETIC test observation 2",
+     "source_key": "synthetic_mk_market", "seller_type": "dealer", "local_registration_status": "locally_registered",
+     "vehicle": {"make": "Example", "model": "Trail", "first_registration": "2011", "fuel": "diesel",
+                 "gearbox": "manual", "drive": "awd", "mileage_km": "180000",
+                 "engine_displacement_cm3": 1995, "power_kw": 103}},
+    {"url": "https://mk-classifieds.example/ad/syn-1003", "observed_at": "2026-10-07T11:15:00Z",
+     "price": "9100", "currency": "EUR", "provenance": "SYNTHETIC test observation 3",
+     "source_key": "synthetic_mk_market", "local_registration_status": "locally_registered",
+     "vehicle": {"make": "Example", "model": "Trail", "first_registration": "2011", "fuel": "diesel",
+                 "gearbox": "manual", "drive": "awd", "mileage_km": "190000",
+                 "engine_displacement_cm3": 1995, "power_kw": 103}},
+    {"url": "https://mk-classifieds.example/ad/syn-1004", "observed_at": "2026-10-07T12:45:00Z",
+     "price": "9400", "currency": "EUR", "provenance": "SYNTHETIC test observation 4",
+     "source_key": "synthetic_mk_market", "local_registration_status": "locally_registered",
+     "vehicle": {"make": "Example", "model": "Trail", "first_registration": "2011", "fuel": "diesel",
+                 "gearbox": "manual", "drive": "awd", "mileage_km": "200000",
+                 "engine_displacement_cm3": 1995, "power_kw": 103}}
+  ]
+}

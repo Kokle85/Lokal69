@@ -1,0 +1,41 @@
+<!-- SYNTHETIC FIXTURE: not a real vehicle or offer -->
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>SUV usati - Concessionario Esempio (sintetico)</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {"@type": "WebPage", "name": "SUV usati (sintetico)"},
+    {
+      "@type": "ItemList",
+      "numberOfItems": 2,
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1,
+         "item": {"@type": "Car", "name": "Example Trail 2.0 Diesel km 199.999",
+                  "url": "https://concessionario.example/usato/auto/example-trail-it301",
+                  "mileageFromOdometer": {"@type": "QuantitativeValue", "value": "199.999", "unitCode": "KMT"},
+                  "offers": {"@type": "Offer", "price": "2.900", "priceCurrency": "EUR"}}},
+        {"@type": "ListItem", "position": 2,
+         "item": {"@type": "Car", "name": "Example Ridge 2.4 Benzina",
+                  "url": "https://concessionario.example/usato/auto/example-ridge-it302?utm_source=portale",
+                  "mileageFromOdometer": {"@type": "QuantitativeValue", "value": 200000, "unitCode": "KMT"},
+                  "offers": {"@type": "Offer", "price": 2500, "priceCurrency": "EUR"}}}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<main>
+<h1>SUV usati</h1>
+<div class="risultati">
+  <article><a href="/usato/auto/example-trail-it301">Example Trail 2.0 Diesel</a> <span>&euro; 2.900</span> <span>km 199.999</span></article>
+  <article><a href="/usato/auto/example-ridge-it302">Example Ridge 2.4 Benzina</a> <span>&euro; 2.500</span> <span>200.000 km</span></article>
+</div>
+</main>
+</body>
+</html>

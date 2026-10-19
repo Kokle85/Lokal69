@@ -1,0 +1,48 @@
+# Subito (IT). Candidate acquisition source - DISABLED, nothing verified.
+# Exact domain(s), terms, robots directives and public routes must be verified first.
+source_key: subito_it
+display_name: "Subito public listings (IT)"
+country: IT
+role: acquisition
+mode: public_html
+adapter: subito_it_public
+adapter_version: unimplemented
+enabled: false
+technical_status: untested
+terms_status: restricted
+terms_url: https://info.subito.it/policies/condizioni-generali.htm
+terms_reviewed_at: 2026-10-14T00:00:00Z
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-14)"
+terms_decision_note: >-
+  Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
+  terms risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on
+  every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any
+  access block. The general terms (updated 2026-09-22, art. 3: they bind users who only consult
+  listings) expressly prohibit robots, spiders, scrapers and other automated tools to access the
+  site or extract its data (art. 5) and any use of Service content by unauthorised aggregators or
+  third parties (art. 10); robots.txt repeats that automatic access needs Subito's permission.
+technical_denial_policy: stop_and_report
+robots_policy: obey
+robots_checked_at: 2026-10-14T00:00:00Z
+robots_summary: >-
+  robots.txt of www.subito.it checked 2026-10-14 (fact, not permission; sha256 bf3e48cb...,
+  Last-Modified 2022-06-17): the 'User-agent: *' group allows / and disallows /vi/, /vim/, /li?,
+  /lim?, /utente/, /annunciutente/, /ai/load/, /pr/, /vf/, /hades/, checkout paths and the
+  pagination forms '*/?o=*' and '*&o=*' (so only the first result page of a search is not
+  disallowed). Its header comment says search robots and other automatic methods are forbidden
+  unless Subito.it gives permission. No Crawl-delay, no AI-crawler groups.
+allowed_hosts:
+  - 'www.subito.it'
+allowed_search_paths: []
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Operator (imprint https://info.subito.it/about.htm, checked 2026-10-14): Subito.it S.r.l. con
+  socio unico, Via Angelo Scarsellini 14, 20161 Milano, IT (P.IVA 05526340962; Adevinta group).
+  subito.it redirects to www.subito.it. The home page answered HTTP 403 (Akamai 'Access Denied') to
+  our user agent, so the site currently refuses this crawler technically. Observed from the build
+  environment (a cloud data-centre network) with our user agent; the owner's network may be answered
+  differently, and any block there stops the source the same way. Search and detail routes are not
+  verified (no listing page was fetched); paths stay empty until they are verified from permitted
+  page captures. Store no seller contact data (art. 4 forbids misuse of contact details).

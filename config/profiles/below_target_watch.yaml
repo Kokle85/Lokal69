@@ -1,0 +1,13 @@
+# Below-target watch: vehicles cheaper than EUR 2,500 are not automatically unsuitable.
+# Separately labelled and DISABLED until the owner chooses it.
+key: below_target_watch
+label: "Below-target watch: under EUR 2,500 (disabled until chosen)"
+queue_label: "Below-target watch queue"
+enabled: false
+min_price_eur: null
+max_price_eur: "2500.00"
+max_price_inclusive: false   # strictly below EUR 2,500.00
+max_mileage_km_exclusive: "200000"
+source_countries: [DE, IT, CH]
+body_types: [suv, offroad, crossover]
+require_taxonomy_match: true

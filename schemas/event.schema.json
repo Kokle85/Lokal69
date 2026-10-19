@@ -1,0 +1,112 @@
+{
+  "$id": "urn:suv-deals:schema:1.0:event.review.pending",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "``schemas/event.schema.json``: internal ``review.pending`` outbox payload (spec 22).\n\nBuilt by ``domain.notifications.build_review_pending_event``. Not the MCP wire envelope: the\nnative provider maps it to ``ReviewPendingOccurrence``. ``fixture`` is present (and true)\nonly on synthetic fixture events, which are never routed externally.",
+  "properties": {
+    "case_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "case_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "dashboard_url": {
+      "maxLength": 2048,
+      "minLength": 8,
+      "type": "string"
+    },
+    "deduplication_key": {
+      "maxLength": 300,
+      "minLength": 1,
+      "type": "string"
+    },
+    "event_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "fixture": {
+      "default": null,
+      "enum": [
+        true,
+        null
+      ],
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "listing_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "listing_revision": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "low",
+        "normal",
+        "high"
+      ],
+      "type": "string"
+    },
+    "profile": {
+      "enum": [
+        "primary",
+        "manual_4000",
+        "below_target_watch"
+      ],
+      "type": "string"
+    },
+    "queue": {
+      "default": null,
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "readiness": {
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    },
+    "summary": {
+      "maxLength": 400,
+      "minLength": 1,
+      "type": "string"
+    },
+    "type": {
+      "const": "review.pending",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "event_id",
+    "type",
+    "occurred_at",
+    "case_id",
+    "case_version",
+    "listing_id",
+    "listing_revision",
+    "priority",
+    "dashboard_url",
+    "summary",
+    "deduplication_key",
+    "readiness",
+    "profile"
+  ],
+  "title": "ReviewPendingEvent",
+  "type": "object"
+}

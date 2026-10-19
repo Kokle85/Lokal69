@@ -1,0 +1,16 @@
+{
+  "label": "shape from 0.9.4 source; live values unverified",
+  "source": "docs/research/crawl4ai_rest_contract.md",
+  "request": {
+    "method": "POST",
+    "path": "/crawl"
+  },
+  "status": 504,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "detail": "Crawl exceeded the time limit"
+  },
+  "note": "section 8: limits.wall_clock_s (300 s)"
+}

@@ -1,0 +1,458 @@
+"""Search-page ingestion: ingestion-key dedup, seen windows, aliases, collisions, detail jobs (spec 9, 10)."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import pytest
+from tests.integration.db.helpers import Seed, sha, unique
+from tests.integration.repos_sources_listings.support import (
+    HOST,
+    Env,
+    card,
+    claim_detail,
+    discover,
+    ingest,
+    later,
+    page,
+    run_detail,
+    source_config,
+    start_run,
+    vehicle,
+)
+
+from suv_deals.domain.enums import CoverageMode, JobType
+from suv_deals.errors import ValidationFailed
+from suv_deals.persistence import database, jobs, listings_repo, sources_repo
+from suv_deals.persistence.database import Database
+from suv_deals.persistence.sources_repo import CrawlRunRecord, RunOutcome
+from suv_deals.persistence.transactions import unit_of_work
+
+pytestmark = pytest.mark.db
+
+
+def _listing_row(seed: Seed, listing_id: Any) -> dict[str, Any]:
+    cur = seed.conn.execute(
+        "select first_seen_at, last_seen_at, canonical_url, detail_generation, quarantined,"
+        " quarantine_reason,"
+        " availability, row_version from app.listings where id = %s",
+        (listing_id,),
+    )
+    names = [d.name for d in cur.description or ()]
+    row = cur.fetchone()
+    assert row is not None
+    return dict(zip(names, row, strict=True))
+
+
+async def test_duplicate_observation_is_a_no_op(db: Database, env: Env, seed: Seed) -> None:
+    slid = unique("SYN")
+    run = await start_run(db, env)
+    discovery = page(env.source_key, [card(slid)])
+    first = await ingest(db, env, run, discovery)
+    assert (first.stored, first.new_listings, len(first.detail_jobs)) == (1, 1, 1)
+    listing_id = first.detail_jobs[0].listing_id
+    before = _listing_row(seed, listing_id)
+    again = await ingest(db, env, run, discovery)
+    assert (again.stored, again.duplicates, again.new_listings, len(again.detail_jobs)) == (0, 1, 0, 0)
+    assert (
+        seed.scalar("select count(*) from app.listing_observations where listing_id = %s", (listing_id,)) == 1
+    )
+    assert seed.scalar("select count(*) from ops.jobs where listing_id = %s", (listing_id,)) == 1
+    assert _listing_row(seed, listing_id) == before
+    counters = seed.conn.execute(
+        "select pages_fetched, cards_seen, new_listings, detail_jobs_enqueued, page_depth from ops.crawl_runs"
+        " where id = %s",
+        (run.id,),
+    ).fetchone()
+    assert counters == (1, 1, 1, 1, 1)
+
+
+async def test_first_and_last_seen_semantics(db: Database, env: Env, seed: Seed) -> None:
+    slid = unique("SYN")
+    middle = await ingest(
+        db, env, await start_run(db, env), page(env.source_key, [card(slid)], fetched_at=later(60))
+    )
+    listing_id = middle.detail_jobs[0].listing_id
+    # A page fetched earlier but ingested later: first_seen moves back, last_seen never decreases.
+    await ingest(db, env, await start_run(db, env), page(env.source_key, [card(slid)], fetched_at=later(0)))
+    row = _listing_row(seed, listing_id)
+    assert (row["first_seen_at"], row["last_seen_at"]) == (later(0), later(60))
+    await ingest(db, env, await start_run(db, env), page(env.source_key, [card(slid)], fetched_at=later(120)))
+    row = _listing_row(seed, listing_id)
+    assert (row["first_seen_at"], row["last_seen_at"]) == (later(0), later(120))
+
+
+async def test_card_change_enqueues_detail_bound_to_generation(db: Database, env: Env, seed: Seed) -> None:
+    slid = unique("SYN")
+    listing_id, _ = await discover(db, env, slid)
+    seed.conn.execute(
+        "update ops.jobs set state = 'succeeded', completed_at = now() where listing_id = %s", (listing_id,)
+    )
+    unchanged = await ingest(
+        db, env, await start_run(db, env), page(env.source_key, [card(slid)], fetched_at=later(5))
+    )
+    assert (unchanged.unchanged_listings, len(unchanged.detail_jobs)) == (1, 0)
+    changed = await ingest(
+        db,
+        env,
+        await start_run(db, env),
+        page(env.source_key, [card(slid, price_minor=265000)], fetched_at=later(10)),
+    )
+    assert changed.changed_listings == 1 and len(changed.detail_jobs) == 1
+    ref = changed.detail_jobs[0]
+    assert ref.generation == 2
+    key = seed.scalar("select dedup_key from ops.jobs where id = %s", (ref.job_id,))
+    assert key == f"detail:{listing_id}:i1:g2"  # identity + incarnation + generation, never a semantic hash
+    # A further change while that job still waits is deduplicated (no new generation).
+    again = await ingest(
+        db,
+        env,
+        await start_run(db, env),
+        page(env.source_key, [card(slid, price_minor=255000)], fetched_at=later(15)),
+    )
+    assert again.changed_listings == 1 and again.detail_jobs == () and again.detail_jobs_deduplicated == 1
+    assert _listing_row(seed, listing_id)["detail_generation"] == 2
+
+
+async def test_alias_recorded_for_changed_url(db: Database, env: Env, seed: Seed) -> None:
+    slid = unique("SYN")
+    listing_id, _ = await discover(db, env, slid)
+    original = _listing_row(seed, listing_id)["canonical_url"]
+    moved = f"https://{HOST}/vehicles/moved/{slid}"
+    report = await ingest(
+        db, env, await start_run(db, env), page(env.source_key, [card(slid, url=moved)], fetched_at=later(5))
+    )
+    assert report.aliases_recorded == 1 and report.new_listings == 0
+    alias = seed.conn.execute(
+        "select alias_url, alias_hash, reason, evidence from app.listing_aliases where listing_id = %s",
+        (listing_id,),
+    ).fetchone()
+    assert alias is not None
+    assert alias[0] == moved and alias[1] == sha(moved) and alias[2] == "canonical_url_changed"
+    assert alias[3]["previous_url_hash"] == sha(original)
+    assert _listing_row(seed, listing_id)["canonical_url"] == original
+    replay = await ingest(
+        db, env, await start_run(db, env), page(env.source_key, [card(slid, url=moved)], fetched_at=later(9))
+    )
+    assert replay.aliases_recorded == 0
+    assert seed.scalar("select count(*) from app.listing_aliases where listing_id = %s", (listing_id,)) == 1
+
+
+async def test_identity_hash_collision_is_quarantined_not_merged(db: Database, env: Env, seed: Seed) -> None:
+    slid = unique("SYN")
+    tampered = seed.listing(
+        env.workspace_id,
+        env.source_id,
+        source_listing_id=slid,
+        identity_material="tampered material",
+        identity_hash=sha(f"{env.source_key}:{slid}"),
+    )
+    report = await ingest(db, env, await start_run(db, env), page(env.source_key, [card(slid)]))
+    assert report.identity_collisions == (slid,) and report.stored == 0 and report.detail_jobs == ()
+    row = _listing_row(seed, tampered)
+    assert row["quarantined"] and row["quarantine_reason"] == "identity_hash_collision"
+    assert seed.scalar("select count(*) from app.listings where source_listing_id = %s", (slid,)) == 1
+    assert (
+        seed.scalar(
+            "select count(*) from ops.audit_events"
+            " where target_id = %s and action = 'listing.identity_hash_collision'",
+            (tampered,),
+        )
+        == 1
+    )
+
+
+async def test_card_only_source_gets_no_detail_jobs(db: Database, env: Env, seed: Seed) -> None:
+    key = unique("cardonly").lower()
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.sync_sources_from_yaml(
+            conn,
+            env.system,
+            [
+                source_config(env.source_key),
+                source_config(key, detail_mode="card_only", allowed_detail_paths=()),
+            ],
+        )
+        source = await sources_repo.get_source_by_key(conn, env.system, key)
+        run = await sources_repo.start_crawl_run(
+            conn,
+            env.system,
+            source_id=source.id,
+            profile_id=env.profiles["primary"],
+            coverage_mode=CoverageMode.ROLLING_PAGES,
+            adapter_version="fixture@1.0.0",
+        )
+    report = await ingest(db, env, run, page(key, [card(unique("SYN"))]))
+    assert report.new_listings == 1 and report.detail_jobs == ()
+
+
+async def test_card_only_card_facts_ride_in_a_no_fetch_detail_job(db: Database, env: Env, seed: Seed) -> None:
+    """card_only sources: the card's own facts become the job payload, newer facts replace waiting ones."""
+    key = unique("cardfacts").lower()
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.sync_sources_from_yaml(
+            conn,
+            env.system,
+            [
+                source_config(env.source_key),
+                source_config(key, detail_mode="card_only", allowed_detail_paths=()),
+            ],
+        )
+        source = await sources_repo.get_source_by_key(conn, env.system, key)
+
+    async def start() -> Any:
+        async with unit_of_work(db, env.system) as conn:
+            return await sources_repo.start_crawl_run(
+                conn,
+                env.system,
+                source_id=source.id,
+                profile_id=env.profiles["primary"],
+                coverage_mode=CoverageMode.ROLLING_PAGES,
+                adapter_version="fixture@1.0.0",
+            )
+
+    slid = unique("SYN")
+    facts = vehicle(slid).model_copy(update={"source_key": key})
+    first = card(slid).model_copy(update={"card_listing": facts})
+    report = await ingest(db, env, await start(), page(key, [first]))
+    assert report.new_listings == 1 and len(report.detail_jobs) == 1
+    job_id = report.detail_jobs[0].job_id
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (job_id,))
+    assert payload["card_listing"]["source_listing_id"] == slid
+    assert payload["card_listing"]["vehicle"]["make"] == "Volkswagen"
+
+    # The card changes while the job still waits: no second job, the waiting one takes the new facts.
+    newer = vehicle(slid, price_minor=255000).model_copy(update={"source_key": key})
+    changed = card(slid, price_minor=255000).model_copy(update={"card_listing": newer})
+    again = await ingest(db, env, await start(), page(key, [changed], fetched_at=later(5)))
+    assert (again.changed_listings, again.detail_jobs, again.detail_jobs_deduplicated) == (1, (), 1)
+    assert (
+        seed.scalar(
+            "select count(*) from ops.jobs where listing_id = %s", (report.detail_jobs[0].listing_id,)
+        )
+        == 1
+    )
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (job_id,))
+    assert payload["card_listing"]["price"]["amount_minor"] == 255000
+
+    # Facts that name another listing are never queued.
+    other = unique("SYN")
+    stray = card(other).model_copy(update={"card_listing": facts})
+    report = await ingest(db, env, await start(), page(key, [stray], fetched_at=later(10)))
+    assert report.new_listings == 1 and report.detail_jobs == ()
+    assert any("name another listing" in w for w in report.warnings)
+
+
+async def _card_only_source(db: Database, env: Env) -> tuple[str, Callable[[], Awaitable[CrawlRunRecord]]]:
+    """A synthetic card_only source and a function that starts one of its crawl runs."""
+    key = unique("cardonly").lower()
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.sync_sources_from_yaml(
+            conn,
+            env.system,
+            [
+                source_config(env.source_key),
+                source_config(key, detail_mode="card_only", allowed_detail_paths=()),
+            ],
+        )
+        source = await sources_repo.get_source_by_key(conn, env.system, key)
+
+    async def start() -> CrawlRunRecord:
+        async with unit_of_work(db, env.system) as conn:
+            return await sources_repo.start_crawl_run(
+                conn,
+                env.system,
+                source_id=source.id,
+                profile_id=env.profiles["primary"],
+                coverage_mode=CoverageMode.ROLLING_PAGES,
+                adapter_version="fixture@1.0.0",
+            )
+
+    return key, start
+
+
+async def test_card_only_facts_outside_the_card_hash_are_refreshed(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """Regression: a card_only card whose hash (title, price, km, URL) stayed the same never queued
+    a job, so changed facts outside the hash (damage, first registration, ...), a parser fix or a
+    card-facts revision that was never promoted were never ingested."""
+    key, start = await _card_only_source(db, env)
+    slid = unique("SYN")
+    facts = vehicle(slid).model_copy(update={"source_key": key})
+    first = await ingest(
+        db, env, await start(), page(key, [card(slid).model_copy(update={"card_listing": facts})])
+    )
+    assert len(first.detail_jobs) == 1
+    listing_id = first.detail_jobs[0].listing_id
+    job = await claim_detail(db, env)
+    assert job.listing_id == listing_id
+    await run_detail(db, env, job, listing_id, facts)  # what the no-fetch card-facts job ingests
+
+    # The same card with the same facts: nothing to do.
+    same = await ingest(
+        db,
+        env,
+        await start(),
+        page(key, [card(slid).model_copy(update={"card_listing": facts})], fetched_at=later(5)),
+    )
+    assert (same.unchanged_listings, same.detail_jobs, same.detail_jobs_deduplicated) == (1, (), 0)
+
+    # Same card hash, corrected first registration: a card-facts job with the new facts.
+    corrected = vehicle(slid, first_registration="2010-05").model_copy(update={"source_key": key})
+    again = await ingest(
+        db,
+        env,
+        await start(),
+        page(key, [card(slid).model_copy(update={"card_listing": corrected})], fetched_at=later(10)),
+    )
+    assert again.unchanged_listings == 1 and len(again.detail_jobs) == 1
+    ref = again.detail_jobs[0]
+    assert job.generation is not None
+    assert ref.reason == listings_repo.CARD_FACTS_CHANGED and ref.generation == job.generation + 1
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (ref.job_id,))
+    assert payload["card_listing"]["vehicle"]["first_registration"]["value"] == "2010-05"
+
+
+async def test_an_unpromoted_card_only_listing_gets_its_facts_again(
+    db: Database, env: Env, seed: Seed
+) -> None:
+    """Regression: when the first card-facts job ended without a revision (cancelled, dead letter,
+    quarantined), the unchanged card never queued another one."""
+    key, start = await _card_only_source(db, env)
+    slid = unique("SYN")
+    facts = vehicle(slid).model_copy(update={"source_key": key})
+    observation = card(slid).model_copy(update={"card_listing": facts})
+    first = await ingest(db, env, await start(), page(key, [observation]))
+    [ref] = first.detail_jobs
+    seed.conn.execute(
+        "update ops.jobs set state = 'cancelled', completed_at = now() where id = %s", (ref.job_id,)
+    )
+    again = await ingest(db, env, await start(), page(key, [observation], fetched_at=later(5)))
+    assert again.unchanged_listings == 1 and len(again.detail_jobs) == 1
+    assert again.detail_jobs[0].reason == listings_repo.CARD_FACTS_CHANGED
+    # A card without facts (a fetch-mode source) is unaffected: still no job for an unchanged card.
+    run = await start_run(db, env)
+    fetch_slid = unique("SYN")
+    await ingest(db, env, run, page(env.source_key, [card(fetch_slid)]))
+    unchanged = await ingest(
+        db, env, await start_run(db, env), page(env.source_key, [card(fetch_slid)], fetched_at=later(5))
+    )
+    assert (unchanged.unchanged_listings, unchanged.detail_jobs) == (1, ())
+
+
+async def test_card_facts_survive_a_claim_between_the_waiting_job_read_and_its_patch(
+    db: Database, env: Env, seed: Seed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a worker claimed the waiting card_only job after it was read but before the newer
+    card facts were patched in; the patch matched no row, the newer card counted as deduplicated
+    and the claimed job ingested the older facts, for good."""
+    key, start = await _card_only_source(db, env)
+    slid = unique("SYN")
+    old_facts = vehicle(slid, price_minor=299000).model_copy(update={"source_key": key})
+    first = await ingest(
+        db,
+        env,
+        await start(),
+        page(key, [card(slid, price_minor=299000).model_copy(update={"card_listing": old_facts})]),
+    )
+    [waiting] = first.detail_jobs
+    original = database.fetch_one  # what listings_repo calls
+    claimed: list[Any] = []
+
+    async def racing_fetch_one(conn: Any, query: Any, params: Any = None) -> Any:
+        row = await original(conn, query, params)
+        if query is listings_repo._WAITING_DETAIL_SQL and row is not None and not claimed:
+            # A detail worker claims the job on its own connection right now.
+            claimed.append(
+                await jobs.claim(db, env.workspace_id, "racing-worker", [JobType.DETAIL], lease_seconds=120)
+            )
+        return row
+
+    monkeypatch.setattr(listings_repo, "fetch_one", racing_fetch_one)
+    new_facts = vehicle(slid, price_minor=250000).model_copy(update={"source_key": key})
+    newer = card(slid, price_minor=250000).model_copy(update={"card_listing": new_facts})
+    second = await ingest(db, env, await start(), page(key, [newer], fetched_at=later(5)))
+    monkeypatch.setattr(listings_repo, "fetch_one", original)
+
+    assert claimed and claimed[0] is not None and claimed[0].id == waiting.job_id
+    assert second.detail_jobs_deduplicated == 0 and len(second.detail_jobs) == 1
+    [ref] = second.detail_jobs
+    assert ref.job_id != waiting.job_id and ref.generation > waiting.generation
+    payload = seed.scalar("select payload from ops.jobs where id = %s", (ref.job_id,))
+    assert payload["card_listing"]["price"]["amount_minor"] == 250000
+    # The claimed job keeps the facts it was claimed with (the newer generation wins later).
+    assert claimed[0].payload["card_listing"]["price"]["amount_minor"] == 299000
+
+
+async def test_page_validation(db: Database, env: Env) -> None:
+    run = await start_run(db, env)
+    with pytest.raises(ValidationFailed):
+        await ingest(db, env, run, page("another_source", [card(unique("SYN"))]))
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.finish_crawl_run(conn, env.system, run.id, RunOutcome(completeness="cancelled"))
+    with pytest.raises(ValidationFailed):
+        await ingest(db, env, run, page(env.source_key, [card(unique("SYN"))]))
+
+
+async def test_invalid_card_url_is_skipped_with_warning(db: Database, env: Env) -> None:
+    good = card(unique("SYN"), position=1)
+    bad = card(unique("SYN"), position=2, url="https://user:pw@dealer-a.synthetic.example/vehicles/x")
+    report = await ingest(db, env, await start_run(db, env), page(env.source_key, [good, bad]))
+    assert report.stored == 1 and any("position 2" in w for w in report.warnings)
+
+
+async def test_complete_scan_absence_sets_unknown_never_removed(db: Database, env: Env, seed: Seed) -> None:
+    gone, stays = unique("SYN"), unique("SYN")
+    first = await start_run(db, env)
+    report = await ingest(db, env, first, page(env.source_key, [card(gone), card(stays, position=1)]))
+    ids = {j.listing_id for j in report.detail_jobs}
+    seed.conn.execute("update app.listings set availability = 'available' where id = any(%s)", (list(ids),))
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.finish_crawl_run(conn, env.system, first.id, RunOutcome(completeness="complete"))
+    second = await start_run(db, env)
+    await ingest(db, env, second, page(env.source_key, [card(stays)], fetched_at=later(30)))
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.finish_crawl_run(conn, env.system, second.id, RunOutcome(completeness="complete"))
+    async with unit_of_work(db, env.system) as conn:
+        absent = await listings_repo.mark_complete_scan_absences(conn, env.system, second.id)
+    gone_id = seed.scalar("select id from app.listings where source_listing_id = %s", (gone,))
+    stays_id = seed.scalar("select id from app.listings where source_listing_id = %s", (stays,))
+    assert absent.marked_unknown == (gone_id,)
+    assert _listing_row(seed, gone_id)["availability"] == "unknown"  # never 'removed' or sold
+    assert _listing_row(seed, stays_id)["availability"] == "available"
+    event = seed.conn.execute(
+        "select metadata from ops.audit_events where target_id = %s and action = 'listing.availability'",
+        (gone_id,),
+    ).fetchone()
+    assert event is not None
+    assert event[0]["reason_code"] == "not_seen_in_complete_scan"
+    assert event[0]["evidence_kind"] == "complete_scan_absence"
+    # A budget-limited (incomplete) traversal never produces absences.
+    third = await start_run(db, env)
+    async with unit_of_work(db, env.system) as conn:
+        await sources_repo.finish_crawl_run(
+            conn, env.system, third.id, RunOutcome(completeness="budget_limited")
+        )
+        assert (
+            await listings_repo.mark_complete_scan_absences(conn, env.system, third.id)
+        ).marked_unknown == ()
+
+
+async def test_fixture_lineage_is_frozen_on_the_listing_at_ingest(db: Database, env: Env, seed: Seed) -> None:
+    """``app.listings.is_fixture`` records the source's mode when the listing was FIRST stored; a
+    later switch of the source to a real mode never relabels it (the new listings are real)."""
+    first = await ingest(db, env, await start_run(db, env), page(env.source_key, [card(unique("SYN"))]))
+    fixture_listing = first.detail_jobs[0].listing_id
+    assert seed.scalar("select is_fixture from app.listings where id = %s", (fixture_listing,)) is True
+    async with unit_of_work(db, env.system) as conn:
+        record = await listings_repo.get_listing(conn, env.system, fixture_listing)
+    assert record.is_fixture is True
+    seed.conn.execute(
+        "update app.sources set mode = 'public_html', version = version + 1 where id = %s", (env.source_id,)
+    )
+    later_page = await ingest(db, env, await start_run(db, env), page(env.source_key, [card(unique("SYN"))]))
+    real_listing = later_page.detail_jobs[0].listing_id
+    assert seed.scalar("select is_fixture from app.listings where id = %s", (real_listing,)) is False
+    assert seed.scalar("select is_fixture from app.listings where id = %s", (fixture_listing,)) is True

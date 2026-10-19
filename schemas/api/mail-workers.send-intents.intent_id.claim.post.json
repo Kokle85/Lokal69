@@ -1,0 +1,104 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "required",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/send-intents/{intent_id}/claim",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/send-intents/{intent_id}/claim`` (``api_client``).\n\nEvery claim has its own ``claim_attempt_id`` (and ``Idempotency-Key: claim-<intent>-<attempt>``)\nso an idempotency layer can never replay an earlier ``proceed: true``: a claim is always\nevaluated fresh (kill switch, suppression, cancellation, binding version).",
+    "properties": {
+      "claim_attempt_id": {
+        "pattern": "^[0-9a-f]{32}$",
+        "type": "string"
+      },
+      "intent_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "mailbox_binding_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "type": "string"
+      },
+      "worker_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._:-]+$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "schema_version",
+      "intent_id",
+      "claim_attempt_id",
+      "mailbox_binding_id",
+      "worker_id"
+    ],
+    "title": "MailWorkerClaimRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of the claim (== ``wire.ClaimDecision``).",
+    "properties": {
+      "intent_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "proceed": {
+        "type": "boolean"
+      },
+      "refusal_reason": {
+        "default": null,
+        "enum": [
+          "intent_expired",
+          "account_mismatch",
+          "kill_switch",
+          "binding_mismatch",
+          "intent_invalid",
+          "outlook_not_classic",
+          "mailbox_unavailable",
+          "duplicate_intent",
+          "not_now",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "required": [
+      "intent_id",
+      "proceed"
+    ],
+    "title": "mail-workers.send-intents.intent_id.claim.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Fresh server revalidation immediately before .Send (never replayed)."
+}

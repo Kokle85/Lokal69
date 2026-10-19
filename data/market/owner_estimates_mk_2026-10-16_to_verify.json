@@ -1,0 +1,85 @@
+{
+  "format": "suv_deals.market_import/1",
+  "evidence_kind": "owner_estimate",
+  "observations": [
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "8300",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's MK resale estimate of 2026-10-16, read from Reklama5 asking prices (not one ad, not a sale). TO VERIFY. ix35 2012, 1.7 CRDi manual (front drive), 180k km, about EUR 8,300.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Hyundai",
+        "model": "ix35",
+        "generation": "LM",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1685,
+        "mileage_km": "180000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "9000",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's MK resale estimate of 2026-10-16, read from Reklama5 asking prices (not one ad, not a sale). TO VERIFY. Antara 2012, 2.2 diesel automatic, 155k km, about EUR 9,000. All-wheel drive assumed for the automatic.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Opel",
+        "model": "Antara",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "automatic",
+        "drive": "awd",
+        "engine_displacement_cm3": 2231,
+        "mileage_km": "155000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "8500",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's MK resale estimate of 2026-10-16, read from Reklama5 asking prices (not one ad, not a sale). TO VERIFY. Yeti 2012, 1.6 TDI manual (front drive), 197k km, about EUR 8,500.",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Škoda",
+        "model": "Yeti",
+        "generation": "5L",
+        "first_registration": "2012",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1598,
+        "mileage_km": "197000"
+      }
+    },
+    {
+      "observed_at": "2026-10-16T00:00:00+02:00",
+      "price": "8650",
+      "currency": "EUR",
+      "price_basis": "unknown",
+      "provenance": "Owner's MK resale estimate of 2026-10-16, read from Reklama5 asking prices (not one ad, not a sale). TO VERIFY. S-Cross 2016, 1.6 diesel manual, 198k km as described, about EUR 8,650. Front drive assumed (an AllGrip 4x4 version also exists).",
+      "seller_type": "unknown",
+      "local_registration_status": "locally_registered",
+      "vehicle": {
+        "make": "Suzuki",
+        "model": "SX4 S-Cross",
+        "generation": "JY",
+        "first_registration": "2016",
+        "fuel": "diesel",
+        "gearbox": "manual",
+        "drive": "fwd",
+        "engine_displacement_cm3": 1598,
+        "mileage_km": "198000"
+      }
+    }
+  ]
+}

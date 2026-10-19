@@ -1,0 +1,606 @@
+# Activation gates
+
+What must happen before each capability of the SUV deal system may run against real services,
+who does it, how it is done, how it is verified and what evidence is kept. Contract: spec section
+32 (activation gates and honest completion states), section 31 (exact-build evidence) and section
+37.10 (activation evidence for the seller-email route). Status as of **2026-10-10** (wave D3); `existing_crawler` and `source_access` updated 2026-10-17, `source_access` again on 2026-10-18 (step 7 for `autoscout24_it`), `mcp_authentication` on 2026-10-18 (phase-1 route decided, still `blocked`).
+
+**Nothing runs by itself.** Two things are `live_verified`, both on the owner's workstation on
+2026-10-17 (evidence log below): the crawler (`existing_crawler`) and the AutoScout24 Italy source
+(`source_access` step 6 for `autoscout24_it`, the owner's hand-run live smoke). On 2026-10-18 the
+owner enabled that source (step 7, "вклучи ја трајно на секои 15 мин", "switch it on permanently,
+every 15 minutes": every 15 minutes from 08:00 to 22:00 Europe/Skopje); it runs on schedule only
+while the owner's scheduler and worker run on the owner's workstation (docs/runbook.md section 9.2). Apart from the
+owner's AutoScout24 Italy smokes of 2026-10-17, no live crawl is recorded here, and no real e-mail
+sent or read, no Slack, no dot, no Outlook on a real PC and no deployed service has been used.
+Every other source is disabled and every external effect is off by default (README "Safety
+defaults"). The work these gates protect is complete and tested offline
+([IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md), [docs/acceptance_matrix.md](docs/acceptance_matrix.md)).
+
+## How to read this file
+
+- **States** (spec 32): `implemented`, `fixture_verified`, `integration_verified`,
+  `live_verified`, `active`, `blocked`, `not_requested`. A gate never moves to `live_verified`
+  or `active` without the evidence listed for it.
+- **Where the state lives.** Every workspace has one row per gate in `ops.activation_gates`,
+  seeded from `src/suv_deals/persistence/gates.py` (`SPEC_GATES`; the reconciler inserts missing
+  gates and never overwrites a recorded one). The MCP tool `deals_health` and the dashboard
+  Overview/Settings show them (`persistence/queries/operations.py`); `suv-deals doctor` reports
+  the source registry gates and the seller-inquiry readiness, not these rows.
+- **Recording a new state is not tooled yet.** No CLI command or API route changes a gate row
+  (only the automatic source access-block path writes one, as `blocked`). Until such a command
+  exists, the seeded status in the database stays as listed below, and the evidence log at the
+  end of this file is the authoritative record of activation progress. Adding that command is
+  an open item ([IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md), "Review findings and open items").
+- **Who.** *Owner*: Vasko. The owner makes the decisions, owns the accounts and the Windows PC, approves
+  destinations and rules, and personally runs the activation canary send. *Operator*: whoever
+  runs the deployment and the `suv-deals` CLI on the owner's behalf. An agent never runs an
+  owner step.
+- **Evidence rules.** Record ids, timestamps, versions, hashes and result codes only. Never record
+  a token, password, OAuth secret, the owner's mailbox address, a seller's address or a message
+  body. Redact logs with `uv run python scripts/redact_logs.py` before attaching them.
+
+## Gate summary
+
+Seeded status = the status every workspace gets from `SPEC_GATES` today.
+
+| Gate | Seeded status | Spec 32 evidence needed | Who | Section |
+|---|---|---|---|---|
+| `implementation_environment` | `implemented` | Authorized repository and actual access | operator | [1](#1-implementation_environment) |
+| `existing_crawler` | `implemented` | Runtime version, health, topology, auth/request contract | operator, owner approves the host | [2](#2-existing_crawler-crawl4ai-service) |
+| `supabase` | `blocked` | Approved project, server credentials, schema/RLS tests, backup choice | owner decides, operator executes | [3](#3-supabase-project) |
+| `source_access` | `blocked` | Per source: configuration, terms decision, robots, unblocked live smoke | owner decides terms, operator implements and smokes | [4](#4-source_access-per-source) |
+| `credentials_api_accounts` | `not_requested` | Owner-approved account, scope, successful test | owner | [5](#5-credentials_api_accounts) |
+| `tax_rules` | `blocked` | Current sourced rule set, applicability, recorded approval | owner (with a qualified adviser) | [6](#6-tax_rules) |
+| `cost_assumptions` | `blocked` | Owner-selected assumptions/quotes, currency treatment | owner | [7](#7-cost_assumptions) |
+| `contribution_threshold` | `blocked` | Explicit choice; EUR 1,500 stays a proposal until then | owner | [8](#8-contribution_threshold-and-other-proposed-values) |
+| `seller_email_sender` | `blocked` | Verified mailbox, provider contract, dedup/suppression, live test evidence (activation canary rows 4-6) | owner (PC, account, canary send), operator (backend) | [9](#9-seller_email_sender-sender-binding-desktop-worker-and-activation-canary) |
+| `seller_inquiry` | `blocked` | Current qualifying candidate with exact-ad seller, address and language evidence; budget and kill-switch checks | owner (switches mode), operator | [10](#10-seller_inquiry) |
+| `seller_reply_slack_route` | `blocked` | Private channel, approved `seller_reply` binding, dot trigger on the signal metadata, correlated reply Outlook -> backend -> Slack -> dot -> MCP with dot's processing evidence | owner (Slack, dot), operator | [11](#11-seller_reply_slack_route-slack-app-channel-and-dot-trigger) |
+| `hosting` | `blocked` | Approved provider, region, budget, domain/TLS, deployment authority | owner decides, operator deploys | [12](#12-hosting) |
+| `mcp_authentication` | `blocked` | Approved persistent access, issuer/audience/scopes, real client success | owner (dot account), operator | [13](#13-mcp_authentication-connecting-dot) |
+| `slack_destination` | `not_requested` | Verified private channel and approved event data (optional candidate fallback) | owner | [14](#14-slack_destination) |
+| `native_mcp_events` | `blocked` | dot supports discovery/subscription, callback security, lifecycle, canary and unsubscribe | owner (dot), operator | [15](#15-native_mcp_events) |
+| `automatic_dot_activation` | `blocked` | A selected route and a correlated end-to-end canary | owner | [16](#16-automatic_dot_activation) |
+| `production_notifications` | `blocked` | Correct destination, dedup and uncertainty handling tested | owner | [17](#17-production_notifications) |
+
+Further activation items that are not separate gate rows are in sections 18 to 20 (exact-build
+release, destination-binding tooling, thresholds).
+
+## Recommended order
+
+Each step only needs the steps above it; any step can stop without affecting the others.
+
+1. Commit the working tree and produce the exact-build release report (section 18).
+2. Supabase production decision, backups and restore drill (3); hosting and domain (12).
+3. MCP access for dot in pull mode (13). From here dot can read the review queue.
+4. Crawl4AI service and firewall (2); ONE permitted dealer source end to end (4).
+5. MK market evidence and FX rates (10, prerequisites); tax rules (6), cost assumptions (7) and
+   the contribution threshold (8) for evidence-supported valuations.
+6. Sender binding, desktop worker and the activation canary on the owner's PC (9).
+7. Slack app, private channel, destination binding and the dot trigger (11, 19).
+8. Automatic seller inquiries (10); native MCP Events for candidate discovery (15, 16, 17).
+
+---
+
+## 1. `implementation_environment`
+
+- **State:** `implemented`. Repository `/home/user/Lokal69`; base commit `e5d47f4` plus the
+  uncommitted waves D1 to D3 (see [docs/qa_evidence.md](docs/qa_evidence.md)).
+- **Remaining:** commit the working tree (owner or operator decision; agents in this build never
+  commit). Everything else in this file assumes one exact commit.
+- **Evidence:** `git rev-parse HEAD`, `git status --short` empty, the release report of section 18.
+
+## 2. `existing_crawler` (Crawl4AI service)
+
+- **State:** `live_verified` on the owner's workstation (2026-10-17, evidence log): the owner's
+  Crawl4AI (host-local loopback `127.0.0.1:11235`) served the AutoScout24 Italy smokes that day;
+  afterwards `scripts/crawler_firewall.sh --check` found all eight rules already present and
+  verified the isolation from inside the crawler, and `doctor --process worker --crawler` passed.
+  The VPS (gate `hosting`) is not set up.
+- **Prerequisites:** an approved host (gate `hosting` or the owner's workstation); the pinned
+  image `unclecode/crawl4ai:0.9.4` with its tested digest; an API token; the host firewall rules.
+- **Who:** operator provisions; owner approves the host.
+- **Steps:**
+  1. Compose (VPS): put the token into `/etc/suv-deals/secrets/crawl4ai_api_token` (root, 0600),
+     export `CRAWL4AI_IMAGE_DIGEST=sha256:<tested digest>` and start the crawler service of
+     `compose.production.yaml`. A crawler already running on the host is used as is: host
+     processes point `CRAWL4AI_BASE_URL` at `http://127.0.0.1:11235` (docs/runbook.md 3.1); never
+     restart or reconfigure a shared crawler.
+  2. Apply BOTH firewall rule sets of docs/runbook.md 3.2 (DOCKER-USER for routed egress, INPUT
+     for host-local services; bridges `br-suv-crawl` and `br-suv-crawlint`) and persist them.
+  3. `uv run suv-deals doctor --process worker --crawler`: health, pinned version 0.9.4,
+     unauthenticated requests refused, read-only `/config/dump` contract, tested topology.
+  4. Run the in-container reachability check of docs/runbook.md 3.2: every host address on a
+     listening port must be unreachable from the crawler.
+- **Verified when:** doctor reports the crawler healthy at 0.9.4 with authentication enforced, and
+  the reachability check prints no `REACHABLE` line.
+- **Evidence:** doctor output (topology, version, auth result), image digest, the firewall rule
+  listing (`iptables -S DOCKER-USER`, `iptables -S INPUT`) and the reachability check output.
+- **Residual risk:** the crawler container drops all capabilities, sets `no-new-privileges` and
+  has CPU/memory/pid limits, but its root file system is writable and it runs as the image's
+  default user (SECURITY.md, residual risks).
+
+## 3. Supabase project
+
+- **State:** `blocked`. Project `Lokal69- Sub` (ref `olkcgrahvkvzgnnsqspr`, eu-west-1,
+  PostgreSQL 17.11) has every migration applied, through `20261013000100_import_values` (docs/schema.md
+  section 9; all 17 migration files; the newest, the owner's recorded purchase price and estimated
+  customs value per listing, docs/schema.md 11.16, applied on 2026-10-14). It serves nothing: no backend process has connected to
+  it, no user or workspace was bootstrapped, no backup was restored.
+- **Prerequisites (owner decisions):** approve the project and region for production; choose the
+  backup capability actually bought (plan/PITR); decide on the two advisor warnings about the
+  project-provided `public.rls_auto_enable()` (EXECUTE for `anon`/`authenticated`; not created by
+  these migrations).
+- **Project settings (operator, in the Supabase dashboard):**
+  - Auth: site URL and redirect allow-list contain `https://<dashboard host>/auth/callback`;
+    sign-ups disabled; users created deliberately (dashboard/README.md "Deployment").
+  - Data API: do not expose `app` or `ops` (the migrations grant nothing to `anon`,
+    `authenticated` or `service_role`; ADR 0001). Keep `pg_graphql` off.
+  - Server credentials: a LOGIN role that is a member of `suv_backend`, or the owner connection
+    with `DATABASE_SET_ROLE=suv_backend` on a direct or session-mode connection (docs/runbook.md
+    3.3). Secrets go into `/etc/suv-deals/<process>.env` (root, 0600), never into the repository.
+  - Storage: a private bucket `source-evidence-private` only if `SNAPSHOT_STORAGE=supabase`.
+  - Migration ledger: the connector recorded apply-time versions; reconcile them before using
+    `scripts/migrate.sh` or `supabase db push` against this project (docs/runbook.md 4.1).
+- **Steps:**
+  1. `DATABASE_URL=<owner connection> uv run suv-deals db migrate --dry-run` (prints the target
+     without the password; expect no pending file).
+  2. `uv run suv-deals doctor --process api` and `GET /readyz` on the deployed API.
+  3. Bootstrap (privileged connection in `MAINTENANCE_DATABASE_URL`, environment only):
+     `uv run suv-deals bootstrap owner --user-id <auth user id> --workspace-name "Deals" --yes`,
+     then `suv-deals config apply --reason "initial configuration" --yes` and
+     `suv-deals sources sync --dry-run` / `--yes`.
+  4. Backup and restore drill (docs/runbook.md 7): `scripts/backup.sh`, then
+     `scripts/restore_check.sh var/backups/suv-deals_<ts>.manifest` into an isolated local
+     database. Record the elapsed time.
+- **Verified when:** doctor shows the schema markers and `SET ROLE suv_backend` working, `/readyz`
+  is ready, the restore check passes.
+- **Evidence:** migration ledger listing, doctor output, restore-check report (row counts,
+  hashes, elapsed time), the chosen backup plan.
+- **Known gap:** the backup manifest and restore check count and verify the v1.0 tables only; the
+  v1.1 tables are inside the dump but not individually verified (OPS-13, open).
+
+## 4. `source_access` (per source)
+
+- **State:** `blocked` for every source except `autoscout24_it`. 14 sources are registered in
+  `config/sources/*.yaml`; 13 are `enabled: false`; `autoscout24_it` is `enabled: true` since
+  2026-10-18 (step 7, the owner's decision) and is the only source ever crawled by the worker (the
+  owner's smokes of 2026-10-17). Two adapters are implemented: the generic dealer adapter
+  (`schemaorg_dealer@1.1.0`, used by the two dealer templates), `fixture_verified` on synthetic
+  pages, and the AutoScout24
+  adapter (`autoscout24@1.0.0`, used by `autoscout24_it` and `autoscout24_de`), built from
+  owner-captured pages. Step 5 below is done for both (2026-10-16): SYNTHETIC saved fixtures with
+  `MANIFEST.yaml` covering the spec 31 set (`tests/adapters/fixtures/autoscout24_it/`,
+  `autoscout24_de/`), `technical_status: fixture_tested`. Step 6 is done for `autoscout24_it`
+  (2026-10-17, the owner's live smoke: `live_smoke_passed`, evidence log) and step 7 on 2026-10-18
+  (enabled, every 15 minutes from 08:00 to 22:00 Europe/Skopje; `doctor` reports it `active
+  (public_html)`; it runs on schedule only while the owner's scheduler and worker run,
+  docs/runbook.md section 9.2). `autoscout24_de`'s live smoke is next; it stays disabled: `doctor`
+  lists it as "not active" with one gate problem ("source is disabled in configuration") until its
+  step 7 (docs/runbook.md section 9.1). The other 10
+  sources have no adapter
+  (`adapter_version: unimplemented`; `sources inspect` and `doctor` say "not activatable (no
+  adapter)"), so configuration alone can never activate them.
+- **mobile.de and AutoScout24: owner decision recorded 2026-10-10 - include them, Outlook is the
+  path** (ADR 0002 addendum). `mobile_de_public`, `autoscout24_de`, `autoscout24_it` and
+  `autoscout24_ch` carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
+  record of the accepted terms risk, not legal permission) and the robots.txt facts checked on
+  2026-10-10; AutoScout24 Germany disallows detail pages for generic crawlers, so `autoscout24_de` is
+  `card_only`. The owner re-confirmed the approval on 2026-10-14 ("ги одобрувам mobile.de,
+  AutoScout24 да се скенираат"). The robots.txt re-check of 2026-10-14 found AutoScout24 DE/IT/CH
+  unchanged but **mobile.de changed**: `suchen.mobile.de` now disallows its search pages for every
+  generic crawler (detail pages only in the form `details.html?id=<n>&vip=1`), so `mobile_de_public`
+  cannot discover listings and its search allow-list is empty; the owner's approval does not override
+  robots.txt (remaining routes: the official Search API, or listing links the owner supplies).
+  `mobile_de_public` and `autoscout24_ch` remain disabled because their adapters are not built
+  (`autoscout24_it` and `autoscout24_de` got theirs on 2026-10-16, see above): building the parsers needs real, redacted
+  page captures, and fetching those pages from the build environment was denied by an automated
+  policy classifier (2026-10-06, and again on 2026-10-14 after the owner's re-confirmation). The
+  capture has to happen on the owner's side (pages saved from the owner's browser) or after the owner
+  grants that permission in the Claude Code settings; then the adapters are built and
+  fixture-verified (steps 1-7 of docs/source_access_register.md). AutoScout24 Switzerland also needs
+  its own terms identified.
+- **All other sources: owner decision recorded 2026-10-14** ("сакам сите да го вклучиш").
+  `subito_it`, `automobile_it`, `comparis_ch`, `carforyou_ch`, `tutti_ch`, `pazar3_mk` and
+  `reklama5_mk` now carry `terms_decision: proceed_acknowledged` with the owner as actor (an audit
+  record, not permission); all stay disabled. The terms and robots.txt review of the same day
+  (docs/research/source_terms_review_2026-10-14.md, every finding independently re-verified) found
+  Subito and automobile.it **restricted** (both terms expressly prohibit robots/scrapers), Comparis'
+  robots.txt disallowing its car-search result and detail endpoints, and every Swiss and MK site
+  except automobile.it answering our user agent with a block or bot challenge from the build
+  environment, so their terms stay unreviewed (gate closed) until the owner reads them in a normal
+  browser. Every adapter still needs real page captures.
+  The optional official mobile.de Search API is gate 5.
+- **Who:** owner records the terms decision; operator verifies routes, implements/configures the
+  adapter, captures fixtures and runs the smoke; owner enables.
+- **Steps** (docs/source_access_register.md "Activation checklist", in order):
+  1. Terms decision record in the source YAML (`terms_status`, `terms_url`, `terms_reviewed_at`,
+     `terms_decision`, actor and note).
+  2. Permitted routes: exact `allowed_hosts`, anchored search/detail path regexes, dealer
+     `search.search_url`.
+  3. Robots check through the robots module (revision hash and time stored): before activation
+     the owner's `capture-samples` reading; once the source runs, the worker itself records a
+     revision per host each UTC day before any page request (`crawling.robots_guard`, since
+     2026-10-17; `sources inspect --from-db` shows status, time and hash).
+  4. Adapter: for a dealer, copy `config/sources/example_dealer_template_de.yaml` (or `_ch`) and
+     confirm schema.org JSON-LD on the permitted pages; for a marketplace, a real adapter.
+  5. Saved fixtures with `MANIFEST.yaml` covering the spec 31 set; `uv run pytest tests/adapters -q`;
+     then `technical_status: fixture_tested`.
+  6. Live smoke by hand: with `SOURCE_NETWORK_ENABLED=true` (Compose:
+     `SUV_DEALS_ENABLE_SOURCE_NETWORK=true` exported for that run only),
+     `uv run suv-deals crawl once --source <key> --max-pages 1`, then
+     `uv run suv-deals worker --drain --queues detail --source <key> --max-jobs N` (`--max-jobs`
+     bounds the detail requests; `max_detail_jobs_per_run` does not bound a drain; `--source`
+     keeps other sources' queued detail jobs out of the drain, so they are not blocked as
+     `source_paused`); check `suv-deals sources inspect <key> --from-db` (its `robots` view must
+     show the run's robots revision: status, time, hash) and `doctor`, and collect the evidence
+     ids with `suv-deals sources smoke-evidence <key>` (the robots.txt request of the run,
+     `purpose: robots`, and `robots_revisions` included). Then
+     `technical_status: live_smoke_passed`. For AutoScout24 the exact owner commands (local
+     uncommitted `enabled: true`, sync, smoke, switch-off) are in docs/runbook.md section 9.1. The
+     first `autoscout24_it` smokes (2026-10-17) predate the worker's robots check (empty robots
+     view, no robots fetch in the evidence) and do not count for step 6; the repeat that day at
+     commit `25f43f8` passed (evidence log).
+  7. Enable through an auditable configuration revision (`sources sync --yes`).
+- **Verified when:** `access_state: ok`, healthy parser outcomes, and the persisted listing,
+  revision and evidence ids of the smoke.
+- **Evidence (spec 31 exact-build list):** commit SHA and image digest, configuration revision and
+  `adapter_version`, source URL, actual observation timestamp, crawl run and job ids with the
+  redacted fetch outcome (the robots.txt request included), the robots revision in effect (time,
+  HTTP status, SHA-256), persisted listing/revision/evidence ids. Record each source separately;
+  one source never proves another.
+
+| Source | Adapter | Terms decision | What blocks it |
+|---|---|---|---|
+| `example_dealer_template_de`, `example_dealer_template_ch` | `schemaorg_dealer@1.1.0` (fixture_verified) | none (templates) | a real permitted dealer: copy, steps 1-7 |
+| `mobile_de_public`, `autoscout24_ch` | placeholder | proceed_acknowledged (owner, 2026-10-10) | included by owner decision; adapters need real page captures; CH terms not identified |
+| `autoscout24_it` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures); `fixture_tested` (step 5 done 2026-10-16 on SYNTHETIC saved fixtures); `live_smoke_passed` (step 6 done 2026-10-17, the owner's live smoke at commit `25f43f8`, evidence log); enabled (step 7 done 2026-10-18, evidence log) | proceed_acknowledged (owner, 2026-10-10) | nothing in its configuration: every gate passes since step 7 (`enabled: true`, a committed configuration revision, the owner's decision of 2026-10-18 "вклучи ја трајно на секои 15 мин", "switch it on permanently, every 15 minutes", which takes effect with `sources sync --yes` on the owner's machine); it runs only while the owner's scheduler and worker run (docs/runbook.md section 9.2, `scripts/local_crawl.sh`), and an access block stops it (`access_blocked`, stop and report); per-model searches (12 models, one page each per run, seller-country filter `cy=I` strongly indicated live 2026-10-17, not yet confirmed by seller country), every 15 min from 08:00 to 22:00 Europe/Skopje (owner decision 2026-10-18; the window is the owner's decision of 2026-10-16, which set 30 min and a 600-request budget; 56 runs x 12 pages = 672 search requests a day; daily budget 800: 672 search + 128 for detail pages and robots.txt, the remaining runs' search pages reserved against detail requests); the step-6 smoke commands are in docs/runbook.md section 9.1 |
+| `autoscout24_de` | implemented (`autoscout24@1.0.0`, 2026-10-16, from owner captures); `fixture_tested` (step 5 done 2026-10-16 on SYNTHETIC saved fixtures), never run live | proceed_acknowledged (owner, 2026-10-10) | `enabled: false` only (the one remaining gate problem; `crawl once` refuses a disabled source): step 5 is done (saved spec-31 fixtures with `MANIFEST.yaml`, `fixture_tested`, synthetic, not a live verification); next the owner's live smoke (step 6, exact commands in docs/runbook.md section 9.1 with this key), then enabling (step 7); per-model searches (12 models, one page each per run, every 30 min from 08:00 to 22:00 Europe/Skopje (owner decision 2026-10-16; 28 runs x 12 pages = 336 search requests a day; daily budget 350); card_only (robots) |
+| `subito_it`, `automobile_it`, `carforyou_ch`, `tutti_ch`, `comparis_ch` | placeholder | pending | domain, terms, routes unverified; an adapter |
+| `pazar3_mk`, `reklama5_mk` (MK comparables) | placeholder | pending | terms and an adapter; until then MK evidence comes from `suv-deals market import` |
+| `mobile_de_api` | skeleton (raises until entitlement) | pending | gate 5 |
+
+## 5. `credentials_api_accounts`
+
+- **State:** `not_requested`. The only candidate is the optional mobile.de Search API; its
+  adapter is a skeleton that refuses with `DependencyUnavailable` until an entitlement exists.
+- **If wanted:** the owner applies for the account; the operator stores the credentials
+  server-side (`MOBILE_DE_API_CREDENTIALS`, `MOBILE_DE_API_ENTITLEMENT_REFERENCE`,
+  `MOBILE_DE_API_ENABLED=true`), implements the adapter from the official documentation, records
+  fixtures and runs a low-volume test. Marketplace login credentials are not API credentials.
+- **Evidence:** entitlement reference, scope, the low-volume test's ids.
+
+## 6. `tax_rules`
+
+- **State:** `blocked`. The engine, validation, versioning and lifecycle are implemented and
+  tested with synthetic rule sets. A North Macedonian DRAFT ships under `config/tax_rules/drafts/`
+  (status `draft`, not approved, golden-tested in `tests/unit/test_mk_rule_draft.py`); it is
+  never selected for valuations, only for the import-cost calculator's labelled indicative
+  preview. No rule set is approved or ACTIVE, so every non-fixture valuation keeps import charges
+  `unknown` and stays incomplete. The tax rule is not a gate for the seller inquiry
+  (`TAX_RULE_NOT_APPROVED` is informational there).
+- **Prerequisites:** a current, sourced rule set (official sources with retrieval time and
+  SHA-256), reviewed against golden cases. For the shipped draft (`2026.10-draft.3`): every
+  remaining `UNCERTAIN - confirm` marker resolved (the list: docs/decisions/0003-transport-and-customs-calculator.md,
+  "What the owner must confirm"; evidence pack docs/tax/mk_import_fact_sheet_2026-10.md, section
+  13; the owner settled two on 2026-10-13: the ДМВ is in the import VAT base, and amounts are
+  whole denars, half-up) and
+  every source re-fetched and re-hashed; the month's customs EUR/MKD rate recorded
+  (`suv-deals fx record ... --purpose customs`).
+- **Who:** owner, with a qualified customs broker or tax professional.
+- **Steps:** docs/tax_rule_approval.md (draft, validate, review, approve, activate). Validation is
+  tooled: `uv run suv-deals tax-rules validate <file>`.
+- **Tooling:** the owner stores a repository draft and moves it through review, approval (named
+  approver + review record bound to the content hash) and activation in the dashboard, Settings,
+  "Tax rules and cost profile" (`/api/settings/tax-rules*`, owner only; `api.owner_config_routes`
+  over `valuation_repo.store_rule_set` / `transition_tax_rule_set`); `suv-deals tax-rules store`
+  also stores a draft. The valuation pipeline reads rule sets only from the database. Nothing is
+  approved or activated automatically: the gate stays `blocked` until the owner does it.
+- **Evidence:** rule set id/version and content SHA-256 (`suv-deals tax-rules list`), review record,
+  approver, activation time, and `suv-deals doctor` reporting `tax_rules/production` ACTIVE.
+- **Per-vehicle values (owner decision D2, 2026-10-13):** once a rule set is ACTIVE, a valuation
+  computes the import charges on the owner's recorded ESTIMATED customs value of the listing when
+  there is one (else on the price), and its profit on the recorded REAL purchase price (else the
+  advertised price, as an estimate). The owner records both in the candidate's "Import values"
+  panel or with `suv-deals import-costs record-values ... --yes` (needs migration
+  `20261013000100`, section 3). An estimated customs value is a labelled planning figure: tax
+  lines built on it are never `rule_supported`.
+
+## 7. `cost_assumptions`
+
+- **State:** `blocked`. Costs are computed from `config/cost_profiles`; unknown costs stay
+  unknown, never zero. **Transport is set:** the owner's decision of 2026-10-13 (ADR 0003) is a
+  fixed EUR 700 per vehicle from any purchase country (`default` profile version 3, line
+  `transport`, low = base = high). The profile version is **not yet approved**, and every other
+  line (bank/FX, inspection, broker, registration, repairs, preparation, storage, reserve,
+  selling) is still `unknown`.
+- **Prerequisites:** the owner's choice of the remaining inspection, broker, registration, repair
+  and reserve assumptions, or real quotes, with their currency treatment; then the approval of the
+  profile version.
+- **Steps:** edit the cost profile YAML, `uv run suv-deals config validate`, then
+  `suv-deals config apply --reason "<what changed>" --yes`.
+- **Tooling:** the owner approves the configured cost-profile version (content hash bound; stored
+  first when the workspace does not hold it yet) in the dashboard, Settings, "Tax rules and cost
+  profile" (`POST /api/settings/cost-profiles/approve`, owner only, over
+  `valuation_repo.approve_cost_profile`).
+- **Evidence:** configuration revision, profile id, the quotes or assumption notes.
+
+## 8. `contribution_threshold` and other PROPOSED values
+
+- **State:** `blocked`. The EUR 1,500 minimum contribution is a proposal
+  (`config/defaults.yaml`, `PROPOSED_MIN_CONTRIBUTION_EUR`, `CONTRIBUTION_THRESHOLD_APPROVED=false`);
+  `doctor` and `inquiries status` say so.
+- **Steps (owner):** confirm or change the amount in `config/defaults.yaml`, set
+  `CONTRIBUTION_THRESHOLD_APPROVED=true` in the runtime environment, then
+  `suv-deals config apply --reason "owner approved the contribution threshold" --yes`.
+- **Evidence:** configuration revision and the owner's decision note.
+- Other PROPOSED values that need an explicit owner confirmation are in section 20.
+
+## 9. `seller_email_sender` (sender binding, desktop worker and activation canary)
+
+- **State:** `blocked`. Sender binding, verification, desktop worker, canary transport on
+  `outlook_local` and the reservation gate `activation_canary_incomplete` are implemented and
+  tested with fakes. No account is bound, no Windows PC was used, no canary was sent.
+- **Owner decisions in force:** `outlook_local` is THE path (owner decision 2026-10-10, ADR 0002
+  addendum): classic Outlook on the owner's PC with the owner's Gmail account sends the inquiries and reads
+  the correlated replies. `gmail_api` / `microsoft_graph` stay in the code but are not part of the
+  activation plan.
+- **Prerequisites:** Supabase and hosting (the desktop worker needs an HTTPS backend URL), a
+  Windows PC with classic Outlook (not "new Outlook") and the mailbox synchronising.
+- **Steps** (docs/runbook.md 10.1 to 10.6, docs/seller_email_activation.md sections 3 and 8):
+  1. Operator: `uv run suv-deals inquiries authorize --reason "owner standing authorization" --yes`
+     (controls row in mode `disabled_until_sender_ready`, standing authorization from
+     `config/seller_inquiry_authorization.yaml`).
+  2. Owner/operator: `uv run suv-deals sender-binding create --provider outlook_local
+     --account-id <id> --from-address <the owner's mailbox> --display-name "<signature name>"
+     --reason "owner-authorized sending identity" --yes`. No shipped tool shows the stable
+     Outlook account key before this step (OPS-10, open): use the SMTP address as `--account-id`
+     (accepted with the warning `ACCOUNT_ID_IS_THE_SMTP_ADDRESS`), or re-create the binding with
+     the key once the worker has reported it. Type the address only on the command line or in the
+     runtime `.env`; never into a file in the repository.
+  3. Operator: `uv run suv-deals mail-worker credential issue --sender-binding <id> --label "Owner
+     PC classic Outlook" --expires 90d --yes` prints the mailbox binding id and the `suvmail_`
+     token ONCE.
+  4. Owner on the PC: install the worker (desktop/outlook-bridge/README.md "Installation") from the
+     SAME commit as the backend; `config.toml` with `api_base_url` (https), the mailbox binding
+     id, the SMTP address, the rule-target folders; `python -m outlook_bridge credential set
+     --expires-at <expiry>` (hidden input, Windows Credential Manager);
+     `python -m outlook_bridge check` must exit 0; start `python -m outlook_bridge run` at logon
+     (Task Scheduler "At log on", "Run only when user is logged on"; never a service).
+  5. Operator: after the first account report and heartbeat,
+     `uv run suv-deals sender-binding verify <id> --reason "technical verification" --yes`; it
+     refuses with codes (`NO_ACTIVE_MAIL_WORKER`, `WORKER_ACCOUNT_*`, `WORKER_HEARTBEAT_*`,
+     `ACCOUNT_KEY_MISMATCH`, ...) until the evidence holds. Set `SELLER_EMAIL_PROVIDER`,
+     `SELLER_EMAIL_ACCOUNT_ID`, `SELLER_EMAIL_FROM` (and `SELLER_EMAIL_REPLY_TO` only if the
+     binding has one) to exactly the binding's values.
+  6. Activation canary (docs/runbook.md 10.6; seller_email_activation.md rows 4-6): hold real
+     inquiries with `suv-deals inquiries set-limits --max-per-24h 0 --max-per-15d 0 --reason ...
+     --expected-version N --yes`; `SUV_CANARY_TARGET_ADDRESS=<owner test address> suv-deals canary
+     prepare --purpose "activation route check" --yes`; put the same address as
+     `canary_target_address` and `send_intents_enabled = true` into the worker's `config.toml`;
+     set `SELLER_EMAIL_CANARY_SEND_ENABLED=true`, `SELLER_INQUIRY_MODE=automatic` and workspace
+     mode automatic (`suv-deals inquiries set-mode automatic --reason ... --expected-version N
+     --yes`). Then **the owner personally** runs `suv-deals canary send <id>
+     --i-confirm-owner-controlled-address --yes`. The worker sends it once; the owner replies from
+     the test mailbox. Afterwards set `SELLER_EMAIL_CANARY_SEND_ENABLED=false` and decide on the
+     caps (section 10).
+- **Verified when:** `suv-deals sender-binding status` shows `verified`, `usable`, `healthy`;
+  `suv-deals canary status` shows `complete` for the binding's CURRENT version; the dashboard
+  Mail workers page shows rows 4-6 from `GET /api/activation/canary-evidence`; a pause makes the
+  worker's next claim answer `kill_switch` (row 7).
+- **Evidence (seller_email_activation.md section 8, rows 1-7):** binding id and version,
+  verification audit id, classic Outlook version from `check`, worker revision = backend commit,
+  canary id, Message-ID match flag, `sent_items_confirmed` time, reply correlation time, the
+  unrelated-mail check (nothing uploaded), the kill-switch claim refusal. Record whether Gmail's
+  Sent Items copy appeared in classic Outlook (UNVERIFIED for the account type).
+- **Without a `complete` canary** every real inquiry is refused at reservation
+  (`activation_canary_incomplete`; nothing debited). A re-verified sender needs a new canary.
+
+## 10. `seller_inquiry`
+
+- **State:** `blocked`. Readiness, reservation, caps 2/24 h and 5/rolling 15 days, the 7-day
+  seller cooldown, dedup, suppression, kill switch and uncertain-send reconciliation are
+  integration-verified. No real inquiry has ever been planned: sent, uncertain and suppressed
+  real-inquiry counts are all 0.
+- **Prerequisites** (each one is checked by readiness or reservation; codes in
+  `domain.inquiries`):
+  - gate 9 complete (verified sender, `complete` canary);
+  - a permitted ACTIVE source whose adapter declares `seller_contact_evidence` (today only the
+    generic dealer adapter) and a fresh observation (PROPOSED 48 h);
+  - MK comparable evidence: `uv run suv-deals market import <file> --evidence-kind asking_price
+    --reason "..." --dry-run`, then `--yes` (schema `suv_deals.market_import/1`); without it every
+    valuation is `insufficient_comparables` and nothing becomes `inquiry_ready`;
+  - current FX rates: `suv-deals fx refresh --yes` with `FX_FETCH_ENABLED=true` (ECB, EUR->CHF
+    only) and `suv-deals fx record --base EUR --quote MKD --rate <d> --date <day> --source-ref
+    "..." --reason "..." --yes` (the ECB publishes no MKD rate); `suv-deals fx status` shows ages;
+  - a cost profile (gate 7 for evidence-supported economics; unknown costs are listed, not zero).
+- **Steps (owner):** restore the caps (`uv run suv-deals inquiries set-limits --max-per-24h 2
+  --max-per-15d 5 --reason "..." --expected-version N --yes`, or lower values), keep
+  `SELLER_INQUIRY_MODE=automatic` for the worker AND the API process (Compose:
+  `SUV_DEALS_SELLER_INQUIRY_MODE`) and the workspace mode `automatic`. No per-message or
+  first-template approval exists anywhere.
+- **Verified when:** `uv run suv-deals inquiries status` shows `sending_possible: true`,
+  `activation_canary: complete`, `sender_identity_problems: []`; the dashboard says "Automatic
+  inquiries possible now: yes"; the first real inquiry reaches `accepted` with Sent Items
+  evidence.
+- **Evidence:** inquiry id, template id/version/hash, authorization version, recipient
+  verification evidence id, attempt id, `sent_items_confirmed` time; `suv-deals evaluation report
+  --days 15` for the 15-day view. Never the seller's address or the body.
+
+## 11. `seller_reply_slack_route` (Slack app, channel and dot trigger)
+
+- **State:** `blocked`. Reply ingest, the outbox signal `seller.reply.received.v1`, the Slack
+  builder, flood control and reconciliation of uncertain posts are integration-verified with
+  fakes. No Slack app, channel or dot trigger exists; nothing was posted.
+- **Prerequisites:** gate 9 (the worker uploads correlated replies); gate 13 (dot can call MCP);
+  the destination-binding tooling of section 19.
+- **Steps:**
+  1. Owner: create a private channel and a Slack app with `chat:write` and
+     `channels:history`/`groups:history` (reconciliation); register the metadata event types
+     `suv_deals.seller_reply_received`, `suv_deals.owner_alert` and `suv_deals.review_pending`
+     under `metadata.event_subscriptions` in the app manifest; invite the app to the channel.
+  2. Operator: dispatcher environment `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`,
+     `SLACK_CHANNEL_ID`, `SLACK_DESTINATION_APPROVAL_REF`, recommended `SLACK_TEAM_ID`,
+     `SLACK_BOT_USER_ID` (blank = unset); `ALLOW_EXTERNAL_NOTIFICATIONS=true` (Compose:
+     `SUV_DEALS_ENABLE_EXTERNAL_NOTIFICATIONS=true`), `SELLER_REPLY_SIGNAL_PROVIDER=slack`.
+     `uv run suv-deals doctor --process dispatcher` must list them as present.
+  3. Owner + operator: an approved, enabled and verified destination binding for the category
+     `seller_reply` on that channel (section 19: no shipped command yet).
+  4. Owner: configure dot's Slack trigger on `SLACK_CHANNEL_ID` with the condition message
+     metadata `event_type == suv_deals.seller_reply_received` (not text, not "any bot message",
+     not the channel alone); `suv_deals.owner_alert` and `suv_deals.review_pending` must not fire
+     it; the action is "call `seller_replies_get` / `seller_inquiries_get` over MCP", never a reply
+     or a send (docs/connect_mcp.md 6.2, docs/notification_bridge.md 5.1).
+  5. Correlated test reply through the whole route. The activation canary reply proves only
+     Outlook -> backend (it emits no Slack signal); this leg needs the first correlated real seller
+     reply or a separately built canary signal (owner decision; not built).
+- **Verified when:** the Slack post's receipt (`provider_accepted_at`) AND dot's own processing
+  evidence (its MCP `seller_replies_get` call with the same reply id) exist. A Slack 2xx alone is
+  never proof that dot processed the signal.
+- **Evidence:** outbox event id, Slack message `ts`, MCP request id of dot's read, the trigger
+  configuration (screenshot or export without tokens).
+
+## 12. `hosting`
+
+- **State:** `blocked`. Dockerfile, `compose.production.yaml` and the runbook exist; no image was
+  built or pushed, no digest recorded, no host provisioned.
+- **Prerequisites (owner):** provider, region, monthly budget, domain, TLS and deployment
+  authority.
+- **Steps (operator):** docs/runbook.md 3 and 8: env files under `/etc/suv-deals/`, reverse proxy
+  with TLS for `/api` and `/mcp` (published ports bound to `127.0.0.1`), pinned base digests,
+  `RELEASE_IMAGE_DIGEST`, deploy with every switch off, then `/readyz`, an authenticated
+  `/api/me` and `deals_health` over MCP.
+- **Evidence:** image digest, crawler digest, release report, smoke results.
+
+## 13. `mcp_authentication` (connecting dot)
+
+- **State:** `blocked`. The MCP server (12 + 3 tools, scopes, OAuth protected-resource metadata,
+  static bearer credentials) is tested with the official SDK client in process. No deployed URL,
+  no real client. The state stays `blocked` until the evidence of the owner's live test below is
+  recorded; the decision and the local checks of 2026-10-18 do not pass the gate.
+- **Phase-1 route (owner decision 2026-10-18, verbatim: "ChatGPT-план е dot: Pro, да има и постои
+  Tunnel, одобрувам": the ChatGPT plan is Pro, the account offers "Add custom MCP server" with
+  Connection: Tunnel, approved):** dot reads, read-only, through OpenAI's Secure MCP Tunnel. The
+  vendor's `tunnel-client` on the owner's WSL machine connects outbound only (api.openai.com:443)
+  and forwards dot's MCP requests to a separate local API on `127.0.0.1:8010` (`MCP_AUTH_MODE=
+  static_bearer`), adding a viewer `suvmcp_` credential (`deals:read`, `reviews:read`, 30 days)
+  from a 0600 file (`mcp.extra_headers`); the ChatGPT plugin uses "No authentication". No
+  deployment, no inbound port, no public URL. `scripts/local_mcp.sh setup|start|status|stop|rotate`
+  (docs/connect_mcp.md section 8, docs/runbook.md 9.3). Rules: only the owner may use the tunnel
+  (S1); a restricted runtime key, Tunnels Read + Use with a usage limit (S2); never
+  `--log.http-raw-unsafe` (S3); the failed-authentication limiter is per process on this route
+  (S4); the credential expires after 30 days (S7); never connect the owner's PC as dot's
+  "computer"; the data dot reads goes to OpenAI.
+- **Phase-1 evidence (owner's live test):** the date, the verified release (the ZIP's line in its
+  `SHA256SUMS.txt`) and `tunnel-client.version` (version and the binary's SHA-256), the negotiated
+  protocol and the tools/list SHA-256 from `start`'s probe report (`var/local_mcp/logs/probe-*.json`),
+  the 7 tools dot discovers, the request ids of dot's `deals_health`, `reviews_list_pending`,
+  `deals_get_candidate` and `deals_estimate_import_costs` calls (the `mcp tool call` lines of the
+  API log, field `request_id`), and the output of `ss -ltnp | grep tunnel-client` while the tunnel
+  runs (expected: nothing) and the start window's "connected to OpenAI" line. UNVERIFIED until
+  then: that ChatGPT with "No authentication" sends no `Authorization` of its own (one would
+  override the injected header), and a control plane that accepts the tunnel. Verified for
+  tunnel-client v0.0.16 on 2026-10-18 (build container, fake key): the health socket replaces the
+  TCP listener, and the 401 path (docs/connect_mcp.md 8.2, 8.6). The owner's first live start
+  (2026-10-19): the local chain passed, OpenAI's control plane refused the tunnel with 401
+  `tunnel_use_forbidden` (a valid key that may not use the tunnel id: the principal's permissions,
+  or an id that is not the tunnel's); the owner's checks are pending (evidence log;
+  docs/connect_mcp.md 8.7).
+- **Steps (other routes):** docs/connect_mcp.md section 4. In short: deploy (12); choose `MCP_AUTH_MODE`
+  (`oauth` preferred; `static_bearer` only for a client that supports it); for a static credential
+  `uv run suv-deals credentials create-mcp --label "dot read-only" --scopes
+  deals:read,reviews:read --role viewer --expires 30d --yes` (token printed once; into dot's
+  secret store only); check that an unauthenticated `curl -i https://<domain>/mcp` is `401`; add
+  the custom MCP server in the owner's ChatGPT/dot account; ask dot to call `deals_health`,
+  `reviews_list_pending` and one candidate. Write scopes (`reviews:write`, `inquiries:read`,
+  `inquiries:pause`) only after the owner approves them.
+- **Evidence:** client surface and version, negotiated protocol, SDK version 2.3.0, SHA-256 of the
+  `tools/list` result, request ids of the successful calls.
+
+## 14. `slack_destination`
+
+- **State:** `not_requested`. Slack as a fallback for candidate discovery is optional; native MCP
+  Events are the chosen candidate route. If the owner wants it, every item of the Slack checklist
+  in docs/notification_bridge.md section 5 applies, with the category `candidate_discovery`.
+
+## 15. `native_mcp_events`
+
+- **State:** `blocked`. The provider, subscriptions, signed callback verification and delivery
+  are implemented and tested; whether the owner's dot surface supports MCP Events for this plugin
+  is unverified.
+- **Steps:** docs/connect_mcp.md section 5: enable `MCP_EVENTS_ENABLED`, `EVENT_BRIDGE_ENABLED`,
+  `EVENT_BRIDGE_PROVIDER=mcp_events`, `ALLOW_EXTERNAL_NOTIFICATIONS` (Compose: the
+  `SUV_DEALS_ENABLE_*` switches) and `MCP_EVENT_SUBSCRIPTION_SECRET_ENCRYPTION_KEY`; an approved
+  `candidate_discovery` destination binding (section 19); rescan the plugin; ask dot to monitor
+  the review queue (dot subscribes itself); send a labelled synthetic canary; unsubscribe; only
+  then set `EVENT_BRIDGE_VERIFIED_AT`.
+- **Evidence:** docs/notification_bridge.md section 8 (subscription id, challenge exchange,
+  delivery receipt, dot's tool calls, duplicate and out-of-order checks, unsubscribe).
+
+## 16. `automatic_dot_activation`
+
+- **State:** `blocked`. Needs one selected route per category and its correlated end-to-end
+  canary: native MCP Events for candidate discovery (15) and the Slack route for seller replies
+  (11). Until then pull mode (dashboard and MCP) is the complete working path.
+
+## 17. `production_notifications`
+
+- **State:** `blocked`. Outbox, dedup and uncertainty handling are tested with fakes. Needs an
+  approved destination binding and a delivery canary. Owner-facing opportunity alerts of the
+  review pipeline have no message builder yet: such events end `blocked` with
+  `OWNER_ALERT_MESSAGE_UNAVAILABLE` (seller-reply owner alerts have their Slack builder).
+
+## 18. Exact-build release report (not a gate row; spec 31 and 34)
+
+- **State:** not produced. The waves D1 to D3 are uncommitted; `scripts/verify_release.sh` marks a
+  dirty tree "not releasable".
+- **Steps:** commit, then `scripts/verify_release.sh --with-e2e` with the target's
+  `VITE_SUPABASE_URL` / `VITE_SUPABASE_PUBLISHABLE_KEY` exported; copy `var/releases/<sha>_<ts>.txt`
+  and the outputs into `docs/qa/<sha>/` (docs/qa/README.md, docs/runbook.md 8).
+- **Verified when:** the report says `result=verified` (clean tree, every step passed, E2E run).
+
+## 19. Destination bindings (tooling gap for gates 11, 14, 15, 17)
+
+Every external delivery goes to exactly one approved, enabled and verified destination binding
+per event category (`app.destination_bindings`, `persistence.bindings_repo`). The repository
+functions exist and are tested (`create_binding`, `approve_binding`, `set_binding_enabled`,
+`mark_binding_verified`, preferences; `tests/integration/repos_valuation_reviews/test_bindings_repo.py`),
+but **no CLI command, API route or dashboard control calls them**. Without a binding the
+dispatcher blocks every event visibly (`NO_ACTIVE_ROUTE`). An owner-only operator command is
+needed before gates 11, 14, 15 or 17 can pass (open item).
+
+## 20. PROPOSED values awaiting the owner's confirmation
+
+| Value | Where | Current |
+|---|---|---|
+| Tax rules | gate 6 | none approved (MK draft shipped, unapproved) |
+| Transport EUR 700 per vehicle | `config/cost_profiles/default_unapproved.yaml` v3, gate 7 | owner decision 2026-10-13; profile version unapproved |
+| Minimum contribution EUR 1,500 | `config/defaults.yaml`, `CONTRIBUTION_THRESHOLD_APPROVED` | proposal |
+| Observation freshness 48 h for an inquiry | `domain/inquiries.py` `MAX_OBSERVATION_AGE` | proposal |
+| Seller cooldown 7 days (floor; owner may lengthen to 365) | `domain/inquiries.py` `SELLER_COOLDOWN`, DB CHECK | proposal for the default |
+| 3 send attempts per inquiry | `domain/inquiries.py` `MAX_SEND_ATTEMPTS` | proposal |
+| `MAX_SIGNALS_PER_INQUIRY_24H` = 6 | `persistence/replies_repo.py` | proposal |
+| `MAX_NEW_REPLIES_PER_MAILBOX_PER_HOUR` = 120 | `persistence/replies_repo.py` | proposal |
+| `MAIL_WORKER_REPLY_LIMIT` = 30 burst, 10 per minute per credential | `api/deps.py` | proposal |
+| `MAX_CANARIES_PER_24H` = 5 | `persistence/canaries_repo.py` | proposal |
+| Canary publication window 24 h | `domain/canary.py` `CANARY_INTENT_TTL` | proposal |
+
+The owner-decided values are not proposals: acquisition DE/IT/CH at EUR 2,500-3,000 inclusive and
+under 200,000 km, MK resale research band EUR 8,000-10,000, ONE automatic initial inquiry per
+verified vehicle/seller pair without message approval, caps 2/24 h and 5/rolling 15 days,
+`outlook_local` as the default send path.
+
+## Evidence log
+
+Append one row per completed activation step (newest last). Ids, versions, hashes and codes only.
+
+| Date (UTC) | Gate / step | Commit | Evidence (ids, codes) | Recorded by |
+|---|---|---|---|---|
+| 2026-10-16 | `source_access` step 5 (saved fixtures): `autoscout24_it`, `autoscout24_de` -> `fixture_tested`; SYNTHETIC fixtures, not a live verification; both stay `enabled: false` | the commit that adds `tests/adapters/fixtures/autoscout24_*` (`git log -- tests/adapters/fixtures/autoscout24_it`) | `MANIFEST.yaml` `designation: synthetic`, `parser_version: autoscout24@1.0.0`, created 2026-10-16 (IT 37 pages, DE 23 pages); `tests/adapters/test_autoscout24_fixtures.py`, `tests/integration/pipeline/test_autoscout24_fixture_pipeline.py` | operator (build session) |
+| 2026-10-17 | `source_access` step 6 (live smoke): `autoscout24_it` -> `live_smoke_passed`; the owner's hand-run smoke (docs/runbook.md 9.1: `crawl once --max-pages 12`, `worker --drain --queues detail --max-jobs 5`); the source stays `enabled: false` | `25f43f8a1451f534cb49e1b93659f904f263742a` | config revision 1 `360d0a9d-b46d-4442-bb8b-309751cde88e`; `autoscout24@1.0.0`; job `d3c60927-9dc7-426b-8a5a-20cab1087c32`, run `46f4bdec-1a91-4702-8ecb-1dff3f5a7255` (`complete`, `access_state: ok`, 12 pages, 15 cards); robots fetch `03976780-d703-4d0c-bcb3-c6838b10e05d` (HTTP 200) and revision `dad6209a-1e23-4f87-a88f-e140e6da7633` (SHA-256 `7c78475c...`); 12 search fetches HTTP 200; 5 detail jobs succeeded (queued by the morning walk): revisions `faf012b2-325d-4f22-9dfc-f638cecc273c`, `d0f0ca62-27a5-4d5f-9991-b1bf11bff2a4`, `7ce1c9bb-f233-40ad-895f-afe861d2ef43`, `4cde316a-040a-4c72-8be9-b3a05e4722a2` and one HTTP 410 (removed, no revision); the run created no revision (no new or changed card); status recorded in the database with `last_live_smoke_at`; full record: docs/source_access_register.md "Live smoke evidence" and docs/evidence/autoscout24_it_live_smoke_2026-10-17.json | owner (smoke), operator (record) |
+| 2026-10-17 | `existing_crawler` -> `live_verified` on the owner's workstation (host-local loopback `127.0.0.1:11235`) | `80e1f96` | `scripts/crawler_firewall.sh --check`: 8 rules present (DOCKER-USER: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, tcp 5432:6543; INPUT: `br-suv-crawl`, `br-suv-crawlint` NEW), none added; "crawler isolation verified: 9 target(s) blocked", no `REACHABLE` line; `doctor --process worker --crawler`: health OK version 0.9.4 (matches the pin), unauthenticated requests refused (401), read-only contract inspection passed; image `unclecode/crawl4ai@sha256:9021b3cb5c6f12570bbcd5395638495e0a06969b3148e377b953d174af2ebc9b`. Recorded after the same day's AutoScout24 Italy smokes (the rules were already in place) | owner (checks), operator (record) |
+| 2026-10-18 | `source_access` step 7 (enable): `autoscout24_it` -> `enabled: true`, every 15 minutes from 08:00 to 22:00 Europe/Skopje (56 runs x 12 search pages = 672 a day; daily budget 800 = 672 + 128); the owner's decision "вклучи ја трајно на секои 15 мин" ("switch it on permanently, every 15 minutes") | the commit that sets `enabled: true` in `config/sources/autoscout24_it.yaml` (`git log -- config/sources/autoscout24_it.yaml`) | the committed configuration change (`enabled: true`, `interval_minutes: 15`, `daily_request_budget: 800`); not yet applied on the owner's machine: the owner's `suv-deals sources sync --yes` writes the audited `source.sync_update` event (run by `scripts/local_crawl.sh start`, docs/runbook.md section 9.2), and that audit event's id and the first scheduled runs' ids are added here when the owner reports them | owner (decision), operator (configuration) |
+| 2026-10-18 | `mcp_authentication` phase-1 route decided (state stays `blocked`): dot through the OpenAI Secure MCP Tunnel, read-only; the owner's decision "ChatGPT-план е dot: Pro, да има и постои Tunnel, одобрувам" (the ChatGPT plan is Pro, "Add custom MCP server" with Connection: Tunnel exists, approved) | the commit that adds `scripts/local_mcp.sh` (`git log -- scripts/local_mcp.sh`) | no live test yet. Local check in the build container (scratch database, SYNTHETIC workspace, the real script, API and credential, a FAKE `tunnel-client` driven by the generated YAML): `mcp probe` passed 4/4 (unauthenticated `initialize` 401 with `WWW-Authenticate: Bearer`, protocol `2025-11-25`, 7 tools, tools/list SHA-256 `bcb1df66242b775812f9623bcde1dc3774e65fad313e661741118fb2fe9d266a`, `deals_health` ready); through the fake tunnel 401 without and 200 with the injected header; `rotate` revoked the old credential (docs/connect_mcp.md 8.6). The owner's live test adds its own evidence row | owner (decision), operator (script, local check) |
+| 2026-10-18 | `mcp_authentication` phase 1: the REAL `tunnel-client` v0.0.16 checked (state stays `blocked`) | the commit that adds the doctor and control-plane readiness to `scripts/local_mcp.sh` (`git log -- scripts/local_mcp.sh`) | the owner's download `tunnel-client-v0.0.16-linux-amd64.zip` SHA-256 `d60cdba019bce451bcc3a15478cc5b9cb11270b049f5b56ea39a80b517f8b117` matches the release's `SHA256SUMS.txt` (SHA-256 `fcce864a5935655534cc3d981257509579dbb5c71dbaec64c17a157ca9d65e56`); binary SHA-256 `01260ee973d5510861bc32979739561edd33869f99f9f8cd324f6d0da5b2e692`. Build container, scratch database, SYNTHETIC tunnel id, FAKE runtime key: `setup` exit 0 (doctor failed only `mcp_server_reachable,oauth_metadata`, expected before `start`); `start`: probe 4/4 (7 tools, tools/list SHA-256 `bcb1df66...`), `tunnel-client doctor` with the API up `RESULT ok`, the real tunnel bound no TCP port, OpenAI answered 401 (the key masked to its last 4 characters in the tunnel log), the window stopped the tunnel within about 2 s, `start` exit 1, the API stopped, no process left; through the vendor's local `dev proxy` with the generated YAML: `initialize` without `Authorization` 200, `notifications/initialized` 202, `tools/list` 200 (7 tools), `tools/call deals_health` 200, a client-sent `Authorization` 401; secret scan clean (docs/connect_mcp.md 8.6). No ChatGPT test | operator |
+| 2026-10-19 | `mcp_authentication` phase 1: the owner's first live start (state stays `blocked`) | the commit that makes the start window show OpenAI's error code (`git log -- scripts/local_mcp.sh`) | the owner's WSL machine, tunnel-client v0.0.16, the real api.openai.com, the owner's tunnel and runtime key (164 characters, `sk-proj-`; only length and prefix checked): the API up, `mcp probe` 4/4, `tunnel-client doctor` with the API up `RESULT ok`; then OpenAI's control plane refused the tunnel. Tunnel log (`var/local_mcp/logs/tunnel-20261019T084820Z.log`, `error=` values counted): 4 x poll HTTP 401 `tunnel_use_forbidden` ("Access denied: caller does not have permission to use this tunnel"), 1 x tunnel metadata HTTP 404 "Tunnel not found", 1 x the harmless OAuth discovery warning. OpenAI accepted the key (no `invalid_api_key`) but did not let its principal use a tunnel with this id: missing tunnel permissions or an id that is not the tunnel's; the metadata 404 fits both, and the id was not compared with the Tunnels page; the previous revision of the window called every 401 a wrong or revoked key. Pending (docs/connect_mcp.md 8.7, the `tunnel_use_forbidden` row): first the tunnel id against the Tunnels page (another id: delete `tunnel-id`, `setup`), then the same organization, Tunnels Read + Use for the owner through a role or group or the owner assigned the tunnel's User role, a key owned by the owner, a new key if anything changed, `setup`, `start`. No ChatGPT test; dot is not connected | owner (live start), operator (diagnosis) |

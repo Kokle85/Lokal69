@@ -1,0 +1,1010 @@
+{
+  "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Get a seller inquiry"
+  },
+  "description": "One automatic seller inquiry of the caller's workspace: vehicle and listing references, state, bound qualification revision, authorization and template versions, language, recipient verification status (the address only for the owner), send attempts, delivery uncertainty, suppression and timestamps. Read-only; there is no send tool.",
+  "errorSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed tool error (``isError: true`` result content). Same codes as the dashboard API.",
+    "properties": {
+      "code": {
+        "enum": [
+          "VALIDATION_ERROR",
+          "UNAUTHENTICATED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "VERSION_CONFLICT",
+          "ALREADY_CLAIMED",
+          "CLAIM_EXPIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "SOURCE_PAUSED",
+          "ACCESS_BLOCKED",
+          "RATE_LIMITED",
+          "INSUFFICIENT_DATA",
+          "DEPENDENCY_UNAVAILABLE",
+          "INTERNAL_ERROR",
+          "EMAIL_DELIVERY_UNCERTAIN"
+        ],
+        "type": "string"
+      },
+      "correlation_id": {
+        "default": null,
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "details": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": null,
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "message": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "retry_after_seconds": {
+        "default": null,
+        "maximum": 86400,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "retry_after_seconds",
+      "correlation_id",
+      "details"
+    ],
+    "title": "ToolError",
+    "type": "object"
+  },
+  "idempotencyOperation": null,
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "inquiry_id": {
+        "format": "uuid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "inquiry_id"
+    ],
+    "title": "seller_inquiries_get",
+    "type": "object"
+  },
+  "name": "seller_inquiries_get",
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``seller_inquiries_get`` / ``GET /api/inquiries/{inquiry_id}``.",
+        "properties": {
+          "approval_required": {
+            "const": false,
+            "default": false,
+            "type": "boolean"
+          },
+          "authorization": {
+            "additionalProperties": false,
+            "description": "The standing-authorization version the inquiry relies on (spec 37.1).",
+            "properties": {
+              "authorization_id": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fingerprint": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "authorization_id",
+              "version",
+              "fingerprint"
+            ],
+            "title": "InquiryAuthorizationRef",
+            "type": "object"
+          },
+          "delivery_uncertain": {
+            "description": "A send attempt may have reached the provider; held for reconciliation.",
+            "type": "boolean"
+          },
+          "identity_key": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "inquiry_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "language": {
+            "description": "Supported inquiry template languages. English only with positive evidence (spec 37.3).",
+            "enum": [
+              "de",
+              "it",
+              "fr",
+              "en",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latest_reply_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "additionalProperties": false,
+            "description": "The exact message (registered template rendering) and its informational MK preview.",
+            "properties": {
+              "mk_preview_body": {
+                "maxLength": 2000,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mk_preview_subject": {
+                "maxLength": 200,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "original_body": {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              "original_subject": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "preview_is_informational": {
+                "const": true,
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "original_subject",
+              "original_body",
+              "mk_preview_subject",
+              "mk_preview_body",
+              "preview_is_informational"
+            ],
+            "title": "InquiryMessageView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "purpose": {
+            "const": "initial_availability_documents_price",
+            "default": "initial_availability_documents_price",
+            "type": "string"
+          },
+          "qualification": {
+            "additionalProperties": false,
+            "description": "The qualification snapshot the inquiry is bound to (stale facts cancel queued work).",
+            "properties": {
+              "asking_price": {
+                "additionalProperties": false,
+                "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+                "properties": {
+                  "amount": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "default": null,
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "known",
+                      "unknown",
+                      "not_applicable"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "amount",
+                  "currency",
+                  "reason"
+                ],
+                "title": "AmountView",
+                "type": "object"
+              },
+              "availability": {
+                "enum": [
+                  "available",
+                  "reserved",
+                  "removed",
+                  "sold_claimed",
+                  "unknown",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "evaluated_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "listing_revision_id": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "readiness": {
+                "description": "Separate from investment readiness (spec 37.2).",
+                "enum": [
+                  "inquiry_ready",
+                  "needs_facts",
+                  "needs_technical_review",
+                  "not_eligible"
+                ],
+                "type": "string"
+              },
+              "readiness_reasons": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 60,
+                "type": "array"
+              },
+              "revision_number": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "rules_version": {
+                "maxLength": 80,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "semantic_hash": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "listing_revision_id",
+              "revision_number",
+              "semantic_hash",
+              "asking_price",
+              "availability",
+              "readiness",
+              "readiness_reasons",
+              "rules_version",
+              "evaluated_at"
+            ],
+            "title": "InquiryQualificationView",
+            "type": "object"
+          },
+          "recipient": {
+            "additionalProperties": false,
+            "description": "The verified recipient (spec 37.3). ``address`` is ``null`` unless the caller is the owner.",
+            "properties": {
+              "address": {
+                "maxLength": 320,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "address_domain": {
+                "maxLength": 253,
+                "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "address_redacted": {
+                "type": "boolean"
+              },
+              "contact_id": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "contact_kind": {
+                "enum": [
+                  "ad_email",
+                  "marketplace_relay",
+                  "official_dealer_contact",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "language": {
+                "description": "The contact's evidenced language; an unsupported one holds the inquiry.",
+                "pattern": "^[a-z]{2}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "language_status": {
+                "enum": [
+                  "resolved",
+                  "language_unresolved",
+                  "unsupported_language",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "verification_status": {
+                "enum": [
+                  "verified",
+                  "unverified",
+                  "unavailable",
+                  "changed",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "verified_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "contact_id",
+              "verification_status",
+              "contact_kind",
+              "address",
+              "address_domain",
+              "address_redacted",
+              "language",
+              "language_status",
+              "verified_at"
+            ],
+            "title": "RecipientView",
+            "type": "object"
+          },
+          "reply_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rfc_message_id": {
+            "maxLength": 998,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "row_version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "seller_entity_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "send_attempts": {
+            "additionalProperties": false,
+            "description": "Every transmission attempt (at most 3); an uncertain one is never resent blindly.",
+            "properties": {
+              "attempts": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "attempt_number": {
+                      "maximum": 3,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "error_code": {
+                      "maxLength": 80,
+                      "pattern": "^[A-Za-z0-9_.:-]{1,80}$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "finished_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "outcome": {
+                      "enum": [
+                        "running",
+                        "accepted",
+                        "pre_submission_failure",
+                        "definite_rejection",
+                        "uncertain"
+                      ],
+                      "type": "string"
+                    },
+                    "provider": {
+                      "enum": [
+                        "outlook_local",
+                        "gmail_api",
+                        "microsoft_graph"
+                      ],
+                      "type": "string"
+                    },
+                    "reconciled_at": {
+                      "format": "date-time",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reconciled_outcome": {
+                      "enum": [
+                        "accepted",
+                        "proven_not_submitted",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "send_intent_committed_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "submission_uncertain": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "attempt_number",
+                    "provider",
+                    "outcome",
+                    "send_intent_committed_at",
+                    "finished_at",
+                    "reconciled_outcome",
+                    "reconciled_at",
+                    "submission_uncertain",
+                    "error_code"
+                  ],
+                  "title": "SendAttemptSummary",
+                  "type": "object"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              "count": {
+                "maximum": 3,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "last_outcome": {
+                "enum": [
+                  "running",
+                  "accepted",
+                  "pre_submission_failure",
+                  "definite_rejection",
+                  "uncertain",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "uncertain": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "count",
+              "last_outcome",
+              "uncertain",
+              "attempts"
+            ],
+            "title": "SendAttemptsView",
+            "type": "object"
+          },
+          "sender": {
+            "additionalProperties": false,
+            "description": "The bound sending identity, without addresses, account ids or credentials.",
+            "properties": {
+              "binding_version": {
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "display_name": {
+                "maxLength": 64,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "enum": [
+                  "outlook_local",
+                  "gmail_api",
+                  "microsoft_graph",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sender_binding_id": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "sender_binding_id",
+              "binding_version",
+              "provider",
+              "display_name"
+            ],
+            "title": "SenderRef",
+            "type": "object"
+          },
+          "state": {
+            "description": "Seller inquiry lifecycle (spec 37.5). `accepted` = provider accepted, not delivered/read.",
+            "enum": [
+              "candidate",
+              "qualifying",
+              "reserved",
+              "queued",
+              "sending",
+              "accepted",
+              "held_facts",
+              "uncertain",
+              "suppressed",
+              "failed_definite",
+              "cancelled",
+              "replied",
+              "bounced",
+              "seller_opted_out",
+              "no_reply_yet"
+            ],
+            "type": "string"
+          },
+          "state_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 30,
+            "type": "array"
+          },
+          "suppression_reason": {
+            "enum": [
+              "hard_bounce",
+              "complaint",
+              "seller_opt_out",
+              "source_paused",
+              "sender_revoked",
+              "unresolved_send_outcome",
+              "kill_switch",
+              "contradictory_availability",
+              "manual",
+              "authorization_revoked",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template": {
+            "additionalProperties": false,
+            "properties": {
+              "body_hash": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope_hash": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "template_id": {
+                "pattern": "^seller_initial_(de|it|fr|en)_v[1-9][0-9]*$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "template_set_version": {
+                "maxLength": 80,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "template_version": {
+                "minimum": 1,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "template_id",
+              "template_version",
+              "template_set_version",
+              "scope_hash",
+              "body_hash"
+            ],
+            "title": "InquiryTemplateView",
+            "type": "object"
+          },
+          "timestamps": {
+            "additionalProperties": false,
+            "properties": {
+              "accepted_at": {
+                "description": "Provider acceptance, not delivery or reading.",
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "queued_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "replied_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reserved_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "send_attempted_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state_changed_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "updated_at": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "created_at",
+              "state_changed_at",
+              "reserved_at",
+              "queued_at",
+              "send_attempted_at",
+              "accepted_at",
+              "replied_at",
+              "updated_at"
+            ],
+            "title": "InquiryTimestamps",
+            "type": "object"
+          },
+          "vehicle": {
+            "additionalProperties": false,
+            "description": "The canonical vehicle of an inquiry: a confirmed cluster or one listing incarnation.",
+            "properties": {
+              "listing_id": {
+                "description": "The qualifying listing (source advertisement).",
+                "format": "uuid",
+                "type": "string"
+              },
+              "listing_reference": {
+                "maxLength": 200,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "listing_url": {
+                "maxLength": 2048,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_key": {
+                "maxLength": 80,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "vehicle_cluster_id": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "vehicle_kind": {
+                "enum": [
+                  "vehicle_cluster",
+                  "listing_incarnation"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "vehicle_kind",
+              "vehicle_cluster_id",
+              "listing_id",
+              "source_key",
+              "listing_reference",
+              "listing_url"
+            ],
+            "title": "InquiryVehicleRef",
+            "type": "object"
+          },
+          "waiting_reason": {
+            "default": null,
+            "description": "Why the inquiry waits (null: not waiting); the same rule as the list rows.",
+            "enum": [
+              "UNCERTAIN_DELIVERY",
+              "NEEDS_FACTS",
+              "INQUIRIES_PAUSED",
+              "SENDER_SETUP_INCOMPLETE",
+              "WORKER_OFFLINE",
+              "RATE_CAP_REACHED",
+              "SELLER_COOLDOWN",
+              "SEND_HELD",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "inquiry_id",
+          "identity_key",
+          "purpose",
+          "seller_entity_id",
+          "vehicle",
+          "state",
+          "state_reasons",
+          "qualification",
+          "authorization",
+          "template",
+          "language",
+          "recipient",
+          "sender",
+          "rfc_message_id",
+          "send_attempts",
+          "delivery_uncertain",
+          "suppression_reason",
+          "message",
+          "reply_count",
+          "latest_reply_id",
+          "timestamps",
+          "row_version",
+          "approval_required",
+          "waiting_reason"
+        ],
+        "title": "InquiryView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "seller_inquiries_get_result",
+    "type": "object"
+  },
+  "paginated": false,
+  "requiredScope": "inquiries:read",
+  "title": "Get a seller inquiry"
+}

@@ -1,0 +1,371 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "IDEMPOTENCY_CONFLICT",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "optional",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/api/settings/tax-rules/transition",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /api/settings/tax-rules/transition`` (owner only).\n\n``expected_status`` and ``content_sha256`` are what the owner saw: a different current status\nis ``409 VERSION_CONFLICT`` (``details.reason = status_changed``), a different content hash\n``422``. ``approved_by`` (the approver's name) and ``review_record`` are REQUIRED for\n``approved`` and refused for every other target.",
+    "if": {
+      "properties": {
+        "target": {
+          "const": "approved"
+        }
+      },
+      "required": [
+        "target"
+      ]
+    },
+    "properties": {
+      "approved_by": {
+        "default": null,
+        "description": "Approval only: the approver's name (recorded with the review).",
+        "maxLength": 200,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "content_sha256": {
+        "description": "Lower-case SHA-256 hex.",
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "expected_status": {
+        "enum": [
+          "draft",
+          "under_review",
+          "approved",
+          "active",
+          "superseded",
+          "expired",
+          "revoked",
+          "unapproved"
+        ],
+        "type": "string"
+      },
+      "idempotency_key": {
+        "description": "Client-chosen key scoped to the caller and operation; a retry with the same key and request returns the original result.",
+        "maxLength": 128,
+        "minLength": 8,
+        "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+        "type": "string"
+      },
+      "review_record": {
+        "additionalProperties": false,
+        "default": null,
+        "description": "The review record an approval binds (``domain.tax_engine.ReviewRecord``).\n\nThe whole approval record (approver name plus this record, as canonical JSON) must fit in\n500 characters (``valuation_repo.MAX_APPROVAL_REFERENCE``); a longer one is refused with\n``details.limit``.",
+        "properties": {
+          "content_sha256": {
+            "description": "The rule-set content hash that was reviewed.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "evidence_refs": {
+            "default": [],
+            "items": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 20,
+            "type": "array"
+          },
+          "notes": {
+            "default": null,
+            "description": "Further notes of the review.",
+            "maxLength": 2000,
+            "minLength": 3,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "professional_reference": {
+            "default": null,
+            "description": "Reference of a professional (customs broker/tax adviser) review.",
+            "maxLength": 200,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reviewed_at": {
+            "description": "When the review was done (not in the future).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "reviewer": {
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
+          "scope": {
+            "description": "What was verified (components, sources, golden cases).",
+            "maxLength": 2000,
+            "minLength": 3,
+            "type": "string"
+          }
+        },
+        "required": [
+          "reviewer",
+          "reviewed_at",
+          "scope",
+          "content_sha256"
+        ],
+        "title": "ReviewRecordInput",
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "rule_set_id": {
+        "pattern": "^[A-Za-z0-9_.:-]{3,200}$",
+        "type": "string"
+      },
+      "target": {
+        "enum": [
+          "under_review",
+          "approved",
+          "active",
+          "revoked"
+        ],
+        "type": "string"
+      },
+      "version": {
+        "maxLength": 200,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "rule_set_id",
+      "version",
+      "expected_status",
+      "target",
+      "content_sha256",
+      "idempotency_key"
+    ],
+    "then": {
+      "required": [
+        "approved_by",
+        "review_record"
+      ]
+    },
+    "title": "TaxRuleTransitionRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "Result of an owner act on a rule set (store a draft or a lifecycle transition).",
+        "properties": {
+          "action": {
+            "enum": [
+              "store",
+              "under_review",
+              "approved",
+              "active",
+              "revoked"
+            ],
+            "type": "string"
+          },
+          "approved_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_by": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "changed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 290,
+            "type": "string"
+          },
+          "previous_status": {
+            "description": "Null when a draft file was stored.",
+            "enum": [
+              "draft",
+              "under_review",
+              "approved",
+              "active",
+              "superseded",
+              "expired",
+              "revoked",
+              "unapproved",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "production_effect": {
+            "maxLength": 500,
+            "type": "string"
+          },
+          "rule_set_id": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "sha256_sealed": {
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "draft",
+              "under_review",
+              "approved",
+              "active",
+              "superseded",
+              "expired",
+              "revoked",
+              "unapproved"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "maxLength": 80,
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "rule_set_id",
+          "version",
+          "label",
+          "previous_status",
+          "status",
+          "content_sha256",
+          "sha256_sealed",
+          "approved_by",
+          "approved_at",
+          "changed_at",
+          "production_effect"
+        ],
+        "title": "TaxRuleChangeResult",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "settings.tax-rules.transition.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only: submit for review, approve (named approver + review record bound to the content hash), activate or revoke a stored rule-set version against the expected status."
+}

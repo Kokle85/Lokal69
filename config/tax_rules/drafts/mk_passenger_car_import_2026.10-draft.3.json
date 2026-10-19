@@ -1,0 +1,427 @@
+{
+  "rule_set_id": "mk-passenger-car-import",
+  "jurisdiction": "MK",
+  "version": "2026.10-draft.3",
+  "status": "draft",
+  "valid_from": "2025-07-01",
+  "valid_to": null,
+  "currency": "MKD",
+  "vehicle_categories": ["passenger_car"],
+  "description": "DRAFT, NOT APPROVED. North Macedonia import charges on a used passenger car (HS 8703, M1) per the fact sheet of 2026-10-13: customs duty (5% default; 0% only on an accepted preferential or US-origin proof), motor-vehicle tax (ДМВ: Table 1 value part on customs value + duty in EUR, Table 2 CO2 part per COC cycle, 400 g/km deemed when CO2 is not established, 50% for plug-in hybrids, BEV not subject) and 18% import VAT on customs value + duty + ДМВ + incidental costs. Owner decisions of 2026-10-13: ДМВ is part of the import VAT base (ЗДДВ чл. 21(2)(1): customs duty, taxes and other import charges, except VAT itself), and every MKD amount and the total are rounded to whole denars, half-up (as the Customs ДМВ guide of 29.12.2019 prints 38,123.8 as 38,124). Not modelled: HS 8704 double-cab pick-ups, HS 9705 collector vehicles, oldtimer exemption (ЗДМВ чл. 17), other exemptions/refunds, customs processing fees (none found, UNCERTAIN), registration-stage fees. UNCERTAIN - confirm: СКД = customs monthly EUR/MKD rate, CO2 band edges and non-integer CO2, hybrid/PHEV fuel column, non-EU preferential list, US-origin evidence. Sources not yet hashed here: Customs Tariff law amendment 130/25 (final gazette text), Правилник 117/2009 (FX), Customs monthly FX list, Customs vehicle page (expired TLS, snippets only). Source sha256 values are of local research copies and must be re-verified at review.",
+  "sources": [
+    {"url": "https://portal.mdt.gov.mk/post-body-files/propisi-od-oblasta-na-danocite-taksite-i-drugite-javni-prixodi-file-7DcP.pdf", "title": "Закон за данок на моторни возила, Сл. весник РСМ 261/2019 (MoF copy)", "retrieved_at": "2026-10-13T12:20:14Z", "sha256": "7ac463cce1798d9addcb961fc60e68d0f089b6f236fcc603db10792461564615"},
+    {"url": "https://portal.mdt.gov.mk/post-body-files/propisi-od-oblasta-na-danocite-taksite-i-drugite-javni-prixodi-file-UXof.pdf", "title": "Уредба за начинот на пресметка на ДМВ, Сл. весник РСМ 277/2019 (MoF copy)", "retrieved_at": "2026-10-13T12:20:12Z", "sha256": "32d4c144c12c1da7bddebf16d001128588c59eb0dba62da94da57f3d28ff379c"},
+    {"url": "https://mchamber.mk/Upload/Documents/%D0%A3%D1%80%D0%B5%D0%B4%D0%B1%D0%B0_%D0%B7%D0%B0_%D0%B8%D0%B7%D0%BC%D0%B5%D0%BD%D1%83%D0%B2%D0%B0%D1%9A%D0%B5_%D0%BD%D0%B0_%D1%83%D1%80%D0%B5%D0%B4%D0%B1%D0%B0%D1%82%D0%B0_%D0%B7%D0%B0_%D0%BD%D0%B0%D1%87%D0%B8%D0%BD%D0%BE%D1%82_%D0%BD%D0%B0_%D0%BF%D1%80%D0%B5%D1%81%D0%BC%D0%B5%D1%82%D0%BA%D0%B0_%D0%BD%D0%B0_%D0%B4%D0%B0%D0%BD%D0%BE%D0%BA%D0%BE%D1%82.pdf", "title": "Уредба за изменување на Уредбата за пресметка на ДМВ, Сл. весник РСМ 220/2023 (Tables 2 and Art. 2(2))", "retrieved_at": "2026-10-13T12:18:30Z", "sha256": "3fc899ebfc4af8ee115079707ee861265ac64c16c59d50b5709418555cf09f65"},
+    {"url": "https://slvesnik.com.mk/Issues/7206fb85a0f2488f9d578cb13e14f890.pdf", "title": "Службен весник РСМ бр. 220 од 19.10.2023 (issue containing item 3831)", "retrieved_at": "2026-10-13T11:51:21Z", "sha256": "29d25de4b096d61368bbcdf8d18696bd2b13b266a3f4ac5c7e9d955206d8ef8a"},
+    {"url": "https://www.ujp.gov.mk/files/attachment/0000/0986/______________________________________.____________267____30.12.2025.pdf", "title": "Закон за данокот на додадена вредност, пречистен текст УЈП (до Сл. весник РСМ 267/25)", "retrieved_at": "2026-10-13T12:04:10Z", "sha256": "946c4d21d1b24f46f731bd1c82833741bf7e000ae89a871624feb546e2e152ab"},
+    {"url": "https://www.eurokonsaltplus.com.mk/wp-content/uploads/2020/03/%D0%A6%D0%B0%D1%80%D0%B8%D0%BD%D1%81%D0%BA%D0%B8-%D0%B7%D0%B0%D0%BA%D0%BE%D0%BD.pdf", "title": "Царински закон, пречистен текст (Сл. весник РМ 39/2005 со измени)", "retrieved_at": "2026-10-13T11:42:10Z", "sha256": "ff9cf30a665eaa341b66f91546cc822c94f8ccd7dd38a09a47cf9e4e80bd7c18"},
+    {"url": "https://www.gisti.org/IMG/pdf/accord-ce-macedonia-jo-20-mars-2004-english.pdf", "title": "Stabilisation and Association Agreement EC-MK, OJ L 84, 20.3.2004", "retrieved_at": "2026-10-13T11:36:36Z", "sha256": "c4bb6b6b5f8d427d2c659303e0c36cf0d6b699a6c01082fae5d92d09f189012f"},
+    {"url": "https://www.bmf.gv.at/dam/jcr:74c083a7-5685-4a0f-ab4b-c69bef3f957d/L406_Nord%20Mazedonien_alternative%20Ursprungsregeln.pdf", "title": "SA Council Decision No 1/2021 (Protocol 4, origin), OJ L 406, 16.11.2021", "retrieved_at": "2026-10-13T11:47:19Z", "sha256": "1689b0ed6c42385a5e6ea17806e2acca7153900bbf0ec23ce3bf9476940329f5"}
+  ],
+  "approved_by": null,
+  "approved_at": null,
+  "required_inputs": ["declaration_date", "customs_value", "customs_value_basis", "customs_fx_rate", "preferential_origin_country", "fuel", "vat_incidental_costs_total"],
+  "optional_inputs": ["co2_g_km", "co2_cycle", "co2_source_document", "classification"],
+  "input_units": {"co2_g_km": "g/km"},
+  "components": [
+    {"id": "customs_value_mkd", "kind": "percentage", "label": "Customs value in MKD (intermediate; the scenario's customs value: transaction value or estimated customs value, incl. transport to the MK place of entry; customs FX)", "category": "import_duty", "currency": "MKD", "intermediate": true, "rate": "1", "base": ["customs_value"], "legal_reference": "Царински закон чл. 28, 35(1)(д), 36(а), 43; Сл. весник РМ 39/2005 со измени"},
+    {
+      "id": "duty_preferential_eu",
+      "kind": "percentage",
+      "label": "Customs duty 0% - accepted EU preferential origin proof (EUR.1 / origin declaration; origin stated as a member state or EU)",
+      "category": "import_duty",
+      "currency": "MKD",
+      "alternative_group": "customs_duty",
+      "applies_when": [
+        {"input": "preferential_origin_country", "op": "in", "value": ["AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK", "EU"]}
+      ],
+      "depends_on": ["customs_value_mkd"],
+      "rate": "0",
+      "base": ["customs_value_mkd"],
+      "legal_reference": "ССА (OJ L 84, 20.3.2004) чл. 18(3), Анекс II, чл. 128; Царински закон чл. 19(3)(г), 19(4); PEM 2023 rules via SA Decision 1/2021"
+    },
+    {
+      "id": "duty_preferential_other_fta",
+      "kind": "percentage",
+      "label": "Customs duty 0% - accepted EFTA/TR/UK/CEFTA/UA preferential proof (UNCERTAIN - confirm: [M] list and HS 8703 coverage per agreement)",
+      "category": "import_duty",
+      "currency": "MKD",
+      "alternative_group": "customs_duty",
+      "applies_when": [
+        {"input": "preferential_origin_country", "op": "in", "value": ["CH", "IS", "LI", "NO", "TR", "GB", "AL", "BA", "ME", "MD", "RS", "XK", "UA"]}
+      ],
+      "depends_on": ["customs_value_mkd"],
+      "rate": "0",
+      "base": ["customs_value_mkd"],
+      "legal_reference": "UNCERTAIN - confirm: EFTA-MK FTA чл. 4 Анекс III; MK-TR FTA; UK-MK PTCA Protocol 4; CEFTA 2006; MK-UA FTA"
+    },
+    {
+      "id": "duty_us_origin",
+      "kind": "percentage",
+      "label": "Customs duty 'слободно' - accepted US-origin evidence (UNCERTAIN - confirm: evidence Customs accepts for used US-built cars)",
+      "category": "import_duty",
+      "currency": "MKD",
+      "alternative_group": "customs_duty",
+      "applies_when": [{"input": "preferential_origin_country", "op": "in", "value": ["US"]}],
+      "depends_on": ["customs_value_mkd"],
+      "rate": "0",
+      "base": ["customs_value_mkd"],
+      "legal_reference": "Закон за Царинската тарифа чл. 2(5) (Сл. весник РСМ 130/25, примена од 1.7.2025 - UNCERTAIN - confirm final gazette text); Царински закон чл. 19(3)(д), 19(4)"
+    },
+    {
+      "id": "duty_standard",
+      "kind": "percentage",
+      "label": "Customs duty 5% - no accepted preferential/US-origin proof (default)",
+      "category": "import_duty",
+      "currency": "MKD",
+      "alternative_group": "customs_duty",
+      "applies_when": [
+        {"input": "preferential_origin_country", "op": "not_in", "value": ["AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK", "EU", "CH", "IS", "LI", "NO", "TR", "GB", "AL", "BA", "ME", "MD", "RS", "XK", "UA", "US"]}
+      ],
+      "depends_on": ["customs_value_mkd"],
+      "rate": "0.05",
+      "base": ["customs_value_mkd"],
+      "legal_reference": "Закон за Царинската тарифа чл. 3(1) и тарифа (8703: 5%); Царински закон чл. 19"
+    },
+    {"id": "vmv_mkd", "kind": "percentage", "label": "ВМВ: customs value + customs duty (intermediate, MKD)", "category": "motor_vehicle_tax", "currency": "MKD", "intermediate": true, "depends_on": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard"], "rate": "1", "base": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard"], "legal_reference": "ЗДМВ чл. 10(2) (Сл. весник РСМ 261/2019)"},
+    {
+      "id": "dmv_value_part",
+      "kind": "bracket",
+      "label": "ДМВ value part: (ВМВ_EUR x пВВ) x СКД, Table 1 on whole ВМВ (intermediate; СКД = customs EUR/MKD rate - UNCERTAIN - confirm vs NBRSM daily rate)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "depends_on": ["vmv_mkd"],
+      "key_terms": ["vmv_mkd"],
+      "key_currency": "EUR",
+      "base": ["vmv_mkd"],
+      "brackets": [
+        {"over": null, "up_to": "10000", "rate_of_base": "0"},
+        {"over": "10000", "up_to": "12000", "rate_of_base": "0.01"},
+        {"over": "12000", "up_to": "14000", "rate_of_base": "0.02"},
+        {"over": "14000", "up_to": "16000", "rate_of_base": "0.04"},
+        {"over": "16000", "up_to": "18000", "rate_of_base": "0.06"},
+        {"over": "18000", "up_to": "20000", "rate_of_base": "0.08"},
+        {"over": "20000", "up_to": "23000", "rate_of_base": "0.10"},
+        {"over": "23000", "up_to": "26000", "rate_of_base": "0.12"},
+        {"over": "26000", "up_to": "29000", "rate_of_base": "0.14"},
+        {"over": "29000", "up_to": "32000", "rate_of_base": "0.16"},
+        {"over": "32000", "up_to": "35000", "rate_of_base": "0.17"},
+        {"over": "35000", "up_to": "40000", "rate_of_base": "0.18"},
+        {"over": "40000", "up_to": "50000", "rate_of_base": "0.19"},
+        {"over": "50000", "up_to": null, "rate_of_base": "0.20"}
+      ],
+      "legal_reference": "Уредба 277/2019 чл. 2(1), Табела 1 (непроменета со 220/2023); ЗДМВ чл. 9(1)-(2)"
+    },
+    {
+      "id": "dmv_co2_petrol",
+      "kind": "bracket",
+      "label": "ДМВ CO2 part, petrol/LPG/CNG column: CO2 x кCO2 (whole value; integer g/km; printed lower bound inclusive - UNCERTAIN - confirm; hybrid_petrol column UNCERTAIN - confirm)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [
+        {"input": "fuel", "op": "in", "value": ["petrol", "lpg", "cng", "hybrid_petrol"]},
+        {"input": "co2_source_document", "op": "in", "value": ["coc", "registration_consent", "manufacturer_certificate", "technical_assessment_certificate", "listing_claim_unverified"]}
+      ],
+      "input": "co2_g_km",
+      "integer_values_only": true,
+      "tables": {
+        "nedc": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "51", "amount_per_unit": "8"},
+          {"lower_inclusive": "51", "upper_exclusive": "76", "amount_per_unit": "15"},
+          {"lower_inclusive": "76", "upper_exclusive": "91", "amount_per_unit": "30"},
+          {"lower_inclusive": "91", "upper_exclusive": "101", "amount_per_unit": "45"},
+          {"lower_inclusive": "101", "upper_exclusive": "111", "amount_per_unit": "60"},
+          {"lower_inclusive": "111", "upper_exclusive": "131", "amount_per_unit": "75"},
+          {"lower_inclusive": "131", "upper_exclusive": "141", "amount_per_unit": "105"},
+          {"lower_inclusive": "141", "upper_exclusive": "151", "amount_per_unit": "180"},
+          {"lower_inclusive": "151", "upper_exclusive": "171", "amount_per_unit": "265"},
+          {"lower_inclusive": "171", "upper_exclusive": "191", "amount_per_unit": "390"},
+          {"lower_inclusive": "191", "upper_exclusive": "226", "amount_per_unit": "495"},
+          {"lower_inclusive": "226", "upper_exclusive": "256", "amount_per_unit": "590"},
+          {"lower_inclusive": "256", "upper_exclusive": null, "amount_per_unit": "695"}
+        ],
+        "wltp": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "64", "amount_per_unit": "8"},
+          {"lower_inclusive": "64", "upper_exclusive": "95", "amount_per_unit": "15"},
+          {"lower_inclusive": "95", "upper_exclusive": "114", "amount_per_unit": "30"},
+          {"lower_inclusive": "114", "upper_exclusive": "124", "amount_per_unit": "45"},
+          {"lower_inclusive": "124", "upper_exclusive": "136", "amount_per_unit": "60"},
+          {"lower_inclusive": "136", "upper_exclusive": "154", "amount_per_unit": "75"},
+          {"lower_inclusive": "154", "upper_exclusive": "161", "amount_per_unit": "105"},
+          {"lower_inclusive": "161", "upper_exclusive": "173", "amount_per_unit": "180"},
+          {"lower_inclusive": "173", "upper_exclusive": "189", "amount_per_unit": "265"},
+          {"lower_inclusive": "189", "upper_exclusive": "211", "amount_per_unit": "390"},
+          {"lower_inclusive": "211", "upper_exclusive": "250", "amount_per_unit": "495"},
+          {"lower_inclusive": "250", "upper_exclusive": "283", "amount_per_unit": "590"},
+          {"lower_inclusive": "283", "upper_exclusive": null, "amount_per_unit": "695"}
+        ]
+      },
+      "legal_reference": "Уредба 277/2019 чл. 2, Табела 2 и чл. 2(2) како изменети со Сл. весник РСМ 220/2023 (во сила 27.10.2023)"
+    },
+    {
+      "id": "dmv_co2_diesel",
+      "kind": "bracket",
+      "label": "ДМВ CO2 part, diesel column: CO2 x кCO2 (whole value; integer g/km; printed lower bound inclusive - UNCERTAIN - confirm; hybrid_diesel column UNCERTAIN - confirm)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [
+        {"input": "fuel", "op": "in", "value": ["diesel", "hybrid_diesel"]},
+        {"input": "co2_source_document", "op": "in", "value": ["coc", "registration_consent", "manufacturer_certificate", "technical_assessment_certificate", "listing_claim_unverified"]}
+      ],
+      "input": "co2_g_km",
+      "integer_values_only": true,
+      "tables": {
+        "nedc": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "51", "amount_per_unit": "15"},
+          {"lower_inclusive": "51", "upper_exclusive": "76", "amount_per_unit": "30"},
+          {"lower_inclusive": "76", "upper_exclusive": "91", "amount_per_unit": "60"},
+          {"lower_inclusive": "91", "upper_exclusive": "101", "amount_per_unit": "90"},
+          {"lower_inclusive": "101", "upper_exclusive": "111", "amount_per_unit": "120"},
+          {"lower_inclusive": "111", "upper_exclusive": "131", "amount_per_unit": "150"},
+          {"lower_inclusive": "131", "upper_exclusive": "141", "amount_per_unit": "195"},
+          {"lower_inclusive": "141", "upper_exclusive": "151", "amount_per_unit": "270"},
+          {"lower_inclusive": "151", "upper_exclusive": "171", "amount_per_unit": "375"},
+          {"lower_inclusive": "171", "upper_exclusive": "191", "amount_per_unit": "510"},
+          {"lower_inclusive": "191", "upper_exclusive": "226", "amount_per_unit": "605"},
+          {"lower_inclusive": "226", "upper_exclusive": "256", "amount_per_unit": "750"},
+          {"lower_inclusive": "256", "upper_exclusive": null, "amount_per_unit": "880"}
+        ],
+        "wltp": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "64", "amount_per_unit": "15"},
+          {"lower_inclusive": "64", "upper_exclusive": "95", "amount_per_unit": "30"},
+          {"lower_inclusive": "95", "upper_exclusive": "114", "amount_per_unit": "60"},
+          {"lower_inclusive": "114", "upper_exclusive": "124", "amount_per_unit": "90"},
+          {"lower_inclusive": "124", "upper_exclusive": "136", "amount_per_unit": "120"},
+          {"lower_inclusive": "136", "upper_exclusive": "154", "amount_per_unit": "150"},
+          {"lower_inclusive": "154", "upper_exclusive": "161", "amount_per_unit": "195"},
+          {"lower_inclusive": "161", "upper_exclusive": "173", "amount_per_unit": "270"},
+          {"lower_inclusive": "173", "upper_exclusive": "189", "amount_per_unit": "375"},
+          {"lower_inclusive": "189", "upper_exclusive": "211", "amount_per_unit": "510"},
+          {"lower_inclusive": "211", "upper_exclusive": "250", "amount_per_unit": "605"},
+          {"lower_inclusive": "250", "upper_exclusive": "283", "amount_per_unit": "750"},
+          {"lower_inclusive": "283", "upper_exclusive": null, "amount_per_unit": "880"}
+        ]
+      },
+      "legal_reference": "Уредба 277/2019 чл. 2, Табела 2 и чл. 2(2) како изменети со Сл. весник РСМ 220/2023 (во сила 27.10.2023)"
+    },
+    {
+      "id": "dmv_co2_phev_petrol",
+      "kind": "bracket",
+      "label": "ДМВ CO2 part, plug-in hybrid HS 8703 60 -> petrol column (UNCERTAIN - confirm column for PHEV)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [
+        {"input": "fuel", "op": "eq", "value": "plugin_hybrid"},
+        {"input": "classification", "op": "in", "value": ["870360"]},
+        {"input": "co2_source_document", "op": "in", "value": ["coc", "registration_consent", "manufacturer_certificate", "technical_assessment_certificate", "listing_claim_unverified"]}
+      ],
+      "input": "co2_g_km",
+      "integer_values_only": true,
+      "tables": {
+        "nedc": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "51", "amount_per_unit": "8"},
+          {"lower_inclusive": "51", "upper_exclusive": "76", "amount_per_unit": "15"},
+          {"lower_inclusive": "76", "upper_exclusive": "91", "amount_per_unit": "30"},
+          {"lower_inclusive": "91", "upper_exclusive": "101", "amount_per_unit": "45"},
+          {"lower_inclusive": "101", "upper_exclusive": "111", "amount_per_unit": "60"},
+          {"lower_inclusive": "111", "upper_exclusive": "131", "amount_per_unit": "75"},
+          {"lower_inclusive": "131", "upper_exclusive": "141", "amount_per_unit": "105"},
+          {"lower_inclusive": "141", "upper_exclusive": "151", "amount_per_unit": "180"},
+          {"lower_inclusive": "151", "upper_exclusive": "171", "amount_per_unit": "265"},
+          {"lower_inclusive": "171", "upper_exclusive": "191", "amount_per_unit": "390"},
+          {"lower_inclusive": "191", "upper_exclusive": "226", "amount_per_unit": "495"},
+          {"lower_inclusive": "226", "upper_exclusive": "256", "amount_per_unit": "590"},
+          {"lower_inclusive": "256", "upper_exclusive": null, "amount_per_unit": "695"}
+        ],
+        "wltp": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "64", "amount_per_unit": "8"},
+          {"lower_inclusive": "64", "upper_exclusive": "95", "amount_per_unit": "15"},
+          {"lower_inclusive": "95", "upper_exclusive": "114", "amount_per_unit": "30"},
+          {"lower_inclusive": "114", "upper_exclusive": "124", "amount_per_unit": "45"},
+          {"lower_inclusive": "124", "upper_exclusive": "136", "amount_per_unit": "60"},
+          {"lower_inclusive": "136", "upper_exclusive": "154", "amount_per_unit": "75"},
+          {"lower_inclusive": "154", "upper_exclusive": "161", "amount_per_unit": "105"},
+          {"lower_inclusive": "161", "upper_exclusive": "173", "amount_per_unit": "180"},
+          {"lower_inclusive": "173", "upper_exclusive": "189", "amount_per_unit": "265"},
+          {"lower_inclusive": "189", "upper_exclusive": "211", "amount_per_unit": "390"},
+          {"lower_inclusive": "211", "upper_exclusive": "250", "amount_per_unit": "495"},
+          {"lower_inclusive": "250", "upper_exclusive": "283", "amount_per_unit": "590"},
+          {"lower_inclusive": "283", "upper_exclusive": null, "amount_per_unit": "695"}
+        ]
+      },
+      "legal_reference": "Уредба 277/2019 Табела 2 (220/2023); ЗДМВ чл. 6(1)(2); column choice UNCERTAIN - confirm"
+    },
+    {
+      "id": "dmv_co2_phev_diesel",
+      "kind": "bracket",
+      "label": "ДМВ CO2 part, plug-in hybrid HS 8703 70 -> diesel column (UNCERTAIN - confirm column for PHEV)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [
+        {"input": "fuel", "op": "eq", "value": "plugin_hybrid"},
+        {"input": "classification", "op": "in", "value": ["870370"]},
+        {"input": "co2_source_document", "op": "in", "value": ["coc", "registration_consent", "manufacturer_certificate", "technical_assessment_certificate", "listing_claim_unverified"]}
+      ],
+      "input": "co2_g_km",
+      "integer_values_only": true,
+      "tables": {
+        "nedc": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "51", "amount_per_unit": "15"},
+          {"lower_inclusive": "51", "upper_exclusive": "76", "amount_per_unit": "30"},
+          {"lower_inclusive": "76", "upper_exclusive": "91", "amount_per_unit": "60"},
+          {"lower_inclusive": "91", "upper_exclusive": "101", "amount_per_unit": "90"},
+          {"lower_inclusive": "101", "upper_exclusive": "111", "amount_per_unit": "120"},
+          {"lower_inclusive": "111", "upper_exclusive": "131", "amount_per_unit": "150"},
+          {"lower_inclusive": "131", "upper_exclusive": "141", "amount_per_unit": "195"},
+          {"lower_inclusive": "141", "upper_exclusive": "151", "amount_per_unit": "270"},
+          {"lower_inclusive": "151", "upper_exclusive": "171", "amount_per_unit": "375"},
+          {"lower_inclusive": "171", "upper_exclusive": "191", "amount_per_unit": "510"},
+          {"lower_inclusive": "191", "upper_exclusive": "226", "amount_per_unit": "605"},
+          {"lower_inclusive": "226", "upper_exclusive": "256", "amount_per_unit": "750"},
+          {"lower_inclusive": "256", "upper_exclusive": null, "amount_per_unit": "880"}
+        ],
+        "wltp": [
+          {"lower_inclusive": "0", "upper_exclusive": "1", "amount_per_unit": "0"},
+          {"lower_inclusive": "1", "upper_exclusive": "64", "amount_per_unit": "15"},
+          {"lower_inclusive": "64", "upper_exclusive": "95", "amount_per_unit": "30"},
+          {"lower_inclusive": "95", "upper_exclusive": "114", "amount_per_unit": "60"},
+          {"lower_inclusive": "114", "upper_exclusive": "124", "amount_per_unit": "90"},
+          {"lower_inclusive": "124", "upper_exclusive": "136", "amount_per_unit": "120"},
+          {"lower_inclusive": "136", "upper_exclusive": "154", "amount_per_unit": "150"},
+          {"lower_inclusive": "154", "upper_exclusive": "161", "amount_per_unit": "195"},
+          {"lower_inclusive": "161", "upper_exclusive": "173", "amount_per_unit": "270"},
+          {"lower_inclusive": "173", "upper_exclusive": "189", "amount_per_unit": "375"},
+          {"lower_inclusive": "189", "upper_exclusive": "211", "amount_per_unit": "510"},
+          {"lower_inclusive": "211", "upper_exclusive": "250", "amount_per_unit": "605"},
+          {"lower_inclusive": "250", "upper_exclusive": "283", "amount_per_unit": "750"},
+          {"lower_inclusive": "283", "upper_exclusive": null, "amount_per_unit": "880"}
+        ]
+      },
+      "legal_reference": "Уредба 277/2019 Табела 2 (220/2023); ЗДМВ чл. 6(1)(2); column choice UNCERTAIN - confirm"
+    },
+    {
+      "id": "dmv_co2_deemed_petrol",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, CO2 not established: deemed 400 g/km x 695 (petrol column top band)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "in", "value": ["petrol", "lpg", "cng", "hybrid_petrol"]}, {"input": "co2_source_document", "op": "eq", "value": "none_available"}],
+      "amount": "278000",
+      "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км); Уредба 277/2019 Табела 2 (220/2023) последна класа"
+    },
+    {
+      "id": "dmv_co2_deemed_diesel",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, CO2 not established: deemed 400 g/km x 880 (diesel column top band)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "in", "value": ["diesel", "hybrid_diesel"]}, {"input": "co2_source_document", "op": "eq", "value": "none_available"}],
+      "amount": "352000",
+      "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км); Уредба 277/2019 Табела 2 (220/2023) последна класа"
+    },
+    {
+      "id": "dmv_co2_deemed_phev_petrol",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, plug-in hybrid HS 8703 60, CO2 not established: deemed 400 g/km x 695 (petrol column top band; halved by dmv_plugin_hybrid_half)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "plugin_hybrid"}, {"input": "classification", "op": "in", "value": ["870360"]}, {"input": "co2_source_document", "op": "eq", "value": "none_available"}],
+      "amount": "278000",
+      "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км), чл. 9(3); Уредба 277/2019 Табела 2 (220/2023) последна класа; column choice UNCERTAIN - confirm"
+    },
+    {
+      "id": "dmv_co2_deemed_phev_diesel",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, plug-in hybrid HS 8703 70, CO2 not established: deemed 400 g/km x 880 (diesel column top band; halved by dmv_plugin_hybrid_half)",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "plugin_hybrid"}, {"input": "classification", "op": "in", "value": ["870370"]}, {"input": "co2_source_document", "op": "eq", "value": "none_available"}],
+      "amount": "352000",
+      "legal_reference": "ЗДМВ чл. 12(2) (400 гр./км), чл. 9(3); Уредба 277/2019 Табела 2 (220/2023) последна класа; column choice UNCERTAIN - confirm"
+    },
+    {
+      "id": "dmv_co2_bev_none",
+      "kind": "fixed",
+      "label": "ДМВ CO2 part, battery-electric: not subject",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "intermediate": true,
+      "alternative_group": "dmv_co2",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "electric"}],
+      "amount": "0",
+      "legal_reference": "ЗДМВ чл. 6(3)(1)"
+    },
+    {
+      "id": "dmv_full",
+      "kind": "percentage",
+      "label": "Motor-vehicle tax (ДМВ), full",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "alternative_group": "dmv",
+      "applies_when": [
+        {"input": "fuel", "op": "in", "value": ["petrol", "lpg", "cng", "hybrid_petrol", "diesel", "hybrid_diesel"]}
+      ],
+      "depends_on": ["dmv_value_part", "dmv_co2_petrol", "dmv_co2_diesel", "dmv_co2_deemed_petrol", "dmv_co2_deemed_diesel"],
+      "rate": "1",
+      "base": ["dmv_value_part", "dmv_co2_petrol", "dmv_co2_diesel", "dmv_co2_deemed_petrol", "dmv_co2_deemed_diesel"],
+      "legal_reference": "ЗДМВ чл. 6, 9(2), 10(2); Уредба 277/2019 чл. 2(1) (220/2023)"
+    },
+    {
+      "id": "dmv_plugin_hybrid_half",
+      "kind": "percentage",
+      "label": "Motor-vehicle tax (ДМВ), plug-in hybrid: 50% of calculated tax",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "alternative_group": "dmv",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "plugin_hybrid"}],
+      "depends_on": ["dmv_value_part", "dmv_co2_phev_petrol", "dmv_co2_phev_diesel", "dmv_co2_deemed_phev_petrol", "dmv_co2_deemed_phev_diesel"],
+      "rate": "0.5",
+      "base": ["dmv_value_part", "dmv_co2_phev_petrol", "dmv_co2_phev_diesel", "dmv_co2_deemed_phev_petrol", "dmv_co2_deemed_phev_diesel"],
+      "legal_reference": "ЗДМВ чл. 9(3)"
+    },
+    {
+      "id": "dmv_bev_not_subject",
+      "kind": "fixed",
+      "label": "Motor-vehicle tax (ДМВ), battery-electric HS 8703 80: not subject",
+      "category": "motor_vehicle_tax",
+      "currency": "MKD",
+      "alternative_group": "dmv",
+      "applies_when": [{"input": "fuel", "op": "eq", "value": "electric"}],
+      "amount": "0",
+      "legal_reference": "ЗДМВ чл. 6(3)(1)"
+    },
+    {"id": "vat_base_mkd", "kind": "percentage", "label": "Import VAT base: customs value + duty + ДМВ + incidental costs to first destination not in customs value (intermediate; ДМВ in the base per owner confirmation 2026-10-13)", "category": "import_vat", "currency": "MKD", "intermediate": true, "depends_on": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard", "dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject"], "rate": "1", "base": ["customs_value_mkd", "duty_preferential_eu", "duty_preferential_other_fta", "duty_us_origin", "duty_standard", "dmv_full", "dmv_plugin_hybrid_half", "dmv_bev_not_subject", "vat_incidental_costs_total"], "legal_reference": "ЗДДВ чл. 21(1)-(2), ДМВ under чл. 21(2)(1) (царината, даноците и другите увозни давачки, освен ДДВ) - owner confirmation 2026-10-13 (пречистен текст УЈП до 267/25)"},
+    {"id": "vat_import", "kind": "percentage", "label": "Import VAT 18%", "category": "import_vat", "currency": "MKD", "depends_on": ["vat_base_mkd"], "rate": "0.18", "base": ["vat_base_mkd"], "legal_reference": "ЗДДВ чл. 28-29 (општа стапка 18%); чл. 31(6)(1), 43(5)-(7)"}
+  ],
+  "rounding_rules": {
+    "component_default": {"quantum": "1", "mode": "half_up", "stage": "before_dependents"},
+    "total": {"quantum": "1", "mode": "half_up", "stage": "before_dependents"}
+  },
+  "missing_input_behavior": "return_incomplete",
+  "sha256": null,
+  "is_fixture": false
+}

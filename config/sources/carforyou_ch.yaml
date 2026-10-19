@@ -1,0 +1,50 @@
+# CarForYou (CH). Candidate acquisition source - DISABLED, nothing verified.
+# Candidate domain (UNVERIFIED, not opened): www.carforyou.ch
+# Exact domain(s), operator, terms, robots directives and public routes must be verified first.
+# A stored owner acknowledgement audits a decision; it is NOT legal permission,
+# and public accessibility is NOT permission.
+source_key: carforyou_ch
+display_name: "CarForYou public listings (CH)"
+country: CH
+role: acquisition
+mode: public_html
+adapter: carforyou_ch_public
+adapter_version: unimplemented   # no route/selector/ID pattern has been verified
+enabled: false
+technical_status: untested
+terms_status: unreviewed
+terms_url: null            # not identified/readable (see notes)
+terms_reviewed_at: null
+terms_decision: proceed_acknowledged
+terms_decision_actor: "owner (decision recorded 2026-10-14)"
+terms_decision_note: >-
+  Owner decision 2026-10-14 ("сакам сите да го вклучиш"): include this source; the owner accepts the
+  terms risk (audit record, not legal permission). Collection stays low-volume, obeys robots.txt on
+  every fetch, never uses CAPTCHA solving, stealth, proxies or fingerprint evasion, and stops on any
+  access block. Nothing could be read from the site, so terms_status stays unreviewed and keeps the
+  source gated.
+technical_denial_policy: stop_and_report
+robots_policy: obey
+robots_checked_at: 2026-10-14T00:00:00Z
+robots_summary: >-
+  robots.txt of www.carforyou.ch could NOT be retrieved on 2026-10-14: in 9 attempts (robots.txt and home page) the TLS
+  connection was reset during the handshake, and once the presented certificate did not match the
+  host name (TLS verification stays on; it is never bypassed). Under the robots module an
+  unreachable robots.txt means complete disallow until a fetch succeeds.
+source_timezone: Europe/Zurich
+# Home page only (2026-10-16): for the owner-run reachability probe (`capture-samples
+# --search-path /`, scripts/readiness_check.sh). No crawl route; the source stays disabled.
+allowed_hosts:
+  - 'www.carforyou.ch'
+allowed_search_paths:
+  - '^/$'
+allowed_detail_paths: []
+search: {}
+notes: >-
+  Swiss used-car marketplace candidate. Domain, operator, terms and imprint are UNVERIFIED: no page
+  could be fetched on 2026-10-14 (connection resets, one host-name mismatch). Observed from the
+  build environment (a cloud data-centre network) with our user agent; the owner's network may be
+  answered differently, and any block there stops the source the same way. No route, selector or
+  listing-ID pattern is encoded. Owner-network probe of 2026-10-16 (scripts/readiness_check.sh):
+  robots.txt gave no response, directly or via Crawl4AI, so nothing else was requested. The
+  source stays off.

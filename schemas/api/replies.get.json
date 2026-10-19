@@ -1,0 +1,317 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": true,
+  "path": "/api/replies",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /api/replies``: keyset page, optionally of one inquiry or only quarantined replies.",
+    "properties": {
+      "cursor": {
+        "default": null,
+        "description": "Opaque next_cursor from the previous page; omit for the first page.",
+        "maxLength": 2048,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "inquiry_id": {
+        "default": null,
+        "format": "uuid",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "default": 25,
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "quarantined_only": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "title": "ReplyListQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "inquiries:read",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "description": "One row of the reply list (no body).",
+              "properties": {
+                "availability": {
+                  "enum": [
+                    "available",
+                    "sold",
+                    "reserved",
+                    "not_available",
+                    "conflicting",
+                    "not_stated",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "content_withheld": {
+                  "default": false,
+                  "description": "True when claim-derived fields of a quarantined reply are withheld (owner only).",
+                  "type": "boolean"
+                },
+                "ingested_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "inquiry_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "message_type": {
+                  "enum": [
+                    "seller_reply",
+                    "auto_reply",
+                    "bounce",
+                    "delivery_notice",
+                    "spam",
+                    "ambiguous"
+                  ],
+                  "type": "string"
+                },
+                "original_language": {
+                  "pattern": "^[a-z]{2}$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "processing_state": {
+                  "enum": [
+                    "stored",
+                    "processed",
+                    "failed"
+                  ],
+                  "type": "string"
+                },
+                "quarantined": {
+                  "type": "boolean"
+                },
+                "received_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "reply_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "signal_status": {
+                  "default": null,
+                  "description": "The reply's seller.reply.received signal: emitted, coalesced (one was still pending for the inquiry), rate_limited (per-inquiry 24 h cap) or not_applicable; null before C1.",
+                  "enum": [
+                    "emitted",
+                    "coalesced",
+                    "rate_limited",
+                    "not_applicable",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "vehicle": {
+                  "additionalProperties": false,
+                  "description": "The canonical vehicle of an inquiry: a confirmed cluster or one listing incarnation.",
+                  "properties": {
+                    "listing_id": {
+                      "description": "The qualifying listing (source advertisement).",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "listing_reference": {
+                      "maxLength": 200,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "listing_url": {
+                      "maxLength": 2048,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "source_key": {
+                      "maxLength": 80,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "vehicle_cluster_id": {
+                      "format": "uuid",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "vehicle_kind": {
+                      "enum": [
+                        "vehicle_cluster",
+                        "listing_incarnation"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "vehicle_kind",
+                    "vehicle_cluster_id",
+                    "listing_id",
+                    "source_key",
+                    "listing_reference",
+                    "listing_url"
+                  ],
+                  "title": "InquiryVehicleRef",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "reply_id",
+                "inquiry_id",
+                "vehicle",
+                "message_type",
+                "original_language",
+                "availability",
+                "quarantined",
+                "processing_state",
+                "received_at",
+                "ingested_at",
+                "signal_status",
+                "content_withheld"
+              ],
+              "title": "ReplySummaryView",
+              "type": "object"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ReplyListView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "replies.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Seller replies with keyset pagination (no bodies)."
+}

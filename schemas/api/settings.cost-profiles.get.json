@@ -1,0 +1,739 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/api/settings/cost-profiles",
+  "request": null,
+  "requestLocation": null,
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "``GET /api/settings/cost-profiles`` (owner only).",
+        "properties": {
+          "configured": {
+            "additionalProperties": false,
+            "description": "A cost-profile version: stored (``id`` set) or the configured file.",
+            "properties": {
+              "approval_status": {
+                "enum": [
+                  "unapproved",
+                  "approved",
+                  "not_stored"
+                ],
+                "type": "string"
+              },
+              "approved_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "approved_by_principal": {
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "basis": {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              "can_approve": {
+                "description": "An owner approval is possible now (unapproved, not a fixture).",
+                "type": "boolean"
+              },
+              "content_sha256": {
+                "description": "Content hash without the approval record.",
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "created_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "currency": {
+                "pattern": "^[A-Z]{3}$",
+                "type": "string"
+              },
+              "id": {
+                "description": "The stored row (the configured file: its stored copy, if any).",
+                "format": "uuid",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "is_fixture": {
+                "type": "boolean"
+              },
+              "lines": {
+                "items": {
+                  "additionalProperties": false,
+                  "description": "One cost-profile assumption (amounts are decimal strings; unknown is null, never 0).",
+                  "properties": {
+                    "base": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "category": {
+                      "enum": [
+                        "purchase",
+                        "bank_fx_charges",
+                        "travel_inspection",
+                        "transport",
+                        "export_plates_insurance",
+                        "customs_broker",
+                        "import_duty",
+                        "motor_vehicle_tax",
+                        "import_vat",
+                        "other_import_charges",
+                        "homologation_registration",
+                        "repairs",
+                        "preparation",
+                        "risk_reserve",
+                        "storage_holding",
+                        "selling_costs",
+                        "refundable_deposit"
+                      ],
+                      "type": "string"
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": "string"
+                    },
+                    "high": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "label": {
+                      "maxLength": 200,
+                      "type": "string"
+                    },
+                    "low": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "maxLength": 1000,
+                      "type": "string"
+                    },
+                    "scope": {
+                      "description": "Only for this case (e.g. origin_country=CH).",
+                      "maxLength": 300,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "quoted",
+                        "estimated",
+                        "actual",
+                        "not_applicable",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "category",
+                    "label",
+                    "status",
+                    "currency",
+                    "low",
+                    "base",
+                    "high",
+                    "note",
+                    "scope"
+                  ],
+                  "title": "CostProfileLineView",
+                  "type": "object"
+                },
+                "maxItems": 200,
+                "type": "array"
+              },
+              "matches_stored": {
+                "description": "Configured file only: the stored copy of this version has the same content (null: not stored).",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "origin": {
+                "enum": [
+                  "stored",
+                  "configured_file"
+                ],
+                "type": "string"
+              },
+              "profile_key": {
+                "maxLength": 80,
+                "type": "string"
+              },
+              "transport": {
+                "additionalProperties": false,
+                "description": "The general (unscoped) transport line.",
+                "properties": {
+                  "base": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "category": {
+                    "enum": [
+                      "purchase",
+                      "bank_fx_charges",
+                      "travel_inspection",
+                      "transport",
+                      "export_plates_insurance",
+                      "customs_broker",
+                      "import_duty",
+                      "motor_vehicle_tax",
+                      "import_vat",
+                      "other_import_charges",
+                      "homologation_registration",
+                      "repairs",
+                      "preparation",
+                      "risk_reserve",
+                      "storage_holding",
+                      "selling_costs",
+                      "refundable_deposit"
+                    ],
+                    "type": "string"
+                  },
+                  "currency": {
+                    "pattern": "^[A-Z]{3}$",
+                    "type": "string"
+                  },
+                  "high": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "label": {
+                    "maxLength": 200,
+                    "type": "string"
+                  },
+                  "low": {
+                    "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "note": {
+                    "maxLength": 1000,
+                    "type": "string"
+                  },
+                  "scope": {
+                    "description": "Only for this case (e.g. origin_country=CH).",
+                    "maxLength": 300,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "enum": [
+                      "quoted",
+                      "estimated",
+                      "actual",
+                      "not_applicable",
+                      "unknown"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "category",
+                  "label",
+                  "status",
+                  "currency",
+                  "low",
+                  "base",
+                  "high",
+                  "note",
+                  "scope"
+                ],
+                "title": "CostProfileLineView",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "version": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "origin",
+              "id",
+              "profile_key",
+              "version",
+              "basis",
+              "currency",
+              "approval_status",
+              "approved_at",
+              "approved_by_principal",
+              "is_fixture",
+              "content_sha256",
+              "matches_stored",
+              "transport",
+              "lines",
+              "can_approve",
+              "created_at"
+            ],
+            "title": "CostProfileSummaryView",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "configured_file": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "configured_problem": {
+            "maxLength": 500,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "default": "The worker runtime values with the configured cost profile file; approving its stored version records your approval of these assumptions (valuations that used the unapproved version are marked stale and recomputed). Unknown lines stay unknown, never zero.",
+            "type": "string"
+          },
+          "profiles": {
+            "items": {
+              "additionalProperties": false,
+              "description": "A cost-profile version: stored (``id`` set) or the configured file.",
+              "properties": {
+                "approval_status": {
+                  "enum": [
+                    "unapproved",
+                    "approved",
+                    "not_stored"
+                  ],
+                  "type": "string"
+                },
+                "approved_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "approved_by_principal": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "basis": {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                "can_approve": {
+                  "description": "An owner approval is possible now (unapproved, not a fixture).",
+                  "type": "boolean"
+                },
+                "content_sha256": {
+                  "description": "Content hash without the approval record.",
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "currency": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "The stored row (the configured file: its stored copy, if any).",
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "is_fixture": {
+                  "type": "boolean"
+                },
+                "lines": {
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "One cost-profile assumption (amounts are decimal strings; unknown is null, never 0).",
+                    "properties": {
+                      "base": {
+                        "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "category": {
+                        "enum": [
+                          "purchase",
+                          "bank_fx_charges",
+                          "travel_inspection",
+                          "transport",
+                          "export_plates_insurance",
+                          "customs_broker",
+                          "import_duty",
+                          "motor_vehicle_tax",
+                          "import_vat",
+                          "other_import_charges",
+                          "homologation_registration",
+                          "repairs",
+                          "preparation",
+                          "risk_reserve",
+                          "storage_holding",
+                          "selling_costs",
+                          "refundable_deposit"
+                        ],
+                        "type": "string"
+                      },
+                      "currency": {
+                        "pattern": "^[A-Z]{3}$",
+                        "type": "string"
+                      },
+                      "high": {
+                        "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "label": {
+                        "maxLength": 200,
+                        "type": "string"
+                      },
+                      "low": {
+                        "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "note": {
+                        "maxLength": 1000,
+                        "type": "string"
+                      },
+                      "scope": {
+                        "description": "Only for this case (e.g. origin_country=CH).",
+                        "maxLength": 300,
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "status": {
+                        "enum": [
+                          "quoted",
+                          "estimated",
+                          "actual",
+                          "not_applicable",
+                          "unknown"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "category",
+                      "label",
+                      "status",
+                      "currency",
+                      "low",
+                      "base",
+                      "high",
+                      "note",
+                      "scope"
+                    ],
+                    "title": "CostProfileLineView",
+                    "type": "object"
+                  },
+                  "maxItems": 200,
+                  "type": "array"
+                },
+                "matches_stored": {
+                  "description": "Configured file only: the stored copy of this version has the same content (null: not stored).",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "origin": {
+                  "enum": [
+                    "stored",
+                    "configured_file"
+                  ],
+                  "type": "string"
+                },
+                "profile_key": {
+                  "maxLength": 80,
+                  "type": "string"
+                },
+                "transport": {
+                  "additionalProperties": false,
+                  "description": "The general (unscoped) transport line.",
+                  "properties": {
+                    "base": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "category": {
+                      "enum": [
+                        "purchase",
+                        "bank_fx_charges",
+                        "travel_inspection",
+                        "transport",
+                        "export_plates_insurance",
+                        "customs_broker",
+                        "import_duty",
+                        "motor_vehicle_tax",
+                        "import_vat",
+                        "other_import_charges",
+                        "homologation_registration",
+                        "repairs",
+                        "preparation",
+                        "risk_reserve",
+                        "storage_holding",
+                        "selling_costs",
+                        "refundable_deposit"
+                      ],
+                      "type": "string"
+                    },
+                    "currency": {
+                      "pattern": "^[A-Z]{3}$",
+                      "type": "string"
+                    },
+                    "high": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "label": {
+                      "maxLength": 200,
+                      "type": "string"
+                    },
+                    "low": {
+                      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "note": {
+                      "maxLength": 1000,
+                      "type": "string"
+                    },
+                    "scope": {
+                      "description": "Only for this case (e.g. origin_country=CH).",
+                      "maxLength": 300,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "enum": [
+                        "quoted",
+                        "estimated",
+                        "actual",
+                        "not_applicable",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "category",
+                    "label",
+                    "status",
+                    "currency",
+                    "low",
+                    "base",
+                    "high",
+                    "note",
+                    "scope"
+                  ],
+                  "title": "CostProfileLineView",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "version": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "origin",
+                "id",
+                "profile_key",
+                "version",
+                "basis",
+                "currency",
+                "approval_status",
+                "approved_at",
+                "approved_by_principal",
+                "is_fixture",
+                "content_sha256",
+                "matches_stored",
+                "transport",
+                "lines",
+                "can_approve",
+                "created_at"
+              ],
+              "title": "CostProfileSummaryView",
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          }
+        },
+        "required": [
+          "configured_file",
+          "configured",
+          "configured_problem",
+          "profiles",
+          "note"
+        ],
+        "title": "CostProfilesView",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "settings.cost-profiles.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only: the configured cost profile (with its transport line) and the stored versions."
+}

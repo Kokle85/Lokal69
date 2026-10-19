@@ -1,0 +1,107 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "VERSION_CONFLICT",
+    "IDEMPOTENCY_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "required",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/v1/mail-workers/canary-intents/{canary_id}/reply",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /v1/mail-workers/canary-intents/{canary_id}/reply`` (headers only; the\nreply's sender as its target hash).",
+    "properties": {
+      "canary_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "from_address_hash": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "in_reply_to": {
+        "default": [],
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+      },
+      "internet_message_id": {
+        "maxLength": 998,
+        "minLength": 3,
+        "type": "string"
+      },
+      "mailbox_binding_id": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "received_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "references": {
+        "default": [],
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "worker_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "canary_id",
+      "mailbox_binding_id",
+      "worker_id",
+      "internet_message_id",
+      "from_address_hash",
+      "received_at"
+    ],
+    "title": "MailWorkerCanaryReply",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of the report and account-report routes.",
+    "properties": {
+      "accepted": {
+        "const": true,
+        "default": true,
+        "type": "boolean"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "title": "mail-workers.canary-intents.canary_id.reply.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "The owner's correlated test reply to an activation canary (headers only)."
+}

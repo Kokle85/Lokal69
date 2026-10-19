@@ -1,0 +1,481 @@
+{
+  "description": "Activation step 6 evidence of autoscout24_it (owner live smoke 2026-10-17): ids, versions, hashes and codes only; no URL, page, body or listing text. Built from the owner's `sources smoke-evidence` output for run 46f4bdec (the step-6 discovery) and run ac1a09b6 (whose queued detail jobs the step-6 drain processed).",
+  "commit": "25f43f8a1451f534cb49e1b93659f904f263742a",
+  "build_id": "dev",
+  "crawler": {
+    "image": "unclecode/crawl4ai@sha256:9021b3cb5c6f12570bbcd5395638495e0a06969b3148e377b953d174af2ebc9b",
+    "version": "0.9.4",
+    "topology": "host-local loopback (127.0.0.1:11235)"
+  },
+  "config_revision": {
+    "config_hash": "ebf0d4bcd014c4fc93f099bd91ec51ffd23ccb29b3edf3bcf83c83f5e7264af0",
+    "effective_at": "2026-10-15 12:53:18.170755+00:00",
+    "id": "360d0a9d-b46d-4442-bb8b-309751cde88e",
+    "revision": 1
+  },
+  "adapter_version": "autoscout24@1.0.0",
+  "robots_revision": {
+    "availability": "available",
+    "body_truncated": false,
+    "content_hash": "7c78475c525adef6bf88187d53e75e9eb7b4ae9fdbe4f05215fb5ddafb396478",
+    "fetched_at": "2026-10-17 11:50:56.709743+00:00",
+    "host": "www.autoscout24.it",
+    "http_status": 200,
+    "id": "dad6209a-1e23-4f87-a88f-e140e6da7633",
+    "parse_ok": true,
+    "user_agent": "SUVDealResearch/0.1 (+private research; contact owner)"
+  },
+  "discovery": {
+    "id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255",
+    "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+    "profile_id": "207e605d-8fd8-4fa5-aec8-9ce02c23be21",
+    "outcome": "complete",
+    "access_state": "ok",
+    "adapter_version": "autoscout24@1.0.0",
+    "parser_version": "autoscout24@1.0.0",
+    "started_at": "2026-10-17 11:50:56.523651+00:00",
+    "finished_at": "2026-10-17 11:55:32.912107+00:00",
+    "pages_fetched": 12,
+    "cards_seen": 15,
+    "new_listings": 0,
+    "changed_listings": 0,
+    "detail_jobs_enqueued": 0,
+    "gap_reasons": []
+  },
+  "discovery_fetches": [
+    {
+      "id": "03976780-d703-4d0c-bcb3-c6838b10e05d",
+      "purpose": "robots",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:50:56.709743+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "d6207abc-f0a9-4cc0-94c6-60807e41047e",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:51:19.721605+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "d22bf0d0-6b5a-45f0-b227-54a31e0004ba",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:51:42.390822+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "a14d178e-052a-4990-9747-5f87aafa031a",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:52:02.949821+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "2464f065-5ae4-4251-8db2-4aa28864cd7d",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:52:26.186894+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "566b8212-b597-477f-b101-8cb9f7a249a7",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:52:48.960318+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "69392b66-b183-4cc7-b691-42093d79799f",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:53:09.364012+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "046310da-e29e-4664-ba16-7ea5e26ea9ab",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:53:32.608355+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "7225aa9a-9d90-48b0-b6ae-af30a1b15da2",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:53:54.984868+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "f161560b-c048-46ed-9c44-a633ccdda302",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:54:15.355293+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "5795600c-6eb3-44eb-a677-22bdd599fff1",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:54:38.565681+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "d141db7e-592f-4eb3-bfef-eeab247b78ce",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:54:59.142875+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    },
+    {
+      "id": "32805e16-0f2d-4b0d-a589-94e31526e01b",
+      "purpose": "search",
+      "host": "www.autoscout24.it",
+      "http_status": 200,
+      "access_state": "ok",
+      "error_code": null,
+      "fetched_at": "2026-10-17 11:55:21.135632+00:00",
+      "job_id": "d3c60927-9dc7-426b-8a5a-20cab1087c32",
+      "crawl_run_id": "46f4bdec-1a91-4702-8ecb-1dff3f5a7255"
+    }
+  ],
+  "cards_observed": [
+    {
+      "listing_id": "76ee20ec-7bdb-4895-b030-b3cba64ce2d8",
+      "observation_id": "93d4cef2-c01c-4fc1-a808-4b765c1e618b",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "c08f05ea-574c-41b4-aefd-c650eba6a336",
+      "observation_id": "18798c5f-72ce-4026-9d37-7b37071692d0",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "88b68d4a-6099-4f51-a635-fc99653d9ff2",
+      "observation_id": "f2941513-7872-47a3-ae48-1026bb783f0d",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "5d6d3f29-19d1-43f0-8f5b-dcb7f7589914",
+      "observation_id": "ff816f56-a48c-4265-876b-19f559679e84",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "19651894-7f11-4049-b6f1-4b14cfa2bded",
+      "observation_id": "523d4293-6620-482f-b58e-1451e698bce4",
+      "current_revision_id": "3170f0e5-c12c-4d61-8a1a-149f891bbe7c",
+      "eligibility_state": "rejected"
+    },
+    {
+      "listing_id": "b14eb095-3dfd-405e-babd-b6f19f2e0172",
+      "observation_id": "80d64be7-4020-475b-9bca-544e7b561a22",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "5ae01676-f476-41f9-a735-63ce6572d960",
+      "observation_id": "043d9a79-c8d3-40c4-a5a9-db0aba3f58c7",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "aec2e390-ae15-43ef-8836-22e3787231d8",
+      "observation_id": "2e38c178-24dd-4fc8-a93c-7761fd49c42e",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "74990a4b-722b-446d-9e8b-60283d83e275",
+      "observation_id": "5cc7e110-6e31-4b31-ac98-6098f854c9bc",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "1ad419aa-a21c-4970-b823-aba74dc8cf71",
+      "observation_id": "04914675-158c-4a7f-9416-25a75d802348",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "2bf88aa4-a565-4cf7-b1de-3d9688ae675f",
+      "observation_id": "82b0ed0f-b01a-46e4-98ae-5ee0713394a7",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "4c2238d4-3093-4b44-a6eb-c00603eed2f7",
+      "observation_id": "25e77864-9bd0-4f76-a75c-10c7d6076c34",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "42e68212-a217-4666-82d2-f9776fc0225e",
+      "observation_id": "fe5cbb5a-a35c-43a1-8d63-fbd3daab497c",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "25004cf9-96da-463e-8ef1-6e67fdb0d015",
+      "observation_id": "9247eab8-90fa-4d30-a916-086901d6365e",
+      "current_revision_id": null,
+      "eligibility_state": null
+    },
+    {
+      "listing_id": "620f99bb-d563-4a37-b56c-6ffcc522fc8c",
+      "observation_id": "7e349a64-34fd-42c2-a0cc-535f78f0ad9a",
+      "current_revision_id": "2c03793a-2d66-46cc-b8d5-e5af9675de72",
+      "eligibility_state": "eligible_primary"
+    }
+  ],
+  "detail_ingests": [
+    {
+      "job_id": "18d1926b-b0b8-4846-85ae-199881d2e6fd",
+      "state": "succeeded",
+      "listing_id": "7f85e4f0-6ef4-408e-9630-76b057ec177b",
+      "fetches": [
+        {
+          "id": "389c12fc-4bcc-4c45-b421-788799a1a885",
+          "purpose": "detail",
+          "host": "www.autoscout24.it",
+          "http_status": 200,
+          "access_state": "ok",
+          "error_code": null,
+          "fetched_at": "2026-10-17 11:55:42.636553+00:00",
+          "job_id": "18d1926b-b0b8-4846-85ae-199881d2e6fd",
+          "crawl_run_id": null
+        }
+      ],
+      "revision_id": "faf012b2-325d-4f22-9dfc-f638cecc273c",
+      "revision_number": 1,
+      "parser_version": "autoscout24@1.0.0",
+      "seller_country": "BE",
+      "eligibility_state": "rejected",
+      "quarantined": false,
+      "evidence_ids": [
+        "a59e821e-1d7b-4001-aad5-9f08c5f1aa66",
+        "f223c81f-a42b-4568-80b7-5ab259ef54ec",
+        "63d14130-655f-4e0c-9d33-e3a1fc312f59",
+        "2cd85e9a-5322-4ee2-a927-29366d6e56b6",
+        "477ce3ae-55d4-4ec0-925d-75c80821eec0",
+        "19a834bf-5e91-457a-95bb-f80e8d885733",
+        "bb532ea7-ce2c-45c1-846f-8d9b57f82d1a",
+        "d28076a5-f2c6-43ec-bfce-607a1a41af3e",
+        "fbd4964e-ef97-4e5b-add3-da1cc8c6b1af",
+        "4f092587-5560-4fd6-bb8b-1a5c5e04ea68",
+        "f0c4b970-a7c8-4ead-8e1f-54735c1e92c1",
+        "38e1b0bf-4e53-46d1-a86d-add8c885171c",
+        "27fe966e-90d8-44ac-acd6-b8a5b3551526"
+      ]
+    },
+    {
+      "job_id": "25b5786b-5581-4358-ba14-327a9f7b8f65",
+      "state": "succeeded",
+      "listing_id": "eb5543ed-8a37-4c3e-af63-31362bb7da4e",
+      "fetches": [
+        {
+          "id": "f81b2c64-927e-4575-a4af-7e670d92997d",
+          "purpose": "detail",
+          "host": "www.autoscout24.it",
+          "http_status": 200,
+          "access_state": "ok",
+          "error_code": null,
+          "fetched_at": "2026-10-17 11:56:03.145966+00:00",
+          "job_id": "25b5786b-5581-4358-ba14-327a9f7b8f65",
+          "crawl_run_id": null
+        }
+      ],
+      "revision_id": "d0f0ca62-27a5-4d5f-9991-b1bf11bff2a4",
+      "revision_number": 1,
+      "parser_version": "autoscout24@1.0.0",
+      "seller_country": "AT",
+      "eligibility_state": "rejected",
+      "quarantined": false,
+      "evidence_ids": [
+        "ae922e2d-13cc-4dd1-b54f-175e7e249d93",
+        "c8a18615-5fb9-4cb7-9d05-a96df001dbde",
+        "17c529a5-2b48-477f-9583-bc42d289577d",
+        "cb14b30a-4dd7-4a56-9445-35d14c6995b0",
+        "6e2f326c-0b0a-4a67-b313-881a5afcf69f",
+        "3012d5f2-b15a-44e3-bf98-5c69adff7c3f",
+        "6dd2e195-6901-4f3c-b112-2340086b8b19",
+        "ec64833b-e180-4e2c-a02f-e0bf55ff6fad",
+        "32879ccc-3b48-4dc5-a6c6-ac06cdabe59f",
+        "ae5497f0-711f-492e-b4d6-4b755e15cd3d",
+        "71e51c61-cb48-4c27-8e0b-d87524ee7f0d",
+        "3118d8c0-653b-4834-9a49-97dab6308dc6",
+        "0e35202a-0137-42b5-b803-667fc17e5845",
+        "61347df1-dbac-485a-9a56-a6f682f6e1f5",
+        "dd466cb2-2cc9-4df5-a97b-39bcc2394210",
+        "642eb33b-f3a5-4a20-b38e-f6e42879967a"
+      ]
+    },
+    {
+      "job_id": "2b6d3ec8-7d98-46e8-a26f-b74269540d18",
+      "state": "succeeded",
+      "listing_id": "07b6b259-57bc-4721-9ed1-f5a88e5951c2",
+      "fetches": [
+        {
+          "id": "c30cbcb3-5223-41d1-aaea-26559c287ba8",
+          "purpose": "detail",
+          "host": "www.autoscout24.it",
+          "http_status": 200,
+          "access_state": "ok",
+          "error_code": null,
+          "fetched_at": "2026-10-17 11:56:25.048491+00:00",
+          "job_id": "2b6d3ec8-7d98-46e8-a26f-b74269540d18",
+          "crawl_run_id": null
+        }
+      ],
+      "revision_id": "7ce1c9bb-f233-40ad-895f-afe861d2ef43",
+      "revision_number": 1,
+      "parser_version": "autoscout24@1.0.0",
+      "seller_country": "BE",
+      "eligibility_state": "rejected",
+      "quarantined": false,
+      "evidence_ids": [
+        "2a2919e6-0321-4cdf-8938-0aa6e21be209",
+        "24909913-d987-4556-8d0b-fabc827b619d",
+        "cc5c69b1-4787-4713-83a1-891823ff8f81",
+        "4a9ece5d-efde-4f28-acd4-95e3064fb365",
+        "34aa295d-0053-429c-a284-1e0243ce26c9",
+        "4e7ec0de-0e8c-4f5c-b1c9-a957301598bd",
+        "e2f24ad6-ac6f-4c6e-ab09-b5f1e72b3014",
+        "f5cac7f7-e387-4702-8f41-7b49eaa11576",
+        "6daa643b-87fc-4351-95ff-dafcb6fda8c9",
+        "569b8c34-d78c-4085-a321-84c3e15465b9",
+        "2ecf9580-2d46-48ea-bf28-e45cf7cebf4a",
+        "72d8fc0a-ad2c-41c4-af8d-af295c6fd2cc",
+        "07f8a614-cba9-4507-804f-f23ef4edd0c0",
+        "fb94e291-a916-4989-a2a5-bae71c70de4f",
+        "53f06ea7-b8ae-4dc1-a9c9-e25f969a2f86"
+      ]
+    },
+    {
+      "job_id": "3130e66f-77cb-49dc-9eb3-514820b0a8a3",
+      "state": "succeeded",
+      "listing_id": "f083eea6-f7e1-4708-8699-2e66ab02991a",
+      "fetches": [
+        {
+          "id": "08c25359-c199-4eba-927f-d40d9d33f701",
+          "purpose": "detail",
+          "host": "www.autoscout24.it",
+          "http_status": 410,
+          "access_state": "removed",
+          "error_code": "http_gone",
+          "fetched_at": "2026-10-17 11:56:47.998587+00:00",
+          "job_id": "3130e66f-77cb-49dc-9eb3-514820b0a8a3",
+          "crawl_run_id": null
+        }
+      ],
+      "revision_id": null,
+      "note": "HTTP 410: listing removed on the site; no revision (availability removed)"
+    },
+    {
+      "job_id": "36096ba2-f3fe-4689-8aa1-f6cd335b056a",
+      "state": "succeeded",
+      "listing_id": "3ec9139c-b332-45e5-bd23-0561bb6f66f1",
+      "fetches": [
+        {
+          "id": "c96d9c55-f6f4-47cf-8e15-7a3654cb5105",
+          "purpose": "detail",
+          "host": "www.autoscout24.it",
+          "http_status": 200,
+          "access_state": "ok",
+          "error_code": null,
+          "fetched_at": "2026-10-17 11:57:08.368764+00:00",
+          "job_id": "36096ba2-f3fe-4689-8aa1-f6cd335b056a",
+          "crawl_run_id": null
+        }
+      ],
+      "revision_id": "4cde316a-040a-4c72-8be9-b3a05e4722a2",
+      "revision_number": 1,
+      "parser_version": "autoscout24@1.0.0",
+      "seller_country": "FR",
+      "eligibility_state": "rejected",
+      "quarantined": false,
+      "evidence_ids": [
+        "4d76f356-7592-4ddc-a1e4-9147c1688c48",
+        "744b2e65-2c08-4881-8858-19ee2ef6660a",
+        "57466c67-9479-44bb-909e-49b71c06acc5",
+        "56a3c5c1-232c-451e-bd9c-5970c86d13fc",
+        "0e314e27-4181-4b5e-ad87-438a6ef267e6",
+        "d9f866bc-addf-4867-be1a-94cfbc7183e7",
+        "d1048653-86fa-4cd9-9a9d-f7150dbd86b5",
+        "e12ca7da-9206-436b-96b7-e5a7a5f2292d",
+        "0144384f-5059-4965-944e-abf8dfc61b9c",
+        "8ebc1332-b434-495d-93ed-39effdd05fb6",
+        "2c8440fa-bafe-4edb-941e-881f83785e9c",
+        "9b2081b9-f234-4f6f-acc7-c3a88991e4f1",
+        "ef379693-f98d-4f52-bb17-f56c0b6091ce",
+        "1ad1f87e-dee7-4cac-9320-b66cb73f2f49"
+      ]
+    }
+  ],
+  "seller_countries_known": {
+    "kept_by_cy_I_walk": {
+      "19651894-7f11-4049-b6f1-4b14cfa2bded": "IT",
+      "620f99bb-d563-4a37-b56c-6ffcc522fc8c": "IT"
+    },
+    "dropped_by_cy_I_walk": {
+      "07b6b259-57bc-4721-9ed1-f5a88e5951c2": "BE",
+      "28a1825b-8886-4de6-b53b-6b0130e52107": "NL",
+      "3ec9139c-b332-45e5-bd23-0561bb6f66f1": "FR",
+      "7f85e4f0-6ef4-408e-9630-76b057ec177b": "BE",
+      "eb5543ed-8a37-4c3e-af63-31362bb7da4e": "AT",
+      "f72fea32-d753-4546-a4de-e48db259deaf": "DE",
+      "fc8912b7-6331-4e46-903f-f5f3537c08fb": "BE"
+    }
+  }
+}

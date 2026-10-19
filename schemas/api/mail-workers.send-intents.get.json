@@ -1,0 +1,189 @@
+{
+  "auth": "mail_worker",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR"
+  ],
+  "idempotencyKeyHeader": null,
+  "mcpTool": null,
+  "method": "GET",
+  "paginated": false,
+  "path": "/v1/mail-workers/send-intents",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "``GET /v1/mail-workers/send-intents?limit=<1..50>``.",
+    "properties": {
+      "limit": {
+        "default": 10,
+        "maximum": 50,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "title": "MailWorkerSendIntentsQuery",
+    "type": "object"
+  },
+  "requestLocation": "query",
+  "requiredScope": "mail:ingest",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Response of ``GET /v1/mail-workers/send-intents`` (== ``wire.SendIntentBatch``).",
+    "properties": {
+      "intents": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "description": "One ``outlook_local`` send intent (== ``wire.WorkerSendIntent``; the length limits and the\n``inquiry_ref == \"inquiry-<inquiry_id>\"`` check live on ``OutlookSendIntent`` itself).\n\n``expired``: the intent's validity ended before any worker claimed it (the backend reaped\nthe attempt as uncertain and no report exists). The worker refuses it as\n``intent_expired`` (never sends it), which lets the backend prove non-submission and\nreconcile the inquiry.",
+          "properties": {
+            "account_id": {
+              "maxLength": 320,
+              "minLength": 1,
+              "type": "string"
+            },
+            "attempt_number": {
+              "maximum": 99,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "binding_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "binding_version": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "body_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "body_text": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "created_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "expired": {
+              "default": false,
+              "type": "boolean"
+            },
+            "from_address": {
+              "maxLength": 254,
+              "type": "string"
+            },
+            "from_display_name": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "idempotency_key": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[A-Za-z0-9._:-]+$",
+              "type": "string"
+            },
+            "inquiry_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "inquiry_ref": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "intent_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "mailbox_binding_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "mime_sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "not_after": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "reply_to_address": {
+              "default": null,
+              "maxLength": 254,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rfc_message_id": {
+              "maxLength": 998,
+              "type": "string"
+            },
+            "schema_version": {
+              "const": "1.0",
+              "default": "1.0",
+              "type": "string"
+            },
+            "subject": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "to_address": {
+              "maxLength": 254,
+              "type": "string"
+            }
+          },
+          "required": [
+            "intent_id",
+            "inquiry_id",
+            "attempt_number",
+            "idempotency_key",
+            "mailbox_binding_id",
+            "binding_id",
+            "binding_version",
+            "account_id",
+            "from_address",
+            "from_display_name",
+            "to_address",
+            "subject",
+            "body_text",
+            "rfc_message_id",
+            "inquiry_ref",
+            "body_hash",
+            "mime_sha256",
+            "created_at",
+            "not_after"
+          ],
+          "title": "MailWorkerSendIntent",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      },
+      "kill_switch_active": {
+        "type": "boolean"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      }
+    },
+    "required": [
+      "kill_switch_active"
+    ],
+    "title": "mail-workers.send-intents.get_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Pending outlook_local send intents of the worker's mailbox plus the kill switch state."
+}

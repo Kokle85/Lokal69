@@ -1,0 +1,209 @@
+{
+  "auth": "user_jwt",
+  "errors": [
+    "UNAUTHENTICATED",
+    "FORBIDDEN",
+    "VALIDATION_ERROR",
+    "RATE_LIMITED",
+    "DEPENDENCY_UNAVAILABLE",
+    "INTERNAL_ERROR",
+    "NOT_FOUND",
+    "IDEMPOTENCY_CONFLICT",
+    "VERSION_CONFLICT"
+  ],
+  "idempotencyKeyHeader": "optional",
+  "mcpTool": null,
+  "method": "POST",
+  "paginated": false,
+  "path": "/api/sources/{source_id}/resume",
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Body of ``POST /api/sources/{source_id}/resume`` (owner only, ``config:admin``; never an MCP\ntool, so there is no tool input to convert to).\n\nThe same fields as the pause body: ``expected_version`` is the source ``version`` the owner saw\n(a changed source is ``409 VERSION_CONFLICT``), ``reason`` is audited, ``idempotency_key`` is\nbound to the source (same key + same request replays the original result).",
+    "properties": {
+      "expected_version": {
+        "description": "Source version from the source status; a changed source returns VERSION_CONFLICT.",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "idempotency_key": {
+        "description": "Client-chosen key scoped to the caller and operation; a retry with the same key and request returns the original result.",
+        "maxLength": 128,
+        "minLength": 8,
+        "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+        "type": "string"
+      },
+      "reason": {
+        "description": "Why (recorded in the audit trail).",
+        "maxLength": 2000,
+        "minLength": 3,
+        "type": "string"
+      }
+    },
+    "required": [
+      "expected_version",
+      "reason",
+      "idempotency_key"
+    ],
+    "title": "ResumeSourceRequest",
+    "type": "object"
+  },
+  "requestLocation": "body",
+  "requiredScope": "config:admin",
+  "response": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "as_of": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "data": {
+        "additionalProperties": false,
+        "description": "The owner's resume of a paused source (``POST /api/sources/{source_id}/resume`` and\n``suv-deals sources resume``; ``config:admin``, never an MCP tool).\n\n``was_paused=False`` is the no-op of a source that was not paused (nothing changed, no job\nrequeued). Otherwise the pause is cleared and, in the same transaction, this source's jobs that\nwere ``blocked`` with ``source_paused`` are back in ``queued`` (``requeued_jobs``). ``enabled``,\n``technical_status`` and ``network_allowed`` are the source's state after the resume: they are\nnever changed by it, so a source the configuration does not enable stays off.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "network_allowed": {
+            "type": "boolean"
+          },
+          "notice": {
+            "default": "A resume only clears the operator pause. It never enables a source (enabling is a configuration revision: the source YAML and `sources sync`) and never changes its technical status (access_blocked / parser_unhealthy are cleared only by the owner's explicit technical-status action).",
+            "type": "string"
+          },
+          "paused": {
+            "const": false,
+            "default": false,
+            "type": "boolean"
+          },
+          "requeued_jobs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "source_key": {
+            "maxLength": 80,
+            "type": "string"
+          },
+          "technical_status": {
+            "enum": [
+              "untested",
+              "fixture_tested",
+              "live_smoke_passed",
+              "degraded",
+              "parser_unhealthy",
+              "access_blocked"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "was_paused": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "source_id",
+          "source_key",
+          "paused",
+          "was_paused",
+          "version",
+          "enabled",
+          "technical_status",
+          "network_allowed",
+          "requeued_jobs",
+          "notice"
+        ],
+        "title": "SourceResumeResult",
+        "type": "object"
+      },
+      "next_cursor": {
+        "default": null,
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "pattern": "^[\\x21-\\x7e]{1,200}$",
+        "type": "string"
+      },
+      "schema_version": {
+        "const": "1.0",
+        "default": "1.0",
+        "type": "string"
+      },
+      "warnings": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Typed warning codes. Each warning also carries a user-readable explanation.",
+              "enum": [
+                "STALE_DATA",
+                "SOURCE_PAUSED",
+                "SOURCE_BLOCKED",
+                "COVERAGE_GAP",
+                "FIXTURE_DATA",
+                "RESEARCH_CANDIDATE",
+                "VALUATION_INCOMPLETE",
+                "VALUATION_STALE",
+                "UNKNOWN_COSTS",
+                "INSUFFICIENT_COMPARABLES",
+                "SMALL_COMPARABLE_SAMPLE",
+                "ASKING_NOT_SALE",
+                "THRESHOLD_PROPOSED",
+                "TAX_RULES_UNAPPROVED",
+                "FX_STALE",
+                "SELLER_CLAIMS_UNVERIFIED",
+                "SCORE_NOT_PROBABILITY",
+                "FROZEN_QUEUE_PROJECTION",
+                "REVISION_NOT_CURRENT",
+                "NEW_REVISION_AVAILABLE",
+                "CLAIM_EXPIRING",
+                "ACTIVATION_BLOCKED",
+                "PARTIAL_RESULTS",
+                "DEPENDENCY_DEGRADED"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "title": "Warning",
+          "type": "object"
+        },
+        "maxItems": 50,
+        "type": "array"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "as_of",
+      "data",
+      "warnings",
+      "next_cursor"
+    ],
+    "title": "sources.source_id.resume.post_response",
+    "type": "object"
+  },
+  "successStatus": 200,
+  "summary": "Owner-only: clear a source's pause against the expected source version and requeue its source_paused jobs; never enables the source or changes its technical status."
+}

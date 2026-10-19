@@ -1,0 +1,1039 @@
+{
+  "$id": "urn:suv-deals:schema:1.0:review",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "``schemas/review.schema.json``: one review case with its candidate and decision history.",
+  "properties": {
+    "candidate": {
+      "additionalProperties": false,
+      "description": "One row of the candidate queue (spec 23 screen 2).",
+      "properties": {
+        "availability": {
+          "enum": [
+            "available",
+            "reserved",
+            "removed",
+            "sold_claimed",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "case_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eligibility": {
+          "enum": [
+            "eligible_primary",
+            "eligible_manual_profile",
+            "needs_facts",
+            "rejected",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eligibility_profile": {
+          "enum": [
+            "primary",
+            "manual_4000",
+            "below_target_watch",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "first_registration": {
+          "additionalProperties": false,
+          "description": "A date known only to some precision. `2011-05` is never invented as 2011-05-01.",
+          "properties": {
+            "precision": {
+              "default": "unknown",
+              "enum": [
+                "day",
+                "month",
+                "year",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "default": null,
+              "pattern": "^\\d{4}(-\\d{2}(-\\d{2})?)?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "PartialDate",
+          "type": "object"
+        },
+        "freshness": {
+          "additionalProperties": false,
+          "properties": {
+            "first_seen_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "flags": {
+              "items": {
+                "enum": [
+                  "detail_never_fetched",
+                  "detail_stale",
+                  "not_seen_recently",
+                  "availability_unchecked",
+                  "source_paused"
+                ],
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            },
+            "last_availability_check_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_detail_success_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_seen_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "first_seen_at",
+            "last_seen_at",
+            "last_detail_success_at",
+            "last_availability_check_at",
+            "stale",
+            "flags"
+          ],
+          "title": "FreshnessView",
+          "type": "object"
+        },
+        "generation": {
+          "maxLength": 80,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_fixture": {
+          "type": "boolean"
+        },
+        "listing_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "make": {
+          "maxLength": 80,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mileage_claim": {
+          "enum": [
+            "seller_reported",
+            "documented",
+            "verified",
+            "estimated",
+            "range_only",
+            "conflicting",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "mileage_km": {
+          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "maxLength": 120,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "price": {
+          "additionalProperties": false,
+          "description": "Payable price in the advertised currency plus its EUR equivalent (rounded for display).",
+          "properties": {
+            "basis": {
+              "enum": [
+                "gross",
+                "net",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "eur_equivalent": {
+              "additionalProperties": false,
+              "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+              "properties": {
+                "amount": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "currency": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "default": null,
+                  "maxLength": 500,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "known",
+                    "unknown",
+                    "not_applicable"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "amount",
+                "currency",
+                "reason"
+              ],
+              "title": "AmountView",
+              "type": "object"
+            },
+            "fx_rate": {
+              "additionalProperties": false,
+              "description": "A recorded FX observation with its explicit direction: 1 ``base`` = ``rate`` ``quote``.",
+              "properties": {
+                "base": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": "string"
+                },
+                "direction": {
+                  "maxLength": 120,
+                  "type": "string"
+                },
+                "provider": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "purpose": {
+                  "enum": [
+                    "reference",
+                    "customs",
+                    "payment"
+                  ],
+                  "type": "string"
+                },
+                "quote": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": "string"
+                },
+                "rate": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": "string"
+                },
+                "rate_date": {
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "base",
+                "quote",
+                "rate",
+                "rate_date",
+                "provider",
+                "purpose",
+                "direction"
+              ],
+              "title": "FxRateView",
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "negotiable": {
+              "enum": [
+                "yes",
+                "no",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "original_currency": {
+              "pattern": "^[A-Z]{3}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "payable": {
+              "additionalProperties": false,
+              "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+              "properties": {
+                "amount": {
+                  "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "currency": {
+                  "pattern": "^[A-Z]{3}$",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "default": null,
+                  "maxLength": 500,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "known",
+                    "unknown",
+                    "not_applicable"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "amount",
+                "currency",
+                "reason"
+              ],
+              "title": "AmountView",
+              "type": "object"
+            },
+            "price_type": {
+              "enum": [
+                "full_vehicle_asking",
+                "instalment",
+                "leasing",
+                "deposit",
+                "auction_start",
+                "auction_current_bid",
+                "export_net",
+                "parts_or_damaged",
+                "price_on_request",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "payable",
+            "original_currency",
+            "eur_equivalent",
+            "fx_rate",
+            "basis",
+            "price_type",
+            "negotiable"
+          ],
+          "title": "PriceSummary",
+          "type": "object"
+        },
+        "quarantined": {
+          "type": "boolean"
+        },
+        "queue_label": {
+          "maxLength": 120,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank": {
+          "additionalProperties": false,
+          "description": "Queue-ordering score. Never a probability of profit (spec 14).",
+          "properties": {
+            "is_probability": {
+              "const": false,
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "default": "Ranking score for ordering the review queue only; it is not a probability of profit.",
+              "type": "string"
+            },
+            "score": {
+              "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+              "type": "string"
+            },
+            "scoring_version": {
+              "maxLength": 80,
+              "type": "string"
+            }
+          },
+          "required": [
+            "score",
+            "scoring_version",
+            "is_probability",
+            "label"
+          ],
+          "title": "RankSummary",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "research_candidate": {
+          "type": "boolean"
+        },
+        "review_state": {
+          "enum": [
+            "pending",
+            "claimed",
+            "needs_information",
+            "watch",
+            "shortlisted",
+            "rejected",
+            "superseded",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision_number": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "seller_country": {
+          "pattern": "^[A-Z]{2}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_country": {
+          "pattern": "^[A-Z]{2}$",
+          "type": "string"
+        },
+        "source_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "source_key": {
+          "maxLength": 80,
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 300,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valuation_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valuation_state": {
+          "enum": [
+            "not_started",
+            "incomplete",
+            "estimated",
+            "quote_supported",
+            "stale",
+            "invalid"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "listing_id",
+        "revision_id",
+        "revision_number",
+        "source_id",
+        "source_key",
+        "source_country",
+        "seller_country",
+        "title",
+        "make",
+        "model",
+        "generation",
+        "price",
+        "mileage_km",
+        "mileage_claim",
+        "first_registration",
+        "availability",
+        "eligibility",
+        "eligibility_profile",
+        "queue_label",
+        "valuation_id",
+        "valuation_state",
+        "case_id",
+        "review_state",
+        "freshness",
+        "rank",
+        "research_candidate",
+        "quarantined",
+        "is_fixture"
+      ],
+      "title": "CandidateSummary",
+      "type": "object"
+    },
+    "case_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "case_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "claim": {
+      "additionalProperties": false,
+      "description": "Claim status visible to every reader. No token, no hash, no other holder identity.",
+      "properties": {
+        "claimed": {
+          "type": "boolean"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "held_by_caller": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "claimed",
+        "held_by_caller",
+        "expires_at"
+      ],
+      "title": "ClaimStateView",
+      "type": "object"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "decisions": {
+      "items": {
+        "additionalProperties": false,
+        "description": "One immutable ``app.review_decisions`` row (spec 14, 21).",
+        "properties": {
+          "actor": {
+            "additionalProperties": false,
+            "description": "The authenticated actor recorded by the server (request bodies carry no actor fields).",
+            "properties": {
+              "principal_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "principal_kind": {
+                "enum": [
+                  "user",
+                  "mcp_client",
+                  "system"
+                ],
+                "type": "string"
+              },
+              "role": {
+                "enum": [
+                  "owner",
+                  "reviewer",
+                  "viewer"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "principal_id",
+              "principal_kind",
+              "role"
+            ],
+            "title": "DecisionActorView",
+            "type": "object"
+          },
+          "case_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "case_state": {
+            "enum": [
+              "pending",
+              "claimed",
+              "needs_information",
+              "watch",
+              "shortlisted",
+              "rejected",
+              "superseded"
+            ],
+            "type": "string"
+          },
+          "case_version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "decided_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "decided_by_caller": {
+            "default": false,
+            "description": "True when the authenticated caller of this response recorded the decision.",
+            "type": "boolean"
+          },
+          "decision_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 100,
+            "type": "array"
+          },
+          "input_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "is_fixture": {
+            "type": "boolean"
+          },
+          "listing_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "listing_revision": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "listing_revision_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "missing_information": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 30,
+            "type": "array"
+          },
+          "model_name": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_run_id": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_version": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_case_version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "notice": {
+            "default": "A reviewer's recommendation with its evidence trail; it does not turn seller claims into verified facts.",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "needs_information",
+              "watch",
+              "shortlisted",
+              "rejected"
+            ],
+            "type": "string"
+          },
+          "prompt_template_version": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "summary": {
+            "maxLength": 4000,
+            "minLength": 10,
+            "type": "string"
+          },
+          "supersedes_decision_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_request_id": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "valuation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "decision_id",
+          "case_id",
+          "case_version",
+          "case_state",
+          "new_case_version",
+          "listing_id",
+          "listing_revision_id",
+          "listing_revision",
+          "valuation_id",
+          "outcome",
+          "reason_codes",
+          "summary",
+          "evidence_ids",
+          "missing_information",
+          "actor",
+          "model_name",
+          "model_version",
+          "model_run_id",
+          "prompt_template_version",
+          "tool_request_id",
+          "input_hash",
+          "decided_at",
+          "supersedes_decision_id",
+          "is_fixture",
+          "decided_by_caller",
+          "notice"
+        ],
+        "title": "ReviewDecisionView",
+        "type": "object"
+      },
+      "maxItems": 200,
+      "type": "array"
+    },
+    "is_fixture": {
+      "type": "boolean"
+    },
+    "latest_decision_id": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "listing_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "listing_revision": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "priority": {
+      "maximum": 100000,
+      "minimum": -100000,
+      "type": "integer"
+    },
+    "profile": {
+      "enum": [
+        "primary",
+        "manual_4000",
+        "below_target_watch"
+      ],
+      "type": "string"
+    },
+    "queue_label": {
+      "maxLength": 120,
+      "type": "string"
+    },
+    "readiness": {
+      "pattern": "^[a-z][a-z0-9_]{0,79}$",
+      "type": "string"
+    },
+    "reason": {
+      "maxLength": 2000,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "revision_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "pending",
+        "claimed",
+        "needs_information",
+        "watch",
+        "shortlisted",
+        "rejected",
+        "superseded"
+      ],
+      "type": "string"
+    },
+    "superseded_by_id": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "valuation": {
+      "additionalProperties": false,
+      "properties": {
+        "base_contribution": {
+          "additionalProperties": false,
+          "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+          "properties": {
+            "amount": {
+              "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "currency": {
+              "pattern": "^[A-Z]{3}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "default": null,
+              "maxLength": 500,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "enum": [
+                "known",
+                "unknown",
+                "not_applicable"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "amount",
+            "currency",
+            "reason"
+          ],
+          "title": "AmountView",
+          "type": "object"
+        },
+        "conservative_contribution": {
+          "additionalProperties": false,
+          "description": "A money amount for display. Unknown is ``amount: null`` with ``status: unknown``, never 0.\n\n``amount`` is rounded half-up to the currency's minor unit; the exact arithmetic happened\non the backend before rounding (spec 3, 18).",
+          "properties": {
+            "amount": {
+              "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "currency": {
+              "pattern": "^[A-Z]{3}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "default": null,
+              "maxLength": 500,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "enum": [
+                "known",
+                "unknown",
+                "not_applicable"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "amount",
+            "currency",
+            "reason"
+          ],
+          "title": "AmountView",
+          "type": "object"
+        },
+        "contribution_label": {
+          "const": "estimated contribution before business tax",
+          "default": "estimated contribution before business tax",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "dependency_fingerprint": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_fixture": {
+          "type": "boolean"
+        },
+        "research_candidate": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "not_started",
+            "incomplete",
+            "estimated",
+            "quote_supported",
+            "stale",
+            "invalid"
+          ],
+          "type": "string"
+        },
+        "valuation_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "valuation_id",
+        "state",
+        "research_candidate",
+        "is_fixture",
+        "created_at",
+        "expires_at",
+        "dependency_fingerprint",
+        "conservative_contribution",
+        "base_contribution",
+        "contribution_label"
+      ],
+      "title": "ValuationRef",
+      "type": [
+        "object",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "case_id",
+    "case_version",
+    "state",
+    "listing_id",
+    "revision_id",
+    "listing_revision",
+    "profile",
+    "queue_label",
+    "readiness",
+    "priority",
+    "claim",
+    "candidate",
+    "valuation",
+    "latest_decision_id",
+    "decisions",
+    "superseded_by_id",
+    "reason",
+    "is_fixture",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "ReviewCase",
+  "type": "object"
+}
