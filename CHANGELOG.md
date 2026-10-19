@@ -106,23 +106,33 @@ plugin uses "No authentication". Nothing was connected to the real ChatGPT accou
   tunnel for a rejection it now reads the last control-plane `error="..."` of the tunnel log with
   that HTTP status (a failed poll, else the metadata fetch), extracts OpenAI's code and text and
   shows "OpenAI says: <code>: <text>" (printable ASCII only, at most 400 characters, only parsed,
-  never evaluated; an `sk-` key-looking run without `*` is masked as `sk-[masked]`, OpenAI's own
-  masked form is kept), and chooses the cause and the fix by the code: `invalid_api_key` (a wrong,
-  truncated or revoked key: compare the masked last 4 characters, a new key, `setup`),
-  `tunnel_use_forbidden` (a valid key whose principal may not use the tunnel: same organization,
-  Tunnels Read + Use for the owner's role or the tunnel's User role, a key owned by the owner,
-  then a new key; the tunnel id is kept), `tunnel_missing_principals` and
-  `tunnel_active_organization_required` (tunnel-client's mitigations; the script sets no
-  organization id), `invalid_tunnel_id_format`; an unknown code or none: the texts by status with
-  OpenAI's words. `tunnel.rejected` holds all of it, so `status` shows the same. Tests: 114 in
-  `tests/cli/test_local_mcp_script.py` (the owner's three real error lines and the real
-  `invalid_api_key` line as stub tunnel-log fixtures, synthetic lines for the other codes, masking,
-  a long text with control characters; the 8 new tests fail against the previous script). The real
+  never evaluated; an `sk-` key-looking run without `*` is masked as `sk-[masked]`, also right
+  after a Go escape such as `\n` or `\t`, OpenAI's own masked form is kept), and chooses the cause
+  and the fix by the code: `invalid_api_key` (a wrong, truncated or revoked key: compare the masked
+  last 4 characters, a new key, `setup`), `tunnel_use_forbidden` (a valid key that OpenAI does not
+  let use the tunnel id: the principal's permissions, or an id that is not the tunnel's; the
+  metadata 404 fits both, so the window never declares the id right: first compare the id with
+  the Tunnels page (another id: delete `tunnel-id`, `setup`), then the same organization, Tunnels
+  Read + Use for the owner through a role or group or the owner assigned the tunnel's User role, a
+  key owned by the owner, then a new key), `tunnel_missing_principals` and
+  `tunnel_active_organization_required` (poll 401s in the vendor's OpenAPI; tunnel-client's
+  mitigations; the script sets no organization id); an unknown code or none: the texts by status
+  with OpenAI's words (401 names every 401 code; 403 is organization-level, for the key's
+  principal). The vendor's `invalid_tunnel_id_format` (HTTP 400) never reaches the window:
+  tunnel-client refuses a malformed id at startup. `tunnel.rejected` holds all of it, so `status`
+  shows the same. Tests: 119 in `tests/cli/test_local_mcp_script.py` (the owner's three real error
+  lines and the real `invalid_api_key` line as stub tunnel-log fixtures, synthetic lines for the
+  other codes, which line speaks (the last failed poll with the stopping status; the owner's lines
+  with the metadata 404 last, a later 429, a later metadata line, two poll codes), masking, also
+  after Go escapes, a long text with control characters; the new tests fail against the previous
+  script, the selection cases each against a script that takes the last line, prefers the metadata
+  line, ignores the status or keeps the first poll). The real
   binary with a FAKE key (build container): the window showed "OpenAI says: invalid_api_key:
   Incorrect API key provided: sk-proj-***...<last 4>" and the key fix. Docs: docs/connect_mcp.md
   8.3, 8.4, 8.6 and the new 8.7 (the permission model, the codes and fixes, the owner's live
   result), docs/runbook.md 9.3, SECURITY.md, ACTIVATION_GATES.md gate 13 (an evidence row; the
-  state stays `blocked`; the Platform permission fix is pending, dot is not connected).
+  state stays `blocked`; the owner's checks of the `tunnel_use_forbidden` row are pending, dot is
+  not connected).
 - Docs: docs/connect_mcp.md section 8 (decision, data flow, the owner's steps on the Platform, in
   WSL and in ChatGPT, test prompts and evidence, turning it off, rules S1-S7, what is unverified),
   sections 2, 3.1 and 4 updated; docs/runbook.md 9.3; ACTIVATION_GATES.md gate 13 and its

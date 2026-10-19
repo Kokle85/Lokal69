@@ -898,12 +898,15 @@ OA_TEXT_MAX=400      # characters of "<code>: <text>" shown
 OA_ERROR_RE='(^| )error="(([^"\\]|\\.)*)"'
 OA_CP_RE='^controlplane client: unexpected (metadata )?status ([1-5][0-9][0-9]): (.+)$'
 OA_CODE_RE='^([a-z][a-z0-9]*(_[a-z0-9]+)+): '
-OA_KEY_RE='(^|[^A-Za-z0-9_*-])(sk-[A-Za-z0-9_*-]+)'
+# A key starts after a character that cannot be part of one, or right after an escape of Go's
+# quoting (\n, \t, \xHH, \uHHHH, \UHHHHHHHH: a letter or digit just before the key).
+OA_KEY_RE='(^|[^A-Za-z0-9_*-]|\\[A-Za-z]|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})(sk-[A-Za-z0-9_*-]+)'
 ROLES_PAGE=https://platform.openai.com/settings/organization/people/roles
 
 # oa_clean TEXT: TEXT for the window and tunnel.rejected: printable ASCII only (every other byte
 # becomes "?"), every sk-... run that holds no "*" (a key OpenAI did not mask) replaced by
-# "sk-[masked]", at most OA_TEXT_MAX characters. Parameter expansion only: nothing is evaluated.
+# "sk-[masked]" (also right after a Go escape such as \n), at most OA_TEXT_MAX characters.
+# Parameter expansion only: nothing is evaluated.
 oa_clean() {
   local LC_ALL=C text=$1 out="" whole lead run
   text=${text//[^ -~]/?}
@@ -948,9 +951,11 @@ say() { printf '%s\n' "$*"; }
 # rejected_message HTTP FAILURES: why OpenAI's control plane keeps answering HTTP 401, 403 or 404
 # (tunnel-client would retry for ever), for tunnel.rejected: a first line (the summary), then
 # "OpenAI says: <code>: <text>" from the tunnel log (openai_says) and the cause and the fix, chosen
-# by OpenAI's code (one HTTP status has several causes: v0.0.16 answers 401 both for a wrong key,
-# invalid_api_key, and for a valid key whose principal may not use the tunnel, tunnel_use_forbidden),
-# else by the status. Sets OA_CODE.
+# by OpenAI's code (one HTTP status has several causes: a failed poll gets 401 for a wrong key,
+# invalid_api_key, and, per the vendor's OpenAPI, for tunnel_use_forbidden, tunnel_missing_principals
+# and tunnel_active_organization_required), else by the status. Sets OA_CODE. (The vendor's
+# invalid_tunnel_id_format is HTTP 400 and never reaches this: v0.0.16 refuses a malformed id at
+# startup, and the watcher does not stop on 400.)
 rejected_message() {
   local http=$1 polls=$2 log="" said=0 new_key
   local polled="control plane HTTP $http on $polls polls in a row"
@@ -968,23 +973,28 @@ rejected_message() {
     tunnel_use_forbidden)
       say "OpenAI denies the runtime API key's principal the use of the tunnel $TUNNEL_ID ($polled)"
       say "OpenAI says: $OA_SAYS"
+      say "Cause: the key is valid, but OpenAI lets its principal (the person or service account that owns" \
+        "the key) use no tunnel with the id $TUNNEL_ID (tunnel_use_forbidden): either that principal lacks" \
+        "the tunnel permissions, or the id is not that of a tunnel in the key's organization (a typo, a" \
+        "deleted and recreated tunnel, another organization's tunnel)."
       if ((OA_META404)); then
-        say "Cause: the key is valid, but its principal (the person or service account that owns the key)" \
-          "may not use this tunnel (tunnel_use_forbidden). The metadata 404 \"Tunnel not found\" in the" \
-          "same log has the same cause (the tunnel is hidden from that principal), not a wrong tunnel id."
-      else
-        say "Cause: the key is valid, but its principal (the person or service account that owns the key)" \
-          "may not use this tunnel (tunnel_use_forbidden)."
+        say "The metadata 404 \"Tunnel not found\" in the same log fits both (a tunnel hidden from that" \
+          "principal, or no tunnel with this id); only step 1 tells them apart."
       fi
       say "Fix, on the Platform (tunnel permissions are organization-level, not per project):"
-      say "  1. the tunnel ($TUNNELS_PAGE) and the key's project are in the SAME organization" \
-        "(organization switcher);"
-      say "  2. the owner's organization role, or the tunnel's own User role, has Tunnels Read + Use" \
-        "($ROLES_PAGE; a role change can take up to 30 minutes);"
-      say "  3. the key is Owned by: You (not a service account without that role) and Restricted with" \
+      say "  1. first the id: compare $TUNNEL_ID with the tunnel's id on $TUNNELS_PAGE in the organization" \
+        "of the key's project (organization switcher). Another id there (a typo, a deleted and recreated" \
+        "tunnel): delete $TUNNEL_ID_FILE and run scripts/local_mcp.sh setup with that id (the key is kept)," \
+        "then start again. The tunnel not there: it is in another organization (step 2). The same id: keep" \
+        "$TUNNEL_ID_FILE and go on;"
+      say "  2. the tunnel and the key's project are in the SAME organization (organization switcher);"
+      say "  3. the owner (the key's principal) has Tunnels Read + Use through an organization role or" \
+        "group, or is assigned the tunnel's own User role ($ROLES_PAGE; a role change can take up to 30" \
+        "minutes);"
+      say "  4. the key is Owned by: You (not a service account without that role) and Restricted with" \
         "Tunnels Read + Use ($API_KEYS_PAGE);"
-      say "  4. then create a NEW key (after a role change the vendor advises new keys), $new_key." \
-        "Keep $TUNNEL_ID_FILE: the tunnel id is not the problem."
+      say "  5. after a change in step 2, 3 or 4, create a NEW key (after a role change the vendor advises" \
+        "new keys), $new_key."
       ;;
     tunnel_missing_principals)
       say "OpenAI refused the runtime API key for the tunnel $TUNNEL_ID ($polled)"
@@ -1002,12 +1012,6 @@ rejected_message() {
       say "Fix (tunnel-client's mitigation): set control_plane.organization_id to the tunnel's" \
         "organization ID. scripts/local_mcp.sh does not set an organization id (tunnel-client.yaml has" \
         "none, and start rewrites that file), so this needs a change to the script."
-      ;;
-    invalid_tunnel_id_format)
-      say "OpenAI does not accept the format of the tunnel id $TUNNEL_ID ($polled)"
-      say "OpenAI says: $OA_SAYS"
-      say "Fix: delete $TUNNEL_ID_FILE and run scripts/local_mcp.sh setup with the exact tunnel_... id" \
-        "from $TUNNELS_PAGE."
       ;;
     *)
       # No code in the log (or no log line), or a code this script does not know: the texts by
@@ -1029,17 +1033,23 @@ rejected_message() {
       fi
       case $http in
         401)
-          say "Cause: HTTP 401 comes with a wrong, truncated or revoked key (invalid_api_key) and with a" \
-            "valid key whose principal may not use this tunnel (tunnel_use_forbidden; docs/connect_mcp.md 8.7)."
+          say "Cause: HTTP 401 comes with a wrong, truncated or revoked key (invalid_api_key) and, for a" \
+            "valid key, with tunnel_use_forbidden (its principal may not use this tunnel, or the id is not" \
+            "the tunnel's), tunnel_missing_principals (the key is not associated with the tunnel's" \
+            "organization or workspace) and tunnel_active_organization_required (the request does not name" \
+            "the tunnel's organization); docs/connect_mcp.md 8.7."
           say "Fix: for a wrong key, $new_key with the right restricted key (Tunnels Read + Use;" \
-            "$API_KEYS_PAGE); for a valid key, give its principal Tunnels Read + Use for this tunnel" \
-            "($ROLES_PAGE), then create a new key and run setup the same way."
+            "$API_KEYS_PAGE); for a valid key, compare $TUNNEL_ID with the id on $TUNNELS_PAGE (another id:" \
+            "delete $TUNNEL_ID_FILE and run setup), check that the tunnel and the key's project are in the" \
+            "same organization and that the key's principal has Tunnels Read + Use ($ROLES_PAGE), then" \
+            "create a new key and run setup the same way."
           ;;
         403)
-          say "Cause: the runtime API key lacks Tunnels Read + Use for $TUNNEL_ID, or the tunnel belongs to" \
-            "another organization or project."
-          say "Fix: give the key that permission or create one in the tunnel's project ($API_KEYS_PAGE)," \
-            "$new_key; for a wrong tunnel id delete $TUNNEL_ID_FILE instead."
+          say "Cause: the runtime API key's principal (its owner) lacks Tunnels Read + Use for $TUNNEL_ID," \
+            "or the tunnel belongs to another organization."
+          say "Fix: give the key's principal Tunnels Read + Use ($ROLES_PAGE) and create a new key, or" \
+            "create the key in a project of the tunnel's organization ($API_KEYS_PAGE); $new_key. For a" \
+            "wrong tunnel id (compare it with $TUNNELS_PAGE) delete $TUNNEL_ID_FILE instead."
           ;;
         *)
           say "Cause: a wrong tunnel id, or a tunnel hidden from the key's principal (another organization," \

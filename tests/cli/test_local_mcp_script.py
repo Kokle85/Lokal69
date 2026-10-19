@@ -1773,21 +1773,43 @@ def test_readyz_200_alone_is_not_connected(world: World) -> None:
 
 
 # Without OpenAI's words in the tunnel log (the stub logs no failed poll): the texts by HTTP status.
+# 401: every code the vendor's OpenAPI lists for a failed poll (tunnel-client v0.0.16
+# docs/openapi.json) and invalid_api_key; 403: tunnel permissions are organization-level (no
+# "project"), and they belong to the key's principal.
+_CAUSE_403 = (
+    "Cause: the runtime API key's principal (its owner) lacks Tunnels Read + Use for {tunnel_id}, or the"
+    " tunnel belongs to another organization."
+)
 _REJECTIONS = {
     401: (
         "OpenAI rejected the runtime API key (control plane HTTP 401 on 3 polls in a row)",
-        "Fix: for a wrong key, delete {tunnel}/control-plane-api-key and run scripts/local_mcp.sh setup"
-        " with the right restricted key (Tunnels Read + Use;"
-        " https://platform.openai.com/settings/organization/api-keys)",
+        [
+            "Cause: HTTP 401 comes with a wrong, truncated or revoked key (invalid_api_key) and, for a"
+            " valid key, with tunnel_use_forbidden (its principal may not use this tunnel, or the id is not"
+            " the tunnel's), tunnel_missing_principals (the key is not associated with the tunnel's"
+            " organization or workspace) and tunnel_active_organization_required (the request does not name"
+            " the tunnel's organization); docs/connect_mcp.md 8.7.",
+            "Fix: for a wrong key, delete {tunnel}/control-plane-api-key and run scripts/local_mcp.sh setup"
+            " with the right restricted key (Tunnels Read + Use;"
+            " https://platform.openai.com/settings/organization/api-keys); for a valid key, compare"
+            " {tunnel_id} with the id on https://platform.openai.com/settings/organization/tunnels (another"
+            " id: delete {tunnel}/tunnel-id and run setup),",
+        ],
     ),
     403: (
         "OpenAI refused the tunnel (control plane HTTP 403 on 3 polls in a row)",
-        "Cause: the runtime API key lacks Tunnels Read + Use for {tunnel_id}, or the tunnel belongs to"
-        " another organization or project.",
+        [
+            _CAUSE_403,
+            "Fix: give the key's principal Tunnels Read + Use"
+            " (https://platform.openai.com/settings/organization/people/roles) and create a new key, or"
+            " create the key in a project of the tunnel's organization"
+            " (https://platform.openai.com/settings/organization/api-keys); delete"
+            " {tunnel}/control-plane-api-key and run scripts/local_mcp.sh setup. For a wrong tunnel id",
+        ],
     ),
     404: (
         "OpenAI does not know the tunnel {tunnel_id} (control plane HTTP 404 on 3 polls in a row)",
-        "Fix: delete {tunnel}/tunnel-id and run scripts/local_mcp.sh setup",
+        ["Fix: delete {tunnel}/tunnel-id and run scripts/local_mcp.sh setup"],
     ),
 }
 REJECTED_401 = "error: OpenAI rejected the runtime API key (control plane HTTP 401 on 3 polls in a row)"
@@ -1804,11 +1826,14 @@ def test_openai_rejecting_the_tunnel_stops_it_and_the_api(world: World, http_sta
     result = world.run("start")
     assert time.monotonic() - started < 15
     assert result.returncode == 1, result.stdout + result.stderr
-    first, detail = (t.format(tunnel=world.tunnel_dir, tunnel_id=TUNNEL_ID) for t in _REJECTIONS[http_status])
+    first, details = _REJECTIONS[http_status]
+    first = first.format(tunnel=world.tunnel_dir, tunnel_id=TUNNEL_ID)
+    details = [t.format(tunnel=world.tunnel_dir, tunnel_id=TUNNEL_ID) for t in details]
     stopping = f"[local_mcp] error: OpenAI's control plane answers HTTP {http_status}; stopping the tunnel"
     assert stopping in result.stderr
     assert f"error: {first}. The tunnel was stopped (exit 0; its log:" in result.stderr
-    assert f"\n  {detail}" in result.stderr
+    for detail in details:
+        assert f"\n  {detail}" in result.stderr, detail
     assert f"holds no control-plane error with HTTP {http_status}: OpenAI's own words" in result.stderr
     assert "OpenAI says" not in result.stderr
     assert "dot can use the plugin" not in result.stdout  # not at "unknown/polling" nor "degraded/polling"
@@ -1818,23 +1843,68 @@ def test_openai_rejecting_the_tunnel_stops_it_and_the_api(world: World, http_sta
     assert "api: stopped" in result.stdout
     assert not list(world.state.glob("*.pid")) and not (world.tunnel_dir / "health.sock").exists()
     recorded = (world.state / "tunnel.rejected").read_text(encoding="utf-8")
-    assert recorded.startswith(f"{first}\n") and detail in recorded
+    assert recorded.startswith(f"{first}\n") and all(detail in recorded for detail in details)
     status = world.run("status")
     assert status.returncode == 1
     assert f"tunnel: not running\n  the last start stopped it: {first}\n" in status.stdout
-    assert f"\n    {detail}" in status.stdout
+    for detail in details:
+        assert f"\n    {detail}" in status.stdout, detail
     _assert_no_secret(result.stdout, result.stderr, status.stdout)
 
 
-def _synthetic(http_status: int, code: str, words: str) -> list[str]:
+def _synthetic(http_status: int, code: str, words: str, *, count: int = 3) -> list[str]:
     """A failed poll with an OpenAI code the owner has not met yet (SYNTHETIC words; the mitigation
     is tunnel-client v0.0.16's own, pkg/controlplane/apierror)."""
-    reason = {401: "401 Unauthorized", 403: "403 Forbidden", 404: "404 Not Found"}[http_status]
+    reason = {
+        401: "401 Unauthorized",
+        403: "403 Forbidden",
+        404: "404 Not Found",
+        429: "429 Too Many Requests",
+    }
     error = f"controlplane client: unexpected status {http_status}: {code}: {words}"
-    return [_poll_failed(error, reason, code)] * 3
+    return [_poll_failed(error, reason[http_status], code)] * count
 
 
+_WRONG_KEY_CAUSE = (
+    "Cause: the key in {tunnel}/control-plane-api-key is wrong, truncated or revoked (invalid_api_key)."
+)
 _USE_FORBIDDEN_SAYS = TUNNEL_USE_FORBIDDEN.split("status 401: ", 1)[1]
+# tunnel_use_forbidden: the window never declares the tunnel id right (a well-formed but wrong id,
+# e.g. of a deleted and recreated tunnel, plausibly gets the same 401 and metadata 404; the vendor:
+# "confirm the tunnel ID and organization/workspace association"); comparing it comes first.
+_META_404_BOTH = (
+    'The metadata 404 "Tunnel not found" in the same log fits both (a tunnel hidden from that principal,'
+    " or no tunnel with this id); only step 1 tells them apart."
+)
+_USE_FORBIDDEN_FIX = [
+    "Cause: the key is valid, but OpenAI lets its principal (the person or service account that owns the"
+    " key) use no tunnel with the id {tunnel_id} (tunnel_use_forbidden): either that principal lacks the"
+    " tunnel permissions, or the id is not that of a tunnel in the key's organization (a typo, a deleted"
+    " and recreated tunnel, another organization's tunnel).",
+    "Fix, on the Platform (tunnel permissions are organization-level, not per project):",
+    "  1. first the id: compare {tunnel_id} with the tunnel's id on"
+    " https://platform.openai.com/settings/organization/tunnels in the organization of the key's project"
+    " (organization switcher). Another id there (a typo, a deleted and recreated tunnel): delete"
+    " {tunnel}/tunnel-id and run scripts/local_mcp.sh setup with that id (the key is kept), then start"
+    " again. The tunnel not there: it is in another organization (step 2). The same id: keep"
+    " {tunnel}/tunnel-id and go on;",
+    "  2. the tunnel and the key's project are in the SAME organization (organization switcher);",
+    "  3. the owner (the key's principal) has Tunnels Read + Use through an organization role or group, or"
+    " is assigned the tunnel's own User role (https://platform.openai.com/settings/organization/people/roles;",
+    "  4. the key is Owned by: You (not a service account without that role) and Restricted with"
+    " Tunnels Read + Use",
+    "  5. after a change in step 2, 3 or 4, create a NEW key (after a role change the vendor advises new"
+    " keys), delete {tunnel}/control-plane-api-key and run scripts/local_mcp.sh setup.",
+]
+_USE_FORBIDDEN_NEVER = [
+    "not the problem",
+    "not a wrong",
+    "Keep {tunnel}/tunnel-id:",
+    "the owner's organization role, or",
+    "wrong, truncated or revoked",
+    "invalid character",
+    "oauth",
+]
 _SAID = [
     pytest.param(
         OWNER_LOG,
@@ -1843,21 +1913,70 @@ _SAID = [
         "OpenAI denies the runtime API key's principal the use of the tunnel {tunnel_id} (control plane"
         " HTTP 401 on 3 polls in a row)",
         _USE_FORBIDDEN_SAYS,
-        [
-            'The metadata 404 "Tunnel not found" in the same log has the same cause (the tunnel is hidden'
-            " from that principal), not a wrong tunnel id.",
-            "Fix, on the Platform (tunnel permissions are organization-level, not per project):",
-            "  1. the tunnel (https://platform.openai.com/settings/organization/tunnels) and the key's"
-            " project are in the SAME organization (organization switcher);",
-            "  2. the owner's organization role, or the tunnel's own User role, has Tunnels Read + Use",
-            "  3. the key is Owned by: You (not a service account without that role) and Restricted with"
-            " Tunnels Read + Use",
-            "  4. then create a NEW key (after a role change the vendor advises new keys), delete"
-            " {tunnel}/control-plane-api-key and run scripts/local_mcp.sh setup. Keep {tunnel}/tunnel-id:"
-            " the tunnel id is not the problem.",
-        ],
-        ["delete {tunnel}/tunnel-id", "wrong, truncated or revoked", "invalid character", "oauth"],
+        [*_USE_FORBIDDEN_FIX, _META_404_BOTH],
+        _USE_FORBIDDEN_NEVER,
         id="owner-2026-10-19-tunnel_use_forbidden",
+    ),
+    # Which line speaks: the last failed POLL with the stopping status; a metadata line with it only
+    # when there is none; a line with another status never (the owner's lines reordered and
+    # SYNTHETIC neighbours, each in the deciding last position).
+    pytest.param(
+        [OWNER_LOG[0], *OWNER_LOG[3:], OWNER_LOG[1], OWNER_LOG[2]],
+        401,
+        "tunnel_use_forbidden",
+        "OpenAI denies the runtime API key's principal the use of the tunnel {tunnel_id} (control plane"
+        " HTTP 401 on 3 polls in a row)",
+        _USE_FORBIDDEN_SAYS,
+        [*_USE_FORBIDDEN_FIX, _META_404_BOTH],
+        _USE_FORBIDDEN_NEVER,
+        id="owner-lines-with-the-metadata-404-last",
+    ),
+    pytest.param(
+        [
+            *[_poll_failed(TUNNEL_USE_FORBIDDEN, code="tunnel_use_forbidden")] * 3,
+            *_synthetic(
+                429,
+                "rate_limit_exceeded",
+                "SYNTHETIC too many requests. mitigation: reduce request concurrency or volume and let"
+                " tunnel-client retry after backoff",
+                count=1,
+            ),
+        ],
+        401,
+        "tunnel_use_forbidden",
+        "OpenAI denies the runtime API key's principal the use of the tunnel {tunnel_id} (control plane"
+        " HTTP 401 on 3 polls in a row)",
+        _USE_FORBIDDEN_SAYS,
+        _USE_FORBIDDEN_FIX,
+        [*_USE_FORBIDDEN_NEVER, "rate_limit_exceeded", "Tunnel not found"],
+        id="a-429-after-the-401-polls",
+    ),
+    pytest.param(
+        [
+            *FAKE_KEY_LOG[2:],
+            _metadata_failed(
+                "controlplane client: unexpected metadata status 401: tunnel_use_forbidden: SYNTHETIC"
+                " metadata words",
+                "401",
+            ),
+        ],
+        401,
+        "invalid_api_key",
+        "OpenAI rejected the runtime API key (control plane HTTP 401 on 3 polls in a row)",
+        f"invalid_api_key: {INCORRECT_KEY}",
+        [_WRONG_KEY_CAUSE],
+        ["SYNTHETIC metadata words", "Owned by"],
+        id="the-poll-over-a-later-metadata-line-with-the-same-status",
+    ),
+    pytest.param(
+        [*[_poll_failed(TUNNEL_USE_FORBIDDEN, code="tunnel_use_forbidden")] * 3, FAKE_KEY_LOG[0]],
+        401,
+        "invalid_api_key",
+        "OpenAI rejected the runtime API key (control plane HTTP 401 on 3 polls in a row)",
+        f"invalid_api_key: {INCORRECT_KEY}",
+        [_WRONG_KEY_CAUSE],
+        ["tunnel_use_forbidden", "Owned by"],
+        id="the-last-of-two-poll-codes",
     ),
     pytest.param(
         FAKE_KEY_LOG,
@@ -1878,14 +1997,14 @@ _SAID = [
     ),
     pytest.param(
         _synthetic(
-            403,
+            401,
             "tunnel_missing_principals",
             "SYNTHETIC no principal of this key matches the tunnel. mitigation: use a runtime API key"
             " associated with the intended organization or workspace",
         ),
-        403,
+        401,
         "tunnel_missing_principals",
-        "OpenAI refused the runtime API key for the tunnel {tunnel_id} (control plane HTTP 403 on 3 polls"
+        "OpenAI refused the runtime API key for the tunnel {tunnel_id} (control plane HTTP 401 on 3 polls"
         " in a row)",
         "tunnel_missing_principals: SYNTHETIC no principal of this key matches the tunnel. mitigation: use"
         " a runtime API key associated with the intended organization or workspace",
@@ -1899,15 +2018,15 @@ _SAID = [
     ),
     pytest.param(
         _synthetic(
-            403,
+            401,
             "tunnel_active_organization_required",
             "SYNTHETIC an organization is required. mitigation: set --control-plane.organization-id,"
             " CONTROL_PLANE_ORGANIZATION_ID, or control_plane.organization_id to the tunnel's"
             " organization ID",
         ),
-        403,
+        401,
         "tunnel_active_organization_required",
-        "OpenAI needs the organization id of the tunnel {tunnel_id} (control plane HTTP 403 on 3 polls in a"
+        "OpenAI needs the organization id of the tunnel {tunnel_id} (control plane HTTP 401 on 3 polls in a"
         " row)",
         "tunnel_active_organization_required: SYNTHETIC an organization is required. mitigation: set"
         " --control-plane.organization-id, CONTROL_PLANE_ORGANIZATION_ID, or control_plane.organization_id"
@@ -1929,10 +2048,9 @@ _SAID = [
         [
             "Note: scripts/local_mcp.sh does not know the code tunnel_paused_synthetic; OpenAI's words"
             " above name the cause",
-            "Cause: the runtime API key lacks Tunnels Read + Use for {tunnel_id}, or the tunnel belongs to"
-            " another organization or project.",
+            _CAUSE_403,
         ],
-        [],
+        ["project.", "tunnel's project", "give the key that permission"],
         id="unknown-code",
     ),
     pytest.param(
@@ -2017,6 +2135,42 @@ def test_a_key_openai_did_not_mask_is_masked_and_its_masked_form_kept(world: Wor
     for text in (result.stderr, status.stdout, recorded):
         assert says in text
         assert other_key not in text and other_key[11:] not in text and API_KEY[8:] not in text
+    _assert_no_secret(result.stdout, result.stderr, status.stdout, recorded)
+
+
+def test_a_key_right_after_a_go_escape_is_masked(world: World) -> None:
+    """Go's quoting writes a newline, a tab, a NUL or a non-printable rune right before a key as \\n,
+    \\t, \\x00, \\u00a0 or \\U000f0000: a letter or digit just before "sk-" (a non-JSON body that an
+    intermediary echoed, say). Such a key is masked all the same, as after an escaped backslash;
+    risk-assessment and a short sk- run stay."""
+    keys = [f"sk-proj-{letter * 40}" for letter in "ABCDEFGH"]
+    words = (
+        rf"<html>\nAuthorization: Bearer\t{keys[0]}\n</html> provided:\n{keys[1]} cr:\r{keys[2]}"
+        rf" nul:\x00{keys[3]} nbsp:\u00a0{keys[4]} rune:\U000f0000{keys[5]} bell:\a{keys[6]}"
+        rf" slash:\\{keys[7]} risk-assessment and \nsk-short"
+    )
+    line = (
+        '2026/10/19 08:48:31 WARN poll failed; backing off component=controlplane error="controlplane'
+        f' client: unexpected status 401: invalid_api_key: {words}" status_code=401\n'
+    )
+    world.setup()
+    world.knob("run_log", line)
+    world.health_sequence(*_rejections(401))
+    world.knob("run_mode", "exit:0:20")
+    result = world.run("start")
+    assert result.returncode == 1, result.stdout + result.stderr
+    status = world.run("status", LOCAL_MCP_TAIL="0")  # no raw log lines
+    recorded = (world.state / "tunnel.rejected").read_text(encoding="utf-8")
+    says = (
+        r"OpenAI says: invalid_api_key: <html>\nAuthorization: Bearer\tsk-[masked]\n</html>"
+        r" provided:\nsk-[masked] cr:\rsk-[masked] nul:\x00sk-[masked] nbsp:\u00a0sk-[masked]"
+        r" rune:\U000f0000sk-[masked] bell:\ask-[masked] slash:\\sk-[masked] risk-assessment and"
+        r" \nsk-short"
+    )
+    for text in (result.stderr, status.stdout, recorded):
+        assert f"{says}\n" in text, text
+        for key in keys:
+            assert key[8:] not in text
     _assert_no_secret(result.stdout, result.stderr, status.stdout, recorded)
 
 

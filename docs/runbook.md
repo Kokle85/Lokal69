@@ -863,8 +863,9 @@ scripts/local_mcp.sh rotate   # new credential, the old one revoked; restart aft
   control plane answers 401, 403 or 404 on 3 polls in a row, the window stops the tunnel and the
   API, exits 1 and shows "OpenAI says: <code>: <text>" from the tunnel log with the cause and the
   fix for that code (`status` repeats them): 401 `invalid_api_key` is a wrong key, 401
-  `tunnel_use_forbidden` a valid key whose principal lacks the tunnel permissions on the Platform
-  (docs/connect_mcp.md 8.3 step 3, 8.7).
+  `tunnel_use_forbidden` a valid key that may not use the tunnel id: the principal's tunnel
+  permissions on the Platform, or an id that is not the tunnel's, so compare the id with the
+  Tunnels page first (docs/connect_mcp.md 8.3 step 3, 8.7).
 - Secrets stay in `~/.config/suv-deals/tunnel/` (0700, files 0600) and in `.env`; the script never
   prints them, never puts them on a command line and never reads, prints or passes `.env`. Never
   run tunnel-client with `--log.http-raw-unsafe`, and never connect the PC as dot's "computer".
